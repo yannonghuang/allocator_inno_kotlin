@@ -1,0 +1,783 @@
+package com.allocator.api
+
+import com.allocator.*
+import com.allocator.services.CaseLoader
+import com.allocator.services.runAllocation
+import com.allocator.services.runPlanning
+import com.opencsv.CSVReaderHeaderAware
+import io.ktor.http.*
+import io.ktor.server.application.*
+import io.ktor.server.request.*
+import io.ktor.server.response.*
+import io.ktor.server.routing.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.datetime.toJavaInstant
+import kotlinx.serialization.json.*
+import org.jetbrains.exposed.sql.*
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.transactions.transaction
+import org.slf4j.LoggerFactory
+import java.io.FileReader
+import java.nio.file.Paths
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+
+private val log = LoggerFactory.getLogger("com.allocator.AllocateRoute")
+private val engineScope = CoroutineScope(Dispatchers.IO)
+
+// ── In-memory plan job state ───────────────────────────────────────────────────
+private val planJobs = ConcurrentHashMap<String, MutableMap<String, Any?>>()
+private val casePlanResults = ConcurrentHashMap<Int, Map<String, Any>>()
+
+/**
+ * Allocation run routes — port of api/allocate.py.
+ * Background allocation runs via Kotlin coroutines; status persisted in DB.
+ */
+fun Routing.allocateRoutes() {
+
+    // ── POST /cases/{case_id}/allocate — start async run ──────────────────────
+    post("/cases/{case_id}/allocate") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+
+        val runId = transaction {
+            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
+                ?: throw NoSuchElementException("Case not found")
+            val demands = Demands.selectAll().where { Demands.caseId eq caseId }.count()
+            val supplies = Supplies.selectAll().where { Supplies.caseId eq caseId }.count()
+            if (demands == 0L) throw IllegalArgumentException("No demand data")
+            if (supplies == 0L) throw IllegalArgumentException("No supply data")
+
+            AllocationRuns.insert {
+                it[AllocationRuns.caseId] = caseId
+                it[status] = "running"
+                it[config] = "{}"
+            }[AllocationRuns.id]
+        }
+
+        // Fire-and-forget in coroutine
+        engineScope.launch { runAllocationBackground(caseId, runId) }
+
+        val response = transaction {
+            val row = AllocationRuns.selectAll().where { AllocationRuns.id eq runId }.single()
+            AllocationRunResponse(
+                id = row[AllocationRuns.id],
+                caseId = row[AllocationRuns.caseId],
+                createdAt = formatTs(row[AllocationRuns.createdAt]),
+                status = row[AllocationRuns.status],
+                config = row[AllocationRuns.config]?.let { Json.parseToJsonElement(it) },
+            )
+        }
+        call.respond(HttpStatusCode.Accepted, response)
+    }
+
+    // ── GET /cases/{case_id}/runs — list runs ──────────────────────────────────
+    get("/cases/{case_id}/runs") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        transaction {
+            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
+                ?: throw NoSuchElementException("Case not found")
+        }
+        val runs = transaction {
+            AllocationRuns.selectAll().where { AllocationRuns.caseId eq caseId }
+                .orderBy(AllocationRuns.createdAt, SortOrder.DESC)
+                .map {
+                    AllocationRunResponse(
+                        id = it[AllocationRuns.id],
+                        caseId = it[AllocationRuns.caseId],
+                        createdAt = formatTs(it[AllocationRuns.createdAt]),
+                        status = it[AllocationRuns.status],
+                        config = it[AllocationRuns.config]?.let { c -> Json.parseToJsonElement(c) },
+                    )
+                }
+        }
+        call.respond(runs)
+    }
+
+    // ── GET /cases/{case_id}/runs/{run_id}/status — lightweight poll ───────────
+    get("/cases/{case_id}/runs/{run_id}/status") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val runId = call.parameters["run_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid run_id")
+        val json = transaction {
+            val row = AllocationRuns.selectAll().where { (AllocationRuns.id eq runId) and (AllocationRuns.caseId eq caseId) }
+                .singleOrNull() ?: throw NoSuchElementException("Run not found")
+            buildJsonObject {
+                put("id", row[AllocationRuns.id])
+                put("status", row[AllocationRuns.status])
+                put("config", row[AllocationRuns.config]?.let { Json.parseToJsonElement(it) } ?: JsonNull)
+            }
+        }
+        call.respond(json)
+    }
+
+    // ── GET /cases/{case_id}/runs/{run_id} — full run + actions ───────────────
+    get("/cases/{case_id}/runs/{run_id}") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val runId = call.parameters["run_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid run_id")
+        val json = transaction {
+            val r = AllocationRuns.selectAll().where { (AllocationRuns.id eq runId) and (AllocationRuns.caseId eq caseId) }
+                .singleOrNull() ?: throw NoSuchElementException("Run not found")
+            val acts = AllocationActions.selectAll().where { AllocationActions.runId eq runId }
+                .orderBy(AllocationActions.id, SortOrder.ASC)
+                .map { a ->
+                    AllocationActionResponse(
+                        id = a[AllocationActions.id],
+                        runId = a[AllocationActions.runId],
+                        variantKey = a[AllocationActions.variantKey],
+                        reqComponentIds = Json.decodeFromString(a[AllocationActions.reqComponentIds]),
+                        reqRates = a[AllocationActions.reqRates]?.let { Json.decodeFromString(it) },
+                        qty = a[AllocationActions.qty],
+                        demandId = a[AllocationActions.demandId],
+                        targetProductId = a[AllocationActions.targetProductId],
+                        targetLocationId = a[AllocationActions.targetLocationId],
+                        outputPeriod = a[AllocationActions.outputPeriod],
+                        edgeType = a[AllocationActions.edgeType],
+                    )
+                }
+            buildJsonObject {
+                put("id", r[AllocationRuns.id])
+                put("case_id", r[AllocationRuns.caseId])
+                put("created_at", formatTs(r[AllocationRuns.createdAt]))
+                put("status", r[AllocationRuns.status])
+                put("config", r[AllocationRuns.config]?.let { Json.parseToJsonElement(it) } ?: JsonNull)
+                put("actions", Json.encodeToJsonElement(acts))
+            }
+        }
+        call.respond(json)
+    }
+
+    // ── GET /cases/{case_id}/runs/{run_id}/feasible-demands ──────────────────
+    get("/cases/{case_id}/runs/{run_id}/feasible-demands") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val runId = call.parameters["run_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid run_id")
+        transaction {
+            AllocationRuns.selectAll().where { (AllocationRuns.id eq runId) and (AllocationRuns.caseId eq caseId) }
+                .singleOrNull() ?: throw NoSuchElementException("Run not found")
+        }
+        val actions = transaction {
+            AllocationActions.selectAll().where { AllocationActions.runId eq runId }.toList()
+        }
+        val feasible = feasibleDemandsFromActions(caseId, actions)
+        call.respond(buildJsonObject {
+            put("feasible_demands", buildJsonArray {
+                feasible.forEach { fd -> add(anyToJson(fd)) }
+            })
+        })
+    }
+
+    // ── GET /cases/{case_id}/plan/products-with-real-bom ─────────────────────
+    get("/cases/{case_id}/plan/products-with-real-bom") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        transaction {
+            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
+                ?: throw NoSuchElementException("Case not found")
+        }
+        val bomCsv = resolveBomCsv()
+        val pairs = mutableListOf<List<String>>()
+        if (bomCsv.toFile().exists()) {
+            try {
+                CSVReaderHeaderAware(FileReader(bomCsv.toFile())).use { reader ->
+                    var row: Map<String, String>?
+                    val firstRow = reader.readMap()
+                    val hasVirtual = firstRow != null && "VIRTUAL" in firstRow
+                    if (firstRow != null) {
+                        val parent = (firstRow["PARENT_ID"] ?: "").trim()
+                        val child = (firstRow["CHILD_ID"] ?: "").trim()
+                        val virtual = (firstRow["VIRTUAL"] ?: "").trim().uppercase()
+                        if (parent.isNotBlank() && child.isNotBlank() && (!hasVirtual || virtual != "Y")) {
+                            pairs.add(listOf(parent, child))
+                        }
+                    }
+                    while (reader.readMap().also { row = it } != null) {
+                        val r = row!!
+                        val parent = (r["PARENT_ID"] ?: "").trim()
+                        val child = (r["CHILD_ID"] ?: "").trim()
+                        if (parent.isBlank() || child.isBlank()) continue
+                        if (hasVirtual && (r["VIRTUAL"] ?: "").trim().uppercase() == "Y") continue
+                        pairs.add(listOf(parent, child))
+                    }
+                }
+            } catch (e: Exception) {
+                log.warn("Failed to read bom.csv: ${e.message}")
+            }
+        }
+        call.respond(mapOf("pairs" to pairs))
+    }
+
+    // ── GET /cases/{case_id}/plan/moves-with-transit ──────────────────────────
+    get("/cases/{case_id}/plan/moves-with-transit") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        transaction {
+            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
+                ?: throw NoSuchElementException("Case not found")
+        }
+        val moves = transaction {
+            MethodMoves.selectAll().where { (MethodMoves.caseId eq caseId) and (MethodMoves.transitTime neq null) }
+                .filter { it[MethodMoves.transitTime] != null && it[MethodMoves.transitTime]!! > 0 }
+                .map { listOf(it[MethodMoves.productId].trim(), it[MethodMoves.fromLocationId].trim(), it[MethodMoves.toLocationId].trim()) }
+                .distinct()
+        }
+        call.respond(mapOf("moves" to moves))
+    }
+
+    // ── POST /cases/{case_id}/plan — demand-to-supply planning ────────────────
+    post("/cases/{case_id}/plan") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        transaction {
+            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
+                ?: throw NoSuchElementException("Case not found")
+        }
+        val data = transaction { CaseLoader.load(caseId) }
+        if (data["demand"].isNullOrEmpty()) throw IllegalArgumentException("No demand data")
+        if (data["supply"].isNullOrEmpty()) throw IllegalArgumentException("No supply data")
+
+        val body = runCatching { call.receiveText() }.getOrElse { "" }
+        val payload = if (body.isBlank()) JsonObject(emptyMap())
+                      else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrElse { JsonObject(emptyMap()) }
+        val configJson = payload["config"]
+        val config: Map<String, Any?>? = if (configJson != null && configJson !is JsonNull)
+            runCatching { Json.decodeFromJsonElement<Map<String, JsonElement>>(configJson) }.getOrNull()
+        else null
+        val useAsync = payload["async"]?.jsonPrimitive?.booleanOrNull == true
+
+        if (useAsync) {
+            val jobId = UUID.randomUUID().toString()
+            val total = data["demand"]?.size ?: 0
+            planJobs[jobId] = mutableMapOf(
+                "case_id" to caseId,
+                "status" to "running",
+                "progress" to mapOf("current" to 0, "total" to total),
+                "result" to null,
+                "error" to null,
+            )
+            engineScope.launch { runPlanBackground(jobId, caseId, data, config) }
+            call.response.headers.append("Location", "/cases/$caseId/plan/status/$jobId")
+            call.respond(HttpStatusCode.Accepted, buildJsonObject {
+                put("job_id", jobId)
+                put("status", "running")
+                put("message", "Poll GET /cases/$caseId/plan/status/$jobId for progress and result.")
+            })
+            return@post
+        }
+
+        val result = runPlanning(data, config = config)
+        val enriched = enrichPlanResultWithData(caseId, result, data)
+        casePlanResults[caseId] = enriched
+        call.respond(anyToJson(enriched))
+    }
+
+    // ── GET /cases/{case_id}/plan/status/{job_id} ─────────────────────────────
+    get("/cases/{case_id}/plan/status/{job_id}") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val jobId = call.parameters["job_id"] ?: throw IllegalArgumentException("Invalid job_id")
+        val job = planJobs[jobId] ?: throw NoSuchElementException("Plan job not found")
+        if (job["case_id"] != caseId) throw NoSuchElementException("Plan job not found for this case")
+        call.respond(buildJsonObject {
+            put("status", job["status"]?.toString() ?: "unknown")
+            put("progress", anyToJson(job["progress"]))
+            if (job["result"] != null) put("result", anyToJson(job["result"]))
+            if (job["error"] != null) put("error", job["error"]?.toString() ?: "")
+        })
+    }
+
+    // ── GET /cases/{case_id}/plan/work-order-pegging ──────────────────────────
+    get("/cases/{case_id}/plan/work-order-pegging") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val demandId = call.request.queryParameters["demand_id"]?.trim() ?: ""
+        val productId = call.request.queryParameters["product_id"]?.trim() ?: ""
+        val locationId = call.request.queryParameters["location_id"]?.trim() ?: ""
+        val method = call.request.queryParameters["method"]?.trim() ?: ""
+        if (demandId.isBlank() || productId.isBlank() || locationId.isBlank() || method.isBlank()) {
+            throw IllegalArgumentException("demand_id, product_id, location_id, method required")
+        }
+        val result = casePlanResults[caseId]
+            ?: throw NoSuchElementException("No plan result for this case. Run plan first.")
+
+        @Suppress("UNCHECKED_CAST")
+        val planningPegging = result["planning_pegging"] as? List<Map<String, Any?>> ?: emptyList()
+        val entry = planningPegging.find { (it["demand_id"]?.toString() ?: "").trim() == demandId }
+            ?: throw NoSuchElementException("No pegging tree for this demand")
+        val tree = entry["tree"] ?: throw NoSuchElementException("No pegging tree for this demand")
+        val woNode = findWoNode(tree, productId, locationId, method)
+            ?: throw NoSuchElementException("Work order not found in pegging tree")
+
+        // Align quantity with work_orders list sum
+        @Suppress("UNCHECKED_CAST")
+        val workOrders = result["work_orders"] as? List<Map<String, Any?>> ?: emptyList()
+        val woQtySum = workOrders.filter { wo ->
+            (wo["demand_id"]?.toString() ?: "").trim() == demandId &&
+            (wo["product_id"]?.toString() ?: "").trim() == productId &&
+            (wo["location_id"]?.toString() ?: "").trim() == locationId &&
+            (wo["method"]?.toString() ?: "").trim() == method
+        }.sumOf { (it["quantity"] as? Number ?: 0).toDouble() }
+
+        val treeJson = anyToJson(woNode)
+        val finalTree = if (woQtySum > 0 && treeJson is JsonObject) {
+            buildJsonObject {
+                treeJson.forEach { (k, v) -> if (k == "quantity") put("quantity", woQtySum) else put(k, v) }
+            }
+        } else treeJson
+        call.respond(buildJsonObject { put("tree", finalTree) })
+    }
+}
+
+// ── Plan helper functions ──────────────────────────────────────────────────────
+
+/** Convert Any? to JsonElement for response serialization. */
+private fun anyToJson(v: Any?): JsonElement = when (v) {
+    null -> JsonNull
+    is JsonElement -> v
+    is Boolean -> JsonPrimitive(v)
+    is Number -> JsonPrimitive(v)
+    is String -> JsonPrimitive(v)
+    is Map<*, *> -> buildJsonObject { v.forEach { (k, vv) -> put(k.toString(), anyToJson(vv)) } }
+    is List<*> -> buildJsonArray { v.forEach { add(anyToJson(it)) } }
+    else -> JsonPrimitive(v.toString())
+}
+
+/** Return set of (parent_id, child_id) for real BOM rows (VIRTUAL != Y). */
+private fun getBomRealPairs(): Set<Pair<String, String>> {
+    val bomCsv = resolveBomCsv()
+    val pairs = mutableSetOf<Pair<String, String>>()
+    if (!bomCsv.toFile().exists()) return pairs
+    try {
+        CSVReaderHeaderAware(FileReader(bomCsv.toFile())).use { reader ->
+            var row: Map<String, String>? = reader.readMap() ?: return pairs
+            val hasVirtual = "VIRTUAL" in row!!
+            while (row != null) {
+                val r = row!!
+                val parent = (r["PARENT_ID"] ?: "").trim()
+                val child = (r["CHILD_ID"] ?: "").trim()
+                if (parent.isNotBlank() && child.isNotBlank()) {
+                    if (!hasVirtual || (r["VIRTUAL"] ?: "").trim().uppercase() != "Y") {
+                        pairs.add(Pair(parent, child))
+                    }
+                }
+                row = reader.readMap()
+            }
+        }
+    } catch (e: Exception) { log.warn("Failed to read bom.csv for plan: ${e.message}") }
+    return pairs
+}
+
+/** Return set of (product_id, from_location, to_location) for moves with transit_time > 0. */
+private fun getMoveTriples(caseId: Int): Set<Triple<String, String, String>> = transaction {
+    MethodMoves.selectAll()
+        .where { (MethodMoves.caseId eq caseId) and (MethodMoves.transitTime neq null) }
+        .filter { it[MethodMoves.transitTime] != null && it[MethodMoves.transitTime]!! > 0 }
+        .map { Triple(it[MethodMoves.productId].trim(), it[MethodMoves.fromLocationId].trim(), it[MethodMoves.toLocationId].trim()) }
+        .toSet()
+}
+
+@Suppress("UNCHECKED_CAST")
+private fun findWoNode(tree: Any?, productId: String, locationId: String, method: String): Map<String, Any?>? {
+    val node = tree as? Map<String, Any?> ?: return null
+    if (node["type"] == "work_order" &&
+        (node["product_id"] as? String ?: "").trim() == productId &&
+        (node["location_id"] as? String ?: "").trim() == locationId &&
+        (node["method"] as? String ?: "").trim() == method) return node
+    for (ch in (node["children"] as? List<*> ?: emptyList<Any?>())) {
+        findWoNode(ch, productId, locationId, method)?.let { return it }
+    }
+    return null
+}
+
+@Suppress("UNCHECKED_CAST")
+private fun subtreeContainsRealMake(node: Any?, bomPairs: Set<Pair<String, String>>): Boolean {
+    val n = node as? Map<String, Any?> ?: return false
+    if (n["type"] == "work_order" && (n["method"] as? String ?: "").trim() == "make") {
+        val relation = (n["children_relation"] as? String ?: "").trim().lowercase()
+        if (relation == "and" || relation == "or") return true
+        val parentId = (n["product_id"] as? String ?: "").trim()
+        for (ch in (n["children"] as? List<*> ?: emptyList<Any?>())) {
+            val childId = ((ch as? Map<String, Any?>)?.get("product_id") as? String ?: "").trim()
+            if (Pair(parentId, childId) in bomPairs) return true
+        }
+    }
+    for (ch in (n["children"] as? List<*> ?: emptyList<Any?>())) {
+        if (subtreeContainsRealMake(ch, bomPairs)) return true
+    }
+    return false
+}
+
+@Suppress("UNCHECKED_CAST")
+private fun subtreeContainsBuy(node: Any?): Boolean {
+    val n = node as? Map<String, Any?> ?: return false
+    if (n["type"] == "purchase") return true
+    for (ch in (n["children"] as? List<*> ?: emptyList<Any?>())) {
+        if (subtreeContainsBuy(ch)) return true
+    }
+    return false
+}
+
+@Suppress("UNCHECKED_CAST")
+private fun subtreeContainsRealMove(node: Any?, moveTriples: Set<Triple<String, String, String>>): Boolean {
+    val n = node as? Map<String, Any?> ?: return false
+    if (n["type"] == "work_order" && (n["method"] as? String ?: "").trim() == "move") {
+        val pid = (n["product_id"] as? String ?: "").trim()
+        val fromLoc = (n["location_source"] as? String ?: "").trim()
+        val toLoc = (n["location_id"] as? String ?: "").trim()
+        if (Triple(pid, fromLoc, toLoc) in moveTriples) return true
+    }
+    for (ch in (n["children"] as? List<*> ?: emptyList<Any?>())) {
+        if (subtreeContainsRealMove(ch, moveTriples)) return true
+    }
+    return false
+}
+
+@Suppress("UNCHECKED_CAST")
+private fun peggingSupplyConsumed(node: Any?): Double {
+    val n = node as? Map<String, Any?> ?: return 0.0
+    var total = if (n["type"] == "supply") (n["quantity"] as? Number ?: 0).toDouble() else 0.0
+    for (ch in (n["children"] as? List<*> ?: emptyList<Any?>())) total += peggingSupplyConsumed(ch)
+    return total
+}
+
+/** Add pegging flags to each work order (returns new list with added keys). */
+@Suppress("UNCHECKED_CAST")
+private fun enrichWorkOrders(
+    workOrders: List<Map<String, Any?>>,
+    planningPegging: List<Map<String, Any?>>,
+    bomPairs: Set<Pair<String, String>>,
+    moveTriples: Set<Triple<String, String, String>>,
+): List<Map<String, Any?>> {
+    val byDemand = planningPegging.associate { e ->
+        (e["demand_id"]?.toString() ?: "").trim() to e["tree"]
+    }
+    return workOrders.map { wo ->
+        val demandId = (wo["demand_id"]?.toString() ?: "").trim()
+        val tree = if (demandId.isNotBlank()) byDemand[demandId] else null
+        val woNode = tree?.let {
+            findWoNode(it,
+                (wo["product_id"] as? String ?: "").trim(),
+                (wo["location_id"] as? String ?: "").trim(),
+                (wo["method"] as? String ?: "").trim())
+        }
+        wo + mapOf(
+            "pegging_includes_real_make" to (woNode?.let { subtreeContainsRealMake(it, bomPairs) } ?: false),
+            "pegging_includes_buy" to (woNode?.let { subtreeContainsBuy(it) } ?: false),
+            "pegging_includes_real_move" to (woNode?.let { subtreeContainsRealMove(it, moveTriples) } ?: false),
+        )
+    }
+}
+
+/** Compute plan KPIs (delivery, inventory, procurement, manufacturing, logistics). */
+@Suppress("UNCHECKED_CAST")
+private fun planKpis(
+    data: Map<String, List<Map<String, Any?>>>,
+    result: Map<String, Any>,
+    bomPairs: Set<Pair<String, String>>,
+): Map<String, Any?> {
+    val demands = data["demand"] ?: emptyList()
+    val committed = result["committed_demands"] as? List<Map<String, Any?>> ?: emptyList()
+    val workOrders = result["work_orders"] as? List<Map<String, Any?>> ?: emptyList()
+    val planningPegging = result["planning_pegging"] as? List<Map<String, Any?>> ?: emptyList()
+
+    val totalRequested = demands.sumOf { (it["quantity"] as? Number ?: 0).toDouble() }
+    val totalCommitted = committed.sumOf { (it["quantity"] as? Number ?: 0).toDouble() }
+    val fillRatePct = if (totalRequested > 0) totalCommitted / totalRequested * 100.0 else null
+
+    val commitByDemand = mutableMapOf<String, String?>()
+    for (c in committed) {
+        val did = (c["demand_id"]?.toString() ?: "").trim()
+        val ct = c["commit_time"] as? String
+        if (did.isNotBlank() && ct != null) {
+            val existing = commitByDemand[did]
+            if (existing == null || ct > existing) commitByDemand[did] = ct
+        }
+    }
+    var onTimeCount = 0
+    for (d in demands) {
+        val did = (d["demand_id"]?.toString() ?: "").trim()
+        val due = (d["request_due_time"] as? String ?: d["request_time"] as? String) ?: continue
+        if (did.isBlank()) continue
+        val ct = commitByDemand[did] ?: continue
+        if (ct <= due) onTimeCount++
+    }
+
+    val treeByDemand = planningPegging.associate { e ->
+        (e["demand_id"]?.toString() ?: "").trim() to e["tree"]
+    }
+    val fulfilledIds = committed
+        .filter { (it["quantity"] as? Number ?: 0).toDouble() > 0 }
+        .map { (it["demand_id"]?.toString() ?: "").trim() }
+        .filter { it.isNotBlank() }
+        .toSet()
+    val fulfilledWithTree = fulfilledIds.filter { it in treeByDemand }
+    var fulfilledByRealMake = 0
+    var fulfilledByInventoryOnly = 0
+    for (did in fulfilledWithTree) {
+        val tree = treeByDemand[did] ?: continue
+        if (subtreeContainsRealMake(tree, bomPairs)) fulfilledByRealMake++ else fulfilledByInventoryOnly++
+    }
+
+    // Supply summary
+    val supplyList = data["supply"] ?: emptyList()
+    val initialTotal = supplyList.sumOf { (it["qty"] as? Number ?: 0).toDouble() }
+    val consumedTotal = planningPegging.sumOf { e -> peggingSupplyConsumed(e["tree"]) }
+    val consumptionRate = if (initialTotal > 0) consumedTotal / initialTotal else null
+
+    fun methodStats(methodVal: String): Map<String, Any?> {
+        val wos = workOrders.filter { wo ->
+            (wo["method"] as? String ?: "").trim().lowercase() == methodVal &&
+            when (methodVal) {
+                "make" -> wo["pegging_includes_real_make"] == true
+                "move" -> wo["pegging_includes_real_move"] == true
+                else -> true
+            }
+        }
+        val seen = mutableMapOf<String, Double>()
+        for (wo in wos) {
+            val key = "${wo["demand_id"]}|${wo["product_id"]}|${wo["location_id"]}|${wo["method"]}"
+            seen[key] = (seen[key] ?: 0.0) + (wo["quantity"] as? Number ?: 0).toDouble()
+        }
+        return mapOf("order_count" to seen.size, "total_quantity" to Math.round(seen.values.sum() * 10000).toDouble() / 10000.0)
+    }
+
+    return mapOf(
+        "delivery" to mapOf(
+            "total_requested" to Math.round(totalRequested * 10000).toDouble() / 10000.0,
+            "total_committed" to Math.round(totalCommitted * 10000).toDouble() / 10000.0,
+            "fill_rate_pct" to fillRatePct?.let { Math.round(it * 100).toDouble() / 100.0 },
+            "demand_count" to demands.size,
+            "on_time_count" to onTimeCount,
+            "fulfilled_with_tree_count" to fulfilledWithTree.size,
+            "fulfilled_by_real_make_count" to fulfilledByRealMake,
+            "fulfilled_by_inventory_only_count" to fulfilledByInventoryOnly,
+        ),
+        "inventory" to mapOf(
+            "initial_total" to Math.round(initialTotal * 10000).toDouble() / 10000.0,
+            "consumed_total" to Math.round(consumedTotal * 10000).toDouble() / 10000.0,
+            "consumption_rate" to consumptionRate?.let { Math.round(it * 10000).toDouble() / 10000.0 },
+        ),
+        "procurement" to methodStats("purchase"),
+        "manufacturing" to methodStats("make"),
+        "logistics" to methodStats("move"),
+    )
+}
+
+/** Enrich a raw runPlanning() result with pegging flags and KPIs. */
+private fun enrichPlanResultWithData(
+    caseId: Int,
+    result: Map<String, Any>,
+    data: Map<String, List<Map<String, Any?>>>,
+): Map<String, Any> {
+    @Suppress("UNCHECKED_CAST")
+    val workOrders = result["work_orders"] as? List<Map<String, Any?>> ?: emptyList()
+    @Suppress("UNCHECKED_CAST")
+    val planningPegging = result["planning_pegging"] as? List<Map<String, Any?>> ?: emptyList()
+    val bomPairs = getBomRealPairs()
+    val moveTriples = getMoveTriples(caseId)
+    val enrichedWos = enrichWorkOrders(workOrders, planningPegging, bomPairs, moveTriples)
+    val enriched = result.toMutableMap()
+    enriched["work_orders"] = enrichedWos
+    val kpis = planKpis(data, enriched, bomPairs)
+    enriched["plan_kpis"] = kpis
+    enriched["supply_summary"] = (kpis["inventory"] ?: emptyMap<String, Any?>())
+    return enriched
+}
+
+private suspend fun runPlanBackground(
+    jobId: String,
+    caseId: Int,
+    data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
+) {
+    try {
+        val total = data["demand"]?.size ?: 0
+        val progressCb: (Map<String, Any?>) -> Unit = { p ->
+            planJobs[jobId]?.let { job ->
+                if (job["status"] == "running") {
+                    job["progress"] = mapOf("current" to (p["current"] ?: 0), "total" to total)
+                }
+            }
+        }
+        val result = runPlanning(data, config = config, progressCallback = progressCb)
+        val enriched = enrichPlanResultWithData(caseId, result, data)
+        casePlanResults[caseId] = enriched
+        planJobs[jobId]?.let { job ->
+            job["status"] = "completed"
+            job["result"] = enriched
+            job["progress"] = mapOf("current" to total, "total" to total)
+        }
+    } catch (e: Exception) {
+        log.error("Plan job $jobId failed: ${e.message}", e)
+        planJobs[jobId]?.let { job ->
+            job["status"] = "failed"
+            job["error"] = e.message ?: "Unknown error"
+        }
+    }
+}
+
+// ── Background allocation worker ───────────────────────────────────────────────
+
+private const val BATCH_SIZE = 2000
+
+private suspend fun runAllocationBackground(caseId: Int, runId: Int) {
+    try {
+        val data = transaction { CaseLoader.load(caseId) }
+        if (data["demand"].isNullOrEmpty() || data["supply"].isNullOrEmpty()) {
+            markRunFailed(runId, caseId, "No demand or supply data")
+            return
+        }
+
+        val progressCallback: (Map<String, Any>) -> Unit = { progress ->
+            try {
+                transaction {
+                    val runRow = AllocationRuns.selectAll().where {
+                        (AllocationRuns.id eq runId) and (AllocationRuns.caseId eq caseId)
+                    }.singleOrNull() ?: return@transaction
+
+                    if (runRow[AllocationRuns.status] != "running") return@transaction
+
+                    val configObj = runRow[AllocationRuns.config]
+                        ?.let { runCatching { Json.parseToJsonElement(it).jsonObject.toMutableMap() }.getOrElse { mutableMapOf() } }
+                        ?: mutableMapOf()
+
+                    // Update progress sub-object (exclude slice/prune keys)
+                    val progressMap = progress.filterKeys { it !in setOf("allocation_slice", "prune_after_step", "prune_components") }
+                        .mapValues { Json.encodeToJsonElement(it.value.toString()) }
+                    configObj["progress"] = JsonObject(progressMap)
+
+                    // Accumulate prune events
+                    if ("prune_after_step" in progress && "prune_components" in progress) {
+                        val existing = (configObj["prunes"] as? JsonArray)?.toMutableList() ?: mutableListOf()
+                        existing.add(buildJsonObject {
+                            put("after_step", progress["prune_after_step"].toString())
+                            put("comp_keys", buildJsonArray { (progress["prune_components"] as? List<*>)?.forEach { add(it.toString()) } })
+                        })
+                        configObj["prunes"] = JsonArray(existing)
+                    }
+
+                    AllocationRuns.update({ AllocationRuns.id eq runId }) {
+                        it[config] = JsonObject(configObj).toString()
+                    }
+
+                    // Persist incremental slice
+                    @Suppress("UNCHECKED_CAST")
+                    val slice = progress["allocation_slice"] as? List<Map<String, Any?>>
+                    if (!slice.isNullOrEmpty()) {
+                        AllocationActions.batchInsert(slice) { a ->
+                            this[AllocationActions.runId] = runId
+                            this[AllocationActions.variantKey] = a["variant_key"] as? String ?: ""
+                            this[AllocationActions.reqComponentIds] = buildJsonArray {
+                                (a["req_component_ids"] as? List<*>)?.forEach { add(it.toString()) }
+                            }.toString()
+                            this[AllocationActions.reqRates] = (a["req_rates"] as? List<*>)?.let { rates ->
+                                "[${rates.joinToString(",") { it.toString() }}]"
+                            }
+                            this[AllocationActions.qty] = (a["qty"] as? Number)?.toDouble() ?: 0.0
+                            this[AllocationActions.demandId] = a["demand_id"] as? String
+                            this[AllocationActions.targetProductId] = a["target_product_id"] as? String
+                            this[AllocationActions.targetLocationId] = a["target_location_id"] as? String
+                            this[AllocationActions.outputPeriod] = (a["output_period"] as? Int)
+                            this[AllocationActions.edgeType] = a["edge_type"] as? String
+                            this[AllocationActions.scarcityRank] = a["scarcity_rank"] as? Int
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                log.warn("Progress callback error: ${e.message}")
+            }
+        }
+
+        val result = runAllocation(
+            data = data,
+            progressCallback = progressCallback,
+        )
+
+        val allocationList = result.allocation
+        if (allocationList.isEmpty()) {
+            markRunFailed(runId, caseId, "Allocation returned no actions")
+            return
+        }
+
+        transaction {
+            // Clear any incremental slices written during progress
+            AllocationActions.deleteWhere { AllocationActions.runId eq runId }
+
+            // Batch insert all final actions
+            for (i in allocationList.indices step BATCH_SIZE) {
+                val batch = allocationList.subList(i, minOf(i + BATCH_SIZE, allocationList.size))
+                AllocationActions.batchInsert(batch) { a ->
+                    this[AllocationActions.runId] = runId
+                    this[AllocationActions.variantKey] = a["variant_key"] as? String ?: ""
+                    this[AllocationActions.reqComponentIds] = buildJsonArray {
+                        (a["req_component_ids"] as? List<*>)?.forEach { add(it.toString()) }
+                    }.toString()
+                    this[AllocationActions.reqRates] = (a["req_rates"] as? List<*>)?.let { rates ->
+                        "[${rates.joinToString(",") { it.toString() }}]"
+                    }
+                    this[AllocationActions.qty] = (a["qty"] as? Number)?.toDouble() ?: 0.0
+                    this[AllocationActions.demandId] = a["demand_id"] as? String
+                    this[AllocationActions.targetProductId] = a["target_product_id"] as? String
+                    this[AllocationActions.targetLocationId] = a["target_location_id"] as? String
+                    this[AllocationActions.outputPeriod] = a["output_period"] as? Int
+                    this[AllocationActions.edgeType] = a["edge_type"] as? String
+                    this[AllocationActions.scarcityRank] = a["scarcity_rank"] as? Int
+                }
+            }
+
+            // Update run to success with metadata
+            val runRow = AllocationRuns.selectAll().where { AllocationRuns.id eq runId }.singleOrNull()
+            val configObj = runRow?.get(AllocationRuns.config)
+                ?.let { runCatching { Json.parseToJsonElement(it).jsonObject.toMutableMap() }.getOrElse { mutableMapOf() } }
+                ?: mutableMapOf()
+            configObj["raw_material_trace"] = Json.encodeToJsonElement(result.rawMaterialTrace.toString())
+            configObj["consumed_by_node"] = Json.encodeToJsonElement(result.consumedByNode.toString())
+            AllocationRuns.update({ AllocationRuns.id eq runId }) {
+                it[status] = "success"
+                it[config] = JsonObject(configObj).toString()
+            }
+        }
+        log.info("Allocation run $runId completed: ${allocationList.size} actions")
+
+    } catch (e: Exception) {
+        log.error("Allocation run $runId failed: ${e.message}", e)
+        markRunFailed(runId, caseId, e.message ?: "Unknown error")
+    }
+}
+
+private fun markRunFailed(runId: Int, caseId: Int, error: String) {
+    try {
+        transaction {
+            AllocationRuns.update({ (AllocationRuns.id eq runId) and (AllocationRuns.caseId eq caseId) }) {
+                it[status] = "failed"
+                it[config] = """{"error": "${error.replace("\"", "'")}"}"""
+            }
+        }
+    } catch (e: Exception) {
+        log.error("Failed to mark run $runId as failed: ${e.message}")
+    }
+}
+
+/** Resolve bom.csv path — walks up from working directory. */
+private fun resolveBomCsv() = run {
+    val base = Paths.get("").toAbsolutePath()
+    val candidates = listOf(
+        base.resolve("csv/bom.csv"),
+        base.parent?.resolve("csv/bom.csv"),
+        base.parent?.parent?.resolve("csv/bom.csv"),
+    )
+    candidates.firstOrNull { it != null && it.toFile().exists() } ?: base.resolve("csv/bom.csv")
+}
+
+// Re-use the timestamp formatter from Cases.kt
+private fun formatTs(ts: kotlinx.datetime.Instant): String {
+    val ISO = java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME.withZone(java.time.ZoneOffset.UTC)
+    return ISO.format(ts.toJavaInstant())
+}

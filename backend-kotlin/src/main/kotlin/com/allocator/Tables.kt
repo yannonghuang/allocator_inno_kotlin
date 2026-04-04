@@ -1,0 +1,168 @@
+package com.allocator
+
+import org.jetbrains.exposed.sql.ReferenceOption
+import org.jetbrains.exposed.sql.Table
+import org.jetbrains.exposed.sql.kotlin.datetime.CurrentTimestamp
+import org.jetbrains.exposed.sql.kotlin.datetime.timestamp
+
+/**
+ * Exposed table definitions — 1:1 port of SQLAlchemy models in models.py.
+ * All domain tables carry a case_id FK with CASCADE delete (multi-tenancy).
+ */
+
+object Cases : Table("cases") {
+    val id = integer("id").autoIncrement()
+    val name = varchar("name", 255)
+    val createdAt = timestamp("created_at").defaultExpression(CurrentTimestamp)
+    override val primaryKey = PrimaryKey(id)
+}
+
+object Boms : Table("bom") {
+    val id = integer("id").autoIncrement()
+    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val bomId = varchar("bom_id", 255)
+    val parentId = varchar("parent_id", 255)
+    val childId = varchar("child_id", 255)
+    val elemIx = integer("elem_ix").nullable()
+    val altGroup = varchar("alt_group", 255).nullable()
+    val rate = double("rate").nullable()
+    override val primaryKey = PrimaryKey(id)
+}
+
+object Customers : Table("customer") {
+    val id = integer("id").autoIncrement()
+    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val customer = varchar("customer", 255)
+    val description = varchar("description", 512).nullable()
+    override val primaryKey = PrimaryKey(id)
+}
+
+object Locations : Table("location") {
+    val id = integer("id").autoIncrement()
+    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val locationId = varchar("location_id", 255)
+    val locationDescription = varchar("location_description", 512).nullable()
+    override val primaryKey = PrimaryKey(id)
+}
+
+object Products : Table("product") {
+    val id = integer("id").autoIncrement()
+    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val productId = varchar("product_id", 255)
+    val description = varchar("description", 512).nullable()
+    override val primaryKey = PrimaryKey(id)
+}
+
+object Vendors : Table("vendor") {
+    val id = integer("id").autoIncrement()
+    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val vendorId = varchar("vendor_id", 255)
+    override val primaryKey = PrimaryKey(id)
+}
+
+object Demands : Table("demand") {
+    val id = integer("id").autoIncrement()
+    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val demandId = varchar("demand_id", 255)
+    val description = varchar("description", 512).nullable()
+    val customerId = varchar("customer_id", 255)
+    val priority = integer("priority").nullable()
+    val requestDueTime = varchar("request_due_time", 64).nullable()
+    val productId = varchar("product_id", 255)
+    val locationId = varchar("location_id", 255).nullable()
+    val quantity = double("quantity")
+    override val primaryKey = PrimaryKey(id)
+}
+
+object MethodBuys : Table("method_buy") {
+    val id = integer("id").autoIncrement()
+    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val productId = varchar("product_id", 255)
+    val locationId = varchar("location_id", 255)
+    val preference = integer("preference").nullable()
+    val leadDaysSupply = integer("lead_days_supply").nullable()
+    val cycleDaysSupply = integer("cycle_days_supply").nullable()
+    val vendorId = varchar("vendor_id", 255).nullable()
+    override val primaryKey = PrimaryKey(id)
+}
+
+object MethodMakes : Table("method_make") {
+    val id = integer("id").autoIncrement()
+    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val bomId = varchar("bom_id", 255)
+    val productId = varchar("product_id", 255)
+    val locationId = varchar("location_id", 255)
+    val preference = integer("preference").nullable()
+    val leadTime = integer("lead_time").nullable()
+    override val primaryKey = PrimaryKey(id)
+}
+
+object ProductLocations : Table("productlocation") {
+    val id = integer("id").autoIncrement()
+    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val productId = varchar("product_id", 255)
+    val description = varchar("description", 512).nullable()
+    val locationId = varchar("location_id", 255)
+    val maxLotSize = double("max_lot_size").nullable()
+    val prodArea = varchar("prod_area", 255).nullable()
+    override val primaryKey = PrimaryKey(id)
+}
+
+object Supplies : Table("supply") {
+    val id = integer("id").autoIncrement()
+    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val supplyId = varchar("supply_id", 255)
+    val description = varchar("description", 512).nullable()
+    val vendorId = varchar("vendor_id", 255).nullable()
+    val locationId = varchar("location_id", 255).nullable()
+    val productId = varchar("product_id", 255)
+    val supplyDate = varchar("supply_date", 64).nullable()
+    val qty = double("qty")
+    override val primaryKey = PrimaryKey(id)
+}
+
+object MethodMoves : Table("method_move") {
+    val id = integer("id").autoIncrement()
+    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val productId = varchar("product_id", 255)
+    val fromLocationId = varchar("from_location_id", 255)
+    val toLocationId = varchar("to_location_id", 255)
+    val transitTime = double("transit_time").nullable()
+    val transitTimeUom = varchar("transit_time_uom", 32).nullable()
+    val preference = integer("preference").nullable()
+    override val primaryKey = PrimaryKey(id)
+}
+
+object AllocationRuns : Table("allocation_run") {
+    val id = integer("id").autoIncrement()
+    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val createdAt = timestamp("created_at").defaultExpression(CurrentTimestamp)
+    val status = varchar("status", 64)      // "running" | "success" | "failed"
+    val config = text("config").nullable()  // JSON blob (kotlinx-serialization)
+    override val primaryKey = PrimaryKey(id)
+}
+
+object AllocationActions : Table("allocation_action") {
+    val id = integer("id").autoIncrement()
+    val runId = integer("run_id").references(AllocationRuns.id, onDelete = ReferenceOption.CASCADE)
+    val variantKey = varchar("variant_key", 512)
+    val reqComponentIds = text("req_component_ids")  // JSON array
+    val reqRates = text("req_rates").nullable()       // JSON array
+    val qty = double("qty")
+    val demandId = varchar("demand_id", 255).nullable()
+    val targetProductId = varchar("target_product_id", 255).nullable()
+    val targetLocationId = varchar("target_location_id", 255).nullable()
+    val outputPeriod = integer("output_period").nullable()
+    val edgeType = varchar("edge_type", 32).nullable()  // "make" | "move"
+    val scarcityRank = integer("scarcity_rank").nullable()
+    override val primaryKey = PrimaryKey(id)
+}
+
+object ManualOverrides : Table("manual_override") {
+    val id = integer("id").autoIncrement()
+    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val entityType = varchar("entity_type", 64)   // "supply" | "demand" | "allocation"
+    val entityKey = varchar("entity_key", 512)
+    val payload = text("payload")                 // JSON blob
+    override val primaryKey = PrimaryKey(id)
+}

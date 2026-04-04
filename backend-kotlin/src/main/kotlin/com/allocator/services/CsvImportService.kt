@@ -1,0 +1,204 @@
+package com.allocator.services
+
+import com.allocator.*
+import com.opencsv.CSVReaderHeaderAware
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.batchInsert
+import org.jetbrains.exposed.sql.deleteWhere
+import org.jetbrains.exposed.sql.transactions.transaction
+import org.slf4j.LoggerFactory
+import java.io.FileReader
+import java.nio.file.Path
+
+private val log = LoggerFactory.getLogger("com.allocator.CsvImportService")
+
+/**
+ * Parses 11 CSV tables and bulk-inserts them for a given case_id.
+ * Port of services/csv_import.py — column names are the same uppercase header names from the CSV files.
+ */
+object CsvImportService {
+
+    fun importFromFolder(caseId: Int, folder: Path) {
+        val tables = listOf(
+            "bom.csv" to ::importBom,
+            "customer.csv" to ::importCustomer,
+            "location.csv" to ::importLocation,
+            "product.csv" to ::importProduct,
+            "vendor.csv" to ::importVendor,
+            "demand.csv" to ::importDemand,
+            "method_buy.csv" to ::importMethodBuy,
+            "method_make.csv" to ::importMethodMake,
+            "productlocation.csv" to ::importProductLocation,
+            "supply.csv" to ::importSupply,
+            "method_move.csv" to ::importMethodMove,
+        )
+        transaction {
+            for ((filename, importer) in tables) {
+                val file = folder.resolve(filename).toFile()
+                if (!file.exists()) {
+                    log.warn("CSV not found, skipping: $file")
+                    continue
+                }
+                log.info("Importing $filename for case $caseId...")
+                val rows = readCsv(file.absolutePath)
+                importer(caseId, rows)
+            }
+        }
+        log.info("CSV import complete for case $caseId.")
+    }
+
+    private fun readCsv(path: String): List<Map<String, String>> {
+        val results = mutableListOf<Map<String, String>>()
+        CSVReaderHeaderAware(FileReader(path)).use { reader ->
+            var row: Map<String, String>?
+            while (reader.readMap().also { row = it } != null) {
+                results.add(row!!)
+            }
+        }
+        return results
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private fun String?.toDoubleOrNullSafe(): Double? {
+        if (this.isNullOrBlank() || this.uppercase() == "NULL") return null
+        return this.toDoubleOrNull()
+    }
+
+    private fun String?.toIntOrNullSafe(): Int? {
+        if (this.isNullOrBlank() || this.uppercase() == "NULL") return null
+        return this.toDoubleOrNull()?.toInt()
+    }
+
+    // ── Per-table importers ───────────────────────────────────────────────────
+
+    private fun importBom(caseId: Int, rows: List<Map<String, String>>) {
+        Boms.deleteWhere { Boms.caseId eq caseId }
+        Boms.batchInsert(rows) { r ->
+            this[Boms.caseId] = caseId
+            this[Boms.bomId] = r["BOM_ID"] ?: ""
+            this[Boms.parentId] = r["PARENT_ID"] ?: ""
+            this[Boms.childId] = r["CHILD_ID"] ?: ""
+            this[Boms.elemIx] = r["ELEM_IX"].toIntOrNullSafe()
+            this[Boms.altGroup] = r["ALT_GROUP"]?.takeIf { it.isNotBlank() }
+            this[Boms.rate] = r["RATE"].toDoubleOrNullSafe()
+        }
+    }
+
+    private fun importCustomer(caseId: Int, rows: List<Map<String, String>>) {
+        Customers.deleteWhere { Customers.caseId eq caseId }
+        Customers.batchInsert(rows) { r ->
+            this[Customers.caseId] = caseId
+            this[Customers.customer] = r["CUSTOMER"] ?: ""
+            this[Customers.description] = r["DESCRIPTION"]?.takeIf { it.isNotBlank() }
+        }
+    }
+
+    private fun importLocation(caseId: Int, rows: List<Map<String, String>>) {
+        Locations.deleteWhere { Locations.caseId eq caseId }
+        Locations.batchInsert(rows) { r ->
+            this[Locations.caseId] = caseId
+            this[Locations.locationId] = r["LOCATION_ID"] ?: ""
+            this[Locations.locationDescription] = r["LOCATION_DESCRIPTION"]?.takeIf { it.isNotBlank() }
+        }
+    }
+
+    private fun importProduct(caseId: Int, rows: List<Map<String, String>>) {
+        Products.deleteWhere { Products.caseId eq caseId }
+        Products.batchInsert(rows) { r ->
+            this[Products.caseId] = caseId
+            this[Products.productId] = r["PRODUCT_ID"] ?: ""
+            this[Products.description] = r["DESCRIPTION"]?.takeIf { it.isNotBlank() }
+        }
+    }
+
+    private fun importVendor(caseId: Int, rows: List<Map<String, String>>) {
+        Vendors.deleteWhere { Vendors.caseId eq caseId }
+        Vendors.batchInsert(rows) { r ->
+            this[Vendors.caseId] = caseId
+            this[Vendors.vendorId] = r["VENDOR_ID"] ?: ""
+        }
+    }
+
+    private fun importDemand(caseId: Int, rows: List<Map<String, String>>) {
+        Demands.deleteWhere { Demands.caseId eq caseId }
+        Demands.batchInsert(rows) { r ->
+            this[Demands.caseId] = caseId
+            this[Demands.demandId] = r["ID"] ?: ""
+            this[Demands.description] = r["DESCRIPTION"]?.takeIf { it.isNotBlank() }
+            this[Demands.customerId] = r["CUSTOMER_ID"] ?: ""
+            this[Demands.priority] = r["PRIORITY"].toIntOrNullSafe()
+            this[Demands.requestDueTime] = r["REQUEST_DUE_TIME"]?.takeIf { it.isNotBlank() }
+            this[Demands.productId] = r["PRODUCT_ID"] ?: ""
+            // LOCATION or LOCATION_ID; fall back to "VIRTUAL"
+            this[Demands.locationId] = (r["LOCATION"] ?: r["LOCATION_ID"])
+                ?.takeIf { it.isNotBlank() } ?: "VIRTUAL"
+            this[Demands.quantity] = r["QUANTITY"].toDoubleOrNullSafe() ?: 0.0
+        }
+    }
+
+    private fun importMethodBuy(caseId: Int, rows: List<Map<String, String>>) {
+        MethodBuys.deleteWhere { MethodBuys.caseId eq caseId }
+        MethodBuys.batchInsert(rows) { r ->
+            this[MethodBuys.caseId] = caseId
+            this[MethodBuys.productId] = r["PRODUCT_ID"] ?: ""
+            this[MethodBuys.locationId] = r["LOCATION_ID"] ?: ""
+            this[MethodBuys.preference] = r["PREFERENCE"].toIntOrNullSafe()
+            this[MethodBuys.leadDaysSupply] = r["LEAD_DAYS_SUPPLY"].toIntOrNullSafe()
+            this[MethodBuys.cycleDaysSupply] = r["CYCLE_DAYS_SUPPLY"].toIntOrNullSafe()
+            this[MethodBuys.vendorId] = r["VENDOR_ID"]?.takeIf { it.isNotBlank() }
+        }
+    }
+
+    private fun importMethodMake(caseId: Int, rows: List<Map<String, String>>) {
+        MethodMakes.deleteWhere { MethodMakes.caseId eq caseId }
+        MethodMakes.batchInsert(rows) { r ->
+            this[MethodMakes.caseId] = caseId
+            this[MethodMakes.bomId] = r["BOM_ID"] ?: ""
+            this[MethodMakes.productId] = r["PRODUCT_ID"] ?: ""
+            this[MethodMakes.locationId] = r["LOCATION_ID"] ?: ""
+            this[MethodMakes.preference] = r["PREFERENCE"].toIntOrNullSafe()
+            this[MethodMakes.leadTime] = r["LEAD_TIME"].toIntOrNullSafe()
+        }
+    }
+
+    private fun importProductLocation(caseId: Int, rows: List<Map<String, String>>) {
+        ProductLocations.deleteWhere { ProductLocations.caseId eq caseId }
+        ProductLocations.batchInsert(rows) { r ->
+            this[ProductLocations.caseId] = caseId
+            this[ProductLocations.productId] = r["PRODUCT_ID"] ?: ""
+            this[ProductLocations.description] = r["DESCRIPTION"]?.takeIf { it.isNotBlank() }
+            this[ProductLocations.locationId] = r["LOCATION_ID"] ?: ""
+            this[ProductLocations.maxLotSize] = r["MAX_LOT_SIZE"].toDoubleOrNullSafe()
+            this[ProductLocations.prodArea] = r["PROD_AREA"]?.takeIf { it.isNotBlank() }
+        }
+    }
+
+    private fun importSupply(caseId: Int, rows: List<Map<String, String>>) {
+        Supplies.deleteWhere { Supplies.caseId eq caseId }
+        Supplies.batchInsert(rows) { r ->
+            this[Supplies.caseId] = caseId
+            this[Supplies.supplyId] = r["SUPPLY_ID"] ?: ""
+            this[Supplies.description] = r["DESCRIPTION"]?.takeIf { it.isNotBlank() }
+            this[Supplies.vendorId] = r["VENDOR_ID"]?.takeIf { it.isNotBlank() }
+            this[Supplies.locationId] = r["LOCATION_ID"]?.takeIf { it.isNotBlank() }
+            this[Supplies.productId] = r["PRODUCT_ID"] ?: ""
+            this[Supplies.supplyDate] = r["SUPPLY_DATE"]?.takeIf { it.isNotBlank() }
+            // Handle scientific notation in qty (e.g. "1e+06")
+            this[Supplies.qty] = r["QTY"].toDoubleOrNullSafe() ?: 0.0
+        }
+    }
+
+    private fun importMethodMove(caseId: Int, rows: List<Map<String, String>>) {
+        MethodMoves.deleteWhere { MethodMoves.caseId eq caseId }
+        MethodMoves.batchInsert(rows) { r ->
+            this[MethodMoves.caseId] = caseId
+            this[MethodMoves.productId] = r["PRODUCT_ID"] ?: ""
+            this[MethodMoves.fromLocationId] = r["FROM_LOCATION_ID"] ?: ""
+            this[MethodMoves.toLocationId] = r["TO_LOCATION_ID"] ?: ""
+            this[MethodMoves.transitTime] = r["TRANSIT_TIME"].toDoubleOrNullSafe()
+            this[MethodMoves.transitTimeUom] = r["TRANSIT_TIME_UOM"]?.takeIf { it.isNotBlank() }
+            this[MethodMoves.preference] = r["PREFERENCE"].toIntOrNullSafe()
+        }
+    }
+}

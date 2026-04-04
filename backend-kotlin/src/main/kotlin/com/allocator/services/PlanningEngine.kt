@@ -1,0 +1,957 @@
+package com.allocator.services
+
+import com.allocator.config
+import org.slf4j.LoggerFactory
+import java.nio.file.Paths
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+
+private val log = LoggerFactory.getLogger("com.allocator.PlanningEngine")
+
+/** Port of services/planning_engine.py — demand-to-supply planning with pegging tree. */
+
+private const val MAX_PLAN_DEPTH = 500
+private val DATE_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd")
+private val DEFAULT_SCORE_WEIGHTS = Triple(0.4, 0.35, 0.25)
+private val BENIGN_REASONS = setOf("cycle_stopped", "cycle_detected")
+private val LATE_DATE = LocalDate.of(9999, 12, 31)
+
+// ── BOM real-pair cache ────────────────────────────────────────────────────────
+
+/** Loads (parent_id, child_id) pairs where VIRTUAL <> 'Y' from bom.csv. */
+private fun loadRealBomPairsFromCsv(): Set<Pair<String, String>> {
+    val candidates = listOf(
+        Paths.get("").toAbsolutePath().resolve("csv/bom.csv"),
+        Paths.get("").toAbsolutePath().parent?.resolve("csv/bom.csv"),
+        Paths.get("").toAbsolutePath().parent?.parent?.resolve("csv/bom.csv"),
+    )
+    val csvFile = candidates.firstOrNull { it != null && it.toFile().exists() }?.toFile() ?: return emptySet()
+    val pairs = mutableSetOf<Pair<String, String>>()
+    try {
+        val lines = csvFile.readLines()
+        if (lines.isEmpty()) return emptySet()
+        val headers = lines[0].split(",").map { it.trim().uppercase() }
+        val parentIdx = headers.indexOf("PARENT_ID")
+        val childIdx = headers.indexOf("CHILD_ID")
+        val virtualIdx = headers.indexOf("VIRTUAL")
+        if (parentIdx < 0 || childIdx < 0) return emptySet()
+        for (line in lines.drop(1)) {
+            val cols = line.split(",")
+            val parent = cols.getOrElse(parentIdx) { "" }.trim()
+            val child = cols.getOrElse(childIdx) { "" }.trim()
+            if (parent.isBlank() || child.isBlank()) continue
+            if (virtualIdx >= 0 && cols.getOrElse(virtualIdx) { "" }.trim().uppercase() == "Y") continue
+            pairs.add(Pair(parent, child))
+        }
+    } catch (e: Exception) {
+        log.warn("Could not read bom.csv for real BOM pairs: ${e.message}")
+    }
+    return pairs
+}
+
+// Loaded once at startup
+val REAL_BOM_PAIRS: Set<Pair<String, String>> by lazy { loadRealBomPairsFromCsv() }
+
+// ── Date helpers ───────────────────────────────────────────────────────────────
+
+private fun parseDate(s: String?): LocalDate? {
+    if (s.isNullOrBlank()) return null
+    val raw = s.trim().take(10)
+    if (raw.length < 10) return null
+    return try { LocalDate.parse(raw, DATE_FMT) } catch (e: Exception) { null }
+}
+
+private fun dateAddDays(d: LocalDate?, days: Double): LocalDate? =
+    if (d == null) null else d.plusDays(days.toLong())
+
+private fun formatDate(d: LocalDate?): String? = d?.format(DATE_FMT)
+
+// ── Inventory helpers ──────────────────────────────────────────────────────────
+
+/** FIFO consumption from mutable inventory. Returns (taken, commitTime). */
+private fun consumeFromInventory(
+    inventory: MutableList<MutableMap<String, Any?>>,
+    productId: String,
+    locationId: String,
+    need: Double,
+): Pair<Double, String?> {
+    val pid = productId.trim()
+    val lid = locationId.trim()
+    val buckets = inventory.filter {
+        it["product_id"]?.toString()?.trim() == pid &&
+        it["location_id"]?.toString()?.trim() == lid &&
+        (it["qty"] as? Number)?.toDouble() ?: 0.0 > 0
+    }.sortedWith(compareBy(
+        { parseDate(it["supply_date"] as? String) ?: LocalDate.MIN },
+        { it["supply_id"]?.toString() ?: "" }
+    ))
+    var taken = 0.0
+    var commitTime: String? = null
+    for (b in buckets) {
+        if (taken >= need) break
+        val avail = (b["qty"] as? Number)?.toDouble() ?: 0.0
+        if (avail <= 0) continue
+        val take = min(avail, need - taken)
+        b["qty"] = avail - take
+        taken += take
+        if (commitTime == null && take > 0) {
+            val sd = b["supply_date"] as? String
+            commitTime = if (sd != null) formatDate(parseDate(sd)) else null
+        }
+    }
+    return Pair(taken, commitTime)
+}
+
+private fun copyInventory(inventory: List<Map<String, Any?>>): MutableList<MutableMap<String, Any?>> =
+    inventory.map { b ->
+        mutableMapOf(
+            "product_id" to (b["product_id"] ?: ""),
+            "location_id" to (b["location_id"] ?: ""),
+            "supply_date" to b["supply_date"],
+            "supply_id" to b["supply_id"],
+            "qty" to ((b["qty"] as? Number)?.toDouble() ?: 0.0),
+        )
+    }.toMutableList()
+
+// ── BOM / variant helpers ──────────────────────────────────────────────────────
+
+/**
+ * Group BOM rows for (product_id, bom_id) by alt_group.
+ * Returns list of (altKey, childMaterials). Falls back to any BOM rows matching parent if bom_id not found.
+ */
+private fun variantsForMake(
+    productId: String,
+    locationId: String,
+    quantity: Double,
+    method: Map<String, Any?>,
+    data: Map<String, List<Map<String, Any?>>>,
+): List<Pair<String, List<Map<String, Any?>>>> {
+    val bomId = (method["bom_id"] as? String)?.trim() ?: return emptyList()
+    if (bomId.isBlank()) return emptyList()
+    val pid = productId.trim()
+    val bomList = data["bom"] ?: emptyList()
+
+    fun buildVariants(rows: List<Map<String, Any?>>): List<Pair<String, List<Map<String, Any?>>>> {
+        val byAlt = mutableMapOf<String, MutableList<Map<String, Any?>>>()
+        for (b in rows) {
+            val rate = (b["rate"] as? Number)?.toDouble() ?: 1.0
+            if (rate <= 0) continue
+            val ag = b["alt_group"]
+            val altKey = if (ag != null && ag.toString().trim().isNotBlank()) ag.toString().trim() else "__null__"
+            val childQty = quantity * rate
+            byAlt.getOrPut(altKey) { mutableListOf() }.add(
+                mapOf("product_id" to (b["child_id"] ?: ""), "location_id" to locationId, "quantity" to childQty)
+            )
+        }
+        return byAlt.map { (k, v) -> Pair(k, v.toList()) }
+    }
+
+    // Primary: match bom_id + parent_id
+    val primary = bomList.filter {
+        (it["parent_id"] as? String)?.trim() == pid && (it["bom_id"] as? String)?.trim() == bomId
+    }
+    if (primary.isNotEmpty()) return buildVariants(primary)
+
+    // Fallback: match parent_id only
+    val fallback = bomList.filter { (it["parent_id"] as? String)?.trim() == pid }
+    if (fallback.isNotEmpty()) {
+        log.debug("variantsForMake: no BOM rows for bom_id={} parent={}; using fallback", bomId, pid)
+        return buildVariants(fallback)
+    }
+    return emptyList()
+}
+
+private fun scaleChildMaterials(children: List<Map<String, Any?>>, scale: Double): List<Map<String, Any?>> {
+    if (abs(scale - 1.0) < 1e-12) return children
+    return children.map { c -> c + mapOf("quantity" to ((c["quantity"] as? Number)?.toDouble() ?: 0.0) * scale) }
+}
+
+private fun childMaterialsForMove(method: Map<String, Any?>, quantity: Double): List<Map<String, Any?>> =
+    listOf(mapOf(
+        "product_id" to (method["product_id"] ?: ""),
+        "location_id" to (method["from_location_id"] ?: ""),
+        "quantity" to quantity,
+    ))
+
+// ── Method selection ───────────────────────────────────────────────────────────
+
+/** Return all methods (buy/make/move) that can fulfill (product, location). */
+fun getMethods(productId: String, locationId: String, data: Map<String, List<Map<String, Any?>>>): List<Map<String, Any?>> {
+    val pid = productId.trim()
+    val loc = locationId.trim()
+    val virtualFallback = loc in setOf("", "VIRTUAL")
+    val result = mutableListOf<Map<String, Any?>>()
+
+    (data["method_buy"] ?: emptyList()).forEach { m ->
+        if ((m["product_id"] as? String)?.trim() == pid) {
+            val mLoc = (m["location_id"] as? String)?.trim() ?: ""
+            if (mLoc == loc || virtualFallback) result.add(mapOf("type" to "purchase") + m)
+        }
+    }
+    (data["method_make"] ?: emptyList()).forEach { m ->
+        if ((m["product_id"] as? String)?.trim() == pid) {
+            val mLoc = (m["location_id"] as? String)?.trim() ?: ""
+            if (mLoc == loc || virtualFallback) result.add(mapOf("type" to "make") + m)
+        }
+    }
+    (data["method_move"] ?: emptyList()).forEach { m ->
+        if ((m["product_id"] as? String)?.trim() == pid &&
+            (m["to_location_id"] as? String)?.trim() == loc) {
+            result.add(mapOf("type" to "move") + m)
+        }
+    }
+    return result
+}
+
+/** Pick best method by preference (lowest number). */
+private fun getPreferredMethod(methods: List<Map<String, Any?>>): Pair<Map<String, Any?>?, String> {
+    if (methods.isEmpty()) return Pair(null, "No methods available.")
+    val chosen = methods.minBy { (it["preference"] as? Number)?.toInt() ?: 0 }
+    val pref = (chosen["preference"] as? Number)?.toInt() ?: 0
+    val loc = (chosen["location_id"] ?: chosen["to_location_id"] ?: "").toString()
+    if (methods.size <= 1) return Pair(chosen, "Only option: ${chosen["type"]} @ $loc (preference $pref).")
+    val alternatives = methods.filter { it !== chosen }
+        .joinToString("; ") { m -> "${m["type"]} @ ${m["location_id"] ?: m["to_location_id"] ?: ""} (preference ${(m["preference"] as? Number)?.toInt() ?: 0})" }
+    return Pair(chosen, "Chosen: ${chosen["type"]} @ $loc (preference $pref). Alternatives: $alternatives.")
+}
+
+/** Normalize score weights to (commit_time, inventory_consumed, purchase) summing to 1. */
+private fun normalizeScoreWeights(weights: Map<String, Any?>?): Triple<Double, Double, Double> {
+    if (weights == null) return DEFAULT_SCORE_WEIGHTS
+    val wC = (weights["commit_time"] as? Number)?.toDouble() ?: 0.0
+    val wI = (weights["inventory_consumed"] as? Number)?.toDouble() ?: 0.0
+    val wP = (weights["purchase"] as? Number)?.toDouble() ?: 0.0
+    val total = wC + wI + wP
+    if (total <= 0) return DEFAULT_SCORE_WEIGHTS
+    return Triple(wC / total, wI / total, wP / total)
+}
+
+/** Score a variant by simulating planning its child components. Returns (maxCommit, consumed, purchaseQty, anyFailed). */
+private fun scoreVariant(
+    altKey: String,
+    childList: List<Map<String, Any?>>,
+    inventory: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+    reqDt: LocalDate?,
+    leadDays: Double,
+    planningPath: Set<Pair<String, String>>,
+    depth: Int,
+): Quadruple<LocalDate?, Double, Double, Boolean> {
+    val invCopy = copyInventory(inventory)
+    val beforeQty = invCopy.sumOf { (it["qty"] as? Number)?.toDouble() ?: 0.0 }
+    var maxCommit: LocalDate? = null
+    var purchaseQty = 0.0
+    var anyFailed = false
+    for (c in childList) {
+        val cReqDt = dateAddDays(reqDt, -leadDays)
+        val cDemand = mapOf(
+            "demand_id" to null,
+            "product_id" to c["product_id"],
+            "location_id" to c["location_id"],
+            "quantity" to c["quantity"],
+            "request_due_time" to formatDate(cReqDt),
+            "request_time" to formatDate(cReqDt),
+        )
+        val (solvedList, cWos, _) = plan(cDemand, invCopy, data, cReqDt, depth = depth - 1, planningPath = planningPath)
+        for (s in solvedList) {
+            if ((s["quantity"] as? Number)?.toDouble() ?: 0.0 <= 0) continue
+            val ct = s["commit_time"] as? String
+            val reason = s["commit_reason"] as? String ?: ""
+            if (ct == null || (reason.isNotBlank() && reason !in BENIGN_REASONS)) anyFailed = true
+            if (ct != null) {
+                val dt = parseDate(ct)
+                if (dt != null && (maxCommit == null || dt > maxCommit)) maxCommit = dt
+            }
+        }
+        for (wo in cWos) {
+            if (wo["method"] == "purchase") purchaseQty += (wo["quantity"] as? Number)?.toDouble() ?: 0.0
+        }
+    }
+    val afterQty = invCopy.sumOf { (it["qty"] as? Number)?.toDouble() ?: 0.0 }
+    val consumed = beforeQty - afterQty
+    if (anyFailed) maxCommit = null
+    return Quadruple(maxCommit, consumed, purchaseQty, anyFailed)
+}
+
+/** Tuple-4 helper (Kotlin lacks built-in quadruple). */
+private data class Quadruple<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
+
+/**
+ * Elaborate method selection: simulate one planning level per method, score, and pick best.
+ * Falls back to preference-only when depth < MAX_PLAN_DEPTH or only 1 method.
+ */
+private fun getPreferredMethodElaborate(
+    methods: List<Map<String, Any?>>,
+    demand: Map<String, Any?>,
+    inventory: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+    requestTimeDt: LocalDate?,
+    config: Map<String, Any?>?,
+    depth: Int,
+    planningPath: Set<Pair<String, String>>,
+): Pair<Map<String, Any?>?, String> {
+    if (methods.isEmpty()) return Pair(null, "No methods available.")
+    if (depth < MAX_PLAN_DEPTH || methods.size <= 1) return getPreferredMethod(methods)
+
+    val variantSelection = (config?.get("variant_selection") as? Map<*, *>)?.let { m ->
+        @Suppress("UNCHECKED_CAST") m as? Map<String, Any?>
+    }
+    val scoreWeights = (variantSelection?.get("score_weights") as? Map<*, *>)?.let { m ->
+        @Suppress("UNCHECKED_CAST") m as? Map<String, Any?>
+    }
+    val (wCommit, wInv, wPurchase) = normalizeScoreWeights(scoreWeights)
+    val productId = demand["product_id"] as? String ?: ""
+    val locationId = demand["location_id"] as? String ?: ""
+    val quantity = (demand["quantity"] as? Number)?.toDouble() ?: 0.0
+    val reqTimeStr = demand["request_due_time"] as? String ?: demand["request_time"] as? String
+
+    data class Scored(val score: Double, val method: Map<String, Any?>, val ts: Double, val consumed: Double, val purchase: Double, val failed: Boolean)
+
+    val scored = methods.map { m ->
+        val invCopy = copyInventory(inventory)
+        val productionLocation = (m["location_id"] ?: m["to_location_id"] ?: locationId) as? String ?: locationId
+        val reqDt = parseDate(reqTimeStr) ?: requestTimeDt
+        val leadDays = when (m["type"]) {
+            "make" -> (m["lead_time"] as? Number)?.toDouble() ?: 0.0
+            "move" -> (m["transit_time"] as? Number)?.toDouble() ?: 0.0
+            "purchase" -> (m["lead_days_supply"] as? Number)?.toDouble() ?: 0.0
+            else -> 0.0
+        }
+        val cReqDt = dateAddDays(reqDt, -leadDays)
+        var maxCommit: LocalDate? = null
+        var purchaseQty = 0.0
+        var anyFailed = false
+
+        val childMaterials = when (m["type"]) {
+            "make" -> {
+                val variants = variantsForMake(productId, productionLocation, quantity, m, data)
+                if (variants.isEmpty()) return@map Scored(-1e9, m, LATE_DATE.toEpochDay().toDouble(), 0.0, 0.0, true)
+                val (variantList, _) = getPreferredVariants(
+                    variants, invCopy, data, reqDt, leadDays, planningPath, depth - 1, quantity,
+                    multiple = false, scoreWeights = scoreWeights, topN = null
+                )
+                variantList.flatMap { (cm, _, _) -> cm }
+            }
+            "move" -> childMaterialsForMove(m, quantity)
+            else -> emptyList()
+        }
+
+        val beforeQty = invCopy.sumOf { (it["qty"] as? Number)?.toDouble() ?: 0.0 }
+        for (c in childMaterials) {
+            val cDemand = mapOf(
+                "demand_id" to null,
+                "product_id" to c["product_id"],
+                "location_id" to c["location_id"],
+                "quantity" to c["quantity"],
+                "request_due_time" to formatDate(cReqDt),
+                "request_time" to formatDate(cReqDt),
+            )
+            val (solvedList, cWos, _) = plan(cDemand, invCopy, data, cReqDt, depth = depth - 1, planningPath = planningPath, config = config)
+            for (s in solvedList) {
+                if ((s["quantity"] as? Number)?.toDouble() ?: 0.0 <= 0) continue
+                val ct = s["commit_time"] as? String
+                val reason = s["commit_reason"] as? String ?: ""
+                if (ct == null || (reason.isNotBlank() && reason !in BENIGN_REASONS)) anyFailed = true
+                if (ct != null) parseDate(ct)?.let { dt -> if (maxCommit == null || dt > maxCommit) maxCommit = dt }
+            }
+            for (wo in cWos) {
+                if (wo["method"] == "purchase") purchaseQty += (wo["quantity"] as? Number)?.toDouble() ?: 0.0
+            }
+        }
+        val afterQty = invCopy.sumOf { (it["qty"] as? Number)?.toDouble() ?: 0.0 }
+        val consumed = beforeQty - afterQty
+        if (anyFailed) maxCommit = null
+        val ts = maxCommit?.toEpochDay()?.toDouble() ?: LATE_DATE.toEpochDay().toDouble()
+        Scored(0.0, m, ts, consumed, purchaseQty, anyFailed)
+    }.toMutableList()
+
+    // Normalize scores
+    val validTs = scored.filter { !it.failed }.map { it.ts }
+    val consList = scored.map { it.consumed }
+    val purchList = scored.map { it.purchase }
+    var spanTs = if (validTs.size >= 2) validTs.max() - validTs.min() else 1.0
+    var spanC = if (consList.isNotEmpty()) consList.max() - consList.min() else 1.0
+    var spanP = if (purchList.isNotEmpty()) purchList.max() - purchList.min() else 1.0
+    if (spanTs <= 0) spanTs = 1.0
+    if (spanC <= 0) spanC = 1.0
+    if (spanP <= 0) spanP = 1.0
+    val tsMax = validTs.maxOrNull() ?: 0.0
+
+    val finalScored = scored.map { s ->
+        if (s.failed) s.copy(score = -1e9)
+        else {
+            val normCommit = max(0.0, min(1.0, (tsMax - s.ts) / spanTs))
+            val normInv = max(0.0, min(1.0, (s.consumed - consList.min()) / spanC))
+            val normP = max(0.0, min(1.0, (purchList.max() - s.purchase) / spanP))
+            s.copy(score = wCommit * normCommit + wInv * normInv + wPurchase * normP)
+        }
+    }.sortedByDescending { it.score }
+
+    val best = finalScored.first()
+    if (best.failed) return getPreferredMethod(methods)
+    val loc = (best.method["location_id"] ?: best.method["to_location_id"] ?: "").toString()
+    return Pair(best.method, "Chosen (elaborate score): ${best.method["type"]} @ $loc " +
+        "(inventory_consumed=${best.consumed.toLong()}, purchase=${best.purchase.toLong()}).")
+}
+
+// ── Variant selection ──────────────────────────────────────────────────────────
+
+/** Result item: (child_materials, alt_key, quantity). */
+typealias VariantResultItem = Triple<List<Map<String, Any?>>, String, Double>
+
+/**
+ * Score and select variants.
+ * multiple=false → single best. multiple=null → all feasible split equally. topN limits how many.
+ */
+fun getPreferredVariants(
+    variants: List<Pair<String, List<Map<String, Any?>>>>,
+    inventory: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+    reqDt: LocalDate?,
+    leadDays: Double,
+    planningPath: Set<Pair<String, String>>,
+    depth: Int,
+    demandNetQty: Double,
+    multiple: Boolean? = null,
+    scoreWeights: Map<String, Any?>? = null,
+    topN: Int? = null,
+): Pair<List<VariantResultItem>, String> {
+    if (variants.isEmpty()) return Pair(emptyList(), "No variants.")
+    if (variants.size == 1) {
+        val (altKey, childList) = variants[0]
+        return Pair(listOf(Triple(childList, altKey, demandNetQty)),
+            "Single variant (ALT_GROUP=$altKey); ${childList.size} component(s).")
+    }
+    log.info("multi-variant: {} variants alt_groups={}", variants.size, variants.map { it.first })
+
+    val (wCommit, wInv, wPurchase) = normalizeScoreWeights(scoreWeights)
+
+    data class ScoredVariant(
+        val sc: Quadruple<LocalDate?, Double, Double, Boolean>,
+        val altKey: String,
+        val childList: List<Map<String, Any?>>,
+        val failed: Boolean,
+    )
+
+    val needRanking = multiple == false || (topN != null && topN >= 1)
+    val scored = variants.map { (altKey, childList) ->
+        val sc = scoreVariant(altKey, childList, inventory, data, reqDt, leadDays, planningPath, depth)
+        ScoredVariant(sc, altKey, childList, sc.fourth)
+    }
+
+    val rankedScored = if (needRanking) {
+        val commits = scored.map { it.sc.first }
+        val consumedList = scored.map { it.sc.second }
+        val purchaseList = scored.map { it.sc.third }
+        val validTs = commits.filterNotNull().filter { it != LATE_DATE }.map { it.toEpochDay().toDouble() }
+        var spanTs = if (validTs.size >= 2) validTs.max() - validTs.min() else 1.0
+        var spanC = if (consumedList.isNotEmpty()) consumedList.max() - consumedList.min() else 1.0
+        var spanP = if (purchaseList.isNotEmpty()) purchaseList.max() - purchaseList.min() else 1.0
+        if (spanTs <= 0) spanTs = 1.0
+        if (spanC <= 0) spanC = 1.0
+        if (spanP <= 0) spanP = 1.0
+        val tsMaxVal = validTs.maxOrNull() ?: 0.0
+
+        val withScore = scored.mapIndexed { i, sv ->
+            val commitTs = commits[i]?.toEpochDay()?.toDouble() ?: LATE_DATE.toEpochDay().toDouble()
+            val consumed = consumedList[i]
+            val purchase = purchaseList[i]
+            if (sv.failed) Pair(-1e9, sv)
+            else {
+                val normCommit = if (spanTs > 0 && commitTs != LATE_DATE.toEpochDay().toDouble()) max(0.0, min(1.0, (tsMaxVal - commitTs) / spanTs)) else 1.0
+                val normInv = max(0.0, min(1.0, (consumed - consumedList.min()) / spanC))
+                val normPurchase = max(0.0, min(1.0, (purchaseList.max() - purchase) / spanP))
+                Pair(wCommit * normCommit + wInv * normInv + wPurchase * normPurchase, sv)
+            }
+        }.sortedByDescending { it.first }
+        withScore.map { it.second }
+    } else scored
+
+    if (multiple == false) {
+        val best = rankedScored.first()
+        val others = rankedScored.drop(1).map { it.altKey }
+        val (mc, negConsumed, purchase, _) = best.sc
+        return Pair(
+            listOf(Triple(best.childList, best.altKey, demandNetQty)),
+            "Chosen variant ALT_GROUP=${best.altKey} (${best.childList.size} component(s)). " +
+            "Score: commit_time=${if (mc == null || mc == LATE_DATE) "—" else mc.format(DATE_FMT)}, " +
+            "inventory_consumed=${negConsumed.toLong()}, purchase_qty=${purchase.toLong()}. " +
+            "Alternatives: ${others.joinToString(", ")}."
+        )
+    }
+
+    // multiple=null: equal split among feasible, optionally limited to topN
+    var feasible = rankedScored.filter { !it.failed }.map { Pair(it.altKey, it.childList) }
+    if (feasible.isEmpty()) feasible = listOf(Pair(rankedScored[0].altKey, rankedScored[0].childList))
+    if (topN != null && topN >= 1) feasible = feasible.take(topN)
+    val n = feasible.size
+    val demandInt = demandNetQty.toLong()
+    val useIntegerSplit = n > 0 && abs(demandNetQty - demandInt.toDouble()) < 1e-9
+    val qtyPerVariant = if (useIntegerSplit && n > 0) {
+        val base = demandInt / n
+        val remainder = (demandInt % n).toInt()
+        List(remainder) { (base + 1).toDouble() } + List(n - remainder) { base.toDouble() }
+    } else {
+        val qtyEach = if (n > 0) demandNetQty / n else demandNetQty
+        List(n) { qtyEach }
+    }
+    val result = feasible.mapIndexed { i, (altKey, childList) ->
+        val qtyI = qtyPerVariant.getOrElse(i) { if (n > 0) demandNetQty / n else demandNetQty }
+        val scale = if (demandNetQty > 1e-12) qtyI / demandNetQty else 1.0
+        Triple(scaleChildMaterials(childList, scale), altKey, qtyI)
+    }
+    val altKeys = result.map { it.second }
+    val qtyStr = if (useIntegerSplit) qtyPerVariant.joinToString(", ") { it.toLong().toString() }
+                 else qtyPerVariant.joinToString(", ") { "%.2f".format(it) }
+    val totalStr = if (useIntegerSplit) demandNetQty.toLong().toString() else "%.2f".format(demandNetQty)
+    val expl = if (topN != null && topN >= 1)
+        "Top $n variant(s) (by score): ALT_GROUP=${altKeys.joinToString(", ")}; quantities: $qtyStr (total $totalStr)."
+    else
+        "Multiple variants ($n): ALT_GROUP=${altKeys.joinToString(", ")}; quantities: $qtyStr (total $totalStr)."
+    return Pair(result, expl)
+}
+
+// ── Product location helpers ───────────────────────────────────────────────────
+
+private fun maxLotSize(productId: String, locationId: String, data: Map<String, List<Map<String, Any?>>>): Double? {
+    for (pl in data["productlocation"] ?: emptyList()) {
+        if ((pl["product_id"] as? String)?.trim() == productId && (pl["location_id"] as? String)?.trim() == locationId) {
+            val v = pl["max_lot_size"]
+            if (v != null) return try { (v as? Number)?.toDouble() ?: v.toString().toDouble() } catch (e: Exception) { null }
+        }
+    }
+    return null
+}
+
+private fun getProdArea(productId: String, locationId: String, data: Map<String, List<Map<String, Any?>>>): String? {
+    for (pl in data["productlocation"] ?: emptyList()) {
+        if ((pl["product_id"] as? String)?.trim() == productId && (pl["location_id"] as? String)?.trim() == locationId) {
+            val v = pl["prod_area"]?.toString()?.trim()
+            if (!v.isNullOrBlank()) return v
+        }
+    }
+    return null
+}
+
+// ── Core recursive planning function ──────────────────────────────────────────
+
+/**
+ * Plan one demand. Returns (committedDemands, workOrders, peggingTreeNode).
+ * Port of planning_engine.plan().
+ */
+fun plan(
+    demand: Map<String, Any?>,
+    inventory: MutableList<MutableMap<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+    requestTimeDt: LocalDate?,
+    depth: Int = MAX_PLAN_DEPTH,
+    planningPath: Set<Pair<String, String>> = emptySet(),
+    config: Map<String, Any?>? = null,
+): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
+
+    val productId = (demand["product_id"] as? String)?.trim() ?: ""
+    val locationId = (demand["location_id"] as? String)?.trim() ?: ""
+    val quantity = (demand["quantity"] as? Number)?.toDouble() ?: 0.0
+    val demandId = demand["demand_id"]
+    val reqTimeStr = demand["request_due_time"] as? String ?: demand["request_time"] as? String
+    val customerId = demand["customer_id"]
+    val customer = demand["customer"]
+
+    fun demandNode(
+        children: List<Map<String, Any?>>,
+        commitTime: String? = null,
+        commitReason: String? = null,
+    ): Map<String, Any?> = mapOf(
+        "type" to "demand",
+        "demand_id" to demandId,
+        "product_id" to productId,
+        "location_id" to locationId,
+        "quantity" to quantity,
+        "request_time" to reqTimeStr,
+        "commit_time" to commitTime,
+        "commit_reason" to commitReason,
+        "children" to children,
+    )
+
+    fun committedRow(qty: Double, commitTime: String?, commitReason: String? = null) = buildMap<String, Any?> {
+        put("demand_id", demandId)
+        put("customer_id", customerId)
+        put("customer", customer)
+        put("product_id", productId)
+        put("location_id", locationId)
+        put("quantity", qty)
+        put("request_time", reqTimeStr)
+        put("commit_time", commitTime)
+        if (commitReason != null) put("commit_reason", commitReason)
+    }
+
+    if (quantity <= 0) return Triple(emptyList(), emptyList(), null)
+
+    if (depth <= 0) {
+        return Triple(listOf(committedRow(quantity, reqTimeStr, "depth_limit")), emptyList(), demandNode(emptyList(), reqTimeStr, "depth_limit"))
+    }
+
+    val key = Pair(productId, locationId)
+    if (key in planningPath) {
+        return Triple(listOf(committedRow(quantity, reqTimeStr, "cycle_stopped")), emptyList(), demandNode(emptyList(), reqTimeStr, "cycle_stopped"))
+    }
+    val path = planningPath + key
+
+    // 1) Fulfill from inventory (FIFO)
+    val (taken, fulfillCommitTime) = consumeFromInventory(inventory, productId, locationId, quantity)
+    val demandFulfilledList = mutableListOf<Map<String, Any?>>()
+    val peggingChildren = mutableListOf<Map<String, Any?>>()
+
+    if (taken > 0) {
+        val commitForFulfilled = fulfillCommitTime ?: reqTimeStr
+        demandFulfilledList.add(committedRow(taken, commitForFulfilled))
+        peggingChildren.add(mapOf(
+            "type" to "supply",
+            "product_id" to productId,
+            "location_id" to locationId,
+            "quantity" to "%.4f".format(taken).toDouble(),
+            "commit_time" to commitForFulfilled,
+            "children" to emptyList<Any>(),
+        ))
+    }
+
+    val demandNetQty = quantity - taken
+    if (demandNetQty <= 0) {
+        return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, fulfillCommitTime))
+    }
+
+    // 2) Get methods
+    val methods = getMethods(productId, locationId, data)
+    if (methods.isEmpty()) {
+        demandFulfilledList.add(committedRow(demandNetQty, reqTimeStr, "no_methods"))
+        return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, reqTimeStr, "no_methods"))
+    }
+
+    if (methods.size > 1) {
+        log.info("multi-method: demand_id={} product_id={} location_id={} count={} types={}",
+            demandId, productId, locationId, methods.size, methods.map { it["type"] })
+    }
+
+    val methodSelection = (config?.get("method_selection") as? Map<*, *>)?.let { @Suppress("UNCHECKED_CAST") it as? Map<String, Any?> }
+    val useElaborateMethod = methodSelection?.get("elaborate") == true
+    val useMultipleMethods = methodSelection?.get("multiple") == true && methods.size > 1
+    val variantSelection = (config?.get("variant_selection") as? Map<*, *>)?.let { @Suppress("UNCHECKED_CAST") it as? Map<String, Any?> }
+    val useSingleVariant = variantSelection?.get("multiple") == false
+    @Suppress("UNCHECKED_CAST")
+    val scoreWeights = variantSelection?.get("score_weights")?.let { it as? Map<String, Any?> }
+    val topN = variantSelection?.get("top_n")?.let { (it as? Number)?.toInt()?.let { n -> max(1, n) } }
+
+    // ── Multiple methods: equal split ──────────────────────────────────────────
+    if (useMultipleMethods) {
+        val n = methods.size
+        val demandInt = demandNetQty.toLong()
+        val useIntSplit = n > 0 && abs(demandNetQty - demandInt.toDouble()) < 1e-9
+        val qtyPerMethod = if (useIntSplit) {
+            val base = demandInt / n; val rem = (demandInt % n).toInt()
+            List(rem) { (base + 1).toDouble() } + List(n - rem) { base.toDouble() }
+        } else {
+            val ea = if (n > 0) demandNetQty / n else demandNetQty; List(n) { ea }
+        }
+
+        val allWos = mutableListOf<Map<String, Any?>>()
+        val allPeggingWoNodes = mutableListOf<Map<String, Any?>>()
+        var latestCommit: LocalDate? = null
+        val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
+
+        for ((idx, m) in methods.withIndex()) {
+            val methodQty = qtyPerMethod.getOrElse(idx) { 0.0 }
+            if (methodQty <= 1e-9) continue
+            val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
+            val leadDays = leadDaysForMethod(m)
+
+            var woChildrenRelation: String? = null
+            val (childMaterials, variantExplanation) = when (m["type"]) {
+                "make" -> {
+                    val variants = variantsForMake(productId, productionLocation, methodQty, m, data)
+                    val (variantList, ve) = getPreferredVariants(variants, inventory, data, reqDt, leadDays, path, depth, methodQty,
+                        multiple = if (useSingleVariant) false else null, scoreWeights = scoreWeights, topN = topN)
+                    val cm = variantList.flatMap { (childList, _, _) -> childList }
+                    if (variantList.size > 1) {
+                        woChildrenRelation = if (variantList.all { (childList, _, _) -> childList.size == 1 }) "or" else "and"
+                    }
+                    Pair(cm, ve)
+                }
+                "move" -> Pair(childMaterialsForMove(m, methodQty), "")
+                else -> Pair(emptyList(), "")
+            }
+
+            val childWos = mutableListOf<Map<String, Any?>>()
+            val commitTimes = mutableListOf<LocalDate>()
+            val childPeggingNodes = mutableListOf<Map<String, Any?>>()
+
+            for (c in childMaterials) {
+                if (m["type"] == "make") {
+                    val parentKey = productId.trim()
+                    val childKey = (c["product_id"] as? String)?.trim() ?: ""
+                    if (Pair(parentKey, childKey) in REAL_BOM_PAIRS) {
+                        log.info("planning: real BOM (VIRTUAL<>Y) parent={} child={} demand={} qty={} (equal-split)", parentKey, childKey, demandId, c["quantity"])
+                    }
+                }
+                val cReqDt = dateAddDays(reqDt, -leadDays)
+                val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
+                    "quantity" to c["quantity"], "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
+                val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config)
+                childWos.addAll(cWos)
+                if (cPegging != null) childPeggingNodes.add(cPegging)
+                for (s in solvedList) {
+                    val sq = (s["quantity"] as? Number)?.toDouble() ?: 0.0; if (sq <= 0) continue
+                    val reason = s["commit_reason"] as? String ?: ""
+                    if (s["commit_time"] == null || (reason.isNotBlank() && reason !in BENIGN_REASONS)) {
+                        val childReason = reason.ifBlank { "child_planning_failed" }
+                        demandFulfilledList.add(committedRow(demandNetQty, reqTimeStr, "child_failed:${s["product_id"]}@${s["location_id"]}($childReason)"))
+                        return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, reqTimeStr, "child_failed:$childReason"))
+                    }
+                }
+                solvedList.forEach { s -> parseDate(s["commit_time"] as? String)?.let { commitTimes.add(it) } }
+            }
+
+            val startDt = computeStartDt(reqDt, leadDays, commitTimes)
+            val endDt = dateAddDays(startDt, leadDays)
+            val (wos, lotCount, lastEnd, lotSizeVal) = buildWorkOrders(productId, productionLocation, methodQty, leadDays, startDt, m, demandId, data)
+            allWos.addAll(wos); allWos.addAll(childWos)
+            if (lastEnd != null && (latestCommit == null || lastEnd > latestCommit)) latestCommit = lastEnd
+
+            val methodType = m["type"] as? String ?: ""
+            val methodLabel = "$methodType@$productionLocation"
+            val woChildren = if (methodType == "purchase") listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to "%.4f".format(methodQty).toDouble(), "children" to emptyList<Any>()))
+                             else childPeggingNodes
+            allPeggingWoNodes.add(buildWoNode(productId, productionLocation, methodQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, "Equal split: $methodLabel (qty ${methodQty.toLong()} of ${demandNetQty.toLong()})", variantExplanation, woChildrenRelation, woChildren))
+        }
+        demandFulfilledList.add(committedRow(demandNetQty, formatDate(latestCommit)))
+        return Triple(demandFulfilledList, allWos, demandNode(allPeggingWoNodes, formatDate(latestCommit)))
+    }
+
+    // ── Single method selection ────────────────────────────────────────────────
+    val (m, methodChoiceExplanation) = when {
+        methods.size == 1 -> {
+            val m = methods[0]; val loc = (m["location_id"] ?: m["to_location_id"] ?: "").toString()
+            Pair(m, "Only option: ${m["type"]} @ $loc.")
+        }
+        useElaborateMethod && depth >= MAX_PLAN_DEPTH ->
+            getPreferredMethodElaborate(methods, demand, inventory, data, requestTimeDt, config, depth, path)
+        else -> getPreferredMethod(methods)
+    }
+
+    if (m == null) {
+        demandFulfilledList.add(committedRow(demandNetQty, reqTimeStr, "no_preferred_method"))
+        return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, reqTimeStr, "no_preferred_method"))
+    }
+
+    val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
+    val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
+    val leadDays = leadDaysForMethod(m)
+
+    // 3) Child materials
+    var woChildrenRelation: String? = null
+    val (childMaterials, variantExplanation) = when (m["type"]) {
+        "make" -> {
+            val variants = variantsForMake(productId, productionLocation, demandNetQty, m, data)
+            val (variantList, ve) = getPreferredVariants(variants, inventory, data, reqDt, leadDays, path, depth, demandNetQty,
+                multiple = if (useSingleVariant) false else null, scoreWeights = scoreWeights, topN = topN)
+            val cm = variantList.flatMap { (childList, _, _) -> childList }
+            if (variantList.size > 1) {
+                woChildrenRelation = if (variantList.all { (childList, _, _) -> childList.size == 1 }) "or" else "and"
+            }
+            Pair(cm, ve)
+        }
+        "move" -> Pair(childMaterialsForMove(m, demandNetQty), "")
+        else -> Pair(emptyList<Map<String, Any?>>(), "")
+    }
+
+    // 4) Recursively plan children
+    val childWos = mutableListOf<Map<String, Any?>>()
+    val commitTimes = mutableListOf<LocalDate>()
+    val childPeggingNodes = mutableListOf<Map<String, Any?>>()
+
+    for (c in childMaterials) {
+        if (m["type"] == "make") {
+            val parentKey = productId.trim()
+            val childKey = (c["product_id"] as? String)?.trim() ?: ""
+            if (Pair(parentKey, childKey) in REAL_BOM_PAIRS) {
+                log.info("planning: real BOM (VIRTUAL<>Y) parent={} child={} demand={} qty={}", parentKey, childKey, demandId, c["quantity"])
+            }
+        }
+        val cReqDt = dateAddDays(reqDt, -leadDays)
+        val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
+            "quantity" to c["quantity"], "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config)
+        childWos.addAll(cWos)
+        if (cPegging != null) childPeggingNodes.add(cPegging)
+        for (s in solvedList) {
+            val sq = (s["quantity"] as? Number)?.toDouble() ?: 0.0; if (sq <= 0) continue
+            val reason = s["commit_reason"] as? String ?: ""
+            if (s["commit_time"] == null || (reason.isNotBlank() && reason !in BENIGN_REASONS)) {
+                val childReason = reason.ifBlank { "child_planning_failed" }
+                demandFulfilledList.add(committedRow(demandNetQty, reqTimeStr, "child_failed:${s["product_id"]}@${s["location_id"]}($childReason)"))
+                return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, reqTimeStr, "child_failed:$childReason"))
+            }
+        }
+        solvedList.forEach { s -> parseDate(s["commit_time"] as? String)?.let { commitTimes.add(it) } }
+    }
+
+    // 5) Timing + work orders
+    val startDt = computeStartDt(reqDt, leadDays, commitTimes)
+    val (wos, lotCount, lastEnd, lotSizeVal) = buildWorkOrders(productId, productionLocation, demandNetQty, leadDays, startDt, m, demandId, data)
+    val methodType = m["type"] as? String ?: ""
+    val woChildren = if (methodType == "purchase") listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to "%.4f".format(demandNetQty).toDouble(), "children" to emptyList<Any>()))
+                     else childPeggingNodes
+    peggingChildren.add(buildWoNode(productId, productionLocation, demandNetQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodChoiceExplanation, variantExplanation, woChildrenRelation, woChildren))
+
+    demandFulfilledList.add(committedRow(demandNetQty, formatDate(lastEnd)))
+    return Triple(demandFulfilledList, wos + childWos, demandNode(peggingChildren, formatDate(lastEnd)))
+}
+
+// ── Lot-batching helper ────────────────────────────────────────────────────────
+
+private data class WorkOrderResult(
+    val wos: List<Map<String, Any?>>,
+    val lotCount: Int,
+    val lastEnd: LocalDate?,
+    val lotSizeVal: Double,
+)
+
+private fun leadDaysForMethod(m: Map<String, Any?>): Double = when (m["type"]) {
+    "make" -> (m["lead_time"] as? Number)?.toDouble() ?: 0.0
+    "move" -> (m["transit_time"] as? Number)?.toDouble() ?: 0.0
+    "purchase" -> (m["lead_days_supply"] as? Number)?.toDouble() ?: 0.0
+    else -> 0.0
+}
+
+private fun computeStartDt(reqDt: LocalDate, leadDays: Double, commitTimes: List<LocalDate>): LocalDate {
+    var startDt = if (leadDays > 0) dateAddDays(reqDt, -leadDays) ?: reqDt else reqDt
+    if (commitTimes.isNotEmpty()) {
+        val latestChild = commitTimes.max()
+        if (latestChild > startDt) startDt = latestChild
+    }
+    return startDt
+}
+
+private fun buildWorkOrders(
+    productId: String,
+    productionLocation: String,
+    qty: Double,
+    leadDays: Double,
+    startDt: LocalDate,
+    m: Map<String, Any?>,
+    demandId: Any?,
+    data: Map<String, List<Map<String, Any?>>>,
+): WorkOrderResult {
+    val lotSizeVal = maxLotSize(productId, productionLocation, data)?.takeIf { it > 0 } ?: qty
+    val lotSize = max(1e-9, lotSizeVal)
+    val prodArea = getProdArea(productId, productionLocation, data)
+    val methodType = m["type"] as? String ?: ""
+    val wos = mutableListOf<Map<String, Any?>>()
+    var left = qty
+    var lotStart: LocalDate? = startDt
+    var lastEnd: LocalDate? = null
+    var lotCount = 0
+    while (left > 1e-9 && lotStart != null) {
+        val lotQty = min(lotSize, left)
+        val lotEnd = dateAddDays(lotStart, leadDays)
+        wos.add(mapOf(
+            "product_id" to productId,
+            "location_id" to productionLocation,
+            "quantity" to "%.4f".format(lotQty).toDouble(),
+            "start_time" to formatDate(lotStart),
+            "end_time" to formatDate(lotEnd),
+            "method" to methodType,
+            "location_source" to (if (methodType == "move") m["from_location_id"] else null),
+            "demand_id" to demandId,
+            "prod_area" to prodArea,
+        ))
+        lastEnd = lotEnd
+        left -= lotQty
+        lotCount++
+        lotStart = if (left > 1e-9) lotEnd else null
+    }
+    return WorkOrderResult(wos, lotCount, lastEnd, lotSizeVal)
+}
+
+private fun buildWoNode(
+    productId: String,
+    productionLocation: String,
+    qty: Double,
+    methodType: String,
+    m: Map<String, Any?>,
+    startDt: LocalDate?,
+    lastEnd: LocalDate?,
+    lotCount: Int,
+    lotSizeVal: Double,
+    methodChoiceExpl: String,
+    variantExpl: String,
+    childrenRelation: String?,
+    woChildren: List<Map<String, Any?>>,
+): Map<String, Any?> = mapOf(
+    "type" to "work_order",
+    "product_id" to productId,
+    "location_id" to productionLocation,
+    "quantity" to "%.4f".format(qty).toDouble(),
+    "start_time" to formatDate(startDt),
+    "end_time" to formatDate(lastEnd),
+    "method" to methodType,
+    "location_source" to (if (methodType == "move") m["from_location_id"] else null),
+    "method_choice_explanation" to methodChoiceExpl,
+    "variant_choice_explanation" to variantExpl.ifBlank { null },
+    "children_relation" to childrenRelation,
+    "lot_count" to (if (lotCount > 0) lotCount else null),
+    "max_lot_size" to lotSizeVal,
+    "children" to woChildren,
+)
+
+// ── Main entry point ───────────────────────────────────────────────────────────
+
+/**
+ * Plan all demands. Returns (committedDemands, workOrders, planningPegging).
+ * Port of planning_engine.run_planning().
+ */
+fun runPlanning(
+    data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>? = null,
+    progressCallback: ((Map<String, Any?>) -> Unit)? = null,
+): Map<String, Any> {
+    val inventory: MutableList<MutableMap<String, Any?>> = (data["supply"] ?: emptyList()).map { s ->
+        mutableMapOf(
+            "product_id" to (s["product_id"] ?: ""),
+            "location_id" to (s["location_id"] ?: ""),
+            "supply_date" to s["supply_date"],
+            "supply_id" to s["supply_id"],
+            "qty" to ((s["qty"] as? Number)?.toDouble() ?: 0.0),
+        )
+    }.toMutableList()
+
+    val demands = (data["demand"] ?: emptyList()).sortedWith(
+        compareBy({ (it["priority"] as? Number)?.toInt() ?: 0 }, { it["demand_id"]?.toString() ?: "" })
+    )
+
+    val committedDemands = mutableListOf<Map<String, Any?>>()
+    val workOrders = mutableListOf<Map<String, Any?>>()
+    val planningPegging = mutableListOf<Map<String, Any?>>()
+    val total = demands.size
+
+    demands.forEachIndexed { i, d ->
+        val reqStr = d["request_due_time"] as? String ?: d["request_time"] as? String
+        val reqDt = parseDate(reqStr)
+        val (solvedList, wos, peggingNode) = plan(d, inventory, data, reqDt, config = config)
+        committedDemands.addAll(solvedList)
+        workOrders.addAll(wos)
+        val demandId = d["demand_id"]
+        if (peggingNode != null && demandId != null) {
+            planningPegging.add(mapOf("demand_id" to demandId, "tree" to peggingNode))
+        }
+        progressCallback?.invoke(mapOf("current" to i + 1, "total" to total, "demand_id" to demandId))
+    }
+
+    return mapOf(
+        "committed_demands" to committedDemands,
+        "work_orders" to workOrders,
+        "planning_pegging" to planningPegging,
+    )
+}
