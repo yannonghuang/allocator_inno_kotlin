@@ -2,3 +2,7 @@ frontend/node_modules/*
 backend/app/services/__pycache__/*
 backend/app/**/*.pyc
 frontend/.next/*
+
+# Kotlin/Gradle build artifacts
+backend-kotlin/build/
+backend-kotlin/.gradle/
