@@ -6,3 +6,4 @@ frontend/.next/*
 # Kotlin/Gradle build artifacts
 backend-kotlin/build/
 backend-kotlin/.gradle/
+backend-kotlin/bin/
