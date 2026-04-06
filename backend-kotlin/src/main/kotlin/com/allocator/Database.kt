@@ -55,16 +55,16 @@ fun initDatabase() {
 
     // Wait up to 30s for Postgres
     log.info("Waiting for PostgreSQL at $jdbcUrl ...")
-    repeat(30) { attempt ->
+    for (attempt in 0..29) {   
         try {
             DriverManager.getConnection(jdbcUrl, user, password).use { it.createStatement().execute("SELECT 1") }
-            return@repeat
+            break
         } catch (e: Exception) {
             val msg = e.message ?: ""
             if ("does not exist" in msg || "database \"$dbName\" does not exist" in msg) {
                 log.info("Database '$dbName' does not exist — creating it...")
                 createDatabase(jdbcUrl, user, password, dbName)
-                return@repeat
+                break
             }
             if (attempt == 29) throw e
             log.warn("DB not ready (attempt ${attempt + 1}/30): ${e.message}")
