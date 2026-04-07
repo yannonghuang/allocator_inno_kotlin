@@ -71,37 +71,64 @@ private fun formatDate(d: LocalDate?): String? = d?.format(DATE_FMT)
 
 // ── Inventory helpers ──────────────────────────────────────────────────────────
 
-/** FIFO consumption from mutable inventory. Returns (taken, commitTime). */
+/** FIFO consumption from mutable inventory. Returns (taken, commitTime).
+ *  When preferDemandId is non-null, demand-tagged buckets for that demand are consumed first,
+ *  then untagged buckets (demand-tagged buckets for OTHER demands are never consumed as fallback).
+ *  When preferDemandId is null the behavior is identical to the original single-pass implementation.
+ */
 private fun consumeFromInventory(
     inventory: MutableList<MutableMap<String, Any?>>,
     productId: String,
     locationId: String,
     need: Double,
+    preferDemandId: Any? = null,
 ): Pair<Double, String?> {
     val pid = productId.trim()
     val lid = locationId.trim()
-    val buckets = inventory.filter {
-        it["product_id"]?.toString()?.trim() == pid &&
-        it["location_id"]?.toString()?.trim() == lid &&
-        (it["qty"] as? Number)?.toDouble() ?: 0.0 > 0
-    }.sortedWith(compareBy(
+    val sorter = compareBy<MutableMap<String, Any?>>(
         { parseDate(it["supply_date"] as? String) ?: LocalDate.MIN },
         { it["supply_id"]?.toString() ?: "" }
-    ))
+    )
+    fun matches(b: MutableMap<String, Any?>) =
+        b["product_id"]?.toString()?.trim() == pid &&
+        b["location_id"]?.toString()?.trim() == lid &&
+        (b["qty"] as? Number)?.toDouble() ?: 0.0 > 0
+
     var taken = 0.0
     var commitTime: String? = null
-    for (b in buckets) {
-        if (taken >= need) break
-        val avail = (b["qty"] as? Number)?.toDouble() ?: 0.0
-        if (avail <= 0) continue
-        val take = min(avail, need - taken)
-        b["qty"] = avail - take
-        taken += take
-        if (commitTime == null && take > 0) {
-            val sd = b["supply_date"] as? String
-            commitTime = if (sd != null) formatDate(parseDate(sd)) else null
+
+    fun consumeFrom(buckets: List<MutableMap<String, Any?>>) {
+        for (b in buckets) {
+            if (taken >= need) break
+            val avail = (b["qty"] as? Number)?.toDouble() ?: 0.0
+            if (avail <= 0) continue
+            val take = min(avail, need - taken)
+            b["qty"] = avail - take
+            taken += take
+            if (commitTime == null && take > 0) {
+                val sd = b["supply_date"] as? String
+                commitTime = if (sd != null) formatDate(parseDate(sd)) else null
+            }
         }
     }
+
+    if (preferDemandId != null) {
+        // Pass 1: tagged buckets for this demand only
+        val tagged = inventory.filter { matches(it) && it["demand_tag"] == preferDemandId }
+            .sortedWith(sorter)
+        consumeFrom(tagged)
+        // Pass 2: untagged buckets (no demand_tag key, or demand_tag == null)
+        if (taken < need) {
+            val untagged = inventory.filter { matches(it) && !it.containsKey("demand_tag") || (matches(it) && it["demand_tag"] == null) }
+                .sortedWith(sorter)
+            consumeFrom(untagged)
+        }
+    } else {
+        // Original behavior: single pass over all matching buckets
+        val buckets = inventory.filter { matches(it) }.sortedWith(sorter)
+        consumeFrom(buckets)
+    }
+
     return Pair(taken, commitTime)
 }
 
@@ -113,6 +140,7 @@ private fun copyInventory(inventory: List<Map<String, Any?>>): MutableList<Mutab
             "supply_date" to b["supply_date"],
             "supply_id" to b["supply_id"],
             "qty" to ((b["qty"] as? Number)?.toDouble() ?: 0.0),
+            "demand_tag" to b["demand_tag"],
         )
     }.toMutableList()
 
@@ -122,7 +150,7 @@ private fun copyInventory(inventory: List<Map<String, Any?>>): MutableList<Mutab
  * Group BOM rows for (product_id, bom_id) by alt_group.
  * Returns list of (altKey, childMaterials). Falls back to any BOM rows matching parent if bom_id not found.
  */
-private fun variantsForMake(
+internal fun variantsForMake(
     productId: String,
     locationId: String,
     quantity: Double,
@@ -169,7 +197,7 @@ private fun scaleChildMaterials(children: List<Map<String, Any?>>, scale: Double
     return children.map { c -> c + mapOf("quantity" to ((c["quantity"] as? Number)?.toDouble() ?: 0.0) * scale) }
 }
 
-private fun childMaterialsForMove(method: Map<String, Any?>, quantity: Double): List<Map<String, Any?>> =
+internal fun childMaterialsForMove(method: Map<String, Any?>, quantity: Double): List<Map<String, Any?>> =
     listOf(mapOf(
         "product_id" to (method["product_id"] ?: ""),
         "location_id" to (method["from_location_id"] ?: ""),
@@ -550,6 +578,7 @@ fun plan(
     depth: Int = MAX_PLAN_DEPTH,
     planningPath: Set<Pair<String, String>> = emptySet(),
     config: Map<String, Any?>? = null,
+    preferDemandId: Any? = null,
 ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
 
     val productId = (demand["product_id"] as? String)?.trim() ?: ""
@@ -601,7 +630,7 @@ fun plan(
     val path = planningPath + key
 
     // 1) Fulfill from inventory (FIFO)
-    val (taken, fulfillCommitTime) = consumeFromInventory(inventory, productId, locationId, quantity)
+    val (taken, fulfillCommitTime) = consumeFromInventory(inventory, productId, locationId, quantity, preferDemandId)
     val demandFulfilledList = mutableListOf<Map<String, Any?>>()
     val peggingChildren = mutableListOf<Map<String, Any?>>()
 
@@ -698,7 +727,7 @@ fun plan(
                 val cReqDt = dateAddDays(reqDt, -leadDays)
                 val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
                     "quantity" to c["quantity"], "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
-                val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config)
+                val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId)
                 childWos.addAll(cWos)
                 if (cPegging != null) childPeggingNodes.add(cPegging)
                 for (s in solvedList) {
@@ -782,7 +811,7 @@ fun plan(
         val cReqDt = dateAddDays(reqDt, -leadDays)
         val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
             "quantity" to c["quantity"], "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config)
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId)
         childWos.addAll(cWos)
         if (cPegging != null) childPeggingNodes.add(cPegging)
         for (s in solvedList) {
@@ -818,7 +847,7 @@ private data class WorkOrderResult(
     val lotSizeVal: Double,
 )
 
-private fun leadDaysForMethod(m: Map<String, Any?>): Double = when (m["type"]) {
+internal fun leadDaysForMethod(m: Map<String, Any?>): Double = when (m["type"]) {
     "make" -> (m["lead_time"] as? Number)?.toDouble() ?: 0.0
     "move" -> (m["transit_time"] as? Number)?.toDouble() ?: 0.0
     "purchase" -> (m["lead_days_supply"] as? Number)?.toDouble() ?: 0.0
@@ -936,13 +965,52 @@ fun runPlanning(
     val planningPegging = mutableListOf<Map<String, Any?>>()
     val total = demands.size
 
+    // ── Consolidation phase ───────────────────────────────────────────────────
+    val consolidationConfig = parseConsolidationConfig(config)
+    val consolidatedWOs = mutableListOf<Map<String, Any?>>()
+    val consolidatedPegging = mutableListOf<Map<String, Any?>>()
+
+    if (consolidationConfig.enabled) {
+        val needs  = collectComponentNeeds(demands, data, consolidationConfig)
+        val groups = groupByTimeBucket(needs, consolidationConfig.periodDays)
+        val result = runConsolidation(groups, inventory, data, consolidationConfig) { dem, inv, dat, reqDt, depth, path, cfg, prefId ->
+            plan(dem, inv, dat, reqDt, depth, path, cfg, prefId)
+        }
+        consolidatedWOs.addAll(result.consolidatedWOs)
+        consolidatedPegging.addAll(result.consolidatedPegging)
+
+        // Inject per-demand tagged supply buckets so each demand's plan() finds its pre-allocated share
+        for ((demandId, componentAllocs) in result.allocation) {
+            for ((componentKey, qty) in componentAllocs) {
+                if (qty <= 1e-12) continue
+                val parts = componentKey.split("|", limit = 2)
+                val pid = parts.getOrElse(0) { "" }
+                val lid = parts.getOrElse(1) { "" }
+                // Use the end_time of the first matching consolidated WO as supply_date
+                val supplyDate = result.consolidatedWOs
+                    .firstOrNull { it["product_id"] == pid && it["location_id"] == lid }
+                    ?.get("end_time") as? String
+                inventory.add(mutableMapOf(
+                    "product_id"  to pid,
+                    "location_id" to lid,
+                    "qty"         to qty,
+                    "supply_date" to supplyDate,
+                    "supply_id"   to "consolidated_$demandId",
+                    "demand_tag"  to demandId,
+                ))
+            }
+        }
+    }
+    // ── Main planning loop ────────────────────────────────────────────────────
+
     demands.forEachIndexed { i, d ->
         val reqStr = d["request_due_time"] as? String ?: d["request_time"] as? String
         val reqDt = parseDate(reqStr)
-        val (solvedList, wos, peggingNode) = plan(d, inventory, data, reqDt, config = config)
+        val demandId = d["demand_id"]
+        val prefId = if (consolidationConfig.enabled) demandId else null
+        val (solvedList, wos, peggingNode) = plan(d, inventory, data, reqDt, config = config, preferDemandId = prefId)
         committedDemands.addAll(solvedList)
         workOrders.addAll(wos)
-        val demandId = d["demand_id"]
         if (peggingNode != null && demandId != null) {
             planningPegging.add(mapOf("demand_id" to demandId, "tree" to peggingNode))
         }
@@ -951,7 +1019,7 @@ fun runPlanning(
 
     return mapOf(
         "committed_demands" to committedDemands,
-        "work_orders" to workOrders,
-        "planning_pegging" to planningPegging,
+        "work_orders"       to consolidatedWOs + workOrders,
+        "planning_pegging"  to consolidatedPegging + planningPegging,
     )
 }
