@@ -21,10 +21,25 @@ fun Routing.bomGraphRoutes() {
     }
 }
 
-private fun nodeId(productId: String, locationId: String) = "$productId|$locationId"
+internal data class MoveRow(
+    val productId: String,
+    val fromLocationId: String,
+    val toLocationId: String,
+    val transitTime: Double?,
+    val preference: Int?,
+)
+
+internal data class MakeRow(
+    val bomId: String,
+    val productId: String,
+    val locationId: String,
+    val preference: Int?,
+    val leadTime: Int?,
+)
+
+internal fun nodeId(productId: String, locationId: String) = "$productId|$locationId"
 
 private fun buildBomGraph(caseId: Int): BomGraphResponse = transaction {
-    // Load all relevant rows upfront
     val demandRows = Demands.selectAll().where { Demands.caseId eq caseId }
         .map { Pair(it[Demands.productId], it[Demands.locationId] ?: "") }
         .filter { it.second.isNotEmpty() }
@@ -34,13 +49,6 @@ private fun buildBomGraph(caseId: Int): BomGraphResponse = transaction {
         .map { Pair(it[MethodBuys.productId], it[MethodBuys.locationId]) }
         .toSet()
 
-    data class MoveRow(
-        val productId: String,
-        val fromLocationId: String,
-        val toLocationId: String,
-        val transitTime: Double?,
-        val preference: Int?,
-    )
     val moveRows = MethodMoves.selectAll().where { MethodMoves.caseId eq caseId }
         .map { MoveRow(
             it[MethodMoves.productId],
@@ -50,13 +58,6 @@ private fun buildBomGraph(caseId: Int): BomGraphResponse = transaction {
             it[MethodMoves.preference],
         )}
 
-    data class MakeRow(
-        val bomId: String,
-        val productId: String,
-        val locationId: String,
-        val preference: Int?,
-        val leadTime: Int?,
-    )
     val makeRows = MethodMakes.selectAll().where { MethodMakes.caseId eq caseId }
         .map { MakeRow(
             it[MethodMakes.bomId],
@@ -67,7 +68,6 @@ private fun buildBomGraph(caseId: Int): BomGraphResponse = transaction {
         )}
 
     // BOM pre-index: (bomId, parentId) -> altKey -> [(childId, rate)]
-    // null altGroup children each get a unique key so they form independent groups of size 1
     val bomByMakeKey = mutableMapOf<Pair<String, String>, MutableMap<String, MutableList<Pair<String, Double>>>>()
     Boms.selectAll().where { Boms.caseId eq caseId }.forEach { row ->
         val key = Pair(row[Boms.bomId], row[Boms.parentId])
@@ -79,6 +79,34 @@ private fun buildBomGraph(caseId: Int): BomGraphResponse = transaction {
             .add(Pair(childId, rate))
     }
 
+    val productDesc = Products.selectAll().where { Products.caseId eq caseId }
+        .associate { it[Products.productId] to it[Products.description] }
+    val locationDesc = Locations.selectAll().where { Locations.caseId eq caseId }
+        .associate { it[Locations.locationId] to it[Locations.locationDescription] }
+
+    buildBomGraphPure(demandRows, buySet, moveRows, makeRows, bomByMakeKey, productDesc, locationDesc)
+}
+
+/**
+ * Pure DFS BOM graph builder — no DB access, fully unit-testable.
+ *
+ * @param demandRows        seed nodes: set of (productId, locationId)
+ * @param buySet            terminal buy nodes: set of (productId, locationId)
+ * @param moveRows          all move method rows for this case
+ * @param makeRows          all make method rows for this case
+ * @param bomByMakeKey      (bomId, parentProductId) → altKey → [(childProductId, rate)]
+ * @param productDesc       productId → description (optional)
+ * @param locationDesc      locationId → description (optional)
+ */
+internal fun buildBomGraphPure(
+    demandRows:    Set<Pair<String, String>>,
+    buySet:        Set<Pair<String, String>>,
+    moveRows:      List<MoveRow>,
+    makeRows:      List<MakeRow>,
+    bomByMakeKey:  Map<Pair<String, String>, Map<String, List<Pair<String, Double>>>>,
+    productDesc:   Map<String, String?> = emptyMap(),
+    locationDesc:  Map<String, String?> = emptyMap(),
+): BomGraphResponse {
     // Move index: (productId, toLocationId) -> list of MoveRow
     val moveByTarget = mutableMapOf<Pair<String, String>, MutableList<MoveRow>>()
     for (mv in moveRows) {
@@ -91,20 +119,12 @@ private fun buildBomGraph(caseId: Int): BomGraphResponse = transaction {
         makeByTarget.getOrPut(Pair(mk.productId, mk.locationId)) { mutableListOf() }.add(mk)
     }
 
-    // Product/location descriptions
-    val productDesc = Products.selectAll().where { Products.caseId eq caseId }
-        .associate { it[Products.productId] to it[Products.description] }
-    val locationDesc = Locations.selectAll().where { Locations.caseId eq caseId }
-        .associate { it[Locations.locationId] to it[Locations.locationDescription] }
-
-    // DFS from demand nodes
     val visited = mutableSetOf<Pair<String, String>>()
     val nodeEstablishedBy = mutableMapOf<Pair<String, String>, MutableSet<String>>()
     val edges = mutableListOf<BomGraphEdge>()
     val edgeIds = mutableSetOf<String>()
 
     val queue: ArrayDeque<Pair<String, String>> = ArrayDeque(demandRows)
-    // Ensure demand nodes are in establishedBy map even if no methods exist
     for (d in demandRows) {
         nodeEstablishedBy.getOrPut(d) { mutableSetOf() }
     }
@@ -114,12 +134,10 @@ private fun buildBomGraph(caseId: Int): BomGraphResponse = transaction {
         if (!visited.add(node)) continue
         val (productId, locationId) = node
 
-        // Check buy (terminal — no further expansion)
         if (buySet.contains(node)) {
             nodeEstablishedBy.getOrPut(node) { mutableSetOf() }.add("buy")
         }
 
-        // Check move: find moves where this node is the target (toLocation)
         moveByTarget[node]?.forEach { mv ->
             val src = Pair(mv.productId, mv.fromLocationId)
             nodeEstablishedBy.getOrPut(node) { mutableSetOf() }.add("move")
@@ -141,11 +159,9 @@ private fun buildBomGraph(caseId: Int): BomGraphResponse = transaction {
             nodeEstablishedBy.getOrPut(src) { mutableSetOf() }
         }
 
-        // Check make: find all make methods for this (product, location)
         makeByTarget[node]?.forEach { mk ->
             val bomGroups = bomByMakeKey[Pair(mk.bomId, mk.productId)] ?: return@forEach
             nodeEstablishedBy.getOrPut(node) { mutableSetOf() }.add("make")
-            // Exhaust ALL alt_groups
             bomGroups.forEach { (altKey, children) ->
                 val altGroupDisplay = if (altKey.startsWith("__null__")) null else altKey
                 children.forEach { (childId, rate) ->
@@ -172,19 +188,19 @@ private fun buildBomGraph(caseId: Int): BomGraphResponse = transaction {
     }
 
     val nodes = nodeEstablishedBy.map { (pair, methods) ->
-        val (productId, locationId) = pair
+        val (pid, lid) = pair
         BomGraphNode(
-            id = nodeId(productId, locationId),
-            productId = productId,
-            locationId = locationId,
-            productDescription = productDesc[productId],
-            locationDescription = locationDesc[locationId],
+            id = nodeId(pid, lid),
+            productId = pid,
+            locationId = lid,
+            productDescription = productDesc[pid],
+            locationDescription = locationDesc[lid],
             establishedBy = methods.toList(),
             isDemand = pair in demandRows,
         )
     }
 
-    BomGraphResponse(
+    return BomGraphResponse(
         nodes = nodes,
         edges = edges,
         nodeCount = nodes.size,
