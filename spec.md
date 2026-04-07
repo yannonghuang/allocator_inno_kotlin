@@ -95,6 +95,73 @@ Note: for a given parent product, child products product_i having identical or n
 
     x, y and z are alternative groups, the logic relationship among them is OR.
 
+
+---------------------------------------
+bom graph (DAG)
+---------------------------------------
+
+BOM graph is similar to an inventory graph, without considering times or quantities, and exhausting alternative methods. It essentially constitutes a feasible space.
+
+1. node=productlocation(product, location). a node denotes physical presence of a product in a location. it can be established by three methods: buy, move, make. 
+
+a node is established by buy if: method_buy(product, location) is available. 
+
+2. edge by method_move: 
+    edge from productlocation(product, location_target) to productlocation(product, location_source), if:
+
+    method_move(product, location_source) 
+    and productlocation(product, location_source) is available
+
+3. edge by method_make: 
+    edge from productlocation(product, location) to productlocation(product_i, location) for i in {requirements of product}, if:
+
+    bom(BOM_ID, PARENT_ID=product, CHILD_ID=product_i, ALT_GROUP=alt_grp_i) 
+    and method_make(BOM_ID, PARENT_ID=product)
+    and all alt_grp_i are identical or null for i in {requirements of product}
+    and productlocation(product_i, location) for i in {requirements of product}, is available 
+
+Note: for a given parent product, child products product_i having identical or null value in ALT_GROUP for i in {requirements of product}, form a requirement set. For example, if
+    bom(PARENT_ID=product, CHILD_ID=product_a, ALT_GROUP=x) 
+    bom(PARENT_ID=product, CHILD_ID=product_b, ALT_GROUP=x) 
+    bom(PARENT_ID=product, CHILD_ID=product_c, ALT_GROUP=y) 
+    bom(PARENT_ID=product, CHILD_ID=product_d, ALT_GROUP=y) 
+    bom(PARENT_ID=product, CHILD_ID=product_e, ALT_GROUP=null) 
+    bom(PARENT_ID=product, CHILD_ID=product_f, ALT_GROUP=null)
+
+    x = {product_a, product_b} is a requirement set, the logic relationship between product_a and product_b is AND;
+    y = {product_c, product_d} is a requirement set, the logic relationship between product_c and product_d is AND;
+    z = {product_e, product_f} is a requirement set, the logic relationship between product_e and product_f is AND.
+
+    x, y and z are alternative groups, the logic relationship among them is OR.
+
+    For a given productlocation(product, location), the relationship among all possible methods is OR.
+
+---------------------------------------
+build bom graph (DAG)
+---------------------------------------
+
+build_bom(productlocation(product, location))
+  bom = {}
+  if method_buy(product, location):
+    bom += {"buy_node", productlocation(product, location)} # add node
+
+  if method_move(product, location_source) and productlocation(product, location_source) and productlocation(product, location_target):
+    bom += {"move_node", productlocation(product, location_source)} + {"move_node", productlocation(product, location_target)} + # add node
+          {"move_edge", [productlocation(product, location_target), productlocation(product, location_source)]} + # add edge
+          build_bom(productlocation(product, location_source)) # add sub_bom
+
+  for each variant of product: # child nodes' ALT_GROUP are identical or null
+    for each required product_i of variant: 
+
+      if productlocation(product, location)  
+        and productlocation(product_i, location) 
+        and bom(BOM_ID, PARENT_ID=product, CHILD_ID=product_i) 
+        and method_make(BOM_ID, PARENT_ID=product)
+
+        bom += {"make_node", productlocation(product, location)} + # add node
+          {"make_edge", [productlocation(product, location), productlocation(product_i, location)]} for all i + # add edges
+          build_bom(productlocation(product_i, location)) for all i # add sub_boms
+
 ---------------------------------------
 pegging
 ---------------------------------------

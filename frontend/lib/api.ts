@@ -540,3 +540,38 @@ export async function getAllocationActions(
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
+
+export type BomGraphNode = {
+  id: string;
+  productId: string;
+  locationId: string;
+  productDescription: string | null;
+  locationDescription: string | null;
+  establishedBy: string[];
+  isDemand: boolean;
+};
+
+export type BomGraphEdge = {
+  id: string;
+  source: string;
+  target: string;
+  edgeType: string;
+  bomId: string | null;
+  altGroup: string | null;
+  rate: number | null;
+  preference: number | null;
+  leadDays: number | null;
+};
+
+export type BomGraphResponse = {
+  nodes: BomGraphNode[];
+  edges: BomGraphEdge[];
+  nodeCount: number;
+  edgeCount: number;
+};
+
+export async function getBomGraph(caseId: number): Promise<BomGraphResponse> {
+  const r = await fetch(`${API}/cases/${caseId}/bom-graph`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}

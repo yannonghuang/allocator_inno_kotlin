@@ -84,3 +84,35 @@ data class ImportCsvResponse(val status: String, val caseId: Int)
 
 @Serializable
 data class StatusResponse(val status: String)
+
+@Serializable
+data class BomGraphNode(
+    val id: String,                   // "{productId}|{locationId}"
+    val productId: String,
+    val locationId: String,
+    val productDescription: String?,
+    val locationDescription: String?,
+    val establishedBy: List<String>,  // subset of ["buy","make","move"]
+    val isDemand: Boolean,            // true if this node originated from a demand row
+)
+
+@Serializable
+data class BomGraphEdge(
+    val id: String,
+    val source: String,               // upstream node id (component/source)
+    val target: String,               // downstream node id (parent/destination)
+    val edgeType: String,             // "make" | "move"
+    val bomId: String?,
+    val altGroup: String?,
+    val rate: Double?,
+    val preference: Int?,
+    val leadDays: Double?,
+)
+
+@Serializable
+data class BomGraphResponse(
+    val nodes: List<BomGraphNode>,
+    val edges: List<BomGraphEdge>,
+    val nodeCount: Int,
+    val edgeCount: Int,
+)

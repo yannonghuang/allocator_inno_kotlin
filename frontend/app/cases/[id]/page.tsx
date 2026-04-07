@@ -204,6 +204,7 @@ function PlanKpiDashboard({
 
 import { SortFilterTable } from '@/app/components/SortFilterTable';
 import { PeggingTree, pathKeyFromPath, type PeggingGraph } from '@/app/components/PeggingTree';
+import BomGraphTab from '@/app/components/BomGraphTab';
 
 export default function CaseDetail() {
   const params = useParams();
@@ -243,7 +244,7 @@ export default function CaseDetail() {
   const allocationViewFetchingRef = useRef<boolean>(false);
   const activeViewRef = useRef<'supply' | 'allocation' | 'suggested' | 'raw-material'>('supply');
   const selectedRunIdRef = useRef<number | null>(null);
-  const [caseSection, setCaseSection] = useState<'allocation' | 'planning'>('allocation');
+  const [caseSection, setCaseSection] = useState<'allocation' | 'planning' | 'bom-graph'>('allocation');
   const [rawMaterialReport, setRawMaterialReport] = useState<RawMaterialUsageReport | null>(null);
   const [rawMaterialReportLoading, setRawMaterialReportLoading] = useState(false);
   const [planResult, setPlanResult] = useState<{
@@ -1033,6 +1034,13 @@ export default function CaseDetail() {
           onClick={() => setCaseSection('planning')}
         >
           Planning
+        </button>
+        <button
+          type="button"
+          className={caseSection === 'bom-graph' ? '' : 'secondary'}
+          onClick={() => setCaseSection('bom-graph')}
+        >
+          BOM Graph
         </button>
       </nav>
       {caseSection === 'allocation' && (
@@ -2036,6 +2044,12 @@ export default function CaseDetail() {
             </div>
           </>
         )}
+      </section>
+      )}
+      {caseSection === 'bom-graph' && (
+      <section>
+        <h2>BOM Graph</h2>
+        <BomGraphTab caseId={id} />
       </section>
       )}
       {copilotOpen && typeof document !== 'undefined' && createPortal(
