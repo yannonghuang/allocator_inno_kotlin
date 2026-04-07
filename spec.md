@@ -330,6 +330,13 @@ plan(demand, inventory, data, request_time_dt, depth, planning_path):
 run_planning(data):
   Inventory = supply buckets. Demands sorted by priority, demand_id. For each d: solved, wos, pegging = plan(d, ...); extend committed_demands and work_orders; append { demand_id, tree } to planning_pegging. Return { committed_demands, work_orders, planning_pegging }.
 
+---------------------------------------------------------------------------------------------------------------------
+consolidation and capacity allocation on shared components: an enhancement for planning algorithm (from demand to supply)
+---------------------------------------------------------------------------------------------------------------------
+in the current planning algorithm, different demands on a shared component trigger creations of workorder independently, resulting in potential redundant workorders. to remedy this, we need to consolidate demands (within a certain time period) sharing the same component before firing a nw workorder on the shared component. rammifications:
+1) outcomes of the shared workorder will be split among competing demands (per priority/preference for example);
+2) demand delivery schedule/quantity will be altered, therefore affecting the scoring. 
+
 ---------------------------------------
 "critical path" 
 ---------------------------------------
