@@ -7,3 +7,9 @@ frontend/.next/*
 backend-kotlin/build/
 backend-kotlin/.gradle/
 backend-kotlin/bin/
+
+# Environment / secrets
+.env
+frontend/.env.local
+frontend/.env*.local
+backend-kotlin/.env.local
