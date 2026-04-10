@@ -2,6 +2,7 @@ frontend/node_modules/*
 backend/app/services/__pycache__/*
 backend/app/**/*.pyc
 frontend/.next/*
+frontend/tsconfig.tsbuildinfo
 
 # Kotlin/Gradle build artifacts
 backend-kotlin/build/

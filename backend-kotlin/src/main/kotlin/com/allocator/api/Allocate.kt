@@ -2,6 +2,7 @@ package com.allocator.api
 
 import com.allocator.*
 import com.allocator.services.CaseLoader
+import com.allocator.services.getMethods
 import com.allocator.services.runAllocation
 import com.allocator.services.runPlanning
 import com.opencsv.CSVReaderHeaderAware
@@ -248,7 +249,7 @@ fun Routing.allocateRoutes() {
                       else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrElse { JsonObject(emptyMap()) }
         val configJson = payload["config"]
         val config: Map<String, Any?>? = if (configJson != null && configJson !is JsonNull)
-            runCatching { Json.decodeFromJsonElement<Map<String, JsonElement>>(configJson) }.getOrNull()
+            runCatching { @Suppress("UNCHECKED_CAST") (jsonElementToNative(configJson) as? Map<String, Any?>) }.getOrNull()
         else null
         val useAsync = payload["async"]?.jsonPrimitive?.booleanOrNull == true
 
@@ -301,19 +302,29 @@ fun Routing.allocateRoutes() {
         val productId = call.request.queryParameters["product_id"]?.trim() ?: ""
         val locationId = call.request.queryParameters["location_id"]?.trim() ?: ""
         val method = call.request.queryParameters["method"]?.trim() ?: ""
-        if (demandId.isBlank() || productId.isBlank() || locationId.isBlank() || method.isBlank()) {
-            throw IllegalArgumentException("demand_id, product_id, location_id, method required")
+        if (productId.isBlank() || locationId.isBlank() || method.isBlank()) {
+            throw IllegalArgumentException("product_id, location_id, method required")
         }
         val result = casePlanResults[caseId]
             ?: throw NoSuchElementException("No plan result for this case. Run plan first.")
 
         @Suppress("UNCHECKED_CAST")
         val planningPegging = result["planning_pegging"] as? List<Map<String, Any?>> ?: emptyList()
-        val entry = planningPegging.find { (it["demand_id"]?.toString() ?: "").trim() == demandId }
-            ?: throw NoSuchElementException("No pegging tree for this demand")
-        val tree = entry["tree"] ?: throw NoSuchElementException("No pegging tree for this demand")
-        val woNode = findWoNode(tree, productId, locationId, method)
-            ?: throw NoSuchElementException("Work order not found in pegging tree")
+
+        // A demand can have multiple pegging trees (one per component group when consolidation is on).
+        // Search all matching trees until the work order node is found.
+        val woNode: Map<String, Any?>? = if (demandId.isNotBlank()) {
+            planningPegging
+                .filter { (it["demand_id"]?.toString() ?: "").trim() == demandId }
+                .firstNotNullOfOrNull { entry -> entry["tree"]?.let { findWoNode(it, productId, locationId, method) } }
+                ?: throw NoSuchElementException("Work order ($productId @ $locationId / $method) not found in any pegging tree for demand $demandId")
+        } else {
+            // Consolidated WO: search all trees where demand_id is null/blank
+            planningPegging
+                .filter { (it["demand_id"]?.toString() ?: "").isBlank() }
+                .firstNotNullOfOrNull { entry -> entry["tree"]?.let { findWoNode(it, productId, locationId, method) } }
+                ?: throw NoSuchElementException("Work order ($productId @ $locationId / $method) not found in any consolidated pegging tree")
+        }
 
         // Align quantity with work_orders list sum
         @Suppress("UNCHECKED_CAST")
@@ -448,29 +459,112 @@ private fun peggingSupplyConsumed(node: Any?): Double {
 }
 
 /** Add pegging flags to each work order (returns new list with added keys). */
-@Suppress("UNCHECKED_CAST")
+/**
+ * BOM-graph direct children of (pid, lid): make→bom children at the production location,
+ * move→same product at source location. Pure BOM graph — no pegging involved.
+ */
+private fun bomGraphChildren(
+    pid: String, lid: String,
+    data: Map<String, List<Map<String, Any?>>>,
+): Set<Pair<String, String>> {
+    val result = mutableSetOf<Pair<String, String>>()
+    for (m in getMethods(pid, lid, data)) {
+        when (m["type"]) {
+            "make" -> {
+                val prodLoc = (m["location_id"] as? String)?.trim() ?: lid
+                val bomId = (m["bom_id"] as? String) ?: continue
+                for (row in (data["bom"] ?: emptyList())) {
+                    if ((row["bom_id"] as? String) != bomId) continue
+                    val childId = (row["child_id"] as? String)?.trim() ?: continue
+                    result.add(Pair(childId, prodLoc))
+                }
+            }
+            "move" -> {
+                val fromLoc = (m["from_location_id"] as? String)?.trim() ?: continue
+                result.add(Pair(pid, fromLoc))
+            }
+            // "purchase" → leaf node, no children in BOM graph
+        }
+    }
+    return result
+}
+
 private fun enrichWorkOrders(
     workOrders: List<Map<String, Any?>>,
     planningPegging: List<Map<String, Any?>>,
     bomPairs: Set<Pair<String, String>>,
     moveTriples: Set<Triple<String, String, String>>,
+    data: Map<String, List<Map<String, Any?>>>,
 ): List<Map<String, Any?>> {
-    val byDemand = planningPegging.associate { e ->
-        (e["demand_id"]?.toString() ?: "").trim() to e["tree"]
-    }
-    return workOrders.map { wo ->
-        val demandId = (wo["demand_id"]?.toString() ?: "").trim()
-        val tree = if (demandId.isNotBlank()) byDemand[demandId] else null
-        val woNode = tree?.let {
-            findWoNode(it,
-                (wo["product_id"] as? String ?: "").trim(),
-                (wo["location_id"] as? String ?: "").trim(),
-                (wo["method"] as? String ?: "").trim())
+    // Multiple pegging trees can share the same demand_id (one per component group from consolidation).
+    // Build a multimap so we can search all trees for a given demand_id.
+    val treesByDemand: Map<String, List<Any?>> = planningPegging
+        .filter { (it["demand_id"]?.toString() ?: "").isNotBlank() }
+        .groupBy { e -> (e["demand_id"]?.toString() ?: "").trim() }
+        .mapValues { (_, entries) -> entries.mapNotNull { it["tree"] } }
+    // Consolidated WOs (demand_id=null) have their own pegging trees
+    val consolidatedTrees = planningPegging
+        .filter { (it["demand_id"]?.toString() ?: "").isBlank() }
+        .mapNotNull { it["tree"] }
+
+    // BOM-graph traversal: for each unique demand product+location, BFS through BOM graph
+    // to find all reachable nodes. Build: "pid|lid" → count of distinct demand products that reach it.
+    val childCache = mutableMapOf<String, Set<Pair<String, String>>>()
+    fun cachedChildren(p: String, l: String) =
+        childCache.getOrPut("$p|$l") { bomGraphChildren(p, l, data) }
+
+    val nodeDemanderSets = mutableMapOf<String, MutableSet<String>>()
+    val uniqueDemandRoots = (data["demand"] ?: emptyList()).mapNotNull { d ->
+        val dp = (d["product_id"] as? String)?.trim() ?: return@mapNotNull null
+        val dl = (d["location_id"] as? String)?.trim() ?: return@mapNotNull null
+        Pair(dp, dl)
+    }.toSet()
+
+    for ((dp, dl) in uniqueDemandRoots) {
+        val demandKey = "$dp|$dl"
+        val queue = ArrayDeque<Pair<String, String>>()
+        val visited = mutableSetOf<String>()
+        queue.add(Pair(dp, dl))
+        while (queue.isNotEmpty()) {
+            val (np, nl) = queue.removeFirst()
+            val key = "$np|$nl"
+            if (!visited.add(key)) continue
+            nodeDemanderSets.getOrPut(key) { mutableSetOf() }.add(demandKey)
+            for (child in cachedChildren(np, nl)) {
+                if ("${child.first}|${child.second}" !in visited) queue.add(child)
+            }
         }
+    }
+
+    return workOrders.map { wo ->
+        val pid = (wo["product_id"] as? String ?: "").trim()
+        val lid = (wo["location_id"] as? String ?: "").trim()
+        val demandId = (wo["demand_id"]?.toString() ?: "").trim()
+        val method = (wo["method"] as? String ?: "").trim()
+        val woNode = if (demandId.isNotBlank()) {
+            // Search all trees for this demand (may be multiple from consolidation component groups)
+            treesByDemand[demandId]?.firstNotNullOfOrNull { findWoNode(it, pid, lid, method) }
+        } else {
+            // Consolidated WO — search through all consolidated pegging trees
+            consolidatedTrees.firstNotNullOfOrNull { findWoNode(it, pid, lid, method) }
+        }
+        val woKey = "$pid|$lid"
+        val competingDemands = nodeDemanderSets[woKey]?.toList() ?: emptyList<String>()
         wo + mapOf(
             "pegging_includes_real_make" to (woNode?.let { subtreeContainsRealMake(it, bomPairs) } ?: false),
             "pegging_includes_buy" to (woNode?.let { subtreeContainsBuy(it) } ?: false),
             "pegging_includes_real_move" to (woNode?.let { subtreeContainsRealMove(it, moveTriples) } ?: false),
+            "demanded_by_multiple" to (competingDemands.size > 1),
+            "multi_supply_available" to (getMethods(pid, lid, data).size > 1),
+            // Explanation fields — propagated from the pegging node so the WO view can show them without opening the pegging tree
+            "wo_explanation_method" to (woNode?.get("method_choice_explanation") as? String),
+            "wo_explanation_variant" to (woNode?.get("variant_choice_explanation") as? String),
+            "wo_competing_demands" to competingDemands,
+            // Consolidation split explanation — only present on consolidated WOs
+            "wo_consolidation_split_mode" to (wo["consolidation_split_mode"] as? String),
+            "wo_consolidation_total_planned" to (wo["consolidation_total_planned"] as? Number)?.toDouble(),
+            @Suppress("UNCHECKED_CAST")
+            "wo_consolidation_split_details" to (wo["consolidation_split_details"] as? List<Map<String, Any?>>),
         )
     }
 }
@@ -570,6 +664,39 @@ private fun planKpis(
     )
 }
 
+/** Commit reasons that mean planning could not fulfill the demand (no real supply was secured). */
+private val FAILURE_REASONS = setOf("depth_limit", "cycle_stopped", "no_methods", "no_preferred_method")
+private fun isFailureReason(reason: String?) =
+    reason != null && (reason in FAILURE_REASONS || reason.startsWith("child_failed:"))
+
+/** Add requested_qty, shortage, and is_failed to each committed demand row.
+ *  Failure-reason rows (no_methods, depth_limit, etc.) are marked is_failed=true and their
+ *  quantity is excluded from the effective committed sum so shortage is computed correctly. */
+private fun enrichCommittedDemands(
+    committed: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+): List<Map<String, Any?>> {
+    // Build demand_id → requested_qty from source demand data
+    val requestedByDemandId = (data["demand"] ?: emptyList()).associate { d ->
+        (d["demand_id"]?.toString() ?: "").trim() to ((d["quantity"] as? Number)?.toDouble() ?: 0.0)
+    }
+    // Sum only non-failure committed qty per demand_id
+    val effectiveCommittedByDemandId = mutableMapOf<String, Double>()
+    for (row in committed) {
+        if (isFailureReason(row["commit_reason"] as? String)) continue
+        val id = (row["demand_id"]?.toString() ?: "").trim()
+        effectiveCommittedByDemandId[id] = (effectiveCommittedByDemandId[id] ?: 0.0) + ((row["quantity"] as? Number)?.toDouble() ?: 0.0)
+    }
+    return committed.map { row ->
+        val id = (row["demand_id"]?.toString() ?: "").trim()
+        val requested = requestedByDemandId[id] ?: 0.0
+        val effectiveCommitted = effectiveCommittedByDemandId[id] ?: 0.0
+        val shortage = maxOf(0.0, requested - effectiveCommitted)
+        val failed = isFailureReason(row["commit_reason"] as? String)
+        row + mapOf("requested_qty" to requested, "shortage" to shortage, "is_failed" to failed)
+    }
+}
+
 /** Enrich a raw runPlanning() result with pegging flags and KPIs. */
 private fun enrichPlanResultWithData(
     caseId: Int,
@@ -582,9 +709,14 @@ private fun enrichPlanResultWithData(
     val planningPegging = result["planning_pegging"] as? List<Map<String, Any?>> ?: emptyList()
     val bomPairs = getBomRealPairs()
     val moveTriples = getMoveTriples(caseId)
-    val enrichedWos = enrichWorkOrders(workOrders, planningPegging, bomPairs, moveTriples)
+    val enrichedWos = enrichWorkOrders(workOrders, planningPegging, bomPairs, moveTriples, data)
+    val enrichedCommitted = enrichCommittedDemands(
+        result["committed_demands"].let { @Suppress("UNCHECKED_CAST") it as? List<Map<String, Any?>> ?: emptyList() },
+        data
+    )
     val enriched = result.toMutableMap()
     enriched["work_orders"] = enrichedWos
+    enriched["committed_demands"] = enrichedCommitted
     val kpis = planKpis(data, enriched, bomPairs)
     enriched["plan_kpis"] = kpis
     enriched["supply_summary"] = (kpis["inventory"] ?: emptyMap<String, Any?>())
@@ -780,4 +912,12 @@ private fun resolveBomCsv() = run {
 private fun formatTs(ts: kotlinx.datetime.Instant): String {
     val ISO = java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME.withZone(java.time.ZoneOffset.UTC)
     return ISO.format(ts.toJavaInstant())
+}
+
+/** Recursively converts a JsonElement to native Kotlin types so config maps can be read with normal == checks. */
+internal fun jsonElementToNative(element: JsonElement): Any? = when (element) {
+    is JsonNull      -> null
+    is JsonPrimitive -> element.booleanOrNull ?: element.longOrNull ?: element.doubleOrNull ?: element.content
+    is JsonObject    -> element.entries.associate { (k, v) -> k to jsonElementToNative(v) }
+    is JsonArray     -> element.map { jsonElementToNative(it) }
 }

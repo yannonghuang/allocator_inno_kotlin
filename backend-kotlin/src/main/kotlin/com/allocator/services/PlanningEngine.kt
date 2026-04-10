@@ -653,7 +653,9 @@ fun plan(
     }
 
     // 2) Get methods
+    val purchaseAllowed = config?.get("purchase_allowed") != false  // default true
     val methods = getMethods(productId, locationId, data)
+        .let { if (purchaseAllowed) it else it.filter { m -> m["type"] != "purchase" } }
     if (methods.isEmpty()) {
         demandFulfilledList.add(committedRow(demandNetQty, reqTimeStr, "no_methods"))
         return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, reqTimeStr, "no_methods"))
@@ -973,7 +975,7 @@ fun runPlanning(
     if (consolidationConfig.enabled) {
         val needs  = collectComponentNeeds(demands, data, consolidationConfig)
         val groups = groupByTimeBucket(needs, consolidationConfig.periodDays)
-        val result = runConsolidation(groups, inventory, data, consolidationConfig) { dem, inv, dat, reqDt, depth, path, cfg, prefId ->
+        val result = runConsolidation(groups, inventory, data, consolidationConfig, planConfig = config) { dem, inv, dat, reqDt, depth, path, cfg, prefId ->
             plan(dem, inv, dat, reqDt, depth, path, cfg, prefId)
         }
         consolidatedWOs.addAll(result.consolidatedWOs)

@@ -166,7 +166,7 @@ export async function getFeasibleDemands(caseId: number, runId: number): Promise
 }
 
 /** Demand-to-supply planning: returns committed demands (with commit_time), work orders, and planning pegging trees. */
-export type CommittedDemand = { demand_id?: string | null; customer_id?: string | null; customer?: string | null; product_id: string; location_id: string; quantity: number; request_time?: string | null; commit_time: string | null; commit_reason?: string | null };
+export type CommittedDemand = { demand_id?: string | null; customer_id?: string | null; customer?: string | null; product_id: string; location_id: string; quantity: number; requested_qty?: number | null; shortage?: number | null; is_failed?: boolean; request_time?: string | null; commit_time: string | null; commit_reason?: string | null };
 export type WorkOrder = {
   product_id: string;
   location_id: string;
@@ -183,6 +183,28 @@ export type WorkOrder = {
   pegging_includes_buy?: boolean;
   /** True if this WO's pegging includes a real move (TRANSIT_TIME > 0). */
   pegging_includes_real_move?: boolean;
+  /** True if this WO's product+location appears in the pegging trees of more than one demand (shared component). */
+  demanded_by_multiple?: boolean;
+  /** True if this WO's product+location has more than one supply method available in the BOM graph. */
+  multi_supply_available?: boolean;
+  /** Why this supply method (make/move/buy) was chosen — propagated from pegging node. */
+  wo_explanation_method?: string | null;
+  /** Why this BOM variant (ALT_GROUP) was chosen — propagated from pegging node. */
+  wo_explanation_variant?: string | null;
+  /** BOM-graph demand products that also require this component (pid|lid format). */
+  wo_competing_demands?: string[];
+  /** Present on consolidated WOs: "priority_first" | "proportional". */
+  wo_consolidation_split_mode?: string | null;
+  /** Present on consolidated WOs: total qty planned for the merged group. */
+  wo_consolidation_total_planned?: number | null;
+  /** Present on consolidated WOs: per-demand split breakdown. */
+  wo_consolidation_split_details?: Array<{
+    demand_id: string | null;
+    parent_product: string;
+    requested_qty: number;
+    allocated_qty: number;
+    priority: number;
+  }> | null;
 };
 
 /** Planning pegging tree node: demand (root) -> work_order -> ... -> supply | purchase (leaves). */
@@ -244,6 +266,16 @@ export type PlanningConfig = {
   };
   /** When true, score methods by commit_time/inventory/purchase (slower; run is async with progress). */
   method_selection?: { elaborate?: boolean; multiple?: boolean };
+  /** When false, the buy/purchase method is excluded from planning. Default: true. */
+  purchase_allowed?: boolean;
+  /** Consolidate shared component demands within a time bucket before planning. */
+  consolidation?: {
+    enabled?: boolean;
+    /** Width of the time bucket in days (1–365). Default: 7. */
+    period_days?: number;
+    /** How to split consolidated output among competing demands. Default: priority_first. */
+    allocation_mode?: 'priority_first' | 'proportional';
+  };
 };
 
 export type PlanResult = { committed_demands: CommittedDemand[]; work_orders: WorkOrder[]; planning_pegging: PlanningPeggingEntry[] };
