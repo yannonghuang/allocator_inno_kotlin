@@ -47,18 +47,22 @@ import {
 } from '@/lib/api';
 
 /** True if the pegging tree has any make WO that the backend marked as involving a real (non-virtual) BOM link.
- *  Fallback: if backend flag is missing, use BOM (parent, child) pairs from bomRealPairKeys. */
+ *  Fallback: if backend flag is missing, use BOM (parent, child) pairs from bomRealPairKeys.
+ *  A make at location "VIRTUAL" is never considered real. */
 function peggingTreeContainsRealMake(node: PlanningPeggingNode, bomRealPairKeys: Set<string>): boolean {
   if (node.type === 'work_order' && (node.method ?? '').toLowerCase() === 'make') {
-    if ((node as { children_relation?: string }).children_relation === 'and' || (node as { children_relation?: string }).children_relation === 'or') {
-      // Backend has explicitly recognized BOM links for this make; treat that as real.
-      return true;
-    }
-    const parentId = (node.product_id ?? '').trim();
-    if (parentId && bomRealPairKeys.size > 0) {
-      for (const child of node.children ?? []) {
-        const childId = (child.product_id ?? '').trim();
-        if (childId && bomRealPairKeys.has(`${parentId}|${childId}`)) return true;
+    const loc = (node.location_id ?? '').trim().toUpperCase();
+    if (loc !== 'VIRTUAL') {
+      if ((node as { children_relation?: string }).children_relation === 'and' || (node as { children_relation?: string }).children_relation === 'or') {
+        // Backend has explicitly recognized BOM links for this make; treat that as real.
+        return true;
+      }
+      const parentId = (node.product_id ?? '').trim();
+      if (parentId && bomRealPairKeys.size > 0) {
+        for (const child of node.children ?? []) {
+          const childId = (child.product_id ?? '').trim();
+          if (childId && bomRealPairKeys.has(`${parentId}|${childId}`)) return true;
+        }
       }
     }
   }
@@ -269,8 +273,17 @@ export default function CaseDetail() {
   const [planResultTab, setPlanResultTab] = useState<'demands' | 'work_orders'>('demands');
   const [planWorkOrderHideDummyProdArea, setPlanWorkOrderHideDummyProdArea] = useState(true);
   const [planDemandRealMakeOnly, setPlanDemandRealMakeOnly] = useState(false);
+  const [planDemandShortOnly, setPlanDemandShortOnly] = useState(false);
   const [planDemandBuyOnly, setPlanDemandBuyOnly] = useState(false);
   const [planDemandRealMoveOnly, setPlanDemandRealMoveOnly] = useState(false);
+  const [planWoDemandedByMultiple, setPlanWoDemandedByMultiple] = useState(false);
+  const [planWoMultiSupply, setPlanWoMultiSupply] = useState(false);
+  const [planWoPurchaseOnly, setPlanWoPurchaseOnly] = useState(false);
+  const [planWoMoveOnly, setPlanWoMoveOnly] = useState(false);
+  const [woExplainOpen, setWoExplainOpen] = useState(false);
+  const [woExplainRow, setWoExplainRow] = useState<WorkOrder | null>(null);
+  const [woExplainKey, setWoExplainKey] = useState<string | null>(null);
+  const [woPeggingRowKey, setWoPeggingRowKey] = useState<string | null>(null);
   const [bomRealPairs, setBomRealPairs] = useState<[string, string][] | null>(null);
   const [realMoveTriples, setRealMoveTriples] = useState<[string, string, string][] | null>(null);
   const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({});
@@ -286,17 +299,22 @@ export default function CaseDetail() {
   const [copilotResizing, setCopilotResizing] = useState(false);
   const copilotMessagesEndRef = useRef<HTMLDivElement | null>(null);
 
-  /** Rule-based intent: map user message to config updates and a reply for variant and method selection. */
+  /** Rule-based intent: map user message to config updates and a reply for variant, method, and consolidation selection. */
   function parseCopilotIntent(message: string, currentConfig: PlanningConfig): { reply: string; configUpdate?: PlanningConfig } {
     const t = message.trim().toLowerCase();
     const vs = currentConfig.variant_selection ?? {};
+    const cs = currentConfig.consolidation ?? {};
     const multi = vs.multiple;
 
-    if (!t) return { reply: 'You can ask to use a single best variant or split across all feasible variants; or to use one method by preference/score or equal split across methods. Say "show config" to see current settings.' };
+    if (!t) return { reply: 'You can configure variant selection, method selection, or shared-component consolidation. Say "show config" to see current settings.' };
 
     if (/show|current|what('s| is)? (my )?config|settings|config/.test(t)) {
-      const mode = multi === false ? 'single best variant' : 'all feasible variants (equal split)';
-      return { reply: `Current variant selection: **${mode}**. Change it by saying e.g. "use single variant" or "split across all variants".` };
+      const variantMode = multi === false ? 'single best variant' : 'all feasible variants (equal split)';
+      const purchaseMode = currentConfig.purchase_allowed === false ? 'disabled' : 'allowed';
+      const consolidationMode = cs.enabled
+        ? `on · ${cs.period_days ?? 7}d bucket · ${cs.allocation_mode === 'proportional' ? 'proportional' : 'priority-first'} split`
+        : 'off';
+      return { reply: `Variant selection: **${variantMode}**. Purchase: **${purchaseMode}**. Consolidation: **${consolidationMode}**.` };
     }
 
     if (/single|one variant|only one|best variant|use one/.test(t)) {
@@ -306,22 +324,74 @@ export default function CaseDetail() {
       };
     }
 
-    if (/all variants|split|multiple variants|every variant|equal split|divide (across|among)/.test(t)) {
+    if (/all variants|multiple variants|every variant|equal split.*variant|divide (across|among).*variant/.test(t)) {
       return {
-        reply: 'Set variant selection to **all feasible variants** with equal split. Demand will be divided among all feasible BOM/variants (integer quantities when demand is integer). Re-run plan to apply.',
+        reply: 'Set variant selection to **all feasible variants** with equal split. Demand will be divided among all feasible BOM/variants. Re-run plan to apply.',
         configUpdate: { variant_selection: { ...vs, multiple: true } },
+      };
+    }
+
+    if (/no purchase|disable purchase|disallow purchase|no buy|exclude buy|without purchase/.test(t)) {
+      return {
+        reply: 'Purchase (buy method) **disabled**. The planner will not use buy methods; demands will be fulfilled from inventory, make, or move only. Re-run plan to apply.',
+        configUpdate: { purchase_allowed: false },
+      };
+    }
+
+    if (/allow purchase|enable purchase|purchase allowed|include buy|with purchase/.test(t)) {
+      return {
+        reply: 'Purchase (buy method) **allowed**. The planner will use buy methods when available. Re-run plan to apply.',
+        configUpdate: { purchase_allowed: true },
+      };
+    }
+
+    if (/enable consolidat|turn on consolidat|consolidate demand|group demand|shared.?component/.test(t)) {
+      return {
+        reply: `Enabled **shared-component consolidation**. Demands within the same time bucket (currently ${cs.period_days ?? 7} days) that share a component will be grouped into one work order, then output is split by ${cs.allocation_mode === 'proportional' ? 'proportional qty' : 'priority order'}. Re-run plan to apply.`,
+        configUpdate: { consolidation: { ...cs, enabled: true } },
+      };
+    }
+
+    if (/disable consolidat|turn off consolidat|no consolidat/.test(t)) {
+      return {
+        reply: 'Disabled consolidation. Each demand will plan its components independently. Re-run plan to apply.',
+        configUpdate: { consolidation: { ...cs, enabled: false } },
+      };
+    }
+
+    const periodMatch = t.match(/(\d+)\s*(?:-\s*)?day(?:s)?\s*(?:bucket|period|window)/);
+    if (periodMatch || /bucket.*(\d+)|period.*(\d+)/.test(t)) {
+      const m2 = t.match(/(\d+)/);
+      const days = Math.max(1, Math.min(365, parseInt(periodMatch?.[1] ?? m2?.[1] ?? '7', 10)));
+      return {
+        reply: `Set consolidation time bucket to **${days} day${days === 1 ? '' : 's'}**. Re-run plan to apply.`,
+        configUpdate: { consolidation: { ...cs, period_days: days } },
+      };
+    }
+
+    if (/proportional|split by (qty|quantity|share)|by share/.test(t)) {
+      return {
+        reply: 'Set consolidation split policy to **proportional** — output is divided in proportion to each demand\'s requested quantity. Re-run plan to apply.',
+        configUpdate: { consolidation: { ...cs, allocation_mode: 'proportional' } },
+      };
+    }
+
+    if (/priority.?first|fill highest priority|by priority|priority order/.test(t)) {
+      return {
+        reply: 'Set consolidation split policy to **priority-first** — highest-priority demands are filled first from consolidated output. Re-run plan to apply.',
+        configUpdate: { consolidation: { ...cs, allocation_mode: 'priority_first' } },
       };
     }
 
     if (/reset|default|clear/.test(t)) {
       return {
-        reply: 'Reset to default: **all feasible variants** (equal split). Re-run plan to apply.',
-        configUpdate: { variant_selection: { multiple: true } },
+        reply: 'Reset to defaults: all feasible variants (equal split), purchase allowed, consolidation off. Re-run plan to apply.',
+        configUpdate: { variant_selection: { multiple: true }, purchase_allowed: true, consolidation: { enabled: false } },
       };
     }
 
     return {
-      reply: 'I handle variant and method selection for planning. Try: "use single variant", "split across all variants", "equal split across methods", or "show config".',
+      reply: 'I handle variant selection, method selection, purchase, and shared-component consolidation. Try: "no purchase", "allow purchase", "enable consolidation", "set 14 day bucket", "proportional split", "use single variant", or "show config".',
     };
   }
 
@@ -412,8 +482,8 @@ export default function CaseDetail() {
     const product_id = String(row.product_id ?? '').trim();
     const location_id = String(row.location_id ?? '').trim();
     const method = String(row.method ?? '').trim();
-    if (!demand_id || !product_id || !location_id || !method) {
-      const msg = `Missing work-order params (demand_id=${demand_id ? 'set' : 'empty'}, product_id=${product_id ? 'set' : 'empty'}, location_id=${location_id ? 'set' : 'empty'}, method=${method ? 'set' : 'empty'}). Re-run plan so work orders include demand_id.`;
+    if (!product_id || !location_id || !method) {
+      const msg = `Missing work-order params (product_id=${product_id ? 'set' : 'empty'}, location_id=${location_id ? 'set' : 'empty'}, method=${method ? 'set' : 'empty'}).`;
       if (typeof console !== 'undefined' && console.warn) console.warn('[WO pegging]', msg);
       setPlanWorkOrderPeggingError(msg);
       return;
@@ -1648,7 +1718,7 @@ export default function CaseDetail() {
         <h2>Planning</h2>
         <p style={{ fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
           Demand-to-supply planning: takes customer demands and outputs committed demands (with commit_time) and planned work orders.
-          Use <strong>Configure planning (copilot)</strong> to set how variants are chosen (single best vs. split across all).
+          Use <strong>Configure planning (copilot)</strong> to set how variants are chosen (single best vs. split across all), or enable shared-component consolidation.
         </p>
         <div style={{ marginBottom: '0.75rem' }}>
           <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem', cursor: 'pointer' }}>
@@ -1673,6 +1743,57 @@ export default function CaseDetail() {
             />
             <span>Use elaborate method selection (slower, scores by commit/inventory/purchase; ignored when equal split across methods is on)</span>
           </label>
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={planningConfig.purchase_allowed !== false}
+              onChange={(e) => setPlanningConfig((c) => ({ ...c, purchase_allowed: e.target.checked }))}
+            />
+            <span>Purchase allowed (uncheck to exclude buy methods from planning)</span>
+          </label>
+          <div style={{ marginTop: '0.5rem', display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={planningConfig.consolidation?.enabled === true}
+                onChange={(e) => setPlanningConfig((c) => ({
+                  ...c,
+                  consolidation: { ...c.consolidation, enabled: e.target.checked },
+                }))}
+              />
+              <span>Consolidate shared components (group demands within a time bucket into one work order, then split output)</span>
+            </label>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}>
+              <span style={{ color: '#a1a1aa' }}>Bucket (days):</span>
+              <input
+                type="number"
+                min={1}
+                max={365}
+                disabled={planningConfig.consolidation?.enabled !== true}
+                value={planningConfig.consolidation?.period_days ?? 7}
+                onChange={(e) => {
+                  const v = Math.max(1, Math.min(365, parseInt(e.target.value, 10) || 7));
+                  setPlanningConfig((c) => ({ ...c, consolidation: { ...c.consolidation, period_days: v } }));
+                }}
+                style={{ width: 64, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+              />
+            </label>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}>
+              <span style={{ color: '#a1a1aa' }}>Split policy:</span>
+              <select
+                disabled={planningConfig.consolidation?.enabled !== true}
+                value={planningConfig.consolidation?.allocation_mode ?? 'priority_first'}
+                onChange={(e) => setPlanningConfig((c) => ({
+                  ...c,
+                  consolidation: { ...c.consolidation, allocation_mode: e.target.value as 'priority_first' | 'proportional' },
+                }))}
+                style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+              >
+                <option value="priority_first">Priority first</option>
+                <option value="proportional">Proportional</option>
+              </select>
+            </label>
+          </div>
           <br style={{ marginTop: '0.25rem' }} />
           <button
             type="button"
@@ -1779,6 +1900,14 @@ export default function CaseDetail() {
                       />
                       <span>Only demands with pegging including a real move (TRANSIT_TIME &gt; 0)</span>
                     </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input
+                        type="checkbox"
+                        checked={planDemandShortOnly}
+                        onChange={(e) => setPlanDemandShortOnly(e.target.checked)}
+                      />
+                      <span>Short supply only (shortage &gt; 0)</span>
+                    </label>
                     {planDemandRealMakeOnly && (
                       <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>
                         {bomRealPairs === null
@@ -1830,6 +1959,9 @@ export default function CaseDetail() {
                         if (!entry?.tree) return false;
                         return peggingTreeContainsRealMove(entry.tree, moveKeys);
                       });
+                    }
+                    if (planDemandShortOnly) {
+                      list = list.filter((r) => (r.shortage ?? 0) > 0.01);
                     }
                     const byCustomer = list.reduce<Record<string, number>>((acc, r) => {
                       const cName = (r.customer ?? r.customer_id ?? '–') as string;
@@ -1883,18 +2015,47 @@ export default function CaseDetail() {
                           filterPlaceholder="Filter by demand ID, customer, product, location…"
                           defaultSortKey="commit_time"
                           stickyHeader
+                          rowStyle={(r) => {
+                            const k = `demand|${r.demand_id ?? ''}|${r.product_id}|${r.location_id}`;
+                            if (r.is_failed) return { background: 'rgba(248,113,113,0.08)', outline: '1px solid rgba(248,113,113,0.3)' };
+                            if (woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
+                            return undefined;
+                          }}
                           columns={[
                             { key: 'demand_id', label: 'Demand ID', sortable: true, render: (r) => r.demand_id ?? '–' },
                             { key: '_customer', label: 'Customer', sortable: true, render: (r) => (r as { _customer?: string })._customer || (r.customer ?? r.customer_id ?? '–') },
                             { key: 'product_id', label: 'Product', sortable: true },
                             { key: 'location_id', label: 'Location', sortable: true },
-                            { key: 'quantity', label: 'Quantity', sortable: true },
+                            { key: 'requested_qty', label: 'Requested', sortable: true, render: (r) => r.requested_qty != null ? Number(r.requested_qty).toLocaleString() : '–' },
+                            { key: 'quantity', label: 'Committed', sortable: true, render: (r) => r.is_failed
+                              ? <span style={{ color: '#f87171', fontWeight: 600, fontSize: '0.78rem', background: 'rgba(248,113,113,0.15)', padding: '1px 6px', borderRadius: 4 }}>FAILED</span>
+                              : String(r.quantity) },
+                            { key: 'shortage', label: 'Shortage', sortable: true, render: (r) => {
+                              const s = r.shortage ?? 0;
+                              return s > 0.01
+                                ? <span style={{ color: '#f87171', fontWeight: 600 }}>{Number(s).toLocaleString()}</span>
+                                : <span style={{ color: '#4ade80' }}>0</span>;
+                            }},
                             { key: 'request_time', label: 'Request time', sortable: true, render: (r) => r.request_time ?? '–' },
                             { key: 'commit_time', label: 'Commit time', sortable: true, render: (r) => r.commit_time ?? '–' },
-                            { key: 'commit_reason', label: 'Commit reason', sortable: true, render: (r) => r.commit_reason ?? '–' },
-                            { key: '_pegging', label: 'Pegging', sortable: false, render: (r) => (
-                              <button type="button" className="secondary" onClick={() => { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); }}>Show</button>
-                            ) },
+                            { key: 'commit_reason', label: 'Commit reason', sortable: true, render: (r) => r.commit_reason
+                              ? <span style={r.is_failed ? { color: '#f87171' } : undefined}>{r.commit_reason}</span>
+                              : <span style={{ color: '#52525b' }}>–</span> },
+                            { key: '_pegging', label: 'Pegging', sortable: false, render: (r) => {
+                              const k = `demand|${r.demand_id ?? ''}|${r.product_id}|${r.location_id}`;
+                              const isSelected = woPeggingRowKey === k;
+                              return (
+                                <button
+                                  type="button"
+                                  className="secondary"
+                                  style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
+                                  onClick={() => {
+                                    if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); }
+                                    else { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); }
+                                  }}
+                                >Show</button>
+                              );
+                            } },
                           ]}
                         />
                       </>
@@ -1938,6 +2099,46 @@ export default function CaseDetail() {
                       />
                       <span>Only work orders whose pegging includes a real move (TRANSIT_TIME &gt; 0)</span>
                     </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input
+                        type="checkbox"
+                        checked={planWoDemandedByMultiple}
+                        onChange={(e) => setPlanWoDemandedByMultiple(e.target.checked)}
+                      />
+                      <span>Only work orders demanded by multiple demands (shared component in BOM graph)</span>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input
+                        type="checkbox"
+                        checked={planWoMultiSupply}
+                        onChange={(e) => setPlanWoMultiSupply(e.target.checked)}
+                      />
+                      <span>Only work orders with multiple supply methods available (BOM graph)</span>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input
+                        type="checkbox"
+                        checked={planWoPurchaseOnly}
+                        onChange={(e) => setPlanWoPurchaseOnly(e.target.checked)}
+                      />
+                      <span>Purchase orders only (method = buy/purchase)</span>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input
+                        type="checkbox"
+                        checked={planWoMoveOnly}
+                        onChange={(e) => setPlanWoMoveOnly(e.target.checked)}
+                      />
+                      <span>Move orders only (method = move)</span>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input
+                        type="checkbox"
+                        checked={planDemandShortOnly}
+                        onChange={(e) => setPlanDemandShortOnly(e.target.checked)}
+                      />
+                      <span>Short supply only (demand shortage &gt; 0)</span>
+                    </label>
                   </div>
                   {planResult.work_orders.length > 0 && (() => {
                     const workOrdersFiltered = planWorkOrderHideDummyProdArea
@@ -1964,13 +2165,22 @@ export default function CaseDetail() {
                     let workOrderRows = planWorkOrderHideDummyProdArea
                       ? planResult.work_orders.filter((r) => (r.prod_area ?? '').trim().toLowerCase() !== 'dummy')
                       : planResult.work_orders;
+                    // Build set of demand IDs with shortage > 0 for short-supply filter
+                    const shortDemandIds = planDemandShortOnly
+                      ? new Set(planResult.committed_demands.filter((d) => (d.shortage ?? 0) > 0.01).map((d) => d.demand_id ?? ''))
+                      : null;
                     // Filters refer to work-order pegging (each WO's supplies subtree), not demand pegging.
-                    const anyPeggingFilter = planDemandRealMakeOnly || planDemandBuyOnly || planDemandRealMoveOnly;
+                    const anyPeggingFilter = planDemandRealMakeOnly || planDemandBuyOnly || planDemandRealMoveOnly || planWoDemandedByMultiple || planWoMultiSupply || planWoPurchaseOnly || planWoMoveOnly || planDemandShortOnly;
                     if (anyPeggingFilter) {
                       workOrderRows = workOrderRows.filter((r) => {
                         if (planDemandRealMakeOnly && !(r.pegging_includes_real_make === true)) return false;
                         if (planDemandBuyOnly && !(r.pegging_includes_buy === true)) return false;
                         if (planDemandRealMoveOnly && !(r.pegging_includes_real_move === true)) return false;
+                        if (planWoDemandedByMultiple && !(r.demanded_by_multiple === true)) return false;
+                        if (planWoMultiSupply && !(r.multi_supply_available === true)) return false;
+                        if (planWoPurchaseOnly) { const m = (r.method ?? '').toLowerCase(); if (m !== 'buy' && m !== 'purchase') return false; }
+                        if (planWoMoveOnly && (r.method ?? '').toLowerCase() !== 'move') return false;
+                        if (shortDemandIds && !shortDemandIds.has(r.demand_id ?? '')) return false;
                         return true;
                       });
                     }
@@ -2022,6 +2232,12 @@ export default function CaseDetail() {
                     filterPlaceholder="Filter by product, location, PROD_AREA, method…"
                     defaultSortKey="start_time"
                     stickyHeader
+                    rowStyle={(r) => {
+                      const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
+                      if (woExplainKey === k) return { background: 'rgba(167,139,250,0.15)', outline: '1px solid rgba(167,139,250,0.4)' };
+                      if (woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
+                      return undefined;
+                    }}
                     columns={[
                       { key: 'product_id', label: 'Product', sortable: true },
                       { key: 'location_id', label: 'Location', sortable: true },
@@ -2031,9 +2247,38 @@ export default function CaseDetail() {
                       { key: 'end_time', label: 'End time', sortable: true, render: (r) => r.end_time ?? '–' },
                       { key: 'method', label: 'Method', sortable: true },
                       { key: 'location_source', label: 'Location source', sortable: true, render: (r) => r.location_source ?? '–' },
-                      { key: '_pegging', label: 'Pegging', sortable: false, render: (r) => (
-                        <button type="button" className="secondary" onClick={() => { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); }}>Show</button>
-                      ) },
+                      { key: '_pegging', label: 'Pegging', sortable: false, render: (r) => {
+                        const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
+                        const isSelected = woPeggingRowKey === k;
+                        return (
+                          <button
+                            type="button"
+                            className="secondary"
+                            style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
+                            onClick={() => {
+                              if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); }
+                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); }
+                            }}
+                          >Show</button>
+                        );
+                      } },
+                      { key: '_explain', label: 'Explain', sortable: false, render: (r) => {
+                        const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
+                        const isSelected = woExplainKey === k;
+                        if (!(r.wo_explanation_method || r.wo_explanation_variant || (r.wo_competing_demands?.length ?? 0) > 0 || (r.wo_consolidation_split_details?.length ?? 0) > 1))
+                          return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                        return (
+                          <button
+                            type="button"
+                            className="secondary"
+                            style={isSelected ? { background: 'rgba(167,139,250,0.25)', borderColor: '#a78bfa' } : undefined}
+                            onClick={() => {
+                              if (isSelected) { setWoExplainOpen(false); setWoExplainKey(null); setWoExplainRow(null); }
+                              else { setWoExplainRow(r); setWoExplainKey(k); setWoExplainOpen(true); }
+                            }}
+                          >Why</button>
+                        );
+                      }},
                     ]}
                   />
                       </>
@@ -2051,6 +2296,128 @@ export default function CaseDetail() {
         <h2>BOM Graph</h2>
         <BomGraphTab caseId={id} />
       </section>
+      )}
+      {woExplainOpen && woExplainRow && typeof document !== 'undefined' && createPortal(
+        <div
+          style={{ position: 'fixed', inset: 0, zIndex: 9997, display: 'flex', justifyContent: 'flex-end', pointerEvents: 'none' }}
+          role="dialog"
+          aria-label="Work order explanation"
+        >
+          <div
+            style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.4)', pointerEvents: 'auto' }}
+            onClick={() => { setWoExplainOpen(false); setWoExplainKey(null); setWoExplainRow(null); }}
+            aria-hidden
+          />
+          <div
+            style={{
+              position: 'relative', zIndex: 10, width: 420, maxWidth: '90vw', height: '100vh',
+              display: 'flex', flexDirection: 'column', background: '#1c1c1e', color: '#e4e4e7',
+              boxShadow: '-4px 0 24px rgba(0,0,0,0.4)', pointerEvents: 'auto',
+            }}
+          >
+            {/* Header */}
+            <div style={{ padding: '1rem 1.25rem', borderBottom: '1px solid #3d3d40', flexShrink: 0 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.25rem' }}>
+                <h3 style={{ margin: 0, color: '#fafafa', fontSize: '1rem' }}>Work order explanation</h3>
+                <button type="button" onClick={() => { setWoExplainOpen(false); setWoExplainKey(null); setWoExplainRow(null); }} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
+              </div>
+              <p style={{ margin: 0, fontSize: '0.8rem', color: '#a1a1aa' }}>
+                <strong>{woExplainRow.product_id}</strong> @ {woExplainRow.location_id}
+                {woExplainRow.method && <> · <span style={{ color: '#67e8f9' }}>{woExplainRow.method}</span></>}
+                {woExplainRow.prod_area && woExplainRow.prod_area.toLowerCase() !== 'dummy' && <> · {woExplainRow.prod_area}</>}
+              </p>
+            </div>
+            {/* Body */}
+            <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
+              {/* Method choice */}
+              {woExplainRow.wo_explanation_method && (
+                <section style={{ marginBottom: '1.25rem' }}>
+                  <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Method selection</h4>
+                  <p style={{ margin: 0, fontSize: '0.875rem', lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{woExplainRow.wo_explanation_method}</p>
+                </section>
+              )}
+              {/* Variant choice */}
+              {woExplainRow.wo_explanation_variant && (
+                <section style={{ marginBottom: '1.25rem' }}>
+                  <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>BOM variant selection</h4>
+                  <p style={{ margin: 0, fontSize: '0.875rem', lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{woExplainRow.wo_explanation_variant}</p>
+                </section>
+              )}
+              {/* Demand competition */}
+              <section style={{ marginBottom: '1.25rem' }}>
+                <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Demand competition (BOM graph)</h4>
+                {(woExplainRow.wo_competing_demands?.length ?? 0) <= 1 ? (
+                  <p style={{ margin: 0, fontSize: '0.875rem', color: '#71717a' }}>Only one demand product requires this component — no competition.</p>
+                ) : (
+                  <>
+                    <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem' }}>
+                      <strong>{woExplainRow.wo_competing_demands!.length}</strong> demand product(s) require this component per the BOM graph:
+                    </p>
+                    <ul style={{ margin: 0, paddingLeft: '1.25rem', fontSize: '0.8rem', color: '#d4d4d8', lineHeight: 1.6 }}>
+                      {woExplainRow.wo_competing_demands!.map((d) => <li key={d}>{d}</li>)}
+                    </ul>
+                  </>
+                )}
+              </section>
+              {/* Consolidation split */}
+              {woExplainRow.wo_consolidation_split_details && woExplainRow.wo_consolidation_split_details.length > 1 && (
+                <section style={{ marginBottom: '1.25rem' }}>
+                  <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Consolidation split</h4>
+                  <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem' }}>
+                    This work order was consolidated for <strong>{woExplainRow.wo_consolidation_split_details.length}</strong> demands
+                    (total planned: <strong>{(woExplainRow.wo_consolidation_total_planned ?? 0).toLocaleString(undefined, { maximumFractionDigits: 1 })}</strong>).
+                    Split mode: <strong>{woExplainRow.wo_consolidation_split_mode === 'proportional' ? 'Proportional' : 'Priority first'}</strong>.
+                  </p>
+                  <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse' }}>
+                    <thead>
+                      <tr style={{ color: '#a1a1aa', textAlign: 'left' }}>
+                        <th style={{ paddingBottom: '0.2rem' }}>Demand</th>
+                        <th style={{ paddingBottom: '0.2rem' }}>Parent product</th>
+                        <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>Priority</th>
+                        <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>Requested</th>
+                        <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>Allocated</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {woExplainRow.wo_consolidation_split_details.map((row, i) => (
+                        <tr key={i} style={{ borderTop: '1px solid #3d3d40' }}>
+                          <td style={{ padding: '0.2rem 0.4rem 0.2rem 0' }}>{row.demand_id ?? '–'}</td>
+                          <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', color: '#a1a1aa' }}>{row.parent_product}</td>
+                          <td style={{ padding: '0.2rem 0', textAlign: 'right' }}>{row.priority}</td>
+                          <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right' }}>{row.requested_qty.toLocaleString(undefined, { maximumFractionDigits: 1 })}</td>
+                          <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right', color: row.allocated_qty < row.requested_qty - 0.01 ? '#f87171' : '#4ade80' }}>
+                            {row.allocated_qty.toLocaleString(undefined, { maximumFractionDigits: 1 })}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </section>
+              )}
+              {/* Supply alternatives */}
+              <section style={{ marginBottom: '1.25rem' }}>
+                <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Supply alternatives (BOM graph)</h4>
+                {woExplainRow.multi_supply_available ? (
+                  <p style={{ margin: 0, fontSize: '0.875rem' }}>
+                    Multiple supply methods are available for this component in the BOM graph.
+                    {woExplainRow.wo_explanation_method
+                      ? <> See <em>Method selection</em> above for the choice made.</>
+                      : <> No method selection explanation was recorded (this may be a pre-existing inventory supply).</>}
+                  </p>
+                ) : (
+                  <p style={{ margin: 0, fontSize: '0.875rem', color: '#71717a' }}>Only one supply method available for this component — no alternatives.</p>
+                )}
+              </section>
+              {/* No explanation available */}
+              {!woExplainRow.wo_explanation_method && !woExplainRow.wo_explanation_variant && (
+                <p style={{ margin: 0, fontSize: '0.875rem', color: '#71717a' }}>
+                  No method or variant explanation available for this work order. This may occur for consolidated work orders or when only one option existed.
+                </p>
+              )}
+            </div>
+          </div>
+        </div>,
+        document.body
       )}
       {copilotOpen && typeof document !== 'undefined' && createPortal(
         <div
@@ -2114,7 +2481,11 @@ export default function CaseDetail() {
               </div>
               <p style={{ margin: 0, fontSize: '0.8rem', color: '#a1a1aa' }}>
                 <strong>Variants:</strong> {planningConfig.variant_selection?.multiple === false ? 'single best' : 'all feasible (equal split)'}.{' '}
-                <strong>Methods:</strong> {planningConfig.method_selection?.multiple === true ? 'equal split' : planningConfig.method_selection?.elaborate === true ? 'one by score (elaborate)' : 'one by preference'}. Express your requirements in natural language; the system may ask follow-up questions to clarify.
+                <strong>Methods:</strong> {planningConfig.method_selection?.multiple === true ? 'equal split' : planningConfig.method_selection?.elaborate === true ? 'one by score (elaborate)' : 'one by preference'}.{' '}
+                <strong>Purchase:</strong> {planningConfig.purchase_allowed === false ? 'disabled' : 'allowed'}.{' '}
+                <strong>Consolidation:</strong> {planningConfig.consolidation?.enabled === true
+                  ? `on · ${planningConfig.consolidation.period_days ?? 7}d · ${planningConfig.consolidation.allocation_mode === 'proportional' ? 'proportional' : 'priority-first'}`
+                  : 'off'}. Express your requirements in natural language; the system may ask follow-up questions to clarify.
               </p>
             </div>
             <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
@@ -2148,6 +2519,8 @@ export default function CaseDetail() {
                     ...res.config_update!,
                     variant_selection: res.config_update!.variant_selection ? { ...prev.variant_selection, ...res.config_update!.variant_selection } : prev.variant_selection,
                     method_selection: res.config_update!.method_selection ? { ...prev.method_selection, ...res.config_update!.method_selection } : prev.method_selection,
+                    purchase_allowed: 'purchase_allowed' in res.config_update! ? res.config_update!.purchase_allowed : prev.purchase_allowed,
+                    consolidation: res.config_update!.consolidation ? { ...prev.consolidation, ...res.config_update!.consolidation } : prev.consolidation,
                   }));
                   setCopilotMessages((prev) => [...prev, { role: 'assistant', text: res.reply }]);
                 } catch {
@@ -2157,6 +2530,7 @@ export default function CaseDetail() {
                     ...configUpdate,
                     variant_selection: configUpdate.variant_selection ? { ...prev.variant_selection, ...configUpdate.variant_selection } : prev.variant_selection,
                     method_selection: configUpdate.method_selection ? { ...prev.method_selection, ...configUpdate.method_selection } : prev.method_selection,
+                    consolidation: configUpdate.consolidation ? { ...prev.consolidation, ...configUpdate.consolidation } : prev.consolidation,
                   }));
                   setCopilotMessages((prev) => [...prev, { role: 'assistant', text: reply }]);
                 } finally {
@@ -2194,7 +2568,7 @@ export default function CaseDetail() {
         >
           <div
             style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 0, pointerEvents: 'auto' }}
-            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); }}
+            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); }}
             aria-hidden
           />
           <div
@@ -2276,7 +2650,10 @@ export default function CaseDetail() {
                   return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>No plan result.</p>;
                 }
                 const demandIdNorm = String(planPeggingContext.row.demand_id ?? '').trim();
-                const entry = planResult.planning_pegging?.find((e) => String(e.demand_id ?? '').trim() === demandIdNorm);
+                // Use the LAST matching entry: planning_pegging = consolidatedPegging + planningPegging,
+                // so the last entry for a demand_id is the main planning tree (not a consolidation component sub-tree).
+                const matchingEntries = planResult.planning_pegging?.filter((e) => String(e.demand_id ?? '').trim() === demandIdNorm) ?? [];
+                const entry = matchingEntries.length > 0 ? matchingEntries[matchingEntries.length - 1] : undefined;
                 tree = entry?.tree ?? null;
                 if (!tree) {
                   return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>No pegging tree for this demand. Re-run plan to get planning_pegging.</p>;
@@ -2424,13 +2801,12 @@ export default function CaseDetail() {
                         )}
                         {hasChildren
                           ? childrenList.map((child, i) => renderNode(child, `${path}-${i}`, depth + 1))
-                          : (
-                              <p style={{ margin: 0, fontSize: '0.8rem', color: '#71717a' }}>
-                                {node.type === 'work_order'
-                                  ? 'No supply breakdown in pegging for this work order (no component nodes or depth-limited).'
-                                  : 'No work orders — planning failed or no method for this demand.'}
-                              </p>
-                            )}
+                          : node.type === 'demand'
+                            ? <p style={{ margin: 0, fontSize: '0.8rem', color: '#f87171' }}>No work orders — planning could not fulfill this demand (no method or child failed).</p>
+                            : node.type === 'work_order'
+                              ? <p style={{ margin: 0, fontSize: '0.8rem', color: '#71717a' }}>No component breakdown (leaf work order or depth-limited).</p>
+                              : null /* supply/purchase/inventory nodes are leaves — no children is normal */
+                        }
                       </div>
                     )}
                   </div>

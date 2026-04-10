@@ -218,6 +218,7 @@ fun runConsolidation(
     inventory: MutableList<MutableMap<String, Any?>>,
     data: Map<String, List<Map<String, Any?>>>,
     config: ConsolidationConfig,
+    planConfig: Map<String, Any?>? = null,
     planFn: (
         demand: Map<String, Any?>,
         inventory: MutableList<MutableMap<String, Any?>>,
@@ -258,7 +259,7 @@ fun runConsolidation(
                     "demand_tag"  to b["demand_tag"],
                 )
             }.toMutableList()
-            val (committed, wos, pegging) = planFn(syntheticDemand, invCopy, data, group.timeBucket, 500, emptySet(), null, null)
+            val (committed, wos, pegging) = planFn(syntheticDemand, invCopy, data, group.timeBucket, 500, emptySet(), planConfig, null)
             val producedQty = committed.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
             // Mark WOs and add
             wos.forEach { wo ->
@@ -289,14 +290,8 @@ fun runConsolidation(
                     "demand_tag"  to b["demand_tag"],
                 )
             }.toMutableList()
-            val (committed, wos, pegging) = planFn(syntheticDemand, invCopy, data, group.timeBucket, 500, emptySet(), null, null)
+            val (committed, wos, pegging) = planFn(syntheticDemand, invCopy, data, group.timeBucket, 500, emptySet(), planConfig, null)
             val producedQty = committed.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
-
-            // Mark all WOs as consolidated
-            wos.forEach { wo ->
-                consolidatedWOs.add(wo + mapOf("consolidated" to true, "demand_id" to null))
-            }
-            if (pegging != null) consolidatedPegging.add(mapOf("demand_id" to null, "consolidated" to true, "tree" to pegging))
 
             // Split output among demands
             val split = when (config.allocationMode) {
@@ -307,6 +302,29 @@ fun runConsolidation(
                 if (qty <= 1e-12) continue
                 allocation.getOrPut(demandId) { mutableMapOf() }[componentKey] = qty
             }
+
+            // Build split detail list for explanation (one entry per demand in the group)
+            val splitDetails = group.needs.map { need ->
+                mapOf(
+                    "demand_id"     to need.demandId,
+                    "parent_product" to need.parentProductId,
+                    "requested_qty" to need.qty,
+                    "allocated_qty" to (split[need.demandId] ?: 0.0),
+                    "priority"      to need.priority,
+                )
+            }
+
+            // Mark all WOs as consolidated and carry split details
+            wos.forEach { wo ->
+                consolidatedWOs.add(wo + mapOf(
+                    "consolidated" to true,
+                    "demand_id" to null,
+                    "consolidation_split_mode" to config.allocationMode,
+                    "consolidation_total_planned" to producedQty,
+                    "consolidation_split_details" to splitDetails,
+                ))
+            }
+            if (pegging != null) consolidatedPegging.add(mapOf("demand_id" to null, "consolidated" to true, "tree" to pegging))
 
             // Consume from real inventory (claim the consolidated supply upfront)
             consumeFromInventoryForConsolidation(inventory, group.productId, group.locationId, producedQty)

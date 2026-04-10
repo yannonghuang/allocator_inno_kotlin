@@ -23,6 +23,8 @@ type Props<T> = {
   stickyHeader?: boolean;
   /** Max height of the table scroll area when stickyHeader is true (default 70vh). */
   stickyHeaderScrollMaxHeight?: string;
+  /** Optional per-row style (e.g. highlight selected row). */
+  rowStyle?: (row: T) => React.CSSProperties | undefined;
   /** Placeholder for the filter input (e.g. "Filter by customer, product…"). */
   filterPlaceholder?: string;
 };
@@ -35,6 +37,7 @@ export function SortFilterTable<T extends Record<string, unknown>>({
   idKey,
   rowId,
   onRowClick,
+  rowStyle,
   stickyHeader = false,
   stickyHeaderScrollMaxHeight = '70vh',
   filterPlaceholder = 'Filter…',
@@ -143,7 +146,7 @@ export function SortFilterTable<T extends Record<string, unknown>>({
                 key={String(row[idKey] ?? i)}
                 id={rowId?.(row)}
                 onClick={onRowClick ? () => onRowClick(row) : undefined}
-                style={onRowClick ? { cursor: 'pointer' } : undefined}
+                style={{ ...(onRowClick ? { cursor: 'pointer' } : {}), ...rowStyle?.(row) }}
                 role={onRowClick ? 'button' : undefined}
               >
                 {columns.map((col) => (
