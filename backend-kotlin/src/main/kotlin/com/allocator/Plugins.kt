@@ -6,6 +6,8 @@ import com.allocator.api.caseRoutes
 import com.allocator.api.explanationRoutes
 import com.allocator.api.overrideRoutes
 import com.allocator.api.peggingRoutes
+import com.allocator.api.productRoutes
+import com.allocator.api.supplyRoutes
 import com.allocator.api.viewRoutes
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
@@ -78,5 +80,7 @@ fun Application.configureRouting() {
         viewRoutes()
         explanationRoutes()
         bomGraphRoutes()
+        productRoutes()
+        supplyRoutes()
     }
 }
