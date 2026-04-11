@@ -8,6 +8,7 @@ frontend/tsconfig.tsbuildinfo
 backend-kotlin/build/
 backend-kotlin/.gradle/
 backend-kotlin/bin/
+backend-kotlin/.kotlin/
 
 # Environment / secrets
 .env
