@@ -2,9 +2,13 @@
 
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
+import { useTranslations } from 'next-intl';
 import { listCases, createCase, deleteCase, importCsv, type Case as CaseType } from '@/lib/api';
+import { LanguageSwitcher } from '@/app/components/LanguageSwitcher';
 
 export default function Home() {
+  const t = useTranslations('home');
+  const tc = useTranslations('common');
   const [cases, setCases] = useState<CaseType[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -68,27 +72,30 @@ export default function Home() {
 
   return (
     <div>
-      <h1>Supply–Demand Allocator</h1>
+      <LanguageSwitcher />
+      <h1>{t('title')}</h1>
       {error && <p style={{ color: '#f87171' }}>{error}</p>}
       <div style={{ marginBottom: '1rem', display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
         <input
-          placeholder="New case name"
+          placeholder={t('newCasePlaceholder')}
           value={newName}
           onChange={(e) => setNewName(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && handleCreate()}
         />
-        <button onClick={handleCreate} disabled={creating}>Create case</button>
+        <button onClick={handleCreate} disabled={creating}>
+          {creating ? t('creating') : t('createCase')}
+        </button>
       </div>
-      {loading ? <p>Loading…</p> : (
+      {loading ? <p>{t('loadingCases')}</p> : (
         <table>
           <thead>
             <tr>
-              <th>Name</th>
-              <th>Type</th>
-              <th>Demands</th>
-              <th>Supplies</th>
-              <th>Runs</th>
-              <th>Actions</th>
+              <th>{t('columns.name')}</th>
+              <th>{t('columns.type')}</th>
+              <th>{t('columns.demands')}</th>
+              <th>{t('columns.supplies')}</th>
+              <th>{t('columns.runs')}</th>
+              <th>{t('columns.actions')}</th>
             </tr>
           </thead>
           <tbody>
@@ -96,11 +103,11 @@ export default function Home() {
               const hasData    = (c.demand_count ?? 0) > 0 || (c.supply_count ?? 0) > 0;
               const hasAlloc   = (c.run_count ?? 0) > 0;
               const hasPlan    = (c.plan_run_count ?? 0) > 0;
-              const typeLabel  = hasAlloc && hasPlan ? 'Planning + Allocation'
-                               : hasPlan             ? 'Planning'
-                               : hasAlloc            ? 'Allocation'
-                               : hasData             ? '–'
-                               : 'New';
+              const typeLabel  = hasAlloc && hasPlan ? t('caseType.planningAllocation')
+                               : hasPlan             ? t('caseType.planning')
+                               : hasAlloc            ? t('caseType.allocation')
+                               : hasData             ? t('caseType.noRuns')
+                               : t('caseType.new');
               return (
                 <tr key={c.id}>
                   <td><Link href={`/cases/${c.id}`}>{c.name}</Link></td>
@@ -113,12 +120,12 @@ export default function Home() {
                       className="secondary"
                       onClick={() => handleImport(c.id)}
                       disabled={importingId === c.id || hasData}
-                      title={hasData ? 'CSV already imported — delete this case to re-import' : 'Import CSV data'}
+                      title={hasData ? t('importDisabledTooltip') : t('importTooltip')}
                     >
-                      {importingId === c.id ? 'Importing…' : 'Import CSV'}
+                      {importingId === c.id ? t('importing') : t('importCsv')}
                     </button>
                     {' '}
-                    <button className="danger" onClick={() => handleDelete(c.id)}>Delete</button>
+                    <button className="danger" onClick={() => handleDelete(c.id)}>{tc('delete')}</button>
                   </td>
                 </tr>
               );
@@ -126,7 +133,7 @@ export default function Home() {
           </tbody>
         </table>
       )}
-      {!loading && cases.length === 0 && <p>No cases yet. Create one and import CSV data.</p>}
+      {!loading && cases.length === 0 && <p>{t('noCases')}</p>}
     </div>
   );
 }

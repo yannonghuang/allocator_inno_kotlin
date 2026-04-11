@@ -3,9 +3,11 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
+import { useTranslations } from 'next-intl';
 import { getRun, getExplanations, getPegging } from '@/lib/api';
 
 export default function RunDetail() {
+  const t = useTranslations('runDetail');
   const params = useParams();
   const caseId = Number(params.id);
   const runId = Number(params.runId);
@@ -54,8 +56,8 @@ export default function RunDetail() {
     }
   };
 
-  if (loading) return <div><Link href={`/cases/${caseId}`}>← Case</Link><p>Loading…</p></div>;
-  if (!runDetail) return <div><Link href={`/cases/${caseId}`}>← Case</Link><p>Run not found</p></div>;
+  if (loading) return <div><Link href={`/cases/${caseId}`}>{t('backToCase')}</Link><p>Loading…</p></div>;
+  if (!runDetail) return <div><Link href={`/cases/${caseId}`}>{t('backToCase')}</Link><p>{t('backToCase')}</p></div>;
 
   const criticalPath = peggingData?.critical_path?.path ?? [];
   const pathsByDemand = peggingData?.critical_paths_by_demand?.paths_by_demand ?? [];
@@ -72,23 +74,27 @@ export default function RunDetail() {
 
   return (
     <div>
-      <p><Link href={`/cases/${caseId}`}>← Case</Link></p>
-      <h1>Run {runId} – {runDetail.run.status}</h1>
+      <p><Link href={`/cases/${caseId}`}>{t('backToCase')}</Link></p>
+      <h1>{t('run')} {runId} – {runDetail.run.status}</h1>
       {error && <p style={{ color: '#f87171' }}>{error}</p>}
 
       <section style={{ marginTop: '1.5rem' }}>
-        <h2>Explainability: why is this supply split?</h2>
+        <h2>{t('explainTitle')}</h2>
         <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-          <input placeholder="Supply ID or product_id|location_id" value={supplyId} onChange={(e) => setSupplyId(e.target.value)} style={{ minWidth: 280 }} />
-          <button onClick={loadExplanations}>Show split</button>
+          <input placeholder={t('supplyIdPlaceholder')} value={supplyId} onChange={(e) => setSupplyId(e.target.value)} style={{ minWidth: 280 }} />
+          <button onClick={loadExplanations}>{t('showSplit')}</button>
         </div>
         {explanations !== null && (
           <table style={{ marginTop: '0.5rem' }}>
             <thead>
-              <tr><th>Demand ID</th><th>Quantity</th><th>Reason</th></tr>
+              <tr>
+                <th>{t('columns.demandId')}</th>
+                <th>{t('columns.quantity')}</th>
+                <th>{t('columns.reason')}</th>
+              </tr>
             </thead>
             <tbody>
-              {explanations.length === 0 ? <tr><td colSpan={3}>No split (supply not used or invalid key)</td></tr> : explanations.map((s) => (
+              {explanations.length === 0 ? <tr><td colSpan={3}>{t('noSplit')}</td></tr> : explanations.map((s) => (
                 <tr key={s.demand_id}>
                   <td>{s.demand_id}</td>
                   <td>{s.quantity}</td>
@@ -101,35 +107,35 @@ export default function RunDetail() {
       </section>
 
       <section style={{ marginTop: '2rem' }}>
-        <h2>Pegging view</h2>
+        <h2>{t('peggingTitle')}</h2>
         <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center', marginBottom: '0.5rem' }}>
           <select value={peggingDirection} onChange={(e) => setPeggingDirection(e.target.value as 'demand-to-supply' | 'supply-to-demand')}>
-            <option value="demand-to-supply">Demand → Supply</option>
-            <option value="supply-to-demand">Supply → Demand</option>
+            <option value="demand-to-supply">{t('demandToSupply')}</option>
+            <option value="supply-to-demand">{t('supplyToDemand')}</option>
           </select>
           {peggingDirection === 'demand-to-supply' && (
             <>
-              <label>Demand ID</label>
-              <input placeholder="demand_id" value={peggingDemandId} onChange={(e) => setPeggingDemandId(e.target.value)} />
+              <label>{t('demandIdLabel')}</label>
+              <input placeholder={t('demandIdPlaceholder')} value={peggingDemandId} onChange={(e) => setPeggingDemandId(e.target.value)} />
             </>
           )}
           {peggingDirection === 'supply-to-demand' && (
             <>
-              <label>Supply ID</label>
-              <input placeholder="supply_id" value={peggingSupplyId} onChange={(e) => setPeggingSupplyId(e.target.value)} />
+              <label>{t('supplyIdLabel')}</label>
+              <input placeholder={t('supplyIdPlaceholder2')} value={peggingSupplyId} onChange={(e) => setPeggingSupplyId(e.target.value)} />
             </>
           )}
-          <button onClick={loadPegging}>Load graph</button>
+          <button onClick={loadPegging}>{t('loadGraph')}</button>
         </div>
         {peggingData && (
           <>
             <p><strong>Nodes:</strong> {peggingData.nodes.length} &nbsp; <strong>Edges:</strong> {peggingData.edges.length}</p>
             {criticalPath.length > 0 && (
-              <p><strong>Critical path (min-sum):</strong> <code>{criticalPath.join(' → ')}</code></p>
+              <p><strong>{t('criticalPathMinSum')}</strong> <code>{criticalPath.join(' → ')}</code></p>
             )}
             {pathsByDemand.length > 0 && (
               <div>
-                <strong>Critical path per demand (supply→demand):</strong>
+                <strong>{t('criticalPathPerDemand')}</strong>
                 <ul>
                   {pathsByDemand.map((p) => (
                     <li key={p.demand_id}>{p.demand_id}: <code>{p.path.join(' → ') || '–'}</code></li>
@@ -157,11 +163,11 @@ export default function RunDetail() {
                   );
                 })}
               </svg>
-              <p style={{ fontSize: '0.75rem', color: '#a1a1aa' }}>Purple = critical path node</p>
+              <p style={{ fontSize: '0.75rem', color: '#a1a1aa' }}>{t('purpleNode')}</p>
             </div>
             <div style={{ marginTop: '0.5rem', fontSize: '0.875rem' }}>
               <details>
-                <summary>Node list</summary>
+                <summary>{t('nodeList')}</summary>
                 <pre style={{ background: '#18181b', padding: '0.5rem', overflow: 'auto' }}>{JSON.stringify(peggingData.nodes.slice(0, 30), null, 2)}{peggingData.nodes.length > 30 ? '\n...' : ''}</pre>
               </details>
             </div>

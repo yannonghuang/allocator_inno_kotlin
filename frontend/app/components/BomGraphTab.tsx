@@ -1,10 +1,12 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
+import { useTranslations } from 'next-intl';
 import { BomTree, type BomDirection } from '@/app/components/BomTree';
 import { getBomGraph, type BomGraphResponse } from '@/lib/api';
 
 export default function BomGraphTab({ caseId }: { caseId: number }) {
+  const t = useTranslations('bomGraph');
   const [data,      setData]      = useState<BomGraphResponse | null>(null);
   const [loading,   setLoading]   = useState(true);
   const [error,     setError]     = useState<string | null>(null);
@@ -53,10 +55,10 @@ export default function BomGraphTab({ caseId }: { caseId: number }) {
       .map(([id]) => id));
   }, [data]);
 
-  if (loading) return <p style={{ color: '#a1a1aa' }}>Loading BOM graph…</p>;
+  if (loading) return <p style={{ color: '#a1a1aa' }}>{t('loading')}</p>;
   if (error)   return <p style={{ color: '#f87171' }}>Error: {error}</p>;
   if (!data || data.nodes.length === 0)
-    return <p style={{ color: '#a1a1aa' }}>No BOM graph nodes found for this case.</p>;
+    return <p style={{ color: '#a1a1aa' }}>{t('noData')}</p>;
 
   const toggleFilter = (f: 'raw' | 'finished' | 'shared') =>
     setActiveFilters(prev => { const s = new Set(prev); s.has(f) ? s.delete(f) : s.add(f); return s; });
@@ -90,14 +92,14 @@ export default function BomGraphTab({ caseId }: { caseId: number }) {
 
       {/* stats row */}
       <p style={{ color: '#a1a1aa', fontSize: '0.82em', margin: 0 }}>
-        <strong style={{ color: '#e4e4e7' }}>{data.nodeCount}</strong> nodes &nbsp;·&nbsp;
-        <strong style={{ color: '#e4e4e7' }}>{data.edgeCount}</strong> edges &nbsp;·&nbsp;
-        {data.nodes.filter(n => n.isDemand).length} demand roots
+        <strong style={{ color: '#e4e4e7' }}>{data.nodeCount}</strong> {t('statsNodes')} &nbsp;·&nbsp;
+        <strong style={{ color: '#e4e4e7' }}>{data.edgeCount}</strong> {t('statsEdges')} &nbsp;·&nbsp;
+        {data.nodes.filter(n => n.isDemand).length} {t('statsDemandRoots')}
         &nbsp;·&nbsp;
         <span style={{ color: '#71717a' }}>
-          Within AND groups children are all required; between OR groups choose one alternative.
-          <span style={{ color: '#3b82f6' }}> Blue bracket</span> = AND.
-          <span style={{ color: '#a78bfa' }}> OR</span> = alternatives.
+          {t('andOrInfo')}
+          <span style={{ color: '#3b82f6' }}> {t('andBracket')}</span> {t('andBracketDesc')}
+          <span style={{ color: '#a78bfa' }}> {t('orLabel')}</span> {t('orDesc')}
         </span>
       </p>
 
@@ -107,14 +109,14 @@ export default function BomGraphTab({ caseId }: { caseId: number }) {
         {/* node search list */}
         <div style={{ flex: '1 1 260px', minWidth: 200, maxWidth: 380 }}>
           <div style={{ color: '#a1a1aa', fontSize: '0.82em', marginBottom: 4 }}>
-            Starting node
+            {t('startingNode')}
           </div>
           {/* filter pills */}
           <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap', marginBottom: 6 }}>
             {([
-              { key: 'raw',      label: `Raw material`,           count: rawCount,      title: 'No make or move edges point to it — must be procured directly' },
-              { key: 'finished', label: `Finished good`,          count: finishedCount, title: 'Not used as a component in any other product' },
-              { key: 'shared',   label: `Shared component`,       count: sharedCount,   title: 'Contributes to 2 or more distinct parent products' },
+              { key: 'raw',      label: t('filterRaw'),      count: rawCount,      title: t('filterRawTooltip') },
+              { key: 'finished', label: t('filterFinished'),  count: finishedCount, title: t('filterFinishedTooltip') },
+              { key: 'shared',   label: t('filterShared'),    count: sharedCount,   title: t('filterSharedTooltip') },
             ] as const).map(({ key, label, count, title }) => (
               <button
                 key={key}
@@ -130,7 +132,7 @@ export default function BomGraphTab({ caseId }: { caseId: number }) {
           </div>
           <input
             type="text"
-            placeholder="Search product or location…"
+            placeholder={t('searchPlaceholder')}
             value={search}
             onChange={e => setSearch(e.target.value)}
             style={{ width: '100%', marginBottom: 4 }}
@@ -140,7 +142,7 @@ export default function BomGraphTab({ caseId }: { caseId: number }) {
             borderRadius: 6, maxHeight: 200, overflow: 'auto',
           }}>
             {sorted.length === 0 && (
-              <div style={{ padding: '6px 10px', color: '#71717a', fontSize: '0.85em' }}>No matches</div>
+              <div style={{ padding: '6px 10px', color: '#71717a', fontSize: '0.85em' }}>{t('noMatches')}</div>
             )}
             {sorted.map(n => (
               <div
@@ -159,9 +161,9 @@ export default function BomGraphTab({ caseId }: { caseId: number }) {
                 <div>
                   <span style={{ color: '#e4e4e7' }}>{n.productId}</span>
                   <span style={{ color: '#71717a' }}> @ {n.locationId}</span>
-                  {n.isDemand   && <span style={{ marginLeft: 5, fontSize: '0.68em', padding: '1px 4px', borderRadius: 3, background: '#2d2d30', color: '#a78bfa' }}>demand</span>}
-                  {isRaw(n.id)  && <span style={{ marginLeft: 5, fontSize: '0.68em', padding: '1px 4px', borderRadius: 3, background: '#2d2d30', color: '#f59e0b' }}>raw</span>}
-                  {isShared(n.id) && <span style={{ marginLeft: 5, fontSize: '0.68em', padding: '1px 4px', borderRadius: 3, background: '#2d2d30', color: '#22c55e' }}>shared</span>}
+                  {n.isDemand   && <span style={{ marginLeft: 5, fontSize: '0.68em', padding: '1px 4px', borderRadius: 3, background: '#2d2d30', color: '#a78bfa' }}>{t('orLabel') === '或' ? '需求' : 'demand'}</span>}
+                  {isRaw(n.id)  && <span style={{ marginLeft: 5, fontSize: '0.68em', padding: '1px 4px', borderRadius: 3, background: '#2d2d30', color: '#f59e0b' }}>{t('filterRaw')}</span>}
+                  {isShared(n.id) && <span style={{ marginLeft: 5, fontSize: '0.68em', padding: '1px 4px', borderRadius: 3, background: '#2d2d30', color: '#22c55e' }}>{t('filterShared')}</span>}
                 </div>
                 {n.productDescription && (
                   <div style={{ color: '#71717a', fontSize: '0.78em', marginTop: 1 }}>{n.productDescription}</div>
@@ -174,25 +176,25 @@ export default function BomGraphTab({ caseId }: { caseId: number }) {
         {/* direction + selected summary */}
         {selectedNode && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-            <div style={{ color: '#a1a1aa', fontSize: '0.82em' }}>Browse direction</div>
+            <div style={{ color: '#a1a1aa', fontSize: '0.82em' }}>{t('direction')}</div>
             <div style={{ display: 'flex', gap: '0.5rem' }}>
               <button
                 type="button"
                 className={direction === 'demand-to-supply' ? '' : 'secondary'}
                 onClick={() => setDirection('demand-to-supply')}
               >
-                Demand → Supply
+                {t('directionDemandToSupply')}
               </button>
               <button
                 type="button"
                 className={direction === 'supply-to-demand' ? '' : 'secondary'}
                 onClick={() => setDirection('supply-to-demand')}
               >
-                Supply → Demand
+                {t('directionSupplyToDemand')}
               </button>
             </div>
             <div style={{ fontSize: '0.82em', color: '#a1a1aa' }}>
-              Starting:{' '}
+              {t('startingLabel')}{' '}
               <strong style={{ color: '#e4e4e7' }}>
                 {selectedNode.productId} @ {selectedNode.locationId}
               </strong>

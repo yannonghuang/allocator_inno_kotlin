@@ -4,6 +4,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
+import { useTranslations } from 'next-intl';
+import { LanguageSwitcher } from '@/app/components/LanguageSwitcher';
 import {
   getCase,
   getFeasibleDemands,
@@ -104,6 +106,7 @@ function PlanKpiDashboard({
     supply_summary?: { initial_total: number; consumed_total: number; consumption_rate: number | null };
   };
 }) {
+  const tK = useTranslations('planning.planKpis');
   let kpis: PlanKpis;
   if (planResult.plan_kpis && typeof planResult.plan_kpis === 'object') {
     kpis = planResult.plan_kpis;
@@ -153,49 +156,49 @@ function PlanKpiDashboard({
   );
   return (
     <div style={{ marginTop: '1rem', marginBottom: '1rem', padding: '1rem', background: 'rgba(0,0,0,0.2)', borderRadius: 8, border: '1px solid #52525b' }}>
-      <h4 style={{ margin: '0 0 0.75rem', fontSize: '1rem', color: '#e4e4e7', fontWeight: 600 }}>Plan KPIs</h4>
+      <h4 style={{ margin: '0 0 0.75rem', fontSize: '1rem', color: '#e4e4e7', fontWeight: 600 }}>{tK('title')}</h4>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem' }}>
-        {card('Delivery performance', [
-          { label: 'Fill rate', value: d.fill_rate_pct != null ? `${Number(d.fill_rate_pct).toFixed(1)}%` : '–' },
-          { label: 'Committed / requested', value: `${Number(d.total_committed ?? 0).toLocaleString()} / ${Number(d.total_requested ?? 0).toLocaleString()}` },
-          { label: 'On time (demands)', value: `${d.on_time_count ?? 0} / ${d.demand_count ?? 0}` },
+        {card(tK('delivery'), [
+          { label: tK('fillRate'), value: d.fill_rate_pct != null ? `${Number(d.fill_rate_pct).toFixed(1)}%` : '–' },
+          { label: tK('committedRequested'), value: `${Number(d.total_committed ?? 0).toLocaleString()} / ${Number(d.total_requested ?? 0).toLocaleString()}` },
+          { label: tK('onTime'), value: `${d.on_time_count ?? 0} / ${d.demand_count ?? 0}` },
           (() => {
             const denom = d.fulfilled_with_tree_count ?? d.demand_count ?? 0;
-            if (!denom) return { label: 'Fulfilled by new builds', value: '–' };
+            if (!denom) return { label: tK('fulfilledByBuilds'), value: '–' };
             const count = d.fulfilled_by_real_make_count ?? 0;
             const pct = ((count / denom) * 100).toFixed(1);
             return {
-              label: 'Fulfilled by new builds',
+              label: tK('fulfilledByBuilds'),
               value: `${count} / ${denom} (${pct}%)`,
             };
           })(),
           (() => {
             const denom = d.fulfilled_with_tree_count ?? d.demand_count ?? 0;
-            if (!denom) return { label: 'Fulfilled by inventories', value: '–' };
+            if (!denom) return { label: tK('fulfilledByInventory'), value: '–' };
             const count = d.fulfilled_by_inventory_only_count ?? 0;
             const pct = ((count / denom) * 100).toFixed(1);
             return {
-              label: 'Fulfilled by inventories',
+              label: tK('fulfilledByInventory'),
               value: `${count} / ${denom} (${pct}%)`,
             };
           })(),
         ], '#34d399')}
-        {card('Inventory consumption', [
-          { label: 'Consumption rate', value: inv.consumption_rate != null ? `${(Number(inv.consumption_rate) * 100).toFixed(1)}%` : '–' },
-          { label: 'Consumed', value: Number(inv.consumed_total ?? 0).toLocaleString() },
-          { label: 'Initial supply', value: Number(inv.initial_total ?? 0).toLocaleString() },
+        {card(tK('inventory'), [
+          { label: tK('consumptionRate'), value: inv.consumption_rate != null ? `${(Number(inv.consumption_rate) * 100).toFixed(1)}%` : '–' },
+          { label: tK('consumed'), value: Number(inv.consumed_total ?? 0).toLocaleString() },
+          { label: tK('initialSupply'), value: Number(inv.initial_total ?? 0).toLocaleString() },
         ], '#a78bfa')}
-        {card('Procurement (buy)', [
-          { label: 'Orders', value: String(proc.order_count ?? 0) },
-          { label: 'Total quantity', value: Number(proc.total_quantity ?? 0).toLocaleString() },
+        {card(tK('procurement'), [
+          { label: tK('orders'), value: String(proc.order_count ?? 0) },
+          { label: tK('totalQuantity'), value: Number(proc.total_quantity ?? 0).toLocaleString() },
         ], '#f59e0b')}
-        {card('Manufacturing (make)', [
-          { label: 'Orders', value: String(mfg.order_count ?? 0) },
-          { label: 'Total quantity', value: Number(mfg.total_quantity ?? 0).toLocaleString() },
+        {card(tK('manufacturing'), [
+          { label: tK('orders'), value: String(mfg.order_count ?? 0) },
+          { label: tK('totalQuantity'), value: Number(mfg.total_quantity ?? 0).toLocaleString() },
         ], '#3b82f6')}
-        {card('Logistics (move)', [
-          { label: 'Orders', value: String(log.order_count ?? 0) },
-          { label: 'Total quantity', value: Number(log.total_quantity ?? 0).toLocaleString() },
+        {card(tK('logistics'), [
+          { label: tK('orders'), value: String(log.order_count ?? 0) },
+          { label: tK('totalQuantity'), value: Number(log.total_quantity ?? 0).toLocaleString() },
         ], '#06b6d4')}
       </div>
     </div>
@@ -258,6 +261,11 @@ import { PeggingTree, pathKeyFromPath, type PeggingGraph } from '@/app/component
 import BomGraphTab from '@/app/components/BomGraphTab';
 
 export default function CaseDetail() {
+  const tNav = useTranslations('nav');
+  const tSec = useTranslations('sections');
+  const tA = useTranslations('allocation');
+  const tP = useTranslations('planning');
+  const tc = useTranslations('common');
   const params = useParams();
   const id = Number(params.id);
   const [c, setC] = useState<CaseType | null>(null);
@@ -1365,12 +1373,13 @@ export default function CaseDetail() {
   };
 
   if (loading || !c) {
-    return <div><Link href="/">← Cases</Link>{loading ? <p>Loading…</p> : <p>Not found</p>}</div>;
+    return <div><Link href="/">{tNav('backToCases')}</Link>{loading ? <p>{tc('loading')}</p> : <p>{tc('notFound')}</p>}</div>;
   }
 
   return (
     <div>
-      <p><Link href="/">← Cases</Link></p>
+      <LanguageSwitcher />
+      <p><Link href="/">{tNav('backToCases')}</Link></p>
       <h1>{c.name}</h1>
       {error && <p style={{ color: '#f87171' }}>{error}</p>}
       <nav style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem', borderBottom: '1px solid #e4e4e7', paddingBottom: '0.5rem' }}>
@@ -1379,32 +1388,32 @@ export default function CaseDetail() {
           className={caseSection === 'allocation' ? '' : 'secondary'}
           onClick={() => setCaseSection('allocation')}
         >
-          Allocation
+          {tSec('allocation')}
         </button>
         <button
           type="button"
           className={caseSection === 'planning' ? '' : 'secondary'}
           onClick={() => setCaseSection('planning')}
         >
-          Planning
+          {tSec('planning')}
         </button>
         <button
           type="button"
           className={caseSection === 'bom-graph' ? '' : 'secondary'}
           onClick={() => setCaseSection('bom-graph')}
         >
-          BOM Graph
+          {tSec('bomGraph')}
         </button>
       </nav>
       {caseSection === 'allocation' && (
       <section>
-        <h2>Allocation</h2>
-        <button onClick={handleAllocate} disabled={allocating}>{allocating ? 'Running…' : 'Run allocation'}</button>
+        <h2>{tSec('allocation')}</h2>
+        <button onClick={handleAllocate} disabled={allocating}>{allocating ? tA('running') : tA('runAllocation')}</button>
         {allocating && allocationProgress != null && (
           <div style={{ marginTop: '0.75rem', maxWidth: 420 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.875rem', marginBottom: '0.25rem', color: '#64748b' }}>
-              <span>Steps: {(allocationProgress.steps ?? 0).toLocaleString()} / {(allocationProgress.max_steps ?? 0).toLocaleString()}</span>
-              <span>Basket: {allocationProgress.basket_keys ?? 0} items, {(Number(allocationProgress.basket_total_qty) ?? 0).toLocaleString()} qty</span>
+              <span>{tA('progress.steps')} {(allocationProgress.steps ?? 0).toLocaleString()} / {(allocationProgress.max_steps ?? 0).toLocaleString()}</span>
+              <span>{tA('progress.basket')} {allocationProgress.basket_keys ?? 0} {tA('progress.items')}, {(Number(allocationProgress.basket_total_qty) ?? 0).toLocaleString()} {tA('progress.qty')}</span>
             </div>
             <div style={{ height: 8, backgroundColor: '#e2e8f0', borderRadius: 4, overflow: 'hidden' }}>
               <div
@@ -1422,8 +1431,8 @@ export default function CaseDetail() {
             <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginTop: '0.25rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <span>
                 {(Number(allocationProgress.initial_basket_total_qty) ?? 0) > 0
-                  ? `${((1 - (Number(allocationProgress.basket_total_qty) ?? 0) / (Number(allocationProgress.initial_basket_total_qty) ?? 1)) * 100).toFixed(1)}% of basket allocated`
-                  : `${(100 * (Number(allocationProgress.steps) ?? 0) / (Number(allocationProgress.max_steps) ?? 1)).toFixed(1)}% of steps`}
+                  ? `${((1 - (Number(allocationProgress.basket_total_qty) ?? 0) / (Number(allocationProgress.initial_basket_total_qty) ?? 1)) * 100).toFixed(1)}% ${tA('progress.pctAllocated')}`
+                  : `${(100 * (Number(allocationProgress.steps) ?? 0) / (Number(allocationProgress.max_steps) ?? 1)).toFixed(1)}% ${tA('progress.pctSteps')}`}
               </span>
               {etaRemainingSeconds != null && etaRemainingSeconds > 0 && (
                 <span style={{ fontWeight: 500, color: '#64748b' }}>
@@ -1431,7 +1440,7 @@ export default function CaseDetail() {
                     ? `${Math.floor(etaRemainingSeconds / 3600)} h ${Math.floor((etaRemainingSeconds % 3600) / 60)} min`
                     : etaRemainingSeconds >= 60
                       ? `${Math.floor(etaRemainingSeconds / 60)} min ${Math.round(etaRemainingSeconds % 60)} s`
-                      : `${Math.round(etaRemainingSeconds)} s`} left
+                      : `${Math.round(etaRemainingSeconds)} s`} {tA('progress.left')}
                 </span>
               )}
             </div>
@@ -1439,26 +1448,25 @@ export default function CaseDetail() {
         )}
         {runs.length > 0 && (
           <div style={{ marginTop: '1rem' }}>
-            <label>Run: </label>
+            <label>{tA('run')} </label>
             <select value={selectedRunId ?? ''} onChange={(e) => setSelectedRunId(Number(e.target.value))}>
               {runs.map((r) => (
                 <option key={r.id} value={r.id}>{new Date(r.created_at).toLocaleString()} – {r.status}</option>
               ))}
             </select>
             {' '}
-            <Link href={`/cases/${id}/runs/${selectedRunId}`} className="btn">Explainability & Pegging</Link>
+            <Link href={`/cases/${id}/runs/${selectedRunId}`} className="btn">{tA('explainabilityPegging')}</Link>
           </div>
         )}
         {selectedRunId && (
           <>
-            <h3 style={{ marginTop: '1.5rem' }}>Views</h3>
             <div style={{ marginBottom: '0.5rem' }}>
               <button
                 type="button"
                 className={activeView === 'supply' ? '' : 'secondary'}
                 onClick={() => setActiveView('supply')}
               >
-                Supply view
+                {tA('views.supply')}
               </button>
               {' '}
               <button
@@ -1466,7 +1474,7 @@ export default function CaseDetail() {
                 className={activeView === 'allocation' ? '' : 'secondary'}
                 onClick={() => setActiveView('allocation')}
               >
-                Allocation view
+                {tA('views.allocation')}
               </button>
               {' '}
               <button
@@ -1474,7 +1482,7 @@ export default function CaseDetail() {
                 className={activeView === 'suggested' ? '' : 'secondary'}
                 onClick={() => setActiveView('suggested')}
               >
-                Demand view
+                {tA('views.demand')}
               </button>
               {' '}
               <button
@@ -1482,13 +1490,13 @@ export default function CaseDetail() {
                 className={activeView === 'raw-material' ? '' : 'secondary'}
                 onClick={() => setActiveView('raw-material')}
               >
-                Raw material usage
+                {tA('views.rawMaterial')}
               </button>
             </div>
             {activeView === 'supply' && (
               <>
                 {supplyViewLoading && supplyView.length === 0 && (
-                  <p style={{ color: '#71717a' }}>Loading supply…</p>
+                  <p style={{ color: '#71717a' }}>{tA('supplyView.loading')}</p>
                 )}
                 {!supplyViewLoading && supplyView.length <= 1 && supplyView.length > 0 && (
                   <p style={{ fontSize: '0.875rem', color: '#71717a', marginBottom: '0.5rem' }}>
@@ -1998,32 +2006,30 @@ export default function CaseDetail() {
       )}
       {caseSection === 'planning' && (
       <section>
-        <h2>Planning</h2>
+        <h2>{tSec('planning')}</h2>
         <p style={{ fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
-          Demand-to-supply planning: takes customer demands and outputs committed demands (with commit_time) and planned work orders.
-          Use <strong>Configure planning (copilot)</strong> to set how variants are chosen (single best vs. split across all), or enable shared-component consolidation.
+          {tP('info')} <strong>{tP('infoConfigureLink')}</strong> {tP('infoSuffix')}
         </p>
 
         {/* ── Overrides management panel ─────────────────────────────────────── */}
         <details style={{ marginBottom: '1rem', border: '1px solid #3d3d40', borderRadius: 6, padding: '0.5rem 0.75rem' }}>
           <summary style={{ cursor: 'pointer', fontSize: '0.9rem', fontWeight: 600, color: '#e4e4e7', userSelect: 'none' }}>
-            User overrides {overrides.length > 0 && <span style={{ marginLeft: 6, background: '#3b82f6', color: '#fff', borderRadius: 10, padding: '1px 7px', fontSize: '0.75rem' }}>{overrides.length}</span>}
+            {tP('overridesPanel.title')} {overrides.length > 0 && <span style={{ marginLeft: 6, background: '#3b82f6', color: '#fff', borderRadius: 10, padding: '1px 7px', fontSize: '0.75rem' }}>{overrides.length}</span>}
           </summary>
           <div style={{ marginTop: '0.75rem' }}>
             <p style={{ fontSize: '0.8rem', color: '#a1a1aa', marginBottom: '0.75rem' }}>
-              Overrides let you manually control: method selection (make/move/buy), BOM variant selection (ALT_GROUP), or component split allocation among competing demands.
-              Active overrides are applied on the next plan run.
+              {tP('overridesPanel.info')}
             </p>
             {overrides.length === 0 && (
-              <p style={{ fontSize: '0.85rem', color: '#52525b', marginBottom: '0.5rem' }}>No overrides set. Use the &ldquo;Override&rdquo; button on a work order in the results table to create one.</p>
+              <p style={{ fontSize: '0.85rem', color: '#52525b', marginBottom: '0.5rem' }}>{tP('overridesPanel.noOverrides')}</p>
             )}
             {overrides.length > 0 && (
               <table style={{ width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse', marginBottom: '0.75rem' }}>
                 <thead>
                   <tr style={{ color: '#a1a1aa', textAlign: 'left', borderBottom: '1px solid #3d3d40' }}>
-                    <th style={{ paddingBottom: '0.3rem', paddingRight: '0.75rem' }}>Type</th>
-                    <th style={{ paddingBottom: '0.3rem', paddingRight: '0.75rem' }}>Entity key</th>
-                    <th style={{ paddingBottom: '0.3rem', paddingRight: '0.75rem' }}>Payload</th>
+                    <th style={{ paddingBottom: '0.3rem', paddingRight: '0.75rem' }}>{tP('overridesPanel.columns.type')}</th>
+                    <th style={{ paddingBottom: '0.3rem', paddingRight: '0.75rem' }}>{tP('overridesPanel.columns.entityKey')}</th>
+                    <th style={{ paddingBottom: '0.3rem', paddingRight: '0.75rem' }}>{tP('overridesPanel.columns.payload')}</th>
                     <th style={{ paddingBottom: '0.3rem' }}></th>
                   </tr>
                 </thead>
@@ -2036,7 +2042,7 @@ export default function CaseDetail() {
                         {JSON.stringify(ov.payload)}
                       </td>
                       <td style={{ padding: '0.3rem 0', whiteSpace: 'nowrap' }}>
-                        <button type="button" className="secondary" style={{ fontSize: '0.75rem', padding: '2px 8px' }} onClick={() => handleDeleteOverride(ov.id)}>Remove</button>
+                        <button type="button" className="secondary" style={{ fontSize: '0.75rem', padding: '2px 8px' }} onClick={() => handleDeleteOverride(ov.id)}>{tc('remove')}</button>
                       </td>
                     </tr>
                   ))}
@@ -2045,7 +2051,7 @@ export default function CaseDetail() {
             )}
             {/* Manual JSON override form */}
             <details style={{ fontSize: '0.8rem' }}>
-              <summary style={{ cursor: 'pointer', color: '#71717a' }}>Add override manually (JSON)</summary>
+              <summary style={{ cursor: 'pointer', color: '#71717a' }}>{tP('overridesPanel.addManually')}</summary>
               <div style={{ marginTop: '0.5rem', display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'flex-end' }}>
                 <select
                   value={overrideForm.entity_type}
@@ -2057,18 +2063,18 @@ export default function CaseDetail() {
                   <option value="component_split">component_split</option>
                 </select>
                 <input
-                  placeholder="entity_key (e.g. PROD|LOC or PROD|LOC|DEMAND)"
+                  placeholder={tP('overridesPanel.entityKeyPlaceholder')}
                   value={overrideForm.entity_key}
                   onChange={(e) => setOverrideForm({ ...overrideForm, entity_key: e.target.value })}
                   style={{ padding: '4px 8px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem', minWidth: 240 }}
                 />
                 <input
-                  placeholder='payload JSON (e.g. {"method":"make"})'
+                  placeholder={tP('overridesPanel.payloadPlaceholder')}
                   value={overrideForm.payload}
                   onChange={(e) => setOverrideForm({ ...overrideForm, payload: e.target.value })}
                   style={{ padding: '4px 8px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem', minWidth: 200 }}
                 />
-                <button type="button" className="secondary" style={{ fontSize: '0.8rem' }} onClick={handleAddOverride}>Add</button>
+                <button type="button" className="secondary" style={{ fontSize: '0.8rem' }} onClick={handleAddOverride}>{tc('add')}</button>
               </div>
             </details>
           </div>
@@ -2083,7 +2089,7 @@ export default function CaseDetail() {
                 method_selection: { ...c.method_selection, multiple: e.target.checked },
               }))}
             />
-            <span>Equal split across methods (when multiple make/move/buy can fulfill a demand; can be slower—we plan each method branch)</span>
+            <span>{tP('config.equalSplitMethods')}</span>
           </label>
           <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem', cursor: 'pointer' }}>
             <input
@@ -2094,7 +2100,7 @@ export default function CaseDetail() {
                 method_selection: { ...c.method_selection, elaborate: e.target.checked },
               }))}
             />
-            <span>Use elaborate method selection (slower, scores by commit/inventory/purchase; ignored when equal split across methods is on)</span>
+            <span>{tP('config.elaborateMethod')}</span>
           </label>
           <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem', cursor: 'pointer' }}>
             <input
@@ -2102,7 +2108,7 @@ export default function CaseDetail() {
               checked={planningConfig.purchase_allowed !== false}
               onChange={(e) => setPlanningConfig((c) => ({ ...c, purchase_allowed: e.target.checked }))}
             />
-            <span>Purchase allowed (uncheck to exclude buy methods from planning)</span>
+            <span>{tP('config.purchaseAllowed')}</span>
           </label>
           <div style={{ marginTop: '0.5rem', display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
@@ -2114,10 +2120,10 @@ export default function CaseDetail() {
                   consolidation: { ...c.consolidation, enabled: e.target.checked },
                 }))}
               />
-              <span>Consolidate shared components (group demands within a time bucket into one work order, then split output)</span>
+              <span>{tP('config.consolidate')}</span>
             </label>
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}>
-              <span style={{ color: '#a1a1aa' }}>Bucket (days):</span>
+              <span style={{ color: '#a1a1aa' }}>{tP('config.bucketDays')}</span>
               <input
                 type="number"
                 min={1}
@@ -2132,7 +2138,7 @@ export default function CaseDetail() {
               />
             </label>
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}>
-              <span style={{ color: '#a1a1aa' }}>Split policy:</span>
+              <span style={{ color: '#a1a1aa' }}>{tP('config.splitPolicy')}</span>
               <select
                 disabled={planningConfig.consolidation?.enabled !== true}
                 value={planningConfig.consolidation?.allocation_mode ?? 'priority_first'}
@@ -2142,8 +2148,8 @@ export default function CaseDetail() {
                 }))}
                 style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
               >
-                <option value="priority_first">Priority first</option>
-                <option value="proportional">Proportional</option>
+                <option value="priority_first">{tP('config.priorityFirst')}</option>
+                <option value="proportional">{tP('config.proportional')}</option>
               </select>
             </label>
           </div>
@@ -2166,7 +2172,7 @@ export default function CaseDetail() {
               }
             }}
           >
-            {planLoading ? 'Running plan…' : 'Run plan'}
+            {planLoading ? tP('running') : tP('runPlan')}
           </button>
           <span style={{ marginLeft: '0.5rem' }} />
           <button
@@ -2175,7 +2181,7 @@ export default function CaseDetail() {
             onClick={() => { loadPlanRunHistory(); setPlanRunHistoryOpen(true); }}
             style={{ padding: '6px 12px' }}
           >
-            Plan run history
+            {tP('planRunHistory')}
           </button>
           <span style={{ marginLeft: '0.5rem' }} />
           <button
@@ -2192,13 +2198,13 @@ export default function CaseDetail() {
               fontWeight: 500,
             }}
           >
-            {copilotOpen ? 'Hide copilot' : 'Configure planning (copilot)'}
+            {copilotOpen ? tP('hideCopilot') : tP('configureCopilot')}
           </button>
         </div>
         {planLoading && planProgress && planProgress.total > 0 && (
           <div style={{ marginTop: '0.5rem', maxWidth: 400 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.25rem' }}>
-              <span>Planning: {planProgress.current} / {planProgress.total} demands</span>
+              <span>{tP('planProgress')} {planProgress.current} / {planProgress.total} {tP('demands')}</span>
             </div>
             <div style={{ height: 8, backgroundColor: '#27272a', borderRadius: 4, overflow: 'hidden' }}>
               <div
@@ -2223,20 +2229,20 @@ export default function CaseDetail() {
                 className={planResultTab === 'demands' ? '' : 'secondary'}
                 onClick={() => setPlanResultTab('demands')}
               >
-                Committed demands
+                {tP('tabs.committedDemands')}
               </button>
               <button
                 type="button"
                 className={planResultTab === 'work_orders' ? '' : 'secondary'}
                 onClick={() => setPlanResultTab('work_orders')}
               >
-                Work orders
+                {tP('tabs.workOrders')}
               </button>
             </div>
             <div style={{ border: '1px solid #3d3d40', borderRadius: 6 }}>
               {planResultTab === 'demands' && (
                 <div style={{ padding: '0.75rem 1rem' }}>
-                  <h4 style={{ marginTop: 0, marginBottom: '0.5rem' }}>Committed demands</h4>
+                  <h4 style={{ marginTop: 0, marginBottom: '0.5rem' }}>{tP('committedDemands.heading')}</h4>
                   <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
@@ -2244,7 +2250,7 @@ export default function CaseDetail() {
                         checked={planDemandRealMakeOnly}
                         onChange={(e) => setPlanDemandRealMakeOnly(e.target.checked)}
                       />
-                      <span>Only demands with pegging including a real make (non-virtual BOM link)</span>
+                      <span>{tP('committedDemands.filterRealMake')}</span>
                     </label>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
@@ -2252,7 +2258,7 @@ export default function CaseDetail() {
                         checked={planDemandBuyOnly}
                         onChange={(e) => setPlanDemandBuyOnly(e.target.checked)}
                       />
-                      <span>Only demands with pegging including a buy work order (purchase)</span>
+                      <span>{tP('committedDemands.filterBuy')}</span>
                     </label>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
@@ -2260,7 +2266,7 @@ export default function CaseDetail() {
                         checked={planDemandRealMoveOnly}
                         onChange={(e) => setPlanDemandRealMoveOnly(e.target.checked)}
                       />
-                      <span>Only demands with pegging including a real move (TRANSIT_TIME &gt; 0)</span>
+                      <span>{tP('committedDemands.filterRealMove')}</span>
                     </label>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
@@ -2268,23 +2274,23 @@ export default function CaseDetail() {
                         checked={planDemandShortOnly}
                         onChange={(e) => setPlanDemandShortOnly(e.target.checked)}
                       />
-                      <span>Short supply only (shortage &gt; 0)</span>
+                      <span>{tP('committedDemands.filterShortOnly')}</span>
                     </label>
                     {planDemandRealMakeOnly && (
                       <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>
                         {bomRealPairs === null
-                          ? 'Loading real BOM pairs…'
+                          ? tP('committedDemands.loadingBomPairs')
                           : bomRealPairs.length === 0
-                            ? 'No BOM rows with VIRTUAL <> Y in bom.csv; no \"real\" make links available.'
+                            ? tP('committedDemands.noBomPairs')
                             : ''}
                       </span>
                     )}
                     {planDemandRealMoveOnly && (
                       <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>
                         {realMoveTriples === null
-                          ? 'Loading moves with TRANSIT_TIME > 0…'
+                          ? tP('committedDemands.loadingMoves')
                           : realMoveTriples.length === 0
-                            ? 'No move methods with TRANSIT_TIME > 0 for this case.'
+                            ? tP('committedDemands.noMoves')
                             : ''}
                       </span>
                     )}
@@ -2334,16 +2340,16 @@ export default function CaseDetail() {
                     return (
                       <>
                         <p style={{ fontSize: '0.8rem', color: '#a1a1aa', marginBottom: hasMultipleCustomers ? '0.5rem' : '0.25rem' }}>
-                          Showing {list.length} of {planResult.committed_demands.length} demands
-                          {planDemandRealMakeOnly && !planDemandBuyOnly && !planDemandRealMoveOnly && ' with pegging including at least one real make (BOM VIRTUAL <> Y).'}
-                          {!planDemandRealMakeOnly && planDemandBuyOnly && !planDemandRealMoveOnly && ' with pegging including at least one buy work order (purchase).'}
-                          {!planDemandRealMakeOnly && !planDemandBuyOnly && planDemandRealMoveOnly && ' with pegging including at least one real move (TRANSIT_TIME > 0).'}
-                          {planDemandRealMakeOnly && planDemandBuyOnly && !planDemandRealMoveOnly && ' with pegging including at least one real make and at least one buy work order.'}
-                          {(planDemandRealMakeOnly || planDemandBuyOnly || planDemandRealMoveOnly) && [planDemandRealMakeOnly, planDemandBuyOnly, planDemandRealMoveOnly].filter(Boolean).length > 1 && ' (multiple filters active).'}
+                          {tP('committedDemands.showing')} {list.length} {tP('committedDemands.of')} {planResult.committed_demands.length} {tP('committedDemands.demandsLabel')}
+                          {planDemandRealMakeOnly && !planDemandBuyOnly && !planDemandRealMoveOnly && ' ' + tP('committedDemands.filterDescMake')}
+                          {!planDemandRealMakeOnly && planDemandBuyOnly && !planDemandRealMoveOnly && ' ' + tP('committedDemands.filterDescBuy')}
+                          {!planDemandRealMakeOnly && !planDemandBuyOnly && planDemandRealMoveOnly && ' ' + tP('committedDemands.filterDescMove')}
+                          {planDemandRealMakeOnly && planDemandBuyOnly && !planDemandRealMoveOnly && ' ' + tP('committedDemands.filterDescMakeAndBuy')}
+                          {(planDemandRealMakeOnly || planDemandBuyOnly || planDemandRealMoveOnly) && [planDemandRealMakeOnly, planDemandBuyOnly, planDemandRealMoveOnly].filter(Boolean).length > 1 && ' ' + tP('committedDemands.filterDescMultiple')}
                         </p>
                         {planDemandRealMakeOnly && list.length === 0 && bomRealPairs !== null && bomRealPairs.length > 0 && (
                           <p style={{ fontSize: '0.8rem', color: '#71717a', marginBottom: '0.5rem' }}>
-                            No demands in this plan have a make work order whose (parent, child) pair matches a BOM row with VIRTUAL &lt;&gt; Y.
+                            {tP('committedDemands.noMakeInPlan')}
                           </p>
                         )}
                         {planDemandBuyOnly && list.length === 0 && (
@@ -2434,7 +2440,7 @@ export default function CaseDetail() {
               )}
               {planResultTab === 'work_orders' && (
                 <div style={{ padding: '0.75rem 1rem' }}>
-                  <h4 style={{ marginTop: 0, marginBottom: '0.5rem' }}>Work orders</h4>
+                  <h4 style={{ marginTop: 0, marginBottom: '0.5rem' }}>{tP('workOrders.heading')}</h4>
                   <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
@@ -2442,7 +2448,7 @@ export default function CaseDetail() {
                         checked={planWorkOrderHideDummyProdArea}
                         onChange={(e) => setPlanWorkOrderHideDummyProdArea(e.target.checked)}
                       />
-                      <span>Hide PROD_AREA = dummy</span>
+                      <span>{tP('workOrders.hideDummy')}</span>
                     </label>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
@@ -2450,7 +2456,7 @@ export default function CaseDetail() {
                         checked={planDemandRealMakeOnly}
                         onChange={(e) => setPlanDemandRealMakeOnly(e.target.checked)}
                       />
-                      <span>Only work orders whose pegging includes a real make (non-virtual BOM link)</span>
+                      <span>{tP('workOrders.filterRealMake')}</span>
                     </label>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
@@ -2458,7 +2464,7 @@ export default function CaseDetail() {
                         checked={planDemandBuyOnly}
                         onChange={(e) => setPlanDemandBuyOnly(e.target.checked)}
                       />
-                      <span>Only work orders whose pegging includes a buy (purchase)</span>
+                      <span>{tP('workOrders.filterBuy')}</span>
                     </label>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
@@ -2466,7 +2472,7 @@ export default function CaseDetail() {
                         checked={planDemandRealMoveOnly}
                         onChange={(e) => setPlanDemandRealMoveOnly(e.target.checked)}
                       />
-                      <span>Only work orders whose pegging includes a real move (TRANSIT_TIME &gt; 0)</span>
+                      <span>{tP('workOrders.filterRealMove')}</span>
                     </label>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
@@ -2474,7 +2480,7 @@ export default function CaseDetail() {
                         checked={planWoDemandedByMultiple}
                         onChange={(e) => setPlanWoDemandedByMultiple(e.target.checked)}
                       />
-                      <span>Only work orders demanded by multiple demands (shared component in BOM graph)</span>
+                      <span>{tP('workOrders.filterMultipleDemands')}</span>
                     </label>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
@@ -2482,7 +2488,7 @@ export default function CaseDetail() {
                         checked={planWoMultiSupply}
                         onChange={(e) => setPlanWoMultiSupply(e.target.checked)}
                       />
-                      <span>Only work orders with multiple supply methods available (BOM graph)</span>
+                      <span>{tP('workOrders.filterMultiSupply')}</span>
                     </label>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
@@ -2490,7 +2496,7 @@ export default function CaseDetail() {
                         checked={planWoPurchaseOnly}
                         onChange={(e) => setPlanWoPurchaseOnly(e.target.checked)}
                       />
-                      <span>Purchase orders only (method = buy/purchase)</span>
+                      <span>{tP('workOrders.filterPurchaseOnly')}</span>
                     </label>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
@@ -2498,7 +2504,7 @@ export default function CaseDetail() {
                         checked={planWoMoveOnly}
                         onChange={(e) => setPlanWoMoveOnly(e.target.checked)}
                       />
-                      <span>Move orders only (method = move)</span>
+                      <span>{tP('workOrders.filterMoveOnly')}</span>
                     </label>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
@@ -2506,7 +2512,7 @@ export default function CaseDetail() {
                         checked={planDemandShortOnly}
                         onChange={(e) => setPlanDemandShortOnly(e.target.checked)}
                       />
-                      <span>Short supply only (shortage &gt; 0)</span>
+                      <span>{tP('committedDemands.filterShortOnly')}</span>
                     </label>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
@@ -2514,7 +2520,7 @@ export default function CaseDetail() {
                         checked={planWoHasOverride}
                         onChange={(e) => setPlanWoHasOverride(e.target.checked)}
                       />
-                      <span>Has manual overrides</span>
+                      <span>{tP('workOrders.filterHasOverride')}</span>
                     </label>
                   </div>
                   {planResult.work_orders.length > 0 && (() => {

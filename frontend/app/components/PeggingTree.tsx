@@ -1,6 +1,7 @@
 'use client';
 
 import React from 'react';
+import { useTranslations } from 'next-intl';
 
 /** Unique key for a node at a specific path in the tree (so same nodeId at different positions don't share state). */
 export const PATH_KEY_SEP = '\u001e';
@@ -38,6 +39,7 @@ function PeggingNodeRow({
   childrenAllowedFor,
   direction,
   ancestorIds = new Set<string>(),
+  t,
 }: {
   graph: PeggingGraph;
   nodeId: string;
@@ -49,6 +51,7 @@ function PeggingNodeRow({
   childrenAllowedFor: Set<string>;
   direction?: string;
   ancestorIds?: Set<string>;
+  t: ReturnType<typeof useTranslations>;
 }) {
   const { nodeById, pathSet, getChildren } = graph;
   const node = nodeById[nodeId];
@@ -67,27 +70,27 @@ function PeggingNodeRow({
   const nodeLoc = nodeParts[1] ?? '';
   const isSupplyToDemand = direction === 'supply-to-demand';
   let typeLabel: string | null = null;
-  if (node.type === 'demand') typeLabel = 'demand';
+  if (node.type === 'demand') typeLabel = t('demand');
   else if (isSupplyToDemand) {
     // Supply pegging: root = supply (raw material); children = made (make) or moved (same product, different loc)
     if (parentId) {
       const parentParts = parentId.split('|');
       const parentProduct = parentParts[0] ?? '';
       const parentLoc = parentParts[1] ?? '';
-      if (nodeProduct !== parentProduct) typeLabel = 'made';
-      else if ((nodeLoc ?? '') !== (parentLoc ?? '')) typeLabel = 'moved';
+      if (nodeProduct !== parentProduct) typeLabel = t('made');
+      else if ((nodeLoc ?? '') !== (parentLoc ?? '')) typeLabel = t('moved');
     }
-    if (typeLabel == null) typeLabel = node.type === 'component' ? 'supply' : node.type === 'variant' ? 'made' : null;
+    if (typeLabel == null) typeLabel = node.type === 'component' ? t('supply') : node.type === 'variant' ? t('made') : null;
   } else {
     // Demand pegging: root = made; leaves = supply (raw inputs); intermediaries = made or moved, never supply
-    if (!parentId) typeLabel = 'made';
+    if (!parentId) typeLabel = t('made');
     else {
       const parentParts = parentId.split('|');
       const parentProduct = parentParts[0] ?? '';
       const parentLoc = parentParts[1] ?? '';
       const sameProductDiffLoc = nodeProduct === parentProduct && (nodeLoc ?? '') !== (parentLoc ?? '');
-      if (hasChildren) typeLabel = sameProductDiffLoc ? 'moved' : 'made';
-      else typeLabel = sameProductDiffLoc ? 'moved' : 'supply';
+      if (hasChildren) typeLabel = sameProductDiffLoc ? t('moved') : t('made');
+      else typeLabel = sameProductDiffLoc ? t('moved') : t('supply');
     }
   }
   const summary = (
@@ -102,21 +105,21 @@ function PeggingNodeRow({
       )}
       {/* edgeQty = flow from this node to its parent (to demand or to next level up) */}
       {edgeQty != null && node.type !== 'demand' && (
-        <span style={{ color: '#71717a', fontSize: '0.85em' }} title="Flow from this node to parent">to parent: {edgeQty}</span>
+        <span style={{ color: '#71717a', fontSize: '0.85em' }} title="Flow from this node to parent">{t('toParent')} {edgeQty}</span>
       )}
       {edgeQty != null && node.type === 'demand' && (
-        <span style={{ color: '#71717a', fontSize: '0.85em' }}>allocated: {edgeQty}{node.demand_qty != null && Number(node.demand_qty) > 0 ? ` (requested: ${node.demand_qty})` : ''}</span>
+        <span style={{ color: '#71717a', fontSize: '0.85em' }}>{t('allocated')} {edgeQty}{node.demand_qty != null && Number(node.demand_qty) > 0 ? ` (${t('requested')} ${node.demand_qty})` : ''}</span>
       )}
       {/* Sum of flows from children into this node; so "from below" matches subordinates */}
       {hasChildren && (
-        <span style={{ color: '#a1a1aa', fontSize: '0.85em' }} title="Sum of edge qtys from rows below (flow into this node)">from below: {children.reduce((s, c) => s + c.qty, 0).toLocaleString()}</span>
+        <span style={{ color: '#a1a1aa', fontSize: '0.85em' }} title="Sum of edge qtys from rows below (flow into this node)">{t('fromBelow')} {children.reduce((s, c) => s + c.qty, 0).toLocaleString()}</span>
       )}
       {depth === 0 && node.qty != null && node.qty > 0 && node.type !== 'demand' && (
-        <span style={{ color: '#71717a', fontSize: '0.85em' }} title="Total inventory at this node (not just for this demand)">inventory: {node.qty}</span>
+        <span style={{ color: '#71717a', fontSize: '0.85em' }} title="Total inventory at this node (not just for this demand)">{t('inventory')} {node.qty}</span>
       )}
       {depth === 0 && node.demand_qty != null && node.demand_qty > 0 && (
         <span style={{ color: '#71717a', fontSize: '0.85em' }} title="Sum of requested qty across all demands for this product@location">
-          total demand (all): {node.demand_qty}{node.demand_count != null && node.demand_count > 0 ? ` (${node.demand_count} demands)` : ''}
+          {t('totalDemand')} {node.demand_qty}{node.demand_count != null && node.demand_count > 0 ? ` (${node.demand_count} ${t('demands')})` : ''}
         </span>
       )}
     </span>
@@ -185,6 +188,7 @@ function PeggingNodeRow({
                   childrenAllowedFor={childrenAllowedFor}
                   direction={direction}
                   ancestorIds={ancestorIdsForChildren}
+                  t={t}
                 />
               </div>
             );
@@ -203,6 +207,7 @@ export function PeggingTree({
   direction,
   servedDemandIds = [],
 }: Props) {
+  const t = useTranslations('pegging');
   const { rootId, nodes, edges, getChildren } = graph;
 
   const handleTreeClick = (e: React.MouseEvent) => {
@@ -219,15 +224,15 @@ export function PeggingTree({
 
   return (
     <div style={{ fontSize: '0.9rem' }}>
-      <p><strong>Nodes:</strong> {nodes.length} &nbsp; <strong>Edges:</strong> {edges.length}</p>
+      <p><strong>{t('nodes')}</strong> {nodes.length} &nbsp; <strong>{t('edges')}</strong> {edges.length}</p>
       {direction === 'supply-to-demand' && servedDemandIds.length > 0 && (
         <p style={{ marginTop: '0.5rem', color: '#a1a1aa', fontSize: '0.85em' }}>
-          <strong>Critical path serves demands:</strong> {servedDemandIds.join(', ')}
+          <strong>{t('criticalPath')}</strong> {servedDemandIds.join(', ')}
         </p>
       )}
       {rootId && (
         <div style={{ marginTop: '0.75rem' }}>
-          <strong>Tree</strong> <span style={{ color: '#71717a', fontSize: '0.85em' }}>(▸ expandable, · leaf. to parent = flow to level above; from below = sum of subordinates; they can differ when flow serves other demands or stays as inventory.)</span>
+          <strong>{t('tree')}</strong> <span style={{ color: '#71717a', fontSize: '0.85em' }}>{t('treeHint')}</span>
           <div
             style={{ marginTop: 6, padding: '0.5rem', background: '#252528', borderRadius: 8, maxHeight: '60vh', minHeight: 200, overflow: 'auto', minWidth: 0 }}
             onClick={handleTreeClick}
@@ -241,6 +246,7 @@ export function PeggingTree({
               onExpand={onExpand}
               childrenAllowedFor={childrenAllowedFor}
               direction={direction}
+              t={t}
             />
           </div>
         </div>
