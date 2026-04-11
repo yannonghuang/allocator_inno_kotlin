@@ -84,6 +84,7 @@ export default function Home() {
           <thead>
             <tr>
               <th>Name</th>
+              <th>Type</th>
               <th>Demands</th>
               <th>Supplies</th>
               <th>Runs</th>
@@ -91,21 +92,37 @@ export default function Home() {
             </tr>
           </thead>
           <tbody>
-            {cases.map((c) => (
-              <tr key={c.id}>
-                <td><Link href={`/cases/${c.id}`}>{c.name}</Link></td>
-                <td>{c.demand_count ?? '–'}</td>
-                <td>{c.supply_count ?? '–'}</td>
-                <td>{c.run_count ?? '–'}</td>
-                <td>
-                  <button className="secondary" onClick={() => handleImport(c.id)} disabled={importingId === c.id}>
-                    {importingId === c.id ? 'Importing…' : 'Import CSV'}
-                  </button>
-                  {' '}
-                  <button className="danger" onClick={() => handleDelete(c.id)}>Delete</button>
-                </td>
-              </tr>
-            ))}
+            {cases.map((c) => {
+              const hasData    = (c.demand_count ?? 0) > 0 || (c.supply_count ?? 0) > 0;
+              const hasAlloc   = (c.run_count ?? 0) > 0;
+              const hasPlan    = (c.plan_run_count ?? 0) > 0;
+              const typeLabel  = hasAlloc && hasPlan ? 'Planning + Allocation'
+                               : hasPlan             ? 'Planning'
+                               : hasAlloc            ? 'Allocation'
+                               : hasData             ? '–'
+                               : 'New';
+              return (
+                <tr key={c.id}>
+                  <td><Link href={`/cases/${c.id}`}>{c.name}</Link></td>
+                  <td style={{ color: !hasAlloc && !hasPlan ? '#52525b' : '#e4e4e7', fontSize: '0.88em' }}>{typeLabel}</td>
+                  <td>{c.demand_count ?? '–'}</td>
+                  <td>{c.supply_count ?? '–'}</td>
+                  <td>{((c.run_count ?? 0) + (c.plan_run_count ?? 0)) || '–'}</td>
+                  <td>
+                    <button
+                      className="secondary"
+                      onClick={() => handleImport(c.id)}
+                      disabled={importingId === c.id || hasData}
+                      title={hasData ? 'CSV already imported — delete this case to re-import' : 'Import CSV data'}
+                    >
+                      {importingId === c.id ? 'Importing…' : 'Import CSV'}
+                    </button>
+                    {' '}
+                    <button className="danger" onClick={() => handleDelete(c.id)}>Delete</button>
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       )}

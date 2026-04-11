@@ -98,7 +98,7 @@ private fun createTables() {
         Cases, Boms, Customers, Locations, Products, Vendors,
         Demands, MethodBuys, MethodMakes, ProductLocations,
         Supplies, MethodMoves, AllocationRuns, AllocationActions,
-        ManualOverrides
+        ManualOverrides, PlanRuns
     )
 }
 
@@ -163,6 +163,34 @@ private fun migrateSchema() {
             WHERE table_schema = 'public' AND table_name = 'transportation'
           ) THEN
             ALTER TABLE transportation RENAME TO method_move;
+          END IF;
+        END
+        ${'$'}${'$'};
+        """.trimIndent(),
+        // Unique constraint on (case_id, entity_type, entity_key) for upsert semantics
+        """
+        DO ${'$'}${'$'}
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.table_constraints
+            WHERE constraint_name = 'uq_override_case_type_key' AND table_name = 'manual_override'
+          ) THEN
+            ALTER TABLE manual_override
+              ADD CONSTRAINT uq_override_case_type_key UNIQUE (case_id, entity_type, entity_key);
+          END IF;
+        END
+        ${'$'}${'$'};
+        """.trimIndent(),
+        // plan_run FK with CASCADE
+        """
+        DO ${'$'}${'$'}
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.table_constraints
+            WHERE constraint_name = 'fk_plan_run_case_id__id' AND table_name = 'plan_run'
+          ) THEN
+            ALTER TABLE plan_run ADD CONSTRAINT fk_plan_run_case_id__id
+              FOREIGN KEY (case_id) REFERENCES cases(id) ON DELETE CASCADE;
           END IF;
         END
         ${'$'}${'$'};

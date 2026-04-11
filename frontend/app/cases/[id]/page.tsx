@@ -13,6 +13,7 @@ import {
   listOverrides,
   addOverride,
   deleteOverride,
+  upsertOverride,
   getSupplyView,
   getRawMaterialUsage,
   type RawMaterialUsageReport,
@@ -23,6 +24,11 @@ import {
   runPlanAsync,
   getPlanStatus,
   planningCopilot,
+  listPlanRuns,
+  getPlanRun,
+  deletePlanRun,
+  type PlanRun,
+  type PlanRunFull,
   type PlanningConfig,
   type PlanningCopilotMessage,
   type CommittedDemand,
@@ -51,20 +57,10 @@ import {
  *  A make at location "VIRTUAL" is never considered real. */
 function peggingTreeContainsRealMake(node: PlanningPeggingNode, bomRealPairKeys: Set<string>): boolean {
   if (node.type === 'work_order' && (node.method ?? '').toLowerCase() === 'make') {
+    // Any make at a physical (non-VIRTUAL) location is a real make operation.
+    // VIRTUAL locations are used only for synthetic BOM alt-group intermediate nodes.
     const loc = (node.location_id ?? '').trim().toUpperCase();
-    if (loc !== 'VIRTUAL') {
-      if ((node as { children_relation?: string }).children_relation === 'and' || (node as { children_relation?: string }).children_relation === 'or') {
-        // Backend has explicitly recognized BOM links for this make; treat that as real.
-        return true;
-      }
-      const parentId = (node.product_id ?? '').trim();
-      if (parentId && bomRealPairKeys.size > 0) {
-        for (const child of node.children ?? []) {
-          const childId = (child.product_id ?? '').trim();
-          if (childId && bomRealPairKeys.has(`${parentId}|${childId}`)) return true;
-        }
-      }
-    }
+    if (loc !== 'VIRTUAL') return true;
   }
   for (const child of node.children ?? []) {
     if (peggingTreeContainsRealMake(child, bomRealPairKeys)) return true;
@@ -207,6 +203,57 @@ function PlanKpiDashboard({
 }
 
 import { SortFilterTable } from '@/app/components/SortFilterTable';
+
+// ── Commit-reason formatting ───────────────────────────────────────────────────
+
+/** Parse a nested child_failed chain: "child_failed:PROD@LOC(reason)" recursively. */
+function parseCommitReasonChain(reason: string): { chain: Array<{ product: string; location: string }>; rootCause: string } {
+  const chain: Array<{ product: string; location: string }> = [];
+  let current = reason;
+  // Greedy (.+) with $ anchor correctly extracts content inside outermost parens.
+  const pattern = /^child_failed:([^@(]+)@([^(]+)\((.+)\)$/;
+  while (true) {
+    const m = current.match(pattern);
+    if (!m) break;
+    chain.push({ product: m[1].trim(), location: m[2].trim() });
+    current = m[3];
+  }
+  return { chain, rootCause: current.trim() };
+}
+
+/** Return a { label, tooltip } pair for a commit_reason string. */
+function formatCommitReason(reason: string, purchaseAllowed: boolean): { label: string; tooltip: string } {
+  const { chain, rootCause } = parseCommitReasonChain(reason);
+
+  let rootLabel: string;
+  switch (rootCause) {
+    case 'no_methods':
+      rootLabel = purchaseAllowed ? 'no supply method' : 'no supply method — purchase is disabled';
+      break;
+    case 'no_preferred_method':
+      rootLabel = 'no preferred supply method';
+      break;
+    case 'cycle_stopped':
+      rootLabel = 'supply chain loop detected';
+      break;
+    case 'depth_limit':
+      rootLabel = 'supply chain too deep';
+      break;
+    default:
+      rootLabel = rootCause;
+  }
+
+  if (chain.length === 0) return { label: rootLabel, tooltip: '' };
+
+  // Drop VIRTUAL-location hops for the display label — they are BOM graph artifacts.
+  const physicalChain = chain.filter(c => c.location.toUpperCase() !== 'VIRTUAL');
+  const displayLeaf = physicalChain.length > 0 ? physicalChain[physicalChain.length - 1] : chain[chain.length - 1];
+  const label = `${displayLeaf.product} @ ${displayLeaf.location}: ${rootLabel}`;
+
+  // Tooltip shows the full failure path for debugging.
+  const tooltip = chain.map(c => `${c.product} @ ${c.location}`).join(' → ') + ` → ${rootCause}`;
+  return { label, tooltip };
+}
 import { PeggingTree, pathKeyFromPath, type PeggingGraph } from '@/app/components/PeggingTree';
 import BomGraphTab from '@/app/components/BomGraphTab';
 
@@ -266,6 +313,8 @@ export default function CaseDetail() {
   const [planExplanationExpanded, setPlanExplanationExpanded] = useState<Set<string>>(new Set());
   const [planPeggingPanelWidth, setPlanPeggingPanelWidth] = useState(420);
   const [planWorkOrderPeggingCache, setPlanWorkOrderPeggingCache] = useState<Record<string, PlanningPeggingNode>>({});
+  // Active demand for WO pegging panel; null = use the row's own demand_id (default)
+  const [woPeggingActiveDemandId, setWoPeggingActiveDemandId] = useState<string | null>(null);
   const [planWorkOrderPeggingLoading, setPlanWorkOrderPeggingLoading] = useState<string | null>(null);
   const [planWorkOrderPeggingError, setPlanWorkOrderPeggingError] = useState<string | null>(null);
   const planPeggingResizeRef = useRef<{ startX: number; startW: number } | null>(null);
@@ -280,6 +329,7 @@ export default function CaseDetail() {
   const [planWoMultiSupply, setPlanWoMultiSupply] = useState(false);
   const [planWoPurchaseOnly, setPlanWoPurchaseOnly] = useState(false);
   const [planWoMoveOnly, setPlanWoMoveOnly] = useState(false);
+  const [planWoHasOverride, setPlanWoHasOverride] = useState(false);
   const [woExplainOpen, setWoExplainOpen] = useState(false);
   const [woExplainRow, setWoExplainRow] = useState<WorkOrder | null>(null);
   const [woExplainKey, setWoExplainKey] = useState<string | null>(null);
@@ -298,6 +348,37 @@ export default function CaseDetail() {
   const copilotResizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [copilotResizing, setCopilotResizing] = useState(false);
   const copilotMessagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  // ── Plan run history state ──────────────────────────────────────────────────
+  const [planRunHistory, setPlanRunHistory] = useState<PlanRun[]>([]);
+  const [planRunHistoryOpen, setPlanRunHistoryOpen] = useState(false);
+  const [planRunHistoryLoading, setPlanRunHistoryLoading] = useState(false);
+  const [planRunLoadingId, setPlanRunLoadingId] = useState<number | null>(null);
+
+  // ── Override dialog state ───────────────────────────────────────────────────
+  const [overrideDialogOpen, setOverrideDialogOpen] = useState(false);
+  const [overrideDialogType, setOverrideDialogType] = useState<'method_selection' | 'variant_selection' | 'component_split' | null>(null);
+  const [overrideDialogWo, setOverrideDialogWo] = useState<WorkOrder | null>(null);
+  const [overrideDialogSaving, setOverrideDialogSaving] = useState(false);
+  const [overrideDialogError, setOverrideDialogError] = useState<string | null>(null);
+  // Structured override form state (type-specific; avoids raw JSON editing)
+  const [overrideMethodValue, setOverrideMethodValue] = useState<string>('make');
+  const [overrideVariantValue, setOverrideVariantValue] = useState('');
+  const [overrideSplitRows, setOverrideSplitRows] = useState<Array<{
+    demand_id: string | null;
+    qty: number;
+    requested_qty: number;
+    priority: number;
+    parent_product: string;
+  }>>([]);
+
+  // Panel resize state
+  const [woExplainPanelWidth, setWoExplainPanelWidth] = useState(420);
+  const woExplainResizeRef = useRef<{ startX: number; startW: number } | null>(null);
+  const [woExplainResizing, setWoExplainResizing] = useState(false);
+  const [planRunHistoryPanelWidth, setPlanRunHistoryPanelWidth] = useState(520);
+  const planRunHistoryResizeRef = useRef<{ startX: number; startW: number } | null>(null);
+  const [planRunHistoryResizing, setPlanRunHistoryResizing] = useState(false);
 
   /** Rule-based intent: map user message to config updates and a reply for variant, method, and consolidation selection. */
   function parseCopilotIntent(message: string, currentConfig: PlanningConfig): { reply: string; configUpdate?: PlanningConfig } {
@@ -468,17 +549,30 @@ export default function CaseDetail() {
     };
   }, [id, planResult]);
 
+  // Reset active-demand selection when the user opens pegging for a different WO
+  useEffect(() => {
+    setWoPeggingActiveDemandId(null);
+  }, [planPeggingContext]);
+
   // Fetch work-order pegging on demand when slide-in opens for a WO.
+  // For consolidated WOs (demand_id=null) the pegging tree is always the shared/merged one;
+  // demand tabs are informational only and must NOT change the fetch key.
   const woPeggingKey =
     planPeggingOpen && planPeggingContext?.type === 'work_order' && id
-      ? `${String(planPeggingContext.row.demand_id ?? '').trim()}|${String(planPeggingContext.row.product_id ?? '').trim()}|${String(planPeggingContext.row.location_id ?? '').trim()}|${String(planPeggingContext.row.method ?? '').trim()}`
+      ? (() => {
+          const row = planPeggingContext.row as WorkOrder;
+          const isConsolidated = row.demand_id == null;
+          const demandPart = isConsolidated ? '' : String(woPeggingActiveDemandId ?? row.demand_id ?? '').trim();
+          return `${demandPart}|${String(row.product_id ?? '').trim()}|${String(row.location_id ?? '').trim()}|${String(row.method ?? '').trim()}`;
+        })()
       : null;
   useEffect(() => {
     if (!woPeggingKey || !id || planPeggingContext?.type !== 'work_order') return;
     const row = planPeggingContext.row as WorkOrder;
     if (planWorkOrderPeggingCache[woPeggingKey]) return;
     if (planWorkOrderPeggingLoading === woPeggingKey) return;
-    const demand_id = String(row.demand_id ?? '').trim();
+    // Consolidated WO: always fetch with demand_id='' so backend searches consolidated trees.
+    const demand_id = row.demand_id == null ? '' : String(woPeggingActiveDemandId ?? row.demand_id ?? '').trim();
     const product_id = String(row.product_id ?? '').trim();
     const location_id = String(row.location_id ?? '').trim();
     const method = String(row.method ?? '').trim();
@@ -649,11 +743,27 @@ export default function CaseDetail() {
     }
   };
 
+  const loadLatestPlanRun = async () => {
+    try {
+      const runs = await listPlanRuns(id);
+      setPlanRunHistory(runs);
+      const latest = runs.find((r) => r.status === 'success');
+      if (!latest) return;
+      const full = await getPlanRun(id, latest.id);
+      if (full.result) {
+        setPlanResult(full.result as typeof planResult);
+        setPlanWorkOrderPeggingCache({});
+      }
+    } catch {
+      // non-fatal — plan results simply won't be pre-loaded
+    }
+  };
+
   useEffect(() => {
     setLoading(true);
     setError(null);
     const timeoutId = setTimeout(() => setLoading(false), 20000);
-    Promise.all([loadCase(), loadRuns(), loadOverrides()]).finally(() => {
+    Promise.all([loadCase(), loadRuns(), loadOverrides(), loadLatestPlanRun()]).finally(() => {
       clearTimeout(timeoutId);
       setLoading(false);
     });
@@ -845,6 +955,32 @@ export default function CaseDetail() {
     };
   }, [copilotResizing]);
 
+  useEffect(() => {
+    if (!woExplainResizing) return;
+    const onMove = (e: MouseEvent) => {
+      const r = woExplainResizeRef.current;
+      if (!r) return;
+      setWoExplainPanelWidth(Math.min(window.innerWidth * 0.9, Math.max(280, r.startW + (r.startX - e.clientX))));
+    };
+    const onUp = () => { woExplainResizeRef.current = null; setWoExplainResizing(false); window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+  }, [woExplainResizing]);
+
+  useEffect(() => {
+    if (!planRunHistoryResizing) return;
+    const onMove = (e: MouseEvent) => {
+      const r = planRunHistoryResizeRef.current;
+      if (!r) return;
+      setPlanRunHistoryPanelWidth(Math.min(window.innerWidth * 0.9, Math.max(280, r.startW + (r.startX - e.clientX))));
+    };
+    const onUp = () => { planRunHistoryResizeRef.current = null; setPlanRunHistoryResizing(false); window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+  }, [planRunHistoryResizing]);
+
   // Defer tree building so first paint shows counts and "Building tree…" instead of blocking on huge graph
   useEffect(() => {
     if (!peggingData) {
@@ -900,6 +1036,40 @@ export default function CaseDetail() {
     }
     return { nodeById, pathSet, rootId, getChildren, nodes, edges };
   }, [peggingData]);
+
+  // Full "entityType|entityKey" set + per-WO helper for precise pending-override detection
+  const woHasSavedOverride = useMemo(() => {
+    const s = new Set<string>();
+    for (const o of overrides) s.add(`${o.entity_type}|${o.entity_key}`);
+    return (r: WorkOrder): boolean => {
+      const productId = r.product_id ?? '';
+      const locationId = r.location_id ?? '';
+      const demandId = r.demand_id ?? '';
+      const methodKey = demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`;
+      const splitKey = r.start_time ? `${productId}|${locationId}|${r.start_time.slice(0, 10)}` : `${productId}|${locationId}`;
+      return s.has(`method_selection|${methodKey}`) || s.has(`variant_selection|${methodKey}`) || s.has(`component_split|${splitKey}`);
+    };
+  }, [overrides]);
+
+  // DFS pre-order traversal of planning_pegging trees → "demandId|productId|locationId|method" → order index
+  const pegOrderMap = useMemo(() => {
+    const order: string[] = [];
+    function visit(node: PlanningPeggingNode, demandId: string) {
+      const nodeDemand = node.demand_id ?? demandId;
+      if (node.type === 'work_order') {
+        order.push(`${nodeDemand}|${node.product_id ?? ''}|${node.location_id ?? ''}|${node.method ?? ''}`);
+        for (const child of node.children ?? []) visit(child, nodeDemand);
+      } else {
+        for (const child of node.children ?? []) visit(child, nodeDemand);
+      }
+    }
+    for (const entry of planResult?.planning_pegging ?? []) {
+      visit(entry.tree, entry.demand_id);
+    }
+    const map = new Map<string, number>();
+    order.forEach((k, i) => { if (!map.has(k)) map.set(k, i); });
+    return map;
+  }, [planResult]);
 
   const handleAllocate = async () => {
     setAllocating(true);
@@ -1078,6 +1248,119 @@ export default function CaseDetail() {
       await loadOverrides();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to delete');
+    }
+  };
+
+  const loadPlanRunHistory = async () => {
+    setPlanRunHistoryLoading(true);
+    try {
+      const data = await listPlanRuns(id);
+      setPlanRunHistory(data);
+    } catch {
+      setPlanRunHistory([]);
+    } finally {
+      setPlanRunHistoryLoading(false);
+    }
+  };
+
+  const handleRestorePlanRun = async (runId: number) => {
+    setPlanRunLoadingId(runId);
+    try {
+      const full = await getPlanRun(id, runId);
+      if (full.result) {
+        setPlanResult(full.result as typeof planResult);
+        setPlanWorkOrderPeggingCache({});
+        setPlanRunHistoryOpen(false);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load plan run');
+    } finally {
+      setPlanRunLoadingId(null);
+    }
+  };
+
+  const handleDeletePlanRun = async (runId: number) => {
+    try {
+      await deletePlanRun(id, runId);
+      setPlanRunHistory((prev) => prev.filter((r) => r.id !== runId));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to delete plan run');
+    }
+  };
+
+  const openOverrideDialog = (type: 'method_selection' | 'variant_selection' | 'component_split', wo: WorkOrder) => {
+    setOverrideDialogType(type);
+    setOverrideDialogWo(wo);
+    setOverrideDialogError(null);
+    if (type === 'method_selection') {
+      const productId = wo.product_id ?? '';
+      const locationId = wo.location_id ?? '';
+      const demandId = wo.demand_id ?? '';
+      const entityKey = demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`;
+      const existing = overrides.find((o) => o.entity_type === 'method_selection' && o.entity_key === entityKey);
+      const savedMethod = existing ? (existing.payload as Record<string, unknown>).method as string | undefined : undefined;
+      setOverrideMethodValue(savedMethod?.toLowerCase() ?? (wo.method ?? 'make').toLowerCase());
+    } else if (type === 'variant_selection') {
+      const productId = wo.product_id ?? '';
+      const locationId = wo.location_id ?? '';
+      const demandId = wo.demand_id ?? '';
+      const entityKey = demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`;
+      const existing = overrides.find((o) => o.entity_type === 'variant_selection' && o.entity_key === entityKey);
+      const savedAltGroup = existing ? (existing.payload as Record<string, unknown>).alt_group as string | undefined : undefined;
+      setOverrideVariantValue(savedAltGroup ?? '');
+    } else {
+      setOverrideSplitRows(
+        (wo.wo_consolidation_split_details ?? []).map((d) => ({
+          demand_id: d.demand_id,
+          qty: d.allocated_qty,
+          requested_qty: d.requested_qty,
+          priority: d.priority,
+          parent_product: d.parent_product,
+        }))
+      );
+    }
+    setOverrideDialogOpen(true);
+  };
+
+  const handleSaveOverride = async () => {
+    if (!overrideDialogType || !overrideDialogWo) return;
+    setOverrideDialogSaving(true);
+    setOverrideDialogError(null);
+    try {
+      const productId = overrideDialogWo.product_id ?? '';
+      const locationId = overrideDialogWo.location_id ?? '';
+      const demandId = overrideDialogWo.demand_id ?? '';
+
+      let payload: Record<string, unknown>;
+      if (overrideDialogType === 'method_selection') {
+        if (!overrideMethodValue.trim()) { setOverrideDialogError('Select a method'); setOverrideDialogSaving(false); return; }
+        payload = { method: overrideMethodValue.trim() };
+      } else if (overrideDialogType === 'variant_selection') {
+        if (!overrideVariantValue.trim()) { setOverrideDialogError('Enter an ALT_GROUP value'); setOverrideDialogSaving(false); return; }
+        payload = { alt_group: overrideVariantValue.trim() };
+      } else {
+        // component_split
+        const allocations = overrideSplitRows.map((r) => ({ demand_id: r.demand_id, qty: Number(r.qty) }));
+        payload = { allocations };
+      }
+
+      let entityKey: string;
+      if (overrideDialogType === 'component_split') {
+        entityKey = overrideDialogWo.start_time
+          ? `${productId}|${locationId}|${overrideDialogWo.start_time.slice(0, 10)}`
+          : `${productId}|${locationId}`;
+      } else {
+        entityKey = demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`;
+      }
+      await upsertOverride(id, overrideDialogType, entityKey, payload);
+      await loadOverrides();
+      setOverrideDialogOpen(false);
+      setOverrideDialogWo(null);
+      setOverrideDialogType(null);
+    } catch (e) {
+      setOverrideDialogError(e instanceof Error ? e.message : 'Failed to save override');
+    } finally {
+      setOverrideDialogSaving(false);
     }
   };
 
@@ -1720,6 +2003,76 @@ export default function CaseDetail() {
           Demand-to-supply planning: takes customer demands and outputs committed demands (with commit_time) and planned work orders.
           Use <strong>Configure planning (copilot)</strong> to set how variants are chosen (single best vs. split across all), or enable shared-component consolidation.
         </p>
+
+        {/* ── Overrides management panel ─────────────────────────────────────── */}
+        <details style={{ marginBottom: '1rem', border: '1px solid #3d3d40', borderRadius: 6, padding: '0.5rem 0.75rem' }}>
+          <summary style={{ cursor: 'pointer', fontSize: '0.9rem', fontWeight: 600, color: '#e4e4e7', userSelect: 'none' }}>
+            User overrides {overrides.length > 0 && <span style={{ marginLeft: 6, background: '#3b82f6', color: '#fff', borderRadius: 10, padding: '1px 7px', fontSize: '0.75rem' }}>{overrides.length}</span>}
+          </summary>
+          <div style={{ marginTop: '0.75rem' }}>
+            <p style={{ fontSize: '0.8rem', color: '#a1a1aa', marginBottom: '0.75rem' }}>
+              Overrides let you manually control: method selection (make/move/buy), BOM variant selection (ALT_GROUP), or component split allocation among competing demands.
+              Active overrides are applied on the next plan run.
+            </p>
+            {overrides.length === 0 && (
+              <p style={{ fontSize: '0.85rem', color: '#52525b', marginBottom: '0.5rem' }}>No overrides set. Use the &ldquo;Override&rdquo; button on a work order in the results table to create one.</p>
+            )}
+            {overrides.length > 0 && (
+              <table style={{ width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse', marginBottom: '0.75rem' }}>
+                <thead>
+                  <tr style={{ color: '#a1a1aa', textAlign: 'left', borderBottom: '1px solid #3d3d40' }}>
+                    <th style={{ paddingBottom: '0.3rem', paddingRight: '0.75rem' }}>Type</th>
+                    <th style={{ paddingBottom: '0.3rem', paddingRight: '0.75rem' }}>Entity key</th>
+                    <th style={{ paddingBottom: '0.3rem', paddingRight: '0.75rem' }}>Payload</th>
+                    <th style={{ paddingBottom: '0.3rem' }}></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {overrides.map((ov) => (
+                    <tr key={ov.id} style={{ borderTop: '1px solid #27272a' }}>
+                      <td style={{ padding: '0.3rem 0.75rem 0.3rem 0', color: '#67e8f9' }}>{ov.entity_type}</td>
+                      <td style={{ padding: '0.3rem 0.75rem 0.3rem 0', color: '#d4d4d8' }}>{ov.entity_key}</td>
+                      <td style={{ padding: '0.3rem 0.75rem 0.3rem 0', color: '#a1a1aa', maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {JSON.stringify(ov.payload)}
+                      </td>
+                      <td style={{ padding: '0.3rem 0', whiteSpace: 'nowrap' }}>
+                        <button type="button" className="secondary" style={{ fontSize: '0.75rem', padding: '2px 8px' }} onClick={() => handleDeleteOverride(ov.id)}>Remove</button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            {/* Manual JSON override form */}
+            <details style={{ fontSize: '0.8rem' }}>
+              <summary style={{ cursor: 'pointer', color: '#71717a' }}>Add override manually (JSON)</summary>
+              <div style={{ marginTop: '0.5rem', display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+                <select
+                  value={overrideForm.entity_type}
+                  onChange={(e) => setOverrideForm({ ...overrideForm, entity_type: e.target.value })}
+                  style={{ padding: '4px 8px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem' }}
+                >
+                  <option value="method_selection">method_selection</option>
+                  <option value="variant_selection">variant_selection</option>
+                  <option value="component_split">component_split</option>
+                </select>
+                <input
+                  placeholder="entity_key (e.g. PROD|LOC or PROD|LOC|DEMAND)"
+                  value={overrideForm.entity_key}
+                  onChange={(e) => setOverrideForm({ ...overrideForm, entity_key: e.target.value })}
+                  style={{ padding: '4px 8px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem', minWidth: 240 }}
+                />
+                <input
+                  placeholder='payload JSON (e.g. {"method":"make"})'
+                  value={overrideForm.payload}
+                  onChange={(e) => setOverrideForm({ ...overrideForm, payload: e.target.value })}
+                  style={{ padding: '4px 8px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem', minWidth: 200 }}
+                />
+                <button type="button" className="secondary" style={{ fontSize: '0.8rem' }} onClick={handleAddOverride}>Add</button>
+              </div>
+            </details>
+          </div>
+        </details>
         <div style={{ marginBottom: '0.75rem' }}>
           <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem', cursor: 'pointer' }}>
             <input
@@ -1815,7 +2168,16 @@ export default function CaseDetail() {
           >
             {planLoading ? 'Running plan…' : 'Run plan'}
           </button>
-          <span style={{ marginLeft: '1rem' }} />
+          <span style={{ marginLeft: '0.5rem' }} />
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => { loadPlanRunHistory(); setPlanRunHistoryOpen(true); }}
+            style={{ padding: '6px 12px' }}
+          >
+            Plan run history
+          </button>
+          <span style={{ marginLeft: '0.5rem' }} />
           <button
             type="button"
             onClick={() => setCopilotOpen((o) => !o)}
@@ -2038,9 +2400,16 @@ export default function CaseDetail() {
                             }},
                             { key: 'request_time', label: 'Request time', sortable: true, render: (r) => r.request_time ?? '–' },
                             { key: 'commit_time', label: 'Commit time', sortable: true, render: (r) => r.commit_time ?? '–' },
-                            { key: 'commit_reason', label: 'Commit reason', sortable: true, render: (r) => r.commit_reason
-                              ? <span style={r.is_failed ? { color: '#f87171' } : undefined}>{r.commit_reason}</span>
-                              : <span style={{ color: '#52525b' }}>–</span> },
+                            { key: 'commit_reason', label: 'Commit reason', sortable: true, render: (r) => {
+                              if (!r.commit_reason) return <span style={{ color: '#52525b' }}>–</span>;
+                              if (!r.is_failed) return <span>{r.commit_reason}</span>;
+                              const { label, tooltip } = formatCommitReason(r.commit_reason, planningConfig.purchase_allowed !== false);
+                              return (
+                                <span title={tooltip || r.commit_reason} style={{ color: '#f87171', cursor: tooltip ? 'help' : 'default' }}>
+                                  {label}
+                                </span>
+                              );
+                            } },
                             { key: '_pegging', label: 'Pegging', sortable: false, render: (r) => {
                               const k = `demand|${r.demand_id ?? ''}|${r.product_id}|${r.location_id}`;
                               const isSelected = woPeggingRowKey === k;
@@ -2137,7 +2506,15 @@ export default function CaseDetail() {
                         checked={planDemandShortOnly}
                         onChange={(e) => setPlanDemandShortOnly(e.target.checked)}
                       />
-                      <span>Short supply only (demand shortage &gt; 0)</span>
+                      <span>Short supply only (shortage &gt; 0)</span>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input
+                        type="checkbox"
+                        checked={planWoHasOverride}
+                        onChange={(e) => setPlanWoHasOverride(e.target.checked)}
+                      />
+                      <span>Has manual overrides</span>
                     </label>
                   </div>
                   {planResult.work_orders.length > 0 && (() => {
@@ -2170,7 +2547,7 @@ export default function CaseDetail() {
                       ? new Set(planResult.committed_demands.filter((d) => (d.shortage ?? 0) > 0.01).map((d) => d.demand_id ?? ''))
                       : null;
                     // Filters refer to work-order pegging (each WO's supplies subtree), not demand pegging.
-                    const anyPeggingFilter = planDemandRealMakeOnly || planDemandBuyOnly || planDemandRealMoveOnly || planWoDemandedByMultiple || planWoMultiSupply || planWoPurchaseOnly || planWoMoveOnly || planDemandShortOnly;
+                    const anyPeggingFilter = planDemandRealMakeOnly || planDemandBuyOnly || planDemandRealMoveOnly || planWoDemandedByMultiple || planWoMultiSupply || planWoPurchaseOnly || planWoMoveOnly || planDemandShortOnly || planWoHasOverride;
                     if (anyPeggingFilter) {
                       workOrderRows = workOrderRows.filter((r) => {
                         if (planDemandRealMakeOnly && !(r.pegging_includes_real_make === true)) return false;
@@ -2180,7 +2557,12 @@ export default function CaseDetail() {
                         if (planWoMultiSupply && !(r.multi_supply_available === true)) return false;
                         if (planWoPurchaseOnly) { const m = (r.method ?? '').toLowerCase(); if (m !== 'buy' && m !== 'purchase') return false; }
                         if (planWoMoveOnly && (r.method ?? '').toLowerCase() !== 'move') return false;
-                        if (shortDemandIds && !shortDemandIds.has(r.demand_id ?? '')) return false;
+                        if (shortDemandIds) {
+                          const matchesDirect = shortDemandIds.has(r.demand_id ?? '');
+                          const matchesConsolidated = !r.demand_id && (r.wo_consolidation_split_details ?? []).some((d) => shortDemandIds.has(d.demand_id ?? ''));
+                          if (!matchesDirect && !matchesConsolidated) return false;
+                        }
+                        if (planWoHasOverride && !woHasSavedOverride(r)) return false;
                         return true;
                       });
                     }
@@ -2211,6 +2593,13 @@ export default function CaseDetail() {
                       }
                     }
                     const groupedRows = Array.from(grouped.values());
+                    // Build demand_id → shortage lookup for the Shortage column
+                    const demandShortageMap = new Map<string, number>();
+                    for (const d of planResult.committed_demands) {
+                      if ((d.demand_id ?? '') && (d.shortage ?? 0) > 0) {
+                        demandShortageMap.set(d.demand_id ?? '', d.shortage ?? 0);
+                      }
+                    }
                     const dummyHiddenCount = planResult.work_orders.filter((r) => (r.prod_area ?? '').trim().toLowerCase() === 'dummy').length;
                     return (
                       <>
@@ -2221,14 +2610,33 @@ export default function CaseDetail() {
                             : ''}
                           {anyPeggingFilter ? ' (filtered by work-order pegging: real make / buy / real move).' : ''}
                         </p>
-                        <SortFilterTable<WorkOrder & { _key?: string; _prod_area?: string }>
+                        <SortFilterTable<WorkOrder & { _key?: string; _prod_area?: string; _peg_order?: number; _demand_label?: string; _demand_ids?: string[]; _shortage?: number }>
                     idKey="_key"
-                    rows={groupedRows.map((r, i) => ({
-                      ...r,
-                      _key: `wo-${i}-${r.product_id}-${r.location_id}`,
-                      _prod_area: String(r.prod_area ?? ''),
-                    }))}
-                    filterKeys={['product_id', 'location_id', '_prod_area', 'method', 'start_time', 'end_time']}
+                    rows={groupedRows.map((r, i) => {
+                      const splitDemandIds = (r.wo_consolidation_split_details ?? [])
+                        .map((d) => d.demand_id)
+                        .filter((d): d is string => d != null && d !== '');
+                      const demandLabel = r.demand_id
+                        ? r.demand_id
+                        : splitDemandIds.length > 0
+                          ? splitDemandIds.join(', ')
+                          : undefined;
+                      // Shortage: for demand-specific WOs look up by demand_id;
+                      // for consolidated WOs sum across all split demands.
+                      const shortage = r.demand_id
+                        ? (demandShortageMap.get(r.demand_id) ?? 0)
+                        : splitDemandIds.reduce((s, did) => s + (demandShortageMap.get(did) ?? 0), 0);
+                      return {
+                        ...r,
+                        _key: `wo-${i}-${r.product_id}-${r.location_id}`,
+                        _prod_area: String(r.prod_area ?? ''),
+                        _peg_order: pegOrderMap.get(`${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`),
+                        _demand_label: demandLabel,
+                        _demand_ids: r.demand_id ? [r.demand_id] : splitDemandIds,
+                        _shortage: shortage > 0 ? shortage : undefined,
+                      };
+                    })}
+                    filterKeys={['product_id', 'location_id', '_prod_area', 'method', 'start_time', 'end_time', '_demand_label']}
                     filterPlaceholder="Filter by product, location, PROD_AREA, method…"
                     defaultSortKey="start_time"
                     stickyHeader
@@ -2236,6 +2644,7 @@ export default function CaseDetail() {
                       const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
                       if (woExplainKey === k) return { background: 'rgba(167,139,250,0.15)', outline: '1px solid rgba(167,139,250,0.4)' };
                       if (woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
+                      if (!r.override_active && !r.consolidation_override_active && woHasSavedOverride(r)) return { borderLeft: '3px solid #b45309' };
                       return undefined;
                     }}
                     columns={[
@@ -2245,9 +2654,43 @@ export default function CaseDetail() {
                       { key: 'quantity', label: 'Quantity', sortable: true },
                       { key: 'start_time', label: 'Start time', sortable: true, render: (r) => r.start_time ?? '–' },
                       { key: 'end_time', label: 'End time', sortable: true, render: (r) => r.end_time ?? '–' },
-                      { key: 'method', label: 'Method', sortable: true },
+                      { key: 'method', label: 'Method', sortable: true, render: (r) => (
+                        <span>
+                          {r.method ?? '–'}
+                          {(r.override_active || r.consolidation_override_active) && (
+                            <span title={r.override_active ? 'User override active (method/variant)' : 'User override active (consolidation split)'} style={{ marginLeft: 5, background: r.override_active ? '#7c3aed' : '#0891b2', color: '#fff', borderRadius: 8, padding: '1px 6px', fontSize: '0.7rem', verticalAlign: 'middle' }}>
+                              override
+                            </span>
+                          )}
+                          {!r.override_active && !r.consolidation_override_active && woHasSavedOverride(r) && (
+                            <span title="Saved override — re-run plan to apply" style={{ marginLeft: 5, background: '#b45309', color: '#fff', borderRadius: 8, padding: '1px 6px', fontSize: '0.7rem', verticalAlign: 'middle' }}>
+                              pending
+                            </span>
+                          )}
+                        </span>
+                      ) },
+                      { key: '_demand_label', label: 'Demand', sortable: true, render: (r) => {
+                        const ids = (r as { _demand_ids?: string[] })._demand_ids ?? [];
+                        const label = (r as { _demand_label?: string })._demand_label;
+                        if (!label) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                        if (ids.length <= 1) return <span>{label}</span>;
+                        const preview = ids.length <= 3 ? label : `${ids.slice(0, 2).join(', ')} +${ids.length - 2} more`;
+                        return (
+                          <span title={label} style={{ cursor: 'default' }}>
+                            {preview}
+                            <span style={{ marginLeft: 5, background: '#0891b2', color: '#fff', borderRadius: 8, padding: '1px 6px', fontSize: '0.7rem', verticalAlign: 'middle' }}>
+                              shared
+                            </span>
+                          </span>
+                        );
+                      } },
+                      { key: '_shortage', label: 'Shortage', sortable: true, render: (r) => {
+                        const s = (r as { _shortage?: number })._shortage;
+                        if (!s) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                        return <span style={{ color: '#f87171' }}>{s.toLocaleString(undefined, { maximumFractionDigits: 1 })}</span>;
+                      } },
                       { key: 'location_source', label: 'Location source', sortable: true, render: (r) => r.location_source ?? '–' },
-                      { key: '_pegging', label: 'Pegging', sortable: false, render: (r) => {
+                      { key: '_peg_order', label: 'Pegging', sortable: true, render: (r) => {
                         const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
                         const isSelected = woPeggingRowKey === k;
                         return (
@@ -2255,7 +2698,8 @@ export default function CaseDetail() {
                             type="button"
                             className="secondary"
                             style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
-                            onClick={() => {
+                            onClick={(e) => {
+                              e.stopPropagation();
                               if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); }
                               else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); }
                             }}
@@ -2279,6 +2723,19 @@ export default function CaseDetail() {
                           >Why</button>
                         );
                       }},
+                      { key: '_override', label: 'Override', sortable: false, render: (r) => {
+                        const hasMethod = r.multi_supply_available === true && r.wo_explanation_method != null;
+                        const hasVariant = r.wo_explanation_variant != null;
+                        const hasSplit = (r.wo_consolidation_split_details?.length ?? 0) > 1;
+                        if (!hasMethod && !hasVariant && !hasSplit) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                        return (
+                          <div style={{ display: 'flex', gap: 4 }}>
+                            {hasMethod && <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 6px' }} onClick={() => openOverrideDialog('method_selection', r)}>Method</button>}
+                            {hasVariant && <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 6px' }} onClick={() => openOverrideDialog('variant_selection', r)}>Variant</button>}
+                            {hasSplit && <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 6px' }} onClick={() => openOverrideDialog('component_split', r)}>Split</button>}
+                          </div>
+                        );
+                      }},
                     ]}
                   />
                       </>
@@ -2297,6 +2754,246 @@ export default function CaseDetail() {
         <BomGraphTab caseId={id} />
       </section>
       )}
+      {/* ── Plan run history slide-in ──────────────────────────────────────────── */}
+      {planRunHistoryOpen && typeof document !== 'undefined' && createPortal(
+        <div style={{ position: 'fixed', inset: 0, zIndex: 9996, display: 'flex', justifyContent: 'flex-end' }} role="dialog" aria-label="Plan run history">
+          <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)' }} onClick={() => setPlanRunHistoryOpen(false)} aria-hidden />
+          <div style={{ position: 'relative', zIndex: 10, width: planRunHistoryPanelWidth, maxWidth: '90vw', height: '100vh', display: 'flex', flexDirection: 'column', background: '#1c1c1e', color: '#e4e4e7', boxShadow: '-4px 0 24px rgba(0,0,0,0.4)' }}>
+            {/* Resize handle */}
+            <div
+              role="separator"
+              aria-label="Resize panel"
+              onMouseDown={(e) => { e.preventDefault(); planRunHistoryResizeRef.current = { startX: e.clientX, startW: planRunHistoryPanelWidth }; setPlanRunHistoryResizing(true); }}
+              style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: 6, cursor: 'col-resize', zIndex: 11 }}
+            />
+            <div style={{ padding: '1rem 1.25rem', borderBottom: '1px solid #3d3d40', flexShrink: 0, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h3 style={{ margin: 0, fontSize: '1rem' }}>Plan run history</h3>
+              <button type="button" onClick={() => setPlanRunHistoryOpen(false)} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
+            </div>
+            <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
+              {planRunHistoryLoading && <p style={{ color: '#71717a' }}>Loading…</p>}
+              {!planRunHistoryLoading && planRunHistory.length === 0 && <p style={{ color: '#71717a' }}>No persisted plan runs found. Run a plan with async mode to persist results.</p>}
+              {!planRunHistoryLoading && planRunHistory.map((run) => (
+                <div key={run.id} style={{ borderBottom: '1px solid #27272a', paddingBottom: '0.75rem', marginBottom: '0.75rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                    <div>
+                      <span style={{ fontSize: '0.85rem', fontWeight: 600, color: run.status === 'success' ? '#4ade80' : run.status === 'failed' ? '#f87171' : '#fbbf24' }}>
+                        {run.status}
+                      </span>
+                      <span style={{ marginLeft: 8, fontSize: '0.8rem', color: '#a1a1aa' }}>
+                        {new Date(run.created_at).toLocaleString()}
+                      </span>
+                      {run.override_count > 0 && (
+                        <span style={{ marginLeft: 8, background: '#7c3aed', color: '#fff', borderRadius: 8, padding: '1px 6px', fontSize: '0.72rem' }}>
+                          {run.override_count} override{run.override_count !== 1 ? 's' : ''}
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      {run.status === 'success' && (
+                        <button
+                          type="button"
+                          className="secondary"
+                          style={{ fontSize: '0.8rem', padding: '3px 10px' }}
+                          disabled={planRunLoadingId === run.id}
+                          onClick={() => handleRestorePlanRun(run.id)}
+                        >
+                          {planRunLoadingId === run.id ? 'Loading…' : 'Load'}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="secondary"
+                        style={{ fontSize: '0.8rem', padding: '3px 10px', color: '#f87171', borderColor: '#f87171' }}
+                        onClick={() => handleDeletePlanRun(run.id)}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                  <div style={{ fontSize: '0.75rem', color: '#71717a', marginTop: '0.25rem' }}>
+                    Run #{run.id}{run.job_id ? ` · job ${run.job_id.slice(0, 8)}…` : ''}
+                    {run.config && Object.keys(run.config).length > 0 && (
+                      <details style={{ display: 'inline-block', marginLeft: 8 }}>
+                        <summary style={{ cursor: 'pointer' }}>config</summary>
+                        <pre style={{ margin: '0.25rem 0', fontSize: '0.7rem', color: '#a1a1aa', whiteSpace: 'pre-wrap' }}>{JSON.stringify(run.config, null, 2)}</pre>
+                      </details>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* ── Override dialog ────────────────────────────────────────────────────── */}
+      {overrideDialogOpen && overrideDialogWo && typeof document !== 'undefined' && createPortal(
+        <div style={{ position: 'fixed', inset: 0, zIndex: 10000, display: 'flex', alignItems: 'center', justifyContent: 'center' }} role="dialog" aria-label="Override dialog">
+          <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.6)' }} onClick={() => setOverrideDialogOpen(false)} aria-hidden />
+          <div style={{ position: 'relative', zIndex: 10, width: 480, maxWidth: '92vw', background: '#1c1c1e', color: '#e4e4e7', borderRadius: 10, boxShadow: '0 8px 32px rgba(0,0,0,0.5)', padding: '1.5rem' }}>
+            <h3 style={{ margin: '0 0 0.25rem', fontSize: '1rem' }}>
+              {overrideDialogType === 'method_selection' ? 'Override method selection'
+                : overrideDialogType === 'variant_selection' ? 'Override BOM variant selection'
+                : 'Override component split allocation'}
+            </h3>
+            <p style={{ margin: '0 0 1rem', fontSize: '0.8rem', color: '#a1a1aa' }}>
+              <strong>{overrideDialogWo.product_id}</strong> @ {overrideDialogWo.location_id}
+              {overrideDialogWo.demand_id && <> · demand {overrideDialogWo.demand_id}</>}
+              {overrideDialogWo.start_time && <> · {overrideDialogWo.start_time.slice(0, 10)}</>}
+            </p>
+            {/* ── Method selection form ─── */}
+            {overrideDialogType === 'method_selection' && overrideDialogWo && (
+              <>
+                {overrideDialogWo.wo_explanation_method && (
+                  <div style={{ marginBottom: '1rem', padding: '0.6rem 0.75rem', background: '#27272a', borderRadius: 6, borderLeft: '3px solid #a78bfa' }}>
+                    <div style={{ fontSize: '0.7rem', color: '#71717a', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '0.3rem' }}>Auto-selected reason</div>
+                    <p style={{ margin: 0, fontSize: '0.8rem', color: '#d4d4d8', lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{overrideDialogWo.wo_explanation_method}</p>
+                  </div>
+                )}
+                <label style={{ display: 'block', fontSize: '0.85rem', color: '#e4e4e7', marginBottom: '0.4rem' }}>Force method</label>
+                <div style={{ display: 'flex', gap: '0.5rem' }}>
+                  {(overrideDialogWo?.wo_explanation_method
+                    ? Array.from(new Set(Array.from(overrideDialogWo.wo_explanation_method.matchAll(/\b(make|move|buy)\b/gi), (match) => match[1].toLowerCase())))
+                    : ['make', 'move', 'buy']
+                  ).map((m) => (
+                    <label key={m} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '0.5rem 0.9rem', borderRadius: 6, border: `1px solid ${overrideMethodValue === m ? '#a78bfa' : '#3d3d40'}`, background: overrideMethodValue === m ? 'rgba(167,139,250,0.12)' : '#27272a', cursor: 'pointer', fontSize: '0.85rem' }}>
+                      <input type="radio" name="override_method" value={m} checked={overrideMethodValue === m} onChange={() => setOverrideMethodValue(m)} style={{ accentColor: '#a78bfa' }} />
+                      {m}
+                    </label>
+                  ))}
+                </div>
+                <p style={{ fontSize: '0.75rem', color: '#71717a', marginTop: '0.5rem' }}>This overrides the planner&apos;s auto-selected method for <strong>{overrideDialogWo.product_id} @ {overrideDialogWo.location_id}</strong>. Re-run plan to apply.</p>
+              </>
+            )}
+            {/* ── Variant selection form ─── */}
+            {overrideDialogType === 'variant_selection' && overrideDialogWo && (
+              <>
+                {overrideDialogWo.wo_explanation_variant && (
+                  <div style={{ marginBottom: '1rem', padding: '0.6rem 0.75rem', background: '#27272a', borderRadius: 6, borderLeft: '3px solid #a78bfa' }}>
+                    <div style={{ fontSize: '0.7rem', color: '#71717a', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '0.3rem' }}>Auto-selected reason</div>
+                    <p style={{ margin: 0, fontSize: '0.8rem', color: '#d4d4d8', lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{overrideDialogWo.wo_explanation_variant}</p>
+                  </div>
+                )}
+                <label style={{ display: 'block', fontSize: '0.85rem', color: '#e4e4e7', marginBottom: '0.4rem' }}>Force ALT_GROUP</label>
+                <input
+                  type="text"
+                  placeholder="Type the ALT_GROUP name to force (e.g. GROUP1)"
+                  value={overrideVariantValue}
+                  onChange={(e) => setOverrideVariantValue(e.target.value)}
+                  style={{ width: '100%', padding: '0.5rem 0.75rem', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 6, color: '#fafafa', fontSize: '0.85rem', boxSizing: 'border-box' }}
+                  autoFocus
+                />
+                <p style={{ fontSize: '0.75rem', color: '#71717a', marginTop: '0.5rem' }}>Read the reason above to see which ALT_GROUP was chosen and its alternatives. Re-run plan to apply.</p>
+              </>
+            )}
+            {/* ── Component split form ─── */}
+            {overrideDialogType === 'component_split' && overrideDialogWo && (() => {
+              const totalPlanned = overrideDialogWo.wo_consolidation_total_planned ?? 0;
+              const sumQty = overrideSplitRows.reduce((s, r) => s + (Number(r.qty) || 0), 0);
+              const over = sumQty > totalPlanned + 0.001;
+              return (
+                <>
+                  <div style={{ marginBottom: '0.75rem', display: 'flex', gap: '1.5rem', fontSize: '0.8rem', color: '#a1a1aa' }}>
+                    <span>Total planned: <strong style={{ color: '#e4e4e7' }}>{totalPlanned.toLocaleString(undefined, { maximumFractionDigits: 1 })}</strong></span>
+                    <span>Split mode: <strong style={{ color: '#e4e4e7' }}>{overrideDialogWo.wo_consolidation_split_mode === 'proportional' ? 'Proportional' : 'Priority first'}</strong></span>
+                  </div>
+                  <table style={{ width: '100%', fontSize: '0.82rem', borderCollapse: 'collapse', marginBottom: '0.5rem' }}>
+                    <thead>
+                      <tr style={{ color: '#71717a', textAlign: 'left', borderBottom: '1px solid #3d3d40' }}>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem' }}>Demand</th>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem' }}>Parent product</th>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem', textAlign: 'right' }}>Pri</th>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem', textAlign: 'right' }}>Requested</th>
+                        <th style={{ paddingBottom: '0.3rem', textAlign: 'right' }}>Override qty</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {overrideSplitRows.map((row, i) => (
+                        <tr key={i} style={{ borderTop: '1px solid #27272a' }}>
+                          <td style={{ padding: '0.3rem 0.5rem 0.3rem 0', color: '#d4d4d8' }}>{row.demand_id ?? '–'}</td>
+                          <td style={{ padding: '0.3rem 0.5rem 0.3rem 0', color: '#a1a1aa', fontSize: '0.78rem' }}>{row.parent_product}</td>
+                          <td style={{ padding: '0.3rem 0.5rem 0.3rem 0', textAlign: 'right' }}>{row.priority}</td>
+                          <td style={{ padding: '0.3rem 0.5rem 0.3rem 0', textAlign: 'right', color: '#71717a' }}>{row.requested_qty.toLocaleString(undefined, { maximumFractionDigits: 1 })}</td>
+                          <td style={{ padding: '0.3rem 0', textAlign: 'right' }}>
+                            <input
+                              type="number"
+                              min={0}
+                              step="any"
+                              value={row.qty}
+                              onChange={(e) => setOverrideSplitRows((prev) => prev.map((r, j) => j === i ? { ...r, qty: parseFloat(e.target.value) || 0 } : r))}
+                              style={{ width: 80, padding: '2px 6px', background: '#1c1c1e', border: `1px solid ${over ? '#f87171' : '#3d3d40'}`, borderRadius: 4, color: '#fafafa', fontSize: '0.82rem', textAlign: 'right' }}
+                            />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot>
+                      <tr style={{ borderTop: '2px solid #3d3d40' }}>
+                        <td colSpan={4} style={{ paddingTop: '0.3rem', color: '#a1a1aa', fontSize: '0.78rem', textAlign: 'right', paddingRight: '0.5rem' }}>Sum</td>
+                        <td style={{ paddingTop: '0.3rem', textAlign: 'right', fontWeight: 600, color: over ? '#f87171' : sumQty <= totalPlanned + 0.001 ? '#4ade80' : '#e4e4e7' }}>
+                          {sumQty.toLocaleString(undefined, { maximumFractionDigits: 1 })}
+                          {over && <span style={{ marginLeft: 4, fontSize: '0.7rem', color: '#f87171' }}>exceeds total</span>}
+                        </td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                  <p style={{ fontSize: '0.75rem', color: '#71717a', margin: '0.25rem 0 0' }}>If the sum exceeds the total planned qty the backend will scale all quantities down proportionally. Re-run plan to apply.</p>
+                </>
+              );
+            })()}
+            {overrideDialogError && <p style={{ color: '#f87171', fontSize: '0.8rem', marginTop: '0.4rem' }}>{overrideDialogError}</p>}
+            {(() => {
+              if (!overrideDialogWo || !overrideDialogType) return null;
+              const productId = overrideDialogWo.product_id ?? '';
+              const locationId = overrideDialogWo.location_id ?? '';
+              const demandId = overrideDialogWo.demand_id ?? '';
+              const entityKey = overrideDialogType === 'component_split'
+                ? (overrideDialogWo.start_time ? `${productId}|${locationId}|${overrideDialogWo.start_time.slice(0, 10)}` : `${productId}|${locationId}`)
+                : (demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`);
+              const existingOverride = overrides.find((o) => o.entity_type === overrideDialogType && o.entity_key === entityKey) ?? null;
+              if (!existingOverride) return null;
+              return (
+                <div style={{ marginTop: '0.75rem', padding: '0.5rem 0.75rem', background: 'rgba(180,83,9,0.12)', border: '1px solid rgba(180,83,9,0.4)', borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                  <span style={{ fontSize: '0.8rem', color: '#fbbf24' }}>Override already saved — re-run plan to apply, or reset to auto.</span>
+                  <button
+                    type="button"
+                    className="secondary"
+                    disabled={overrideDialogSaving}
+                    style={{ fontSize: '0.8rem', padding: '3px 10px', color: '#f87171', borderColor: 'rgba(248,113,113,0.4)' }}
+                    onClick={async () => {
+                      setOverrideDialogSaving(true);
+                      setOverrideDialogError(null);
+                      try {
+                        await deleteOverride(id, existingOverride.id);
+                        await loadOverrides();
+                        setOverrideDialogOpen(false);
+                        setOverrideDialogWo(null);
+                        setOverrideDialogType(null);
+                      } catch (e) {
+                        setOverrideDialogError(e instanceof Error ? e.message : 'Failed to reset');
+                      } finally {
+                        setOverrideDialogSaving(false);
+                      }
+                    }}
+                  >
+                    Reset to auto
+                  </button>
+                </div>
+              );
+            })()}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: '1rem' }}>
+              <button type="button" className="secondary" onClick={() => setOverrideDialogOpen(false)}>Cancel</button>
+              <button type="button" disabled={overrideDialogSaving} onClick={handleSaveOverride}>
+                {overrideDialogSaving ? 'Saving…' : 'Save override'}
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
       {woExplainOpen && woExplainRow && typeof document !== 'undefined' && createPortal(
         <div
           style={{ position: 'fixed', inset: 0, zIndex: 9997, display: 'flex', justifyContent: 'flex-end', pointerEvents: 'none' }}
@@ -2310,11 +3007,18 @@ export default function CaseDetail() {
           />
           <div
             style={{
-              position: 'relative', zIndex: 10, width: 420, maxWidth: '90vw', height: '100vh',
+              position: 'relative', zIndex: 10, width: woExplainPanelWidth, maxWidth: '90vw', height: '100vh',
               display: 'flex', flexDirection: 'column', background: '#1c1c1e', color: '#e4e4e7',
               boxShadow: '-4px 0 24px rgba(0,0,0,0.4)', pointerEvents: 'auto',
             }}
           >
+            {/* Resize handle */}
+            <div
+              role="separator"
+              aria-label="Resize panel"
+              onMouseDown={(e) => { e.preventDefault(); woExplainResizeRef.current = { startX: e.clientX, startW: woExplainPanelWidth }; setWoExplainResizing(true); }}
+              style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: 6, cursor: 'col-resize', zIndex: 11 }}
+            />
             {/* Header */}
             <div style={{ padding: '1rem 1.25rem', borderBottom: '1px solid #3d3d40', flexShrink: 0 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.25rem' }}>
@@ -2332,14 +3036,28 @@ export default function CaseDetail() {
               {/* Method choice */}
               {woExplainRow.wo_explanation_method && (
                 <section style={{ marginBottom: '1.25rem' }}>
-                  <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Method selection</h4>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
+                    <h4 style={{ margin: 0, color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Method selection</h4>
+                    {woExplainRow.multi_supply_available && (
+                      <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 8px' }}
+                        onClick={() => { setWoExplainOpen(false); setWoExplainKey(null); openOverrideDialog('method_selection', woExplainRow); }}>
+                        Override
+                      </button>
+                    )}
+                  </div>
                   <p style={{ margin: 0, fontSize: '0.875rem', lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{woExplainRow.wo_explanation_method}</p>
                 </section>
               )}
               {/* Variant choice */}
               {woExplainRow.wo_explanation_variant && (
                 <section style={{ marginBottom: '1.25rem' }}>
-                  <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>BOM variant selection</h4>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
+                    <h4 style={{ margin: 0, color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>BOM variant selection</h4>
+                    <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 8px' }}
+                      onClick={() => { setWoExplainOpen(false); setWoExplainKey(null); openOverrideDialog('variant_selection', woExplainRow); }}>
+                      Override
+                    </button>
+                  </div>
                   <p style={{ margin: 0, fontSize: '0.875rem', lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{woExplainRow.wo_explanation_variant}</p>
                 </section>
               )}
@@ -2362,7 +3080,17 @@ export default function CaseDetail() {
               {/* Consolidation split */}
               {woExplainRow.wo_consolidation_split_details && woExplainRow.wo_consolidation_split_details.length > 1 && (
                 <section style={{ marginBottom: '1.25rem' }}>
-                  <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Consolidation split</h4>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
+                    <h4 style={{ margin: 0, color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Consolidation split</h4>
+                    <button
+                      type="button"
+                      className="secondary"
+                      style={{ fontSize: '0.72rem', padding: '2px 8px' }}
+                      onClick={() => { setWoExplainOpen(false); setWoExplainKey(null); openOverrideDialog('component_split', woExplainRow); }}
+                    >
+                      Override split
+                    </button>
+                  </div>
                   <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem' }}>
                     This work order was consolidated for <strong>{woExplainRow.wo_consolidation_split_details.length}</strong> demands
                     (total planned: <strong>{(woExplainRow.wo_consolidation_total_planned ?? 0).toLocaleString(undefined, { maximumFractionDigits: 1 })}</strong>).
@@ -2625,8 +3353,60 @@ export default function CaseDetail() {
               {' '}
               When multiple inventories or work orders appear as siblings under the same parent, they are alternative paths <strong>OR</strong> that can each supply flow to that parent.
             </p>
+            {planPeggingContext.type === 'work_order' && (() => {
+              const row = planPeggingContext.row;
+              // "Shared" means the planner consolidated multiple demands into one WO (demand_id=null).
+              // Demand-specific WOs serve one demand each — not shared even if the same product@location
+              // has sibling WOs for other demands.
+              const sharedDemands = row.demand_id == null
+                ? (row.wo_consolidation_split_details ?? [])
+                    .map((d) => d.demand_id)
+                    .filter((d): d is string => d != null && d !== '')
+                : [];
+              if (sharedDemands.length <= 1) return null;
+              const active = woPeggingActiveDemandId ?? (sharedDemands[0] ?? '');
+              return (
+                <div style={{ marginBottom: '0.75rem' }}>
+                  <span style={{ fontSize: '0.75rem', color: '#a1a1aa', marginRight: 6 }}>
+                    Consolidated for {sharedDemands.length} demands — viewing:
+                  </span>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 4 }}>
+                    {sharedDemands.map((did) => (
+                      <button
+                        key={did}
+                        type="button"
+                        className="secondary"
+                        title={did}
+                        style={{
+                          fontSize: '0.72rem', padding: '2px 8px', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                          background: active === did ? 'rgba(167,139,250,0.18)' : undefined,
+                          borderColor: active === did ? '#a78bfa' : undefined,
+                          color: active === did ? '#a78bfa' : undefined,
+                        }}
+                        onClick={() => setWoPeggingActiveDemandId(did)}
+                      >
+                        {did}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
+            {planPeggingContext.type === 'work_order' && (() => {
+              const row = planPeggingContext.row as WorkOrder;
+              // For demand-specific WOs (not consolidated), show a single demand note
+              // analogous to the consolidated tabs, so the UI is consistent.
+              if (row.demand_id == null) return null;
+              return (
+                <div style={{ marginBottom: '0.75rem', fontSize: '0.75rem', color: '#a1a1aa' }}>
+                  Serving demand: <span style={{ color: '#e4e4e7', fontWeight: 500 }}>{row.demand_id}</span>
+                </div>
+              );
+            })()}
             {(() => {
               let tree: PlanningPeggingNode | null = null;
+              const isWoPeggingView = planPeggingContext.type === 'work_order';
+              const woPeggingDemandId = isWoPeggingView ? (planPeggingContext.row as WorkOrder).demand_id ?? null : null;
               if (planPeggingContext.type === 'work_order') {
                 if (planWorkOrderPeggingLoading === woPeggingKey || (woPeggingKey && !planWorkOrderPeggingCache[woPeggingKey] && !planWorkOrderPeggingError)) {
                   return (
@@ -2679,7 +3459,7 @@ export default function CaseDetail() {
                   ? Number((planPeggingContext.row as WorkOrder).quantity ?? 0)
                   : null;
                 const label = node.type === 'demand'
-                  ? `${node.product_id ?? node.demand_id ?? '–'} · ${Number(node.quantity ?? 0).toLocaleString()} @ ${node.location_id ?? '–'}${node.demand_id && node.product_id !== node.demand_id ? ` (demand ${node.demand_id})` : ''}`
+                  ? `${node.product_id ?? node.demand_id ?? '–'} · ${Number(node.quantity ?? 0).toLocaleString()} @ ${node.location_id ?? '–'}${node.demand_id && node.product_id !== node.demand_id && !(isWoPeggingView && woPeggingDemandId) ? ` (demand ${node.demand_id})` : ''}`
                   : node.type === 'work_order'
                     ? (() => {
                         const qty = woRowQty ?? Number(node.quantity ?? 0);

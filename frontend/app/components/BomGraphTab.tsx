@@ -48,7 +48,7 @@ export default function BomGraphTab({ caseId }: { caseId: number }) {
       if (!parentSets.has(e.source)) parentSets.set(e.source, new Set());
       parentSets.get(e.source)!.add(e.target);
     }
-    return new Set([...parentSets.entries()]
+    return new Set(Array.from(parentSets.entries())
       .filter(([, parents]) => parents.size >= 2)
       .map(([id]) => id));
   }, [data]);

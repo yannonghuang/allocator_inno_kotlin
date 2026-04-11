@@ -82,6 +82,58 @@ fun Routing.overrideRoutes() {
             call.respond(mapOf("status" to "ok", "count" to overrides.size))
         }
 
+        // PUT /cases/{case_id}/overrides/{override_id} — update single override by id
+        put("/{override_id}") {
+            val caseId = call.parameters["case_id"]?.toIntOrNull()
+                ?: throw IllegalArgumentException("Invalid case_id")
+            val overrideId = call.parameters["override_id"]?.toIntOrNull()
+                ?: throw IllegalArgumentException("Invalid override_id")
+            requireCase(caseId)
+            val body = call.receive<ManualOverrideCreate>()
+            val response = transaction {
+                val updated = ManualOverrides.update({
+                    (ManualOverrides.id eq overrideId) and (ManualOverrides.caseId eq caseId)
+                }) {
+                    it[entityType] = body.entityType
+                    it[entityKey] = body.entityKey
+                    it[payload] = body.payload.toString()
+                }
+                if (updated == 0) throw NoSuchElementException("Override not found")
+                rowToResponse(ManualOverrides.selectAll().where { ManualOverrides.id eq overrideId }.single())
+            }
+            call.respond(response)
+        }
+
+        // POST /cases/{case_id}/overrides/upsert — create-or-update by (entityType, entityKey)
+        post("/upsert") {
+            val caseId = call.parameters["case_id"]?.toIntOrNull()
+                ?: throw IllegalArgumentException("Invalid case_id")
+            requireCase(caseId)
+            val body = call.receive<ManualOverrideCreate>()
+            val response = transaction {
+                val existing = ManualOverrides.selectAll().where {
+                    (ManualOverrides.caseId eq caseId) and
+                    (ManualOverrides.entityType eq body.entityType) and
+                    (ManualOverrides.entityKey eq body.entityKey)
+                }.firstOrNull()
+                if (existing != null) {
+                    ManualOverrides.update({ ManualOverrides.id eq existing[ManualOverrides.id] }) {
+                        it[payload] = body.payload.toString()
+                    }
+                    rowToResponse(ManualOverrides.selectAll().where { ManualOverrides.id eq existing[ManualOverrides.id] }.single())
+                } else {
+                    val insertedId = ManualOverrides.insert {
+                        it[ManualOverrides.caseId] = caseId
+                        it[entityType] = body.entityType
+                        it[entityKey] = body.entityKey
+                        it[payload] = body.payload.toString()
+                    }[ManualOverrides.id]
+                    rowToResponse(ManualOverrides.selectAll().where { ManualOverrides.id eq insertedId }.single())
+                }
+            }
+            call.respond(HttpStatusCode.OK, response)
+        }
+
         // DELETE /cases/{case_id}/overrides/{override_id}
         delete("/{override_id}") {
             val caseId = call.parameters["case_id"]?.toIntOrNull()

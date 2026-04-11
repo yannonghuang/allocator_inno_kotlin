@@ -1,6 +1,73 @@
 package com.allocator.services
 
+import kotlinx.serialization.json.*
+import org.slf4j.LoggerFactory
 import java.time.LocalDate
+
+private val log = LoggerFactory.getLogger("com.allocator.ConsolidationEngine")
+
+// ── Override index ─────────────────────────────────────────────────────────────
+
+/**
+ * Recursively convert a JsonElement (or plain Kotlin type) to a plain Any? value.
+ * Needed because CaseLoader stores override payloads as JsonObject, and a raw
+ * `as? Map<String, Any?>` cast succeeds at runtime (type erasure) but leaves
+ * JsonPrimitive values in the map — whose toString() includes surrounding quotes.
+ */
+private fun jsonToAny(v: Any?): Any? = when (v) {
+    is JsonPrimitive -> if (v.isString) v.content else v.booleanOrNull ?: v.doubleOrNull ?: v.content
+    is JsonArray -> v.map { jsonToAny(it) }
+    is JsonObject -> v.entries.associate { (k, el) -> k to jsonToAny(el) }
+    else -> v
+}
+
+/**
+ * Build a lookup map: "entityType|entityKey" → payload map (plain Kotlin types).
+ * Used by both ConsolidationEngine and PlanningEngine to resolve user overrides.
+ */
+@Suppress("UNCHECKED_CAST")
+fun buildOverrideIndex(overrides: List<Map<String, Any?>>): Map<String, Map<String, Any?>> {
+    val result = mutableMapOf<String, Map<String, Any?>>()
+    for (o in overrides) {
+        val type = o["entity_type"]?.toString()?.trim() ?: continue
+        val key  = o["entity_key"]?.toString()?.trim()  ?: continue
+        val raw  = o["payload"]
+        val payloadMap: Map<String, Any?> = when (raw) {
+            is JsonObject -> raw.entries.associate { (k, v) -> k to jsonToAny(v) }
+            is Map<*, *>  -> raw as Map<String, Any?>
+            else          -> emptyMap()
+        }
+        result["$type|$key"] = payloadMap
+    }
+    return result
+}
+
+/**
+ * Parse a component_split override payload into a demandId→qty map.
+ * Clamps the total to producedQty if the override specifies more than was planned.
+ */
+@Suppress("UNCHECKED_CAST")
+fun parseSplitOverride(
+    payload: Map<String, Any?>,
+    producedQty: Double,
+): Map<Any?, Double> {
+    val allocations = payload["allocations"] as? List<*> ?: return emptyMap()
+    val raw = mutableMapOf<Any?, Double>()
+    for (item in allocations) {
+        val m = item as? Map<*, *> ?: continue
+        val demandId = m["demand_id"]
+        val qty = (m["qty"] as? Number)?.toDouble() ?: continue
+        if (qty > 0) raw[demandId] = (raw[demandId] ?: 0.0) + qty
+    }
+    if (raw.isEmpty()) return emptyMap()
+    val total = raw.values.sum()
+    return if (total > producedQty + 1e-9 && total > 1e-12) {
+        val scale = producedQty / total
+        raw.mapValues { (_, v) -> v * scale }.also {
+            log.warn("component_split override total {} exceeds producedQty {}; scaled down", total, producedQty)
+        }
+    } else raw
+}
 
 // ── Data classes ──────────────────────────────────────────────────────────────
 
@@ -234,6 +301,10 @@ fun runConsolidation(
     val allocation          = mutableMapOf<Any?, MutableMap<String, Double>>()
     val consolidatedPegging = mutableListOf<Map<String, Any?>>()
 
+    // Build override index once — shared across all groups
+    @Suppress("UNCHECKED_CAST")
+    val overrideIndex = buildOverrideIndex((data["overrides"] ?: emptyList()) as List<Map<String, Any?>>)
+
     for (group in groups) {
         val componentKey = "${group.productId}|${group.locationId}"
 
@@ -293,10 +364,19 @@ fun runConsolidation(
             val (committed, wos, pegging) = planFn(syntheticDemand, invCopy, data, group.timeBucket, 500, emptySet(), planConfig, null)
             val producedQty = committed.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
 
-            // Split output among demands
-            val split = when (config.allocationMode) {
-                "proportional" -> splitProportional(group, producedQty)
-                else           -> splitPriorityFirst(group, producedQty)
+            // Check for a component_split override before falling back to engine split policy
+            val splitKey = "${group.productId}|${group.locationId}|${group.timeBucket}"
+            val splitOverridePayload = overrideIndex["component_split|$splitKey"]
+            val splitOverrideActive = splitOverridePayload != null
+            val split: Map<Any?, Double> = if (splitOverridePayload != null) {
+                parseSplitOverride(splitOverridePayload, producedQty).also {
+                    log.info("component_split override applied for {} — {} demands", splitKey, it.size)
+                }
+            } else {
+                when (config.allocationMode) {
+                    "proportional" -> splitProportional(group, producedQty)
+                    else           -> splitPriorityFirst(group, producedQty)
+                }
             }
             for ((demandId, qty) in split) {
                 if (qty <= 1e-12) continue
@@ -322,6 +402,7 @@ fun runConsolidation(
                     "consolidation_split_mode" to config.allocationMode,
                     "consolidation_total_planned" to producedQty,
                     "consolidation_split_details" to splitDetails,
+                    "consolidation_override_active" to splitOverrideActive,
                 ))
             }
             if (pegging != null) consolidatedPegging.add(mapOf("demand_id" to null, "consolidated" to true, "tree" to pegging))
