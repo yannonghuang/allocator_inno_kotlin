@@ -161,8 +161,22 @@ object AllocationActions : Table("allocation_action") {
 object ManualOverrides : Table("manual_override") {
     val id = integer("id").autoIncrement()
     val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
-    val entityType = varchar("entity_type", 64)   // "supply" | "demand" | "allocation"
+    val entityType = varchar("entity_type", 64)   // "supply" | "demand" | "component_split" | "method_selection" | "variant_selection"
     val entityKey = varchar("entity_key", 512)
     val payload = text("payload")                 // JSON blob
+    override val primaryKey = PrimaryKey(id)
+}
+
+/** Persisted planning run: config + override snapshot + result JSON so state is restorable. */
+object PlanRuns : Table("plan_run") {
+    val id = integer("id").autoIncrement()
+    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val jobId = varchar("job_id", 64).nullable()
+    val status = varchar("status", 16).default("running")       // "running" | "success" | "failed"
+    val config = text("config").nullable()                       // JSON: PlanningConfig sent with request
+    val overrideSnapshot = text("override_snapshot").nullable()  // JSON: overrides active at run time
+    val result = text("result").nullable()                       // JSON: enriched plan result
+    val error = text("error").nullable()
+    val createdAt = timestamp("created_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 }

@@ -1,5 +1,6 @@
 package com.allocator
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
 
@@ -24,10 +25,11 @@ data class CaseResponse(
 data class CaseDetailResponse(
     val id: Int,
     val name: String,
-    val createdAt: String,
-    val demandCount: Int = 0,
-    val supplyCount: Int = 0,
-    val runCount: Int = 0,
+    @SerialName("created_at")    val createdAt: String,
+    @SerialName("demand_count")  val demandCount: Int = 0,
+    @SerialName("supply_count")  val supplyCount: Int = 0,
+    @SerialName("run_count")     val runCount: Int = 0,
+    @SerialName("plan_run_count") val planRunCount: Int = 0,
 )
 
 @Serializable
@@ -56,17 +58,17 @@ data class AllocationActionResponse(
 
 @Serializable
 data class ManualOverrideCreate(
-    val entityType: String,
-    val entityKey: String,
+    @SerialName("entity_type") val entityType: String,
+    @SerialName("entity_key") val entityKey: String,
     val payload: JsonElement,
 )
 
 @Serializable
 data class ManualOverrideResponse(
     val id: Int,
-    val caseId: Int,
-    val entityType: String,
-    val entityKey: String,
+    @SerialName("case_id") val caseId: Int,
+    @SerialName("entity_type") val entityType: String,
+    @SerialName("entity_key") val entityKey: String,
     val payload: JsonElement,
 )
 
@@ -84,6 +86,30 @@ data class ImportCsvResponse(val status: String, val caseId: Int)
 
 @Serializable
 data class StatusResponse(val status: String)
+
+@Serializable
+data class PlanRunResponse(
+    val id: Int,
+    @SerialName("case_id") val caseId: Int,
+    @SerialName("job_id") val jobId: String? = null,
+    val status: String,
+    val config: JsonElement? = null,
+    @SerialName("override_count") val overrideCount: Int = 0,
+    @SerialName("created_at") val createdAt: String,
+)
+
+@Serializable
+data class PlanRunFullResponse(
+    val id: Int,
+    @SerialName("case_id") val caseId: Int,
+    @SerialName("job_id") val jobId: String? = null,
+    val status: String,
+    val config: JsonElement? = null,
+    @SerialName("override_snapshot") val overrideSnapshot: JsonElement? = null,
+    val result: JsonElement? = null,
+    val error: String? = null,
+    @SerialName("created_at") val createdAt: String,
+)
 
 @Serializable
 data class BomGraphNode(

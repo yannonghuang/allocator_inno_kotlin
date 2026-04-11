@@ -579,6 +579,7 @@ fun plan(
     planningPath: Set<Pair<String, String>> = emptySet(),
     config: Map<String, Any?>? = null,
     preferDemandId: Any? = null,
+    overrideIndex: Map<String, Map<String, Any?>> = emptyMap(),
 ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
 
     val productId = (demand["product_id"] as? String)?.trim() ?: ""
@@ -760,16 +761,51 @@ fun plan(
         return Triple(demandFulfilledList, allWos, demandNode(allPeggingWoNodes, formatDate(latestCommit)))
     }
 
+    // ── Override lookup for this (product, location, demand) ──────────────────
+    // Exact match only: demand-specific WOs match demand-scoped keys; null-demand WOs match
+    // location-level keys. No fallback — prevents a location-level override (saved for a
+    // consolidated/null-demand WO) from leaking to unrelated demand-specific WOs.
+    val demandIdStr = demandId?.toString()?.trim() ?: ""
+    val methodOverride = if (demandIdStr.isNotBlank())
+        overrideIndex["method_selection|$productId|$locationId|$demandIdStr"]
+    else
+        overrideIndex["method_selection|$productId|$locationId"]
+    val variantOverride = if (demandIdStr.isNotBlank())
+        overrideIndex["variant_selection|$productId|$locationId|$demandIdStr"]
+    else
+        overrideIndex["variant_selection|$productId|$locationId"]
+    // Filter to the override-specified method if one is configured
+    val effectiveMethods = if (methodOverride != null) {
+        val forcedType = (methodOverride["method"] ?: methodOverride["method_type"])?.toString()
+        val forcedPref = (methodOverride["preference"] as? Number)?.toInt()
+        methods.filter { m ->
+            (forcedType == null || m["type"]?.toString() == forcedType) &&
+            (forcedPref == null || (m["preference"] as? Number)?.toInt() == forcedPref)
+        }.ifEmpty {
+            log.warn("method_selection override for {}@{} matched no methods; using all", productId, locationId)
+            methods
+        }
+    } else methods
+
     // ── Single method selection ────────────────────────────────────────────────
     val (m, methodChoiceExplanation) = when {
-        methods.size == 1 -> {
-            val m = methods[0]; val loc = (m["location_id"] ?: m["to_location_id"] ?: "").toString()
-            Pair(m, "Only option: ${m["type"]} @ $loc.")
+        effectiveMethods.size == 1 -> {
+            val m = effectiveMethods[0]; val loc = (m["location_id"] ?: m["to_location_id"] ?: "").toString()
+            val base = "Only option: ${m["type"]} @ $loc."
+            Pair(m, if (methodOverride != null) "$base [method override active]" else base)
         }
         useElaborateMethod && depth >= MAX_PLAN_DEPTH ->
-            getPreferredMethodElaborate(methods, demand, inventory, data, requestTimeDt, config, depth, path)
-        else -> getPreferredMethod(methods)
+            getPreferredMethodElaborate(effectiveMethods, demand, inventory, data, requestTimeDt, config, depth, path)
+        else -> getPreferredMethod(effectiveMethods)
     }
+
+    // Override is active only when it actually changed the selected method vs auto-selection.
+    // For elaborate mode (expensive), fall back to checking whether choices were restricted.
+    val methodOverrideActive = methodOverride != null && when {
+        useElaborateMethod && depth >= MAX_PLAN_DEPTH -> effectiveMethods.size < methods.size
+        else -> getPreferredMethod(methods).first?.get("type")?.toString() != m?.get("type")?.toString()
+    }
+    val overrideActive = methodOverrideActive || variantOverride != null
 
     if (m == null) {
         demandFulfilledList.add(committedRow(demandNetQty, reqTimeStr, "no_preferred_method"))
@@ -784,14 +820,24 @@ fun plan(
     var woChildrenRelation: String? = null
     val (childMaterials, variantExplanation) = when (m["type"]) {
         "make" -> {
-            val variants = variantsForMake(productId, productionLocation, demandNetQty, m, data)
+            val rawVariants = variantsForMake(productId, productionLocation, demandNetQty, m, data)
+            // Apply variant_selection override: force a specific alt_group
+            val variants = if (variantOverride != null) {
+                val forcedAltGroup = variantOverride["alt_group"]?.toString()
+                rawVariants.filter { (altKey, _) -> forcedAltGroup == null || altKey == forcedAltGroup }
+                    .ifEmpty {
+                        log.warn("variant_selection override alt_group={} for {}@{} matched nothing; using all", forcedAltGroup, productId, productionLocation)
+                        rawVariants
+                    }
+            } else rawVariants
             val (variantList, ve) = getPreferredVariants(variants, inventory, data, reqDt, leadDays, path, depth, demandNetQty,
                 multiple = if (useSingleVariant) false else null, scoreWeights = scoreWeights, topN = topN)
             val cm = variantList.flatMap { (childList, _, _) -> childList }
             if (variantList.size > 1) {
                 woChildrenRelation = if (variantList.all { (childList, _, _) -> childList.size == 1 }) "or" else "and"
             }
-            Pair(cm, ve)
+            val veAnnotated = if (variantOverride != null) "$ve [variant override active]" else ve
+            Pair(cm, veAnnotated)
         }
         "move" -> Pair(childMaterialsForMove(m, demandNetQty), "")
         else -> Pair(emptyList<Map<String, Any?>>(), "")
@@ -813,7 +859,7 @@ fun plan(
         val cReqDt = dateAddDays(reqDt, -leadDays)
         val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
             "quantity" to c["quantity"], "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId)
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex)
         childWos.addAll(cWos)
         if (cPegging != null) childPeggingNodes.add(cPegging)
         for (s in solvedList) {
@@ -830,11 +876,11 @@ fun plan(
 
     // 5) Timing + work orders
     val startDt = computeStartDt(reqDt, leadDays, commitTimes)
-    val (wos, lotCount, lastEnd, lotSizeVal) = buildWorkOrders(productId, productionLocation, demandNetQty, leadDays, startDt, m, demandId, data)
+    val (wos, lotCount, lastEnd, lotSizeVal) = buildWorkOrders(productId, productionLocation, demandNetQty, leadDays, startDt, m, demandId, data, overrideActive)
     val methodType = m["type"] as? String ?: ""
     val woChildren = if (methodType == "purchase") listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to "%.4f".format(demandNetQty).toDouble(), "children" to emptyList<Any>()))
                      else childPeggingNodes
-    peggingChildren.add(buildWoNode(productId, productionLocation, demandNetQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodChoiceExplanation, variantExplanation, woChildrenRelation, woChildren))
+    peggingChildren.add(buildWoNode(productId, productionLocation, demandNetQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodChoiceExplanation, variantExplanation, woChildrenRelation, woChildren, overrideActive))
 
     demandFulfilledList.add(committedRow(demandNetQty, formatDate(lastEnd)))
     return Triple(demandFulfilledList, wos + childWos, demandNode(peggingChildren, formatDate(lastEnd)))
@@ -874,6 +920,7 @@ private fun buildWorkOrders(
     m: Map<String, Any?>,
     demandId: Any?,
     data: Map<String, List<Map<String, Any?>>>,
+    overrideActive: Boolean = false,
 ): WorkOrderResult {
     val lotSizeVal = maxLotSize(productId, productionLocation, data)?.takeIf { it > 0 } ?: qty
     val lotSize = max(1e-9, lotSizeVal)
@@ -897,6 +944,7 @@ private fun buildWorkOrders(
             "location_source" to (if (methodType == "move") m["from_location_id"] else null),
             "demand_id" to demandId,
             "prod_area" to prodArea,
+            "override_active" to overrideActive,
         ))
         lastEnd = lotEnd
         left -= lotQty
@@ -920,6 +968,7 @@ private fun buildWoNode(
     variantExpl: String,
     childrenRelation: String?,
     woChildren: List<Map<String, Any?>>,
+    overrideActive: Boolean = false,
 ): Map<String, Any?> = mapOf(
     "type" to "work_order",
     "product_id" to productId,
@@ -934,6 +983,7 @@ private fun buildWoNode(
     "children_relation" to childrenRelation,
     "lot_count" to (if (lotCount > 0) lotCount else null),
     "max_lot_size" to lotSizeVal,
+    "override_active" to overrideActive,
     "children" to woChildren,
 )
 
@@ -967,6 +1017,10 @@ fun runPlanning(
     val planningPegging = mutableListOf<Map<String, Any?>>()
     val total = demands.size
 
+    // Build override index once — passed through to all plan() calls
+    @Suppress("UNCHECKED_CAST")
+    val overrideIndex = buildOverrideIndex((data["overrides"] ?: emptyList()) as List<Map<String, Any?>>)
+
     // ── Consolidation phase ───────────────────────────────────────────────────
     val consolidationConfig = parseConsolidationConfig(config)
     val consolidatedWOs = mutableListOf<Map<String, Any?>>()
@@ -976,7 +1030,7 @@ fun runPlanning(
         val needs  = collectComponentNeeds(demands, data, consolidationConfig)
         val groups = groupByTimeBucket(needs, consolidationConfig.periodDays)
         val result = runConsolidation(groups, inventory, data, consolidationConfig, planConfig = config) { dem, inv, dat, reqDt, depth, path, cfg, prefId ->
-            plan(dem, inv, dat, reqDt, depth, path, cfg, prefId)
+            plan(dem, inv, dat, reqDt, depth, path, cfg, prefId, overrideIndex = overrideIndex)
         }
         consolidatedWOs.addAll(result.consolidatedWOs)
         consolidatedPegging.addAll(result.consolidatedPegging)
@@ -1010,7 +1064,7 @@ fun runPlanning(
         val reqDt = parseDate(reqStr)
         val demandId = d["demand_id"]
         val prefId = if (consolidationConfig.enabled) demandId else null
-        val (solvedList, wos, peggingNode) = plan(d, inventory, data, reqDt, config = config, preferDemandId = prefId)
+        val (solvedList, wos, peggingNode) = plan(d, inventory, data, reqDt, config = config, preferDemandId = prefId, overrideIndex = overrideIndex)
         committedDemands.addAll(solvedList)
         workOrders.addAll(wos)
         if (peggingNode != null && demandId != null) {

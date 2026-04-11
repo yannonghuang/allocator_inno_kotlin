@@ -31,6 +31,8 @@ private val engineScope = CoroutineScope(Dispatchers.IO)
 // ── In-memory plan job state ───────────────────────────────────────────────────
 private val planJobs = ConcurrentHashMap<String, MutableMap<String, Any?>>()
 private val casePlanResults = ConcurrentHashMap<Int, Map<String, Any>>()
+// jobId → plan_run.id for associating async jobs with persisted runs
+private val planJobRunIds = ConcurrentHashMap<String, Int>()
 
 /**
  * Allocation run routes — port of api/allocate.py.
@@ -344,6 +346,76 @@ fun Routing.allocateRoutes() {
         } else treeJson
         call.respond(buildJsonObject { put("tree", finalTree) })
     }
+
+    // ── GET /cases/{case_id}/plan-runs — list persisted plan runs ─────────────
+    get("/cases/{case_id}/plan-runs") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        transaction {
+            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
+                ?: throw NoSuchElementException("Case not found")
+        }
+        val runs = transaction {
+            PlanRuns.selectAll().where { PlanRuns.caseId eq caseId }
+                .orderBy(PlanRuns.createdAt, SortOrder.DESC)
+                .map { row ->
+                    val snapshot = row[PlanRuns.overrideSnapshot]
+                    val overrideCount = if (snapshot != null) {
+                        runCatching { (Json.parseToJsonElement(snapshot) as? JsonArray)?.size ?: 0 }.getOrElse { 0 }
+                    } else 0
+                    PlanRunResponse(
+                        id = row[PlanRuns.id],
+                        caseId = row[PlanRuns.caseId],
+                        jobId = row[PlanRuns.jobId],
+                        status = row[PlanRuns.status],
+                        config = row[PlanRuns.config]?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
+                        overrideCount = overrideCount,
+                        createdAt = formatTs(row[PlanRuns.createdAt]),
+                    )
+                }
+        }
+        call.respond(runs)
+    }
+
+    // ── GET /cases/{case_id}/plan-runs/{run_id} — full run with result ────────
+    get("/cases/{case_id}/plan-runs/{run_id}") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val runId = call.parameters["run_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid run_id")
+        val response = transaction {
+            val row = PlanRuns.selectAll().where {
+                (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId)
+            }.singleOrNull() ?: throw NoSuchElementException("Plan run not found")
+            PlanRunFullResponse(
+                id = row[PlanRuns.id],
+                caseId = row[PlanRuns.caseId],
+                jobId = row[PlanRuns.jobId],
+                status = row[PlanRuns.status],
+                config = row[PlanRuns.config]?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
+                overrideSnapshot = row[PlanRuns.overrideSnapshot]?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
+                result = row[PlanRuns.result]?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
+                error = row[PlanRuns.error],
+                createdAt = formatTs(row[PlanRuns.createdAt]),
+            )
+        }
+        call.respond(response)
+    }
+
+    // ── DELETE /cases/{case_id}/plan-runs/{run_id} ────────────────────────────
+    delete("/cases/{case_id}/plan-runs/{run_id}") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val runId = call.parameters["run_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid run_id")
+        transaction {
+            val deleted = PlanRuns.deleteWhere {
+                (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId)
+            }
+            if (deleted == 0) throw NoSuchElementException("Plan run not found")
+        }
+        call.respond(HttpStatusCode.NoContent)
+    }
 }
 
 // ── Plan helper functions ──────────────────────────────────────────────────────
@@ -411,13 +483,11 @@ private fun findWoNode(tree: Any?, productId: String, locationId: String, method
 private fun subtreeContainsRealMake(node: Any?, bomPairs: Set<Pair<String, String>>): Boolean {
     val n = node as? Map<String, Any?> ?: return false
     if (n["type"] == "work_order" && (n["method"] as? String ?: "").trim() == "make") {
-        val relation = (n["children_relation"] as? String ?: "").trim().lowercase()
-        if (relation == "and" || relation == "or") return true
-        val parentId = (n["product_id"] as? String ?: "").trim()
-        for (ch in (n["children"] as? List<*> ?: emptyList<Any?>())) {
-            val childId = ((ch as? Map<String, Any?>)?.get("product_id") as? String ?: "").trim()
-            if (Pair(parentId, childId) in bomPairs) return true
-        }
+        // Any make at a physical (non-VIRTUAL) location is a real make operation.
+        // VIRTUAL locations are used only for synthetic BOM alt-group intermediate nodes.
+        val location = (n["location_id"] as? String ?: "").trim().uppercase()
+        if (location != "VIRTUAL") return true
+        // For VIRTUAL location makes, recurse into children to find a real make deeper.
     }
     for (ch in (n["children"] as? List<*> ?: emptyList<Any?>())) {
         if (subtreeContainsRealMake(ch, bomPairs)) return true
@@ -565,6 +635,9 @@ private fun enrichWorkOrders(
             "wo_consolidation_total_planned" to (wo["consolidation_total_planned"] as? Number)?.toDouble(),
             @Suppress("UNCHECKED_CAST")
             "wo_consolidation_split_details" to (wo["consolidation_split_details"] as? List<Map<String, Any?>>),
+            // Override active flags — propagated from planning/consolidation engines
+            "override_active" to (wo["override_active"] as? Boolean ?: false),
+            "consolidation_override_active" to (wo["consolidation_override_active"] as? Boolean ?: false),
         )
     }
 }
@@ -729,6 +802,30 @@ private suspend fun runPlanBackground(
     data: Map<String, List<Map<String, Any?>>>,
     config: Map<String, Any?>?,
 ) {
+    // Insert plan_run record at start, capturing current override snapshot
+    val planRunId = transaction {
+        val overrides = ManualOverrides.selectAll().where { ManualOverrides.caseId eq caseId }
+            .map { row ->
+                buildJsonObject {
+                    put("id", row[ManualOverrides.id])
+                    put("case_id", row[ManualOverrides.caseId])
+                    put("entity_type", row[ManualOverrides.entityType])
+                    put("entity_key", row[ManualOverrides.entityKey])
+                    put("payload", runCatching { Json.parseToJsonElement(row[ManualOverrides.payload]) }.getOrElse { JsonNull })
+                }
+            }
+        val overrideSnapshotJson = JsonArray(overrides).toString()
+        val configJson = resolveEffectiveConfig(config).toString()
+        PlanRuns.insert {
+            it[PlanRuns.caseId] = caseId
+            it[PlanRuns.jobId] = jobId
+            it[PlanRuns.status] = "running"
+            it[PlanRuns.config] = configJson
+            it[PlanRuns.overrideSnapshot] = overrideSnapshotJson
+        }[PlanRuns.id]
+    }
+    planJobRunIds[jobId] = planRunId
+
     try {
         val total = data["demand"]?.size ?: 0
         val progressCb: (Map<String, Any?>) -> Unit = { p ->
@@ -741,6 +838,16 @@ private suspend fun runPlanBackground(
         val result = runPlanning(data, config = config, progressCallback = progressCb)
         val enriched = enrichPlanResultWithData(caseId, result, data)
         casePlanResults[caseId] = enriched
+
+        // Persist result to plan_run
+        val resultJson = runCatching { anyToJson(enriched).toString() }.getOrElse { null }
+        transaction {
+            PlanRuns.update({ PlanRuns.id eq planRunId }) {
+                it[PlanRuns.status] = "success"
+                it[PlanRuns.result] = resultJson
+            }
+        }
+
         planJobs[jobId]?.let { job ->
             job["status"] = "completed"
             job["result"] = enriched
@@ -748,6 +855,12 @@ private suspend fun runPlanBackground(
         }
     } catch (e: Exception) {
         log.error("Plan job $jobId failed: ${e.message}", e)
+        transaction {
+            PlanRuns.update({ PlanRuns.id eq planRunId }) {
+                it[PlanRuns.status] = "failed"
+                it[PlanRuns.error] = e.message ?: "Unknown error"
+            }
+        }
         planJobs[jobId]?.let { job ->
             job["status"] = "failed"
             job["error"] = e.message ?: "Unknown error"
@@ -894,6 +1007,41 @@ private fun markRunFailed(runId: Int, caseId: Int, error: String) {
         }
     } catch (e: Exception) {
         log.error("Failed to mark run $runId as failed: ${e.message}")
+    }
+}
+
+/**
+ * Expand a raw planning config (which may be null or partially specified) into a fully
+ * populated map that records every parameter at its effective runtime value, including
+ * defaults.  Persisting this instead of the raw config means a stored plan run is
+ * self-describing — future code changes to defaults cannot alter its interpretation.
+ */
+@Suppress("UNCHECKED_CAST")
+private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
+    val c = config ?: emptyMap()
+    val methodSel     = (c["method_selection"]  as? Map<*, *>)?.let { it as Map<String, Any?> } ?: emptyMap()
+    val variantSel    = (c["variant_selection"] as? Map<*, *>)?.let { it as Map<String, Any?> } ?: emptyMap()
+    val consolidation = (c["consolidation"]     as? Map<*, *>)?.let { it as Map<String, Any?> } ?: emptyMap()
+
+    return buildJsonObject {
+        put("purchase_allowed", c["purchase_allowed"] as? Boolean ?: true)
+        putJsonObject("method_selection") {
+            put("elaborate", methodSel["elaborate"] as? Boolean ?: false)
+            put("multiple",  methodSel["multiple"]  as? Boolean ?: false)
+        }
+        putJsonObject("variant_selection") {
+            put("multiple", variantSel["multiple"] as? Boolean ?: true)
+            variantSel["score_weights"]?.let { put("score_weights", anyToJson(it)) }
+            variantSel["top_n"]?.let { put("top_n", (it as? Number)?.toInt() ?: 0) }
+        }
+        putJsonObject("consolidation") {
+            put("enabled",         consolidation["enabled"]      as? Boolean ?: false)
+            put("period_days",     ((consolidation["period_days"] as? Number)?.toInt() ?: 7).coerceIn(1, 365))
+            put("allocation_mode", when (consolidation["allocation_mode"]?.toString()) {
+                "proportional" -> "proportional"
+                else           -> "priority_first"
+            })
+        }
     }
 }
 

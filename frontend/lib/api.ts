@@ -1,6 +1,6 @@
 const API = typeof window !== 'undefined' ? '/api' : 'http://localhost:8000';
 
-export type Case = { id: number; name: string; created_at: string; demand_count?: number; supply_count?: number; run_count?: number };
+export type Case = { id: number; name: string; created_at: string; demand_count?: number; supply_count?: number; run_count?: number; plan_run_count?: number };
 export type AllocationRun = { id: number; case_id: number; created_at: string; status: string; config?: Record<string, unknown> };
 export type AllocationAction = { id: number; run_id: number; variant_key: string; req_component_ids: string[]; qty: number; demand_id?: string; target_product_id?: string; target_location_id?: string };
 export type FeasibleDemand = { demand_id: string; customer_id?: string | null; customer?: string | null; product_id: string; requested_qty: number; allocated_qty: number; fulfillment_rate?: number | null; status: string; suggested_revision?: string; request_due_time?: string | null; revised_time?: string | null };
@@ -205,6 +205,10 @@ export type WorkOrder = {
     allocated_qty: number;
     priority: number;
   }> | null;
+  /** True if a user override (method_selection or variant_selection) was applied for this WO. */
+  override_active?: boolean;
+  /** True if a user override (component_split) was applied during consolidation for this WO. */
+  consolidation_override_active?: boolean;
 };
 
 /** Planning pegging tree node: demand (root) -> work_order -> ... -> supply | purchase (leaves). */
@@ -386,6 +390,53 @@ export async function addOverride(caseId: number, entityType: string, entityKey:
 
 export async function deleteOverride(caseId: number, overrideId: number): Promise<void> {
   const r = await fetch(`${API}/cases/${caseId}/overrides/${overrideId}`, { method: 'DELETE' });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+/** Upsert override by (entityType, entityKey) — creates or updates in a single call. */
+export async function upsertOverride(caseId: number, entityType: string, entityKey: string, payload: Record<string, unknown>): Promise<ManualOverride> {
+  const r = await fetch(`${API}/cases/${caseId}/overrides/upsert`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ entity_type: entityType, entity_key: entityKey, payload }) });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+/** Update an existing override by id. */
+export async function updateOverride(caseId: number, overrideId: number, data: { entity_type: string; entity_key: string; payload: Record<string, unknown> }): Promise<ManualOverride> {
+  const r = await fetch(`${API}/cases/${caseId}/overrides/${overrideId}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export type PlanRun = {
+  id: number;
+  case_id: number;
+  job_id: string | null;
+  status: 'running' | 'success' | 'failed';
+  config: Record<string, unknown> | null;
+  override_count: number;
+  created_at: string;
+};
+
+export type PlanRunFull = PlanRun & {
+  override_snapshot: ManualOverride[] | null;
+  result: PlanResult | null;
+  error: string | null;
+};
+
+export async function listPlanRuns(caseId: number): Promise<PlanRun[]> {
+  const r = await fetch(`${API}/cases/${caseId}/plan-runs`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function getPlanRun(caseId: number, runId: number): Promise<PlanRunFull> {
+  const r = await fetch(`${API}/cases/${caseId}/plan-runs/${runId}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function deletePlanRun(caseId: number, runId: number): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/plan-runs/${runId}`, { method: 'DELETE' });
   if (!r.ok) throw new Error(await r.text());
 }
 

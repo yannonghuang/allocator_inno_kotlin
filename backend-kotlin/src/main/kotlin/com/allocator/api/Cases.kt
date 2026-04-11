@@ -44,14 +44,23 @@ fun Routing.caseRoutes() {
             call.respond(HttpStatusCode.Created, response)
         }
 
-        // GET /cases — list all (newest first)
+        // GET /cases — list all (newest first) with counts
         get {
             val cases = transaction {
-                Cases.selectAll().orderBy(Cases.createdAt, SortOrder.DESC).map {
-                    CaseResponse(
-                        id = it[Cases.id],
-                        name = it[Cases.name],
-                        createdAt = formatTs(it[Cases.createdAt]),
+                Cases.selectAll().orderBy(Cases.createdAt, SortOrder.DESC).map { row ->
+                    val caseId = row[Cases.id]
+                    val demandCount   = Demands.selectAll().where { Demands.caseId eq caseId }.count().toInt()
+                    val supplyCount   = Supplies.selectAll().where { Supplies.caseId eq caseId }.count().toInt()
+                    val allocRunCount = AllocationRuns.selectAll().where { AllocationRuns.caseId eq caseId }.count().toInt()
+                    val planRunCount  = PlanRuns.selectAll().where { PlanRuns.caseId eq caseId }.count().toInt()
+                    CaseDetailResponse(
+                        id = caseId,
+                        name = row[Cases.name],
+                        createdAt = formatTs(row[Cases.createdAt]),
+                        demandCount   = demandCount,
+                        supplyCount   = supplyCount,
+                        runCount      = allocRunCount,
+                        planRunCount  = planRunCount,
                     )
                 }
             }
@@ -67,16 +76,18 @@ fun Routing.caseRoutes() {
                 val detail = transaction {
                     val c = Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
                         ?: throw NoSuchElementException("Case not found")
-                    val demandCount = Demands.selectAll().where { Demands.caseId eq caseId }.count().toInt()
-                    val supplyCount = Supplies.selectAll().where { Supplies.caseId eq caseId }.count().toInt()
-                    val runCount = AllocationRuns.selectAll().where { AllocationRuns.caseId eq caseId }.count().toInt()
+                    val demandCount   = Demands.selectAll().where { Demands.caseId eq caseId }.count().toInt()
+                    val supplyCount   = Supplies.selectAll().where { Supplies.caseId eq caseId }.count().toInt()
+                    val allocRunCount = AllocationRuns.selectAll().where { AllocationRuns.caseId eq caseId }.count().toInt()
+                    val planRunCount  = PlanRuns.selectAll().where { PlanRuns.caseId eq caseId }.count().toInt()
                     CaseDetailResponse(
                         id = c[Cases.id],
                         name = c[Cases.name],
                         createdAt = formatTs(c[Cases.createdAt]),
-                        demandCount = demandCount,
-                        supplyCount = supplyCount,
-                        runCount = runCount,
+                        demandCount  = demandCount,
+                        supplyCount  = supplyCount,
+                        runCount     = allocRunCount,
+                        planRunCount = planRunCount,
                     )
                 }
                 call.respond(detail)

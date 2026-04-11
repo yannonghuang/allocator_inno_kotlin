@@ -58,9 +58,9 @@ function getChildGroups(
   for (const e of indeps) {
     groups.push({ kind: 'independent', edge: e, childId: e.source });
   }
-  for (const [ag, es] of altMap) {
-    groups.push({ kind: 'and-alt', altGroup: ag, items: es.map(e => ({ edge: e, childId: e.source })) });
-  }
+  Array.from(altMap.entries()).forEach(([ag, es]: [string, BomGraphEdge[]]) => {
+    groups.push({ kind: 'and-alt', altGroup: ag, items: es.map((e: BomGraphEdge) => ({ edge: e, childId: e.source })) });
+  });
   for (const e of moves) {
     groups.push({ kind: 'move', edge: e, childId: e.source });
   }
