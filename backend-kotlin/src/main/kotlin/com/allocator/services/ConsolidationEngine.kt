@@ -230,7 +230,12 @@ fun collectComponentNeeds(
                 val productionLocation = (method["location_id"] as? String)?.trim() ?: locationId
                 val variants = variantsForMake(productId, productionLocation, qty, method, data)
                 if (variants.isEmpty()) continue
-                // Take the first (best-preference) variant's child materials
+                // Only consolidate when there is a single, unambiguous BOM variant (a required
+                // component). OR-alternative variants are not required — the runtime planner
+                // chooses among them via getPreferredVariants. Pre-claiming via consolidation
+                // would inject spurious consolidated_* supplies even when there is only one
+                // demand and nothing to actually consolidate.
+                if (variants.size > 1) continue
                 val (_, childList) = variants[0]
                 for (child in childList) {
                     val cProductId  = (child["product_id"]  as? String)?.trim() ?: continue
