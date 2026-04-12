@@ -167,6 +167,18 @@ object ManualOverrides : Table("manual_override") {
     override val primaryKey = PrimaryKey(id)
 }
 
+/** Persisted material supply update events for manual impact analysis. */
+object MaterialEvents : Table("material_event") {
+    val id          = integer("id").autoIncrement()
+    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val supplyId    = varchar("supply_id", 255)
+    val delayDays   = integer("delay_days").default(0)
+    val qtyDecreasePct = double("qty_decrease_pct").default(0.0)
+    val note        = text("note").nullable()
+    val createdAt   = timestamp("created_at").defaultExpression(CurrentTimestamp)
+    override val primaryKey = PrimaryKey(id)
+}
+
 /** Persisted planning run: config + override snapshot + result JSON so state is restorable. */
 object PlanRuns : Table("plan_run") {
     val id = integer("id").autoIncrement()

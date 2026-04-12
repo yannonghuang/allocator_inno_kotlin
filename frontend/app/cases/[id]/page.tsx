@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
@@ -52,7 +52,24 @@ import {
   type AllocationViewRow,
   type AllocationExplanation,
   type AllocationProgress,
+  type MaterialEvent,
+  type MaterialImpactResult,
+  listMaterialEvents,
+  createMaterialEvent,
+  updateMaterialEvent,
+  deleteMaterialEvent,
+  analyzeMaterialImpact,
 } from '@/lib/api';
+
+type SupplySuggestion = {
+  id: string;
+  description: string | null;
+  productId: string;
+  supplyDate: string | null;
+  qty: number;
+  vendorId: string | null;
+  locationId: string | null;
+};
 
 /** True if the pegging tree has any make WO that the backend marked as involving a real (non-virtual) BOM link.
  *  Fallback: if backend flag is missing, use BOM (parent, child) pairs from bomRealPairKeys.
@@ -91,6 +108,18 @@ function peggingTreeContainsRealMove(node: PlanningPeggingNode, realMoveKeys: Se
   }
   for (const child of node.children ?? []) {
     if (peggingTreeContainsRealMove(child, realMoveKeys)) return true;
+  }
+  return false;
+}
+
+/** True if any supply node in the pegging tree has a supply_id containing the given substring (case-insensitive). */
+function peggingTreeContainsSupply(node: PlanningPeggingNode, supplySubstr: string): boolean {
+  if (node.type === 'supply') {
+    const sid = (node.supply_id ?? '').trim().toLowerCase();
+    if (sid && sid.includes(supplySubstr)) return true;
+  }
+  for (const child of node.children ?? []) {
+    if (peggingTreeContainsSupply(child, supplySubstr)) return true;
   }
   return false;
 }
@@ -303,9 +332,23 @@ export default function CaseDetail() {
   const allocationViewFetchingRef = useRef<boolean>(false);
   const activeViewRef = useRef<'supply' | 'allocation' | 'suggested' | 'raw-material'>('supply');
   const selectedRunIdRef = useRef<number | null>(null);
-  const [caseSection, setCaseSection] = useState<'allocation' | 'planning' | 'bom-graph'>('allocation');
+  const [caseSection, setCaseSection] = useState<'allocation' | 'planning' | 'bom-graph' | 'material'>('allocation');
   const [rawMaterialReport, setRawMaterialReport] = useState<RawMaterialUsageReport | null>(null);
   const [rawMaterialReportLoading, setRawMaterialReportLoading] = useState(false);
+
+  // ── Material impact events ─────────────────────────────────────────────────
+  const [materialEvents, setMaterialEvents] = useState<MaterialEvent[]>([]);
+  const [materialEventsLoading, setMaterialEventsLoading] = useState(false);
+  const [materialImpacts, setMaterialImpacts] = useState<Record<number, MaterialImpactResult | null>>({});
+  const [materialImpactLoading, setMaterialImpactLoading] = useState<Record<number, boolean>>({});
+  const [materialEventEditing, setMaterialEventEditing] = useState<Record<number, { supplyId: string; delayDays: number; qtyDecreasePct: number; note: string }>>({});
+  const [materialEventSaving, setMaterialEventSaving] = useState<Record<number, boolean>>({});
+  // New event form state (-1 = "new" sentinel)
+  const [materialNewEvent, setMaterialNewEvent] = useState<{ supplyId: string; delayDays: number; qtyDecreasePct: number; note: string } | null>(null);
+  const [materialNewSaving, setMaterialNewSaving] = useState(false);
+  const [materialNewSupplySuggestions, setMaterialNewSupplySuggestions] = useState<SupplySuggestion[]>([]);
+  const [materialNewShowSuggestions, setMaterialNewShowSuggestions] = useState(false);
+  const materialNewDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [planResult, setPlanResult] = useState<{
     committed_demands: CommittedDemand[];
     work_orders: WorkOrder[];
@@ -333,6 +376,13 @@ export default function CaseDetail() {
   const [planDemandShortOnly, setPlanDemandShortOnly] = useState(false);
   const [planDemandBuyOnly, setPlanDemandBuyOnly] = useState(false);
   const [planDemandRealMoveOnly, setPlanDemandRealMoveOnly] = useState(false);
+  const [planDemandSupplyFilter, setPlanDemandSupplyFilter] = useState('');
+  const [supplyFilterInput, setSupplyFilterInput] = useState('');
+  const [supplyFilterSuggestions, setSupplyFilterSuggestions] = useState<SupplySuggestion[]>([]);
+  const [showSupplyFilterSuggestions, setShowSupplyFilterSuggestions] = useState(false);
+  const [supplyFilterSuggestionIndex, setSupplyFilterSuggestionIndex] = useState(-1);
+  const supplyFilterDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const supplyFilterListRef = useRef<HTMLUListElement>(null);
   const [planWoDemandedByMultiple, setPlanWoDemandedByMultiple] = useState(false);
   const [planWoMultiSupply, setPlanWoMultiSupply] = useState(false);
   const [planWoPurchaseOnly, setPlanWoPurchaseOnly] = useState(false);
@@ -344,7 +394,7 @@ export default function CaseDetail() {
   const [woPeggingRowKey, setWoPeggingRowKey] = useState<string | null>(null);
   const [bomRealPairs, setBomRealPairs] = useState<[string, string][] | null>(null);
   const [realMoveTriples, setRealMoveTriples] = useState<[string, string, string][] | null>(null);
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({});
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true } });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -897,6 +947,16 @@ export default function CaseDetail() {
       .finally(() => setRawMaterialReportLoading(false));
   }, [activeView, selectedRunId, id]);
 
+  // Load material events when Material Impact section becomes active
+  useEffect(() => {
+    if (caseSection !== 'material') return;
+    setMaterialEventsLoading(true);
+    listMaterialEvents(id)
+      .then(setMaterialEvents)
+      .catch(() => {})
+      .finally(() => setMaterialEventsLoading(false));
+  }, [caseSection, id]);
+
   useEffect(() => {
     if (!peggingResizing) return;
     const onMove = (e: MouseEvent) => {
@@ -1009,6 +1069,43 @@ export default function CaseDetail() {
     }, 0);
     return () => clearTimeout(t);
   }, [peggingData]);
+
+  // Supply filter typeahead: scroll selected item into view
+  useEffect(() => {
+    if (supplyFilterSuggestionIndex >= 0 && supplyFilterListRef.current) {
+      const item = supplyFilterListRef.current.children[supplyFilterSuggestionIndex] as HTMLElement | undefined;
+      item?.scrollIntoView({ block: 'nearest' });
+    }
+  }, [supplyFilterSuggestionIndex]);
+
+  const handleSupplyFilterInputChange = useCallback((val: string) => {
+    setSupplyFilterInput(val);
+    setSupplyFilterSuggestionIndex(-1);
+    if (!val.trim()) {
+      setShowSupplyFilterSuggestions(false);
+      setSupplyFilterSuggestions([]);
+      setPlanDemandSupplyFilter('');
+      return;
+    }
+    if (supplyFilterDebounce.current) clearTimeout(supplyFilterDebounce.current);
+    supplyFilterDebounce.current = setTimeout(async () => {
+      try {
+        const res = await fetch(`/api/supplies?q=${encodeURIComponent(val.trim())}`);
+        if (res.ok) {
+          setSupplyFilterSuggestions(await res.json());
+          setShowSupplyFilterSuggestions(true);
+        }
+      } catch { /* backend unreachable */ }
+    }, 200);
+  }, []);
+
+  const selectSupplyFilterSuggestion = useCallback((s: SupplySuggestion) => {
+    setSupplyFilterInput(s.id);
+    setPlanDemandSupplyFilter(s.id);
+    setShowSupplyFilterSuggestions(false);
+    setSupplyFilterSuggestions([]);
+    setSupplyFilterSuggestionIndex(-1);
+  }, []);
 
   // Pegging data comes from API (getPegging): nodes and edges (each edge has from, to, qty).
   // For "allocated" on demand children we use edge.qty (inv→demand = share from that parent node).
@@ -1403,6 +1500,13 @@ export default function CaseDetail() {
           onClick={() => setCaseSection('bom-graph')}
         >
           {tSec('bomGraph')}
+        </button>
+        <button
+          type="button"
+          className={caseSection === 'material' ? '' : 'secondary'}
+          onClick={() => setCaseSection('material')}
+        >
+          {tSec('material')}
         </button>
       </nav>
       {caseSection === 'allocation' && (
@@ -2294,11 +2398,101 @@ export default function CaseDetail() {
                             : ''}
                       </span>
                     )}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem', color: '#e4e4e7', position: 'relative' }}>
+                      <span style={{ whiteSpace: 'nowrap' }}>Supply:</span>
+                      <div style={{ position: 'relative' }}>
+                        {showSupplyFilterSuggestions && supplyFilterSuggestions.length > 0 && (
+                          <ul
+                            ref={supplyFilterListRef}
+                            style={{
+                              position: 'absolute',
+                              bottom: '100%',
+                              left: 0,
+                              marginBottom: '2px',
+                              background: '#fff',
+                              border: '1px solid #d4d4d8',
+                              borderRadius: '6px',
+                              boxShadow: '0 4px 16px rgba(0,0,0,0.15)',
+                              maxHeight: '220px',
+                              overflowY: 'auto',
+                              zIndex: 200,
+                              minWidth: '260px',
+                              listStyle: 'none',
+                              margin: 0,
+                              padding: 0,
+                            }}
+                          >
+                            {supplyFilterSuggestions.map((s, i) => (
+                              <li
+                                key={s.id}
+                                onMouseDown={(e) => { e.preventDefault(); selectSupplyFilterSuggestion(s); }}
+                                style={{
+                                  padding: '6px 10px',
+                                  cursor: 'pointer',
+                                  background: i === supplyFilterSuggestionIndex ? '#eff6ff' : 'transparent',
+                                  borderBottom: i < supplyFilterSuggestions.length - 1 ? '1px solid #f4f4f5' : 'none',
+                                }}
+                                onMouseEnter={() => setSupplyFilterSuggestionIndex(i)}
+                              >
+                                <div style={{ fontFamily: 'monospace', fontWeight: 600, color: '#1d4ed8', fontSize: '0.8rem' }}>{s.id}</div>
+                                <div style={{ fontSize: '0.72rem', color: '#71717a', marginTop: '1px' }}>
+                                  {[s.productId, s.supplyDate, s.qty != null ? `qty ${s.qty}` : null, s.locationId].filter(Boolean).join(' · ')}
+                                </div>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                        <input
+                          type="text"
+                          value={supplyFilterInput}
+                          onChange={(e) => handleSupplyFilterInputChange(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (showSupplyFilterSuggestions && supplyFilterSuggestions.length > 0) {
+                              if (e.key === 'ArrowDown') { e.preventDefault(); setSupplyFilterSuggestionIndex(i => Math.min(i + 1, supplyFilterSuggestions.length - 1)); return; }
+                              if (e.key === 'ArrowUp')   { e.preventDefault(); setSupplyFilterSuggestionIndex(i => Math.max(i - 1, -1)); return; }
+                              if (e.key === 'Enter' && supplyFilterSuggestionIndex >= 0) { e.preventDefault(); selectSupplyFilterSuggestion(supplyFilterSuggestions[supplyFilterSuggestionIndex]); return; }
+                            }
+                            if (e.key === 'Escape') { setShowSupplyFilterSuggestions(false); setSupplyFilterSuggestionIndex(-1); }
+                          }}
+                          onBlur={() => setTimeout(() => setShowSupplyFilterSuggestions(false), 150)}
+                          placeholder="type product id…"
+                          style={{
+                            fontSize: '0.8rem',
+                            padding: '0.2rem 0.4rem',
+                            borderRadius: '4px',
+                            border: `1px solid ${planDemandSupplyFilter ? '#3b82f6' : '#52525b'}`,
+                            background: '#27272a',
+                            color: '#e4e4e7',
+                            width: '160px',
+                          }}
+                        />
+                      </div>
+                      {(supplyFilterInput || planDemandSupplyFilter) && (
+                        <button
+                          onClick={() => { setSupplyFilterInput(''); setPlanDemandSupplyFilter(''); setShowSupplyFilterSuggestions(false); }}
+                          style={{ background: 'none', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '0.85rem', padding: 0 }}
+                        >✕</button>
+                      )}
+                      {planDemandSupplyFilter && (
+                        <span style={{ fontSize: '0.72rem', color: '#60a5fa', fontFamily: 'monospace' }}>{planDemandSupplyFilter}</span>
+                      )}
+                    </div>
                   </div>
                   {(() => {
                     if (!planResult?.committed_demands.length) return null;
+                    // Last entry per demand_id — used by all filters except supply filter.
+                    // (planning_pegging = consolidatedPegging + planningPegging; last = main planning tree)
                     const peggingByDemandId = (planResult.planning_pegging ?? []).reduce<Record<string, PlanningPeggingEntry>>((acc, e) => {
                       if (e.demand_id) acc[e.demand_id] = e;
+                      return acc;
+                    }, {});
+                    // ALL trees per demand_id — consolidation entries contain original supply IDs
+                    // that the main tree replaces with consolidated_* synthetic IDs.
+                    const allPeggingTreesByDemandId = (planResult.planning_pegging ?? []).reduce<Record<string, PlanningPeggingNode[]>>((acc, e) => {
+                      if (e.demand_id && e.tree) {
+                        if (!acc[e.demand_id]) acc[e.demand_id] = [];
+                        acc[e.demand_id].push(e.tree);
+                      }
                       return acc;
                     }, {});
                     let list = planResult.committed_demands;
@@ -2330,6 +2524,15 @@ export default function CaseDetail() {
                     }
                     if (planDemandShortOnly) {
                       list = list.filter((r) => (r.shortage ?? 0) > 0.01);
+                    }
+                    if (planDemandSupplyFilter.trim()) {
+                      const substr = planDemandSupplyFilter.trim().toLowerCase();
+                      list = list.filter((r) => {
+                        const demandId = r.demand_id ?? (r as unknown as { demand_id?: string }).demand_id;
+                        const trees = demandId ? allPeggingTreesByDemandId[demandId] : null;
+                        if (!trees?.length) return false;
+                        return trees.some(t => peggingTreeContainsSupply(t, substr));
+                      });
                     }
                     const byCustomer = list.reduce<Record<string, number>>((acc, r) => {
                       const cName = (r.customer ?? r.customer_id ?? '–') as string;
@@ -2758,6 +2961,302 @@ export default function CaseDetail() {
       <section>
         <h2>BOM Graph</h2>
         <BomGraphTab caseId={id} />
+      </section>
+      )}
+      {caseSection === 'material' && (
+      <section>
+        <h2>{tSec('material')}</h2>
+
+        {/* ── New event form ── */}
+        {materialNewEvent === null ? (
+          <button
+            type="button"
+            style={{ marginBottom: '1.25rem' }}
+            onClick={() => setMaterialNewEvent({ supplyId: '', delayDays: 0, qtyDecreasePct: 0, note: '' })}
+          >
+            + Add supply event
+          </button>
+        ) : (
+          <div style={{ background: '#18181b', border: '1px solid #3d3d40', borderRadius: 8, padding: '1rem', marginBottom: '1.25rem', maxWidth: 640 }}>
+            <h3 style={{ margin: '0 0 0.75rem', fontSize: '0.95rem', color: '#e4e4e7' }}>New supply event</h3>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem', marginBottom: '0.75rem' }}>
+              {/* Supply ID typeahead */}
+              <div style={{ gridColumn: '1 / -1', position: 'relative' }}>
+                <label style={{ display: 'block', fontSize: '0.8rem', color: '#a1a1aa', marginBottom: 3 }}>Supply ID</label>
+                <input
+                  type="text"
+                  value={materialNewEvent.supplyId}
+                  style={{ width: '100%', boxSizing: 'border-box' }}
+                  placeholder="Type supply ID…"
+                  autoComplete="off"
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setMaterialNewEvent(ev => ev ? { ...ev, supplyId: val } : ev);
+                    if (!val.trim()) {
+                      setMaterialNewShowSuggestions(false);
+                      setMaterialNewSupplySuggestions([]);
+                      return;
+                    }
+                    if (materialNewDebounce.current) clearTimeout(materialNewDebounce.current);
+                    materialNewDebounce.current = setTimeout(async () => {
+                      try {
+                        const res = await fetch(`/api/supplies?q=${encodeURIComponent(val.trim())}`);
+                        if (res.ok) {
+                          setMaterialNewSupplySuggestions(await res.json());
+                          setMaterialNewShowSuggestions(true);
+                        }
+                      } catch { /* unreachable */ }
+                    }, 200);
+                  }}
+                  onBlur={() => { setTimeout(() => setMaterialNewShowSuggestions(false), 150); }}
+                />
+                {materialNewShowSuggestions && materialNewSupplySuggestions.length > 0 && (
+                  <div style={{ position: 'absolute', zIndex: 50, left: 0, right: 0, top: '100%', background: '#1c1c1e', border: '1px solid #3d3d40', borderRadius: 6, maxHeight: 200, overflowY: 'auto', boxShadow: '0 4px 16px rgba(0,0,0,0.4)' }}>
+                    {materialNewSupplySuggestions.map((s) => (
+                      <div
+                        key={s.id}
+                        style={{ padding: '6px 10px', cursor: 'pointer', fontSize: '0.82rem', color: '#e4e4e7', borderBottom: '1px solid #27272a' }}
+                        onMouseDown={() => {
+                          setMaterialNewEvent(ev => ev ? { ...ev, supplyId: s.id } : ev);
+                          setMaterialNewShowSuggestions(false);
+                          setMaterialNewSupplySuggestions([]);
+                        }}
+                      >
+                        <span style={{ fontWeight: 600 }}>{s.id}</span>
+                        {s.productId && <span style={{ marginLeft: 8, color: '#a1a1aa' }}>{s.productId}</span>}
+                        {s.supplyDate && <span style={{ marginLeft: 8, color: '#71717a' }}>{s.supplyDate}</span>}
+                        <span style={{ marginLeft: 8, color: '#71717a' }}>qty {Number(s.qty).toLocaleString()}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              {/* Delay days */}
+              <div>
+                <label style={{ display: 'block', fontSize: '0.8rem', color: '#a1a1aa', marginBottom: 3 }}>Delay (days)</label>
+                <input
+                  type="number"
+                  min={0}
+                  style={{ width: '100%', boxSizing: 'border-box' }}
+                  value={materialNewEvent.delayDays}
+                  onChange={(e) => setMaterialNewEvent(ev => ev ? { ...ev, delayDays: parseInt(e.target.value) || 0 } : ev)}
+                />
+              </div>
+              {/* Qty decrease % */}
+              <div>
+                <label style={{ display: 'block', fontSize: '0.8rem', color: '#a1a1aa', marginBottom: 3 }}>Qty decrease (%)</label>
+                <input
+                  type="number"
+                  min={0}
+                  max={100}
+                  step={0.1}
+                  style={{ width: '100%', boxSizing: 'border-box' }}
+                  value={materialNewEvent.qtyDecreasePct}
+                  onChange={(e) => setMaterialNewEvent(ev => ev ? { ...ev, qtyDecreasePct: parseFloat(e.target.value) || 0 } : ev)}
+                />
+              </div>
+              {/* Note */}
+              <div style={{ gridColumn: '1 / -1' }}>
+                <label style={{ display: 'block', fontSize: '0.8rem', color: '#a1a1aa', marginBottom: 3 }}>Note (optional)</label>
+                <input
+                  type="text"
+                  style={{ width: '100%', boxSizing: 'border-box' }}
+                  value={materialNewEvent.note}
+                  onChange={(e) => setMaterialNewEvent(ev => ev ? { ...ev, note: e.target.value } : ev)}
+                />
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              <button
+                type="button"
+                disabled={materialNewSaving || !materialNewEvent.supplyId.trim()}
+                onClick={async () => {
+                  if (!materialNewEvent.supplyId.trim()) return;
+                  setMaterialNewSaving(true);
+                  try {
+                    const created = await createMaterialEvent(id, {
+                      supplyId: materialNewEvent.supplyId.trim(),
+                      delayDays: materialNewEvent.delayDays,
+                      qtyDecreasePct: materialNewEvent.qtyDecreasePct,
+                      note: materialNewEvent.note || null,
+                    });
+                    setMaterialEvents(evs => [created, ...evs]);
+                    setMaterialNewEvent(null);
+                  } catch { /* ignore */ } finally {
+                    setMaterialNewSaving(false);
+                  }
+                }}
+              >
+                {materialNewSaving ? 'Saving…' : 'Save'}
+              </button>
+              <button type="button" className="secondary" onClick={() => { setMaterialNewEvent(null); setMaterialNewShowSuggestions(false); }}>Cancel</button>
+            </div>
+          </div>
+        )}
+
+        {/* ── Events list ── */}
+        {materialEventsLoading && <p style={{ color: '#71717a' }}>Loading…</p>}
+        {!materialEventsLoading && materialEvents.length === 0 && (
+          <p style={{ color: '#71717a' }}>No supply events recorded. Add one above to analyze impacts.</p>
+        )}
+        {materialEvents.map((ev) => {
+          const editing = materialEventEditing[ev.id];
+          const saving = materialEventSaving[ev.id] ?? false;
+          const impact = materialImpacts[ev.id];
+          const impactLoading = materialImpactLoading[ev.id] ?? false;
+          return (
+            <div key={ev.id} style={{ background: '#18181b', border: '1px solid #3d3d40', borderRadius: 8, padding: '1rem', marginBottom: '1rem' }}>
+              {editing ? (
+                /* ── Inline edit form ── */
+                <div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem', marginBottom: '0.75rem' }}>
+                    <div style={{ gridColumn: '1 / -1' }}>
+                      <label style={{ display: 'block', fontSize: '0.8rem', color: '#a1a1aa', marginBottom: 3 }}>Supply ID</label>
+                      <input type="text" style={{ width: '100%', boxSizing: 'border-box' }} value={editing.supplyId}
+                        onChange={(e) => setMaterialEventEditing(m => ({ ...m, [ev.id]: { ...m[ev.id], supplyId: e.target.value } }))} />
+                    </div>
+                    <div>
+                      <label style={{ display: 'block', fontSize: '0.8rem', color: '#a1a1aa', marginBottom: 3 }}>Delay (days)</label>
+                      <input type="number" min={0} style={{ width: '100%', boxSizing: 'border-box' }} value={editing.delayDays}
+                        onChange={(e) => setMaterialEventEditing(m => ({ ...m, [ev.id]: { ...m[ev.id], delayDays: parseInt(e.target.value) || 0 } }))} />
+                    </div>
+                    <div>
+                      <label style={{ display: 'block', fontSize: '0.8rem', color: '#a1a1aa', marginBottom: 3 }}>Qty decrease (%)</label>
+                      <input type="number" min={0} max={100} step={0.1} style={{ width: '100%', boxSizing: 'border-box' }} value={editing.qtyDecreasePct}
+                        onChange={(e) => setMaterialEventEditing(m => ({ ...m, [ev.id]: { ...m[ev.id], qtyDecreasePct: parseFloat(e.target.value) || 0 } }))} />
+                    </div>
+                    <div style={{ gridColumn: '1 / -1' }}>
+                      <label style={{ display: 'block', fontSize: '0.8rem', color: '#a1a1aa', marginBottom: 3 }}>Note</label>
+                      <input type="text" style={{ width: '100%', boxSizing: 'border-box' }} value={editing.note}
+                        onChange={(e) => setMaterialEventEditing(m => ({ ...m, [ev.id]: { ...m[ev.id], note: e.target.value } }))} />
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.5rem' }}>
+                    <button type="button" disabled={saving}
+                      onClick={async () => {
+                        setMaterialEventSaving(m => ({ ...m, [ev.id]: true }));
+                        try {
+                          const updated = await updateMaterialEvent(id, ev.id, {
+                            supplyId: editing.supplyId.trim(),
+                            delayDays: editing.delayDays,
+                            qtyDecreasePct: editing.qtyDecreasePct,
+                            note: editing.note || null,
+                          });
+                          setMaterialEvents(evs => evs.map(e => e.id === ev.id ? updated : e));
+                          setMaterialEventEditing(m => { const n = { ...m }; delete n[ev.id]; return n; });
+                          setMaterialImpacts(m => { const n = { ...m }; delete n[ev.id]; return n; });
+                        } catch { /* ignore */ } finally {
+                          setMaterialEventSaving(m => ({ ...m, [ev.id]: false }));
+                        }
+                      }}>{saving ? 'Saving…' : 'Save'}</button>
+                    <button type="button" className="secondary"
+                      onClick={() => setMaterialEventEditing(m => { const n = { ...m }; delete n[ev.id]; return n; })}>Cancel</button>
+                  </div>
+                </div>
+              ) : (
+                /* ── Read view ── */
+                <div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
+                    <div style={{ flex: 1 }}>
+                      <span style={{ fontWeight: 600, color: '#e4e4e7', fontSize: '0.9rem' }}>{ev.supplyId}</span>
+                      <span style={{ marginLeft: 10, background: ev.delayDays > 0 ? '#7c3aed' : '#3d3d40', color: '#fff', borderRadius: 6, padding: '2px 7px', fontSize: '0.75rem' }}>
+                        {ev.delayDays > 0 ? `+${ev.delayDays}d delay` : 'no delay'}
+                      </span>
+                      {ev.qtyDecreasePct > 0 && (
+                        <span style={{ marginLeft: 6, background: '#b45309', color: '#fff', borderRadius: 6, padding: '2px 7px', fontSize: '0.75rem' }}>
+                          −{ev.qtyDecreasePct}% qty
+                        </span>
+                      )}
+                      {ev.note && <span style={{ marginLeft: 10, color: '#a1a1aa', fontSize: '0.8rem' }}>{ev.note}</span>}
+                      <span style={{ marginLeft: 10, color: '#52525b', fontSize: '0.75rem' }}>{new Date(ev.createdAt).toLocaleString()}</span>
+                    </div>
+                    <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+                      <button type="button" className="secondary" style={{ fontSize: '0.8rem', padding: '3px 10px' }}
+                        onClick={() => setMaterialEventEditing(m => ({ ...m, [ev.id]: { supplyId: ev.supplyId, delayDays: ev.delayDays, qtyDecreasePct: ev.qtyDecreasePct, note: ev.note ?? '' } }))}>
+                        Edit
+                      </button>
+                      <button type="button" className="secondary" style={{ fontSize: '0.8rem', padding: '3px 10px', color: '#f87171', borderColor: '#f87171' }}
+                        onClick={async () => {
+                          try {
+                            await deleteMaterialEvent(id, ev.id);
+                            setMaterialEvents(evs => evs.filter(e => e.id !== ev.id));
+                            setMaterialImpacts(m => { const n = { ...m }; delete n[ev.id]; return n; });
+                          } catch { /* ignore */ }
+                        }}>
+                        Delete
+                      </button>
+                      <button type="button" style={{ fontSize: '0.8rem', padding: '3px 10px' }}
+                        disabled={impactLoading}
+                        onClick={async () => {
+                          setMaterialImpactLoading(m => ({ ...m, [ev.id]: true }));
+                          setMaterialImpacts(m => ({ ...m, [ev.id]: null }));
+                          try {
+                            const result = await analyzeMaterialImpact(ev.supplyId, ev.delayDays, ev.qtyDecreasePct);
+                            setMaterialImpacts(m => ({ ...m, [ev.id]: result }));
+                          } catch { /* ignore */ } finally {
+                            setMaterialImpactLoading(m => ({ ...m, [ev.id]: false }));
+                          }
+                        }}>
+                        {impactLoading ? 'Analyzing…' : 'Analyze impact'}
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* ── Impact results ── */}
+                  {impact && (
+                    <div style={{ marginTop: '0.875rem', borderTop: '1px solid #27272a', paddingTop: '0.875rem' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: '0.5rem', flexWrap: 'wrap' }}>
+                        <span style={{ fontSize: '0.82rem', color: '#a1a1aa' }}>
+                          Supply: <b style={{ color: '#e4e4e7' }}>{impact.supply.productId}</b>
+                          {impact.supply.locationId && <> @ <b style={{ color: '#e4e4e7' }}>{impact.supply.locationId}</b></>}
+                          {' '}· qty {Number(impact.supply.qty).toLocaleString()}
+                          {impact.supply.vendorId && <> · vendor {impact.supply.vendorId}</>}
+                          {impact.supply.supplyDate && <> · {impact.supply.supplyDate}</>}
+                        </span>
+                        <span style={{ background: impact.impactedDemandCount > 0 ? '#991b1b' : '#166534', color: '#fff', borderRadius: 6, padding: '2px 8px', fontSize: '0.8rem', fontWeight: 600 }}>
+                          {impact.impactedDemandCount} impacted demand{impact.impactedDemandCount !== 1 ? 's' : ''}
+                        </span>
+                        {impact.note && <span style={{ color: '#a1a1aa', fontSize: '0.8rem' }}>{impact.note}</span>}
+                      </div>
+                      {impact.impacts.length > 0 && (
+                        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem' }}>
+                          <thead>
+                            <tr style={{ color: '#71717a', borderBottom: '1px solid #27272a' }}>
+                              <th style={{ textAlign: 'left', padding: '4px 8px', fontWeight: 500 }}>Demand ID</th>
+                              <th style={{ textAlign: 'left', padding: '4px 8px', fontWeight: 500 }}>Product</th>
+                              <th style={{ textAlign: 'left', padding: '4px 8px', fontWeight: 500 }}>Customer</th>
+                              <th style={{ textAlign: 'right', padding: '4px 8px', fontWeight: 500 }}>Due</th>
+                              <th style={{ textAlign: 'right', padding: '4px 8px', fontWeight: 500 }}>Req qty</th>
+                              <th style={{ textAlign: 'right', padding: '4px 8px', fontWeight: 500 }}>Consumed</th>
+                              <th style={{ textAlign: 'center', padding: '4px 8px', fontWeight: 500 }}>Status</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {impact.impacts.map((imp) => (
+                              <tr key={imp.demandId} style={{ borderBottom: '1px solid #1f1f22' }}>
+                                <td style={{ padding: '5px 8px', color: '#e4e4e7', fontFamily: 'monospace' }}>{imp.demandId}</td>
+                                <td style={{ padding: '5px 8px', color: '#a1a1aa' }}>{imp.productId}</td>
+                                <td style={{ padding: '5px 8px', color: '#a1a1aa' }}>{imp.customerId}</td>
+                                <td style={{ padding: '5px 8px', color: '#a1a1aa', textAlign: 'right' }}>{imp.requestDueTime ?? '–'}</td>
+                                <td style={{ padding: '5px 8px', textAlign: 'right', color: '#e4e4e7' }}>{Number(imp.requestedQty).toLocaleString()}</td>
+                                <td style={{ padding: '5px 8px', textAlign: 'right', color: '#e4e4e7' }}>{Number(imp.consumedSupplyQty).toLocaleString()}</td>
+                                <td style={{ padding: '5px 8px', textAlign: 'center' }}>
+                                  <span style={{ background: imp.status === 'delayed' ? '#7c3aed' : '#b45309', color: '#fff', borderRadius: 5, padding: '2px 7px', fontSize: '0.73rem' }}>
+                                    {imp.status}
+                                  </span>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
       </section>
       )}
       {/* ── Plan run history slide-in ──────────────────────────────────────────── */}
@@ -3355,7 +3854,7 @@ export default function CaseDetail() {
             <p style={{ margin: 0, marginBottom: '0.5rem', fontSize: '0.8rem', color: '#71717a' }}>
               {planPeggingContext.type === 'work_order'
                 ? 'Root = this work order; below it are the supplies that fulfill it (inventory, child work orders, purchase) at all levels.'
-                : '▢ Inventory (static state) and ⚙ Work order (transformation). Root = target inventory; work orders transform between states; leaves = supply or purchase inventory.'}
+                : '▢ blue = demand target, ▢ purple = supply / purchase inventory, ⚙ green = work order (transformation). Root = target demand; leaves = supply or purchase inventory.'}
               {' '}
               When multiple inventories or work orders appear as siblings under the same parent, they are alternative paths <strong>OR</strong> that can each supply flow to that parent.
             </p>
@@ -3413,6 +3912,8 @@ export default function CaseDetail() {
               let tree: PlanningPeggingNode | null = null;
               const isWoPeggingView = planPeggingContext.type === 'work_order';
               const woPeggingDemandId = isWoPeggingView ? (planPeggingContext.row as WorkOrder).demand_id ?? null : null;
+              // The demand whose pegging we're viewing — suppress redundant "(demand …)" labels on all nodes that carry this id.
+              const contextDemandId = isWoPeggingView ? woPeggingDemandId : (planPeggingContext.row as { demand_id?: string | null }).demand_id ?? null;
               if (planPeggingContext.type === 'work_order') {
                 if (planWorkOrderPeggingLoading === woPeggingKey || (woPeggingKey && !planWorkOrderPeggingCache[woPeggingKey] && !planWorkOrderPeggingError)) {
                   return (
@@ -3445,9 +3946,33 @@ export default function CaseDetail() {
                   return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>No pegging tree for this demand. Re-run plan to get planning_pegging.</p>;
                 }
               }
-              function renderNode(node: PlanningPeggingNode, path: string, depth: number) {
+
+              function renderNode(node: PlanningPeggingNode, path: string, depth: number, xlink = false) {
                 const childrenList = node.children ?? [];
-                const hasChildren = childrenList.length > 0;
+
+                // Consolidated supply nodes: find the original supply trees from non-last
+                // planning_pegging entries for the embedded demand_id.
+                // supply_id format: "consolidated_${demandId}_${productId}"
+                let consolidatedSourceTrees: PlanningPeggingNode[] = [];
+                if (!xlink && node.type === 'supply' && node.supply_id?.startsWith('consolidated_')) {
+                  const withoutPrefix = node.supply_id.slice('consolidated_'.length);
+                  const pid = node.product_id ?? '';
+                  // Strip the trailing _${productId} to recover the embedded demandId
+                  const embeddedDemandId = pid && withoutPrefix.endsWith(`_${pid}`)
+                    ? withoutPrefix.slice(0, -(pid.length + 1))
+                    : withoutPrefix;
+                  const allEntries = (planResult?.planning_pegging ?? []).filter(
+                    (e) => String(e.demand_id ?? '').trim() === embeddedDemandId
+                  );
+                  consolidatedSourceTrees = allEntries
+                    .slice(0, -1)
+                    .map((e) => e.tree)
+                    .filter((t): t is PlanningPeggingNode =>
+                      t != null && t.product_id === pid
+                    );
+                }
+
+                const hasChildren = childrenList.length > 0 || consolidatedSourceTrees.length > 0;
                 const isRoot = path === '0';
                 const expandable = hasChildren || isRoot;
                 const isExpanded = planPeggingExpanded.has(path);
@@ -3457,15 +3982,22 @@ export default function CaseDetail() {
                   else next.add(path);
                   return next;
                 });
-                const isInventory = node.type === 'demand' || node.type === 'supply' || node.type === 'purchase';
-                const icon = isInventory ? '▢' : '⚙';
-                const typeLabel = isInventory ? 'Inventory' : 'Work order';
+                const isDemand = node.type === 'demand';
+                const isWorkOrder = node.type === 'work_order';
+                const icon = !isWorkOrder ? '▢' : '⚙';
+                const typeLabel = isDemand ? 'Need'
+                  : node.type === 'supply' ? 'Supply'
+                  : node.type === 'purchase' ? 'Purchase'
+                  : 'Work order';
+                const typeColor = isDemand ? '#60a5fa'
+                  : isWorkOrder ? '#34d399'
+                  : '#a78bfa';
                 // When viewing work-order pegging, root node quantity must match the table row the user clicked
                 const woRowQty = planPeggingContext?.type === 'work_order' && isRoot && path === '0'
                   ? Number((planPeggingContext.row as WorkOrder).quantity ?? 0)
                   : null;
                 const label = node.type === 'demand'
-                  ? `${node.product_id ?? node.demand_id ?? '–'} · ${Number(node.quantity ?? 0).toLocaleString()} @ ${node.location_id ?? '–'}${node.demand_id && node.product_id !== node.demand_id && !(isWoPeggingView && woPeggingDemandId) ? ` (demand ${node.demand_id})` : ''}`
+                  ? `${node.product_id ?? node.demand_id ?? '–'} · ${Number(node.quantity ?? 0).toLocaleString()} @ ${node.location_id ?? '–'}${node.demand_id && node.product_id !== node.demand_id && node.demand_id !== contextDemandId ? ` (demand ${node.demand_id})` : ''}`
                   : node.type === 'work_order'
                     ? (() => {
                         const qty = woRowQty ?? Number(node.quantity ?? 0);
@@ -3478,8 +4010,8 @@ export default function CaseDetail() {
                         return `${node.method} ${node.product_id} @ ${node.location_id ?? '–'} · ${qty.toLocaleString()}${node.end_time ? ` · end ${node.end_time}` : ''}${lotPart}`;
                       })()
                     : node.type === 'supply'
-                      ? `${node.product_id} @ ${node.location_id ?? '–'} · ${Number(node.quantity ?? 0).toLocaleString()} (supply)`
-                      : `${node.product_id} @ ${node.location_id ?? '–'} · ${Number(node.quantity ?? 0).toLocaleString()} (purchase)`;
+                      ? `${node.product_id} @ ${node.location_id ?? '–'} · ${Number(node.quantity ?? 0).toLocaleString()}${node.supply_id ? ` · ${node.supply_id}` : ''}`
+                      : `${node.product_id} @ ${node.location_id ?? '–'} · ${Number(node.quantity ?? 0).toLocaleString()}`;
                 const indentPx = 12;
                 let childGroupLabel: string | null = null;
                 let childGroupKind: 'and' | 'or' | null = null;
@@ -3516,12 +4048,8 @@ export default function CaseDetail() {
                       }}
                     >
                       <span style={{ width: 14, flexShrink: 0 }}>{expandable ? (isExpanded ? '▼' : '▶') : '·'}</span>
-                      <span style={{ width: 18, flexShrink: 0, fontSize: '0.9em' }} title={isInventory ? 'Inventory (state)' : 'Work order (transformation)'}>{icon}</span>
-                      <span style={{ flex: 1 }}>
-                        <span style={{ color: isInventory ? '#a78bfa' : '#34d399', fontWeight: 600 }}>{typeLabel}</span>
-                        {' '}
-                        {label}
-                      </span>
+                      <span style={{ width: 18, flexShrink: 0, fontSize: '0.9em', color: typeColor }} title={typeLabel}>{icon}</span>
+                      <span style={{ flex: 1, color: typeColor }}>{label}</span>
                     </button>
                     {node.type === 'work_order' && (node.method_choice_explanation || node.variant_choice_explanation) && (() => {
                       const explanationPath = `explain-${path}`;
@@ -3585,20 +4113,30 @@ export default function CaseDetail() {
                             <span>{childGroupLabel}</span>
                           </div>
                         )}
-                        {hasChildren
-                          ? childrenList.map((child, i) => renderNode(child, `${path}-${i}`, depth + 1))
-                          : node.type === 'demand'
-                            ? <p style={{ margin: 0, fontSize: '0.8rem', color: '#f87171' }}>No work orders — planning could not fulfill this demand (no method or child failed).</p>
-                            : node.type === 'work_order'
-                              ? <p style={{ margin: 0, fontSize: '0.8rem', color: '#71717a' }}>No component breakdown (leaf work order or depth-limited).</p>
-                              : null /* supply/purchase/inventory nodes are leaves — no children is normal */
+                        {childrenList.length > 0
+                          ? childrenList.map((child, i) => renderNode(child, `${path}-${i}`, depth + 1, xlink))
+                          : consolidatedSourceTrees.length > 0
+                            ? null /* rendered below */
+                            : node.type === 'demand'
+                              ? <p style={{ margin: 0, fontSize: '0.8rem', color: '#f87171' }}>No work orders — planning could not fulfill this demand (no method or child failed).</p>
+                              : node.type === 'work_order'
+                                ? <p style={{ margin: 0, fontSize: '0.8rem', color: '#71717a' }}>No component breakdown (leaf work order or depth-limited).</p>
+                                : null
                         }
+                        {consolidatedSourceTrees.length > 0 && isExpanded && (
+                          <>
+                            <div style={{ marginBottom: 3, marginTop: 2, display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: '0.7rem', color: '#fb923c', backgroundColor: 'rgba(251,146,60,0.12)', borderRadius: 999, padding: '1px 6px' }}>
+                              ↑ original supplies consumed by this consolidation
+                            </div>
+                            {consolidatedSourceTrees.map((t, i) => renderNode(t, `${path}-cs${i}`, depth + 1, true))}
+                          </>
+                        )}
                       </div>
                     )}
                   </div>
                 );
               }
-              return <div style={{ marginTop: '0.5rem' }}>{renderNode(tree, '0', 0)}</div>;
+              return <div style={{ marginTop: '0.5rem' }}>{tree ? renderNode(tree, '0', 0) : null}</div>;
             })()}
           </div>
         </div>,

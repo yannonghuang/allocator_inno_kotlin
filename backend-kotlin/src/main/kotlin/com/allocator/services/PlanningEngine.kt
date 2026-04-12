@@ -76,13 +76,15 @@ private fun formatDate(d: LocalDate?): String? = d?.format(DATE_FMT)
  *  then untagged buckets (demand-tagged buckets for OTHER demands are never consumed as fallback).
  *  When preferDemandId is null the behavior is identical to the original single-pass implementation.
  */
+private data class ConsumedBucket(val supplyId: String?, val qty: Double, val commitTime: String?)
+
 private fun consumeFromInventory(
     inventory: MutableList<MutableMap<String, Any?>>,
     productId: String,
     locationId: String,
     need: Double,
     preferDemandId: Any? = null,
-): Pair<Double, String?> {
+): List<ConsumedBucket> {
     val pid = productId.trim()
     val lid = locationId.trim()
     val sorter = compareBy<MutableMap<String, Any?>>(
@@ -94,21 +96,24 @@ private fun consumeFromInventory(
         b["location_id"]?.toString()?.trim() == lid &&
         (b["qty"] as? Number)?.toDouble() ?: 0.0 > 0
 
-    var taken = 0.0
-    var commitTime: String? = null
+    val consumed = mutableListOf<ConsumedBucket>()
+    var remaining = need
 
     fun consumeFrom(buckets: List<MutableMap<String, Any?>>) {
         for (b in buckets) {
-            if (taken >= need) break
+            if (remaining <= 0) break
             val avail = (b["qty"] as? Number)?.toDouble() ?: 0.0
             if (avail <= 0) continue
-            val take = min(avail, need - taken)
+            val take = min(avail, remaining)
             b["qty"] = avail - take
-            taken += take
-            if (commitTime == null && take > 0) {
-                val sd = b["supply_date"] as? String
-                commitTime = if (sd != null) formatDate(parseDate(sd)) else null
-            }
+            remaining -= take
+            val sd = b["supply_date"] as? String
+            val commitTime = if (sd != null) formatDate(parseDate(sd)) else null
+            consumed.add(ConsumedBucket(
+                supplyId = b["supply_id"]?.toString(),
+                qty = take,
+                commitTime = commitTime,
+            ))
         }
     }
 
@@ -118,7 +123,7 @@ private fun consumeFromInventory(
             .sortedWith(sorter)
         consumeFrom(tagged)
         // Pass 2: untagged buckets (no demand_tag key, or demand_tag == null)
-        if (taken < need) {
+        if (remaining > 0) {
             val untagged = inventory.filter { matches(it) && !it.containsKey("demand_tag") || (matches(it) && it["demand_tag"] == null) }
                 .sortedWith(sorter)
             consumeFrom(untagged)
@@ -129,7 +134,7 @@ private fun consumeFromInventory(
         consumeFrom(buckets)
     }
 
-    return Pair(taken, commitTime)
+    return consumed
 }
 
 private fun copyInventory(inventory: List<Map<String, Any?>>): MutableList<MutableMap<String, Any?>> =
@@ -631,21 +636,27 @@ fun plan(
     val path = planningPath + key
 
     // 1) Fulfill from inventory (FIFO)
-    val (taken, fulfillCommitTime) = consumeFromInventory(inventory, productId, locationId, quantity, preferDemandId)
+    val consumedBuckets = consumeFromInventory(inventory, productId, locationId, quantity, preferDemandId)
+    val taken = consumedBuckets.sumOf { it.qty }
+    val fulfillCommitTime = consumedBuckets.firstOrNull()?.commitTime
     val demandFulfilledList = mutableListOf<Map<String, Any?>>()
     val peggingChildren = mutableListOf<Map<String, Any?>>()
 
     if (taken > 0) {
         val commitForFulfilled = fulfillCommitTime ?: reqTimeStr
         demandFulfilledList.add(committedRow(taken, commitForFulfilled))
-        peggingChildren.add(mapOf(
-            "type" to "supply",
-            "product_id" to productId,
-            "location_id" to locationId,
-            "quantity" to "%.4f".format(taken).toDouble(),
-            "commit_time" to commitForFulfilled,
-            "children" to emptyList<Any>(),
-        ))
+        // One supply node per consumed bucket so each node carries its exact supply_id
+        for (bucket in consumedBuckets) {
+            peggingChildren.add(mapOf(
+                "type" to "supply",
+                "product_id" to productId,
+                "location_id" to locationId,
+                "supply_id" to bucket.supplyId,
+                "quantity" to "%.4f".format(bucket.qty).toDouble(),
+                "commit_time" to (bucket.commitTime ?: reqTimeStr),
+                "children" to emptyList<Any>(),
+            ))
+        }
     }
 
     val demandNetQty = quantity - taken
@@ -1051,7 +1062,7 @@ fun runPlanning(
                     "location_id" to lid,
                     "qty"         to qty,
                     "supply_date" to supplyDate,
-                    "supply_id"   to "consolidated_$demandId",
+                    "supply_id"   to "consolidated_${demandId}_${pid}",
                     "demand_tag"  to demandId,
                 ))
             }
