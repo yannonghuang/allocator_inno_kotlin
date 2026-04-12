@@ -98,7 +98,7 @@ private fun createTables() {
         Cases, Boms, Customers, Locations, Products, Vendors,
         Demands, MethodBuys, MethodMakes, ProductLocations,
         Supplies, MethodMoves, AllocationRuns, AllocationActions,
-        ManualOverrides, PlanRuns
+        ManualOverrides, PlanRuns, MaterialEvents
     )
 }
 

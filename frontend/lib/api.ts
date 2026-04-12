@@ -234,6 +234,8 @@ export type PlanningPeggingNode = {
   /** For make work orders: how many production lots were created and the max lot size used. */
   lot_count?: number | null;
   max_lot_size?: number | null;
+  /** For supply nodes: the specific supply record that was consumed. */
+  supply_id?: string | null;
   children: PlanningPeggingNode[];
 };
 
@@ -655,6 +657,99 @@ export type BomGraphResponse = {
 
 export async function getBomGraph(caseId: number): Promise<BomGraphResponse> {
   const r = await fetch(`${API}/cases/${caseId}/bom-graph`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// ── Material Events ────────────────────────────────────────────────────────────
+
+export type MaterialEvent = {
+  id: number;
+  caseId: number;
+  supplyId: string;
+  delayDays: number;
+  qtyDecreasePct: number;
+  note: string | null;
+  createdAt: string;
+};
+
+export type MaterialImpactedDemand = {
+  demandId: string;
+  productId: string;
+  locationId: string | null;
+  customerId: string;
+  description: string | null;
+  priority: number | null;
+  requestDueTime: string | null;
+  requestedQty: number;
+  consumedSupplyQty: number;
+  status: string; // "delayed" | "at_risk"
+};
+
+export type MaterialImpactResult = {
+  supply: {
+    supplyId: string;
+    productId: string;
+    qty: number;
+    supplyDate: string | null;
+    locationId: string | null;
+    vendorId: string | null;
+  };
+  deliveryDelayDays: number;
+  quantityDecreasePct: number;
+  impactedDemandCount: number;
+  impacts: MaterialImpactedDemand[];
+  note: string | null;
+};
+
+export async function listMaterialEvents(caseId: number): Promise<MaterialEvent[]> {
+  const r = await fetch(`${API}/cases/${caseId}/material-events`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function createMaterialEvent(
+  caseId: number,
+  body: { supplyId: string; delayDays: number; qtyDecreasePct: number; note?: string | null },
+): Promise<MaterialEvent> {
+  const r = await fetch(`${API}/cases/${caseId}/material-events`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ supplyId: body.supplyId, delayDays: body.delayDays, qtyDecreasePct: body.qtyDecreasePct, note: body.note }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function updateMaterialEvent(
+  caseId: number,
+  eventId: number,
+  body: { supplyId: string; delayDays: number; qtyDecreasePct: number; note?: string | null },
+): Promise<MaterialEvent> {
+  const r = await fetch(`${API}/cases/${caseId}/material-events/${eventId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ supplyId: body.supplyId, delayDays: body.delayDays, qtyDecreasePct: body.qtyDecreasePct, note: body.note }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function deleteMaterialEvent(caseId: number, eventId: number): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/material-events/${eventId}`, { method: 'DELETE' });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+export async function analyzeMaterialImpact(
+  supplyId: string,
+  deliveryDelayDays: number,
+  quantityDecreasePct: number,
+): Promise<MaterialImpactResult> {
+  const r = await fetch(`${API}/material-impact`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ supplyId, deliveryDelayDays, quantityDecreasePct }),
+  });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }

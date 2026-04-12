@@ -55,7 +55,8 @@
   "sections": {
     "allocation": "配置",
     "planning": "计划",
-    "bomGraph": "物料清单图"
+    "bomGraph": "物料清单图",
+    "material": "物料影响分析"
   },
   "allocation": {
     "runAllocation": "运行配置",

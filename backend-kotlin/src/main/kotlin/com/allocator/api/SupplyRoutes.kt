@@ -45,7 +45,7 @@ fun Routing.supplyRoutes() {
                     }
             }
             val results = rows
-                .filter { it.id.startsWith(q, ignoreCase = true) }
+                .filter { q.isEmpty() || it.id.startsWith(q, ignoreCase = true) || it.productId.contains(q, ignoreCase = true) }
                 .take(20)
             call.respond(results)
         }

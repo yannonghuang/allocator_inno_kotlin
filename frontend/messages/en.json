@@ -55,7 +55,8 @@
   "sections": {
     "allocation": "Allocation",
     "planning": "Planning",
-    "bomGraph": "BOM Graph"
+    "bomGraph": "BOM Graph",
+    "material": "Material Impact"
   },
   "allocation": {
     "runAllocation": "Run allocation",
