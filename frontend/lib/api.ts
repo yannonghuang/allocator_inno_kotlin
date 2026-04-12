@@ -239,7 +239,7 @@ export type PlanningPeggingNode = {
   children: PlanningPeggingNode[];
 };
 
-export type PlanningPeggingEntry = { demand_id: string; tree: PlanningPeggingNode };
+export type PlanningPeggingEntry = { demand_id: string | null; tree: PlanningPeggingNode };
 
 /** Plan KPI dashboard: delivery, inventory, procurement, manufacturing, logistics. */
 export type PlanKpis = {
@@ -317,7 +317,7 @@ export async function getMovesWithTransit(caseId: number): Promise<{ moves: [str
 /** Fetch work-order pegging on demand: how this WO is fulfilled by its supplies (all levels). Requires a prior plan run. */
 export async function getWorkOrderPegging(
   caseId: number,
-  params: { demand_id: string; product_id: string; location_id: string; method: string }
+  params: { demand_id: string; product_id: string; location_id: string; method: string; run_id?: number }
 ): Promise<{ tree: PlanningPeggingNode }> {
   const sp = new URLSearchParams({
     demand_id: params.demand_id,
@@ -325,6 +325,7 @@ export async function getWorkOrderPegging(
     location_id: params.location_id,
     method: params.method,
   });
+  if (params.run_id != null) sp.set('run_id', String(params.run_id));
   const r = await fetch(`${API}/cases/${caseId}/plan/work-order-pegging?${sp.toString()}`);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
@@ -657,6 +658,44 @@ export type BomGraphResponse = {
 
 export async function getBomGraph(caseId: number): Promise<BomGraphResponse> {
   const r = await fetch(`${API}/cases/${caseId}/bom-graph`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// ── Planning Supply View ───────────────────────────────────────────────────────
+
+/** A supply record belonging to a case — returned by GET /cases/{id}/supplies. */
+export type CaseSupplyRow = {
+  id: number;
+  supplyId: string;
+  productId: string;
+  locationId: string | null;
+  vendorId: string | null;
+  supplyDate: string | null;
+  qty: number;
+  description: string | null;
+};
+
+/** A demand pegged to a supply, computed client-side from planning_pegging inversion. */
+export type PeggedDemandEntry = {
+  demandId: string;
+  customer: string | null;
+  qtyConsumed: number;
+};
+
+/** Enriched supply row for the Plan Supply View table (supply metadata + pegging aggregates). */
+export type PlanSupplyViewRow = CaseSupplyRow & {
+  consumedQty: number;
+  residualQty: number;
+  utilizationRate: number | null;
+  peggedDemandCount: number;
+  totalPeggedQty: number;
+  peggedDemands: PeggedDemandEntry[];
+};
+
+/** Fetch all supply records for a case (flat table scan, no run context needed). */
+export async function getCaseSupplies(caseId: number): Promise<CaseSupplyRow[]> {
+  const r = await fetch(`${API}/cases/${caseId}/supplies`);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }

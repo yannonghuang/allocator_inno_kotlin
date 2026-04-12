@@ -304,11 +304,18 @@ fun Routing.allocateRoutes() {
         val productId = call.request.queryParameters["product_id"]?.trim() ?: ""
         val locationId = call.request.queryParameters["location_id"]?.trim() ?: ""
         val method = call.request.queryParameters["method"]?.trim() ?: ""
+        val runIdParam = call.request.queryParameters["run_id"]?.toIntOrNull()
         if (productId.isBlank() || locationId.isBlank() || method.isBlank()) {
             throw IllegalArgumentException("product_id, location_id, method required")
         }
-        val result = casePlanResults[caseId]
-            ?: throw NoSuchElementException("No plan result for this case. Run plan first.")
+        val result = if (runIdParam != null) {
+            loadPlanResultFromDb(caseId, runIdParam)
+                ?: throw NoSuchElementException("Plan run $runIdParam not found for case $caseId.")
+        } else {
+            casePlanResults[caseId]
+                ?: loadPlanResultFromDb(caseId)?.also { casePlanResults[caseId] = it }
+                ?: throw NoSuchElementException("No plan result for this case. Run plan first.")
+        }
 
         @Suppress("UNCHECKED_CAST")
         val planningPegging = result["planning_pegging"] as? List<Map<String, Any?>> ?: emptyList()
@@ -430,6 +437,51 @@ private fun anyToJson(v: Any?): JsonElement = when (v) {
     is Map<*, *> -> buildJsonObject { v.forEach { (k, vv) -> put(k.toString(), anyToJson(vv)) } }
     is List<*> -> buildJsonArray { v.forEach { add(anyToJson(it)) } }
     else -> JsonPrimitive(v.toString())
+}
+
+/**
+ * Inverse of anyToJson: converts a stored JsonElement back to the Map<String,Any?>/List<Any?>
+ * structure expected by findWoNode and other plan-result helpers.
+ */
+private fun jsonToAny(v: JsonElement): Any? = when (v) {
+    is JsonNull -> null
+    is JsonPrimitive -> when {
+        v.isString -> v.content
+        v.booleanOrNull != null -> v.boolean
+        v.intOrNull != null -> v.int
+        v.longOrNull != null -> v.long
+        v.doubleOrNull != null -> v.double
+        else -> v.content
+    }
+    is JsonObject -> v.mapValues { (_, vv) -> jsonToAny(vv) }
+    is JsonArray  -> v.map { jsonToAny(it) }
+}
+
+/**
+ * Load a plan result for a case from the DB.
+ * - If [runId] is provided, load that specific run (any status).
+ * - Otherwise, load the latest successful run and warm up [casePlanResults].
+ * Returns null if not found or the stored result cannot be parsed.
+ */
+@Suppress("UNCHECKED_CAST")
+private fun loadPlanResultFromDb(caseId: Int, runId: Int? = null): Map<String, Any>? {
+    val resultJson = transaction {
+        if (runId != null) {
+            PlanRuns.selectAll()
+                .where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }
+                .firstOrNull()
+                ?.get(PlanRuns.result)
+        } else {
+            PlanRuns.selectAll()
+                .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
+                .orderBy(PlanRuns.id, SortOrder.DESC)
+                .firstOrNull()
+                ?.get(PlanRuns.result)
+        }
+    } ?: return null
+    return runCatching {
+        jsonToAny(Json.parseToJsonElement(resultJson)) as? Map<String, Any>
+    }.getOrNull()
 }
 
 /** Return set of (parent_id, child_id) for real BOM rows (VIRTUAL != Y). */

@@ -275,7 +275,8 @@
     "hideCopilot": "Hide copilot",
     "tabs": {
       "committedDemands": "Committed demands",
-      "workOrders": "Work orders"
+      "workOrders": "Work orders",
+      "supplies": "Supplies ({count})"
     },
     "committedDemands": {
       "heading": "Committed demands",
@@ -451,6 +452,42 @@
       "errors": {
         "selectMethod": "Select a method",
         "enterAltGroup": "Enter an ALT_GROUP value"
+      }
+    },
+    "supplyView": {
+      "heading": "Supply universe",
+      "filterPlaceholder": "Filter by supply ID, product, location…",
+      "filterUnusedOnly": "Unused only",
+      "filterPartialOnly": "Partially consumed",
+      "filterHideDummy": "Hide dummy",
+      "loading": "Loading supplies…",
+      "showing": "Showing {shown} of {total} supplies.",
+      "overallUtilization": "Overall utilization: {pct}% ({consumed} / {initial})",
+      "columns": {
+        "supplyId": "Supply ID",
+        "product": "Product",
+        "location": "Location",
+        "vendor": "Vendor",
+        "supplyDate": "Supply Date",
+        "initialQty": "Initial Qty",
+        "consumed": "Consumed",
+        "residual": "Residual",
+        "utilPct": "Util %",
+        "peggedDemands": "Pegged Demands",
+        "totalPeggedQty": "Total Pegged Qty",
+        "pegging": "Pegging"
+      },
+      "peggingPanel": {
+        "title": "Supply pegging: {supplyId}",
+        "description": "Demands fulfilled (in part) by this supply in the latest plan run, sorted by quantity consumed.",
+        "initialQty": "Initial qty:",
+        "consumed": "Consumed:",
+        "demandCount": "{count, plural, one {# demand} other {# demands}}",
+        "columns": {
+          "demandId": "Demand ID",
+          "customer": "Customer",
+          "qtyConsumed": "Qty consumed"
+        }
       }
     },
     "commitReasons": {

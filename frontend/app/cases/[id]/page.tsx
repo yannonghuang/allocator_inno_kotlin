@@ -59,6 +59,10 @@ import {
   updateMaterialEvent,
   deleteMaterialEvent,
   analyzeMaterialImpact,
+  type CaseSupplyRow,
+  type PeggedDemandEntry,
+  type PlanSupplyViewRow,
+  getCaseSupplies,
 } from '@/lib/api';
 
 type SupplySuggestion = {
@@ -236,6 +240,22 @@ function PlanKpiDashboard({
 
 import { SortFilterTable } from '@/app/components/SortFilterTable';
 
+/** Extract a human-readable message from an API error.
+ *  The backend often returns JSON bodies like {"detail":"..."} or {"error":"..."}.
+ *  If the raw string is valid JSON with one of those fields, return that field's value;
+ *  otherwise return the raw string as-is. */
+function parseApiError(raw: unknown): string {
+  const s = raw instanceof Error ? raw.message : String(raw ?? 'Unknown error');
+  try {
+    const parsed = JSON.parse(s);
+    if (typeof parsed === 'object' && parsed !== null) {
+      const msg = parsed.detail ?? parsed.message ?? parsed.error;
+      if (typeof msg === 'string') return msg;
+    }
+  } catch { /* not JSON */ }
+  return s;
+}
+
 // ── Commit-reason formatting ───────────────────────────────────────────────────
 
 /** Parse a nested child_failed chain: "child_failed:PROD@LOC(reason)" recursively. */
@@ -359,18 +379,36 @@ export default function CaseDetail() {
   const [planLoading, setPlanLoading] = useState(false);
   const [planError, setPlanError] = useState<string | null>(null);
   const [planPeggingOpen, setPlanPeggingOpen] = useState(false);
-  const [planPeggingContext, setPlanPeggingContext] = useState<{ type: 'demand'; row: CommittedDemand } | { type: 'work_order'; row: WorkOrder } | null>(null);
+  const [planPeggingContext, setPlanPeggingContext] = useState<
+    | { type: 'demand'; row: CommittedDemand }
+    | { type: 'work_order'; row: WorkOrder }
+    | { type: 'supply'; supplyId: string; peggedDemands: PeggedDemandEntry[]; initialQty: number; consumedQty: number }
+    | null
+  >(null);
   const [planPeggingExpanded, setPlanPeggingExpanded] = useState<Set<string>>(new Set(['0']));
   const [planExplanationExpanded, setPlanExplanationExpanded] = useState<Set<string>>(new Set());
   const [planPeggingPanelWidth, setPlanPeggingPanelWidth] = useState(420);
   const [planWorkOrderPeggingCache, setPlanWorkOrderPeggingCache] = useState<Record<string, PlanningPeggingNode>>({});
   // Active demand for WO pegging panel; null = use the row's own demand_id (default)
   const [woPeggingActiveDemandId, setWoPeggingActiveDemandId] = useState<string | null>(null);
+  // When drilling from supply pegging panel into a demand tree, remembers the supply context for the back link.
+  const [previousPeggingContext, setPreviousPeggingContext] = useState<{
+    type: 'supply'; supplyId: string; peggedDemands: PeggedDemandEntry[]; initialQty: number; consumedQty: number;
+  } | null>(null);
   const [planWorkOrderPeggingLoading, setPlanWorkOrderPeggingLoading] = useState<string | null>(null);
   const [planWorkOrderPeggingError, setPlanWorkOrderPeggingError] = useState<string | null>(null);
   const planPeggingResizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [planPeggingResizing, setPlanPeggingResizing] = useState(false);
-  const [planResultTab, setPlanResultTab] = useState<'demands' | 'work_orders'>('demands');
+  const [planResultTab, setPlanResultTab] = useState<'demands' | 'work_orders' | 'supplies'>('demands');
+  // ID of the plan run currently loaded in planResult; null = freshly-run (not from history)
+  const [currentPlanRunId, setCurrentPlanRunId] = useState<number | null>(null);
+  const [caseSupplies, setCaseSupplies] = useState<CaseSupplyRow[]>([]);
+  const [caseSuppliesLoading, setCaseSuppliesLoading] = useState(false);
+  const [caseSuppliesError, setCaseSuppliesError] = useState<string | null>(null);
+  const [planSupplyTextFilter, setPlanSupplyTextFilter] = useState('');
+  const [planSupplyUnusedOnly, setPlanSupplyUnusedOnly] = useState(false);
+  const [planSupplyPartialOnly, setPlanSupplyPartialOnly] = useState(false);
+  const [planSupplyHideDummy, setPlanSupplyHideDummy] = useState(true);
   const [planWorkOrderHideDummyProdArea, setPlanWorkOrderHideDummyProdArea] = useState(true);
   const [planDemandRealMakeOnly, setPlanDemandRealMakeOnly] = useState(false);
   const [planDemandShortOnly, setPlanDemandShortOnly] = useState(false);
@@ -546,6 +584,7 @@ export default function CaseDetail() {
         if (st.progress) setPlanProgress(st.progress);
         if (st.status === 'completed' && st.result) {
           setPlanResult(st.result);
+          setCurrentPlanRunId(null);
           setPlanWorkOrderPeggingCache({});
           setPlanJobId(null);
           setPlanLoading(false);
@@ -580,6 +619,22 @@ export default function CaseDetail() {
       }
     };
   }, [planJobId, id]);
+
+  // Load case supplies once we have a plan result (fetched once; cleared when planResult is cleared).
+  useEffect(() => {
+    if (!planResult || !id) {
+      setCaseSupplies([]);
+      setCaseSuppliesError(null);
+      return;
+    }
+    let cancelled = false;
+    setCaseSuppliesLoading(true);
+    getCaseSupplies(id)
+      .then((rows) => { if (!cancelled) setCaseSupplies(rows); })
+      .catch((e) => { if (!cancelled) setCaseSuppliesError(parseApiError(e)); })
+      .finally(() => { if (!cancelled) setCaseSuppliesLoading(false); });
+    return () => { cancelled = true; };
+  }, [id, planResult]);
 
   // Load real BOM pairs and real move triples once we have a plan result.
   useEffect(() => {
@@ -643,13 +698,13 @@ export default function CaseDetail() {
     setPlanWorkOrderPeggingError(null);
     setPlanWorkOrderPeggingLoading(woPeggingKey);
     if (typeof console !== 'undefined' && console.log) console.log('[WO pegging] Fetching', { caseId: id, demand_id, product_id, location_id, method });
-    getWorkOrderPegging(Number(id), { demand_id, product_id, location_id, method })
+    getWorkOrderPegging(Number(id), { demand_id, product_id, location_id, method, ...(currentPlanRunId != null ? { run_id: currentPlanRunId } : {}) })
       .then((res) => {
         if (typeof console !== 'undefined' && console.log) console.log('[WO pegging] Loaded tree for', woPeggingKey);
         setPlanWorkOrderPeggingCache((prev) => ({ ...prev, [woPeggingKey]: res.tree }));
       })
       .catch((err) => {
-        const message = err?.message ?? 'Failed to load work-order pegging';
+        const message = parseApiError(err);
         if (typeof console !== 'undefined' && console.error) console.error('[WO pegging] Error', message, err);
         setPlanWorkOrderPeggingError(message);
       })
@@ -810,6 +865,7 @@ export default function CaseDetail() {
       const full = await getPlanRun(id, latest.id);
       if (full.result) {
         setPlanResult(full.result as typeof planResult);
+        setCurrentPlanRunId(latest.id);
         setPlanWorkOrderPeggingCache({});
       }
     } catch {
@@ -1176,6 +1232,76 @@ export default function CaseDetail() {
     return map;
   }, [planResult]);
 
+  /**
+   * Invert demand-centric planning_pegging trees into a supply-centric map.
+   * Key: supply_id. Value: { totalPeggedQty, demands[] }
+   * Consolidated synthetic IDs (consolidated_*) are keyed but won't match any CaseSupplyRow.
+   */
+  const supplyPeggingMap = useMemo(() => {
+    const map = new Map<string, { totalPeggedQty: number; demands: PeggedDemandEntry[] }>();
+    if (!planResult?.planning_pegging) return map;
+
+    const demandCustomerMap = new Map<string, string | null>();
+    for (const d of planResult.committed_demands ?? []) {
+      if (d.demand_id) demandCustomerMap.set(d.demand_id, d.customer ?? null);
+    }
+
+    // activeDemandId: the demand currently in scope as we descend the tree.
+    // For non-consolidated entries it's the entry-level demand_id throughout.
+    // For consolidated entries (entry demand_id = null), demand-type nodes inside
+    // the tree carry their own demand_id — we pick it up as we descend.
+    function walk(node: PlanningPeggingNode, activeDemandId: string | null) {
+      // When we step into a demand node, switch to its own demand_id.
+      const effectiveDemandId =
+        node.type === 'demand' && node.demand_id ? node.demand_id : activeDemandId;
+
+      if (node.type === 'supply' && node.supply_id && effectiveDemandId) {
+        const sid = node.supply_id;
+        const qty = Number(node.quantity ?? 0);
+        const existing = map.get(sid);
+        if (existing) {
+          const existingForDemand = existing.demands.find((d) => d.demandId === effectiveDemandId);
+          if (existingForDemand) {
+            existingForDemand.qtyConsumed += qty;
+          } else {
+            existing.demands.push({ demandId: effectiveDemandId, customer: demandCustomerMap.get(effectiveDemandId) ?? null, qtyConsumed: qty });
+          }
+          existing.totalPeggedQty += qty;
+        } else {
+          map.set(sid, {
+            totalPeggedQty: qty,
+            demands: [{ demandId: effectiveDemandId, customer: demandCustomerMap.get(effectiveDemandId) ?? null, qtyConsumed: qty }],
+          });
+        }
+      }
+      for (const child of node.children ?? []) walk(child, effectiveDemandId);
+    }
+
+    for (const entry of planResult.planning_pegging) {
+      walk(entry.tree, entry.demand_id ?? null);
+    }
+    return map;
+  }, [planResult]);
+
+  /** Join caseSupplies rows with supplyPeggingMap to produce the enriched supply view. */
+  const planSupplyViewRows = useMemo((): PlanSupplyViewRow[] => {
+    return caseSupplies.map((s) => {
+      const pegging = supplyPeggingMap.get(s.supplyId);
+      const consumedQty = pegging?.totalPeggedQty ?? 0;
+      const residualQty = Math.max(0, s.qty - consumedQty);
+      const utilizationRate = s.qty > 0 ? consumedQty / s.qty : null;
+      return {
+        ...s,
+        consumedQty,
+        residualQty,
+        utilizationRate,
+        peggedDemandCount: pegging?.demands.length ?? 0,
+        totalPeggedQty: pegging?.totalPeggedQty ?? 0,
+        peggedDemands: pegging?.demands ?? [],
+      };
+    });
+  }, [caseSupplies, supplyPeggingMap]);
+
   const handleAllocate = async () => {
     setAllocating(true);
     setError(null);
@@ -1374,6 +1500,7 @@ export default function CaseDetail() {
       const full = await getPlanRun(id, runId);
       if (full.result) {
         setPlanResult(full.result as typeof planResult);
+        setCurrentPlanRunId(runId);
         setPlanWorkOrderPeggingCache({});
         setPlanRunHistoryOpen(false);
       }
@@ -2342,6 +2469,13 @@ export default function CaseDetail() {
               >
                 {tP('tabs.workOrders')}
               </button>
+              <button
+                type="button"
+                className={planResultTab === 'supplies' ? '' : 'secondary'}
+                onClick={() => setPlanResultTab('supplies')}
+              >
+                {tP('tabs.supplies', { count: planSupplyViewRows.length.toLocaleString() })}
+              </button>
             </div>
             <div style={{ border: '1px solid #3d3d40', borderRadius: 6 }}>
               {planResultTab === 'demands' && (
@@ -2628,8 +2762,8 @@ export default function CaseDetail() {
                                   className="secondary"
                                   style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
                                   onClick={() => {
-                                    if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); }
-                                    else { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); }
+                                    if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); }
+                                    else { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); }
                                   }}
                                 >Show</button>
                               );
@@ -2644,15 +2778,7 @@ export default function CaseDetail() {
               {planResultTab === 'work_orders' && (
                 <div style={{ padding: '0.75rem 1rem' }}>
                   <h4 style={{ marginTop: 0, marginBottom: '0.5rem' }}>{tP('workOrders.heading')}</h4>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
-                      <input
-                        type="checkbox"
-                        checked={planWorkOrderHideDummyProdArea}
-                        onChange={(e) => setPlanWorkOrderHideDummyProdArea(e.target.checked)}
-                      />
-                      <span>{tP('workOrders.hideDummy')}</span>
-                    </label>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.25rem' }}>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
                         type="checkbox"
@@ -2724,6 +2850,17 @@ export default function CaseDetail() {
                         onChange={(e) => setPlanWoHasOverride(e.target.checked)}
                       />
                       <span>{tP('workOrders.filterHasOverride')}</span>
+                    </label>
+                  </div>
+                  <div style={{ marginTop: '0.2rem', marginBottom: '0.4rem' }}>
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.72rem', color: '#71717a', cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={planWorkOrderHideDummyProdArea}
+                        onChange={(e) => setPlanWorkOrderHideDummyProdArea(e.target.checked)}
+                        style={{ accentColor: '#71717a' }}
+                      />
+                      <span>{tP('workOrders.hideDummy')}</span>
                     </label>
                   </div>
                   {planResult.work_orders.length > 0 && (() => {
@@ -2909,8 +3046,8 @@ export default function CaseDetail() {
                             style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
                             onClick={(e) => {
                               e.stopPropagation();
-                              if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); }
-                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); }
+                              if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); }
+                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); }
                             }}
                           >Show</button>
                         );
@@ -2947,6 +3084,114 @@ export default function CaseDetail() {
                       }},
                     ]}
                   />
+                      </>
+                    );
+                  })()}
+                </div>
+              )}
+              {planResultTab === 'supplies' && (
+                <div style={{ padding: '0.75rem 1rem' }}>
+                  <h4 style={{ marginTop: 0, marginBottom: '0.5rem' }}>{tP('supplyView.heading')}</h4>
+                  {/* Filter controls */}
+                  <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
+                    <div style={{ position: 'relative' }}>
+                      <input
+                        type="text"
+                        value={planSupplyTextFilter}
+                        onChange={(e) => setPlanSupplyTextFilter(e.target.value)}
+                        placeholder={tP('supplyView.filterPlaceholder')}
+                        style={{ fontSize: '0.8rem', padding: '0.2rem 0.4rem', paddingRight: planSupplyTextFilter ? '1.4rem' : '0.4rem', borderRadius: 4, border: `1px solid ${planSupplyTextFilter ? '#3b82f6' : '#52525b'}`, background: '#27272a', color: '#e4e4e7', width: 280 }}
+                      />
+                      {planSupplyTextFilter && (
+                        <button onClick={() => setPlanSupplyTextFilter('')} style={{ position: 'absolute', right: 4, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '0.85rem', padding: 0, lineHeight: 1 }}>✕</button>
+                      )}
+                    </div>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input type="checkbox" checked={planSupplyUnusedOnly} onChange={(e) => { setPlanSupplyUnusedOnly(e.target.checked); if (e.target.checked) setPlanSupplyPartialOnly(false); }} />
+                      <span>{tP('supplyView.filterUnusedOnly')}</span>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input type="checkbox" checked={planSupplyPartialOnly} onChange={(e) => { setPlanSupplyPartialOnly(e.target.checked); if (e.target.checked) setPlanSupplyUnusedOnly(false); }} />
+                      <span>{tP('supplyView.filterPartialOnly')}</span>
+                    </label>
+                  </div>
+                  <div style={{ marginTop: '0.2rem', marginBottom: '0.4rem' }}>
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.72rem', color: '#71717a', cursor: 'pointer' }}>
+                      <input type="checkbox" checked={planSupplyHideDummy} onChange={(e) => setPlanSupplyHideDummy(e.target.checked)} style={{ accentColor: '#71717a' }} />
+                      <span>{tP('supplyView.filterHideDummy')}</span>
+                    </label>
+                  </div>
+                  {caseSuppliesLoading && <p style={{ color: '#a1a1aa', fontSize: '0.85rem' }}>{tP('supplyView.loading')}</p>}
+                  {caseSuppliesError && <p style={{ color: '#f87171', fontSize: '0.85rem' }}>{caseSuppliesError}</p>}
+                  {!caseSuppliesLoading && !caseSuppliesError && (() => {
+                    const q = planSupplyTextFilter.trim().toLowerCase();
+                    let rows = planSupplyViewRows;
+                    if (planSupplyHideDummy) rows = rows.filter((r) => !r.supplyId.toLowerCase().endsWith('_dummy'));
+                    if (q) rows = rows.filter((r) => r.supplyId.toLowerCase().includes(q) || r.productId.toLowerCase().includes(q) || (r.locationId ?? '').toLowerCase().includes(q));
+                    if (planSupplyUnusedOnly) rows = rows.filter((r) => r.peggedDemandCount === 0);
+                    if (planSupplyPartialOnly) rows = rows.filter((r) => r.residualQty > 0 && r.consumedQty > 0);
+
+                    const totalInitial = planSupplyViewRows.reduce((s, r) => s + r.qty, 0);
+                    const totalConsumed = planSupplyViewRows.reduce((s, r) => s + r.consumedQty, 0);
+                    const overallUtil = totalInitial > 0 ? ((totalConsumed / totalInitial) * 100).toFixed(1) : null;
+
+                    return (
+                      <>
+                        <p style={{ fontSize: '0.8rem', color: '#a1a1aa', marginBottom: '0.5rem', marginTop: 0 }}>
+                          {tP('supplyView.showing', { shown: rows.length.toLocaleString(), total: planSupplyViewRows.length.toLocaleString() })}
+                          {overallUtil != null && (
+                            <span> {tP('supplyView.overallUtilization', { pct: overallUtil, consumed: Number(totalConsumed).toLocaleString(), initial: Number(totalInitial).toLocaleString() })}</span>
+                          )}
+                        </p>
+                        <SortFilterTable<PlanSupplyViewRow & { _key: string }>
+                          idKey="_key"
+                          rows={rows.map((r, i) => ({ ...r, _key: `psv-${i}-${r.supplyId}` }))}
+                          filterKeys={[]}
+                          defaultSortKey="supplyDate"
+                          columns={[
+                            { key: 'supplyId', label: tP('supplyView.columns.supplyId'), sortable: true },
+                            { key: 'productId', label: tP('supplyView.columns.product'), sortable: true },
+                            { key: 'locationId', label: tP('supplyView.columns.location'), sortable: true, render: (r) => r.locationId ?? '–' },
+                            { key: 'vendorId', label: tP('supplyView.columns.vendor'), sortable: true, render: (r) => r.vendorId ?? '–' },
+                            { key: 'supplyDate', label: tP('supplyView.columns.supplyDate'), sortable: true, render: (r) => r.supplyDate ?? '–' },
+                            { key: 'qty', label: tP('supplyView.columns.initialQty'), sortable: true, render: (r) => Number(r.qty).toLocaleString() },
+                            { key: 'consumedQty', label: tP('supplyView.columns.consumed'), sortable: true, render: (r) => r.consumedQty > 0 ? <span style={{ color: '#a78bfa' }}>{Number(r.consumedQty).toLocaleString()}</span> : <span style={{ color: '#52525b' }}>0</span> },
+                            { key: 'residualQty', label: tP('supplyView.columns.residual'), sortable: true, render: (r) => r.residualQty > 0 ? <span style={{ color: '#34d399' }}>{Number(r.residualQty).toLocaleString()}</span> : <span style={{ color: '#52525b' }}>0</span> },
+                            { key: 'utilizationRate', label: tP('supplyView.columns.utilPct'), sortable: true, render: (r) => {
+                              if (r.utilizationRate == null) return <span style={{ color: '#52525b' }}>–</span>;
+                              const pct = (r.utilizationRate * 100).toFixed(1);
+                              const color = r.utilizationRate >= 0.9 ? '#34d399' : r.utilizationRate >= 0.5 ? '#f59e0b' : '#f87171';
+                              return <span style={{ color }}>{pct}%</span>;
+                            }},
+                            { key: 'peggedDemandCount', label: tP('supplyView.columns.peggedDemands'), sortable: true, render: (r) => r.peggedDemandCount > 0 ? <span style={{ color: '#60a5fa' }}>{r.peggedDemandCount}</span> : <span style={{ color: '#52525b' }}>0</span> },
+                            { key: 'totalPeggedQty', label: tP('supplyView.columns.totalPeggedQty'), sortable: true, render: (r) => r.totalPeggedQty > 0 ? Number(r.totalPeggedQty).toLocaleString() : <span style={{ color: '#52525b' }}>0</span> },
+                            { key: '_sup_pegging' as keyof (PlanSupplyViewRow & { _key: string }), label: tP('supplyView.columns.pegging'), sortable: false, render: (r) => {
+                              if (r.peggedDemandCount === 0) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                              const k = `supply|${r.supplyId}`;
+                              const isSelected = woPeggingRowKey === k;
+                              return (
+                                <button
+                                  type="button"
+                                  className="secondary"
+                                  style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
+                                  onClick={() => {
+                                    if (isSelected) {
+                                      setPlanPeggingOpen(false);
+                                      setPlanPeggingContext(null);
+                                      setWoPeggingRowKey(null);
+                                      setPreviousPeggingContext(null);
+                                    } else {
+                                      setPlanPeggingContext({ type: 'supply', supplyId: r.supplyId, peggedDemands: r.peggedDemands, initialQty: r.qty, consumedQty: r.consumedQty });
+                                      setPlanPeggingOpen(true);
+                                      setWoPeggingRowKey(k);
+                                      setPreviousPeggingContext(null);
+                                    }
+                                  }}
+                                >Show</button>
+                              );
+                            }},
+                          ]}
+                        />
                       </>
                     );
                   })()}
@@ -3801,7 +4046,7 @@ export default function CaseDetail() {
         >
           <div
             style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 0, pointerEvents: 'auto' }}
-            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); }}
+            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); }}
             aria-hidden
           />
           <div
@@ -3843,21 +4088,99 @@ export default function CaseDetail() {
                 zIndex: 11,
               }}
             />
+            {previousPeggingContext && (
+              <div style={{ marginBottom: '0.5rem' }}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPlanPeggingContext(previousPeggingContext);
+                    setWoPeggingRowKey(`supply|${previousPeggingContext.supplyId}`);
+                    setPreviousPeggingContext(null);
+                  }}
+                  style={{ background: 'none', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '0.78rem', padding: 0, display: 'flex', alignItems: 'center', gap: '0.3rem' }}
+                >
+                  ← {previousPeggingContext.supplyId}
+                </button>
+              </div>
+            )}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
               <h3 style={{ margin: 0, color: '#fafafa' }}>
-                {planPeggingContext.type === 'demand'
-                  ? `Pegging: ${planPeggingContext.row.demand_id ?? planPeggingContext.row.product_id}`
-                  : `Pegging: ${planPeggingContext.row.product_id} @ ${planPeggingContext.row.location_id}`}
+                {planPeggingContext.type === 'supply'
+                  ? tP('supplyView.peggingPanel.title', { supplyId: planPeggingContext.supplyId })
+                  : planPeggingContext.type === 'demand'
+                    ? `Pegging: ${planPeggingContext.row.demand_id ?? planPeggingContext.row.product_id}`
+                    : `Pegging: ${planPeggingContext.row.product_id} @ ${planPeggingContext.row.location_id}`}
               </h3>
-              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
+              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setPreviousPeggingContext(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
             </div>
             <p style={{ margin: 0, marginBottom: '0.5rem', fontSize: '0.8rem', color: '#71717a' }}>
-              {planPeggingContext.type === 'work_order'
-                ? 'Root = this work order; below it are the supplies that fulfill it (inventory, child work orders, purchase) at all levels.'
-                : '▢ blue = demand target, ▢ purple = supply / purchase inventory, ⚙ green = work order (transformation). Root = target demand; leaves = supply or purchase inventory.'}
-              {' '}
-              When multiple inventories or work orders appear as siblings under the same parent, they are alternative paths <strong>OR</strong> that can each supply flow to that parent.
+              {planPeggingContext.type === 'supply'
+                ? tP('supplyView.peggingPanel.description')
+                : planPeggingContext.type === 'work_order'
+                  ? 'Root = this work order; below it are the supplies that fulfill it (inventory, child work orders, purchase) at all levels.'
+                  : '▢ blue = demand target, ▢ purple = supply / purchase inventory, ⚙ green = work order (transformation). Root = target demand; leaves = supply or purchase inventory.'}
+              {planPeggingContext.type !== 'supply' && (
+                <>{' '}When multiple inventories or work orders appear as siblings under the same parent, they are alternative paths <strong>OR</strong> that can each supply flow to that parent.</>
+              )}
             </p>
+            {planPeggingContext.type === 'supply' && (() => {
+              const ctx = planPeggingContext;
+              return (
+                <div>
+                  <p style={{ fontSize: '0.8rem', color: '#71717a', margin: '0 0 0.75rem' }}>
+                    {tP('supplyView.peggingPanel.initialQty')} <strong style={{ color: '#e4e4e7' }}>{Number(ctx.initialQty).toLocaleString()}</strong>
+                    {' · '}{tP('supplyView.peggingPanel.consumed')} <strong style={{ color: '#a78bfa' }}>{Number(ctx.consumedQty).toLocaleString()}</strong>
+                    {' · '}{tP('supplyView.peggingPanel.demandCount', { count: ctx.peggedDemands.length })}
+                  </p>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
+                    <thead>
+                      <tr style={{ borderBottom: '1px solid #3d3d40', color: '#a1a1aa' }}>
+                        <th style={{ textAlign: 'left', padding: '4px 6px', fontWeight: 500 }}>{tP('supplyView.peggingPanel.columns.demandId')}</th>
+                        <th style={{ textAlign: 'left', padding: '4px 6px', fontWeight: 500 }}>{tP('supplyView.peggingPanel.columns.customer')}</th>
+                        <th style={{ textAlign: 'right', padding: '4px 6px', fontWeight: 500 }}>{tP('supplyView.peggingPanel.columns.qtyConsumed')}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...ctx.peggedDemands]
+                        .sort((a, b) => b.qtyConsumed - a.qtyConsumed)
+                        .map((d) => {
+                          const demandRow = planResult.committed_demands.find((cd) => cd.demand_id === d.demandId);
+                          const demandKey = demandRow ? `demand|${demandRow.demand_id ?? ''}|${demandRow.product_id}|${demandRow.location_id}` : null;
+                          const isActive = demandKey != null && woPeggingRowKey === demandKey;
+                          return (
+                          <tr key={d.demandId} style={{ borderBottom: '1px solid #27272a' }}>
+                            <td style={{ padding: '4px 6px', fontFamily: 'monospace' }}>
+                              {demandRow ? (
+                                <button
+                                  type="button"
+                                  className="secondary"
+                                  style={{ fontSize: '0.78rem', padding: '1px 6px', fontFamily: 'monospace', ...(isActive ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : {}) }}
+                                  onClick={() => {
+                                    if (isActive) {
+                                      setPlanPeggingContext({ type: 'supply', supplyId: ctx.supplyId, peggedDemands: ctx.peggedDemands, initialQty: ctx.initialQty, consumedQty: ctx.consumedQty });
+                                      setWoPeggingRowKey(`supply|${ctx.supplyId}`);
+                                      setPreviousPeggingContext(null);
+                                    } else {
+                                      setPreviousPeggingContext({ type: 'supply', supplyId: ctx.supplyId, peggedDemands: ctx.peggedDemands, initialQty: ctx.initialQty, consumedQty: ctx.consumedQty });
+                                      setPlanPeggingContext({ type: 'demand', row: demandRow });
+                                      setWoPeggingRowKey(demandKey);
+                                    }
+                                  }}
+                                >{d.demandId}</button>
+                              ) : (
+                                <span style={{ color: '#60a5fa' }}>{d.demandId || '–'}</span>
+                              )}
+                            </td>
+                            <td style={{ padding: '4px 6px', color: '#e4e4e7' }}>{d.customer ?? '–'}</td>
+                            <td style={{ padding: '4px 6px', textAlign: 'right', color: '#a78bfa' }}>{Number(d.qtyConsumed).toLocaleString()}</td>
+                          </tr>
+                          );
+                        })}
+                    </tbody>
+                  </table>
+                </div>
+              );
+            })()}
             {planPeggingContext.type === 'work_order' && (() => {
               const row = planPeggingContext.row;
               // "Shared" means the planner consolidated multiple demands into one WO (demand_id=null).
@@ -3908,7 +4231,7 @@ export default function CaseDetail() {
                 </div>
               );
             })()}
-            {(() => {
+            {planPeggingContext.type !== 'supply' && (() => {
               let tree: PlanningPeggingNode | null = null;
               const isWoPeggingView = planPeggingContext.type === 'work_order';
               const woPeggingDemandId = isWoPeggingView ? (planPeggingContext.row as WorkOrder).demand_id ?? null : null;

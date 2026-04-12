@@ -14,6 +14,7 @@ object Cases : Table("cases") {
     val id = integer("id").autoIncrement()
     val name = varchar("name", 255)
     val createdAt = timestamp("created_at").defaultExpression(CurrentTimestamp)
+    val assessmentCriteria = text("assessment_criteria").nullable()
     override val primaryKey = PrimaryKey(id)
 }
 
@@ -190,5 +191,20 @@ object PlanRuns : Table("plan_run") {
     val result = text("result").nullable()                       // JSON: enriched plan result
     val error = text("error").nullable()
     val createdAt = timestamp("created_at").defaultExpression(CurrentTimestamp)
+    override val primaryKey = PrimaryKey(id)
+}
+
+/** Persisted material impact assessment results (rating + LLM explanation per supply change). */
+object MaterialImpactAssessments : Table("material_impact_assessment") {
+    val id                  = integer("id").autoIncrement()
+    val caseId              = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val planRunId           = integer("plan_run_id").references(PlanRuns.id, onDelete = ReferenceOption.SET_NULL).nullable()
+    val supplyId            = varchar("supply_id", 255)
+    val deliveryDelayDays   = integer("delivery_delay_days").default(0)
+    val quantityDecreasePct = double("quantity_decrease_pct").default(0.0)
+    val criteria            = text("criteria")
+    val rating              = varchar("rating", 10)   // LOW | MEDIUM | HIGH
+    val explanation         = text("explanation")
+    val createdAt           = timestamp("created_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 }

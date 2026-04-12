@@ -275,7 +275,8 @@
     "hideCopilot": "隐藏副驾驶",
     "tabs": {
       "committedDemands": "已承诺需求",
-      "workOrders": "生产订单"
+      "workOrders": "生产订单",
+      "supplies": "供应（{count}）"
     },
     "committedDemands": {
       "heading": "已承诺需求",
@@ -451,6 +452,42 @@
       "errors": {
         "selectMethod": "请选择方法",
         "enterAltGroup": "请输入 ALT_GROUP 值"
+      }
+    },
+    "supplyView": {
+      "heading": "供应全景",
+      "filterPlaceholder": "按供应 ID、产品、地点筛选…",
+      "filterUnusedOnly": "仅未使用",
+      "filterPartialOnly": "部分消耗",
+      "filterHideDummy": "隐藏虚拟供应",
+      "loading": "加载供应数据…",
+      "showing": "显示 {shown} / {total} 条供应。",
+      "overallUtilization": "整体利用率：{pct}%（{consumed} / {initial}）",
+      "columns": {
+        "supplyId": "供应 ID",
+        "product": "产品",
+        "location": "地点",
+        "vendor": "供应商",
+        "supplyDate": "供应日期",
+        "initialQty": "初始数量",
+        "consumed": "已消耗",
+        "residual": "剩余",
+        "utilPct": "利用率 %",
+        "peggedDemands": "关联需求数",
+        "totalPeggedQty": "关联需求总量",
+        "pegging": "追溯"
+      },
+      "peggingPanel": {
+        "title": "供应追溯：{supplyId}",
+        "description": "在最新计划运行中（部分）由此供应满足的需求，按消耗量降序排列。",
+        "initialQty": "初始数量：",
+        "consumed": "已消耗：",
+        "demandCount": "{count} 个需求",
+        "columns": {
+          "demandId": "需求 ID",
+          "customer": "客户",
+          "qtyConsumed": "消耗数量"
+        }
       }
     },
     "commitReasons": {

@@ -1,6 +1,8 @@
 package com.allocator.api
 
+import com.allocator.Cases
 import com.allocator.Supplies
+import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
@@ -17,6 +19,18 @@ data class SupplySuggestion(
     val qty:         Double,
     val vendorId:    String?,
     val locationId:  String?,
+)
+
+@Serializable
+data class CaseSupplyRow(
+    val id:          Int,
+    val supplyId:    String,
+    val productId:   String,
+    val locationId:  String?,
+    val vendorId:    String?,
+    val supplyDate:  String?,
+    val qty:         Double,
+    val description: String?,
 )
 
 /**
@@ -48,6 +62,36 @@ fun Routing.supplyRoutes() {
                 .filter { q.isEmpty() || it.id.startsWith(q, ignoreCase = true) || it.productId.contains(q, ignoreCase = true) }
                 .take(20)
             call.respond(results)
+        }
+    }
+
+    /**
+     * GET /cases/{case_id}/supplies
+     * Returns all supply records for the given case, ordered by supply_id.
+     * Used by the planning Supply View tab to join with pegging data.
+     */
+    route("/cases/{case_id}/supplies") {
+        get {
+            val caseId = call.parameters["case_id"]?.toIntOrNull()
+                ?: return@get call.respond(HttpStatusCode.BadRequest, "Invalid case_id")
+            val rows = transaction {
+                Supplies.selectAll()
+                    .where { Supplies.caseId eq caseId }
+                    .orderBy(Supplies.supplyId, SortOrder.ASC)
+                    .map { row ->
+                        CaseSupplyRow(
+                            id          = row[Supplies.id],
+                            supplyId    = row[Supplies.supplyId],
+                            productId   = row[Supplies.productId],
+                            locationId  = row[Supplies.locationId],
+                            vendorId    = row[Supplies.vendorId],
+                            supplyDate  = row[Supplies.supplyDate],
+                            qty         = row[Supplies.qty],
+                            description = row[Supplies.description],
+                        )
+                    }
+            }
+            call.respond(rows)
         }
     }
 }

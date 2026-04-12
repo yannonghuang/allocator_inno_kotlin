@@ -1,6 +1,7 @@
 package com.allocator
 
 import com.allocator.api.allocateRoutes
+import com.allocator.api.assessmentRoutes
 import com.allocator.api.bomGraphRoutes
 import com.allocator.api.caseRoutes
 import com.allocator.api.explanationRoutes
@@ -84,6 +85,7 @@ fun Application.configureRouting() {
         bomGraphRoutes()
         materialImpactRoutes()
         materialEventRoutes()
+        assessmentRoutes()
         productRoutes()
         supplyRoutes()
     }
