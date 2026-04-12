@@ -239,7 +239,7 @@ export type PlanningPeggingNode = {
   children: PlanningPeggingNode[];
 };
 
-export type PlanningPeggingEntry = { demand_id: string; tree: PlanningPeggingNode };
+export type PlanningPeggingEntry = { demand_id: string | null; tree: PlanningPeggingNode };
 
 /** Plan KPI dashboard: delivery, inventory, procurement, manufacturing, logistics. */
 export type PlanKpis = {
@@ -317,7 +317,7 @@ export async function getMovesWithTransit(caseId: number): Promise<{ moves: [str
 /** Fetch work-order pegging on demand: how this WO is fulfilled by its supplies (all levels). Requires a prior plan run. */
 export async function getWorkOrderPegging(
   caseId: number,
-  params: { demand_id: string; product_id: string; location_id: string; method: string }
+  params: { demand_id: string; product_id: string; location_id: string; method: string; run_id?: number }
 ): Promise<{ tree: PlanningPeggingNode }> {
   const sp = new URLSearchParams({
     demand_id: params.demand_id,
@@ -325,6 +325,7 @@ export async function getWorkOrderPegging(
     location_id: params.location_id,
     method: params.method,
   });
+  if (params.run_id != null) sp.set('run_id', String(params.run_id));
   const r = await fetch(`${API}/cases/${caseId}/plan/work-order-pegging?${sp.toString()}`);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
@@ -661,6 +662,44 @@ export async function getBomGraph(caseId: number): Promise<BomGraphResponse> {
   return r.json();
 }
 
+// ── Planning Supply View ───────────────────────────────────────────────────────
+
+/** A supply record belonging to a case — returned by GET /cases/{id}/supplies. */
+export type CaseSupplyRow = {
+  id: number;
+  supplyId: string;
+  productId: string;
+  locationId: string | null;
+  vendorId: string | null;
+  supplyDate: string | null;
+  qty: number;
+  description: string | null;
+};
+
+/** A demand pegged to a supply, computed client-side from planning_pegging inversion. */
+export type PeggedDemandEntry = {
+  demandId: string;
+  customer: string | null;
+  qtyConsumed: number;
+};
+
+/** Enriched supply row for the Plan Supply View table (supply metadata + pegging aggregates). */
+export type PlanSupplyViewRow = CaseSupplyRow & {
+  consumedQty: number;
+  residualQty: number;
+  utilizationRate: number | null;
+  peggedDemandCount: number;
+  totalPeggedQty: number;
+  peggedDemands: PeggedDemandEntry[];
+};
+
+/** Fetch all supply records for a case (flat table scan, no run context needed). */
+export async function getCaseSupplies(caseId: number): Promise<CaseSupplyRow[]> {
+  const r = await fetch(`${API}/cases/${caseId}/supplies`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
 // ── Material Events ────────────────────────────────────────────────────────────
 
 export type MaterialEvent = {
@@ -750,6 +789,86 @@ export async function analyzeMaterialImpact(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ supplyId, deliveryDelayDays, quantityDecreasePct }),
   });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// ── Material Impact Assessment ─────────────────────────────────────────────────
+
+export type AssessmentSummary = {
+  id: number;
+  supplyId: string;
+  deliveryDelayDays: number;
+  quantityDecreasePct: number;
+  rating: 'LOW' | 'MEDIUM' | 'HIGH';
+  explanation: string;
+  criteria: string;
+  createdAt: string;
+};
+
+export type AssessmentResponse = {
+  id: number;
+  rating: 'LOW' | 'MEDIUM' | 'HIGH';
+  explanation: string;
+  criteria: string;
+  caseId: number;
+  planRunId: number | null;
+  supply: {
+    supplyId: string;
+    productId: string;
+    qty: number;
+    supplyDate: string | null;
+    locationId: string | null;
+    vendorId: string | null;
+  };
+  impactedDemandCount: number;
+  impacts: MaterialImpactedDemand[];
+  createdAt: string;
+};
+
+/** Get the assessment criteria text stored for a case (null = not set). */
+export async function getAssessmentCriteria(caseId: number): Promise<string | null> {
+  const r = await fetch(`${API}/cases/${caseId}/assessment-criteria`);
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return (data as { criteria: string | null }).criteria ?? null;
+}
+
+/** Persist updated assessment criteria for a case. */
+export async function setAssessmentCriteria(caseId: number, criteria: string): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/assessment-criteria`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ criteria }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+/** List past assessments for a case, optionally filtered by supplyId. */
+export async function listAssessments(caseId: number, supplyId?: string): Promise<AssessmentSummary[]> {
+  const sp = new URLSearchParams();
+  if (supplyId) sp.set('supplyId', supplyId);
+  const q = sp.toString() ? `?${sp}` : '';
+  const r = await fetch(`${API}/cases/${caseId}/material-impact-assessments${q}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+/** Run a new assessment (Mode A): supply change params → impact computation → LLM rating. */
+export async function runAssessment(
+  caseId: number,
+  supplyId: string,
+  deliveryDelayDays: number,
+  quantityDecreasePct: number,
+  planRunId?: number | null,
+): Promise<AssessmentResponse> {
+  const body: Record<string, unknown> = { supplyId, deliveryDelayDays, quantityDecreasePct, caseId };
+  if (planRunId != null) body.planRunId = planRunId;
+  const r = await fetchWithTimeout(
+    `${API}/material-impact-assessment`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
+    120_000,
+  );
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }

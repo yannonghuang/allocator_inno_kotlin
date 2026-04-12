@@ -19,6 +19,8 @@ data class MaterialImpactRequest(
     val supplyId: String,
     val deliveryDelayDays: Int = 0,
     val quantityDecreasePct: Double = 0.0,
+    /** Pin to a specific plan run. Omit (or null) to use the latest successful run. */
+    val planRunId: Int? = null,
 )
 
 @Serializable
@@ -47,6 +49,8 @@ data class MaterialImpactedDemand(
 
 @Serializable
 data class MaterialImpactResponse(
+    val caseId: Int,
+    val planRunId: Int?,
     val supply: MaterialSupplyDetail,
     val deliveryDelayDays: Int,
     val quantityDecreasePct: Double,
@@ -81,6 +85,143 @@ private fun supplyQtyInTree(node: JsonElement, supplyId: String): Double {
         .sumOf { supplyQtyInTree(it, supplyId) }
 }
 
+// ── Core logic (also called by AssessmentRoutes for Mode A) ──────────────────
+
+internal fun computeMaterialImpact(req: MaterialImpactRequest): MaterialImpactResponse = transaction {
+    // 1. Look up supply
+    val supplyRow = Supplies.selectAll()
+        .where { Supplies.supplyId eq req.supplyId }
+        .firstOrNull()
+        ?: throw IllegalArgumentException("Supply '${req.supplyId}' not found")
+
+    val caseId = supplyRow[Supplies.caseId]
+    val productId = supplyRow[Supplies.productId].trim()
+
+    val supply = MaterialSupplyDetail(
+        supplyId = supplyRow[Supplies.supplyId],
+        productId = productId,
+        qty = supplyRow[Supplies.qty],
+        supplyDate = supplyRow[Supplies.supplyDate],
+        locationId = supplyRow[Supplies.locationId],
+        vendorId = supplyRow[Supplies.vendorId],
+    )
+
+    // 2. Resolve plan run — specific if planRunId is set, else latest successful
+    val latestPlanRun = if (req.planRunId != null) {
+        PlanRuns.selectAll()
+            .where { (PlanRuns.id eq req.planRunId) and (PlanRuns.caseId eq caseId) }
+            .firstOrNull()
+    } else {
+        PlanRuns.selectAll()
+            .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
+            .orderBy(PlanRuns.id, SortOrder.DESC)
+            .firstOrNull()
+    }
+
+    if (latestPlanRun == null) {
+        val note = if (req.planRunId != null)
+            "Plan run ${req.planRunId} not found for this case."
+        else
+            "No successful plan run found for this case."
+        return@transaction MaterialImpactResponse(
+            caseId = caseId, planRunId = null,
+            supply = supply,
+            deliveryDelayDays = req.deliveryDelayDays,
+            quantityDecreasePct = req.quantityDecreasePct,
+            impactedDemandCount = 0,
+            impacts = emptyList(),
+            note = note,
+        )
+    }
+
+    val resolvedPlanRunId = latestPlanRun[PlanRuns.id]
+    val resultJson = latestPlanRun[PlanRuns.result]
+        ?: return@transaction MaterialImpactResponse(
+            caseId = caseId, planRunId = resolvedPlanRunId,
+            supply = supply,
+            deliveryDelayDays = req.deliveryDelayDays,
+            quantityDecreasePct = req.quantityDecreasePct,
+            impactedDemandCount = 0,
+            impacts = emptyList(),
+            note = "Plan run has no result data.",
+        )
+
+    // 3. Parse result and walk planning_pegging trees
+    val planResult = Json.parseToJsonElement(resultJson)
+    val pegging = (planResult as? JsonObject)?.get("planning_pegging") as? JsonArray
+        ?: JsonArray(emptyList())
+
+    // demand_id → allocated qty from this supply
+    val demandAllocated = mutableMapOf<String, Double>()
+    for (entry in pegging) {
+        val obj = entry as? JsonObject ?: continue
+        val demandId = obj["demand_id"]?.jsonPrimitive?.contentOrNull?.trim()
+            ?: continue
+        if (demandId.isBlank()) continue
+        val tree = obj["tree"] ?: continue
+        if (treeContainsSupply(tree, req.supplyId)) {
+            val qty = supplyQtyInTree(tree, req.supplyId)
+            demandAllocated[demandId] = (demandAllocated[demandId] ?: 0.0) + qty
+        }
+    }
+
+    if (demandAllocated.isEmpty()) {
+        return@transaction MaterialImpactResponse(
+            caseId = caseId, planRunId = resolvedPlanRunId,
+            supply = supply,
+            deliveryDelayDays = req.deliveryDelayDays,
+            quantityDecreasePct = req.quantityDecreasePct,
+            impactedDemandCount = 0,
+            impacts = emptyList(),
+        )
+    }
+
+    // 4. Fetch demand details
+    val demandRows = Demands.selectAll()
+        .where { (Demands.caseId eq caseId) and (Demands.demandId inList demandAllocated.keys.toList()) }
+        .toList()
+
+    val impactStatus = if (req.deliveryDelayDays > 0) "delayed" else "at_risk"
+
+    val impacts = demandRows.map { d ->
+        val did = d[Demands.demandId]
+        MaterialImpactedDemand(
+            demandId = did,
+            productId = d[Demands.productId],
+            locationId = d[Demands.locationId],
+            customerId = d[Demands.customerId],
+            description = d[Demands.description],
+            priority = d[Demands.priority],
+            requestDueTime = d[Demands.requestDueTime],
+            requestedQty = d[Demands.quantity],
+            consumedSupplyQty = demandAllocated[did] ?: 0.0,
+            status = impactStatus,
+        )
+    }
+
+    log.info(
+        "material-impact result: supplyId={} product={} location={} impactedDemands={}",
+        supply.supplyId, supply.productId, supply.locationId, impacts.size,
+    )
+    impacts.forEach { d ->
+        log.info(
+            "  impacted demand: demandId={} customer={} product={} location={} " +
+            "requestedQty={} consumedSupplyQty={} dueTime={} priority={} status={}",
+            d.demandId, d.customerId, d.productId, d.locationId,
+            d.requestedQty, d.consumedSupplyQty, d.requestDueTime, d.priority, d.status,
+        )
+    }
+
+    MaterialImpactResponse(
+        caseId = caseId, planRunId = resolvedPlanRunId,
+        supply = supply,
+        deliveryDelayDays = req.deliveryDelayDays,
+        quantityDecreasePct = req.quantityDecreasePct,
+        impactedDemandCount = impacts.size,
+        impacts = impacts,
+    )
+}
+
 // ── Route ─────────────────────────────────────────────────────────────────────
 
 /**
@@ -89,9 +230,6 @@ private fun supplyQtyInTree(node: JsonElement, supplyId: String): Double {
  * Given a supply ID and the nature of the change (delay days, quantity decrease),
  * finds all committed demands impacted by that supply using the latest successful
  * planning run for the supply's case.
- *
- * Impact is determined by walking the planning_pegging trees stored in the plan run
- * result and finding demands whose supply tree references this supply's product+location.
  */
 fun Routing.materialImpactRoutes() {
     route("/material-impact") {
@@ -108,128 +246,7 @@ fun Routing.materialImpactRoutes() {
                 "material-impact request: supplyId={} delayDays={} qtyDecreasePct={}",
                 req.supplyId, req.deliveryDelayDays, req.quantityDecreasePct,
             )
-
-            val result = transaction {
-                // 1. Look up supply
-                val supplyRow = Supplies.selectAll()
-                    .where { Supplies.supplyId eq req.supplyId }
-                    .firstOrNull()
-                    ?: throw IllegalArgumentException("Supply '${req.supplyId}' not found")
-
-                val caseId = supplyRow[Supplies.caseId]
-                val productId = supplyRow[Supplies.productId].trim()
-                val locationId = (supplyRow[Supplies.locationId] ?: "").trim()
-
-                val supply = MaterialSupplyDetail(
-                    supplyId = supplyRow[Supplies.supplyId],
-                    productId = productId,
-                    qty = supplyRow[Supplies.qty],
-                    supplyDate = supplyRow[Supplies.supplyDate],
-                    locationId = supplyRow[Supplies.locationId],
-                    vendorId = supplyRow[Supplies.vendorId],
-                )
-
-                // 2. Latest successful plan run for this case
-                val latestPlanRun = PlanRuns.selectAll()
-                    .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
-                    .orderBy(PlanRuns.id, SortOrder.DESC)
-                    .firstOrNull()
-
-                if (latestPlanRun == null) {
-                    return@transaction MaterialImpactResponse(
-                        supply = supply,
-                        deliveryDelayDays = req.deliveryDelayDays,
-                        quantityDecreasePct = req.quantityDecreasePct,
-                        impactedDemandCount = 0,
-                        impacts = emptyList(),
-                        note = "No successful plan run found for this case.",
-                    )
-                }
-
-                val resultJson = latestPlanRun[PlanRuns.result]
-                    ?: return@transaction MaterialImpactResponse(
-                        supply = supply,
-                        deliveryDelayDays = req.deliveryDelayDays,
-                        quantityDecreasePct = req.quantityDecreasePct,
-                        impactedDemandCount = 0,
-                        impacts = emptyList(),
-                        note = "Plan run has no result data.",
-                    )
-
-                // 3. Parse result and walk planning_pegging trees
-                val planResult = Json.parseToJsonElement(resultJson)
-                val pegging = (planResult as? JsonObject)?.get("planning_pegging") as? JsonArray
-                    ?: JsonArray(emptyList())
-
-                // demand_id → allocated qty from this supply
-                val demandAllocated = mutableMapOf<String, Double>()
-                for (entry in pegging) {
-                    val obj = entry as? JsonObject ?: continue
-                    val demandId = obj["demand_id"]?.jsonPrimitive?.contentOrNull?.trim()
-                        ?: continue
-                    if (demandId.isBlank()) continue
-                    val tree = obj["tree"] ?: continue
-                    if (treeContainsSupply(tree, req.supplyId)) {
-                        val qty = supplyQtyInTree(tree, req.supplyId)
-                        demandAllocated[demandId] = (demandAllocated[demandId] ?: 0.0) + qty
-                    }
-                }
-
-                if (demandAllocated.isEmpty()) {
-                    return@transaction MaterialImpactResponse(
-                        supply = supply,
-                        deliveryDelayDays = req.deliveryDelayDays,
-                        quantityDecreasePct = req.quantityDecreasePct,
-                        impactedDemandCount = 0,
-                        impacts = emptyList(),
-                    )
-                }
-
-                // 4. Fetch demand details
-                val demandRows = Demands.selectAll()
-                    .where { (Demands.caseId eq caseId) and (Demands.demandId inList demandAllocated.keys.toList()) }
-                    .toList()
-
-                val impactStatus = if (req.deliveryDelayDays > 0) "delayed" else "at_risk"
-
-                val impacts = demandRows.map { d ->
-                    val did = d[Demands.demandId]
-                    MaterialImpactedDemand(
-                        demandId = did,
-                        productId = d[Demands.productId],
-                        locationId = d[Demands.locationId],
-                        customerId = d[Demands.customerId],
-                        description = d[Demands.description],
-                        priority = d[Demands.priority],
-                        requestDueTime = d[Demands.requestDueTime],
-                        requestedQty = d[Demands.quantity],
-                        consumedSupplyQty = demandAllocated[did] ?: 0.0,
-                        status = impactStatus,
-                    )
-                }
-
-                log.info(
-                    "material-impact result: supplyId={} product={} location={} impactedDemands={}",
-                    supply.supplyId, supply.productId, supply.locationId, impacts.size,
-                )
-                impacts.forEach { d ->
-                    log.info(
-                        "  impacted demand: demandId={} customer={} product={} location={} " +
-                        "requestedQty={} consumedSupplyQty={} dueTime={} priority={} status={}",
-                        d.demandId, d.customerId, d.productId, d.locationId,
-                        d.requestedQty, d.consumedSupplyQty, d.requestDueTime, d.priority, d.status,
-                    )
-                }
-
-                MaterialImpactResponse(
-                    supply = supply,
-                    deliveryDelayDays = req.deliveryDelayDays,
-                    quantityDecreasePct = req.quantityDecreasePct,
-                    impactedDemandCount = impacts.size,
-                    impacts = impacts,
-                )
-            }
-            call.respond(result)
+            call.respond(computeMaterialImpact(req))
         }
     }
 }

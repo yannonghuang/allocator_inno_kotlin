@@ -59,6 +59,16 @@ import {
   updateMaterialEvent,
   deleteMaterialEvent,
   analyzeMaterialImpact,
+  type CaseSupplyRow,
+  type PeggedDemandEntry,
+  type PlanSupplyViewRow,
+  getCaseSupplies,
+  type AssessmentSummary,
+  type AssessmentResponse,
+  getAssessmentCriteria,
+  setAssessmentCriteria,
+  listAssessments,
+  runAssessment,
 } from '@/lib/api';
 
 type SupplySuggestion = {
@@ -236,6 +246,22 @@ function PlanKpiDashboard({
 
 import { SortFilterTable } from '@/app/components/SortFilterTable';
 
+/** Extract a human-readable message from an API error.
+ *  The backend often returns JSON bodies like {"detail":"..."} or {"error":"..."}.
+ *  If the raw string is valid JSON with one of those fields, return that field's value;
+ *  otherwise return the raw string as-is. */
+function parseApiError(raw: unknown): string {
+  const s = raw instanceof Error ? raw.message : String(raw ?? 'Unknown error');
+  try {
+    const parsed = JSON.parse(s);
+    if (typeof parsed === 'object' && parsed !== null) {
+      const msg = parsed.detail ?? parsed.message ?? parsed.error;
+      if (typeof msg === 'string') return msg;
+    }
+  } catch { /* not JSON */ }
+  return s;
+}
+
 // ── Commit-reason formatting ───────────────────────────────────────────────────
 
 /** Parse a nested child_failed chain: "child_failed:PROD@LOC(reason)" recursively. */
@@ -289,6 +315,38 @@ function formatCommitReason(reason: string, purchaseAllowed: boolean): { label: 
 import { PeggingTree, pathKeyFromPath, type PeggingGraph } from '@/app/components/PeggingTree';
 import BomGraphTab from '@/app/components/BomGraphTab';
 
+// ── Assessment criteria helpers ────────────────────────────────────────────────
+const CRITERIA_HEADERS = {
+  high: 'the following are criteria for HIGH rating:',
+  low: 'the following are criteria for LOW rating:',
+  medium: 'the following are criteria for MEDIUM rating:',
+} as const;
+
+function parseCriteriaParts(text: string): { high: string; low: string; medium: string } {
+  const result: Record<string, string[]> = { high: [], low: [], medium: [] };
+  let current: string | null = null;
+  for (const line of text.split('\n')) {
+    const trimmed = line.trimStart().toLowerCase();
+    if (trimmed.startsWith('the following are criteria for high')) { current = 'high'; continue; }
+    if (trimmed.startsWith('the following are criteria for low')) { current = 'low'; continue; }
+    if (trimmed.startsWith('the following are criteria for medium')) { current = 'medium'; continue; }
+    if (current) result[current].push(line);
+  }
+  return {
+    high: result.high.join('\n').trim(),
+    low: result.low.join('\n').trim(),
+    medium: result.medium.join('\n').trim(),
+  };
+}
+
+function buildCriteriaText(high: string, low: string, medium: string): string {
+  const parts: string[] = [];
+  if (high.trim()) { parts.push(CRITERIA_HEADERS.high); parts.push(high.trim()); }
+  if (low.trim()) { parts.push(CRITERIA_HEADERS.low); parts.push(low.trim()); }
+  if (medium.trim()) { parts.push(CRITERIA_HEADERS.medium); parts.push(medium.trim()); }
+  return parts.join('\n');
+}
+
 export default function CaseDetail() {
   const tNav = useTranslations('nav');
   const tSec = useTranslations('sections');
@@ -341,6 +399,12 @@ export default function CaseDetail() {
   const [materialEventsLoading, setMaterialEventsLoading] = useState(false);
   const [materialImpacts, setMaterialImpacts] = useState<Record<number, MaterialImpactResult | null>>({});
   const [materialImpactLoading, setMaterialImpactLoading] = useState<Record<number, boolean>>({});
+  const [materialAssessments, setMaterialAssessments] = useState<Record<number, AssessmentResponse | null>>({});
+  const [materialAssessmentLoading, setMaterialAssessmentLoading] = useState<Record<number, boolean>>({});
+  const [materialAssessmentError, setMaterialAssessmentError] = useState<Record<number, string | null>>({});
+  const [materialAssessmentHistory, setMaterialAssessmentHistory] = useState<Record<number, AssessmentSummary[]>>({});
+  const [materialAssessmentHistoryOpen, setMaterialAssessmentHistoryOpen] = useState<Record<number, boolean>>({});
+  const [materialEventCollapsed, setMaterialEventCollapsed] = useState<Record<number, boolean>>({});
   const [materialEventEditing, setMaterialEventEditing] = useState<Record<number, { supplyId: string; delayDays: number; qtyDecreasePct: number; note: string }>>({});
   const [materialEventSaving, setMaterialEventSaving] = useState<Record<number, boolean>>({});
   // New event form state (-1 = "new" sentinel)
@@ -359,19 +423,52 @@ export default function CaseDetail() {
   const [planLoading, setPlanLoading] = useState(false);
   const [planError, setPlanError] = useState<string | null>(null);
   const [planPeggingOpen, setPlanPeggingOpen] = useState(false);
-  const [planPeggingContext, setPlanPeggingContext] = useState<{ type: 'demand'; row: CommittedDemand } | { type: 'work_order'; row: WorkOrder } | null>(null);
+  const [planPeggingContext, setPlanPeggingContext] = useState<
+    | { type: 'demand'; row: CommittedDemand }
+    | { type: 'work_order'; row: WorkOrder }
+    | { type: 'supply'; supplyId: string; peggedDemands: PeggedDemandEntry[]; initialQty: number; consumedQty: number }
+    | null
+  >(null);
   const [planPeggingExpanded, setPlanPeggingExpanded] = useState<Set<string>>(new Set(['0']));
   const [planExplanationExpanded, setPlanExplanationExpanded] = useState<Set<string>>(new Set());
   const [planPeggingPanelWidth, setPlanPeggingPanelWidth] = useState(420);
   const [planWorkOrderPeggingCache, setPlanWorkOrderPeggingCache] = useState<Record<string, PlanningPeggingNode>>({});
   // Active demand for WO pegging panel; null = use the row's own demand_id (default)
   const [woPeggingActiveDemandId, setWoPeggingActiveDemandId] = useState<string | null>(null);
+  // When drilling from supply pegging panel into a demand tree, remembers the supply context for the back link.
+  const [previousPeggingContext, setPreviousPeggingContext] = useState<{
+    type: 'supply'; supplyId: string; peggedDemands: PeggedDemandEntry[]; initialQty: number; consumedQty: number;
+  } | null>(null);
   const [planWorkOrderPeggingLoading, setPlanWorkOrderPeggingLoading] = useState<string | null>(null);
   const [planWorkOrderPeggingError, setPlanWorkOrderPeggingError] = useState<string | null>(null);
   const planPeggingResizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [planPeggingResizing, setPlanPeggingResizing] = useState(false);
-  const [planResultTab, setPlanResultTab] = useState<'demands' | 'work_orders'>('demands');
+  const [planResultTab, setPlanResultTab] = useState<'demands' | 'work_orders' | 'supplies'>('demands');
+  // ID of the plan run currently loaded in planResult; null = freshly-run (not from history)
+  const [currentPlanRunId, setCurrentPlanRunId] = useState<number | null>(null);
+  const [caseSupplies, setCaseSupplies] = useState<CaseSupplyRow[]>([]);
+  const [caseSuppliesLoading, setCaseSuppliesLoading] = useState(false);
+  const [caseSuppliesError, setCaseSuppliesError] = useState<string | null>(null);
+  const [planSupplyTextFilter, setPlanSupplyTextFilter] = useState('');
+  const [planSupplyUnusedOnly, setPlanSupplyUnusedOnly] = useState(false);
+  const [planSupplyPartialOnly, setPlanSupplyPartialOnly] = useState(false);
+  const [planSupplyHideDummy, setPlanSupplyHideDummy] = useState(true);
   const [planWorkOrderHideDummyProdArea, setPlanWorkOrderHideDummyProdArea] = useState(true);
+  // ── Assessment state ────────────────────────────────────────────────────────
+  const [assessCriteria, setAssessCriteria] = useState('');
+  const [assessCriteriaHigh, setAssessCriteriaHigh] = useState('');
+  const [assessCriteriaLow, setAssessCriteriaLow] = useState('');
+  const [assessCriteriaMedium, setAssessCriteriaMedium] = useState('');
+  const [assessCriteriaOpen, setAssessCriteriaOpen] = useState(false);
+  const [assessCriteriaSaving, setAssessCriteriaSaving] = useState(false);
+  const [assessCriteriaLoaded, setAssessCriteriaLoaded] = useState(false);
+  const [assessmentRunning, setAssessmentRunning] = useState(false);
+  const [assessmentResult, setAssessmentResult] = useState<AssessmentResponse | null>(null);
+  const [assessmentHistory, setAssessmentHistory] = useState<AssessmentSummary[]>([]);
+  const [assessmentHistoryOpen, setAssessmentHistoryOpen] = useState(false);
+  const [assessDelayDays, setAssessDelayDays] = useState(0);
+  const [assessQtyDecreasePct, setAssessQtyDecreasePct] = useState(0);
+  const [assessError, setAssessError] = useState<string | null>(null);
   const [planDemandRealMakeOnly, setPlanDemandRealMakeOnly] = useState(false);
   const [planDemandShortOnly, setPlanDemandShortOnly] = useState(false);
   const [planDemandBuyOnly, setPlanDemandBuyOnly] = useState(false);
@@ -442,6 +539,7 @@ export default function CaseDetail() {
   function parseCopilotIntent(message: string, currentConfig: PlanningConfig): { reply: string; configUpdate?: PlanningConfig } {
     const t = message.trim().toLowerCase();
     const vs = currentConfig.variant_selection ?? {};
+    const ms = currentConfig.method_selection ?? {};
     const cs = currentConfig.consolidation ?? {};
     const multi = vs.multiple;
 
@@ -449,11 +547,12 @@ export default function CaseDetail() {
 
     if (/show|current|what('s| is)? (my )?config|settings|config/.test(t)) {
       const variantMode = multi === false ? 'single best variant' : 'all feasible variants (equal split)';
+      const methodMode = ms.multiple === true ? 'equal split across methods' : ms.elaborate === true ? 'one by score (elaborate)' : 'one by preference (cascade — tries preferred first, falls back to next if children fail)';
       const purchaseMode = currentConfig.purchase_allowed === false ? 'disabled' : 'allowed';
       const consolidationMode = cs.enabled
         ? `on · ${cs.period_days ?? 7}d bucket · ${cs.allocation_mode === 'proportional' ? 'proportional' : 'priority-first'} split`
         : 'off';
-      return { reply: `Variant selection: **${variantMode}**. Purchase: **${purchaseMode}**. Consolidation: **${consolidationMode}**.` };
+      return { reply: `Variant selection: **${variantMode}**. Method selection: **${methodMode}**. Purchase: **${purchaseMode}**. Consolidation: **${consolidationMode}**.` };
     }
 
     if (/single|one variant|only one|best variant|use one/.test(t)) {
@@ -467,6 +566,27 @@ export default function CaseDetail() {
       return {
         reply: 'Set variant selection to **all feasible variants** with equal split. Demand will be divided among all feasible BOM/variants. Re-run plan to apply.',
         configUpdate: { variant_selection: { ...vs, multiple: true } },
+      };
+    }
+
+    if (/equal.?split.?method|split.?method.?equal|split across method|multiple method|use all method/.test(t)) {
+      return {
+        reply: 'Set method selection to **equal split across methods**. When multiple make/move/buy methods can fulfill a demand, quantity is divided equally among them. Re-run plan to apply.',
+        configUpdate: { method_selection: { ...ms, multiple: true, elaborate: false } },
+      };
+    }
+
+    if (/elaborate method|simulate method|score method|method by score/.test(t)) {
+      return {
+        reply: 'Set method selection to **elaborate (score by simulation)**. The planner simulates each method\'s child materials and picks the one with earliest commit, most inventory consumed, and least purchase. Slower. Re-run plan to apply.',
+        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false } },
+      };
+    }
+
+    if (/by preference|prefer method|cascade method|preferred method|one by preference/.test(t)) {
+      return {
+        reply: 'Set method selection to **by preference (cascade)**. The planner tries the most preferred method first; if its child materials cannot be planned, it falls back to the next preferred method. Re-run plan to apply.',
+        configUpdate: { method_selection: { ...ms, multiple: false, elaborate: false } },
       };
     }
 
@@ -524,13 +644,13 @@ export default function CaseDetail() {
 
     if (/reset|default|clear/.test(t)) {
       return {
-        reply: 'Reset to defaults: all feasible variants (equal split), purchase allowed, consolidation off. Re-run plan to apply.',
-        configUpdate: { variant_selection: { multiple: true }, purchase_allowed: true, consolidation: { enabled: false } },
+        reply: 'Reset to defaults: all feasible variants (equal split), by preference (cascade) method selection, purchase allowed, consolidation off. Re-run plan to apply.',
+        configUpdate: { variant_selection: { multiple: true }, method_selection: { multiple: false, elaborate: false }, purchase_allowed: true, consolidation: { enabled: false } },
       };
     }
 
     return {
-      reply: 'I handle variant selection, method selection, purchase, and shared-component consolidation. Try: "no purchase", "allow purchase", "enable consolidation", "set 14 day bucket", "proportional split", "use single variant", or "show config".',
+      reply: 'I handle variant selection, method selection, purchase, and shared-component consolidation. Try: "single best variant", "all variants", "by preference", "elaborate method", "equal split methods", "no purchase", "allow purchase", "enable consolidation", "set 14 day bucket", "proportional split", or "show config".',
     };
   }
 
@@ -546,6 +666,7 @@ export default function CaseDetail() {
         if (st.progress) setPlanProgress(st.progress);
         if (st.status === 'completed' && st.result) {
           setPlanResult(st.result);
+          setCurrentPlanRunId(null);
           setPlanWorkOrderPeggingCache({});
           setPlanJobId(null);
           setPlanLoading(false);
@@ -581,6 +702,22 @@ export default function CaseDetail() {
     };
   }, [planJobId, id]);
 
+  // Load case supplies once we have a plan result (fetched once; cleared when planResult is cleared).
+  useEffect(() => {
+    if (!planResult || !id) {
+      setCaseSupplies([]);
+      setCaseSuppliesError(null);
+      return;
+    }
+    let cancelled = false;
+    setCaseSuppliesLoading(true);
+    getCaseSupplies(id)
+      .then((rows) => { if (!cancelled) setCaseSupplies(rows); })
+      .catch((e) => { if (!cancelled) setCaseSuppliesError(parseApiError(e)); })
+      .finally(() => { if (!cancelled) setCaseSuppliesLoading(false); });
+    return () => { cancelled = true; };
+  }, [id, planResult]);
+
   // Load real BOM pairs and real move triples once we have a plan result.
   useEffect(() => {
     if (!planResult || !planResult.committed_demands.length || !id) {
@@ -611,6 +748,33 @@ export default function CaseDetail() {
   useEffect(() => {
     setWoPeggingActiveDemandId(null);
   }, [planPeggingContext]);
+
+  // Reset assessment result/history when a different supply is opened in the pegging panel
+  const currentPeggingSupplyId = planPeggingContext?.type === 'supply' ? planPeggingContext.supplyId : null;
+  useEffect(() => {
+    if (currentPeggingSupplyId) {
+      setAssessmentResult(null);
+      setAssessmentHistory([]);
+      setAssessmentHistoryOpen(false);
+      setAssessError(null);
+    }
+  }, [currentPeggingSupplyId]);
+
+  // Load assessment criteria lazily when the editor is opened for the first time
+  useEffect(() => {
+    if (!assessCriteriaOpen || assessCriteriaLoaded || !id) return;
+    getAssessmentCriteria(id)
+      .then((c) => {
+        const val = c ?? '';
+        setAssessCriteria(val);
+        const parts = parseCriteriaParts(val);
+        setAssessCriteriaHigh(parts.high);
+        setAssessCriteriaLow(parts.low);
+        setAssessCriteriaMedium(parts.medium);
+        setAssessCriteriaLoaded(true);
+      })
+      .catch(() => setAssessCriteriaLoaded(true));
+  }, [assessCriteriaOpen, assessCriteriaLoaded, id]);
 
   // Fetch work-order pegging on demand when slide-in opens for a WO.
   // For consolidated WOs (demand_id=null) the pegging tree is always the shared/merged one;
@@ -643,13 +807,13 @@ export default function CaseDetail() {
     setPlanWorkOrderPeggingError(null);
     setPlanWorkOrderPeggingLoading(woPeggingKey);
     if (typeof console !== 'undefined' && console.log) console.log('[WO pegging] Fetching', { caseId: id, demand_id, product_id, location_id, method });
-    getWorkOrderPegging(Number(id), { demand_id, product_id, location_id, method })
+    getWorkOrderPegging(Number(id), { demand_id, product_id, location_id, method, ...(currentPlanRunId != null ? { run_id: currentPlanRunId } : {}) })
       .then((res) => {
         if (typeof console !== 'undefined' && console.log) console.log('[WO pegging] Loaded tree for', woPeggingKey);
         setPlanWorkOrderPeggingCache((prev) => ({ ...prev, [woPeggingKey]: res.tree }));
       })
       .catch((err) => {
-        const message = err?.message ?? 'Failed to load work-order pegging';
+        const message = parseApiError(err);
         if (typeof console !== 'undefined' && console.error) console.error('[WO pegging] Error', message, err);
         setPlanWorkOrderPeggingError(message);
       })
@@ -810,6 +974,7 @@ export default function CaseDetail() {
       const full = await getPlanRun(id, latest.id);
       if (full.result) {
         setPlanResult(full.result as typeof planResult);
+        setCurrentPlanRunId(latest.id);
         setPlanWorkOrderPeggingCache({});
       }
     } catch {
@@ -1169,12 +1334,82 @@ export default function CaseDetail() {
       }
     }
     for (const entry of planResult?.planning_pegging ?? []) {
-      visit(entry.tree, entry.demand_id);
+      visit(entry.tree, entry.demand_id ?? '');
     }
     const map = new Map<string, number>();
     order.forEach((k, i) => { if (!map.has(k)) map.set(k, i); });
     return map;
   }, [planResult]);
+
+  /**
+   * Invert demand-centric planning_pegging trees into a supply-centric map.
+   * Key: supply_id. Value: { totalPeggedQty, demands[] }
+   * Consolidated synthetic IDs (consolidated_*) are keyed but won't match any CaseSupplyRow.
+   */
+  const supplyPeggingMap = useMemo(() => {
+    const map = new Map<string, { totalPeggedQty: number; demands: PeggedDemandEntry[] }>();
+    if (!planResult?.planning_pegging) return map;
+
+    const demandCustomerMap = new Map<string, string | null>();
+    for (const d of planResult.committed_demands ?? []) {
+      if (d.demand_id) demandCustomerMap.set(d.demand_id, d.customer ?? null);
+    }
+
+    // activeDemandId: the demand currently in scope as we descend the tree.
+    // For non-consolidated entries it's the entry-level demand_id throughout.
+    // For consolidated entries (entry demand_id = null), demand-type nodes inside
+    // the tree carry their own demand_id — we pick it up as we descend.
+    function walk(node: PlanningPeggingNode, activeDemandId: string | null) {
+      // When we step into a demand node, switch to its own demand_id.
+      const effectiveDemandId =
+        node.type === 'demand' && node.demand_id ? node.demand_id : activeDemandId;
+
+      if (node.type === 'supply' && node.supply_id && effectiveDemandId) {
+        const sid = node.supply_id;
+        const qty = Number(node.quantity ?? 0);
+        const existing = map.get(sid);
+        if (existing) {
+          const existingForDemand = existing.demands.find((d) => d.demandId === effectiveDemandId);
+          if (existingForDemand) {
+            existingForDemand.qtyConsumed += qty;
+          } else {
+            existing.demands.push({ demandId: effectiveDemandId, customer: demandCustomerMap.get(effectiveDemandId) ?? null, qtyConsumed: qty });
+          }
+          existing.totalPeggedQty += qty;
+        } else {
+          map.set(sid, {
+            totalPeggedQty: qty,
+            demands: [{ demandId: effectiveDemandId, customer: demandCustomerMap.get(effectiveDemandId) ?? null, qtyConsumed: qty }],
+          });
+        }
+      }
+      for (const child of node.children ?? []) walk(child, effectiveDemandId);
+    }
+
+    for (const entry of planResult.planning_pegging) {
+      walk(entry.tree, entry.demand_id ?? null);
+    }
+    return map;
+  }, [planResult]);
+
+  /** Join caseSupplies rows with supplyPeggingMap to produce the enriched supply view. */
+  const planSupplyViewRows = useMemo((): PlanSupplyViewRow[] => {
+    return caseSupplies.map((s) => {
+      const pegging = supplyPeggingMap.get(s.supplyId);
+      const consumedQty = pegging?.totalPeggedQty ?? 0;
+      const residualQty = Math.max(0, s.qty - consumedQty);
+      const utilizationRate = s.qty > 0 ? consumedQty / s.qty : null;
+      return {
+        ...s,
+        consumedQty,
+        residualQty,
+        utilizationRate,
+        peggedDemandCount: pegging?.demands.length ?? 0,
+        totalPeggedQty: pegging?.totalPeggedQty ?? 0,
+        peggedDemands: pegging?.demands ?? [],
+      };
+    });
+  }, [caseSupplies, supplyPeggingMap]);
 
   const handleAllocate = async () => {
     setAllocating(true);
@@ -1374,6 +1609,7 @@ export default function CaseDetail() {
       const full = await getPlanRun(id, runId);
       if (full.result) {
         setPlanResult(full.result as typeof planResult);
+        setCurrentPlanRunId(runId);
         setPlanWorkOrderPeggingCache({});
         setPlanRunHistoryOpen(false);
       }
@@ -1466,6 +1702,53 @@ export default function CaseDetail() {
       setOverrideDialogError(e instanceof Error ? e.message : 'Failed to save override');
     } finally {
       setOverrideDialogSaving(false);
+    }
+  };
+
+  // ── Assessment handlers ─────────────────────────────────────────────────────
+
+  const handleAssess = async () => {
+    if (!planPeggingContext || planPeggingContext.type !== 'supply') return;
+    setAssessmentRunning(true);
+    setAssessError(null);
+    try {
+      const result = await runAssessment(
+        id,
+        planPeggingContext.supplyId,
+        assessDelayDays,
+        assessQtyDecreasePct,
+        currentPlanRunId,
+      );
+      setAssessmentResult(result);
+      const hist = await listAssessments(id, planPeggingContext.supplyId);
+      setAssessmentHistory(hist);
+      setAssessmentHistoryOpen(true);
+    } catch (e) {
+      setAssessError(e instanceof Error ? e.message : 'Assessment failed');
+    } finally {
+      setAssessmentRunning(false);
+    }
+  };
+
+  const handleLoadHistory = async () => {
+    if (!planPeggingContext || planPeggingContext.type !== 'supply') return;
+    if (!assessmentHistoryOpen) {
+      try {
+        const hist = await listAssessments(id, planPeggingContext.supplyId);
+        setAssessmentHistory(hist);
+      } catch (_) { /* best-effort */ }
+    }
+    setAssessmentHistoryOpen((o) => !o);
+  };
+
+  const handleSaveCriteria = async () => {
+    setAssessCriteriaSaving(true);
+    try {
+      const combined = buildCriteriaText(assessCriteriaHigh, assessCriteriaLow, assessCriteriaMedium);
+      await setAssessmentCriteria(id, combined);
+      setAssessCriteria(combined);
+    } catch (_) { /* TODO: surface error */ } finally {
+      setAssessCriteriaSaving(false);
     }
   };
 
@@ -2187,6 +2470,17 @@ export default function CaseDetail() {
           <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem', cursor: 'pointer' }}>
             <input
               type="checkbox"
+              checked={planningConfig.variant_selection?.multiple === false}
+              onChange={(e) => setPlanningConfig((c) => ({
+                ...c,
+                variant_selection: { ...c.variant_selection, multiple: e.target.checked ? false : undefined },
+              }))}
+            />
+            <span>{tP('config.singleBestVariant')}</span>
+          </label>
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
               checked={planningConfig.method_selection?.multiple === true}
               onChange={(e) => setPlanningConfig((c) => ({
                 ...c,
@@ -2341,6 +2635,13 @@ export default function CaseDetail() {
                 onClick={() => setPlanResultTab('work_orders')}
               >
                 {tP('tabs.workOrders')}
+              </button>
+              <button
+                type="button"
+                className={planResultTab === 'supplies' ? '' : 'secondary'}
+                onClick={() => setPlanResultTab('supplies')}
+              >
+                {tP('tabs.supplies', { count: planSupplyViewRows.length.toLocaleString() })}
               </button>
             </div>
             <div style={{ border: '1px solid #3d3d40', borderRadius: 6 }}>
@@ -2628,8 +2929,8 @@ export default function CaseDetail() {
                                   className="secondary"
                                   style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
                                   onClick={() => {
-                                    if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); }
-                                    else { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); }
+                                    if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); }
+                                    else { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); }
                                   }}
                                 >Show</button>
                               );
@@ -2644,15 +2945,7 @@ export default function CaseDetail() {
               {planResultTab === 'work_orders' && (
                 <div style={{ padding: '0.75rem 1rem' }}>
                   <h4 style={{ marginTop: 0, marginBottom: '0.5rem' }}>{tP('workOrders.heading')}</h4>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
-                      <input
-                        type="checkbox"
-                        checked={planWorkOrderHideDummyProdArea}
-                        onChange={(e) => setPlanWorkOrderHideDummyProdArea(e.target.checked)}
-                      />
-                      <span>{tP('workOrders.hideDummy')}</span>
-                    </label>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.25rem' }}>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
                         type="checkbox"
@@ -2724,6 +3017,17 @@ export default function CaseDetail() {
                         onChange={(e) => setPlanWoHasOverride(e.target.checked)}
                       />
                       <span>{tP('workOrders.filterHasOverride')}</span>
+                    </label>
+                  </div>
+                  <div style={{ marginTop: '0.2rem', marginBottom: '0.4rem' }}>
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.72rem', color: '#71717a', cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={planWorkOrderHideDummyProdArea}
+                        onChange={(e) => setPlanWorkOrderHideDummyProdArea(e.target.checked)}
+                        style={{ accentColor: '#71717a' }}
+                      />
+                      <span>{tP('workOrders.hideDummy')}</span>
                     </label>
                   </div>
                   {planResult.work_orders.length > 0 && (() => {
@@ -2909,8 +3213,8 @@ export default function CaseDetail() {
                             style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
                             onClick={(e) => {
                               e.stopPropagation();
-                              if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); }
-                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); }
+                              if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); }
+                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); }
                             }}
                           >Show</button>
                         );
@@ -2952,6 +3256,177 @@ export default function CaseDetail() {
                   })()}
                 </div>
               )}
+              {planResultTab === 'supplies' && (
+                <div style={{ padding: '0.75rem 1rem' }}>
+                  <h4 style={{ marginTop: 0, marginBottom: '0.5rem' }}>{tP('supplyView.heading')}</h4>
+                  {/* Filter controls */}
+                  <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
+                    <div style={{ position: 'relative' }}>
+                      <input
+                        type="text"
+                        value={planSupplyTextFilter}
+                        onChange={(e) => setPlanSupplyTextFilter(e.target.value)}
+                        placeholder={tP('supplyView.filterPlaceholder')}
+                        style={{ fontSize: '0.8rem', padding: '0.2rem 0.4rem', paddingRight: planSupplyTextFilter ? '1.4rem' : '0.4rem', borderRadius: 4, border: `1px solid ${planSupplyTextFilter ? '#3b82f6' : '#52525b'}`, background: '#27272a', color: '#e4e4e7', width: 280 }}
+                      />
+                      {planSupplyTextFilter && (
+                        <button onClick={() => setPlanSupplyTextFilter('')} style={{ position: 'absolute', right: 4, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '0.85rem', padding: 0, lineHeight: 1 }}>✕</button>
+                      )}
+                    </div>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input type="checkbox" checked={planSupplyUnusedOnly} onChange={(e) => { setPlanSupplyUnusedOnly(e.target.checked); if (e.target.checked) setPlanSupplyPartialOnly(false); }} />
+                      <span>{tP('supplyView.filterUnusedOnly')}</span>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input type="checkbox" checked={planSupplyPartialOnly} onChange={(e) => { setPlanSupplyPartialOnly(e.target.checked); if (e.target.checked) setPlanSupplyUnusedOnly(false); }} />
+                      <span>{tP('supplyView.filterPartialOnly')}</span>
+                    </label>
+                  </div>
+                  <div style={{ marginTop: '0.2rem', marginBottom: '0.4rem' }}>
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.72rem', color: '#71717a', cursor: 'pointer' }}>
+                      <input type="checkbox" checked={planSupplyHideDummy} onChange={(e) => setPlanSupplyHideDummy(e.target.checked)} style={{ accentColor: '#71717a' }} />
+                      <span>{tP('supplyView.filterHideDummy')}</span>
+                    </label>
+                  </div>
+                  {/* Assessment criteria editor */}
+                  <div style={{ marginBottom: '0.75rem', borderTop: '1px solid #3d3d40', paddingTop: '0.5rem' }}>
+                    <button
+                      type="button"
+                      onClick={() => setAssessCriteriaOpen((o) => !o)}
+                      style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '0.75rem', padding: 0 }}
+                    >
+                      {assessCriteriaOpen ? '▾' : '▸'} {tP('assessment.criteria')}
+                    </button>
+                    {assessCriteriaOpen && (
+                      <div style={{ marginTop: '0.5rem' }}>
+                        {(['high', 'low', 'medium'] as const).map((tier) => {
+                          const tierColor = tier === 'high' ? '#f87171' : tier === 'low' ? '#34d399' : '#fbbf24';
+                          const tierBg = tier === 'high' ? 'rgba(248,113,113,0.12)' : tier === 'low' ? 'rgba(52,211,153,0.12)' : 'rgba(251,191,36,0.12)';
+                          const tierBorder = tier === 'high' ? 'rgba(248,113,113,0.35)' : tier === 'low' ? 'rgba(52,211,153,0.35)' : 'rgba(251,191,36,0.35)';
+                          const tierValue = tier === 'high' ? assessCriteriaHigh : tier === 'low' ? assessCriteriaLow : assessCriteriaMedium;
+                          const tierSetter = tier === 'high' ? setAssessCriteriaHigh : tier === 'low' ? setAssessCriteriaLow : setAssessCriteriaMedium;
+                          return (
+                            <div key={tier} style={{ marginBottom: '0.6rem' }}>
+                              <p style={{ fontSize: '0.75rem', margin: '0 0 3px', color: '#a1a1aa' }}>
+                                The following are criteria for{' '}
+                                <span style={{ padding: '1px 7px', borderRadius: 10, background: tierBg, color: tierColor, border: `1px solid ${tierColor}`, fontWeight: 700, fontSize: '0.72rem' }}>
+                                  {tier.toUpperCase()}
+                                </span>
+                                {' '}rating:
+                              </p>
+                              <textarea
+                                value={tierValue}
+                                onChange={(e) => tierSetter(e.target.value)}
+                                rows={2}
+                                placeholder={`Describe what makes an impact ${tier.toUpperCase()}…`}
+                                style={{ width: '100%', fontSize: '0.8rem', background: '#27272a', color: '#e4e4e7', border: `1px solid ${tierBorder}`, borderRadius: 4, padding: '0.4rem', resize: 'vertical', boxSizing: 'border-box' }}
+                              />
+                            </div>
+                          );
+                        })}
+                        <div style={{ display: 'flex', gap: 8, marginTop: '0.4rem' }}>
+                          <button
+                            type="button"
+                            onClick={handleSaveCriteria}
+                            disabled={assessCriteriaSaving || buildCriteriaText(assessCriteriaHigh, assessCriteriaLow, assessCriteriaMedium) === assessCriteria}
+                            style={{ fontSize: '0.8rem' }}
+                          >
+                            {assessCriteriaSaving ? tP('assessment.criteriaSaving') : tP('assessment.criteriaSave')}
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary"
+                            onClick={() => {
+                              const parts = parseCriteriaParts(assessCriteria);
+                              setAssessCriteriaHigh(parts.high);
+                              setAssessCriteriaLow(parts.low);
+                              setAssessCriteriaMedium(parts.medium);
+                              setAssessCriteriaOpen(false);
+                            }}
+                            style={{ fontSize: '0.8rem' }}
+                          >
+                            {tP('assessment.criteriaCancel')}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  {caseSuppliesLoading && <p style={{ color: '#a1a1aa', fontSize: '0.85rem' }}>{tP('supplyView.loading')}</p>}
+                  {caseSuppliesError && <p style={{ color: '#f87171', fontSize: '0.85rem' }}>{caseSuppliesError}</p>}
+                  {!caseSuppliesLoading && !caseSuppliesError && (() => {
+                    const q = planSupplyTextFilter.trim().toLowerCase();
+                    let rows = planSupplyViewRows;
+                    if (planSupplyHideDummy) rows = rows.filter((r) => !r.supplyId.toLowerCase().endsWith('_dummy'));
+                    if (q) rows = rows.filter((r) => r.supplyId.toLowerCase().includes(q) || r.productId.toLowerCase().includes(q) || (r.locationId ?? '').toLowerCase().includes(q));
+                    if (planSupplyUnusedOnly) rows = rows.filter((r) => r.peggedDemandCount === 0);
+                    if (planSupplyPartialOnly) rows = rows.filter((r) => r.residualQty > 0 && r.consumedQty > 0);
+
+                    const totalInitial = planSupplyViewRows.reduce((s, r) => s + r.qty, 0);
+                    const totalConsumed = planSupplyViewRows.reduce((s, r) => s + r.consumedQty, 0);
+                    const overallUtil = totalInitial > 0 ? ((totalConsumed / totalInitial) * 100).toFixed(1) : null;
+
+                    return (
+                      <>
+                        <p style={{ fontSize: '0.8rem', color: '#a1a1aa', marginBottom: '0.5rem', marginTop: 0 }}>
+                          {tP('supplyView.showing', { shown: rows.length.toLocaleString(), total: planSupplyViewRows.length.toLocaleString() })}
+                          {overallUtil != null && (
+                            <span> {tP('supplyView.overallUtilization', { pct: overallUtil, consumed: Number(totalConsumed).toLocaleString(), initial: Number(totalInitial).toLocaleString() })}</span>
+                          )}
+                        </p>
+                        <SortFilterTable<PlanSupplyViewRow & { _key: string }>
+                          idKey="_key"
+                          rows={rows.map((r, i) => ({ ...r, _key: `psv-${i}-${r.supplyId}` }))}
+                          filterKeys={[]}
+                          defaultSortKey="supplyDate"
+                          columns={[
+                            { key: 'supplyId', label: tP('supplyView.columns.supplyId'), sortable: true },
+                            { key: 'productId', label: tP('supplyView.columns.product'), sortable: true },
+                            { key: 'locationId', label: tP('supplyView.columns.location'), sortable: true, render: (r) => r.locationId ?? '–' },
+                            { key: 'vendorId', label: tP('supplyView.columns.vendor'), sortable: true, render: (r) => r.vendorId ?? '–' },
+                            { key: 'supplyDate', label: tP('supplyView.columns.supplyDate'), sortable: true, render: (r) => r.supplyDate ?? '–' },
+                            { key: 'qty', label: tP('supplyView.columns.initialQty'), sortable: true, render: (r) => Number(r.qty).toLocaleString() },
+                            { key: 'consumedQty', label: tP('supplyView.columns.consumed'), sortable: true, render: (r) => r.consumedQty > 0 ? <span style={{ color: '#a78bfa' }}>{Number(r.consumedQty).toLocaleString()}</span> : <span style={{ color: '#52525b' }}>0</span> },
+                            { key: 'residualQty', label: tP('supplyView.columns.residual'), sortable: true, render: (r) => r.residualQty > 0 ? <span style={{ color: '#34d399' }}>{Number(r.residualQty).toLocaleString()}</span> : <span style={{ color: '#52525b' }}>0</span> },
+                            { key: 'utilizationRate', label: tP('supplyView.columns.utilPct'), sortable: true, render: (r) => {
+                              if (r.utilizationRate == null) return <span style={{ color: '#52525b' }}>–</span>;
+                              const pct = (r.utilizationRate * 100).toFixed(1);
+                              const color = r.utilizationRate >= 0.9 ? '#34d399' : r.utilizationRate >= 0.5 ? '#f59e0b' : '#f87171';
+                              return <span style={{ color }}>{pct}%</span>;
+                            }},
+                            { key: 'peggedDemandCount', label: tP('supplyView.columns.peggedDemands'), sortable: true, render: (r) => r.peggedDemandCount > 0 ? <span style={{ color: '#60a5fa' }}>{r.peggedDemandCount}</span> : <span style={{ color: '#52525b' }}>0</span> },
+                            { key: 'totalPeggedQty', label: tP('supplyView.columns.totalPeggedQty'), sortable: true, render: (r) => r.totalPeggedQty > 0 ? Number(r.totalPeggedQty).toLocaleString() : <span style={{ color: '#52525b' }}>0</span> },
+                            { key: '_sup_pegging' as keyof (PlanSupplyViewRow & { _key: string }), label: tP('supplyView.columns.pegging'), sortable: false, render: (r) => {
+                              if (r.peggedDemandCount === 0) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                              const k = `supply|${r.supplyId}`;
+                              const isSelected = woPeggingRowKey === k;
+                              return (
+                                <button
+                                  type="button"
+                                  className="secondary"
+                                  style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
+                                  onClick={() => {
+                                    if (isSelected) {
+                                      setPlanPeggingOpen(false);
+                                      setPlanPeggingContext(null);
+                                      setWoPeggingRowKey(null);
+                                      setPreviousPeggingContext(null);
+                                    } else {
+                                      setPlanPeggingContext({ type: 'supply', supplyId: r.supplyId, peggedDemands: r.peggedDemands, initialQty: r.qty, consumedQty: r.consumedQty });
+                                      setPlanPeggingOpen(true);
+                                      setWoPeggingRowKey(k);
+                                      setPreviousPeggingContext(null);
+                                    }
+                                  }}
+                                >Show</button>
+                              );
+                            }},
+                          ]}
+                        />
+                      </>
+                    );
+                  })()}
+                </div>
+              )}
             </div>
           </>
         )}
@@ -2966,6 +3441,70 @@ export default function CaseDetail() {
       {caseSection === 'material' && (
       <section>
         <h2>{tSec('material')}</h2>
+
+        {/* ── Assessment criteria editor ── */}
+        <div style={{ marginBottom: '1rem', borderBottom: '1px solid #3d3d40', paddingBottom: '0.75rem' }}>
+          <button
+            type="button"
+            onClick={() => setAssessCriteriaOpen((o) => !o)}
+            style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '0.8rem', padding: 0 }}
+          >
+            {assessCriteriaOpen ? '▾' : '▸'} {tP('assessment.criteria')}
+          </button>
+          {assessCriteriaOpen && (
+            <div style={{ marginTop: '0.5rem', maxWidth: 640 }}>
+              {(['high', 'low', 'medium'] as const).map((tier) => {
+                const tierColor = tier === 'high' ? '#f87171' : tier === 'low' ? '#34d399' : '#fbbf24';
+                const tierBg = tier === 'high' ? 'rgba(248,113,113,0.12)' : tier === 'low' ? 'rgba(52,211,153,0.12)' : 'rgba(251,191,36,0.12)';
+                const tierBorder = tier === 'high' ? 'rgba(248,113,113,0.35)' : tier === 'low' ? 'rgba(52,211,153,0.35)' : 'rgba(251,191,36,0.35)';
+                const tierValue = tier === 'high' ? assessCriteriaHigh : tier === 'low' ? assessCriteriaLow : assessCriteriaMedium;
+                const tierSetter = tier === 'high' ? setAssessCriteriaHigh : tier === 'low' ? setAssessCriteriaLow : setAssessCriteriaMedium;
+                return (
+                  <div key={tier} style={{ marginBottom: '0.6rem' }}>
+                    <p style={{ fontSize: '0.75rem', margin: '0 0 3px', color: '#a1a1aa' }}>
+                      The following are criteria for{' '}
+                      <span style={{ padding: '1px 7px', borderRadius: 10, background: tierBg, color: tierColor, border: `1px solid ${tierColor}`, fontWeight: 700, fontSize: '0.72rem' }}>
+                        {tier.toUpperCase()}
+                      </span>
+                      {' '}rating:
+                    </p>
+                    <textarea
+                      value={tierValue}
+                      onChange={(e) => tierSetter(e.target.value)}
+                      rows={2}
+                      placeholder={`Describe what makes an impact ${tier.toUpperCase()}…`}
+                      style={{ width: '100%', fontSize: '0.8rem', background: '#27272a', color: '#e4e4e7', border: `1px solid ${tierBorder}`, borderRadius: 4, padding: '0.4rem', resize: 'vertical', boxSizing: 'border-box' }}
+                    />
+                  </div>
+                );
+              })}
+              <div style={{ display: 'flex', gap: 8, marginTop: '0.4rem' }}>
+                <button
+                  type="button"
+                  onClick={handleSaveCriteria}
+                  disabled={assessCriteriaSaving || buildCriteriaText(assessCriteriaHigh, assessCriteriaLow, assessCriteriaMedium) === assessCriteria}
+                  style={{ fontSize: '0.8rem' }}
+                >
+                  {assessCriteriaSaving ? tP('assessment.criteriaSaving') : tP('assessment.criteriaSave')}
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => {
+                    const parts = parseCriteriaParts(assessCriteria);
+                    setAssessCriteriaHigh(parts.high);
+                    setAssessCriteriaLow(parts.low);
+                    setAssessCriteriaMedium(parts.medium);
+                    setAssessCriteriaOpen(false);
+                  }}
+                  style={{ fontSize: '0.8rem' }}
+                >
+                  {tP('assessment.criteriaCancel')}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
 
         {/* ── New event form ── */}
         {materialNewEvent === null ? (
@@ -3104,6 +3643,7 @@ export default function CaseDetail() {
           const saving = materialEventSaving[ev.id] ?? false;
           const impact = materialImpacts[ev.id];
           const impactLoading = materialImpactLoading[ev.id] ?? false;
+          const isCollapsed = materialEventCollapsed[ev.id] ?? false;
           return (
             <div key={ev.id} style={{ background: '#18181b', border: '1px solid #3d3d40', borderRadius: 8, padding: '1rem', marginBottom: '1rem' }}>
               {editing ? (
@@ -3157,7 +3697,9 @@ export default function CaseDetail() {
                 /* ── Read view ── */
                 <div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
-                    <div style={{ flex: 1 }}>
+                    <div style={{ flex: 1, display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', gap: 0, cursor: 'pointer' }}
+                      onClick={() => setMaterialEventCollapsed(m => ({ ...m, [ev.id]: !(m[ev.id] ?? false) }))}>
+                      <span style={{ marginRight: 6, color: '#71717a', fontSize: '0.75rem', userSelect: 'none' }}>{isCollapsed ? '▸' : '▾'}</span>
                       <span style={{ fontWeight: 600, color: '#e4e4e7', fontSize: '0.9rem' }}>{ev.supplyId}</span>
                       <span style={{ marginLeft: 10, background: ev.delayDays > 0 ? '#7c3aed' : '#3d3d40', color: '#fff', borderRadius: 6, padding: '2px 7px', fontSize: '0.75rem' }}>
                         {ev.delayDays > 0 ? `+${ev.delayDays}d delay` : 'no delay'}
@@ -3172,7 +3714,10 @@ export default function CaseDetail() {
                     </div>
                     <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
                       <button type="button" className="secondary" style={{ fontSize: '0.8rem', padding: '3px 10px' }}
-                        onClick={() => setMaterialEventEditing(m => ({ ...m, [ev.id]: { supplyId: ev.supplyId, delayDays: ev.delayDays, qtyDecreasePct: ev.qtyDecreasePct, note: ev.note ?? '' } }))}>
+                        onClick={() => {
+                          setMaterialEventCollapsed(m => ({ ...m, [ev.id]: false }));
+                          setMaterialEventEditing(m => ({ ...m, [ev.id]: { supplyId: ev.supplyId, delayDays: ev.delayDays, qtyDecreasePct: ev.qtyDecreasePct, note: ev.note ?? '' } }));
+                        }}>
                         Edit
                       </button>
                       <button type="button" className="secondary" style={{ fontSize: '0.8rem', padding: '3px 10px', color: '#f87171', borderColor: '#f87171' }}
@@ -3199,9 +3744,29 @@ export default function CaseDetail() {
                         }}>
                         {impactLoading ? 'Analyzing…' : 'Analyze impact'}
                       </button>
+                      <button type="button" style={{ fontSize: '0.8rem', padding: '3px 10px' }}
+                        disabled={materialAssessmentLoading[ev.id] ?? false}
+                        onClick={async () => {
+                          setMaterialAssessmentLoading(m => ({ ...m, [ev.id]: true }));
+                          setMaterialAssessmentError(m => ({ ...m, [ev.id]: null }));
+                          try {
+                            const result = await runAssessment(id, ev.supplyId, ev.delayDays, ev.qtyDecreasePct);
+                            setMaterialAssessments(m => ({ ...m, [ev.id]: result }));
+                            const hist = await listAssessments(id, ev.supplyId);
+                            setMaterialAssessmentHistory(m => ({ ...m, [ev.id]: hist }));
+                            setMaterialAssessmentHistoryOpen(m => ({ ...m, [ev.id]: true }));
+                          } catch (e) {
+                            setMaterialAssessmentError(m => ({ ...m, [ev.id]: e instanceof Error ? e.message : 'Assessment failed' }));
+                          } finally {
+                            setMaterialAssessmentLoading(m => ({ ...m, [ev.id]: false }));
+                          }
+                        }}>
+                        {(materialAssessmentLoading[ev.id] ?? false) ? 'Assessing…' : 'Assess impact'}
+                      </button>
                     </div>
                   </div>
 
+                  {!isCollapsed && (<>
                   {/* ── Impact results ── */}
                   {impact && (
                     <div style={{ marginTop: '0.875rem', borderTop: '1px solid #27272a', paddingTop: '0.875rem' }}>
@@ -3252,6 +3817,92 @@ export default function CaseDetail() {
                       )}
                     </div>
                   )}
+
+                  {/* ── Assessment result ── */}
+                  {materialAssessmentError[ev.id] && (
+                    <p style={{ color: '#f87171', fontSize: '0.78rem', margin: '0.5rem 0 0' }}>{materialAssessmentError[ev.id]}</p>
+                  )}
+                  {materialAssessments[ev.id] && (() => {
+                    const ar = materialAssessments[ev.id]!;
+                    return (
+                      <div style={{ marginTop: '0.875rem', borderTop: '1px solid #27272a', paddingTop: '0.875rem' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: '0.25rem' }}>
+                          <span style={{ fontSize: '0.82rem', color: '#a1a1aa' }}>{tP('assessment.ratingLabel')} </span>
+                          <span style={{
+                            display: 'inline-block',
+                            padding: '1px 10px',
+                            borderRadius: 12,
+                            fontSize: '0.8rem',
+                            fontWeight: 600,
+                            letterSpacing: '0.05em',
+                            background: ar.rating === 'LOW' ? 'rgba(52,211,153,0.15)' : ar.rating === 'HIGH' ? 'rgba(248,113,113,0.15)' : 'rgba(251,191,36,0.15)',
+                            color: ar.rating === 'LOW' ? '#34d399' : ar.rating === 'HIGH' ? '#f87171' : '#fbbf24',
+                            border: `1px solid ${ar.rating === 'LOW' ? '#34d399' : ar.rating === 'HIGH' ? '#f87171' : '#fbbf24'}`,
+                          }}>{ar.rating}</span>
+                        </div>
+                        <p style={{ fontSize: '0.78rem', color: '#d4d4d8', margin: '0.3rem 0 0' }}>{ar.explanation}</p>
+                      </div>
+                    );
+                  })()}
+
+                  {/* ── Assessment history toggle ── */}
+                  <div style={{ marginTop: '0.6rem' }}>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (!(materialAssessmentHistoryOpen[ev.id] ?? false)) {
+                          try {
+                            const hist = await listAssessments(id, ev.supplyId);
+                            setMaterialAssessmentHistory(m => ({ ...m, [ev.id]: hist }));
+                          } catch { /* best-effort */ }
+                        }
+                        setMaterialAssessmentHistoryOpen(m => ({ ...m, [ev.id]: !(m[ev.id] ?? false) }));
+                      }}
+                      style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '0.75rem', padding: 0 }}
+                    >
+                      {(materialAssessmentHistoryOpen[ev.id] ?? false) ? '▾' : '▸'} {tP('assessment.history')}
+                    </button>
+                    {(materialAssessmentHistoryOpen[ev.id] ?? false) && (
+                      <div style={{ marginTop: '0.5rem' }}>
+                        {!(materialAssessmentHistory[ev.id]?.length) ? (
+                          <p style={{ fontSize: '0.75rem', color: '#71717a', margin: 0 }}>{tP('assessment.noHistory')}</p>
+                        ) : (
+                          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.75rem' }}>
+                            <thead>
+                              <tr style={{ borderBottom: '1px solid #3d3d40', color: '#a1a1aa' }}>
+                                <th style={{ textAlign: 'left', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.date')}</th>
+                                <th style={{ textAlign: 'center', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.rating')}</th>
+                                <th style={{ textAlign: 'right', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.delay')}</th>
+                                <th style={{ textAlign: 'right', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.qtyPct')}</th>
+                                <th style={{ textAlign: 'left', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.explanation')}</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {materialAssessmentHistory[ev.id]!.map((h) => (
+                                <tr key={h.id} style={{ borderBottom: '1px solid #27272a' }}>
+                                  <td style={{ padding: '3px 5px', color: '#71717a', whiteSpace: 'nowrap' }}>{h.createdAt.slice(0, 10)}</td>
+                                  <td style={{ padding: '3px 5px', textAlign: 'center' }}>
+                                    <span style={{
+                                      padding: '0 6px',
+                                      borderRadius: 10,
+                                      fontWeight: 600,
+                                      fontSize: '0.72rem',
+                                      background: h.rating === 'LOW' ? 'rgba(52,211,153,0.15)' : h.rating === 'HIGH' ? 'rgba(248,113,113,0.15)' : 'rgba(251,191,36,0.15)',
+                                      color: h.rating === 'LOW' ? '#34d399' : h.rating === 'HIGH' ? '#f87171' : '#fbbf24',
+                                    }}>{h.rating}</span>
+                                  </td>
+                                  <td style={{ padding: '3px 5px', textAlign: 'right', color: '#e4e4e7' }}>{h.deliveryDelayDays}</td>
+                                  <td style={{ padding: '3px 5px', textAlign: 'right', color: '#e4e4e7' }}>{h.quantityDecreasePct}</td>
+                                  <td style={{ padding: '3px 5px', color: '#a1a1aa', maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={h.explanation}>{h.explanation}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  </>)}
                 </div>
               )}
             </div>
@@ -3801,7 +4452,7 @@ export default function CaseDetail() {
         >
           <div
             style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 0, pointerEvents: 'auto' }}
-            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); }}
+            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); }}
             aria-hidden
           />
           <div
@@ -3843,21 +4494,201 @@ export default function CaseDetail() {
                 zIndex: 11,
               }}
             />
+            {previousPeggingContext && (
+              <div style={{ marginBottom: '0.5rem' }}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPlanPeggingContext(previousPeggingContext);
+                    setWoPeggingRowKey(`supply|${previousPeggingContext.supplyId}`);
+                    setPreviousPeggingContext(null);
+                  }}
+                  style={{ background: 'none', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '0.78rem', padding: 0, display: 'flex', alignItems: 'center', gap: '0.3rem' }}
+                >
+                  ← {previousPeggingContext.supplyId}
+                </button>
+              </div>
+            )}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
               <h3 style={{ margin: 0, color: '#fafafa' }}>
-                {planPeggingContext.type === 'demand'
-                  ? `Pegging: ${planPeggingContext.row.demand_id ?? planPeggingContext.row.product_id}`
-                  : `Pegging: ${planPeggingContext.row.product_id} @ ${planPeggingContext.row.location_id}`}
+                {planPeggingContext.type === 'supply'
+                  ? tP('supplyView.peggingPanel.title', { supplyId: planPeggingContext.supplyId })
+                  : planPeggingContext.type === 'demand'
+                    ? `Pegging: ${planPeggingContext.row.demand_id ?? planPeggingContext.row.product_id}`
+                    : `Pegging: ${planPeggingContext.row.product_id} @ ${planPeggingContext.row.location_id}`}
               </h3>
-              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
+              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setPreviousPeggingContext(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
             </div>
             <p style={{ margin: 0, marginBottom: '0.5rem', fontSize: '0.8rem', color: '#71717a' }}>
-              {planPeggingContext.type === 'work_order'
-                ? 'Root = this work order; below it are the supplies that fulfill it (inventory, child work orders, purchase) at all levels.'
-                : '▢ blue = demand target, ▢ purple = supply / purchase inventory, ⚙ green = work order (transformation). Root = target demand; leaves = supply or purchase inventory.'}
-              {' '}
-              When multiple inventories or work orders appear as siblings under the same parent, they are alternative paths <strong>OR</strong> that can each supply flow to that parent.
+              {planPeggingContext.type === 'supply'
+                ? tP('supplyView.peggingPanel.description')
+                : planPeggingContext.type === 'work_order'
+                  ? 'Root = this work order; below it are the supplies that fulfill it (inventory, child work orders, purchase) at all levels.'
+                  : '▢ blue = demand target, ▢ purple = supply / purchase inventory, ⚙ green = work order (transformation). Root = target demand; leaves = supply or purchase inventory.'}
+              {planPeggingContext.type !== 'supply' && (
+                <>{' '}When multiple inventories or work orders appear as siblings under the same parent, they are alternative paths <strong>OR</strong> that can each supply flow to that parent.</>
+              )}
             </p>
+            {planPeggingContext.type === 'supply' && (() => {
+              const ctx = planPeggingContext;
+              return (
+                <div>
+                  <p style={{ fontSize: '0.8rem', color: '#71717a', margin: '0 0 0.75rem' }}>
+                    {tP('supplyView.peggingPanel.initialQty')} <strong style={{ color: '#e4e4e7' }}>{Number(ctx.initialQty).toLocaleString()}</strong>
+                    {' · '}{tP('supplyView.peggingPanel.consumed')} <strong style={{ color: '#a78bfa' }}>{Number(ctx.consumedQty).toLocaleString()}</strong>
+                    {' · '}{tP('supplyView.peggingPanel.demandCount', { count: ctx.peggedDemands.length })}
+                  </p>
+                  {/* ── Assessment UI ──────────────────────────────────────── */}
+                  <div style={{ marginBottom: '1rem', padding: '0.6rem 0.75rem', background: '#1c1c1e', borderRadius: 6, border: '1px solid #3d3d40' }}>
+                    {/* Input row */}
+                    <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
+                      <label style={{ fontSize: '0.78rem', color: '#a1a1aa', display: 'flex', alignItems: 'center', gap: 4 }}>
+                        {tP('assessment.delayDays')}
+                        <input
+                          type="number" min={0}
+                          value={assessDelayDays}
+                          onChange={(e) => setAssessDelayDays(Math.max(0, Number(e.target.value)))}
+                          style={{ width: 60, fontSize: '0.78rem', padding: '2px 4px', background: '#27272a', color: '#e4e4e7', border: '1px solid #52525b', borderRadius: 3 }}
+                        />
+                      </label>
+                      <label style={{ fontSize: '0.78rem', color: '#a1a1aa', display: 'flex', alignItems: 'center', gap: 4 }}>
+                        {tP('assessment.qtyDecreasePct')}
+                        <input
+                          type="number" min={0} max={100}
+                          value={assessQtyDecreasePct}
+                          onChange={(e) => setAssessQtyDecreasePct(Math.max(0, Math.min(100, Number(e.target.value))))}
+                          style={{ width: 60, fontSize: '0.78rem', padding: '2px 4px', background: '#27272a', color: '#e4e4e7', border: '1px solid #52525b', borderRadius: 3 }}
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        onClick={handleAssess}
+                        disabled={assessmentRunning}
+                        style={{ fontSize: '0.8rem' }}
+                      >
+                        {assessmentRunning ? tP('assessment.assessing') : tP('assessment.assess')}
+                      </button>
+                    </div>
+                    {/* Error */}
+                    {assessError && (
+                      <p style={{ color: '#f87171', fontSize: '0.75rem', margin: '0 0 0.4rem' }}>{assessError}</p>
+                    )}
+                    {/* Rating result */}
+                    {assessmentResult && (
+                      <div style={{ marginBottom: '0.4rem' }}>
+                        <span style={{ fontSize: '0.82rem', color: '#a1a1aa' }}>{tP('assessment.ratingLabel')} </span>
+                        <span style={{
+                          display: 'inline-block',
+                          padding: '1px 10px',
+                          borderRadius: 12,
+                          fontSize: '0.8rem',
+                          fontWeight: 600,
+                          letterSpacing: '0.05em',
+                          background: assessmentResult.rating === 'LOW' ? 'rgba(52,211,153,0.15)' : assessmentResult.rating === 'HIGH' ? 'rgba(248,113,113,0.15)' : 'rgba(251,191,36,0.15)',
+                          color: assessmentResult.rating === 'LOW' ? '#34d399' : assessmentResult.rating === 'HIGH' ? '#f87171' : '#fbbf24',
+                          border: `1px solid ${assessmentResult.rating === 'LOW' ? '#34d399' : assessmentResult.rating === 'HIGH' ? '#f87171' : '#fbbf24'}`,
+                        }}>{assessmentResult.rating}</span>
+                        <p style={{ fontSize: '0.78rem', color: '#d4d4d8', margin: '0.35rem 0 0' }}>{assessmentResult.explanation}</p>
+                      </div>
+                    )}
+                    {/* History toggle */}
+                    <button
+                      type="button"
+                      onClick={handleLoadHistory}
+                      style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '0.75rem', padding: 0 }}
+                    >
+                      {assessmentHistoryOpen ? '▾' : '▸'} {tP('assessment.history')}
+                    </button>
+                    {assessmentHistoryOpen && (
+                      <div style={{ marginTop: '0.5rem' }}>
+                        {assessmentHistory.length === 0 ? (
+                          <p style={{ fontSize: '0.75rem', color: '#71717a', margin: 0 }}>{tP('assessment.noHistory')}</p>
+                        ) : (
+                          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.75rem' }}>
+                            <thead>
+                              <tr style={{ borderBottom: '1px solid #3d3d40', color: '#a1a1aa' }}>
+                                <th style={{ textAlign: 'left', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.date')}</th>
+                                <th style={{ textAlign: 'center', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.rating')}</th>
+                                <th style={{ textAlign: 'right', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.delay')}</th>
+                                <th style={{ textAlign: 'right', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.qtyPct')}</th>
+                                <th style={{ textAlign: 'left', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.explanation')}</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {assessmentHistory.map((h) => (
+                                <tr key={h.id} style={{ borderBottom: '1px solid #27272a' }}>
+                                  <td style={{ padding: '3px 5px', color: '#71717a', whiteSpace: 'nowrap' }}>{h.createdAt.slice(0, 10)}</td>
+                                  <td style={{ padding: '3px 5px', textAlign: 'center' }}>
+                                    <span style={{
+                                      padding: '0 6px',
+                                      borderRadius: 10,
+                                      fontWeight: 600,
+                                      fontSize: '0.72rem',
+                                      background: h.rating === 'LOW' ? 'rgba(52,211,153,0.15)' : h.rating === 'HIGH' ? 'rgba(248,113,113,0.15)' : 'rgba(251,191,36,0.15)',
+                                      color: h.rating === 'LOW' ? '#34d399' : h.rating === 'HIGH' ? '#f87171' : '#fbbf24',
+                                    }}>{h.rating}</span>
+                                  </td>
+                                  <td style={{ padding: '3px 5px', textAlign: 'right', color: '#e4e4e7' }}>{h.deliveryDelayDays}</td>
+                                  <td style={{ padding: '3px 5px', textAlign: 'right', color: '#e4e4e7' }}>{h.quantityDecreasePct}</td>
+                                  <td style={{ padding: '3px 5px', color: '#a1a1aa', maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={h.explanation}>{h.explanation}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  {/* ── Pegged demand table ────────────────────────────────── */}
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
+                    <thead>
+                      <tr style={{ borderBottom: '1px solid #3d3d40', color: '#a1a1aa' }}>
+                        <th style={{ textAlign: 'left', padding: '4px 6px', fontWeight: 500 }}>{tP('supplyView.peggingPanel.columns.demandId')}</th>
+                        <th style={{ textAlign: 'left', padding: '4px 6px', fontWeight: 500 }}>{tP('supplyView.peggingPanel.columns.customer')}</th>
+                        <th style={{ textAlign: 'right', padding: '4px 6px', fontWeight: 500 }}>{tP('supplyView.peggingPanel.columns.qtyConsumed')}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...ctx.peggedDemands]
+                        .sort((a, b) => b.qtyConsumed - a.qtyConsumed)
+                        .map((d) => {
+                          const demandRow = planResult?.committed_demands.find((cd) => cd.demand_id === d.demandId);
+                          const demandKey = demandRow ? `demand|${demandRow.demand_id ?? ''}|${demandRow.product_id}|${demandRow.location_id}` : null;
+                          const isActive = demandKey != null && woPeggingRowKey === demandKey;
+                          return (
+                          <tr key={d.demandId} style={{ borderBottom: '1px solid #27272a' }}>
+                            <td style={{ padding: '4px 6px', fontFamily: 'monospace' }}>
+                              {demandRow ? (
+                                <button
+                                  type="button"
+                                  className="secondary"
+                                  style={{ fontSize: '0.78rem', padding: '1px 6px', fontFamily: 'monospace', ...(isActive ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : {}) }}
+                                  onClick={() => {
+                                    if (isActive) {
+                                      setPlanPeggingContext({ type: 'supply', supplyId: ctx.supplyId, peggedDemands: ctx.peggedDemands, initialQty: ctx.initialQty, consumedQty: ctx.consumedQty });
+                                      setWoPeggingRowKey(`supply|${ctx.supplyId}`);
+                                      setPreviousPeggingContext(null);
+                                    } else {
+                                      setPreviousPeggingContext({ type: 'supply', supplyId: ctx.supplyId, peggedDemands: ctx.peggedDemands, initialQty: ctx.initialQty, consumedQty: ctx.consumedQty });
+                                      setPlanPeggingContext({ type: 'demand', row: demandRow });
+                                      setWoPeggingRowKey(demandKey);
+                                    }
+                                  }}
+                                >{d.demandId}</button>
+                              ) : (
+                                <span style={{ color: '#60a5fa' }}>{d.demandId || '–'}</span>
+                              )}
+                            </td>
+                            <td style={{ padding: '4px 6px', color: '#e4e4e7' }}>{d.customer ?? '–'}</td>
+                            <td style={{ padding: '4px 6px', textAlign: 'right', color: '#a78bfa' }}>{Number(d.qtyConsumed).toLocaleString()}</td>
+                          </tr>
+                          );
+                        })}
+                    </tbody>
+                  </table>
+                </div>
+              );
+            })()}
             {planPeggingContext.type === 'work_order' && (() => {
               const row = planPeggingContext.row;
               // "Shared" means the planner consolidated multiple demands into one WO (demand_id=null).
@@ -3908,7 +4739,7 @@ export default function CaseDetail() {
                 </div>
               );
             })()}
-            {(() => {
+            {planPeggingContext.type !== 'supply' && (() => {
               let tree: PlanningPeggingNode | null = null;
               const isWoPeggingView = planPeggingContext.type === 'work_order';
               const woPeggingDemandId = isWoPeggingView ? (planPeggingContext.row as WorkOrder).demand_id ?? null : null;

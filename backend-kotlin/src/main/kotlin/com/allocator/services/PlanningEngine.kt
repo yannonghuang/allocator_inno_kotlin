@@ -313,6 +313,62 @@ private fun scoreVariant(
 private data class Quadruple<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
 
 /**
+ * Cascade method selection: try each method in ascending preference order.
+ * Returns the first method whose children can be successfully planned.
+ * Falls back to preference-only when depth is exhausted or only one method exists.
+ */
+private fun getPreferredMethodCascade(
+    methods: List<Map<String, Any?>>,
+    demand: Map<String, Any?>,
+    inventory: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+    requestTimeDt: LocalDate?,
+    config: Map<String, Any?>?,
+    depth: Int,
+    planningPath: Set<Pair<String, String>>,
+): Pair<Map<String, Any?>?, String> {
+    if (methods.isEmpty()) return Pair(null, "No methods available.")
+    if (depth < MAX_PLAN_DEPTH || methods.size <= 1) return getPreferredMethod(methods)
+
+    val productId = demand["product_id"] as? String ?: ""
+    val locationId = demand["location_id"] as? String ?: ""
+    val quantity = (demand["quantity"] as? Number)?.toDouble() ?: 0.0
+    val reqTimeStr = demand["request_due_time"] as? String ?: demand["request_time"] as? String
+    val reqDt = parseDate(reqTimeStr) ?: requestTimeDt
+
+    val sorted = methods.sortedBy { (it["preference"] as? Number)?.toInt() ?: 0 }
+
+    for (m in sorted) {
+        val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
+        val leadDays = leadDaysForMethod(m)
+
+        val failed = when (m["type"]) {
+            "purchase" -> false
+            "move" -> {
+                val children = childMaterialsForMove(m, quantity)
+                scoreVariant("cascade", children, inventory, data, reqDt, leadDays, planningPath, depth - 1).fourth
+            }
+            "make" -> {
+                val variants = variantsForMake(productId, productionLocation, quantity, m, data)
+                variants.isEmpty() || variants.all { (altKey, childList) ->
+                    scoreVariant(altKey, childList, inventory, data, reqDt, leadDays, planningPath, depth - 1).fourth
+                }
+            }
+            else -> false
+        }
+
+        if (!failed) {
+            val loc = (m["location_id"] ?: m["to_location_id"] ?: "").toString()
+            val pref = (m["preference"] as? Number)?.toInt() ?: 0
+            return Pair(m, "Cascade (by preference): ${m["type"]} @ $loc (pref $pref) — first feasible.")
+        }
+    }
+
+    log.debug("cascade: all methods failed for {}@{}, falling back to lowest-preference", productId, locationId)
+    return getPreferredMethod(methods)
+}
+
+/**
  * Elaborate method selection: simulate one planning level per method, score, and pick best.
  * Falls back to preference-only when depth < MAX_PLAN_DEPTH or only 1 method.
  */
@@ -660,7 +716,9 @@ fun plan(
     }
 
     val demandNetQty = quantity - taken
-    if (demandNetQty <= 0) {
+    if (demandNetQty <= 1e-9) {
+        // Treat sub-epsilon residuals as fully satisfied (prevents floating-point drift from
+        // cascading into child_failed when a consolidation proportional share rounds down by ε)
         return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, fulfillCommitTime))
     }
 
@@ -807,7 +865,7 @@ fun plan(
         }
         useElaborateMethod && depth >= MAX_PLAN_DEPTH ->
             getPreferredMethodElaborate(effectiveMethods, demand, inventory, data, requestTimeDt, config, depth, path)
-        else -> getPreferredMethod(effectiveMethods)
+        else -> getPreferredMethodCascade(effectiveMethods, demand, inventory, data, requestTimeDt, config, depth, path)
     }
 
     // Override is active only when it actually changed the selected method vs auto-selection.

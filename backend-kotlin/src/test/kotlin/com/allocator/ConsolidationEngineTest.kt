@@ -74,7 +74,7 @@ class ConsolidationEngineTest : FunSpec({
         val inv    = mutableListOf<MutableMap<String, Any?>>()
         val config = ConsolidationConfig(enabled = true, periodDays = 7, allocationMode = "priority_first")
 
-        val result = runConsolidation(listOf(group), inv, emptyData, config, ::simplePlanFn)
+        val result = runConsolidation(listOf(group), inv, emptyData, config, planFn = ::simplePlanFn)
 
         result.consolidatedWOs shouldHaveSize 1
         result.consolidatedWOs[0]["consolidated"] shouldBe true
@@ -94,7 +94,7 @@ class ConsolidationEngineTest : FunSpec({
         val inv    = mutableListOf<MutableMap<String, Any?>>()
         val config = ConsolidationConfig(enabled = true, periodDays = 7, allocationMode = "priority_first")
 
-        val result = runConsolidation(listOf(group), inv, emptyData, config, ::simplePlanFn)
+        val result = runConsolidation(listOf(group), inv, emptyData, config, planFn = ::simplePlanFn)
 
         // produced=50, D1 gets 10, D2 gets 40
         result.allocation["D1"]!!["C|L"]!! shouldBe (10.0 plusOrMinus 1e-9)
@@ -110,7 +110,7 @@ class ConsolidationEngineTest : FunSpec({
         val inv    = mutableListOf<MutableMap<String, Any?>>()
         val config = ConsolidationConfig(enabled = true, periodDays = 7, allocationMode = "proportional")
 
-        val result = runConsolidation(listOf(group), inv, emptyData, config, cappedPlanFn(25.0))
+        val result = runConsolidation(listOf(group), inv, emptyData, config, planFn = cappedPlanFn(25.0))
 
         // D1 → 25 * (10/50) = 5.0; D2 → 25 * (40/50) = 20.0
         result.allocation["D1"]!!["C|L"]!! shouldBe (5.0 plusOrMinus 1e-9)
@@ -126,7 +126,7 @@ class ConsolidationEngineTest : FunSpec({
         val inv    = mutableListOf<MutableMap<String, Any?>>()
         val config = ConsolidationConfig(enabled = true, periodDays = 7, allocationMode = "priority_first")
 
-        val result = runConsolidation(listOf(group), inv, emptyData, config, cappedPlanFn(40.0))
+        val result = runConsolidation(listOf(group), inv, emptyData, config, planFn = cappedPlanFn(40.0))
 
         result.allocation["D1"]!!["C|L"]!! shouldBe (30.0 plusOrMinus 1e-9)  // full
         result.allocation["D2"]!!["C|L"]!! shouldBe (10.0 plusOrMinus 1e-9)  // only remainder
@@ -140,7 +140,7 @@ class ConsolidationEngineTest : FunSpec({
         val inv    = mutableListOf<MutableMap<String, Any?>>()
         val config = ConsolidationConfig(enabled = true, periodDays = 7)
 
-        val result = runConsolidation(listOf(group), inv, emptyData, config, ::simplePlanFn)
+        val result = runConsolidation(listOf(group), inv, emptyData, config, planFn = ::simplePlanFn)
 
         result.consolidatedWOs shouldHaveSize 1
         result.consolidatedWOs[0]["consolidated"] shouldBe false   // pass-through
@@ -159,7 +159,7 @@ class ConsolidationEngineTest : FunSpec({
         val inv    = mutableListOf<MutableMap<String, Any?>>()
         val config = ConsolidationConfig(enabled = true, periodDays = 7, allocationMode = "priority_first")
 
-        val result = runConsolidation(listOf(group), inv, emptyData, config, ::simplePlanFn)
+        val result = runConsolidation(listOf(group), inv, emptyData, config, planFn = ::simplePlanFn)
 
         result.consolidatedWOs shouldHaveSize 1
         result.allocation["D1"]!!["C|L"]!! shouldBe (10.0 plusOrMinus 1e-9)
@@ -230,7 +230,7 @@ class ConsolidationEngineTest : FunSpec({
         val inv   = mutableListOf<MutableMap<String, Any?>>()
         val config = ConsolidationConfig(enabled = true, periodDays = 7)
 
-        val result = runConsolidation(listOf(group), inv, emptyData, config, ::simplePlanFn)
+        val result = runConsolidation(listOf(group), inv, emptyData, config, planFn = ::simplePlanFn)
 
         result.consolidatedWOs shouldHaveSize 1
         result.consolidatedWOs[0]["consolidated"] shouldBe false
@@ -252,7 +252,7 @@ class ConsolidationEngineTest : FunSpec({
 
         val inv    = mutableListOf<MutableMap<String, Any?>>()
         val config = ConsolidationConfig(enabled = true, periodDays = 7, allocationMode = "priority_first")
-        val result = runConsolidation(groups, inv, emptyData, config, ::simplePlanFn)
+        val result = runConsolidation(groups, inv, emptyData, config, planFn = ::simplePlanFn)
 
         result.consolidatedWOs shouldHaveSize 2
         val woC = result.consolidatedWOs.first { it["product_id"] == "C" }

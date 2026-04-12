@@ -257,6 +257,7 @@
       }
     },
     "config": {
+      "singleBestVariant": "Single best BOM variant (score and pick one variant per demand; default is equal split across all feasible variants)",
       "equalSplitMethods": "Equal split across methods (when multiple make/move/buy can fulfill a demand; can be slower—we plan each method branch)",
       "elaborateMethod": "Use elaborate method selection (slower, scores by commit/inventory/purchase; ignored when equal split across methods is on)",
       "purchaseAllowed": "Purchase allowed (uncheck to exclude buy methods from planning)",
@@ -275,7 +276,8 @@
     "hideCopilot": "Hide copilot",
     "tabs": {
       "committedDemands": "Committed demands",
-      "workOrders": "Work orders"
+      "workOrders": "Work orders",
+      "supplies": "Supplies ({count})"
     },
     "committedDemands": {
       "heading": "Committed demands",
@@ -451,6 +453,65 @@
       "errors": {
         "selectMethod": "Select a method",
         "enterAltGroup": "Enter an ALT_GROUP value"
+      }
+    },
+    "supplyView": {
+      "heading": "Supply universe",
+      "filterPlaceholder": "Filter by supply ID, product, location…",
+      "filterUnusedOnly": "Unused only",
+      "filterPartialOnly": "Partially consumed",
+      "filterHideDummy": "Hide dummy",
+      "loading": "Loading supplies…",
+      "showing": "Showing {shown} of {total} supplies.",
+      "overallUtilization": "Overall utilization: {pct}% ({consumed} / {initial})",
+      "columns": {
+        "supplyId": "Supply ID",
+        "product": "Product",
+        "location": "Location",
+        "vendor": "Vendor",
+        "supplyDate": "Supply Date",
+        "initialQty": "Initial Qty",
+        "consumed": "Consumed",
+        "residual": "Residual",
+        "utilPct": "Util %",
+        "peggedDemands": "Pegged Demands",
+        "totalPeggedQty": "Total Pegged Qty",
+        "pegging": "Pegging"
+      },
+      "peggingPanel": {
+        "title": "Supply pegging: {supplyId}",
+        "description": "Demands fulfilled (in part) by this supply in the latest plan run, sorted by quantity consumed.",
+        "initialQty": "Initial qty:",
+        "consumed": "Consumed:",
+        "demandCount": "{count, plural, one {# demand} other {# demands}}",
+        "columns": {
+          "demandId": "Demand ID",
+          "customer": "Customer",
+          "qtyConsumed": "Qty consumed"
+        }
+      },
+      "assessment": {
+        "criteria": "Assessment criteria",
+        "criteriaPlaceholder": "Describe how to evaluate impact severity (LOW / MEDIUM / HIGH). Can be in English or Chinese.",
+        "criteriaHint": "Saved per case. Used by the LLM when rating supply-change impact. Leave blank to use the built-in default.",
+        "criteriaSave": "Save",
+        "criteriaSaving": "Saving…",
+        "criteriaCancel": "Cancel",
+        "assess": "Assess impact",
+        "assessing": "Assessing…",
+        "delayDays": "Delay (days):",
+        "qtyDecreasePct": "Qty decrease (%):",
+        "ratingLabel": "Rating:",
+        "explanationLabel": "Explanation:",
+        "history": "Assessment history",
+        "noHistory": "No assessments yet for this supply.",
+        "historyColumns": {
+          "date": "Date",
+          "rating": "Rating",
+          "delay": "Delay",
+          "qtyPct": "Qty ↓%",
+          "explanation": "Explanation"
+        }
       }
     },
     "commitReasons": {

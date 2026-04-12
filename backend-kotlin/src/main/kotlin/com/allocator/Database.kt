@@ -98,7 +98,7 @@ private fun createTables() {
         Cases, Boms, Customers, Locations, Products, Vendors,
         Demands, MethodBuys, MethodMakes, ProductLocations,
         Supplies, MethodMoves, AllocationRuns, AllocationActions,
-        ManualOverrides, PlanRuns, MaterialEvents
+        ManualOverrides, PlanRuns, MaterialEvents, MaterialImpactAssessments
     )
 }
 
@@ -195,6 +195,8 @@ private fun migrateSchema() {
         END
         ${'$'}${'$'};
         """.trimIndent(),
+        // Assessment criteria column on cases
+        "ALTER TABLE cases ADD COLUMN IF NOT EXISTS assessment_criteria TEXT",
         // Fix FK constraints to use ON DELETE CASCADE (idempotent: drop if exists, re-add)
         *cascadeFkMigrations()
     )

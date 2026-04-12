@@ -9,6 +9,7 @@ data class AppConfig(
         ?: "postgresql://postgres:postgres@localhost:5432/allocator",
     val csvRootPath: String = System.getenv("CSV_ROOT_PATH") ?: "csv",
     val openAiApiKey: String? = System.getenv("OPENAI_API_KEY"),
+    val assessmentModel: String = System.getenv("ASSESSMENT_MODEL") ?: "gpt-4o-mini",
 )
 
 val config = AppConfig()
