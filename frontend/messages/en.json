@@ -488,6 +488,29 @@
           "customer": "Customer",
           "qtyConsumed": "Qty consumed"
         }
+      },
+      "assessment": {
+        "criteria": "Assessment criteria",
+        "criteriaPlaceholder": "Describe how to evaluate impact severity (LOW / MEDIUM / HIGH). Can be in English or Chinese.",
+        "criteriaHint": "Saved per case. Used by the LLM when rating supply-change impact. Leave blank to use the built-in default.",
+        "criteriaSave": "Save",
+        "criteriaSaving": "Saving…",
+        "criteriaCancel": "Cancel",
+        "assess": "Assess impact",
+        "assessing": "Assessing…",
+        "delayDays": "Delay (days):",
+        "qtyDecreasePct": "Qty decrease (%):",
+        "ratingLabel": "Rating:",
+        "explanationLabel": "Explanation:",
+        "history": "Assessment history",
+        "noHistory": "No assessments yet for this supply.",
+        "historyColumns": {
+          "date": "Date",
+          "rating": "Rating",
+          "delay": "Delay",
+          "qtyPct": "Qty ↓%",
+          "explanation": "Explanation"
+        }
       }
     },
     "commitReasons": {

@@ -488,6 +488,29 @@
           "customer": "客户",
           "qtyConsumed": "消耗数量"
         }
+      },
+      "assessment": {
+        "criteria": "评估标准",
+        "criteriaPlaceholder": "描述如何评定影响严重程度（低 / 中 / 高），支持中文或英文。",
+        "criteriaHint": "按方案保存。LLM 评估供应变更影响时使用此标准。留空则使用默认标准。",
+        "criteriaSave": "保存",
+        "criteriaSaving": "保存中…",
+        "criteriaCancel": "取消",
+        "assess": "评估影响",
+        "assessing": "评估中…",
+        "delayDays": "延迟（天）：",
+        "qtyDecreasePct": "数量减少（%）：",
+        "ratingLabel": "评级：",
+        "explanationLabel": "说明：",
+        "history": "评估历史记录",
+        "noHistory": "此供应暂无评估记录。",
+        "historyColumns": {
+          "date": "日期",
+          "rating": "评级",
+          "delay": "延迟",
+          "qtyPct": "数量↓%",
+          "explanation": "说明"
+        }
       }
     },
     "commitReasons": {

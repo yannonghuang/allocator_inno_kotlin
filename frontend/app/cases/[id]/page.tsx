@@ -63,6 +63,12 @@ import {
   type PeggedDemandEntry,
   type PlanSupplyViewRow,
   getCaseSupplies,
+  type AssessmentSummary,
+  type AssessmentResponse,
+  getAssessmentCriteria,
+  setAssessmentCriteria,
+  listAssessments,
+  runAssessment,
 } from '@/lib/api';
 
 type SupplySuggestion = {
@@ -410,6 +416,19 @@ export default function CaseDetail() {
   const [planSupplyPartialOnly, setPlanSupplyPartialOnly] = useState(false);
   const [planSupplyHideDummy, setPlanSupplyHideDummy] = useState(true);
   const [planWorkOrderHideDummyProdArea, setPlanWorkOrderHideDummyProdArea] = useState(true);
+  // ── Assessment state ────────────────────────────────────────────────────────
+  const [assessCriteria, setAssessCriteria] = useState('');
+  const [assessCriteriaEdit, setAssessCriteriaEdit] = useState('');
+  const [assessCriteriaOpen, setAssessCriteriaOpen] = useState(false);
+  const [assessCriteriaSaving, setAssessCriteriaSaving] = useState(false);
+  const [assessCriteriaLoaded, setAssessCriteriaLoaded] = useState(false);
+  const [assessmentRunning, setAssessmentRunning] = useState(false);
+  const [assessmentResult, setAssessmentResult] = useState<AssessmentResponse | null>(null);
+  const [assessmentHistory, setAssessmentHistory] = useState<AssessmentSummary[]>([]);
+  const [assessmentHistoryOpen, setAssessmentHistoryOpen] = useState(false);
+  const [assessDelayDays, setAssessDelayDays] = useState(0);
+  const [assessQtyDecreasePct, setAssessQtyDecreasePct] = useState(0);
+  const [assessError, setAssessError] = useState<string | null>(null);
   const [planDemandRealMakeOnly, setPlanDemandRealMakeOnly] = useState(false);
   const [planDemandShortOnly, setPlanDemandShortOnly] = useState(false);
   const [planDemandBuyOnly, setPlanDemandBuyOnly] = useState(false);
@@ -666,6 +685,30 @@ export default function CaseDetail() {
   useEffect(() => {
     setWoPeggingActiveDemandId(null);
   }, [planPeggingContext]);
+
+  // Reset assessment result/history when a different supply is opened in the pegging panel
+  const currentPeggingSupplyId = planPeggingContext?.type === 'supply' ? planPeggingContext.supplyId : null;
+  useEffect(() => {
+    if (currentPeggingSupplyId) {
+      setAssessmentResult(null);
+      setAssessmentHistory([]);
+      setAssessmentHistoryOpen(false);
+      setAssessError(null);
+    }
+  }, [currentPeggingSupplyId]);
+
+  // Load assessment criteria lazily when the editor is opened for the first time
+  useEffect(() => {
+    if (!assessCriteriaOpen || assessCriteriaLoaded || !id) return;
+    getAssessmentCriteria(id)
+      .then((c) => {
+        const val = c ?? '';
+        setAssessCriteria(val);
+        setAssessCriteriaEdit(val);
+        setAssessCriteriaLoaded(true);
+      })
+      .catch(() => setAssessCriteriaLoaded(true));
+  }, [assessCriteriaOpen, assessCriteriaLoaded, id]);
 
   // Fetch work-order pegging on demand when slide-in opens for a WO.
   // For consolidated WOs (demand_id=null) the pegging tree is always the shared/merged one;
@@ -1225,7 +1268,7 @@ export default function CaseDetail() {
       }
     }
     for (const entry of planResult?.planning_pegging ?? []) {
-      visit(entry.tree, entry.demand_id);
+      visit(entry.tree, entry.demand_id ?? '');
     }
     const map = new Map<string, number>();
     order.forEach((k, i) => { if (!map.has(k)) map.set(k, i); });
@@ -1593,6 +1636,52 @@ export default function CaseDetail() {
       setOverrideDialogError(e instanceof Error ? e.message : 'Failed to save override');
     } finally {
       setOverrideDialogSaving(false);
+    }
+  };
+
+  // ── Assessment handlers ─────────────────────────────────────────────────────
+
+  const handleAssess = async () => {
+    if (!planPeggingContext || planPeggingContext.type !== 'supply') return;
+    setAssessmentRunning(true);
+    setAssessError(null);
+    try {
+      const result = await runAssessment(
+        id,
+        planPeggingContext.supplyId,
+        assessDelayDays,
+        assessQtyDecreasePct,
+        currentPlanRunId,
+      );
+      setAssessmentResult(result);
+      const hist = await listAssessments(id, planPeggingContext.supplyId);
+      setAssessmentHistory(hist);
+      setAssessmentHistoryOpen(true);
+    } catch (e) {
+      setAssessError(e instanceof Error ? e.message : 'Assessment failed');
+    } finally {
+      setAssessmentRunning(false);
+    }
+  };
+
+  const handleLoadHistory = async () => {
+    if (!planPeggingContext || planPeggingContext.type !== 'supply') return;
+    if (!assessmentHistoryOpen) {
+      try {
+        const hist = await listAssessments(id, planPeggingContext.supplyId);
+        setAssessmentHistory(hist);
+      } catch (_) { /* best-effort */ }
+    }
+    setAssessmentHistoryOpen((o) => !o);
+  };
+
+  const handleSaveCriteria = async () => {
+    setAssessCriteriaSaving(true);
+    try {
+      await setAssessmentCriteria(id, assessCriteriaEdit);
+      setAssessCriteria(assessCriteriaEdit);
+    } catch (_) { /* TODO: surface error */ } finally {
+      setAssessCriteriaSaving(false);
     }
   };
 
@@ -3121,6 +3210,46 @@ export default function CaseDetail() {
                       <span>{tP('supplyView.filterHideDummy')}</span>
                     </label>
                   </div>
+                  {/* Assessment criteria editor */}
+                  <div style={{ marginBottom: '0.75rem', borderTop: '1px solid #3d3d40', paddingTop: '0.5rem' }}>
+                    <button
+                      type="button"
+                      onClick={() => setAssessCriteriaOpen((o) => !o)}
+                      style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '0.75rem', padding: 0 }}
+                    >
+                      {assessCriteriaOpen ? '▾' : '▸'} {tP('assessment.criteria')}
+                    </button>
+                    {assessCriteriaOpen && (
+                      <div style={{ marginTop: '0.5rem' }}>
+                        <p style={{ fontSize: '0.72rem', color: '#71717a', margin: '0 0 0.4rem' }}>{tP('assessment.criteriaHint')}</p>
+                        <textarea
+                          value={assessCriteriaEdit}
+                          onChange={(e) => setAssessCriteriaEdit(e.target.value)}
+                          rows={5}
+                          placeholder={tP('assessment.criteriaPlaceholder')}
+                          style={{ width: '100%', fontSize: '0.8rem', background: '#27272a', color: '#e4e4e7', border: '1px solid #52525b', borderRadius: 4, padding: '0.4rem', resize: 'vertical', boxSizing: 'border-box' }}
+                        />
+                        <div style={{ display: 'flex', gap: 8, marginTop: '0.4rem' }}>
+                          <button
+                            type="button"
+                            onClick={handleSaveCriteria}
+                            disabled={assessCriteriaSaving || assessCriteriaEdit === assessCriteria}
+                            style={{ fontSize: '0.8rem' }}
+                          >
+                            {assessCriteriaSaving ? tP('assessment.criteriaSaving') : tP('assessment.criteriaSave')}
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary"
+                            onClick={() => { setAssessCriteriaEdit(assessCriteria); setAssessCriteriaOpen(false); }}
+                            style={{ fontSize: '0.8rem' }}
+                          >
+                            {tP('assessment.criteriaCancel')}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                   {caseSuppliesLoading && <p style={{ color: '#a1a1aa', fontSize: '0.85rem' }}>{tP('supplyView.loading')}</p>}
                   {caseSuppliesError && <p style={{ color: '#f87171', fontSize: '0.85rem' }}>{caseSuppliesError}</p>}
                   {!caseSuppliesLoading && !caseSuppliesError && (() => {
@@ -4132,6 +4261,108 @@ export default function CaseDetail() {
                     {' · '}{tP('supplyView.peggingPanel.consumed')} <strong style={{ color: '#a78bfa' }}>{Number(ctx.consumedQty).toLocaleString()}</strong>
                     {' · '}{tP('supplyView.peggingPanel.demandCount', { count: ctx.peggedDemands.length })}
                   </p>
+                  {/* ── Assessment UI ──────────────────────────────────────── */}
+                  <div style={{ marginBottom: '1rem', padding: '0.6rem 0.75rem', background: '#1c1c1e', borderRadius: 6, border: '1px solid #3d3d40' }}>
+                    {/* Input row */}
+                    <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
+                      <label style={{ fontSize: '0.78rem', color: '#a1a1aa', display: 'flex', alignItems: 'center', gap: 4 }}>
+                        {tP('assessment.delayDays')}
+                        <input
+                          type="number" min={0}
+                          value={assessDelayDays}
+                          onChange={(e) => setAssessDelayDays(Math.max(0, Number(e.target.value)))}
+                          style={{ width: 60, fontSize: '0.78rem', padding: '2px 4px', background: '#27272a', color: '#e4e4e7', border: '1px solid #52525b', borderRadius: 3 }}
+                        />
+                      </label>
+                      <label style={{ fontSize: '0.78rem', color: '#a1a1aa', display: 'flex', alignItems: 'center', gap: 4 }}>
+                        {tP('assessment.qtyDecreasePct')}
+                        <input
+                          type="number" min={0} max={100}
+                          value={assessQtyDecreasePct}
+                          onChange={(e) => setAssessQtyDecreasePct(Math.max(0, Math.min(100, Number(e.target.value))))}
+                          style={{ width: 60, fontSize: '0.78rem', padding: '2px 4px', background: '#27272a', color: '#e4e4e7', border: '1px solid #52525b', borderRadius: 3 }}
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        onClick={handleAssess}
+                        disabled={assessmentRunning}
+                        style={{ fontSize: '0.8rem' }}
+                      >
+                        {assessmentRunning ? tP('assessment.assessing') : tP('assessment.assess')}
+                      </button>
+                    </div>
+                    {/* Error */}
+                    {assessError && (
+                      <p style={{ color: '#f87171', fontSize: '0.75rem', margin: '0 0 0.4rem' }}>{assessError}</p>
+                    )}
+                    {/* Rating result */}
+                    {assessmentResult && (
+                      <div style={{ marginBottom: '0.4rem' }}>
+                        <span style={{ fontSize: '0.82rem', color: '#a1a1aa' }}>{tP('assessment.ratingLabel')} </span>
+                        <span style={{
+                          display: 'inline-block',
+                          padding: '1px 10px',
+                          borderRadius: 12,
+                          fontSize: '0.8rem',
+                          fontWeight: 600,
+                          letterSpacing: '0.05em',
+                          background: assessmentResult.rating === 'LOW' ? 'rgba(52,211,153,0.15)' : assessmentResult.rating === 'HIGH' ? 'rgba(248,113,113,0.15)' : 'rgba(251,191,36,0.15)',
+                          color: assessmentResult.rating === 'LOW' ? '#34d399' : assessmentResult.rating === 'HIGH' ? '#f87171' : '#fbbf24',
+                          border: `1px solid ${assessmentResult.rating === 'LOW' ? '#34d399' : assessmentResult.rating === 'HIGH' ? '#f87171' : '#fbbf24'}`,
+                        }}>{assessmentResult.rating}</span>
+                        <p style={{ fontSize: '0.78rem', color: '#d4d4d8', margin: '0.35rem 0 0' }}>{assessmentResult.explanation}</p>
+                      </div>
+                    )}
+                    {/* History toggle */}
+                    <button
+                      type="button"
+                      onClick={handleLoadHistory}
+                      style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '0.75rem', padding: 0 }}
+                    >
+                      {assessmentHistoryOpen ? '▾' : '▸'} {tP('assessment.history')}
+                    </button>
+                    {assessmentHistoryOpen && (
+                      <div style={{ marginTop: '0.5rem' }}>
+                        {assessmentHistory.length === 0 ? (
+                          <p style={{ fontSize: '0.75rem', color: '#71717a', margin: 0 }}>{tP('assessment.noHistory')}</p>
+                        ) : (
+                          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.75rem' }}>
+                            <thead>
+                              <tr style={{ borderBottom: '1px solid #3d3d40', color: '#a1a1aa' }}>
+                                <th style={{ textAlign: 'left', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.date')}</th>
+                                <th style={{ textAlign: 'center', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.rating')}</th>
+                                <th style={{ textAlign: 'right', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.delay')}</th>
+                                <th style={{ textAlign: 'right', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.qtyPct')}</th>
+                                <th style={{ textAlign: 'left', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.explanation')}</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {assessmentHistory.map((h) => (
+                                <tr key={h.id} style={{ borderBottom: '1px solid #27272a' }}>
+                                  <td style={{ padding: '3px 5px', color: '#71717a', whiteSpace: 'nowrap' }}>{h.createdAt.slice(0, 10)}</td>
+                                  <td style={{ padding: '3px 5px', textAlign: 'center' }}>
+                                    <span style={{
+                                      padding: '0 6px',
+                                      borderRadius: 10,
+                                      fontWeight: 600,
+                                      fontSize: '0.72rem',
+                                      background: h.rating === 'LOW' ? 'rgba(52,211,153,0.15)' : h.rating === 'HIGH' ? 'rgba(248,113,113,0.15)' : 'rgba(251,191,36,0.15)',
+                                      color: h.rating === 'LOW' ? '#34d399' : h.rating === 'HIGH' ? '#f87171' : '#fbbf24',
+                                    }}>{h.rating}</span>
+                                  </td>
+                                  <td style={{ padding: '3px 5px', textAlign: 'right', color: '#e4e4e7' }}>{h.deliveryDelayDays}</td>
+                                  <td style={{ padding: '3px 5px', textAlign: 'right', color: '#e4e4e7' }}>{h.quantityDecreasePct}</td>
+                                  <td style={{ padding: '3px 5px', color: '#a1a1aa', maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={h.explanation}>{h.explanation}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  {/* ── Pegged demand table ────────────────────────────────── */}
                   <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
                     <thead>
                       <tr style={{ borderBottom: '1px solid #3d3d40', color: '#a1a1aa' }}>
@@ -4144,7 +4375,7 @@ export default function CaseDetail() {
                       {[...ctx.peggedDemands]
                         .sort((a, b) => b.qtyConsumed - a.qtyConsumed)
                         .map((d) => {
-                          const demandRow = planResult.committed_demands.find((cd) => cd.demand_id === d.demandId);
+                          const demandRow = planResult?.committed_demands.find((cd) => cd.demand_id === d.demandId);
                           const demandKey = demandRow ? `demand|${demandRow.demand_id ?? ''}|${demandRow.product_id}|${demandRow.location_id}` : null;
                           const isActive = demandKey != null && woPeggingRowKey === demandKey;
                           return (
