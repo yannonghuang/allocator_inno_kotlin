@@ -257,6 +257,7 @@
       }
     },
     "config": {
+      "singleBestVariant": "Single best BOM variant (score and pick one variant per demand; default is equal split across all feasible variants)",
       "equalSplitMethods": "Equal split across methods (when multiple make/move/buy can fulfill a demand; can be slower—we plan each method branch)",
       "elaborateMethod": "Use elaborate method selection (slower, scores by commit/inventory/purchase; ignored when equal split across methods is on)",
       "purchaseAllowed": "Purchase allowed (uncheck to exclude buy methods from planning)",

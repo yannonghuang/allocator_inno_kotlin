@@ -315,6 +315,38 @@ function formatCommitReason(reason: string, purchaseAllowed: boolean): { label: 
 import { PeggingTree, pathKeyFromPath, type PeggingGraph } from '@/app/components/PeggingTree';
 import BomGraphTab from '@/app/components/BomGraphTab';
 
+// ── Assessment criteria helpers ────────────────────────────────────────────────
+const CRITERIA_HEADERS = {
+  high: 'the following are criteria for HIGH rating:',
+  low: 'the following are criteria for LOW rating:',
+  medium: 'the following are criteria for MEDIUM rating:',
+} as const;
+
+function parseCriteriaParts(text: string): { high: string; low: string; medium: string } {
+  const result: Record<string, string[]> = { high: [], low: [], medium: [] };
+  let current: string | null = null;
+  for (const line of text.split('\n')) {
+    const trimmed = line.trimStart().toLowerCase();
+    if (trimmed.startsWith('the following are criteria for high')) { current = 'high'; continue; }
+    if (trimmed.startsWith('the following are criteria for low')) { current = 'low'; continue; }
+    if (trimmed.startsWith('the following are criteria for medium')) { current = 'medium'; continue; }
+    if (current) result[current].push(line);
+  }
+  return {
+    high: result.high.join('\n').trim(),
+    low: result.low.join('\n').trim(),
+    medium: result.medium.join('\n').trim(),
+  };
+}
+
+function buildCriteriaText(high: string, low: string, medium: string): string {
+  const parts: string[] = [];
+  if (high.trim()) { parts.push(CRITERIA_HEADERS.high); parts.push(high.trim()); }
+  if (low.trim()) { parts.push(CRITERIA_HEADERS.low); parts.push(low.trim()); }
+  if (medium.trim()) { parts.push(CRITERIA_HEADERS.medium); parts.push(medium.trim()); }
+  return parts.join('\n');
+}
+
 export default function CaseDetail() {
   const tNav = useTranslations('nav');
   const tSec = useTranslations('sections');
@@ -367,6 +399,12 @@ export default function CaseDetail() {
   const [materialEventsLoading, setMaterialEventsLoading] = useState(false);
   const [materialImpacts, setMaterialImpacts] = useState<Record<number, MaterialImpactResult | null>>({});
   const [materialImpactLoading, setMaterialImpactLoading] = useState<Record<number, boolean>>({});
+  const [materialAssessments, setMaterialAssessments] = useState<Record<number, AssessmentResponse | null>>({});
+  const [materialAssessmentLoading, setMaterialAssessmentLoading] = useState<Record<number, boolean>>({});
+  const [materialAssessmentError, setMaterialAssessmentError] = useState<Record<number, string | null>>({});
+  const [materialAssessmentHistory, setMaterialAssessmentHistory] = useState<Record<number, AssessmentSummary[]>>({});
+  const [materialAssessmentHistoryOpen, setMaterialAssessmentHistoryOpen] = useState<Record<number, boolean>>({});
+  const [materialEventCollapsed, setMaterialEventCollapsed] = useState<Record<number, boolean>>({});
   const [materialEventEditing, setMaterialEventEditing] = useState<Record<number, { supplyId: string; delayDays: number; qtyDecreasePct: number; note: string }>>({});
   const [materialEventSaving, setMaterialEventSaving] = useState<Record<number, boolean>>({});
   // New event form state (-1 = "new" sentinel)
@@ -418,7 +456,9 @@ export default function CaseDetail() {
   const [planWorkOrderHideDummyProdArea, setPlanWorkOrderHideDummyProdArea] = useState(true);
   // ── Assessment state ────────────────────────────────────────────────────────
   const [assessCriteria, setAssessCriteria] = useState('');
-  const [assessCriteriaEdit, setAssessCriteriaEdit] = useState('');
+  const [assessCriteriaHigh, setAssessCriteriaHigh] = useState('');
+  const [assessCriteriaLow, setAssessCriteriaLow] = useState('');
+  const [assessCriteriaMedium, setAssessCriteriaMedium] = useState('');
   const [assessCriteriaOpen, setAssessCriteriaOpen] = useState(false);
   const [assessCriteriaSaving, setAssessCriteriaSaving] = useState(false);
   const [assessCriteriaLoaded, setAssessCriteriaLoaded] = useState(false);
@@ -499,6 +539,7 @@ export default function CaseDetail() {
   function parseCopilotIntent(message: string, currentConfig: PlanningConfig): { reply: string; configUpdate?: PlanningConfig } {
     const t = message.trim().toLowerCase();
     const vs = currentConfig.variant_selection ?? {};
+    const ms = currentConfig.method_selection ?? {};
     const cs = currentConfig.consolidation ?? {};
     const multi = vs.multiple;
 
@@ -506,11 +547,12 @@ export default function CaseDetail() {
 
     if (/show|current|what('s| is)? (my )?config|settings|config/.test(t)) {
       const variantMode = multi === false ? 'single best variant' : 'all feasible variants (equal split)';
+      const methodMode = ms.multiple === true ? 'equal split across methods' : ms.elaborate === true ? 'one by score (elaborate)' : 'one by preference (cascade — tries preferred first, falls back to next if children fail)';
       const purchaseMode = currentConfig.purchase_allowed === false ? 'disabled' : 'allowed';
       const consolidationMode = cs.enabled
         ? `on · ${cs.period_days ?? 7}d bucket · ${cs.allocation_mode === 'proportional' ? 'proportional' : 'priority-first'} split`
         : 'off';
-      return { reply: `Variant selection: **${variantMode}**. Purchase: **${purchaseMode}**. Consolidation: **${consolidationMode}**.` };
+      return { reply: `Variant selection: **${variantMode}**. Method selection: **${methodMode}**. Purchase: **${purchaseMode}**. Consolidation: **${consolidationMode}**.` };
     }
 
     if (/single|one variant|only one|best variant|use one/.test(t)) {
@@ -524,6 +566,27 @@ export default function CaseDetail() {
       return {
         reply: 'Set variant selection to **all feasible variants** with equal split. Demand will be divided among all feasible BOM/variants. Re-run plan to apply.',
         configUpdate: { variant_selection: { ...vs, multiple: true } },
+      };
+    }
+
+    if (/equal.?split.?method|split.?method.?equal|split across method|multiple method|use all method/.test(t)) {
+      return {
+        reply: 'Set method selection to **equal split across methods**. When multiple make/move/buy methods can fulfill a demand, quantity is divided equally among them. Re-run plan to apply.',
+        configUpdate: { method_selection: { ...ms, multiple: true, elaborate: false } },
+      };
+    }
+
+    if (/elaborate method|simulate method|score method|method by score/.test(t)) {
+      return {
+        reply: 'Set method selection to **elaborate (score by simulation)**. The planner simulates each method\'s child materials and picks the one with earliest commit, most inventory consumed, and least purchase. Slower. Re-run plan to apply.',
+        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false } },
+      };
+    }
+
+    if (/by preference|prefer method|cascade method|preferred method|one by preference/.test(t)) {
+      return {
+        reply: 'Set method selection to **by preference (cascade)**. The planner tries the most preferred method first; if its child materials cannot be planned, it falls back to the next preferred method. Re-run plan to apply.',
+        configUpdate: { method_selection: { ...ms, multiple: false, elaborate: false } },
       };
     }
 
@@ -581,13 +644,13 @@ export default function CaseDetail() {
 
     if (/reset|default|clear/.test(t)) {
       return {
-        reply: 'Reset to defaults: all feasible variants (equal split), purchase allowed, consolidation off. Re-run plan to apply.',
-        configUpdate: { variant_selection: { multiple: true }, purchase_allowed: true, consolidation: { enabled: false } },
+        reply: 'Reset to defaults: all feasible variants (equal split), by preference (cascade) method selection, purchase allowed, consolidation off. Re-run plan to apply.',
+        configUpdate: { variant_selection: { multiple: true }, method_selection: { multiple: false, elaborate: false }, purchase_allowed: true, consolidation: { enabled: false } },
       };
     }
 
     return {
-      reply: 'I handle variant selection, method selection, purchase, and shared-component consolidation. Try: "no purchase", "allow purchase", "enable consolidation", "set 14 day bucket", "proportional split", "use single variant", or "show config".',
+      reply: 'I handle variant selection, method selection, purchase, and shared-component consolidation. Try: "single best variant", "all variants", "by preference", "elaborate method", "equal split methods", "no purchase", "allow purchase", "enable consolidation", "set 14 day bucket", "proportional split", or "show config".',
     };
   }
 
@@ -704,7 +767,10 @@ export default function CaseDetail() {
       .then((c) => {
         const val = c ?? '';
         setAssessCriteria(val);
-        setAssessCriteriaEdit(val);
+        const parts = parseCriteriaParts(val);
+        setAssessCriteriaHigh(parts.high);
+        setAssessCriteriaLow(parts.low);
+        setAssessCriteriaMedium(parts.medium);
         setAssessCriteriaLoaded(true);
       })
       .catch(() => setAssessCriteriaLoaded(true));
@@ -1678,8 +1744,9 @@ export default function CaseDetail() {
   const handleSaveCriteria = async () => {
     setAssessCriteriaSaving(true);
     try {
-      await setAssessmentCriteria(id, assessCriteriaEdit);
-      setAssessCriteria(assessCriteriaEdit);
+      const combined = buildCriteriaText(assessCriteriaHigh, assessCriteriaLow, assessCriteriaMedium);
+      await setAssessmentCriteria(id, combined);
+      setAssessCriteria(combined);
     } catch (_) { /* TODO: surface error */ } finally {
       setAssessCriteriaSaving(false);
     }
@@ -2400,6 +2467,17 @@ export default function CaseDetail() {
           </div>
         </details>
         <div style={{ marginBottom: '0.75rem' }}>
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={planningConfig.variant_selection?.multiple === false}
+              onChange={(e) => setPlanningConfig((c) => ({
+                ...c,
+                variant_selection: { ...c.variant_selection, multiple: e.target.checked ? false : undefined },
+              }))}
+            />
+            <span>{tP('config.singleBestVariant')}</span>
+          </label>
           <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem', cursor: 'pointer' }}>
             <input
               type="checkbox"
@@ -3221,19 +3299,36 @@ export default function CaseDetail() {
                     </button>
                     {assessCriteriaOpen && (
                       <div style={{ marginTop: '0.5rem' }}>
-                        <p style={{ fontSize: '0.72rem', color: '#71717a', margin: '0 0 0.4rem' }}>{tP('assessment.criteriaHint')}</p>
-                        <textarea
-                          value={assessCriteriaEdit}
-                          onChange={(e) => setAssessCriteriaEdit(e.target.value)}
-                          rows={5}
-                          placeholder={tP('assessment.criteriaPlaceholder')}
-                          style={{ width: '100%', fontSize: '0.8rem', background: '#27272a', color: '#e4e4e7', border: '1px solid #52525b', borderRadius: 4, padding: '0.4rem', resize: 'vertical', boxSizing: 'border-box' }}
-                        />
+                        {(['high', 'low', 'medium'] as const).map((tier) => {
+                          const tierColor = tier === 'high' ? '#f87171' : tier === 'low' ? '#34d399' : '#fbbf24';
+                          const tierBg = tier === 'high' ? 'rgba(248,113,113,0.12)' : tier === 'low' ? 'rgba(52,211,153,0.12)' : 'rgba(251,191,36,0.12)';
+                          const tierBorder = tier === 'high' ? 'rgba(248,113,113,0.35)' : tier === 'low' ? 'rgba(52,211,153,0.35)' : 'rgba(251,191,36,0.35)';
+                          const tierValue = tier === 'high' ? assessCriteriaHigh : tier === 'low' ? assessCriteriaLow : assessCriteriaMedium;
+                          const tierSetter = tier === 'high' ? setAssessCriteriaHigh : tier === 'low' ? setAssessCriteriaLow : setAssessCriteriaMedium;
+                          return (
+                            <div key={tier} style={{ marginBottom: '0.6rem' }}>
+                              <p style={{ fontSize: '0.75rem', margin: '0 0 3px', color: '#a1a1aa' }}>
+                                The following are criteria for{' '}
+                                <span style={{ padding: '1px 7px', borderRadius: 10, background: tierBg, color: tierColor, border: `1px solid ${tierColor}`, fontWeight: 700, fontSize: '0.72rem' }}>
+                                  {tier.toUpperCase()}
+                                </span>
+                                {' '}rating:
+                              </p>
+                              <textarea
+                                value={tierValue}
+                                onChange={(e) => tierSetter(e.target.value)}
+                                rows={2}
+                                placeholder={`Describe what makes an impact ${tier.toUpperCase()}…`}
+                                style={{ width: '100%', fontSize: '0.8rem', background: '#27272a', color: '#e4e4e7', border: `1px solid ${tierBorder}`, borderRadius: 4, padding: '0.4rem', resize: 'vertical', boxSizing: 'border-box' }}
+                              />
+                            </div>
+                          );
+                        })}
                         <div style={{ display: 'flex', gap: 8, marginTop: '0.4rem' }}>
                           <button
                             type="button"
                             onClick={handleSaveCriteria}
-                            disabled={assessCriteriaSaving || assessCriteriaEdit === assessCriteria}
+                            disabled={assessCriteriaSaving || buildCriteriaText(assessCriteriaHigh, assessCriteriaLow, assessCriteriaMedium) === assessCriteria}
                             style={{ fontSize: '0.8rem' }}
                           >
                             {assessCriteriaSaving ? tP('assessment.criteriaSaving') : tP('assessment.criteriaSave')}
@@ -3241,7 +3336,13 @@ export default function CaseDetail() {
                           <button
                             type="button"
                             className="secondary"
-                            onClick={() => { setAssessCriteriaEdit(assessCriteria); setAssessCriteriaOpen(false); }}
+                            onClick={() => {
+                              const parts = parseCriteriaParts(assessCriteria);
+                              setAssessCriteriaHigh(parts.high);
+                              setAssessCriteriaLow(parts.low);
+                              setAssessCriteriaMedium(parts.medium);
+                              setAssessCriteriaOpen(false);
+                            }}
                             style={{ fontSize: '0.8rem' }}
                           >
                             {tP('assessment.criteriaCancel')}
@@ -3340,6 +3441,70 @@ export default function CaseDetail() {
       {caseSection === 'material' && (
       <section>
         <h2>{tSec('material')}</h2>
+
+        {/* ── Assessment criteria editor ── */}
+        <div style={{ marginBottom: '1rem', borderBottom: '1px solid #3d3d40', paddingBottom: '0.75rem' }}>
+          <button
+            type="button"
+            onClick={() => setAssessCriteriaOpen((o) => !o)}
+            style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '0.8rem', padding: 0 }}
+          >
+            {assessCriteriaOpen ? '▾' : '▸'} {tP('assessment.criteria')}
+          </button>
+          {assessCriteriaOpen && (
+            <div style={{ marginTop: '0.5rem', maxWidth: 640 }}>
+              {(['high', 'low', 'medium'] as const).map((tier) => {
+                const tierColor = tier === 'high' ? '#f87171' : tier === 'low' ? '#34d399' : '#fbbf24';
+                const tierBg = tier === 'high' ? 'rgba(248,113,113,0.12)' : tier === 'low' ? 'rgba(52,211,153,0.12)' : 'rgba(251,191,36,0.12)';
+                const tierBorder = tier === 'high' ? 'rgba(248,113,113,0.35)' : tier === 'low' ? 'rgba(52,211,153,0.35)' : 'rgba(251,191,36,0.35)';
+                const tierValue = tier === 'high' ? assessCriteriaHigh : tier === 'low' ? assessCriteriaLow : assessCriteriaMedium;
+                const tierSetter = tier === 'high' ? setAssessCriteriaHigh : tier === 'low' ? setAssessCriteriaLow : setAssessCriteriaMedium;
+                return (
+                  <div key={tier} style={{ marginBottom: '0.6rem' }}>
+                    <p style={{ fontSize: '0.75rem', margin: '0 0 3px', color: '#a1a1aa' }}>
+                      The following are criteria for{' '}
+                      <span style={{ padding: '1px 7px', borderRadius: 10, background: tierBg, color: tierColor, border: `1px solid ${tierColor}`, fontWeight: 700, fontSize: '0.72rem' }}>
+                        {tier.toUpperCase()}
+                      </span>
+                      {' '}rating:
+                    </p>
+                    <textarea
+                      value={tierValue}
+                      onChange={(e) => tierSetter(e.target.value)}
+                      rows={2}
+                      placeholder={`Describe what makes an impact ${tier.toUpperCase()}…`}
+                      style={{ width: '100%', fontSize: '0.8rem', background: '#27272a', color: '#e4e4e7', border: `1px solid ${tierBorder}`, borderRadius: 4, padding: '0.4rem', resize: 'vertical', boxSizing: 'border-box' }}
+                    />
+                  </div>
+                );
+              })}
+              <div style={{ display: 'flex', gap: 8, marginTop: '0.4rem' }}>
+                <button
+                  type="button"
+                  onClick={handleSaveCriteria}
+                  disabled={assessCriteriaSaving || buildCriteriaText(assessCriteriaHigh, assessCriteriaLow, assessCriteriaMedium) === assessCriteria}
+                  style={{ fontSize: '0.8rem' }}
+                >
+                  {assessCriteriaSaving ? tP('assessment.criteriaSaving') : tP('assessment.criteriaSave')}
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => {
+                    const parts = parseCriteriaParts(assessCriteria);
+                    setAssessCriteriaHigh(parts.high);
+                    setAssessCriteriaLow(parts.low);
+                    setAssessCriteriaMedium(parts.medium);
+                    setAssessCriteriaOpen(false);
+                  }}
+                  style={{ fontSize: '0.8rem' }}
+                >
+                  {tP('assessment.criteriaCancel')}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
 
         {/* ── New event form ── */}
         {materialNewEvent === null ? (
@@ -3478,6 +3643,7 @@ export default function CaseDetail() {
           const saving = materialEventSaving[ev.id] ?? false;
           const impact = materialImpacts[ev.id];
           const impactLoading = materialImpactLoading[ev.id] ?? false;
+          const isCollapsed = materialEventCollapsed[ev.id] ?? false;
           return (
             <div key={ev.id} style={{ background: '#18181b', border: '1px solid #3d3d40', borderRadius: 8, padding: '1rem', marginBottom: '1rem' }}>
               {editing ? (
@@ -3531,7 +3697,9 @@ export default function CaseDetail() {
                 /* ── Read view ── */
                 <div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
-                    <div style={{ flex: 1 }}>
+                    <div style={{ flex: 1, display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', gap: 0, cursor: 'pointer' }}
+                      onClick={() => setMaterialEventCollapsed(m => ({ ...m, [ev.id]: !(m[ev.id] ?? false) }))}>
+                      <span style={{ marginRight: 6, color: '#71717a', fontSize: '0.75rem', userSelect: 'none' }}>{isCollapsed ? '▸' : '▾'}</span>
                       <span style={{ fontWeight: 600, color: '#e4e4e7', fontSize: '0.9rem' }}>{ev.supplyId}</span>
                       <span style={{ marginLeft: 10, background: ev.delayDays > 0 ? '#7c3aed' : '#3d3d40', color: '#fff', borderRadius: 6, padding: '2px 7px', fontSize: '0.75rem' }}>
                         {ev.delayDays > 0 ? `+${ev.delayDays}d delay` : 'no delay'}
@@ -3546,7 +3714,10 @@ export default function CaseDetail() {
                     </div>
                     <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
                       <button type="button" className="secondary" style={{ fontSize: '0.8rem', padding: '3px 10px' }}
-                        onClick={() => setMaterialEventEditing(m => ({ ...m, [ev.id]: { supplyId: ev.supplyId, delayDays: ev.delayDays, qtyDecreasePct: ev.qtyDecreasePct, note: ev.note ?? '' } }))}>
+                        onClick={() => {
+                          setMaterialEventCollapsed(m => ({ ...m, [ev.id]: false }));
+                          setMaterialEventEditing(m => ({ ...m, [ev.id]: { supplyId: ev.supplyId, delayDays: ev.delayDays, qtyDecreasePct: ev.qtyDecreasePct, note: ev.note ?? '' } }));
+                        }}>
                         Edit
                       </button>
                       <button type="button" className="secondary" style={{ fontSize: '0.8rem', padding: '3px 10px', color: '#f87171', borderColor: '#f87171' }}
@@ -3573,9 +3744,29 @@ export default function CaseDetail() {
                         }}>
                         {impactLoading ? 'Analyzing…' : 'Analyze impact'}
                       </button>
+                      <button type="button" style={{ fontSize: '0.8rem', padding: '3px 10px' }}
+                        disabled={materialAssessmentLoading[ev.id] ?? false}
+                        onClick={async () => {
+                          setMaterialAssessmentLoading(m => ({ ...m, [ev.id]: true }));
+                          setMaterialAssessmentError(m => ({ ...m, [ev.id]: null }));
+                          try {
+                            const result = await runAssessment(id, ev.supplyId, ev.delayDays, ev.qtyDecreasePct);
+                            setMaterialAssessments(m => ({ ...m, [ev.id]: result }));
+                            const hist = await listAssessments(id, ev.supplyId);
+                            setMaterialAssessmentHistory(m => ({ ...m, [ev.id]: hist }));
+                            setMaterialAssessmentHistoryOpen(m => ({ ...m, [ev.id]: true }));
+                          } catch (e) {
+                            setMaterialAssessmentError(m => ({ ...m, [ev.id]: e instanceof Error ? e.message : 'Assessment failed' }));
+                          } finally {
+                            setMaterialAssessmentLoading(m => ({ ...m, [ev.id]: false }));
+                          }
+                        }}>
+                        {(materialAssessmentLoading[ev.id] ?? false) ? 'Assessing…' : 'Assess impact'}
+                      </button>
                     </div>
                   </div>
 
+                  {!isCollapsed && (<>
                   {/* ── Impact results ── */}
                   {impact && (
                     <div style={{ marginTop: '0.875rem', borderTop: '1px solid #27272a', paddingTop: '0.875rem' }}>
@@ -3626,6 +3817,92 @@ export default function CaseDetail() {
                       )}
                     </div>
                   )}
+
+                  {/* ── Assessment result ── */}
+                  {materialAssessmentError[ev.id] && (
+                    <p style={{ color: '#f87171', fontSize: '0.78rem', margin: '0.5rem 0 0' }}>{materialAssessmentError[ev.id]}</p>
+                  )}
+                  {materialAssessments[ev.id] && (() => {
+                    const ar = materialAssessments[ev.id]!;
+                    return (
+                      <div style={{ marginTop: '0.875rem', borderTop: '1px solid #27272a', paddingTop: '0.875rem' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: '0.25rem' }}>
+                          <span style={{ fontSize: '0.82rem', color: '#a1a1aa' }}>{tP('assessment.ratingLabel')} </span>
+                          <span style={{
+                            display: 'inline-block',
+                            padding: '1px 10px',
+                            borderRadius: 12,
+                            fontSize: '0.8rem',
+                            fontWeight: 600,
+                            letterSpacing: '0.05em',
+                            background: ar.rating === 'LOW' ? 'rgba(52,211,153,0.15)' : ar.rating === 'HIGH' ? 'rgba(248,113,113,0.15)' : 'rgba(251,191,36,0.15)',
+                            color: ar.rating === 'LOW' ? '#34d399' : ar.rating === 'HIGH' ? '#f87171' : '#fbbf24',
+                            border: `1px solid ${ar.rating === 'LOW' ? '#34d399' : ar.rating === 'HIGH' ? '#f87171' : '#fbbf24'}`,
+                          }}>{ar.rating}</span>
+                        </div>
+                        <p style={{ fontSize: '0.78rem', color: '#d4d4d8', margin: '0.3rem 0 0' }}>{ar.explanation}</p>
+                      </div>
+                    );
+                  })()}
+
+                  {/* ── Assessment history toggle ── */}
+                  <div style={{ marginTop: '0.6rem' }}>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (!(materialAssessmentHistoryOpen[ev.id] ?? false)) {
+                          try {
+                            const hist = await listAssessments(id, ev.supplyId);
+                            setMaterialAssessmentHistory(m => ({ ...m, [ev.id]: hist }));
+                          } catch { /* best-effort */ }
+                        }
+                        setMaterialAssessmentHistoryOpen(m => ({ ...m, [ev.id]: !(m[ev.id] ?? false) }));
+                      }}
+                      style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '0.75rem', padding: 0 }}
+                    >
+                      {(materialAssessmentHistoryOpen[ev.id] ?? false) ? '▾' : '▸'} {tP('assessment.history')}
+                    </button>
+                    {(materialAssessmentHistoryOpen[ev.id] ?? false) && (
+                      <div style={{ marginTop: '0.5rem' }}>
+                        {!(materialAssessmentHistory[ev.id]?.length) ? (
+                          <p style={{ fontSize: '0.75rem', color: '#71717a', margin: 0 }}>{tP('assessment.noHistory')}</p>
+                        ) : (
+                          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.75rem' }}>
+                            <thead>
+                              <tr style={{ borderBottom: '1px solid #3d3d40', color: '#a1a1aa' }}>
+                                <th style={{ textAlign: 'left', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.date')}</th>
+                                <th style={{ textAlign: 'center', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.rating')}</th>
+                                <th style={{ textAlign: 'right', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.delay')}</th>
+                                <th style={{ textAlign: 'right', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.qtyPct')}</th>
+                                <th style={{ textAlign: 'left', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.explanation')}</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {materialAssessmentHistory[ev.id]!.map((h) => (
+                                <tr key={h.id} style={{ borderBottom: '1px solid #27272a' }}>
+                                  <td style={{ padding: '3px 5px', color: '#71717a', whiteSpace: 'nowrap' }}>{h.createdAt.slice(0, 10)}</td>
+                                  <td style={{ padding: '3px 5px', textAlign: 'center' }}>
+                                    <span style={{
+                                      padding: '0 6px',
+                                      borderRadius: 10,
+                                      fontWeight: 600,
+                                      fontSize: '0.72rem',
+                                      background: h.rating === 'LOW' ? 'rgba(52,211,153,0.15)' : h.rating === 'HIGH' ? 'rgba(248,113,113,0.15)' : 'rgba(251,191,36,0.15)',
+                                      color: h.rating === 'LOW' ? '#34d399' : h.rating === 'HIGH' ? '#f87171' : '#fbbf24',
+                                    }}>{h.rating}</span>
+                                  </td>
+                                  <td style={{ padding: '3px 5px', textAlign: 'right', color: '#e4e4e7' }}>{h.deliveryDelayDays}</td>
+                                  <td style={{ padding: '3px 5px', textAlign: 'right', color: '#e4e4e7' }}>{h.quantityDecreasePct}</td>
+                                  <td style={{ padding: '3px 5px', color: '#a1a1aa', maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={h.explanation}>{h.explanation}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  </>)}
                 </div>
               )}
             </div>

@@ -179,6 +179,11 @@ fun splitPriorityFirst(
 
 /**
  * Allocates availableQty proportionally by each demand's qty share.
+ *
+ * When availableQty >= totalQty (no actual shortage), each demand receives exactly its full
+ * requirement to avoid floating-point under-allocation (e.g. 690 * (345/690) = 344.999...).
+ * That under-allocation would leave a tiny residual in individual planning which, if the
+ * component has no production method, cascades into child_failed for the parent demand.
  */
 fun splitProportional(
     group: ConsolidationGroup,
@@ -188,6 +193,10 @@ fun splitProportional(
         // Equal split fallback
         val each = if (group.needs.isNotEmpty()) availableQty / group.needs.size else 0.0
         return group.needs.associate { it.demandId to each }
+    }
+    // No shortage: give each demand exactly what it needs (skip floating-point arithmetic)
+    if (availableQty >= group.totalQty - 1e-9) {
+        return group.needs.associate { need -> need.demandId to need.qty }
     }
     return group.needs.associate { need ->
         need.demandId to availableQty * (need.qty / group.totalQty)

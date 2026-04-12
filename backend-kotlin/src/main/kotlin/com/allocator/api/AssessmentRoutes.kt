@@ -23,11 +23,14 @@ import org.slf4j.LoggerFactory
 private val log = LoggerFactory.getLogger("com.allocator.AssessmentRoute")
 
 private val DEFAULT_CRITERIA = """
-Evaluate the impact severity based on:
-- Number of impacted demands and their priorities
-- Total quantity at risk relative to the supply quantity
-- Proximity of demand due dates to the supply change
-- Magnitude of the delay or quantity reduction
+the following are criteria for HIGH rating:
+number of impacted demands is equal or greater than 5, or total quantity of impacted demands is equal or greater than 5000.
+
+the following are criteria for LOW rating:
+number of impacted demands is no more than 2, or total quantity of impacted demands is less than 500.
+
+the following are criteria for MEDIUM rating:
+otherwise.
 """.trimIndent()
 
 // ── DTOs ──────────────────────────────────────────────────────────────────────
@@ -73,9 +76,9 @@ data class AssessmentResponse(
     val createdAt: String,
 )
 
-// ── Anthropic client (lazily created, shared) ─────────────────────────────────
+// ── OpenAI client (lazily created, shared) ────────────────────────────────────
 
-private val anthropicClient: HttpClient by lazy {
+private val openAiClient: HttpClient by lazy {
     HttpClient(CIO) {
         install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
         install(HttpTimeout) { requestTimeoutMillis = 90_000 }
@@ -83,20 +86,20 @@ private val anthropicClient: HttpClient by lazy {
 }
 
 @Serializable
-private data class AnthropicMessage(val role: String, val content: String)
+private data class OpenAiMessage(val role: String, val content: String)
 
 @Serializable
-private data class AnthropicRequest(
+private data class OpenAiRequest(
     val model: String,
     @SerialName("max_tokens") val maxTokens: Int,
-    val messages: List<AnthropicMessage>,
+    val messages: List<OpenAiMessage>,
 )
 
 @Serializable
-private data class AnthropicContentBlock(val type: String, val text: String? = null)
+private data class OpenAiChoice(val message: OpenAiMessage)
 
 @Serializable
-private data class AnthropicResponse(val content: List<AnthropicContentBlock>)
+private data class OpenAiResponse(val choices: List<OpenAiChoice>)
 
 // ── LLM helpers ───────────────────────────────────────────────────────────────
 
@@ -137,30 +140,29 @@ EXPLANATION: <2–3 sentences; use the same language as the assessment criteria 
 }
 
 private suspend fun callLlm(prompt: String): Pair<String, String> {
-    val apiKey = config.anthropicApiKey
-        ?: throw IllegalStateException("ANTHROPIC_API_KEY is not configured")
+    val apiKey = config.openAiApiKey
+        ?: throw IllegalStateException("OPENAI_API_KEY is not configured")
 
-    val reqBody = AnthropicRequest(
+    val reqBody = OpenAiRequest(
         model = config.assessmentModel,
         maxTokens = 512,
-        messages = listOf(AnthropicMessage(role = "user", content = prompt)),
+        messages = listOf(OpenAiMessage(role = "user", content = prompt)),
     )
 
-    val resp = anthropicClient.post("https://api.anthropic.com/v1/messages") {
-        header("x-api-key", apiKey)
-        header("anthropic-version", "2023-06-01")
+    val resp = openAiClient.post("https://api.openai.com/v1/chat/completions") {
+        header("Authorization", "Bearer $apiKey")
         contentType(ContentType.Application.Json)
         setBody(reqBody)
     }
 
     if (!resp.status.isSuccess()) {
         val body = resp.body<String>()
-        throw IllegalStateException("Anthropic API error ${resp.status.value}: $body")
+        throw IllegalStateException("OpenAI API error ${resp.status.value}: $body")
     }
 
-    val anthropicResp = resp.body<AnthropicResponse>()
-    val text = anthropicResp.content.firstOrNull { it.type == "text" }?.text
-        ?: throw IllegalStateException("Anthropic response contained no text block")
+    val openAiResp = resp.body<OpenAiResponse>()
+    val text = openAiResp.choices.firstOrNull()?.message?.content
+        ?: throw IllegalStateException("OpenAI response contained no content")
 
     val ratingLine = text.lines().firstOrNull { it.startsWith("RATING:") }
         ?: throw IllegalStateException("LLM response missing RATING line. Raw: $text")
@@ -206,23 +208,22 @@ fun Routing.assessmentRoutes() {
         val caseId = call.parameters["caseId"]?.toIntOrNull()
             ?: throw IllegalArgumentException("Invalid caseId")
         val supplyId = call.request.queryParameters["supplyId"]
-        val rows = transaction {
+        val summaries = transaction {
             var q = MaterialImpactAssessments.selectAll()
                 .where { MaterialImpactAssessments.caseId eq caseId }
             if (supplyId != null) q = q.andWhere { MaterialImpactAssessments.supplyId eq supplyId }
-            q.orderBy(MaterialImpactAssessments.id, SortOrder.DESC).toList()
-        }
-        val summaries = rows.map { r ->
-            AssessmentSummary(
-                id = r[MaterialImpactAssessments.id],
-                supplyId = r[MaterialImpactAssessments.supplyId],
-                deliveryDelayDays = r[MaterialImpactAssessments.deliveryDelayDays],
-                quantityDecreasePct = r[MaterialImpactAssessments.quantityDecreasePct],
-                rating = r[MaterialImpactAssessments.rating],
-                explanation = r[MaterialImpactAssessments.explanation],
-                criteria = r[MaterialImpactAssessments.criteria],
-                createdAt = r[MaterialImpactAssessments.createdAt].toString(),
-            )
+            q.orderBy(MaterialImpactAssessments.id, SortOrder.DESC).map { r ->
+                AssessmentSummary(
+                    id = r[MaterialImpactAssessments.id],
+                    supplyId = r[MaterialImpactAssessments.supplyId],
+                    deliveryDelayDays = r[MaterialImpactAssessments.deliveryDelayDays],
+                    quantityDecreasePct = r[MaterialImpactAssessments.quantityDecreasePct],
+                    rating = r[MaterialImpactAssessments.rating],
+                    explanation = r[MaterialImpactAssessments.explanation],
+                    criteria = r[MaterialImpactAssessments.criteria],
+                    createdAt = r[MaterialImpactAssessments.createdAt].toString(),
+                )
+            }
         }
         call.respond(summaries)
     }
