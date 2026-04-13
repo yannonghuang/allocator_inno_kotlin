@@ -294,7 +294,7 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
             jobId, req.supplyId, req.deliveryDelayDays, req.quantityDecreasePct)
         val contingentResult = runPlanning(mutatedData, config = parsedConfig)
 
-        // 6. Persist contingent plan run (only when persist=true)
+        // 6. Persist contingent plan run + material event record (only when persist=true)
         val contingentPlanRunId: Int? = if (req.persist) {
             val metadataJson = buildJsonObject {
                 put("type", "contingent")
@@ -305,7 +305,7 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
             }.toString()
             val contingentResultJson = runCatching { resultToJson(contingentResult).toString() }.getOrNull()
             transaction {
-                PlanRuns.insert {
+                val planRunId = PlanRuns.insert {
                     it[PlanRuns.caseId] = caseId
                     it[PlanRuns.jobId] = jobId
                     it[PlanRuns.status] = "contingent"
@@ -313,6 +313,15 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
                     it[PlanRuns.result] = contingentResultJson
                     it[PlanRuns.metadata] = metadataJson
                 }[PlanRuns.id]
+                // Record the material event so it appears in the case view
+                MaterialEvents.insert {
+                    it[MaterialEvents.caseId]         = caseId
+                    it[MaterialEvents.supplyId]       = req.supplyId.trim()
+                    it[MaterialEvents.delayDays]      = req.deliveryDelayDays
+                    it[MaterialEvents.qtyDecreasePct] = req.quantityDecreasePct
+                    it[MaterialEvents.note]           = "AI agent analysis (planRun=$planRunId)"
+                }
+                planRunId
             }
         } else null
 
