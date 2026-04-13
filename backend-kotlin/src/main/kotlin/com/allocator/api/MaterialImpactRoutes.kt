@@ -501,10 +501,14 @@ fun Routing.materialImpactRoutes() {
     }
 }
 
+@Serializable
+private data class PromoteResponse(val planRunId: Int, val caseId: Int, val status: String)
+
 /**
  * POST /cases/{caseId}/plan-runs/{planRunId}/promote
  * Promotes a contingent plan run to "success" status, making it the active plan for the case.
  * Only plan runs with status="contingent" can be promoted.
+ * Idempotent: already-promoted runs return 200 without error.
  */
 fun Routing.planRunRoutes() {
     post("/cases/{caseId}/plan-runs/{planRunId}/promote") {
@@ -518,17 +522,18 @@ fun Routing.planRunRoutes() {
                 .firstOrNull()
                 ?: throw NoSuchElementException("PlanRun $planRunId not found for case $caseId")
             val status = row[PlanRuns.status]
-            if (status != "contingent") {
-                throw IllegalArgumentException(
+            when (status) {
+                "contingent" -> PlanRuns.update({ PlanRuns.id eq planRunId }) {
+                    it[PlanRuns.status] = "success"
+                }
+                "success" -> { /* already promoted — idempotent, no-op */ }
+                else -> throw IllegalArgumentException(
                     "PlanRun $planRunId has status='$status'; only 'contingent' runs can be promoted"
                 )
             }
-            PlanRuns.update({ PlanRuns.id eq planRunId }) {
-                it[PlanRuns.status] = "success"
-            }
         }
         log.info("plan-run promoted: caseId={} planRunId={} status=success", caseId, planRunId)
-        call.respond(mapOf("planRunId" to planRunId, "caseId" to caseId, "status" to "success"))
+        call.respond(PromoteResponse(planRunId = planRunId, caseId = caseId, status = "success"))
     }
 }
 
