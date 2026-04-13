@@ -501,6 +501,37 @@ fun Routing.materialImpactRoutes() {
     }
 }
 
+/**
+ * POST /cases/{caseId}/plan-runs/{planRunId}/promote
+ * Promotes a contingent plan run to "success" status, making it the active plan for the case.
+ * Only plan runs with status="contingent" can be promoted.
+ */
+fun Routing.planRunRoutes() {
+    post("/cases/{caseId}/plan-runs/{planRunId}/promote") {
+        val caseId = call.parameters["caseId"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid caseId")
+        val planRunId = call.parameters["planRunId"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid planRunId")
+        transaction {
+            val row = PlanRuns.selectAll()
+                .where { (PlanRuns.id eq planRunId) and (PlanRuns.caseId eq caseId) }
+                .firstOrNull()
+                ?: throw NoSuchElementException("PlanRun $planRunId not found for case $caseId")
+            val status = row[PlanRuns.status]
+            if (status != "contingent") {
+                throw IllegalArgumentException(
+                    "PlanRun $planRunId has status='$status'; only 'contingent' runs can be promoted"
+                )
+            }
+            PlanRuns.update({ PlanRuns.id eq planRunId }) {
+                it[PlanRuns.status] = "success"
+            }
+        }
+        log.info("plan-run promoted: caseId={} planRunId={} status=success", caseId, planRunId)
+        call.respond(mapOf("planRunId" to planRunId, "caseId" to caseId, "status" to "success"))
+    }
+}
+
 // ── Legacy synchronous path (used by AssessmentRoutes Mode A) ─────────────────
 //
 // Kept intact so AssessmentRoutes can call it directly without going through the

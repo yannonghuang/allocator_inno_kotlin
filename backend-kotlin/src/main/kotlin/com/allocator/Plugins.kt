@@ -9,6 +9,7 @@ import com.allocator.api.overrideRoutes
 import com.allocator.api.peggingRoutes
 import com.allocator.api.materialImpactRoutes
 import com.allocator.api.materialEventRoutes
+import com.allocator.api.planRunRoutes
 import com.allocator.api.productRoutes
 import com.allocator.api.supplyRoutes
 import com.allocator.api.viewRoutes
@@ -86,6 +87,7 @@ fun Application.configureRouting() {
         materialImpactRoutes()
         materialEventRoutes()
         assessmentRoutes()
+        planRunRoutes()
         productRoutes()
         supplyRoutes()
     }
