@@ -185,11 +185,12 @@ object PlanRuns : Table("plan_run") {
     val id = integer("id").autoIncrement()
     val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
     val jobId = varchar("job_id", 64).nullable()
-    val status = varchar("status", 16).default("running")       // "running" | "success" | "failed"
+    val status = varchar("status", 16).default("running")       // "running" | "success" | "failed" | "contingent"
     val config = text("config").nullable()                       // JSON: PlanningConfig sent with request
     val overrideSnapshot = text("override_snapshot").nullable()  // JSON: overrides active at run time
     val result = text("result").nullable()                       // JSON: enriched plan result
     val error = text("error").nullable()
+    val metadata = text("metadata").nullable()                   // JSON: {"type":"contingent","supplyId":"...","deliveryDelayDays":N,"quantityDecreasePct":N,"baselinePlanRunId":M}
     val createdAt = timestamp("created_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 }

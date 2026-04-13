@@ -504,8 +504,15 @@ export default function CaseDetail() {
   const [copilotResizing, setCopilotResizing] = useState(false);
   const copilotMessagesEndRef = useRef<HTMLDivElement | null>(null);
 
+  // ── Supply criticality analysis state ─────────────────────────────────────
+  const [supplyCriticalityMap, setSupplyCriticalityMap] = useState<Record<string, 'critical' | 'not_critical' | 'running' | 'error'>>({});
+  const [criticalityRunning, setCriticalityRunning] = useState(false);
+  const [criticalityProgress, setCriticalityProgress] = useState<{ done: number; total: number } | null>(null);
+
   // ── Plan run history state ──────────────────────────────────────────────────
   const [planRunHistory, setPlanRunHistory] = useState<PlanRun[]>([]);
+  const currentRunIsContingent = currentPlanRunId != null &&
+    planRunHistory.find(r => r.id === currentPlanRunId)?.status === 'contingent';
   const [planRunHistoryOpen, setPlanRunHistoryOpen] = useState(false);
   const [planRunHistoryLoading, setPlanRunHistoryLoading] = useState(false);
   const [planRunLoadingId, setPlanRunLoadingId] = useState<number | null>(null);
@@ -976,6 +983,7 @@ export default function CaseDetail() {
         setPlanResult(full.result as typeof planResult);
         setCurrentPlanRunId(latest.id);
         setPlanWorkOrderPeggingCache({});
+        if (full.config) setPlanningConfig(full.config as PlanningConfig);
       }
     } catch {
       // non-fatal — plan results simply won't be pre-loaded
@@ -1392,6 +1400,16 @@ export default function CaseDetail() {
     return map;
   }, [planResult]);
 
+  /** Sum of initial_qty per product_id across all supply view rows (unfiltered). */
+  const supplyProductTotalMap = useMemo((): Record<string, number> => {
+    const m: Record<string, number> = {};
+    for (const r of supplyView) {
+      const pid = r.product_id ?? '';
+      if (pid) m[pid] = (m[pid] ?? 0) + (Number(r.initial_qty) || 0);
+    }
+    return m;
+  }, [supplyView]);
+
   /** Join caseSupplies rows with supplyPeggingMap to produce the enriched supply view. */
   const planSupplyViewRows = useMemo((): PlanSupplyViewRow[] => {
     return caseSupplies.map((s) => {
@@ -1410,6 +1428,51 @@ export default function CaseDetail() {
       };
     });
   }, [caseSupplies, supplyPeggingMap]);
+
+  /** Sum of qty per productId across all plan supply view rows (unfiltered). */
+  const planSupplyProductTotalMap = useMemo((): Record<string, number> => {
+    const m: Record<string, number> = {};
+    for (const r of planSupplyViewRows) {
+      const pid = r.productId ?? '';
+      if (pid) m[pid] = (m[pid] ?? 0) + (Number(r.qty) || 0);
+    }
+    return m;
+  }, [planSupplyViewRows]);
+
+  const handleAnalyzeCriticality = async () => {
+    const all = planSupplyViewRows.filter(r => !r.supplyId.toLowerCase().endsWith('_dummy'));
+    if (all.length === 0) return;
+
+    // Supplies with zero consumption are trivially safe — skip re-plan for them
+    const trivialSafe = all.filter(r => r.consumedQty === 0);
+    const needsAnalysis = all.filter(r => r.consumedQty > 0);
+
+    setCriticalityRunning(true);
+    setCriticalityProgress({ done: trivialSafe.length, total: all.length });
+    setSupplyCriticalityMap(prev => {
+      const next = { ...prev };
+      for (const r of trivialSafe) next[r.supplyId] = 'not_critical';
+      for (const r of needsAnalysis) next[r.supplyId] = 'running';
+      return next;
+    });
+
+    const BATCH = 5;
+    let done = trivialSafe.length;
+    for (let i = 0; i < needsAnalysis.length; i += BATCH) {
+      const batch = needsAnalysis.slice(i, i + BATCH);
+      await Promise.all(batch.map(async (r) => {
+        try {
+          const result = await analyzeMaterialImpact(r.supplyId, 0, 100, false);
+          setSupplyCriticalityMap(prev => ({ ...prev, [r.supplyId]: result.impactedDemandCount > 0 ? 'critical' : 'not_critical' }));
+        } catch {
+          setSupplyCriticalityMap(prev => ({ ...prev, [r.supplyId]: 'error' }));
+        }
+        done++;
+        setCriticalityProgress({ done, total: all.length });
+      }));
+    }
+    setCriticalityRunning(false);
+  };
 
   const handleAllocate = async () => {
     setAllocating(true);
@@ -1611,6 +1674,7 @@ export default function CaseDetail() {
         setPlanResult(full.result as typeof planResult);
         setCurrentPlanRunId(runId);
         setPlanWorkOrderPeggingCache({});
+        if (full.config) setPlanningConfig(full.config as PlanningConfig);
         setPlanRunHistoryOpen(false);
       }
     } catch (e) {
@@ -1910,11 +1974,11 @@ export default function CaseDetail() {
                   />
                   Only consumed (consumed qty &gt; 0) — uncheck to see all supplies
                 </label>
-                <SortFilterTable<SupplyViewRow & { _rowKey?: string }>
+                <SortFilterTable<SupplyViewRow & { _rowKey?: string; product_total: number }>
                 idKey="_rowKey"
                 rows={supplyView
                   .filter((r) => !supplyFilterConsumedOnly || (Number(r.consumed_qty) || 0) > 0)
-                  .map((r, i) => ({ ...r, _rowKey: r.id != null ? String(r.id) : `supply-${r.supply_id}-${i}` }))}
+                  .map((r, i) => ({ ...r, _rowKey: r.id != null ? String(r.id) : `supply-${r.supply_id}-${i}`, product_total: supplyProductTotalMap[r.product_id] ?? 0 }))}
                 rowId={(r) => (r.id != null ? `supply-${r.id}` : r.supply_id ? `supply-${r.supply_id}` : undefined)}
                 onRowClick={handleSupplyPeggingClick}
                 filterKeys={['supply_id', 'product_id', 'location_id', 'component_key', 'supply_date', 'consumed_qty', 'utilization_rate']}
@@ -1925,6 +1989,7 @@ export default function CaseDetail() {
                   { key: 'product_id', label: 'Product', sortable: true },
                   { key: 'location_id', label: 'Location', sortable: true },
                   { key: 'initial_qty', label: 'Initial qty', sortable: true },
+                  { key: 'product_total', label: 'Total per product', sortable: true, render: (r) => r.product_total > 0 ? r.product_total.toLocaleString() : '–' },
                   { key: 'consumed_qty', label: 'Consumed qty', sortable: true },
                   { key: 'residual_qty', label: 'Residual qty', sortable: true },
                   { key: 'utilization_rate', label: 'Utilization', sortable: true, render: (r) => r.utilization_rate != null ? `${(Number(r.utilization_rate) * 100).toFixed(1)}%` : '–' },
@@ -2554,7 +2619,8 @@ export default function CaseDetail() {
           <br style={{ marginTop: '0.25rem' }} />
           <button
             type="button"
-            disabled={planLoading}
+            disabled={planLoading || currentRunIsContingent}
+            title={currentRunIsContingent ? 'Viewing a contingent (what-if) run — load a baseline run first to re-plan' : undefined}
             onClick={async () => {
               setPlanError(null);
               setPlanLoading(true);
@@ -2619,6 +2685,12 @@ export default function CaseDetail() {
         {planError && <p style={{ color: '#f87171', marginTop: '0.5rem' }}>{planError}</p>}
         {planResult && !planLoading && (
           <>
+            {currentRunIsContingent && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#2e1065', border: '1px solid #7c3aed', borderRadius: 6, padding: '6px 12px', marginBottom: '0.75rem', fontSize: '0.82rem', color: '#ddd6fe' }}>
+                <span style={{ fontWeight: 700, color: '#a78bfa' }}>Contingent run #{currentPlanRunId}</span>
+                <span>— what-if branch. Run a fresh plan to create a new baseline.</span>
+              </div>
+            )}
             {/* Plan KPI dashboard – always show when plan result exists; build kpis safely from backend or client */}
             <PlanKpiDashboard planResult={planResult} />
             <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1.5rem', marginBottom: '0.5rem' }}>
@@ -3288,6 +3360,36 @@ export default function CaseDetail() {
                       <span>{tP('supplyView.filterHideDummy')}</span>
                     </label>
                   </div>
+                  {/* Criticality analysis */}
+                  <div style={{ marginBottom: '0.75rem', borderTop: '1px solid #3d3d40', paddingTop: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      onClick={handleAnalyzeCriticality}
+                      disabled={criticalityRunning || planSupplyViewRows.length === 0}
+                      style={{ fontSize: '0.8rem' }}
+                    >
+                      {criticalityRunning
+                        ? `Analyzing… (${criticalityProgress?.done ?? 0}/${criticalityProgress?.total ?? 0})`
+                        : 'Analyze Criticality'}
+                    </button>
+                    {!criticalityRunning && Object.keys(supplyCriticalityMap).length > 0 && (
+                      <button
+                        type="button"
+                        className="secondary"
+                        onClick={() => setSupplyCriticalityMap({})}
+                        style={{ fontSize: '0.8rem' }}
+                      >Clear</button>
+                    )}
+                    {!criticalityRunning && Object.keys(supplyCriticalityMap).length > 0 && (() => {
+                      const critical = Object.values(supplyCriticalityMap).filter(s => s === 'critical').length;
+                      const safe = Object.values(supplyCriticalityMap).filter(s => s === 'not_critical').length;
+                      return <span style={{ fontSize: '0.75rem', color: '#a1a1aa' }}>
+                        <span style={{ color: '#f87171', fontWeight: 600 }}>{critical} critical</span>
+                        {' · '}
+                        <span style={{ color: '#34d399' }}>{safe} safe</span>
+                      </span>;
+                    })()}
+                  </div>
                   {/* Assessment criteria editor */}
                   <div style={{ marginBottom: '0.75rem', borderTop: '1px solid #3d3d40', paddingTop: '0.5rem' }}>
                     <button
@@ -3373,25 +3475,39 @@ export default function CaseDetail() {
                             <span> {tP('supplyView.overallUtilization', { pct: overallUtil, consumed: Number(totalConsumed).toLocaleString(), initial: Number(totalInitial).toLocaleString() })}</span>
                           )}
                         </p>
-                        <SortFilterTable<PlanSupplyViewRow & { _key: string }>
+                        <SortFilterTable<PlanSupplyViewRow & { _key: string; productTotal: number; criticalityOrder: number }>
                           idKey="_key"
-                          rows={rows.map((r, i) => ({ ...r, _key: `psv-${i}-${r.supplyId}` }))}
+                          rows={rows.map((r, i) => {
+                            const cs = supplyCriticalityMap[r.supplyId];
+                            const criticalityOrder = cs === 'critical' ? 0 : cs === 'not_critical' ? 1 : cs === 'error' ? 2 : cs === 'running' ? 3 : 4;
+                            return { ...r, _key: `psv-${i}-${r.supplyId}`, productTotal: planSupplyProductTotalMap[r.productId] ?? 0, criticalityOrder };
+                          })}
                           filterKeys={[]}
                           defaultSortKey="supplyDate"
                           columns={[
+                            { key: 'criticalityOrder', label: 'Criticality', sortable: true, render: (r) => {
+                              const cs = supplyCriticalityMap[r.supplyId];
+                              if (!cs) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                              if (cs === 'running') return <span style={{ color: '#a1a1aa', fontSize: '0.75rem' }}>…</span>;
+                              if (cs === 'error') return <span style={{ color: '#f59e0b', fontSize: '0.72rem' }}>err</span>;
+                              if (cs === 'critical') return <span style={{ background: 'rgba(248,113,113,0.15)', color: '#f87171', border: '1px solid rgba(248,113,113,0.4)', borderRadius: 8, padding: '1px 8px', fontSize: '0.72rem', fontWeight: 700 }}>Critical</span>;
+                              return <span style={{ background: 'rgba(52,211,153,0.12)', color: '#34d399', border: '1px solid rgba(52,211,153,0.35)', borderRadius: 8, padding: '1px 8px', fontSize: '0.72rem', fontWeight: 700 }}>Safe</span>;
+                            }},
                             { key: 'supplyId', label: tP('supplyView.columns.supplyId'), sortable: true },
                             { key: 'productId', label: tP('supplyView.columns.product'), sortable: true },
                             { key: 'locationId', label: tP('supplyView.columns.location'), sortable: true, render: (r) => r.locationId ?? '–' },
                             { key: 'vendorId', label: tP('supplyView.columns.vendor'), sortable: true, render: (r) => r.vendorId ?? '–' },
                             { key: 'supplyDate', label: tP('supplyView.columns.supplyDate'), sortable: true, render: (r) => r.supplyDate ?? '–' },
                             { key: 'qty', label: tP('supplyView.columns.initialQty'), sortable: true, render: (r) => Number(r.qty).toLocaleString() },
+                            { key: 'productTotal', label: tP('supplyView.columns.productTotal'), sortable: true, render: (r) => r.productTotal > 0 ? Number(r.productTotal).toLocaleString() : '–' },
                             { key: 'consumedQty', label: tP('supplyView.columns.consumed'), sortable: true, render: (r) => r.consumedQty > 0 ? <span style={{ color: '#a78bfa' }}>{Number(r.consumedQty).toLocaleString()}</span> : <span style={{ color: '#52525b' }}>0</span> },
                             { key: 'residualQty', label: tP('supplyView.columns.residual'), sortable: true, render: (r) => r.residualQty > 0 ? <span style={{ color: '#34d399' }}>{Number(r.residualQty).toLocaleString()}</span> : <span style={{ color: '#52525b' }}>0</span> },
                             { key: 'utilizationRate', label: tP('supplyView.columns.utilPct'), sortable: true, render: (r) => {
                               if (r.utilizationRate == null) return <span style={{ color: '#52525b' }}>–</span>;
                               const pct = (r.utilizationRate * 100).toFixed(1);
-                              const color = r.utilizationRate >= 0.9 ? '#34d399' : r.utilizationRate >= 0.5 ? '#f59e0b' : '#f87171';
-                              return <span style={{ color }}>{pct}%</span>;
+                              const color = r.utilizationRate > 1.0 ? '#f87171' : r.utilizationRate >= 0.9 ? '#34d399' : r.utilizationRate >= 0.5 ? '#f59e0b' : '#f87171';
+                              const overAllocated = r.utilizationRate > 1.0;
+                              return <span style={{ color }} title={overAllocated ? 'Over-allocated: consumed exceeds initial qty' : undefined}>{pct}%{overAllocated ? ' ⚠' : ''}</span>;
                             }},
                             { key: 'peggedDemandCount', label: tP('supplyView.columns.peggedDemands'), sortable: true, render: (r) => r.peggedDemandCount > 0 ? <span style={{ color: '#60a5fa' }}>{r.peggedDemandCount}</span> : <span style={{ color: '#52525b' }}>0</span> },
                             { key: 'totalPeggedQty', label: tP('supplyView.columns.totalPeggedQty'), sortable: true, render: (r) => r.totalPeggedQty > 0 ? Number(r.totalPeggedQty).toLocaleString() : <span style={{ color: '#52525b' }}>0</span> },
@@ -3750,7 +3866,7 @@ export default function CaseDetail() {
                           setMaterialAssessmentLoading(m => ({ ...m, [ev.id]: true }));
                           setMaterialAssessmentError(m => ({ ...m, [ev.id]: null }));
                           try {
-                            const result = await runAssessment(id, ev.supplyId, ev.delayDays, ev.qtyDecreasePct);
+                            const result = await runAssessment(id, ev.supplyId, ev.delayDays, ev.qtyDecreasePct, undefined, impact);
                             setMaterialAssessments(m => ({ ...m, [ev.id]: result }));
                             const hist = await listAssessments(id, ev.supplyId);
                             setMaterialAssessmentHistory(m => ({ ...m, [ev.id]: hist }));
@@ -3781,6 +3897,11 @@ export default function CaseDetail() {
                         <span style={{ background: impact.impactedDemandCount > 0 ? '#991b1b' : '#166534', color: '#fff', borderRadius: 6, padding: '2px 8px', fontSize: '0.8rem', fontWeight: 600 }}>
                           {impact.impactedDemandCount} impacted demand{impact.impactedDemandCount !== 1 ? 's' : ''}
                         </span>
+                        {impact.contingentPlanRunId != null && (
+                          <span style={{ color: '#71717a', fontSize: '0.75rem' }}>
+                            baseline run #{impact.planRunId} · contingent run #{impact.contingentPlanRunId}
+                          </span>
+                        )}
                         {impact.note && <span style={{ color: '#a1a1aa', fontSize: '0.8rem' }}>{impact.note}</span>}
                       </div>
                       {impact.impacts.length > 0 && (
@@ -3792,26 +3913,41 @@ export default function CaseDetail() {
                               <th style={{ textAlign: 'left', padding: '4px 8px', fontWeight: 500 }}>Customer</th>
                               <th style={{ textAlign: 'right', padding: '4px 8px', fontWeight: 500 }}>Due</th>
                               <th style={{ textAlign: 'right', padding: '4px 8px', fontWeight: 500 }}>Req qty</th>
-                              <th style={{ textAlign: 'right', padding: '4px 8px', fontWeight: 500 }}>Consumed</th>
+                              <th style={{ textAlign: 'right', padding: '4px 8px', fontWeight: 500 }}>Baseline qty</th>
+                              <th style={{ textAlign: 'right', padding: '4px 8px', fontWeight: 500 }}>Contingent qty</th>
+                              <th style={{ textAlign: 'right', padding: '4px 8px', fontWeight: 500 }}>Shortfall</th>
                               <th style={{ textAlign: 'center', padding: '4px 8px', fontWeight: 500 }}>Status</th>
                             </tr>
                           </thead>
                           <tbody>
-                            {impact.impacts.map((imp) => (
-                              <tr key={imp.demandId} style={{ borderBottom: '1px solid #1f1f22' }}>
-                                <td style={{ padding: '5px 8px', color: '#e4e4e7', fontFamily: 'monospace' }}>{imp.demandId}</td>
-                                <td style={{ padding: '5px 8px', color: '#a1a1aa' }}>{imp.productId}</td>
-                                <td style={{ padding: '5px 8px', color: '#a1a1aa' }}>{imp.customerId}</td>
-                                <td style={{ padding: '5px 8px', color: '#a1a1aa', textAlign: 'right' }}>{imp.requestDueTime ?? '–'}</td>
-                                <td style={{ padding: '5px 8px', textAlign: 'right', color: '#e4e4e7' }}>{Number(imp.requestedQty).toLocaleString()}</td>
-                                <td style={{ padding: '5px 8px', textAlign: 'right', color: '#e4e4e7' }}>{Number(imp.consumedSupplyQty).toLocaleString()}</td>
-                                <td style={{ padding: '5px 8px', textAlign: 'center' }}>
-                                  <span style={{ background: imp.status === 'delayed' ? '#7c3aed' : '#b45309', color: '#fff', borderRadius: 5, padding: '2px 7px', fontSize: '0.73rem' }}>
-                                    {imp.status}
-                                  </span>
-                                </td>
-                              </tr>
-                            ))}
+                            {impact.impacts.map((imp) => {
+                              const baseQty = imp.baselineCommittedQty ?? imp.consumedSupplyQty;
+                              const contQty = imp.contingentCommittedQty ?? 0;
+                              const shortfall = baseQty - contQty;
+                              const statusColor =
+                                imp.status === 'newly_failed' ? '#991b1b' :
+                                imp.status === 'qty_reduced'  ? '#b45309' :
+                                imp.status === 'delayed'      ? '#7c3aed' : '#b45309';
+                              return (
+                                <tr key={imp.demandId} style={{ borderBottom: '1px solid #1f1f22' }}>
+                                  <td style={{ padding: '5px 8px', color: '#e4e4e7', fontFamily: 'monospace' }}>{imp.demandId}</td>
+                                  <td style={{ padding: '5px 8px', color: '#a1a1aa' }}>{imp.productId}</td>
+                                  <td style={{ padding: '5px 8px', color: '#a1a1aa' }}>{imp.customerId}</td>
+                                  <td style={{ padding: '5px 8px', color: '#a1a1aa', textAlign: 'right' }}>{imp.requestDueTime ?? '–'}</td>
+                                  <td style={{ padding: '5px 8px', textAlign: 'right', color: '#e4e4e7' }}>{Number(imp.requestedQty).toLocaleString()}</td>
+                                  <td style={{ padding: '5px 8px', textAlign: 'right', color: '#e4e4e7' }}>{Number(baseQty).toLocaleString()}</td>
+                                  <td style={{ padding: '5px 8px', textAlign: 'right', color: contQty < baseQty ? '#f87171' : '#e4e4e7' }}>{Number(contQty).toLocaleString()}</td>
+                                  <td style={{ padding: '5px 8px', textAlign: 'right', color: shortfall > 0 ? '#f87171' : '#a1a1aa' }}>
+                                    {shortfall > 0 ? `-${Number(shortfall).toLocaleString()}` : '–'}
+                                  </td>
+                                  <td style={{ padding: '5px 8px', textAlign: 'center' }}>
+                                    <span style={{ background: statusColor, color: '#fff', borderRadius: 5, padding: '2px 7px', fontSize: '0.73rem' }}>
+                                      {imp.status}
+                                    </span>
+                                  </td>
+                                </tr>
+                              );
+                            })}
                           </tbody>
                         </table>
                       )}
@@ -3933,7 +4069,7 @@ export default function CaseDetail() {
                 <div key={run.id} style={{ borderBottom: '1px solid #27272a', paddingBottom: '0.75rem', marginBottom: '0.75rem' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                     <div>
-                      <span style={{ fontSize: '0.85rem', fontWeight: 600, color: run.status === 'success' ? '#4ade80' : run.status === 'failed' ? '#f87171' : '#fbbf24' }}>
+                      <span style={{ fontSize: '0.85rem', fontWeight: 600, color: run.status === 'success' ? '#4ade80' : run.status === 'failed' ? '#f87171' : run.status === 'contingent' ? '#a78bfa' : '#fbbf24' }}>
                         {run.status}
                       </span>
                       <span style={{ marginLeft: 8, fontSize: '0.8rem', color: '#a1a1aa' }}>
@@ -3946,7 +4082,7 @@ export default function CaseDetail() {
                       )}
                     </div>
                     <div style={{ display: 'flex', gap: 6 }}>
-                      {run.status === 'success' && (
+                      {(run.status === 'success' || run.status === 'contingent') && (
                         <button
                           type="button"
                           className="secondary"

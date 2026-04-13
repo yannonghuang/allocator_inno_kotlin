@@ -344,13 +344,17 @@ fun runConsolidation(
                     "demand_tag"  to b["demand_tag"],
                 )
             }.toMutableList()
-            val (committed, wos, pegging) = planFn(syntheticDemand, invCopy, data, group.timeBucket, 500, emptySet(), planConfig, null)
+            val (committed, wos, _) = planFn(syntheticDemand, invCopy, data, group.timeBucket, 500, emptySet(), planConfig, null)
             val producedQty = committed.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
             // Mark WOs and add
             wos.forEach { wo ->
                 consolidatedWOs.add(wo + mapOf("consolidated" to false))
             }
-            if (pegging != null) consolidatedPegging.add(mapOf("demand_id" to need.demandId, "tree" to pegging))
+            // Do NOT add pegging for single-demand groups here — the main planning loop will plan
+            // this demand again using the tagged supply bucket (injected below) and produce the
+            // authoritative pegging. Emitting pegging here would double-count supply consumption
+            // in planning_pegging (this copy-based run shows the original supply; the main loop
+            // shows the consolidated supply, and the walk sums both).
             allocation.getOrPut(need.demandId) { mutableMapOf() }[componentKey] = producedQty
             // Consume from real inventory (claim the supply)
             consumeFromInventoryForConsolidation(inventory, group.productId, group.locationId, producedQty)

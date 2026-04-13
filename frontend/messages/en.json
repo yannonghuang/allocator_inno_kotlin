@@ -471,6 +471,7 @@
         "vendor": "Vendor",
         "supplyDate": "Supply Date",
         "initialQty": "Initial Qty",
+        "productTotal": "Total per product",
         "consumed": "Consumed",
         "residual": "Residual",
         "utilPct": "Util %",

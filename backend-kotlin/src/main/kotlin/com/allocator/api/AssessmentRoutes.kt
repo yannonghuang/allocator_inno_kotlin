@@ -33,6 +33,16 @@ the following are criteria for MEDIUM rating:
 otherwise.
 """.trimIndent()
 
+/**
+ * Programmatic rating for the DEFAULT_CRITERIA thresholds.
+ * Used whenever the active criteria matches the default to avoid LLM arithmetic/logic errors.
+ */
+private fun computeDefaultRating(demandCount: Int, totalShortfall: Double): String = when {
+    demandCount >= 5 || totalShortfall >= 5000.0 -> "HIGH"
+    demandCount <= 2 || totalShortfall < 500.0   -> "LOW"
+    else                                          -> "MEDIUM"
+}
+
 // ── DTOs ──────────────────────────────────────────────────────────────────────
 
 @Serializable
@@ -112,15 +122,24 @@ private fun buildPrompt(impact: MaterialImpactResponse, criteria: String): Strin
         }
         if (isEmpty()) append("no change parameters specified")
     }
+
+    // Pre-compute aggregates so the LLM evaluates criteria against explicit numbers.
+    // Fall back to consumedSupplyQty for the legacy sync path where re-plan fields are absent.
+    val totalShortfall = impact.impacts.sumOf { d ->
+        if (d.baselineCommittedQty > 0.0 || d.contingentCommittedQty > 0.0)
+            d.baselineCommittedQty - d.contingentCommittedQty
+        else
+            d.consumedSupplyQty
+    }
+    val demandCount = impact.impactedDemandCount
+
     val demandLines = impact.impacts.joinToString("\n") { d ->
-        "- ${d.demandId}  customer=${d.customerId}  priority=${d.priority ?: "n/a"}  due=${d.requestDueTime ?: "n/a"}  requested=${d.requestedQty}  supply-consumed=${d.consumedSupplyQty}  status=${d.status}"
+        val shortfall = d.baselineCommittedQty - d.contingentCommittedQty
+        "- ${d.demandId}  customer=${d.customerId}  priority=${d.priority ?: "n/a"}  due=${d.requestDueTime ?: "n/a"}  requested=${d.requestedQty}  baseline-committed=${d.baselineCommittedQty}  contingent-committed=${d.contingentCommittedQty}  shortfall=${shortfall}  status=${d.status}"
     }.ifEmpty { "  (none)" }
 
     return """
 You are a supply chain risk analyst.
-
-Assessment criteria:
-$criteria
 
 Supply change under evaluation:
 - Supply ID: ${impact.supply.supplyId}
@@ -128,14 +147,56 @@ Supply change under evaluation:
 - Initial quantity: ${impact.supply.qty}
 - Change: $changeDesc
 
-Impacted committed demands (${impact.impactedDemandCount} total):
+PRE-COMPUTED SUMMARY (authoritative — do NOT recalculate from the detail rows below):
+- Number of impacted demands: $demandCount
+- Total shortfall quantity: $totalShortfall
+
+Impacted demand details (for context only):
 $demandLines
+
+Assessment criteria:
+$criteria
+
+Instructions:
+1. Use ONLY the pre-computed summary figures above (impacted demand count = $demandCount, total shortfall = $totalShortfall).
+2. Evaluate EVERY condition in the criteria independently, including all OR branches.
+3. If ANY condition for a rating is satisfied, that rating applies — do not stop at the first failing condition.
 
 Classify the overall impact severity as exactly one of: LOW, MEDIUM, or HIGH.
 
 Respond in this exact format (no other text before or after):
 RATING: <LOW|MEDIUM|HIGH>
-EXPLANATION: <2–3 sentences; use the same language as the assessment criteria above>
+EXPLANATION: <2–3 sentences; state the specific pre-computed values that triggered the rating>
+""".trimIndent()
+}
+
+/**
+ * Prompt variant for when the rating has already been determined programmatically.
+ * The LLM is asked only to write the explanation — no classification task.
+ */
+private fun buildExplanationPrompt(impact: MaterialImpactResponse, criteria: String, rating: String, totalShortfall: Double): String {
+    val changeDesc = buildString {
+        if (impact.deliveryDelayDays > 0) append("delayed by ${impact.deliveryDelayDays} days")
+        if (impact.quantityDecreasePct > 0) {
+            if (isNotEmpty()) append(", ")
+            append("quantity reduced by ${impact.quantityDecreasePct}%")
+        }
+        if (isEmpty()) append("no change parameters specified")
+    }
+    return """
+You are a supply chain risk analyst writing an impact summary.
+
+Supply change: ${impact.supply.supplyId} (${impact.supply.productId}), $changeDesc
+Impacted demands: ${impact.impactedDemandCount}, total shortfall quantity: $totalShortfall
+
+Assessment criteria used:
+$criteria
+
+The impact has been rated: $rating
+
+Write 2–3 sentences explaining this rating in terms of the criteria above.
+Cite the specific numbers (demand count and total shortfall) that determined the outcome.
+Output ONLY the explanation text — no labels, no preamble.
 """.trimIndent()
 }
 
@@ -174,6 +235,32 @@ private suspend fun callLlm(prompt: String): Pair<String, String> {
 
     log.info("LLM assessment: rating={} explanation_len={}", rating, explanation.length)
     return Pair(rating, explanation)
+}
+
+/** Call LLM and return the raw response text (no RATING: parsing — for explanation-only prompts). */
+private suspend fun callLlmForText(prompt: String): String {
+    val apiKey = config.openAiApiKey
+        ?: throw IllegalStateException("OPENAI_API_KEY is not configured")
+
+    val reqBody = OpenAiRequest(
+        model = config.assessmentModel,
+        maxTokens = 256,
+        messages = listOf(OpenAiMessage(role = "user", content = prompt)),
+    )
+
+    val resp = openAiClient.post("https://api.openai.com/v1/chat/completions") {
+        header("Authorization", "Bearer $apiKey")
+        contentType(ContentType.Application.Json)
+        setBody(reqBody)
+    }
+
+    if (!resp.status.isSuccess()) {
+        val body = resp.body<String>()
+        throw IllegalStateException("OpenAI API error ${resp.status.value}: $body")
+    }
+
+    return resp.body<OpenAiResponse>().choices.firstOrNull()?.message?.content?.trim()
+        ?: throw IllegalStateException("OpenAI response contained no content")
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -286,9 +373,26 @@ private suspend fun handleAssessment(
         effectiveCaseId, impact.supply.supplyId, impact.deliveryDelayDays, impact.impactedDemandCount,
     )
 
-    // Call LLM
-    val prompt = buildPrompt(impact, criteria)
-    val (rating, explanation) = callLlm(prompt)
+    // Determine rating — programmatically for default criteria; LLM for custom criteria
+    // totalShortfall: prefer re-plan diff fields; fall back to consumedSupplyQty for the
+    // legacy sync path (computeMaterialImpact) which doesn't run a contingent plan.
+    val totalShortfall = impact.impacts.sumOf { d ->
+        if (d.baselineCommittedQty > 0.0 || d.contingentCommittedQty > 0.0)
+            d.baselineCommittedQty - d.contingentCommittedQty
+        else
+            d.consumedSupplyQty
+    }
+    val (rating, explanation) = if (criteria.trim() == DEFAULT_CRITERIA.trim()) {
+        val computedRating = computeDefaultRating(impact.impactedDemandCount, totalShortfall)
+        log.info("assessment: using programmatic rating={} (demandCount={} totalShortfall={})",
+            computedRating, impact.impactedDemandCount, totalShortfall)
+        val explanationPrompt = buildExplanationPrompt(impact, criteria, computedRating, totalShortfall)
+        val explanationText = callLlmForText(explanationPrompt)
+        Pair(computedRating, explanationText)
+    } else {
+        val prompt = buildPrompt(impact, criteria)
+        callLlm(prompt)
+    }
 
     // Persist result
     val assessmentId = transaction {

@@ -414,7 +414,7 @@ export type PlanRun = {
   id: number;
   case_id: number;
   job_id: string | null;
-  status: 'running' | 'success' | 'failed';
+  status: 'running' | 'success' | 'failed' | 'contingent';
   config: Record<string, unknown> | null;
   override_count: number;
   created_at: string;
@@ -722,10 +722,20 @@ export type MaterialImpactedDemand = {
   requestDueTime: string | null;
   requestedQty: number;
   consumedSupplyQty: number;
-  status: string; // "delayed" | "at_risk"
+  status: string; // "newly_failed" | "qty_reduced" | "delayed" | "at_risk"
+  // Re-plan diff fields
+  baselineCommittedQty: number;
+  contingentCommittedQty: number;
+  qtyDelta: number;
+  baselineFailed: boolean;
+  contingentFailed: boolean;
+  contingentCommitReason: string | null;
 };
 
 export type MaterialImpactResult = {
+  caseId: number;
+  planRunId: number | null;
+  contingentPlanRunId: number | null;
   supply: {
     supplyId: string;
     productId: string;
@@ -783,14 +793,34 @@ export async function analyzeMaterialImpact(
   supplyId: string,
   deliveryDelayDays: number,
   quantityDecreasePct: number,
+  persist = true,
 ): Promise<MaterialImpactResult> {
-  const r = await fetch(`${API}/material-impact`, {
+  // 1. Submit async re-plan job
+  const submit = await fetch(`${API}/material-impact`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ supplyId, deliveryDelayDays, quantityDecreasePct }),
+    body: JSON.stringify({ supplyId, deliveryDelayDays, quantityDecreasePct, persist }),
   });
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+  if (!submit.ok) throw new Error(await submit.text());
+  const { jobId } = await submit.json();
+  if (!jobId) throw new Error('No jobId returned from material-impact');
+
+  // 2. Poll until completed (exponential back-off: 1→2→4→8→8s, max 120s)
+  let delay = 1000;
+  const maxDelay = 8000;
+  const maxWait = 120_000;
+  const start = Date.now();
+  while (Date.now() - start < maxWait) {
+    await new Promise(res => setTimeout(res, delay));
+    delay = Math.min(delay * 2, maxDelay);
+
+    const poll = await fetch(`${API}/material-impact/status/${encodeURIComponent(jobId)}`);
+    if (!poll.ok) throw new Error(`Poll failed: ${poll.status}`);
+    const body = await poll.json();
+    if (body.status === 'completed') return body.result as MaterialImpactResult;
+    if (body.status === 'failed') throw new Error(body.error ?? 'Re-plan job failed');
+  }
+  throw new Error('Material impact analysis timed out');
 }
 
 // ── Material Impact Assessment ─────────────────────────────────────────────────
@@ -854,16 +884,21 @@ export async function listAssessments(caseId: number, supplyId?: string): Promis
   return r.json();
 }
 
-/** Run a new assessment (Mode A): supply change params → impact computation → LLM rating. */
+/** Run a new assessment.
+ *  Mode B (preferred): pass `impact` to skip re-computation and use the already-run re-plan result.
+ *  Mode A (fallback):  omit `impact`; backend computes impact via pegging-tree walk (less accurate).
+ */
 export async function runAssessment(
   caseId: number,
   supplyId: string,
   deliveryDelayDays: number,
   quantityDecreasePct: number,
   planRunId?: number | null,
+  impact?: MaterialImpactResult | null,
 ): Promise<AssessmentResponse> {
   const body: Record<string, unknown> = { supplyId, deliveryDelayDays, quantityDecreasePct, caseId };
   if (planRunId != null) body.planRunId = planRunId;
+  if (impact != null) body.impact = impact;
   const r = await fetchWithTimeout(
     `${API}/material-impact-assessment`,
     { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },

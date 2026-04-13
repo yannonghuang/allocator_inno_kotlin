@@ -197,6 +197,8 @@ private fun migrateSchema() {
         """.trimIndent(),
         // Assessment criteria column on cases
         "ALTER TABLE cases ADD COLUMN IF NOT EXISTS assessment_criteria TEXT",
+        // Metadata column on plan_run (used for contingent runs from material-impact)
+        "ALTER TABLE plan_run ADD COLUMN IF NOT EXISTS metadata TEXT",
         // Fix FK constraints to use ON DELETE CASCADE (idempotent: drop if exists, re-add)
         *cascadeFkMigrations()
     )
