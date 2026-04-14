@@ -390,22 +390,65 @@ fun Routing.allocateRoutes() {
             ?: throw IllegalArgumentException("Invalid case_id")
         val runId = call.parameters["run_id"]?.toIntOrNull()
             ?: throw IllegalArgumentException("Invalid run_id")
-        val response = transaction {
+
+        data class RawRow(
+            val id: Int, val caseId: Int, val jobId: String?, val status: String,
+            val config: String?, val overrideSnapshot: String?,
+            val result: String?, val error: String?, val createdAt: kotlinx.datetime.Instant,
+        )
+        val raw = transaction {
             val row = PlanRuns.selectAll().where {
                 (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId)
             }.singleOrNull() ?: throw NoSuchElementException("Plan run not found")
-            PlanRunFullResponse(
-                id = row[PlanRuns.id],
-                caseId = row[PlanRuns.caseId],
-                jobId = row[PlanRuns.jobId],
-                status = row[PlanRuns.status],
-                config = row[PlanRuns.config]?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
-                overrideSnapshot = row[PlanRuns.overrideSnapshot]?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
-                result = row[PlanRuns.result]?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
-                error = row[PlanRuns.error],
-                createdAt = formatTs(row[PlanRuns.createdAt]),
+            RawRow(
+                id = row[PlanRuns.id], caseId = row[PlanRuns.caseId],
+                jobId = row[PlanRuns.jobId], status = row[PlanRuns.status],
+                config = row[PlanRuns.config], overrideSnapshot = row[PlanRuns.overrideSnapshot],
+                result = row[PlanRuns.result], error = row[PlanRuns.error],
+                createdAt = row[PlanRuns.createdAt],
             )
         }
+
+        // Lazily re-enrich stale results that pre-date requested_qty enrichment.
+        // Check by looking at the first committed_demand entry; if requested_qty is absent,
+        // reload case data and re-enrich, then persist so it only runs once.
+        val resultJson: String? = if (raw.result != null && raw.status == "success") {
+            val needsEnrichment = runCatching {
+                val parsed = Json.parseToJsonElement(raw.result).jsonObject
+                val firstDemand = parsed["committed_demands"]?.jsonArray?.firstOrNull()?.jsonObject
+                firstDemand != null && !firstDemand.containsKey("requested_qty")
+            }.getOrElse { false }
+
+            if (needsEnrichment) {
+                runCatching {
+                    @Suppress("UNCHECKED_CAST")
+                    val resultMap = jsonToAny(Json.parseToJsonElement(raw.result)) as? Map<String, Any>
+                    if (resultMap != null) {
+                        val data = transaction { CaseLoader.load(caseId) }
+                        val enriched = enrichPlanResultWithData(caseId, resultMap, data)
+                        val enrichedJson = anyToJson(enriched).toString()
+                        transaction {
+                            PlanRuns.update({ PlanRuns.id eq runId }) {
+                                it[PlanRuns.result] = enrichedJson
+                            }
+                        }
+                        enrichedJson
+                    } else raw.result
+                }.getOrElse { raw.result }
+            } else raw.result
+        } else raw.result
+
+        val response = PlanRunFullResponse(
+            id = raw.id,
+            caseId = raw.caseId,
+            jobId = raw.jobId,
+            status = raw.status,
+            config = raw.config?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
+            overrideSnapshot = raw.overrideSnapshot?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
+            result = resultJson?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
+            error = raw.error,
+            createdAt = formatTs(raw.createdAt),
+        )
         call.respond(response)
     }
 
