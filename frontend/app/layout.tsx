@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import './globals.css';
 import { NextIntlClientProvider } from 'next-intl';
 import { getMessages, getLocale } from 'next-intl/server';
+import { SidebarLayout } from '@/app/components/SidebarLayout';
 
 export const metadata: Metadata = {
   title: 'Supply-Demand Allocator',
@@ -19,7 +20,9 @@ export default async function RootLayout({
     <html lang={locale}>
       <body>
         <NextIntlClientProvider messages={messages}>
-          {children}
+          <SidebarLayout>
+            {children}
+          </SidebarLayout>
         </NextIntlClientProvider>
       </body>
     </html>

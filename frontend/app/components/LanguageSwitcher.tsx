@@ -17,7 +17,7 @@ export function LanguageSwitcher() {
   };
 
   return (
-    <div style={{ position: 'fixed', top: 8, right: 16, zIndex: 1000, display: 'flex', gap: 4 }}>
+    <div style={{ display: 'flex', gap: 4 }}>
       <button
         className={locale === 'en' ? '' : 'secondary'}
         style={{ fontSize: '0.78em', padding: '2px 8px', minWidth: 36 }}

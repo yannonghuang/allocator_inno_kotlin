@@ -50,7 +50,17 @@
     }
   },
   "nav": {
-    "backToCases": "← 方案列表"
+    "backToCases": "← 方案列表",
+    "cases": "方案列表",
+    "planning": "计划",
+    "configure": "配置",
+    "kpis": "关键指标",
+    "history": "历史记录",
+    "bomGraph": "物料清单图",
+    "materialImpact": "影响分析",
+    "events": "事件",
+    "criteria": "评估标准",
+    "allocation": "配置运算"
   },
   "sections": {
     "allocation": "配置",

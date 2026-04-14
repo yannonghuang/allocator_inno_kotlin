@@ -50,7 +50,17 @@
     }
   },
   "nav": {
-    "backToCases": "← Cases"
+    "backToCases": "← Cases",
+    "cases": "Cases",
+    "planning": "Planning",
+    "configure": "Configure",
+    "kpis": "KPIs",
+    "history": "History",
+    "bomGraph": "BOM Graph",
+    "materialImpact": "Impact Analysis",
+    "events": "Events",
+    "criteria": "Criteria",
+    "allocation": "Allocation"
   },
   "sections": {
     "allocation": "Allocation",
