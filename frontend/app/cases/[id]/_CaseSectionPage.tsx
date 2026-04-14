@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
@@ -346,6 +346,85 @@ function buildCriteriaText(high: string, low: string, medium: string): string {
   return parts.join('\n');
 }
 
+// ── Work-order pivot helpers ───────────────────────────────────────────────────
+type WoEnrichedRow = WorkOrder & {
+  _key?: string;
+  _prod_area?: string;
+  _peg_order?: number;
+  _demand_label?: string;
+  _demand_ids?: string[];
+  _shortage?: number;
+};
+
+type WoPivotGroup = {
+  _pivot_key: string;
+  qty_total: number;
+  wo_count: number;
+  product_count: number;
+  demand_count: number;
+  methods: string;
+  start_time_min: string | null;
+  end_time_max: string | null;
+  rows: WoEnrichedRow[];
+};
+
+type WoNestedGroup = WoPivotGroup & { subGroups: WoPivotGroup[] };
+
+function buildWoNestedPivotGroups(rows: WoEnrichedRow[]): WoNestedGroup[] {
+  const outerMap = new Map<string, WoEnrichedRow[]>();
+  for (const row of rows) {
+    const key = row._prod_area || '(none)';
+    if (!outerMap.has(key)) outerMap.set(key, []);
+    outerMap.get(key)!.push(row);
+  }
+  return Array.from(outerMap.entries())
+    .map(([key, outerRows]) => ({
+      _pivot_key: key,
+      qty_total: outerRows.reduce((s, r) => s + (Number(r.quantity) || 0), 0),
+      wo_count: outerRows.length,
+      product_count: new Set(outerRows.map((r) => r.product_id)).size,
+      demand_count: new Set(
+        outerRows.flatMap((r) =>
+          (r._demand_ids?.length ? r._demand_ids : [r.demand_id])
+        ).filter((d): d is string => d != null && d !== '')
+      ).size,
+      methods: Array.from(new Set(outerRows.map((r) => r.method).filter(Boolean))).join(', '),
+      start_time_min: outerRows.map((r) => r.start_time).filter(Boolean).sort()[0] ?? null,
+      end_time_max: outerRows.map((r) => r.end_time).filter(Boolean).sort().reverse()[0] ?? null,
+      rows: outerRows,
+      subGroups: buildWoPivotGroups(outerRows, 'location'),
+    }))
+    .sort((a, b) => b.qty_total - a.qty_total);
+}
+
+function buildWoPivotGroups(rows: WoEnrichedRow[], pivot: 'prod_area' | 'location'): WoPivotGroup[] {
+  const groupMap = new Map<string, WoEnrichedRow[]>();
+  for (const row of rows) {
+    const key = pivot === 'prod_area'
+      ? (row._prod_area || '(none)')
+      : (row.location_id || '(none)');
+    if (!groupMap.has(key)) groupMap.set(key, []);
+    groupMap.get(key)!.push(row);
+  }
+  return Array.from(groupMap.entries())
+    .map(([key, groupRows]) => ({
+      _pivot_key: key,
+      qty_total: groupRows.reduce((s, r) => s + (Number(r.quantity) || 0), 0),
+      wo_count: groupRows.length,
+      product_count: new Set(groupRows.map((r) => r.product_id)).size,
+      demand_count: new Set(
+        groupRows.flatMap((r) =>
+          (r._demand_ids?.length ? r._demand_ids : [r.demand_id])
+        ).filter((d): d is string => d != null && d !== '')
+      ).size,
+      methods: Array.from(new Set(groupRows.map((r) => r.method).filter(Boolean))).join(', '),
+      start_time_min: groupRows.map((r) => r.start_time).filter(Boolean).sort()[0] ?? null,
+      end_time_max: groupRows.map((r) => r.end_time).filter(Boolean).sort().reverse()[0] ?? null,
+      rows: groupRows,
+    }))
+    .sort((a, b) => b.qty_total - a.qty_total);
+}
+
 export function CaseDetail({ section: sectionProp = 'planning', subsection }: { section?: string; subsection?: string }) {
   const tNav = useTranslations('nav');
   const tSec = useTranslations('sections');
@@ -484,6 +563,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planWoPurchaseOnly, setPlanWoPurchaseOnly] = useState(false);
   const [planWoMoveOnly, setPlanWoMoveOnly] = useState(false);
   const [planWoHasOverride, setPlanWoHasOverride] = useState(false);
+  const [planWoPivot, setPlanWoPivot] = useState<'none' | 'prod_area' | 'location' | 'nested'>('none');
+  const [planWoPivotExpanded, setPlanWoPivotExpanded] = useState<Set<string>>(new Set());
+  const [planWoPivotSubExpanded, setPlanWoPivotSubExpanded] = useState<Set<string>>(new Set());
   const [woExplainOpen, setWoExplainOpen] = useState(false);
   const [woExplainRow, setWoExplainRow] = useState<WorkOrder | null>(null);
   const [woExplainKey, setWoExplainKey] = useState<string | null>(null);
@@ -3067,6 +3149,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <span>{tP('workOrders.hideDummy')}</span>
                     </label>
                   </div>
+                  {/* ── Pivot selector ── */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
+                    <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>Pivot:</span>
+                    {(['none', 'prod_area', 'location', 'nested'] as const).map((mode) => (
+                      <button
+                        key={mode}
+                        type="button"
+                        className={planWoPivot === mode ? '' : 'secondary'}
+                        style={{ fontSize: '0.75rem', padding: '2px 10px' }}
+                        onClick={() => { setPlanWoPivot(mode); setPlanWoPivotExpanded(new Set()); setPlanWoPivotSubExpanded(new Set()); }}
+                      >
+                        {mode === 'none' ? 'None' : mode === 'prod_area' ? 'PROD_AREA' : mode === 'location' ? 'Location' : 'PROD_AREA › Location'}
+                      </button>
+                    ))}
+                  </div>
                   {planResult.work_orders.length > 0 && (() => {
                     const workOrdersFiltered = planWorkOrderHideDummyProdArea
                       ? planResult.work_orders.filter((r) => (r.prod_area ?? '').trim().toLowerCase() !== 'dummy')
@@ -3151,18 +3248,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       }
                     }
                     const dummyHiddenCount = planResult.work_orders.filter((r) => (r.prod_area ?? '').trim().toLowerCase() === 'dummy').length;
-                    return (
-                      <>
-                        <p style={{ fontSize: '0.8rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
-                          Showing {groupedRows.length.toLocaleString()} work order{groupedRows.length !== 1 ? 's' : ''}
-                          {planWorkOrderHideDummyProdArea && dummyHiddenCount > 0
-                            ? ` (${dummyHiddenCount.toLocaleString()} with PROD_AREA = dummy hidden)`
-                            : ''}
-                          {anyPeggingFilter ? ' (filtered by work-order pegging: real make / buy / real move).' : ''}
-                        </p>
-                        <SortFilterTable<WorkOrder & { _key?: string; _prod_area?: string; _peg_order?: number; _demand_label?: string; _demand_ids?: string[]; _shortage?: number }>
-                    idKey="_key"
-                    rows={groupedRows.map((r, i) => {
+                    const woRows: WoEnrichedRow[] = groupedRows.map((r, i) => {
                       const splitDemandIds = (r.wo_consolidation_split_details ?? [])
                         .map((d) => d.demand_id)
                         .filter((d): d is string => d != null && d !== '');
@@ -3171,8 +3257,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         : splitDemandIds.length > 0
                           ? splitDemandIds.join(', ')
                           : undefined;
-                      // Shortage: for demand-specific WOs look up by demand_id;
-                      // for consolidated WOs sum across all split demands.
                       const shortage = r.demand_id
                         ? (demandShortageMap.get(r.demand_id) ?? 0)
                         : splitDemandIds.reduce((s, did) => s + (demandShortageMap.get(did) ?? 0), 0);
@@ -3185,22 +3269,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         _demand_ids: r.demand_id ? [r.demand_id] : splitDemandIds,
                         _shortage: shortage > 0 ? shortage : undefined,
                       };
-                    })}
-                    filterKeys={['product_id', 'location_id', '_prod_area', 'method', 'start_time', 'end_time', '_demand_label']}
-                    filterPlaceholder="Filter by product, location, PROD_AREA, method…"
-                    defaultSortKey="start_time"
-                    stickyHeader
-                    rowStyle={(r) => {
-                      const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
-                      if (woExplainKey === k) return { background: 'rgba(167,139,250,0.15)', outline: '1px solid rgba(167,139,250,0.4)' };
-                      if (woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
-                      if (!r.override_active && !r.consolidation_override_active && woHasSavedOverride(r)) return { borderLeft: '3px solid #b45309' };
-                      return undefined;
-                    }}
-                    columns={[
+                    });
+                    const woColumns: { key: string; label: string; sortable?: boolean; render?: (r: WoEnrichedRow) => React.ReactNode }[] = [
                       { key: 'product_id', label: 'Product', sortable: true },
                       { key: 'location_id', label: 'Location', sortable: true },
-                      { key: '_prod_area', label: 'PROD_AREA', sortable: true, render: (r) => ((r as { _prod_area?: string })._prod_area || r.prod_area) ?? '–' },
+                      { key: '_prod_area', label: 'PROD_AREA', sortable: true, render: (r) => r._prod_area || r.prod_area || '–' },
                       { key: 'quantity', label: 'Quantity', sortable: true },
                       { key: 'start_time', label: 'Start time', sortable: true, render: (r) => r.start_time ?? '–' },
                       { key: 'end_time', label: 'End time', sortable: true, render: (r) => r.end_time ?? '–' },
@@ -3220,8 +3293,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         </span>
                       ) },
                       { key: '_demand_label', label: 'Demand', sortable: true, render: (r) => {
-                        const ids = (r as { _demand_ids?: string[] })._demand_ids ?? [];
-                        const label = (r as { _demand_label?: string })._demand_label;
+                        const ids = r._demand_ids ?? [];
+                        const label = r._demand_label;
                         if (!label) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
                         if (ids.length <= 1) return <span>{label}</span>;
                         const preview = ids.length <= 3 ? label : `${ids.slice(0, 2).join(', ')} +${ids.length - 2} more`;
@@ -3235,7 +3308,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         );
                       } },
                       { key: '_shortage', label: 'Shortage', sortable: true, render: (r) => {
-                        const s = (r as { _shortage?: number })._shortage;
+                        const s = r._shortage;
                         if (!s) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
                         return <span style={{ color: '#f87171' }}>{s.toLocaleString(undefined, { maximumFractionDigits: 1 })}</span>;
                       } },
@@ -3286,8 +3359,142 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           </div>
                         );
                       }},
-                    ]}
-                  />
+                    ];
+                    const pivotGroups = (planWoPivot === 'prod_area' || planWoPivot === 'location') ? buildWoPivotGroups(woRows, planWoPivot) : [];
+                    const nestedGroups = planWoPivot === 'nested' ? buildWoNestedPivotGroups(woRows) : [];
+                    const woRowStyle = (r: WoEnrichedRow) => {
+                      const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
+                      if (woExplainKey === k) return { background: 'rgba(167,139,250,0.15)', outline: '1px solid rgba(167,139,250,0.4)' };
+                      if (woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
+                      if (!r.override_active && !r.consolidation_override_active && woHasSavedOverride(r)) return { borderLeft: '3px solid #b45309' };
+                      return undefined;
+                    };
+                    const pivotHeaderCols = (label: string) => (
+                      <tr>
+                        <th style={{ width: '1.5rem' }} />
+                        <th>{label}</th>
+                        <th style={{ textAlign: 'right' }}>Qty</th>
+                        <th style={{ textAlign: 'right' }}>WOs</th>
+                        <th style={{ textAlign: 'right' }}>Products</th>
+                        <th style={{ textAlign: 'right' }}>Demands</th>
+                        <th>Methods</th>
+                        <th>Start</th>
+                        <th>End</th>
+                      </tr>
+                    );
+                    const pivotGroupRow = (group: WoPivotGroup, expanded: boolean, onToggle: () => void, indent = 0) => (
+                      <tr
+                        style={{ cursor: 'pointer', background: expanded ? 'rgba(59,130,246,0.08)' : undefined }}
+                        onClick={onToggle}
+                      >
+                        <td style={{ color: '#3b82f6', fontSize: '0.85rem', userSelect: 'none', paddingLeft: indent > 0 ? `${indent * 1.5 + 0.5}rem` : undefined }}>{expanded ? '▼' : '▶'}</td>
+                        <td style={{ fontWeight: indent === 0 ? 600 : 400, paddingLeft: indent > 0 ? `${indent * 0.5}rem` : undefined }}>{group._pivot_key}</td>
+                        <td style={{ textAlign: 'right' }}>{group.qty_total.toLocaleString()}</td>
+                        <td style={{ textAlign: 'right', color: '#a1a1aa' }}>{group.wo_count}</td>
+                        <td style={{ textAlign: 'right', color: '#a1a1aa' }}>{group.product_count}</td>
+                        <td style={{ textAlign: 'right', color: '#a1a1aa' }}>{group.demand_count}</td>
+                        <td style={{ color: '#a1a1aa', fontSize: '0.8rem' }}>{group.methods || '–'}</td>
+                        <td style={{ color: '#a1a1aa', fontSize: '0.8rem' }}>{group.start_time_min?.slice(0, 10) ?? '–'}</td>
+                        <td style={{ color: '#a1a1aa', fontSize: '0.8rem' }}>{group.end_time_max?.slice(0, 10) ?? '–'}</td>
+                      </tr>
+                    );
+                    return (
+                      <>
+                        <p style={{ fontSize: '0.8rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
+                          Showing {groupedRows.length.toLocaleString()} work order{groupedRows.length !== 1 ? 's' : ''}
+                          {planWorkOrderHideDummyProdArea && dummyHiddenCount > 0
+                            ? ` (${dummyHiddenCount.toLocaleString()} with PROD_AREA = dummy hidden)`
+                            : ''}
+                          {anyPeggingFilter ? ' (filtered by work-order pegging: real make / buy / real move).' : ''}
+                        </p>
+                        {planWoPivot === 'prod_area' || planWoPivot === 'location' ? (
+                          /* ── Flat pivot (PROD_AREA or Location) ── */
+                          <table>
+                            <thead>{pivotHeaderCols(planWoPivot === 'prod_area' ? 'PROD_AREA' : 'Location')}</thead>
+                            <tbody>
+                              {pivotGroups.map((group) => {
+                                const expanded = planWoPivotExpanded.has(group._pivot_key);
+                                return (
+                                  <React.Fragment key={group._pivot_key}>
+                                    {pivotGroupRow(group, expanded, () => setPlanWoPivotExpanded((prev) => {
+                                      const next = new Set(prev);
+                                      expanded ? next.delete(group._pivot_key) : next.add(group._pivot_key);
+                                      return next;
+                                    }))}
+                                    {expanded && (
+                                      <tr>
+                                        <td colSpan={9} style={{ padding: 0 }}>
+                                          <div style={{ paddingLeft: '1.5rem', borderLeft: '3px solid #3b82f6', margin: '0.25rem 0 0.5rem' }}>
+                                            <SortFilterTable<WoEnrichedRow> columns={woColumns} rows={group.rows} idKey="_key" rowStyle={woRowStyle} />
+                                          </div>
+                                        </td>
+                                      </tr>
+                                    )}
+                                  </React.Fragment>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        ) : planWoPivot === 'nested' ? (
+                          /* ── Nested pivot (PROD_AREA → Location) ── */
+                          <table>
+                            <thead>{pivotHeaderCols('PROD_AREA / Location')}</thead>
+                            <tbody>
+                              {nestedGroups.map((outer) => {
+                                const outerExpanded = planWoPivotExpanded.has(outer._pivot_key);
+                                return (
+                                  <React.Fragment key={outer._pivot_key}>
+                                    {pivotGroupRow(outer, outerExpanded, () => setPlanWoPivotExpanded((prev) => {
+                                      const next = new Set(prev);
+                                      outerExpanded ? next.delete(outer._pivot_key) : next.add(outer._pivot_key);
+                                      return next;
+                                    }))}
+                                    {outerExpanded && outer.subGroups.map((sub) => {
+                                      const subKey = `${outer._pivot_key}|${sub._pivot_key}`;
+                                      const subExpanded = planWoPivotSubExpanded.has(subKey);
+                                      return (
+                                        <React.Fragment key={subKey}>
+                                          {pivotGroupRow(sub, subExpanded, () => setPlanWoPivotSubExpanded((prev) => {
+                                            const next = new Set(prev);
+                                            subExpanded ? next.delete(subKey) : next.add(subKey);
+                                            return next;
+                                          }), 1)}
+                                          {subExpanded && (
+                                            <tr>
+                                              <td colSpan={9} style={{ padding: 0 }}>
+                                                <div style={{ paddingLeft: '3rem', borderLeft: '3px solid #a78bfa', margin: '0.25rem 0 0.5rem' }}>
+                                                  <SortFilterTable<WoEnrichedRow> columns={woColumns} rows={sub.rows} idKey="_key" rowStyle={woRowStyle} />
+                                                </div>
+                                              </td>
+                                            </tr>
+                                          )}
+                                        </React.Fragment>
+                                      );
+                                    })}
+                                  </React.Fragment>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        ) : (
+                          /* ── Flat view (unchanged) ── */
+                          <SortFilterTable<WoEnrichedRow>
+                            columns={woColumns}
+                            rows={woRows}
+                            idKey="_key"
+                            filterKeys={['product_id', 'location_id', '_prod_area', 'method', 'start_time', 'end_time', '_demand_label']}
+                            filterPlaceholder="Filter by product, location, PROD_AREA, method…"
+                            defaultSortKey="start_time"
+                            stickyHeader
+                            rowStyle={(r) => {
+                              const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
+                              if (woExplainKey === k) return { background: 'rgba(167,139,250,0.15)', outline: '1px solid rgba(167,139,250,0.4)' };
+                              if (woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
+                              if (!r.override_active && !r.consolidation_override_active && woHasSavedOverride(r)) return { borderLeft: '3px solid #b45309' };
+                              return undefined;
+                            }}
+                          />
+                        )}
                       </>
                     );
                   })()}
