@@ -17,6 +17,8 @@ data class MaterialEventRequest(
     val supplyId: String,
     val delayDays: Int = 0,
     val qtyDecreasePct: Double = 0.0,
+    /** Absolute qty reduction. When set and > 0, takes precedence over qtyDecreasePct. */
+    val qtyDecreaseAbs: Double? = null,
     val note: String? = null,
 )
 
@@ -27,6 +29,7 @@ data class MaterialEventResponse(
     val supplyId: String,
     val delayDays: Int,
     val qtyDecreasePct: Double,
+    val qtyDecreaseAbs: Double? = null,
     val note: String?,
     val createdAt: String,
 )
@@ -37,6 +40,7 @@ private fun rowToResponse(row: ResultRow) = MaterialEventResponse(
     supplyId       = row[MaterialEvents.supplyId],
     delayDays      = row[MaterialEvents.delayDays],
     qtyDecreasePct = row[MaterialEvents.qtyDecreasePct],
+    qtyDecreaseAbs = row[MaterialEvents.qtyDecreaseAbs],
     note           = row[MaterialEvents.note],
     createdAt      = row[MaterialEvents.createdAt].toString(),
 )
@@ -76,6 +80,7 @@ fun Routing.materialEventRoutes() {
                     it[MaterialEvents.supplyId]       = req.supplyId.trim()
                     it[MaterialEvents.delayDays]      = req.delayDays
                     it[MaterialEvents.qtyDecreasePct] = req.qtyDecreasePct
+                    it[MaterialEvents.qtyDecreaseAbs] = req.qtyDecreaseAbs
                     it[MaterialEvents.note]           = req.note?.trim()
                 }[MaterialEvents.id]
                 MaterialEvents.selectAll()
@@ -100,6 +105,7 @@ fun Routing.materialEventRoutes() {
                     it[supplyId]       = req.supplyId.trim()
                     it[delayDays]      = req.delayDays
                     it[qtyDecreasePct] = req.qtyDecreasePct
+                    it[qtyDecreaseAbs] = req.qtyDecreaseAbs
                     it[note]           = req.note?.trim()
                 }
                 if (updated == 0) throw NoSuchElementException("Event $eventId not found for case $caseId")

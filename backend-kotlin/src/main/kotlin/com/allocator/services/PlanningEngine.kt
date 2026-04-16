@@ -19,6 +19,27 @@ private val DEFAULT_SCORE_WEIGHTS = Triple(0.4, 0.35, 0.25)
 private val BENIGN_REASONS = setOf("cycle_stopped", "cycle_detected")
 private val LATE_DATE = LocalDate.of(9999, 12, 31)
 
+/** True for commit reasons that signal a genuine planning failure — the child contributed
+ *  nothing (or nothing useful) to the parent's supply chain.  Benign cycle-detection
+ *  reasons and the "partial" success reason are excluded: they still count toward the
+ *  effective committed quantity when calculating the bottleneck. */
+private fun isHardPlanningFailure(reason: String?): Boolean {
+    if (reason.isNullOrBlank()) return false
+    if (reason in BENIGN_REASONS) return false
+    if (reason == "partial") return false
+    return true  // no_methods, no_preferred_method, depth_limit, child_failed:*, etc.
+}
+
+/** Holds the first-pass planning result for a single child material. */
+private data class ChildPassResult(
+    val child: Map<String, Any?>,
+    val neededQty: Double,
+    val effectiveQty: Double,        // committed qty from non-hard-failure rows
+    val wos: List<Map<String, Any?>>,
+    val pegging: Map<String, Any?>?,
+    val cTimes: List<LocalDate>,
+)
+
 // ── BOM real-pair cache ────────────────────────────────────────────────────────
 
 /** Loads (parent_id, child_id) pairs where VIRTUAL <> 'Y' from bom.csv. */
@@ -912,11 +933,29 @@ fun plan(
         else -> Pair(emptyList<Map<String, Any?>>(), "")
     }
 
-    // 4) Recursively plan children
+    // 4) Recursively plan children — with partial-fulfillment support.
+    //
+    //    Instead of aborting when a child can only supply a fraction of what is
+    //    needed, we:
+    //      a) Snapshot inventory before any child planning.
+    //      b) Run a first pass for all children at the full demandNetQty.
+    //      c) Compute the achievable parent qty as the bottleneck ratio:
+    //             achievable = min over children of (effectiveCommitted / needed) * demandNetQty
+    //      d) If partial: restore the inventory snapshot and re-plan all children
+    //         at the proportionally-scaled achievable qty (second pass).  Because the
+    //         scale factor is derived from what each child actually committed in the
+    //         first pass, the second pass is guaranteed to succeed.
+    //      e) Emit the parent WO for achievableQty; use commit_reason="partial" (not
+    //         a failure reason) so the demand shows a non-zero shortage in the UI.
     val childWos = mutableListOf<Map<String, Any?>>()
     val commitTimes = mutableListOf<LocalDate>()
     val childPeggingNodes = mutableListOf<Map<String, Any?>>()
 
+    // Snapshot inventory before any child planning.
+    val inventorySnap = copyInventory(inventory)
+
+    // ── First pass: plan all children at full demandNetQty ────────────────────
+    val childPassResults = mutableListOf<ChildPassResult>()
     for (c in childMaterials) {
         if (m["type"] == "make") {
             val parentKey = productId.trim()
@@ -926,33 +965,90 @@ fun plan(
             }
         }
         val cReqDt = dateAddDays(reqDt, -leadDays)
+        val neededQty = (c["quantity"] as? Number)?.toDouble() ?: 0.0
         val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
-            "quantity" to c["quantity"], "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
+            "quantity" to neededQty, "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
         val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex)
-        childWos.addAll(cWos)
-        if (cPegging != null) childPeggingNodes.add(cPegging)
-        for (s in solvedList) {
-            val sq = (s["quantity"] as? Number)?.toDouble() ?: 0.0; if (sq <= 0) continue
-            val reason = s["commit_reason"] as? String ?: ""
-            if (s["commit_time"] == null || (reason.isNotBlank() && reason !in BENIGN_REASONS)) {
-                val childReason = reason.ifBlank { "child_planning_failed" }
-                demandFulfilledList.add(committedRow(demandNetQty, reqTimeStr, "child_failed:${s["product_id"]}@${s["location_id"]}($childReason)"))
-                return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, reqTimeStr, "child_failed:$childReason"))
-            }
+        // Sum rows that are not hard planning failures.
+        // BENIGN_REASONS (cycle_stopped) and "partial" both count as committed.
+        val effectiveQty = solvedList.sumOf { s ->
+            if (!isHardPlanningFailure(s["commit_reason"] as? String))
+                (s["quantity"] as? Number)?.toDouble() ?: 0.0
+            else 0.0
         }
-        solvedList.forEach { s -> parseDate(s["commit_time"] as? String)?.let { commitTimes.add(it) } }
+        val cTimes = solvedList.mapNotNull { s -> parseDate(s["commit_time"] as? String) }
+        childPassResults.add(ChildPassResult(c, neededQty, effectiveQty, cWos, cPegging, cTimes))
     }
 
-    // 5) Timing + work orders
-    val startDt = computeStartDt(reqDt, leadDays, commitTimes)
-    val (wos, lotCount, lastEnd, lotSizeVal) = buildWorkOrders(productId, productionLocation, demandNetQty, leadDays, startDt, m, demandId, data, overrideActive)
-    val methodType = m["type"] as? String ?: ""
-    val woChildren = if (methodType == "purchase") listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to "%.4f".format(demandNetQty).toDouble(), "children" to emptyList<Any>()))
-                     else childPeggingNodes
-    peggingChildren.add(buildWoNode(productId, productionLocation, demandNetQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodChoiceExplanation, variantExplanation, woChildrenRelation, woChildren, overrideActive))
+    val anyChildShort = childPassResults.any { cr -> cr.effectiveQty < cr.neededQty - 1e-9 }
 
-    demandFulfilledList.add(committedRow(demandNetQty, formatDate(lastEnd)))
-    return Triple(demandFulfilledList, wos + childWos, demandNode(peggingChildren, formatDate(lastEnd)))
+    // ── Determine achievable parent qty ────────────────────────────────────────
+    val achievableParentQty: Double
+    if (!anyChildShort || childMaterials.isEmpty()) {
+        // All children fully committed — first-pass results are final.
+        achievableParentQty = demandNetQty
+        childPassResults.forEach { cr ->
+            childWos.addAll(cr.wos)
+            if (cr.pegging != null) childPeggingNodes.add(cr.pegging)
+            commitTimes.addAll(cr.cTimes)
+        }
+    } else {
+        // Bottleneck: child with the worst committed/needed ratio limits the parent.
+        val rawAchievable = childPassResults.minOf { cr ->
+            if (cr.neededQty > 1e-9) cr.effectiveQty * demandNetQty / cr.neededQty else demandNetQty
+        }
+        // Subtract a tiny epsilon so the second pass never over-requests by a rounding artifact.
+        val capped = (rawAchievable - 1e-9).coerceIn(0.0, demandNetQty)
+
+        if (capped <= 1e-9) {
+            // Nothing achievable at all — hard failure (preserve original behaviour).
+            val bottleneck = childPassResults.first { cr -> cr.effectiveQty < cr.neededQty - 1e-9 }
+            val childProduct = bottleneck.child["product_id"]?.toString() ?: "?"
+            val childLoc     = bottleneck.child["location_id"]?.toString() ?: "?"
+            val reason = "child_failed:${childProduct}@${childLoc}(no_inventory)"
+            demandFulfilledList.add(committedRow(demandNetQty, reqTimeStr, reason))
+            return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, reqTimeStr, reason))
+        }
+        achievableParentQty = capped
+
+        // ── Second pass: restore inventory and re-plan at achievable qty ──────
+        // Because scale = capped/demandNetQty, each child is asked for exactly
+        // what it committed in the first pass (minus epsilon), so this pass succeeds.
+        inventory.clear()
+        inventory.addAll(inventorySnap)
+        val scale = achievableParentQty / demandNetQty
+        val scaledChildren = scaleChildMaterials(childMaterials, scale)
+        for (c in scaledChildren) {
+            if (m["type"] == "make") {
+                val parentKey = productId.trim()
+                val childKey = (c["product_id"] as? String)?.trim() ?: ""
+                if (Pair(parentKey, childKey) in REAL_BOM_PAIRS) {
+                    log.info("planning: real BOM partial re-plan parent={} child={} demand={} achievable={}", parentKey, childKey, demandId, achievableParentQty)
+                }
+            }
+            val cReqDt = dateAddDays(reqDt, -leadDays)
+            val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
+                "quantity" to c["quantity"], "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
+            val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex)
+            childWos.addAll(cWos)
+            if (cPegging != null) childPeggingNodes.add(cPegging)
+            solvedList.forEach { s -> parseDate(s["commit_time"] as? String)?.let { commitTimes.add(it) } }
+        }
+    }
+
+    // 5) Timing + work orders (using achievableParentQty; equals demandNetQty when not partial)
+    val startDt = computeStartDt(reqDt, leadDays, commitTimes)
+    val (wos, lotCount, lastEnd, lotSizeVal) = buildWorkOrders(productId, productionLocation, achievableParentQty, leadDays, startDt, m, demandId, data, overrideActive)
+    val methodType = m["type"] as? String ?: ""
+    val woChildren = if (methodType == "purchase") listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to "%.4f".format(achievableParentQty).toDouble(), "children" to emptyList<Any>()))
+                     else childPeggingNodes
+    peggingChildren.add(buildWoNode(productId, productionLocation, achievableParentQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodChoiceExplanation, variantExplanation, woChildrenRelation, woChildren, overrideActive))
+
+    // "partial" is NOT a failure reason — it keeps is_failed=false so enrichCommittedDemands
+    // counts achievableParentQty toward effectiveCommitted and computes shortage correctly.
+    val partialReason = if (anyChildShort && achievableParentQty < demandNetQty - 1e-9) "partial" else null
+    demandFulfilledList.add(committedRow(achievableParentQty, formatDate(lastEnd), partialReason))
+    return Triple(demandFulfilledList, wos + childWos, demandNode(peggingChildren, formatDate(lastEnd), partialReason))
 }
 
 // ── Lot-batching helper ────────────────────────────────────────────────────────

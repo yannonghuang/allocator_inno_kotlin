@@ -30,7 +30,7 @@ private val engineScope = CoroutineScope(Dispatchers.IO)
 
 // ── In-memory plan job state ───────────────────────────────────────────────────
 private val planJobs = ConcurrentHashMap<String, MutableMap<String, Any?>>()
-private val casePlanResults = ConcurrentHashMap<Int, Map<String, Any>>()
+internal val casePlanResults = ConcurrentHashMap<Int, Map<String, Any>>()
 // jobId → plan_run.id for associating async jobs with persisted runs
 private val planJobRunIds = ConcurrentHashMap<String, Int>()
 
@@ -293,6 +293,7 @@ fun Routing.allocateRoutes() {
             put("progress", anyToJson(job["progress"]))
             if (job["result"] != null) put("result", anyToJson(job["result"]))
             if (job["error"] != null) put("error", job["error"]?.toString() ?: "")
+            planJobRunIds[jobId]?.let { put("plan_run_id", it) }
         })
     }
 
@@ -323,10 +324,26 @@ fun Routing.allocateRoutes() {
         // A demand can have multiple pegging trees (one per component group when consolidation is on).
         // Search all matching trees until the work order node is found.
         val woNode: Map<String, Any?>? = if (demandId.isNotBlank()) {
-            planningPegging
-                .filter { (it["demand_id"]?.toString() ?: "").trim() == demandId }
+            val matchingEntries = planningPegging.filter { (it["demand_id"]?.toString() ?: "").trim() == demandId }
+            log.warn("[WO pegging] demand={} productId={} locationId={} method={} planningPegging.size={} matchingEntries.size={}",
+                demandId, productId, locationId, method, planningPegging.size, matchingEntries.size)
+            if (matchingEntries.isEmpty()) {
+                val allIds = planningPegging.map { (it["demand_id"]?.toString() ?: "<null>").trim() }.distinct().take(20)
+                log.warn("[WO pegging] No pegging tree for demand={}. All demand_ids in pegging: {}", demandId, allIds)
+            } else {
+                @Suppress("UNCHECKED_CAST")
+                val firstTree = matchingEntries[0]["tree"] as? Map<String, Any?>
+                val childTypes = (firstTree?.get("children") as? List<*>)
+                    ?.mapNotNull { (it as? Map<*, *>)?.get("type")?.toString() } ?: emptyList()
+                log.warn("[WO pegging] First tree root type={} children types={}", firstTree?.get("type"), childTypes)
+            }
+            val found = matchingEntries
                 .firstNotNullOfOrNull { entry -> entry["tree"]?.let { findWoNode(it, productId, locationId, method) } }
-                ?: throw NoSuchElementException("Work order ($productId @ $locationId / $method) not found in any pegging tree for demand $demandId")
+            if (found == null && matchingEntries.isNotEmpty()) {
+                val allWoKeys = matchingEntries.flatMap { entry -> collectAllWoKeys(entry["tree"]) }
+                log.warn("[WO pegging] Tree found for demand={} but WO {}@{}/{} not in it. All WO keys in tree: {}", demandId, productId, locationId, method, allWoKeys)
+            }
+            found ?: throw NoSuchElementException("Work order ($productId @ $locationId / $method) not found in any pegging tree for demand $demandId")
         } else {
             // Consolidated WO: search all trees where demand_id is null/blank
             planningPegging
@@ -363,7 +380,7 @@ fun Routing.allocateRoutes() {
                 ?: throw NoSuchElementException("Case not found")
         }
         val runs = transaction {
-            PlanRuns.selectAll().where { PlanRuns.caseId eq caseId }
+            PlanRuns.selectAll().where { (PlanRuns.caseId eq caseId) and (PlanRuns.status neq "ready") and (PlanRuns.status neq "running") }
                 .orderBy(PlanRuns.createdAt, SortOrder.DESC)
                 .map { row ->
                     val snapshot = row[PlanRuns.overrideSnapshot]
@@ -377,11 +394,62 @@ fun Routing.allocateRoutes() {
                         status = row[PlanRuns.status],
                         config = row[PlanRuns.config]?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
                         overrideCount = overrideCount,
+                        name = row[PlanRuns.name],
+                        notes = row[PlanRuns.notes],
                         createdAt = formatTs(row[PlanRuns.createdAt]),
                     )
                 }
         }
         call.respond(runs)
+    }
+
+    // ── GET /cases/{case_id}/plan-runs/unsaved — restore in-memory unsaved run ──
+    // Returns the latest "ready" run with its in-memory result so the frontend can
+    // restore state after a page swap before the user has explicitly saved the run.
+    // If the in-memory result has expired (e.g. server restart), marks the stale row
+    // as "failed" and returns 404 so the frontend falls back to the latest saved run.
+    get("/cases/{case_id}/plan-runs/unsaved") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+
+        data class ReadyRow(
+            val id: Int, val name: String?, val notes: String?,
+            val config: String?, val createdAt: kotlinx.datetime.Instant,
+        )
+        val readyRow = transaction {
+            PlanRuns.selectAll()
+                .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "ready") }
+                .orderBy(PlanRuns.id, SortOrder.DESC)
+                .firstOrNull()
+                ?.let { r -> ReadyRow(r[PlanRuns.id], r[PlanRuns.name], r[PlanRuns.notes], r[PlanRuns.config], r[PlanRuns.createdAt]) }
+        }
+
+        if (readyRow == null) {
+            call.respond(HttpStatusCode.NotFound, buildJsonObject { put("error", "no unsaved run") })
+            return@get
+        }
+
+        val inMemory = casePlanResults[caseId]
+        if (inMemory == null) {
+            // Server restarted — clean up the stale ready row so it doesn't linger
+            transaction { PlanRuns.update({ PlanRuns.id eq readyRow.id }) { it[PlanRuns.status] = "failed" } }
+            call.respond(HttpStatusCode.NotFound, buildJsonObject { put("error", "in-memory result expired") })
+            return@get
+        }
+
+        call.respond(PlanRunFullResponse(
+            id = readyRow.id,
+            caseId = caseId,
+            jobId = null,
+            status = "ready",
+            config = readyRow.config?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
+            overrideSnapshot = null,
+            result = runCatching { anyToJson(inMemory) }.getOrNull(),
+            error = null,
+            name = readyRow.name,
+            notes = readyRow.notes,
+            createdAt = formatTs(readyRow.createdAt),
+        ))
     }
 
     // ── GET /cases/{case_id}/plan-runs/{run_id} — full run with result ────────
@@ -394,7 +462,9 @@ fun Routing.allocateRoutes() {
         data class RawRow(
             val id: Int, val caseId: Int, val jobId: String?, val status: String,
             val config: String?, val overrideSnapshot: String?,
-            val result: String?, val error: String?, val createdAt: kotlinx.datetime.Instant,
+            val result: String?, val error: String?,
+            val name: String?, val notes: String?,
+            val createdAt: kotlinx.datetime.Instant,
         )
         val raw = transaction {
             val row = PlanRuns.selectAll().where {
@@ -405,6 +475,7 @@ fun Routing.allocateRoutes() {
                 jobId = row[PlanRuns.jobId], status = row[PlanRuns.status],
                 config = row[PlanRuns.config], overrideSnapshot = row[PlanRuns.overrideSnapshot],
                 result = row[PlanRuns.result], error = row[PlanRuns.error],
+                name = row[PlanRuns.name], notes = row[PlanRuns.notes],
                 createdAt = row[PlanRuns.createdAt],
             )
         }
@@ -416,7 +487,8 @@ fun Routing.allocateRoutes() {
             val needsEnrichment = runCatching {
                 val parsed = Json.parseToJsonElement(raw.result).jsonObject
                 val firstDemand = parsed["committed_demands"]?.jsonArray?.firstOrNull()?.jsonObject
-                firstDemand != null && !firstDemand.containsKey("requested_qty")
+                // Re-enrich if either requested_qty or shortage is absent (shortage was added later)
+                firstDemand != null && (!firstDemand.containsKey("requested_qty") || !firstDemand.containsKey("shortage"))
             }.getOrElse { false }
 
             if (needsEnrichment) {
@@ -447,6 +519,8 @@ fun Routing.allocateRoutes() {
             overrideSnapshot = raw.overrideSnapshot?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
             result = resultJson?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
             error = raw.error,
+            name = raw.name,
+            notes = raw.notes,
             createdAt = formatTs(raw.createdAt),
         )
         call.respond(response)
@@ -465,6 +539,77 @@ fun Routing.allocateRoutes() {
             if (deleted == 0) throw NoSuchElementException("Plan run not found")
         }
         call.respond(HttpStatusCode.NoContent)
+    }
+
+    // ── POST /cases/{case_id}/plan-runs/{run_id}/save — persist in-memory result ─
+    post("/cases/{case_id}/plan-runs/{run_id}/save") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val runId = call.parameters["run_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid run_id")
+
+        val body = runCatching { call.receiveText() }.getOrElse { "" }
+        val payload = if (body.isBlank()) JsonObject(emptyMap())
+                      else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrElse { JsonObject(emptyMap()) }
+        val nameArg = payload["name"]?.jsonPrimitive?.contentOrNull
+        val notesArg = payload["notes"]?.jsonPrimitive?.contentOrNull
+
+        val runRow = transaction {
+            PlanRuns.selectAll().where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }.singleOrNull()
+        } ?: throw NoSuchElementException("Plan run $runId not found for case $caseId")
+
+        val currentStatus = runRow[PlanRuns.status]
+        if (currentStatus == "success" || currentStatus == "contingent") {
+            // Already persisted — apply name/notes update if provided, then return
+            if (nameArg != null || notesArg != null) {
+                transaction {
+                    PlanRuns.update({ PlanRuns.id eq runId }) {
+                        if (nameArg != null) it[PlanRuns.name] = nameArg.ifBlank { null }
+                        if (notesArg != null) it[PlanRuns.notes] = notesArg.ifBlank { null }
+                    }
+                }
+            }
+            call.respond(buildJsonObject { put("id", runId); put("status", currentStatus) })
+            return@post
+        }
+        if (currentStatus != "ready") {
+            throw IllegalStateException("Cannot save plan run with status '$currentStatus'")
+        }
+
+        val enriched = casePlanResults[caseId]
+            ?: throw NoSuchElementException("No in-memory plan result for case $caseId. Re-run plan first.")
+        val resultJson = runCatching { anyToJson(enriched).toString() }.getOrElse { null }
+        transaction {
+            PlanRuns.update({ PlanRuns.id eq runId }) {
+                it[PlanRuns.status] = "success"
+                it[PlanRuns.result] = resultJson
+                if (nameArg != null) it[PlanRuns.name] = nameArg.ifBlank { null }
+                if (notesArg != null) it[PlanRuns.notes] = notesArg.ifBlank { null }
+            }
+        }
+        call.respond(buildJsonObject { put("id", runId); put("status", "success") })
+    }
+
+    // ── PATCH /cases/{case_id}/plan-runs/{run_id} — update name / notes ──────
+    patch("/cases/{case_id}/plan-runs/{run_id}") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val runId = call.parameters["run_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid run_id")
+
+        val body = runCatching { call.receiveText() }.getOrElse { "" }
+        val payload = if (body.isBlank()) JsonObject(emptyMap())
+                      else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrElse { JsonObject(emptyMap()) }
+
+        transaction {
+            val exists = PlanRuns.selectAll().where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }.any()
+            if (!exists) throw NoSuchElementException("Plan run $runId not found for case $caseId")
+            PlanRuns.update({ (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }) {
+                if (payload.containsKey("name")) it[PlanRuns.name] = payload["name"]?.jsonPrimitive?.contentOrNull?.ifBlank { null }
+                if (payload.containsKey("notes")) it[PlanRuns.notes] = payload["notes"]?.jsonPrimitive?.contentOrNull?.ifBlank { null }
+            }
+        }
+        call.respond(buildJsonObject { put("id", runId) })
     }
 }
 
@@ -572,6 +717,20 @@ private fun findWoNode(tree: Any?, productId: String, locationId: String, method
         findWoNode(ch, productId, locationId, method)?.let { return it }
     }
     return null
+}
+
+/** Collect all work_order nodes from the pegging tree as "pid@lid/method" strings — for debugging. */
+@Suppress("UNCHECKED_CAST")
+private fun collectAllWoKeys(tree: Any?, result: MutableList<String> = mutableListOf()): List<String> {
+    val node = tree as? Map<String, Any?> ?: return result
+    if (node["type"] == "work_order") {
+        val pid = (node["product_id"] as? String ?: "").trim()
+        val lid = (node["location_id"] as? String ?: "").trim()
+        val m   = (node["method"] as? String ?: "").trim()
+        result.add("$pid@$lid/$m")
+    }
+    for (ch in (node["children"] as? List<*> ?: emptyList<Any?>())) collectAllWoKeys(ch, result)
+    return result
 }
 
 @Suppress("UNCHECKED_CAST")
@@ -790,7 +949,11 @@ private fun planKpis(
     // Supply summary
     val supplyList = data["supply"] ?: emptyList()
     val initialTotal = supplyList.sumOf { (it["qty"] as? Number ?: 0).toDouble() }
-    val consumedTotal = planningPegging.sumOf { e -> peggingSupplyConsumed(e["tree"]) }
+    // Exclude passthrough entries (single-demand consolidation pass-through trees) from the
+    // supply-consumption sum to avoid double-counting: those trees show the original supply
+    // consumed by the consolidation run, while the main-loop trees show the same demand
+    // consuming the injected consolidated supply bucket.
+    val consumedTotal = planningPegging.filter { it["passthrough"] != true }.sumOf { e -> peggingSupplyConsumed(e["tree"]) }
     val consumptionRate = if (initialTotal > 0) consumedTotal / initialTotal else null
 
     fun methodStats(methodVal: String): Map<String, Any?> {
@@ -934,12 +1097,10 @@ private suspend fun runPlanBackground(
         val enriched = enrichPlanResultWithData(caseId, result, data)
         casePlanResults[caseId] = enriched
 
-        // Persist result to plan_run
-        val resultJson = runCatching { anyToJson(enriched).toString() }.getOrElse { null }
+        // Mark run as ready (result not yet persisted — user must explicitly save)
         transaction {
             PlanRuns.update({ PlanRuns.id eq planRunId }) {
-                it[PlanRuns.status] = "success"
-                it[PlanRuns.result] = resultJson
+                it[PlanRuns.status] = "ready"
             }
         }
 

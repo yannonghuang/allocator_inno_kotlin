@@ -32,6 +32,8 @@ data class MaterialImpactRequest(
     val supplyId: String,
     val deliveryDelayDays: Int = 0,
     val quantityDecreasePct: Double = 0.0,
+    /** Absolute qty reduction. When set and > 0, takes precedence over quantityDecreasePct. */
+    val quantityDecreaseAbs: Double? = null,
     /** Pin to a specific baseline plan run. Omit (or null) to use the latest successful run. */
     val planRunId: Int? = null,
     /**
@@ -87,6 +89,7 @@ data class MaterialImpactResponse(
     val supply: MaterialSupplyDetail,
     val deliveryDelayDays: Int,
     val quantityDecreasePct: Double,
+    val quantityDecreaseAbs: Double? = null,
     val impactedDemandCount: Int,
     val impacts: List<MaterialImpactedDemand>,
     val note: String? = null,
@@ -166,7 +169,8 @@ private data class SupplyLookup(
 
 private data class BaselineLookup(
     val planRunId: Int,
-    val resultJson: String,
+    /** Parsed committed-demands map — either from in-memory casePlanResults (ready) or DB (success). */
+    val resultMap: Map<String, Any>,
     val configJson: String?,
 )
 
@@ -215,30 +219,49 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
         val caseId = supplyLookup.caseId
         val supply = supplyLookup.supply
 
-        // 2. Find baseline plan run — read all columns inside transaction
-        val baselineLookup: BaselineLookup? = transaction {
-            val row = if (req.planRunId != null) {
-                PlanRuns.selectAll()
-                    .where { (PlanRuns.id eq req.planRunId) and (PlanRuns.caseId eq caseId) }
-                    .firstOrNull()
-            } else {
-                PlanRuns.selectAll()
+        // 2. Find baseline plan run — always a persisted ("success") run.
+        // Auto-persist happens on the frontend when "analyze criticality" is checked.
+        val baselineLookup: BaselineLookup? = if (req.planRunId != null) {
+            // Explicit run pinned — must be a persisted run.
+            transaction {
+                val row = PlanRuns.selectAll()
+                    .where { (PlanRuns.id eq req.planRunId) and (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
+                    .firstOrNull() ?: return@transaction null
+                val resultMap = row[PlanRuns.result]?.let { json ->
+                    runCatching {
+                        @Suppress("UNCHECKED_CAST")
+                        jsonElementToNative(Json.parseToJsonElement(json)) as? Map<String, Any>
+                    }.getOrNull()
+                }
+                resultMap?.let { BaselineLookup(row[PlanRuns.id], it, row[PlanRuns.config]) }
+            }
+        } else {
+            // Latest persisted success run for this case.
+            transaction {
+                val row = PlanRuns.selectAll()
                     .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
                     .orderBy(PlanRuns.id, SortOrder.DESC)
-                    .firstOrNull()
+                    .firstOrNull() ?: return@transaction null
+                val resultMap = row[PlanRuns.result]?.let { json ->
+                    runCatching {
+                        @Suppress("UNCHECKED_CAST")
+                        jsonElementToNative(Json.parseToJsonElement(json)) as? Map<String, Any>
+                    }.getOrNull()
+                }
+                resultMap?.let { BaselineLookup(row[PlanRuns.id], it, row[PlanRuns.config]) }
             }
-            row?.let { BaselineLookup(it[PlanRuns.id], it[PlanRuns.result] ?: "", it[PlanRuns.config]) }
         }
 
         if (baselineLookup == null) {
             val note = if (req.planRunId != null)
                 "Plan run ${req.planRunId} not found for this case."
             else
-                "No successful plan run found for this case."
+                "No plan result available. Run a plan first."
             val resp = MaterialImpactResponse(
                 caseId = caseId, planRunId = null, supply = supply,
                 deliveryDelayDays = req.deliveryDelayDays,
                 quantityDecreasePct = req.quantityDecreasePct,
+                quantityDecreaseAbs = req.quantityDecreaseAbs,
                 impactedDemandCount = 0, impacts = emptyList(), note = note,
             )
             materialImpactJobs[jobId]?.apply { set("status", "completed"); set("result", Json.encodeToJsonElement(resp)) }
@@ -246,28 +269,21 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
         }
 
         val baselinePlanRunId = baselineLookup.planRunId
-        val baselineResultJson = baselineLookup.resultJson
-        if (baselineResultJson.isBlank()) {
-            val resp = MaterialImpactResponse(
-                caseId = caseId, planRunId = baselinePlanRunId, supply = supply,
-                deliveryDelayDays = req.deliveryDelayDays,
-                quantityDecreasePct = req.quantityDecreasePct,
-                impactedDemandCount = 0, impacts = emptyList(),
-                note = "Baseline plan run has no result data.",
-            )
-            materialImpactJobs[jobId]?.apply { set("status", "completed"); set("result", Json.encodeToJsonElement(resp)) }
-            return
-        }
 
         // 3. Load case data and mutate the target supply
         val caseData = CaseLoader.load(caseId)
         val mutatedSupply = (caseData["supply"] ?: emptyList()).map { s ->
             if ((s["supply_id"] as? String)?.trim() == req.supplyId.trim()) {
                 s.toMutableMap().apply {
-                    if (req.quantityDecreasePct > 0) {
-                        val oldQty = (s["qty"] as? Number)?.toDouble() ?: 0.0
-                        put("qty", oldQty * (1.0 - req.quantityDecreasePct / 100.0))
+                    val oldQty = (s["qty"] as? Number)?.toDouble() ?: 0.0
+                    val newQty = when {
+                        req.quantityDecreaseAbs != null && req.quantityDecreaseAbs > 0 ->
+                            maxOf(0.0, oldQty - req.quantityDecreaseAbs)
+                        req.quantityDecreasePct > 0 ->
+                            oldQty * (1.0 - req.quantityDecreasePct / 100.0)
+                        else -> oldQty
                     }
+                    if (newQty != oldQty) put("qty", newQty)
                     if (req.deliveryDelayDays > 0) {
                         val newDate = parseSupplyDate(s["supply_date"] as? String)
                             ?.plusDays(req.deliveryDelayDays.toLong())
@@ -326,12 +342,7 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
         } else null
 
         // 7. Diff baseline vs contingent
-        @Suppress("UNCHECKED_CAST")
-        val baselineResultMap = runCatching {
-            jsonElementToNative(Json.parseToJsonElement(baselineResultJson)) as? Map<String, Any>
-        }.getOrNull() ?: emptyMap<String, Any>()
-
-        val baselineOutcomes = parseCommittedDemands(baselineResultMap)
+        val baselineOutcomes = parseCommittedDemands(baselineLookup.resultMap)
         val contingentOutcomes = parseCommittedDemands(contingentResult)
 
         // Demands that had committed qty in baseline but degraded in contingent
@@ -355,6 +366,7 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
                 supply = supply,
                 deliveryDelayDays = req.deliveryDelayDays,
                 quantityDecreasePct = req.quantityDecreasePct,
+                quantityDecreaseAbs = req.quantityDecreaseAbs,
                 impactedDemandCount = 0, impacts = emptyList(),
             )
             materialImpactJobs[jobId]?.apply { set("status", "completed"); set("result", Json.encodeToJsonElement(resp)) }
@@ -559,41 +571,33 @@ internal fun computeMaterialImpact(req: MaterialImpactRequest): MaterialImpactRe
         vendorId = supplyRow[Supplies.vendorId],
     )
 
+    // AI agent path: only use persisted "success" runs — never in-memory "ready" state.
+    // If no saved run exists, throw so the agent knows to run and save a plan first.
     val latestPlanRun = if (req.planRunId != null) {
         PlanRuns.selectAll()
-            .where { (PlanRuns.id eq req.planRunId) and (PlanRuns.caseId eq caseId) }
+            .where { (PlanRuns.id eq req.planRunId) and (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
             .firstOrNull()
+            ?: throw NoSuchElementException(
+                "Plan run ${req.planRunId} not found or has not been saved yet. Save the plan run before requesting an assessment."
+            )
     } else {
         PlanRuns.selectAll()
             .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
             .orderBy(PlanRuns.id, SortOrder.DESC)
             .firstOrNull()
-    }
-
-    if (latestPlanRun == null) {
-        val note = if (req.planRunId != null)
-            "Plan run ${req.planRunId} not found for this case."
-        else
-            "No successful plan run found for this case."
-        return@transaction MaterialImpactResponse(
-            caseId = caseId, planRunId = null, supply = supply,
-            deliveryDelayDays = req.deliveryDelayDays,
-            quantityDecreasePct = req.quantityDecreasePct,
-            impactedDemandCount = 0, impacts = emptyList(), note = note,
-        )
+            ?: throw NoSuchElementException(
+                "No saved plan run found for this case. Run a plan and save it before requesting an assessment."
+            )
     }
 
     val resolvedPlanRunId = latestPlanRun[PlanRuns.id]
-    val resultJson = latestPlanRun[PlanRuns.result]
-        ?: return@transaction MaterialImpactResponse(
-            caseId = caseId, planRunId = resolvedPlanRunId, supply = supply,
-            deliveryDelayDays = req.deliveryDelayDays,
-            quantityDecreasePct = req.quantityDecreasePct,
-            impactedDemandCount = 0, impacts = emptyList(),
-            note = "Plan run has no result data.",
-        )
 
-    val planResult = Json.parseToJsonElement(resultJson)
+    val planResult: JsonElement = run {
+        val resultJson = latestPlanRun[PlanRuns.result]
+            ?: throw IllegalStateException("Plan run $resolvedPlanRunId has no result data.")
+        Json.parseToJsonElement(resultJson)
+    }
+
     val pegging = (planResult as? JsonObject)?.get("planning_pegging") as? JsonArray
         ?: JsonArray(emptyList())
 

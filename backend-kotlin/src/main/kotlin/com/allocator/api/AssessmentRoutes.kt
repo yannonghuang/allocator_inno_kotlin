@@ -33,6 +33,17 @@ the following are criteria for MEDIUM rating:
 otherwise.
 """.trimIndent()
 
+private val DEFAULT_CRITERIA_ZH = """
+以下是HIGH评级的标准：
+受影响需求数量大于等于5，或受影响需求的总数量大于等于5000。
+
+以下是LOW评级的标准：
+受影响需求数量不超过2，或受影响需求的总数量小于500。
+
+以下是MEDIUM评级的标准：
+其他情况。
+""".trimIndent()
+
 /**
  * Programmatic rating for the DEFAULT_CRITERIA thresholds.
  * Used whenever the active criteria matches the default to avoid LLM arithmetic/logic errors.
@@ -51,6 +62,7 @@ data class AssessmentRequest(
     val supplyId: String? = null,
     val deliveryDelayDays: Int = 0,
     val quantityDecreasePct: Double = 0.0,
+    val quantityDecreaseAbs: Double? = null,
     val planRunId: Int? = null,
     // Mode B: pre-computed impact (agent passes this in; no recomputation)
     val impact: MaterialImpactResponse? = null,
@@ -64,8 +76,10 @@ data class AssessmentRequest(
 data class AssessmentSummary(
     val id: Int,
     val supplyId: String,
+    val planRunId: Int? = null,
     val deliveryDelayDays: Int,
     val quantityDecreasePct: Double,
+    val quantityDecreaseAbs: Double? = null,
     val rating: String,
     val explanation: String,
     val criteria: String,
@@ -116,7 +130,10 @@ private data class OpenAiResponse(val choices: List<OpenAiChoice>)
 private fun buildPrompt(impact: MaterialImpactResponse, criteria: String): String {
     val changeDesc = buildString {
         if (impact.deliveryDelayDays > 0) append("delayed by ${impact.deliveryDelayDays} days")
-        if (impact.quantityDecreasePct > 0) {
+        if (impact.quantityDecreaseAbs != null && impact.quantityDecreaseAbs > 0) {
+            if (isNotEmpty()) append(", ")
+            append("quantity reduced by ${impact.quantityDecreaseAbs} units (absolute)")
+        } else if (impact.quantityDecreasePct > 0) {
             if (isNotEmpty()) append(", ")
             append("quantity reduced by ${impact.quantityDecreasePct}%")
         }
@@ -177,7 +194,10 @@ EXPLANATION: <2–3 sentences; state the specific pre-computed values that trigg
 private fun buildExplanationPrompt(impact: MaterialImpactResponse, criteria: String, rating: String, totalShortfall: Double): String {
     val changeDesc = buildString {
         if (impact.deliveryDelayDays > 0) append("delayed by ${impact.deliveryDelayDays} days")
-        if (impact.quantityDecreasePct > 0) {
+        if (impact.quantityDecreaseAbs != null && impact.quantityDecreaseAbs > 0) {
+            if (isNotEmpty()) append(", ")
+            append("quantity reduced by ${impact.quantityDecreaseAbs} units (absolute)")
+        } else if (impact.quantityDecreasePct > 0) {
             if (isNotEmpty()) append(", ")
             append("quantity reduced by ${impact.quantityDecreasePct}%")
         }
@@ -295,16 +315,24 @@ fun Routing.assessmentRoutes() {
         val caseId = call.parameters["caseId"]?.toIntOrNull()
             ?: throw IllegalArgumentException("Invalid caseId")
         val supplyId = call.request.queryParameters["supplyId"]
+        val planRunId = call.request.queryParameters["planRunId"]?.toIntOrNull()
+        val deliveryDelayDays = call.request.queryParameters["deliveryDelayDays"]?.toIntOrNull()
+        val quantityDecreasePct = call.request.queryParameters["quantityDecreasePct"]?.toDoubleOrNull()
         val summaries = transaction {
             var q = MaterialImpactAssessments.selectAll()
                 .where { MaterialImpactAssessments.caseId eq caseId }
             if (supplyId != null) q = q.andWhere { MaterialImpactAssessments.supplyId eq supplyId }
+            if (planRunId != null) q = q.andWhere { MaterialImpactAssessments.planRunId eq planRunId }
+            if (deliveryDelayDays != null) q = q.andWhere { MaterialImpactAssessments.deliveryDelayDays eq deliveryDelayDays }
+            if (quantityDecreasePct != null) q = q.andWhere { MaterialImpactAssessments.quantityDecreasePct eq quantityDecreasePct }
             q.orderBy(MaterialImpactAssessments.id, SortOrder.DESC).map { r ->
                 AssessmentSummary(
                     id = r[MaterialImpactAssessments.id],
                     supplyId = r[MaterialImpactAssessments.supplyId],
+                    planRunId = r[MaterialImpactAssessments.planRunId],
                     deliveryDelayDays = r[MaterialImpactAssessments.deliveryDelayDays],
                     quantityDecreasePct = r[MaterialImpactAssessments.quantityDecreasePct],
+                    quantityDecreaseAbs = r[MaterialImpactAssessments.quantityDecreaseAbs],
                     rating = r[MaterialImpactAssessments.rating],
                     explanation = r[MaterialImpactAssessments.explanation],
                     criteria = r[MaterialImpactAssessments.criteria],
@@ -345,6 +373,48 @@ private suspend fun handleAssessment(
         ?: req.impact?.caseId
         ?: throw IllegalArgumentException("caseId required (path param, body.caseId, or body.impact.caseId)")
 
+    // Idempotency: reuse an existing assessment with identical parameters (same agent may be called twice).
+    // Only applies to Mode A (supplyId path) — Mode B always has a fresh impact object.
+    if (req.impact == null && req.supplyId != null) {
+        val existing = transaction {
+            var q = MaterialImpactAssessments.selectAll()
+                .where { MaterialImpactAssessments.caseId eq effectiveCaseId }
+                .andWhere { MaterialImpactAssessments.supplyId eq req.supplyId }
+                .andWhere { MaterialImpactAssessments.deliveryDelayDays eq req.deliveryDelayDays }
+                .andWhere { MaterialImpactAssessments.quantityDecreasePct eq req.quantityDecreasePct }
+            if (req.planRunId != null)
+                q = q.andWhere { MaterialImpactAssessments.planRunId eq req.planRunId }
+            q.orderBy(MaterialImpactAssessments.id, SortOrder.DESC).firstOrNull()
+        }
+        if (existing != null) {
+            log.info("assessment cache hit: id={} supplyId={} planRunId={} rating={}",
+                existing[MaterialImpactAssessments.id], req.supplyId, req.planRunId, existing[MaterialImpactAssessments.rating])
+            // Re-run impact analysis to get current demand details (cheap — no LLM).
+            val impact = computeMaterialImpact(MaterialImpactRequest(
+                supplyId = req.supplyId,
+                deliveryDelayDays = req.deliveryDelayDays,
+                quantityDecreasePct = req.quantityDecreasePct,
+                quantityDecreaseAbs = req.quantityDecreaseAbs,
+                planRunId = req.planRunId,
+            ))
+            call.respond(
+                AssessmentResponse(
+                    id = existing[MaterialImpactAssessments.id],
+                    rating = existing[MaterialImpactAssessments.rating],
+                    explanation = existing[MaterialImpactAssessments.explanation],
+                    criteria = existing[MaterialImpactAssessments.criteria],
+                    caseId = effectiveCaseId,
+                    planRunId = impact.planRunId,
+                    supply = impact.supply,
+                    impactedDemandCount = impact.impactedDemandCount,
+                    impacts = impact.impacts,
+                    createdAt = existing[MaterialImpactAssessments.createdAt].toString(),
+                )
+            )
+            return
+        }
+    }
+
     // Resolve impact — Mode B preferred, Mode A if only supply params given
     val impact: MaterialImpactResponse = when {
         req.impact != null -> req.impact
@@ -353,6 +423,7 @@ private suspend fun handleAssessment(
                 supplyId = req.supplyId,
                 deliveryDelayDays = req.deliveryDelayDays,
                 quantityDecreasePct = req.quantityDecreasePct,
+                quantityDecreaseAbs = req.quantityDecreaseAbs,
                 planRunId = req.planRunId,
             )
             computeMaterialImpact(impactReq)
@@ -382,7 +453,8 @@ private suspend fun handleAssessment(
         else
             d.consumedSupplyQty
     }
-    val (rating, explanation) = if (criteria.trim() == DEFAULT_CRITERIA.trim()) {
+    val isDefaultCriteria = criteria.trim() == DEFAULT_CRITERIA.trim() || criteria.trim() == DEFAULT_CRITERIA_ZH.trim()
+    val (rating, explanation) = if (isDefaultCriteria) {
         val computedRating = computeDefaultRating(impact.impactedDemandCount, totalShortfall)
         log.info("assessment: using programmatic rating={} (demandCount={} totalShortfall={})",
             computedRating, impact.impactedDemandCount, totalShortfall)
@@ -402,6 +474,7 @@ private suspend fun handleAssessment(
             it[MaterialImpactAssessments.supplyId]            = impact.supply.supplyId
             it[MaterialImpactAssessments.deliveryDelayDays]   = impact.deliveryDelayDays
             it[MaterialImpactAssessments.quantityDecreasePct] = impact.quantityDecreasePct
+            it[MaterialImpactAssessments.quantityDecreaseAbs] = impact.quantityDecreaseAbs
             it[MaterialImpactAssessments.criteria]            = criteria
             it[MaterialImpactAssessments.rating]              = rating
             it[MaterialImpactAssessments.explanation]         = explanation

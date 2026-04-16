@@ -95,6 +95,8 @@ data class PlanRunResponse(
     val status: String,
     val config: JsonElement? = null,
     @SerialName("override_count") val overrideCount: Int = 0,
+    val name: String? = null,
+    val notes: String? = null,
     @SerialName("created_at") val createdAt: String,
 )
 
@@ -108,8 +110,9 @@ data class PlanRunFullResponse(
     @SerialName("override_snapshot") val overrideSnapshot: JsonElement? = null,
     val result: JsonElement? = null,
     val error: String? = null,
-    @SerialName("created_at") val createdAt: String,
-)
+    val name: String? = null,
+    val notes: String? = null,
+    @SerialName("created_at") val createdAt: String,)
 
 @Serializable
 data class BomGraphNode(

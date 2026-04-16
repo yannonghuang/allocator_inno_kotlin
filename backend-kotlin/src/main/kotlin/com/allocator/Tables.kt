@@ -173,9 +173,10 @@ object MaterialEvents : Table("material_event") {
     val id          = integer("id").autoIncrement()
     val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
     val supplyId    = varchar("supply_id", 255)
-    val delayDays   = integer("delay_days").default(0)
+    val delayDays      = integer("delay_days").default(0)
     val qtyDecreasePct = double("qty_decrease_pct").default(0.0)
-    val note        = text("note").nullable()
+    val qtyDecreaseAbs = double("qty_decrease_abs").nullable()   // absolute qty decrease; takes precedence over pct when set
+    val note           = text("note").nullable()
     val createdAt   = timestamp("created_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 }
@@ -191,6 +192,8 @@ object PlanRuns : Table("plan_run") {
     val result = text("result").nullable()                       // JSON: enriched plan result
     val error = text("error").nullable()
     val metadata = text("metadata").nullable()                   // JSON: {"type":"contingent","supplyId":"...","deliveryDelayDays":N,"quantityDecreasePct":N,"baselinePlanRunId":M}
+    val name = varchar("name", 255).nullable()
+    val notes = text("notes").nullable()
     val createdAt = timestamp("created_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 }
@@ -203,6 +206,7 @@ object MaterialImpactAssessments : Table("material_impact_assessment") {
     val supplyId            = varchar("supply_id", 255)
     val deliveryDelayDays   = integer("delivery_delay_days").default(0)
     val quantityDecreasePct = double("quantity_decrease_pct").default(0.0)
+    val quantityDecreaseAbs = double("quantity_decrease_abs").nullable()  // absolute qty decrease; takes precedence over pct when set
     val criteria            = text("criteria")
     val rating              = varchar("rating", 10)   // LOW | MEDIUM | HIGH
     val explanation         = text("explanation")

@@ -199,6 +199,13 @@ private fun migrateSchema() {
         "ALTER TABLE cases ADD COLUMN IF NOT EXISTS assessment_criteria TEXT",
         // Metadata column on plan_run (used for contingent runs from material-impact)
         "ALTER TABLE plan_run ADD COLUMN IF NOT EXISTS metadata TEXT",
+        // Name and notes on plan_run
+        "ALTER TABLE plan_run ADD COLUMN IF NOT EXISTS name VARCHAR(255)",
+        "ALTER TABLE plan_run ADD COLUMN IF NOT EXISTS notes TEXT",
+        // Absolute qty decrease on material_event (takes precedence over pct when set)
+        "ALTER TABLE material_event ADD COLUMN IF NOT EXISTS qty_decrease_abs DOUBLE PRECISION",
+        // Absolute qty decrease on material_impact_assessment
+        "ALTER TABLE material_impact_assessment ADD COLUMN IF NOT EXISTS quantity_decrease_abs DOUBLE PRECISION",
         // Fix FK constraints to use ON DELETE CASCADE (idempotent: drop if exists, re-add)
         *cascadeFkMigrations()
     )

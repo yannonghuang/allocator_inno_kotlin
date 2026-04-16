@@ -239,7 +239,7 @@ export type PlanningPeggingNode = {
   children: PlanningPeggingNode[];
 };
 
-export type PlanningPeggingEntry = { demand_id: string | null; tree: PlanningPeggingNode };
+export type PlanningPeggingEntry = { demand_id: string | null; tree: PlanningPeggingNode; passthrough?: boolean };
 
 /** Plan KPI dashboard: delivery, inventory, procurement, manufacturing, logistics. */
 export type PlanKpis = {
@@ -352,6 +352,7 @@ export type PlanStatusResponse = {
   progress?: { current: number; total: number };
   result?: PlanResult;
   error?: string;
+  plan_run_id?: number;
 };
 
 export async function getPlanStatus(caseId: number, jobId: string): Promise<PlanStatusResponse> {
@@ -417,6 +418,8 @@ export type PlanRun = {
   status: 'running' | 'success' | 'failed' | 'contingent';
   config: Record<string, unknown> | null;
   override_count: number;
+  name: string | null;
+  notes: string | null;
   created_at: string;
 };
 
@@ -438,8 +441,36 @@ export async function getPlanRun(caseId: number, runId: number): Promise<PlanRun
   return r.json();
 }
 
+/** Returns the current unsaved (status="ready") plan run with its in-memory result,
+ *  or null if none exists or the server-side memory has expired. */
+export async function getUnsavedPlanRun(caseId: number): Promise<PlanRunFull | null> {
+  const r = await fetch(`${API}/cases/${caseId}/plan-runs/unsaved`);
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
 export async function deletePlanRun(caseId: number, runId: number): Promise<void> {
   const r = await fetch(`${API}/cases/${caseId}/plan-runs/${runId}`, { method: 'DELETE' });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+export async function savePlanRun(caseId: number, runId: number, opts?: { name?: string; notes?: string }): Promise<{ id: number; status: string }> {
+  const r = await fetch(`${API}/cases/${caseId}/plan-runs/${runId}/save`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(opts ?? {}),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function updatePlanRun(caseId: number, runId: number, data: { name?: string; notes?: string }): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/plan-runs/${runId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
   if (!r.ok) throw new Error(await r.text());
 }
 
@@ -708,6 +739,7 @@ export type MaterialEvent = {
   supplyId: string;
   delayDays: number;
   qtyDecreasePct: number;
+  qtyDecreaseAbs: number | null;
   note: string | null;
   createdAt: string;
 };
@@ -759,12 +791,12 @@ export async function listMaterialEvents(caseId: number): Promise<MaterialEvent[
 
 export async function createMaterialEvent(
   caseId: number,
-  body: { supplyId: string; delayDays: number; qtyDecreasePct: number; note?: string | null },
+  body: { supplyId: string; delayDays: number; qtyDecreasePct: number; qtyDecreaseAbs?: number | null; note?: string | null },
 ): Promise<MaterialEvent> {
   const r = await fetch(`${API}/cases/${caseId}/material-events`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ supplyId: body.supplyId, delayDays: body.delayDays, qtyDecreasePct: body.qtyDecreasePct, note: body.note }),
+    body: JSON.stringify({ supplyId: body.supplyId, delayDays: body.delayDays, qtyDecreasePct: body.qtyDecreasePct, qtyDecreaseAbs: body.qtyDecreaseAbs ?? null, note: body.note }),
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
@@ -773,12 +805,12 @@ export async function createMaterialEvent(
 export async function updateMaterialEvent(
   caseId: number,
   eventId: number,
-  body: { supplyId: string; delayDays: number; qtyDecreasePct: number; note?: string | null },
+  body: { supplyId: string; delayDays: number; qtyDecreasePct: number; qtyDecreaseAbs?: number | null; note?: string | null },
 ): Promise<MaterialEvent> {
   const r = await fetch(`${API}/cases/${caseId}/material-events/${eventId}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ supplyId: body.supplyId, delayDays: body.delayDays, qtyDecreasePct: body.qtyDecreasePct, note: body.note }),
+    body: JSON.stringify({ supplyId: body.supplyId, delayDays: body.delayDays, qtyDecreasePct: body.qtyDecreasePct, qtyDecreaseAbs: body.qtyDecreaseAbs ?? null, note: body.note }),
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
@@ -794,12 +826,13 @@ export async function analyzeMaterialImpact(
   deliveryDelayDays: number,
   quantityDecreasePct: number,
   persist = true,
+  quantityDecreaseAbs?: number | null,
 ): Promise<MaterialImpactResult> {
   // 1. Submit async re-plan job
   const submit = await fetch(`${API}/material-impact`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ supplyId, deliveryDelayDays, quantityDecreasePct, persist }),
+    body: JSON.stringify({ supplyId, deliveryDelayDays, quantityDecreasePct, quantityDecreaseAbs: quantityDecreaseAbs ?? null, persist }),
   });
   if (!submit.ok) throw new Error(await submit.text());
   const { jobId } = await submit.json();
@@ -895,10 +928,12 @@ export async function runAssessment(
   quantityDecreasePct: number,
   planRunId?: number | null,
   impact?: MaterialImpactResult | null,
+  quantityDecreaseAbs?: number | null,
 ): Promise<AssessmentResponse> {
   const body: Record<string, unknown> = { supplyId, deliveryDelayDays, quantityDecreasePct, caseId };
   if (planRunId != null) body.planRunId = planRunId;
   if (impact != null) body.impact = impact;
+  if (quantityDecreaseAbs != null && quantityDecreaseAbs > 0) body.quantityDecreaseAbs = quantityDecreaseAbs;
   const r = await fetchWithTimeout(
     `${API}/material-impact-assessment`,
     { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },

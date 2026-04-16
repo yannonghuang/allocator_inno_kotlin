@@ -68,6 +68,8 @@ import {
   setAssessmentCriteria,
   listAssessments,
   runAssessment,
+  savePlanRun,
+  updatePlanRun,
 } from '@/lib/api';
 
 type SupplySuggestion = {
@@ -296,6 +298,9 @@ function formatCommitReason(reason: string, purchaseAllowed: boolean): { label: 
     case 'depth_limit':
       rootLabel = 'supply chain too deep';
       break;
+    case 'partial':
+      rootLabel = 'partial fulfillment — insufficient components';
+      break;
     default:
       rootLabel = rootCause;
   }
@@ -315,20 +320,18 @@ import { PeggingTree, pathKeyFromPath, type PeggingGraph } from '@/app/component
 import BomGraphTab from '@/app/components/BomGraphTab';
 
 // ── Assessment criteria helpers ────────────────────────────────────────────────
-const CRITERIA_HEADERS = {
-  high: 'the following are criteria for HIGH rating:',
-  low: 'the following are criteria for LOW rating:',
-  medium: 'the following are criteria for MEDIUM rating:',
-} as const;
 
+/** Parse criteria text into per-tier parts. Recognises both English and Chinese section headers. */
 function parseCriteriaParts(text: string): { high: string; low: string; medium: string } {
   const result: Record<string, string[]> = { high: [], low: [], medium: [] };
   let current: string | null = null;
   for (const line of text.split('\n')) {
-    const trimmed = line.trimStart().toLowerCase();
-    if (trimmed.startsWith('the following are criteria for high')) { current = 'high'; continue; }
-    if (trimmed.startsWith('the following are criteria for low')) { current = 'low'; continue; }
-    if (trimmed.startsWith('the following are criteria for medium')) { current = 'medium'; continue; }
+    const t = line.trimStart().toLowerCase();
+    // English: "the following are criteria for high/low/medium rating:"
+    // Chinese: "以下是high/low/medium评级的标准："
+    if (t.startsWith('the following are criteria for high') || t.startsWith('以下是high')) { current = 'high'; continue; }
+    if (t.startsWith('the following are criteria for low')  || t.startsWith('以下是low'))  { current = 'low';  continue; }
+    if (t.startsWith('the following are criteria for medium') || t.startsWith('以下是medium')) { current = 'medium'; continue; }
     if (current) result[current].push(line);
   }
   return {
@@ -338,11 +341,14 @@ function parseCriteriaParts(text: string): { high: string; low: string; medium: 
   };
 }
 
-function buildCriteriaText(high: string, low: string, medium: string): string {
+function buildCriteriaText(
+  high: string, low: string, medium: string,
+  headers: { high: string; low: string; medium: string },
+): string {
   const parts: string[] = [];
-  if (high.trim()) { parts.push(CRITERIA_HEADERS.high); parts.push(high.trim()); }
-  if (low.trim()) { parts.push(CRITERIA_HEADERS.low); parts.push(low.trim()); }
-  if (medium.trim()) { parts.push(CRITERIA_HEADERS.medium); parts.push(medium.trim()); }
+  if (high.trim()) { parts.push(headers.high); parts.push(high.trim()); }
+  if (low.trim()) { parts.push(headers.low); parts.push(low.trim()); }
+  if (medium.trim()) { parts.push(headers.medium); parts.push(medium.trim()); }
   return parts.join('\n');
 }
 
@@ -353,6 +359,7 @@ type WoEnrichedRow = WorkOrder & {
   _peg_order?: number;
   _demand_label?: string;
   _demand_ids?: string[];
+  _requested_qty?: number;
   _shortage?: number;
 };
 
@@ -431,6 +438,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const tA = useTranslations('allocation');
   const tP = useTranslations('planning');
   const tc = useTranslations('common');
+  // Locale-aware section headers used when assembling / saving criteria text
+  const criteriaHeaders = {
+    high:   tP('assessment.criteriaHeader', { tier: 'HIGH' }),
+    low:    tP('assessment.criteriaHeader', { tier: 'LOW' }),
+    medium: tP('assessment.criteriaHeader', { tier: 'MEDIUM' }),
+  };
   const params = useParams();
   const id = Number(params.id);
   const [c, setC] = useState<CaseType | null>(null);
@@ -483,10 +496,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [materialAssessmentHistory, setMaterialAssessmentHistory] = useState<Record<number, AssessmentSummary[]>>({});
   const [materialAssessmentHistoryOpen, setMaterialAssessmentHistoryOpen] = useState<Record<number, boolean>>({});
   const [materialEventCollapsed, setMaterialEventCollapsed] = useState<Record<number, boolean>>({});
-  const [materialEventEditing, setMaterialEventEditing] = useState<Record<number, { supplyId: string; delayDays: number; qtyDecreasePct: number; note: string }>>({});
+  const [materialEventEditing, setMaterialEventEditing] = useState<Record<number, { supplyId: string; delayDays: number; qtyDecreaseMode: 'pct' | 'abs'; qtyDecreasePct: number; qtyDecreaseAbs: number; note: string }>>({});
   const [materialEventSaving, setMaterialEventSaving] = useState<Record<number, boolean>>({});
   // New event form state (-1 = "new" sentinel)
-  const [materialNewEvent, setMaterialNewEvent] = useState<{ supplyId: string; delayDays: number; qtyDecreasePct: number; note: string } | null>(null);
+  const [materialNewEvent, setMaterialNewEvent] = useState<{ supplyId: string; delayDays: number; qtyDecreaseMode: 'pct' | 'abs'; qtyDecreasePct: number; qtyDecreaseAbs: number; note: string } | null>(null);
   const [materialNewSaving, setMaterialNewSaving] = useState(false);
   const [materialNewSupplySuggestions, setMaterialNewSupplySuggestions] = useState<SupplySuggestion[]>([]);
   const [materialNewShowSuggestions, setMaterialNewShowSuggestions] = useState(false);
@@ -524,6 +537,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planResultTab, setPlanResultTab] = useState<'demands' | 'work_orders' | 'supplies'>('demands');
   // ID of the plan run currently loaded in planResult; null = freshly-run (not from history)
   const [currentPlanRunId, setCurrentPlanRunId] = useState<number | null>(null);
+  // DB run ID for the current fresh (unsaved) plan result; null once saved or when loading from history
+  const [freshPlanRunId, setFreshPlanRunId] = useState<number | null>(null);
+  const [planRunSaving, setPlanRunSaving] = useState(false);
+  const [planRunSaveError, setPlanRunSaveError] = useState<string | null>(null);
+  // Name/notes for the fresh unsaved run
+  const [freshRunName, setFreshRunName] = useState('');
+  const [freshRunNotes, setFreshRunNotes] = useState('');
+  // Inline editing state for history panel: runId → { name, notes }
+  const [planRunEditing, setPlanRunEditing] = useState<Record<number, { name: string; notes: string }>>({});
+  const [planRunEditSaving, setPlanRunEditSaving] = useState<Record<number, boolean>>({});
   const [caseSupplies, setCaseSupplies] = useState<CaseSupplyRow[]>([]);
   const [caseSuppliesLoading, setCaseSuppliesLoading] = useState(false);
   const [caseSuppliesError, setCaseSuppliesError] = useState<string | null>(null);
@@ -545,7 +568,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [assessmentHistory, setAssessmentHistory] = useState<AssessmentSummary[]>([]);
   const [assessmentHistoryOpen, setAssessmentHistoryOpen] = useState(false);
   const [assessDelayDays, setAssessDelayDays] = useState(0);
+  const [assessQtyDecreaseMode, setAssessQtyDecreaseMode] = useState<'pct' | 'abs'>('pct');
   const [assessQtyDecreasePct, setAssessQtyDecreasePct] = useState(0);
+  const [assessQtyDecreaseAbs, setAssessQtyDecreaseAbs] = useState(0);
   const [assessError, setAssessError] = useState<string | null>(null);
   const [planDemandRealMakeOnly, setPlanDemandRealMakeOnly] = useState(false);
   const [planDemandShortOnly, setPlanDemandShortOnly] = useState(false);
@@ -589,6 +614,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [supplyCriticalityMap, setSupplyCriticalityMap] = useState<Record<string, 'critical' | 'not_critical' | 'running' | 'error'>>({});
   const [criticalityRunning, setCriticalityRunning] = useState(false);
   const [criticalityProgress, setCriticalityProgress] = useState<{ done: number; total: number } | null>(null);
+  // Whether to auto-run criticality scan after planning (config option, default: off)
+  const [analyzeCriticalityEnabled, setAnalyzeCriticalityEnabled] = useState(false);
+  // Set to true after plan completes with analyzeCriticalityEnabled; cleared once caseSupplies loads and analysis starts
+  const [autoCriticalityPending, setAutoCriticalityPending] = useState(false);
 
   // ── Plan run history state ──────────────────────────────────────────────────
   const [planRunHistory, setPlanRunHistory] = useState<PlanRun[]>([]);
@@ -753,9 +782,28 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         const st = await getPlanStatus(id, planJobId);
         if (st.progress) setPlanProgress(st.progress);
         if (st.status === 'completed' && st.result) {
+          const freshId = st.plan_run_id ?? null;
           setPlanResult(st.result);
-          setCurrentPlanRunId(null);
+          setPlanRunSaveError(null);
           setPlanWorkOrderPeggingCache({});
+          setSupplyCriticalityMap({});
+          try { sessionStorage.removeItem(`criticality-case-${id}`); } catch { /* ignore */ }
+          if (analyzeCriticalityEnabled && freshId && id != null) {
+            // Auto-persist so impact/criticality analysis can use the persisted run.
+            try {
+              await savePlanRun(Number(id), freshId);
+              setCurrentPlanRunId(freshId);
+              setFreshPlanRunId(null);
+            } catch {
+              // Auto-save failed — leave as unsaved; user can save manually.
+              setCurrentPlanRunId(null);
+              setFreshPlanRunId(freshId);
+            }
+            setAutoCriticalityPending(true);
+          } else {
+            setCurrentPlanRunId(null);
+            setFreshPlanRunId(freshId);
+          }
           setPlanJobId(null);
           setPlanLoading(false);
           setPlanProgress(null);
@@ -806,6 +854,25 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return () => { cancelled = true; };
   }, [id, planResult]);
 
+  // Auto-run criticality analysis once caseSupplies finishes loading after a plan run with analyze_criticality on.
+  useEffect(() => {
+    if (!autoCriticalityPending || caseSuppliesLoading || caseSupplies.length === 0) return;
+    setAutoCriticalityPending(false);
+    handleAnalyzeCriticality();
+  // handleAnalyzeCriticality is stable enough for this use; listed deps drive the trigger condition
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoCriticalityPending, caseSuppliesLoading, caseSupplies.length]);
+
+  // Persist criticality map to sessionStorage so it survives page swaps.
+  useEffect(() => {
+    if (!id || Object.keys(supplyCriticalityMap).length === 0 || criticalityRunning) return;
+    const runKey: number | null = currentPlanRunId ?? (freshPlanRunId ?? null);
+    try {
+      sessionStorage.setItem(`criticality-case-${id}`, JSON.stringify({ runKey, map: supplyCriticalityMap }));
+    } catch { /* ignore */ }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [supplyCriticalityMap]);
+
   // Load real BOM pairs and real move triples once we have a plan result.
   useEffect(() => {
     if (!planResult || !planResult.committed_demands.length || !id) {
@@ -855,13 +922,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       .then((c) => {
         const val = c ?? '';
         setAssessCriteria(val);
-        const parts = parseCriteriaParts(val);
-        setAssessCriteriaHigh(parts.high);
-        setAssessCriteriaLow(parts.low);
-        setAssessCriteriaMedium(parts.medium);
+        if (val) {
+          const parts = parseCriteriaParts(val);
+          setAssessCriteriaHigh(parts.high);
+          setAssessCriteriaLow(parts.low);
+          setAssessCriteriaMedium(parts.medium);
+        } else {
+          // No custom criteria saved — pre-fill with locale defaults as a starting point
+          setAssessCriteriaHigh(tP('assessment.criteriaDefaultHigh'));
+          setAssessCriteriaLow(tP('assessment.criteriaDefaultLow'));
+          setAssessCriteriaMedium(tP('assessment.criteriaDefaultMedium'));
+        }
         setAssessCriteriaLoaded(true);
       })
       .catch(() => setAssessCriteriaLoaded(true));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [assessCriteriaOpen, assessCriteriaLoaded, id]);
 
   // Fetch work-order pegging on demand when slide-in opens for a WO.
@@ -1053,6 +1128,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     }
   };
 
+  const restoreCriticality = (runKey: number | null) => {
+    try {
+      const stored = sessionStorage.getItem(`criticality-case-${id}`);
+      if (!stored) return;
+      const { runKey: storedKey, map } = JSON.parse(stored);
+      if (storedKey === runKey) setSupplyCriticalityMap(map);
+    } catch { /* ignore */ }
+  };
+
   const loadLatestPlanRun = async () => {
     try {
       const runs = await listPlanRuns(id);
@@ -1065,6 +1149,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         setCurrentPlanRunId(latest.id);
         setPlanWorkOrderPeggingCache({});
         if (full.config) setPlanningConfig(full.config as PlanningConfig);
+        restoreCriticality(latest.id);
       }
     } catch {
       // non-fatal — plan results simply won't be pre-loaded
@@ -1476,6 +1561,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     }
 
     for (const entry of planResult.planning_pegging) {
+      if (entry.passthrough) continue;
       walk(entry.tree, entry.demand_id ?? null);
     }
     return map;
@@ -1754,6 +1840,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       if (full.result) {
         setPlanResult(full.result as typeof planResult);
         setCurrentPlanRunId(runId);
+        setFreshPlanRunId(null);
+        setPlanRunSaveError(null);
         setPlanWorkOrderPeggingCache({});
         if (full.config) setPlanningConfig(full.config as PlanningConfig);
         setPlanRunHistoryOpen(false);
@@ -1861,8 +1949,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         id,
         planPeggingContext.supplyId,
         assessDelayDays,
-        assessQtyDecreasePct,
+        assessQtyDecreaseMode === 'pct' ? assessQtyDecreasePct : 0,
         currentPlanRunId,
+        undefined,
+        assessQtyDecreaseMode === 'abs' ? assessQtyDecreaseAbs : null,
       );
       setAssessmentResult(result);
       const hist = await listAssessments(id, planPeggingContext.supplyId);
@@ -1889,7 +1979,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const handleSaveCriteria = async () => {
     setAssessCriteriaSaving(true);
     try {
-      const combined = buildCriteriaText(assessCriteriaHigh, assessCriteriaLow, assessCriteriaMedium);
+      const combined = buildCriteriaText(assessCriteriaHigh, assessCriteriaLow, assessCriteriaMedium, criteriaHeaders);
       await setAssessmentCriteria(id, combined);
       setAssessCriteria(combined);
     } catch (_) { /* TODO: surface error */ } finally {
@@ -2632,6 +2722,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               />
               <span>{tP('config.consolidate')}</span>
             </label>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={analyzeCriticalityEnabled}
+                onChange={(e) => setAnalyzeCriticalityEnabled(e.target.checked)}
+              />
+              <span style={{ fontSize: '0.875rem' }}>Analyze Criticality</span>
+            </label>
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}>
               <span style={{ color: '#a1a1aa' }}>{tP('config.bucketDays')}</span>
               <input
@@ -2672,6 +2770,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               setPlanError(null);
               setPlanLoading(true);
               setPlanProgress(null);
+              setFreshPlanRunId(null);
+              setFreshRunName('');
+              setFreshRunNotes('');
+              setPlanRunSaveError(null);
+              setAutoCriticalityPending(false);
+              setSupplyCriticalityMap({});
+              setCriticalityProgress(null);
               const config = Object.keys(planningConfig).length ? planningConfig : undefined;
               try {
                 const { job_id } = await runPlanAsync(id, config);
@@ -2736,6 +2841,59 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#2e1065', border: '1px solid #7c3aed', borderRadius: 6, padding: '6px 12px', marginBottom: '0.75rem', fontSize: '0.82rem', color: '#ddd6fe' }}>
                 <span style={{ fontWeight: 700, color: '#a78bfa' }}>Contingent run #{currentPlanRunId}</span>
                 <span>— what-if branch. Run a fresh plan to create a new baseline.</span>
+              </div>
+            )}
+            {currentPlanRunId === null && freshPlanRunId !== null && (
+              <div style={{ marginBottom: '0.75rem', padding: '0.6rem 0.75rem', background: '#1a2e1a', border: '1px solid #166534', borderRadius: 6 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: '0.5rem' }}>
+                  <span style={{ fontSize: '0.78rem', color: '#86efac', fontWeight: 600 }}>Unsaved</span>
+                  <span style={{ fontSize: '0.75rem', color: '#71717a' }}>— results are in memory only</span>
+                </div>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+                  <input
+                    type="text"
+                    placeholder="Run name (optional)"
+                    value={freshRunName}
+                    onChange={(e) => setFreshRunName(e.target.value)}
+                    style={{ flex: '1 1 180px', minWidth: 0, padding: '4px 8px', background: '#27272a', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, fontSize: '0.82rem' }}
+                  />
+                  <input
+                    type="text"
+                    placeholder="Notes (optional)"
+                    value={freshRunNotes}
+                    onChange={(e) => setFreshRunNotes(e.target.value)}
+                    style={{ flex: '2 1 240px', minWidth: 0, padding: '4px 8px', background: '#27272a', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, fontSize: '0.82rem' }}
+                  />
+                  <button
+                    type="button"
+                    disabled={planRunSaving}
+                    onClick={async () => {
+                      if (!freshPlanRunId || !id) return;
+                      setPlanRunSaving(true);
+                      setPlanRunSaveError(null);
+                      try {
+                        await savePlanRun(id, freshPlanRunId, {
+                          name: freshRunName.trim() || undefined,
+                          notes: freshRunNotes.trim() || undefined,
+                        });
+                        setCurrentPlanRunId(freshPlanRunId);
+                        setFreshPlanRunId(null);
+                        setFreshRunName('');
+                        setFreshRunNotes('');
+                        const runs = await listPlanRuns(id);
+                        setPlanRunHistory(runs);
+                      } catch (e) {
+                        setPlanRunSaveError(e instanceof Error ? e.message : 'Save failed');
+                      } finally {
+                        setPlanRunSaving(false);
+                      }
+                    }}
+                    style={{ padding: '5px 14px', background: '#16a34a', color: '#fff', border: 'none', borderRadius: 6, cursor: planRunSaving ? 'wait' : 'pointer', fontWeight: 600, fontSize: '0.82rem', whiteSpace: 'nowrap' }}
+                  >
+                    {planRunSaving ? 'Saving…' : 'Save run'}
+                  </button>
+                </div>
+                {planRunSaveError && <p style={{ margin: '0.4rem 0 0', fontSize: '0.75rem', color: '#f87171' }}>{planRunSaveError}</p>}
               </div>
             )}
             {/* Plan KPI dashboard – always show when plan result exists; build kpis safely from backend or client */}
@@ -3031,8 +3189,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             { key: 'commit_time', label: 'Commit time', sortable: true, render: (r) => r.commit_time ?? '–' },
                             { key: 'commit_reason', label: 'Commit reason', sortable: true, render: (r) => {
                               if (!r.commit_reason) return <span style={{ color: '#52525b' }}>–</span>;
-                              if (!r.is_failed) return <span>{r.commit_reason}</span>;
                               const { label, tooltip } = formatCommitReason(r.commit_reason, planningConfig.purchase_allowed !== false);
+                              if (!r.is_failed) {
+                                // Non-failure reason (e.g. "partial") — amber, informational
+                                const isPartial = r.commit_reason === 'partial' || r.commit_reason.startsWith('partial:');
+                                return (
+                                  <span title={tooltip || r.commit_reason} style={{ color: isPartial ? '#fb923c' : undefined, cursor: tooltip ? 'help' : 'default', fontSize: '0.78rem' }}>
+                                    {label}
+                                  </span>
+                                );
+                              }
                               return (
                                 <span title={tooltip || r.commit_reason} style={{ color: '#f87171', cursor: tooltip ? 'help' : 'default' }}>
                                   {label}
@@ -3240,12 +3406,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       }
                     }
                     const groupedRows = Array.from(grouped.values());
-                    // Build demand_id → shortage lookup for the Shortage column
+                    // Build demand_id → requested_qty / shortage lookups (mirrors demands-tab pattern)
+                    const demandRequestedMap = new Map<string, number>();
                     const demandShortageMap = new Map<string, number>();
                     for (const d of planResult.committed_demands) {
-                      if ((d.demand_id ?? '') && (d.shortage ?? 0) > 0) {
-                        demandShortageMap.set(d.demand_id ?? '', d.shortage ?? 0);
-                      }
+                      const id = d.demand_id ?? '';
+                      if (!id) continue;
+                      if (d.requested_qty != null) demandRequestedMap.set(id, d.requested_qty);
+                      if ((d.shortage ?? 0) > 0) demandShortageMap.set(id, d.shortage ?? 0);
                     }
                     const dummyHiddenCount = planResult.work_orders.filter((r) => (r.prod_area ?? '').trim().toLowerCase() === 'dummy').length;
                     const woRows: WoEnrichedRow[] = groupedRows.map((r, i) => {
@@ -3257,6 +3425,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         : splitDemandIds.length > 0
                           ? splitDemandIds.join(', ')
                           : undefined;
+                      const requested = r.demand_id
+                        ? (demandRequestedMap.get(r.demand_id) ?? undefined)
+                        : splitDemandIds.reduce((s, did) => s + (demandRequestedMap.get(did) ?? 0), 0) || undefined;
                       const shortage = r.demand_id
                         ? (demandShortageMap.get(r.demand_id) ?? 0)
                         : splitDemandIds.reduce((s, did) => s + (demandShortageMap.get(did) ?? 0), 0);
@@ -3267,6 +3438,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         _peg_order: pegOrderMap.get(`${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`),
                         _demand_label: demandLabel,
                         _demand_ids: r.demand_id ? [r.demand_id] : splitDemandIds,
+                        _requested_qty: requested,
                         _shortage: shortage > 0 ? shortage : undefined,
                       };
                     });
@@ -3274,7 +3446,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       { key: 'product_id', label: 'Product', sortable: true },
                       { key: 'location_id', label: 'Location', sortable: true },
                       { key: '_prod_area', label: 'PROD_AREA', sortable: true, render: (r) => r._prod_area || r.prod_area || '–' },
-                      { key: 'quantity', label: 'Quantity', sortable: true },
+                      { key: '_requested_qty', label: 'Requested', sortable: true, render: (r) =>
+                        r._requested_qty != null ? Number(r._requested_qty).toLocaleString() : '–'
+                      },
+                      { key: 'quantity', label: 'Committed', sortable: true, render: (r) => Number(r.quantity).toLocaleString() },
                       { key: 'start_time', label: 'Start time', sortable: true, render: (r) => r.start_time ?? '–' },
                       { key: 'end_time', label: 'End time', sortable: true, render: (r) => r.end_time ?? '–' },
                       { key: 'method', label: 'Method', sortable: true, render: (r) => (
@@ -3310,7 +3485,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       { key: '_shortage', label: 'Shortage', sortable: true, render: (r) => {
                         const s = r._shortage;
                         if (!s) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
-                        return <span style={{ color: '#f87171' }}>{s.toLocaleString(undefined, { maximumFractionDigits: 1 })}</span>;
+                        return <span style={{ color: '#f87171' }}>{Number(s).toLocaleString()}</span>;
                       } },
                       { key: 'location_source', label: 'Location source', sortable: true, render: (r) => r.location_source ?? '–' },
                       { key: '_peg_order', label: 'Pegging', sortable: true, render: (r) => {
@@ -3582,17 +3757,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           return (
                             <div key={tier} style={{ marginBottom: '0.6rem' }}>
                               <p style={{ fontSize: '0.75rem', margin: '0 0 3px', color: '#a1a1aa' }}>
-                                The following are criteria for{' '}
-                                <span style={{ padding: '1px 7px', borderRadius: 10, background: tierBg, color: tierColor, border: `1px solid ${tierColor}`, fontWeight: 700, fontSize: '0.72rem' }}>
-                                  {tier.toUpperCase()}
-                                </span>
-                                {' '}rating:
+                                {tP('assessment.criteriaHeaderBefore')}
+                                <span style={{ padding: '1px 7px', borderRadius: 10, background: tierBg, color: tierColor, border: `1px solid ${tierColor}`, fontWeight: 700, fontSize: '0.72rem' }}>{tier.toUpperCase()}</span>
+                                {tP('assessment.criteriaHeaderAfter')}
                               </p>
                               <textarea
                                 value={tierValue}
                                 onChange={(e) => tierSetter(e.target.value)}
                                 rows={2}
-                                placeholder={`Describe what makes an impact ${tier.toUpperCase()}…`}
+                                placeholder={tP('assessment.criteriaPlaceholderTier', { tier: tier.toUpperCase() })}
                                 style={{ width: '100%', fontSize: '0.8rem', background: '#27272a', color: '#e4e4e7', border: `1px solid ${tierBorder}`, borderRadius: 4, padding: '0.4rem', resize: 'vertical', boxSizing: 'border-box' }}
                               />
                             </div>
@@ -3602,7 +3775,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           <button
                             type="button"
                             onClick={handleSaveCriteria}
-                            disabled={assessCriteriaSaving || buildCriteriaText(assessCriteriaHigh, assessCriteriaLow, assessCriteriaMedium) === assessCriteria}
+                            disabled={assessCriteriaSaving || buildCriteriaText(assessCriteriaHigh, assessCriteriaLow, assessCriteriaMedium, criteriaHeaders) === assessCriteria}
                             style={{ fontSize: '0.8rem' }}
                           >
                             {assessCriteriaSaving ? tP('assessment.criteriaSaving') : tP('assessment.criteriaSave')}
@@ -3750,17 +3923,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 return (
                   <div key={tier} style={{ marginBottom: '0.6rem' }}>
                     <p style={{ fontSize: '0.75rem', margin: '0 0 3px', color: '#a1a1aa' }}>
-                      The following are criteria for{' '}
-                      <span style={{ padding: '1px 7px', borderRadius: 10, background: tierBg, color: tierColor, border: `1px solid ${tierColor}`, fontWeight: 700, fontSize: '0.72rem' }}>
-                        {tier.toUpperCase()}
-                      </span>
-                      {' '}rating:
+                      {tP('assessment.criteriaHeaderBefore')}
+                      <span style={{ padding: '1px 7px', borderRadius: 10, background: tierBg, color: tierColor, border: `1px solid ${tierColor}`, fontWeight: 700, fontSize: '0.72rem' }}>{tier.toUpperCase()}</span>
+                      {tP('assessment.criteriaHeaderAfter')}
                     </p>
                     <textarea
                       value={tierValue}
                       onChange={(e) => tierSetter(e.target.value)}
                       rows={2}
-                      placeholder={`Describe what makes an impact ${tier.toUpperCase()}…`}
+                      placeholder={tP('assessment.criteriaPlaceholderTier', { tier: tier.toUpperCase() })}
                       style={{ width: '100%', fontSize: '0.8rem', background: '#27272a', color: '#e4e4e7', border: `1px solid ${tierBorder}`, borderRadius: 4, padding: '0.4rem', resize: 'vertical', boxSizing: 'border-box' }}
                     />
                   </div>
@@ -3770,7 +3941,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <button
                   type="button"
                   onClick={handleSaveCriteria}
-                  disabled={assessCriteriaSaving || buildCriteriaText(assessCriteriaHigh, assessCriteriaLow, assessCriteriaMedium) === assessCriteria}
+                  disabled={assessCriteriaSaving || buildCriteriaText(assessCriteriaHigh, assessCriteriaLow, assessCriteriaMedium, criteriaHeaders) === assessCriteria}
                   style={{ fontSize: '0.8rem' }}
                 >
                   {assessCriteriaSaving ? tP('assessment.criteriaSaving') : tP('assessment.criteriaSave')}
@@ -3799,7 +3970,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           <button
             type="button"
             style={{ marginBottom: '1.25rem' }}
-            onClick={() => setMaterialNewEvent({ supplyId: '', delayDays: 0, qtyDecreasePct: 0, note: '' })}
+            onClick={() => setMaterialNewEvent({ supplyId: '', delayDays: 0, qtyDecreaseMode: 'pct', qtyDecreasePct: 0, qtyDecreaseAbs: 0, note: '' })}
           >
             + Add supply event
           </button>
@@ -3869,18 +4040,33 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   onChange={(e) => setMaterialNewEvent(ev => ev ? { ...ev, delayDays: parseInt(e.target.value) || 0 } : ev)}
                 />
               </div>
-              {/* Qty decrease % */}
+              {/* Qty decrease — segmented mode control + input */}
               <div>
-                <label style={{ display: 'block', fontSize: '0.8rem', color: '#a1a1aa', marginBottom: 3 }}>Qty decrease (%)</label>
-                <input
-                  type="number"
-                  min={0}
-                  max={100}
-                  step={0.1}
-                  style={{ width: '100%', boxSizing: 'border-box' }}
-                  value={materialNewEvent.qtyDecreasePct}
-                  onChange={(e) => setMaterialNewEvent(ev => ev ? { ...ev, qtyDecreasePct: parseFloat(e.target.value) || 0 } : ev)}
-                />
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
+                  <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>Qty decrease</span>
+                  <div style={{ display: 'flex', border: '1px solid #4c1d95', borderRadius: 4, overflow: 'hidden' }}>
+                    <button type="button"
+                      onClick={() => setMaterialNewEvent(ev => ev ? { ...ev, qtyDecreaseMode: 'pct' } : ev)}
+                      style={{ fontSize: '0.72rem', padding: '1px 8px', background: materialNewEvent.qtyDecreaseMode === 'pct' ? '#4c1d95' : '#27272a', color: '#e4e4e7', border: 'none', cursor: 'pointer' }}>
+                      %
+                    </button>
+                    <button type="button"
+                      onClick={() => setMaterialNewEvent(ev => ev ? { ...ev, qtyDecreaseMode: 'abs' } : ev)}
+                      style={{ fontSize: '0.72rem', padding: '1px 8px', background: materialNewEvent.qtyDecreaseMode === 'abs' ? '#4c1d95' : '#27272a', color: '#e4e4e7', border: 'none', borderLeft: '1px solid #4c1d95', cursor: 'pointer' }}>
+                      qty
+                    </button>
+                  </div>
+                </div>
+                {materialNewEvent.qtyDecreaseMode === 'pct' ? (
+                  <input type="number" min={0} max={100} step={0.1} style={{ width: '100%', boxSizing: 'border-box' }}
+                    value={materialNewEvent.qtyDecreasePct}
+                    onChange={(e) => setMaterialNewEvent(ev => ev ? { ...ev, qtyDecreasePct: parseFloat(e.target.value) || 0 } : ev)} />
+                ) : (
+                  <input type="number" min={0} step={1} style={{ width: '100%', boxSizing: 'border-box' }}
+                    placeholder="Absolute qty reduction"
+                    value={materialNewEvent.qtyDecreaseAbs}
+                    onChange={(e) => setMaterialNewEvent(ev => ev ? { ...ev, qtyDecreaseAbs: parseFloat(e.target.value) || 0 } : ev)} />
+                )}
               </div>
               {/* Note */}
               <div style={{ gridColumn: '1 / -1' }}>
@@ -3904,7 +4090,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     const created = await createMaterialEvent(id, {
                       supplyId: materialNewEvent.supplyId.trim(),
                       delayDays: materialNewEvent.delayDays,
-                      qtyDecreasePct: materialNewEvent.qtyDecreasePct,
+                      qtyDecreasePct: materialNewEvent.qtyDecreaseMode === 'pct' ? materialNewEvent.qtyDecreasePct : 0,
+                      qtyDecreaseAbs: materialNewEvent.qtyDecreaseMode === 'abs' ? materialNewEvent.qtyDecreaseAbs : null,
                       note: materialNewEvent.note || null,
                     });
                     setMaterialEvents(evs => [created, ...evs]);
@@ -3949,9 +4136,28 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         onChange={(e) => setMaterialEventEditing(m => ({ ...m, [ev.id]: { ...m[ev.id], delayDays: parseInt(e.target.value) || 0 } }))} />
                     </div>
                     <div>
-                      <label style={{ display: 'block', fontSize: '0.8rem', color: '#a1a1aa', marginBottom: 3 }}>Qty decrease (%)</label>
-                      <input type="number" min={0} max={100} step={0.1} style={{ width: '100%', boxSizing: 'border-box' }} value={editing.qtyDecreasePct}
-                        onChange={(e) => setMaterialEventEditing(m => ({ ...m, [ev.id]: { ...m[ev.id], qtyDecreasePct: parseFloat(e.target.value) || 0 } }))} />
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
+                        <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>Qty decrease</span>
+                        <div style={{ display: 'flex', border: '1px solid #4c1d95', borderRadius: 4, overflow: 'hidden' }}>
+                          <button type="button"
+                            onClick={() => setMaterialEventEditing(m => ({ ...m, [ev.id]: { ...m[ev.id], qtyDecreaseMode: 'pct' } }))}
+                            style={{ fontSize: '0.72rem', padding: '1px 8px', background: editing.qtyDecreaseMode === 'pct' ? '#4c1d95' : '#27272a', color: '#e4e4e7', border: 'none', cursor: 'pointer' }}>
+                            %
+                          </button>
+                          <button type="button"
+                            onClick={() => setMaterialEventEditing(m => ({ ...m, [ev.id]: { ...m[ev.id], qtyDecreaseMode: 'abs' } }))}
+                            style={{ fontSize: '0.72rem', padding: '1px 8px', background: editing.qtyDecreaseMode === 'abs' ? '#4c1d95' : '#27272a', color: '#e4e4e7', border: 'none', borderLeft: '1px solid #4c1d95', cursor: 'pointer' }}>
+                            qty
+                          </button>
+                        </div>
+                      </div>
+                      {editing.qtyDecreaseMode === 'pct' ? (
+                        <input type="number" min={0} max={100} step={0.1} style={{ width: '100%', boxSizing: 'border-box' }} value={editing.qtyDecreasePct}
+                          onChange={(e) => setMaterialEventEditing(m => ({ ...m, [ev.id]: { ...m[ev.id], qtyDecreasePct: parseFloat(e.target.value) || 0 } }))} />
+                      ) : (
+                        <input type="number" min={0} step={1} style={{ width: '100%', boxSizing: 'border-box' }} placeholder="Absolute qty reduction" value={editing.qtyDecreaseAbs}
+                          onChange={(e) => setMaterialEventEditing(m => ({ ...m, [ev.id]: { ...m[ev.id], qtyDecreaseAbs: parseFloat(e.target.value) || 0 } }))} />
+                      )}
                     </div>
                     <div style={{ gridColumn: '1 / -1' }}>
                       <label style={{ display: 'block', fontSize: '0.8rem', color: '#a1a1aa', marginBottom: 3 }}>Note</label>
@@ -3967,7 +4173,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           const updated = await updateMaterialEvent(id, ev.id, {
                             supplyId: editing.supplyId.trim(),
                             delayDays: editing.delayDays,
-                            qtyDecreasePct: editing.qtyDecreasePct,
+                            qtyDecreasePct: editing.qtyDecreaseMode === 'pct' ? editing.qtyDecreasePct : 0,
+                            qtyDecreaseAbs: editing.qtyDecreaseMode === 'abs' ? editing.qtyDecreaseAbs : null,
                             note: editing.note || null,
                           });
                           setMaterialEvents(evs => evs.map(e => e.id === ev.id ? updated : e));
@@ -3992,11 +4199,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <span style={{ marginLeft: 10, background: ev.delayDays > 0 ? '#7c3aed' : '#3d3d40', color: '#fff', borderRadius: 6, padding: '2px 7px', fontSize: '0.75rem' }}>
                         {ev.delayDays > 0 ? `+${ev.delayDays}d delay` : 'no delay'}
                       </span>
-                      {ev.qtyDecreasePct > 0 && (
+                      {(ev.qtyDecreaseAbs != null && ev.qtyDecreaseAbs > 0) ? (
+                        <span style={{ marginLeft: 6, background: '#b45309', color: '#fff', borderRadius: 6, padding: '2px 7px', fontSize: '0.75rem' }}>
+                          −{Number(ev.qtyDecreaseAbs).toLocaleString()} qty
+                        </span>
+                      ) : ev.qtyDecreasePct > 0 ? (
                         <span style={{ marginLeft: 6, background: '#b45309', color: '#fff', borderRadius: 6, padding: '2px 7px', fontSize: '0.75rem' }}>
                           −{ev.qtyDecreasePct}% qty
                         </span>
-                      )}
+                      ) : null}
                       {ev.note && <span style={{ marginLeft: 10, color: '#a1a1aa', fontSize: '0.8rem' }}>{ev.note}</span>}
                       <span style={{ marginLeft: 10, color: '#52525b', fontSize: '0.75rem' }}>{new Date(ev.createdAt).toLocaleString()}</span>
                     </div>
@@ -4004,7 +4215,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <button type="button" className="secondary" style={{ fontSize: '0.8rem', padding: '3px 10px' }}
                         onClick={() => {
                           setMaterialEventCollapsed(m => ({ ...m, [ev.id]: false }));
-                          setMaterialEventEditing(m => ({ ...m, [ev.id]: { supplyId: ev.supplyId, delayDays: ev.delayDays, qtyDecreasePct: ev.qtyDecreasePct, note: ev.note ?? '' } }));
+                          setMaterialEventEditing(m => ({ ...m, [ev.id]: { supplyId: ev.supplyId, delayDays: ev.delayDays, qtyDecreaseMode: ev.qtyDecreaseAbs != null && ev.qtyDecreaseAbs > 0 ? 'abs' : 'pct', qtyDecreasePct: ev.qtyDecreasePct, qtyDecreaseAbs: ev.qtyDecreaseAbs ?? 0, note: ev.note ?? '' } }));
                         }}>
                         Edit
                       </button>
@@ -4024,7 +4235,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           setMaterialImpactLoading(m => ({ ...m, [ev.id]: true }));
                           setMaterialImpacts(m => ({ ...m, [ev.id]: null }));
                           try {
-                            const result = await analyzeMaterialImpact(ev.supplyId, ev.delayDays, ev.qtyDecreasePct);
+                            const result = await analyzeMaterialImpact(ev.supplyId, ev.delayDays, ev.qtyDecreasePct, true, ev.qtyDecreaseAbs);
                             setMaterialImpacts(m => ({ ...m, [ev.id]: result }));
                           } catch { /* ignore */ } finally {
                             setMaterialImpactLoading(m => ({ ...m, [ev.id]: false }));
@@ -4038,7 +4249,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           setMaterialAssessmentLoading(m => ({ ...m, [ev.id]: true }));
                           setMaterialAssessmentError(m => ({ ...m, [ev.id]: null }));
                           try {
-                            const result = await runAssessment(id, ev.supplyId, ev.delayDays, ev.qtyDecreasePct, undefined, impact);
+                            const result = await runAssessment(id, ev.supplyId, ev.delayDays, ev.qtyDecreasePct, undefined, impact, ev.qtyDecreaseAbs);
                             setMaterialAssessments(m => ({ ...m, [ev.id]: result }));
                             const hist = await listAssessments(id, ev.supplyId);
                             setMaterialAssessmentHistory(m => ({ ...m, [ev.id]: hist }));
@@ -4237,7 +4448,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
               {planRunHistoryLoading && <p style={{ color: '#71717a' }}>Loading…</p>}
               {!planRunHistoryLoading && planRunHistory.length === 0 && <p style={{ color: '#71717a' }}>No persisted plan runs found. Run a plan with async mode to persist results.</p>}
-              {!planRunHistoryLoading && planRunHistory.map((run) => (
+              {!planRunHistoryLoading && planRunHistory.map((run) => {
+                const editing = planRunEditing[run.id];
+                const isSavingEdit = !!planRunEditSaving[run.id];
+                return (
                 <div key={run.id} style={{ borderBottom: '1px solid #27272a', paddingBottom: '0.75rem', marginBottom: '0.75rem' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                     <div>
@@ -4265,6 +4479,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           {planRunLoadingId === run.id ? 'Loading…' : 'Load'}
                         </button>
                       )}
+                      {!editing && (
+                        <button
+                          type="button"
+                          className="secondary"
+                          style={{ fontSize: '0.8rem', padding: '3px 10px' }}
+                          onClick={() => setPlanRunEditing((prev) => ({ ...prev, [run.id]: { name: run.name ?? '', notes: run.notes ?? '' } }))}
+                        >
+                          Edit
+                        </button>
+                      )}
                       <button
                         type="button"
                         className="secondary"
@@ -4275,6 +4499,59 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       </button>
                     </div>
                   </div>
+                  {/* Name display / edit */}
+                  {editing ? (
+                    <div style={{ marginTop: '0.5rem', display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      <input
+                        type="text"
+                        placeholder="Name (optional)"
+                        value={editing.name}
+                        onChange={(e) => setPlanRunEditing((prev) => ({ ...prev, [run.id]: { ...prev[run.id], name: e.target.value } }))}
+                        style={{ padding: '4px 8px', background: '#27272a', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, fontSize: '0.82rem' }}
+                      />
+                      <textarea
+                        placeholder="Notes (optional)"
+                        value={editing.notes}
+                        rows={2}
+                        onChange={(e) => setPlanRunEditing((prev) => ({ ...prev, [run.id]: { ...prev[run.id], notes: e.target.value } }))}
+                        style={{ padding: '4px 8px', background: '#27272a', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, fontSize: '0.82rem', resize: 'vertical' }}
+                      />
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        <button
+                          type="button"
+                          disabled={isSavingEdit}
+                          onClick={async () => {
+                            if (!id) return;
+                            setPlanRunEditSaving((prev) => ({ ...prev, [run.id]: true }));
+                            try {
+                              await updatePlanRun(id, run.id, { name: editing.name.trim() || undefined, notes: editing.notes.trim() || undefined });
+                              setPlanRunHistory((prev) => prev.map((r) => r.id === run.id ? { ...r, name: editing.name.trim() || null, notes: editing.notes.trim() || null } : r));
+                              setPlanRunEditing((prev) => { const n = { ...prev }; delete n[run.id]; return n; });
+                            } catch {
+                              // keep edit open on error
+                            } finally {
+                              setPlanRunEditSaving((prev) => { const n = { ...prev }; delete n[run.id]; return n; });
+                            }
+                          }}
+                          style={{ padding: '3px 10px', background: '#3b82f6', color: '#fff', border: 'none', borderRadius: 4, fontSize: '0.8rem', cursor: isSavingEdit ? 'wait' : 'pointer' }}
+                        >
+                          {isSavingEdit ? 'Saving…' : 'Save'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPlanRunEditing((prev) => { const n = { ...prev }; delete n[run.id]; return n; })}
+                          style={{ padding: '3px 10px', background: 'transparent', color: '#a1a1aa', border: '1px solid #3d3d40', borderRadius: 4, fontSize: '0.8rem', cursor: 'pointer' }}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : (run.name || run.notes) ? (
+                    <div style={{ marginTop: '0.3rem' }}>
+                      {run.name && <p style={{ margin: 0, fontSize: '0.85rem', color: '#e4e4e7', fontWeight: 500 }}>{run.name}</p>}
+                      {run.notes && <p style={{ margin: '0.15rem 0 0', fontSize: '0.78rem', color: '#a1a1aa', whiteSpace: 'pre-wrap' }}>{run.notes}</p>}
+                    </div>
+                  ) : null}
                   <div style={{ fontSize: '0.75rem', color: '#71717a', marginTop: '0.25rem' }}>
                     Run #{run.id}{run.job_id ? ` · job ${run.job_id.slice(0, 8)}…` : ''}
                     {run.config && Object.keys(run.config).length > 0 && (
@@ -4285,7 +4562,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     )}
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         </div>,
@@ -4859,15 +5137,37 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           style={{ width: 60, fontSize: '0.78rem', padding: '2px 4px', background: '#27272a', color: '#e4e4e7', border: '1px solid #52525b', borderRadius: 3 }}
                         />
                       </label>
-                      <label style={{ fontSize: '0.78rem', color: '#a1a1aa', display: 'flex', alignItems: 'center', gap: 4 }}>
-                        {tP('assessment.qtyDecreasePct')}
-                        <input
-                          type="number" min={0} max={100}
-                          value={assessQtyDecreasePct}
-                          onChange={(e) => setAssessQtyDecreasePct(Math.max(0, Math.min(100, Number(e.target.value))))}
-                          style={{ width: 60, fontSize: '0.78rem', padding: '2px 4px', background: '#27272a', color: '#e4e4e7', border: '1px solid #52525b', borderRadius: 3 }}
-                        />
-                      </label>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                        <span style={{ fontSize: '0.78rem', color: '#a1a1aa' }}>{tP('assessment.qtyDecreasePct')}</span>
+                        <div style={{ display: 'flex', border: '1px solid #4c1d95', borderRadius: 4, overflow: 'hidden' }}>
+                          <button type="button"
+                            onClick={() => setAssessQtyDecreaseMode('pct')}
+                            style={{ fontSize: '0.72rem', padding: '1px 8px', background: assessQtyDecreaseMode === 'pct' ? '#4c1d95' : '#27272a', color: '#e4e4e7', border: 'none', cursor: 'pointer' }}>
+                            %
+                          </button>
+                          <button type="button"
+                            onClick={() => setAssessQtyDecreaseMode('abs')}
+                            style={{ fontSize: '0.72rem', padding: '1px 8px', background: assessQtyDecreaseMode === 'abs' ? '#4c1d95' : '#27272a', color: '#e4e4e7', border: 'none', borderLeft: '1px solid #4c1d95', cursor: 'pointer' }}>
+                            qty
+                          </button>
+                        </div>
+                        {assessQtyDecreaseMode === 'pct' ? (
+                          <input
+                            type="number" min={0} max={100}
+                            value={assessQtyDecreasePct}
+                            onChange={(e) => setAssessQtyDecreasePct(Math.max(0, Math.min(100, Number(e.target.value))))}
+                            style={{ width: 60, fontSize: '0.78rem', padding: '2px 4px', background: '#27272a', color: '#e4e4e7', border: '1px solid #52525b', borderRadius: 3 }}
+                          />
+                        ) : (
+                          <input
+                            type="number" min={0} step={1}
+                            placeholder="units"
+                            value={assessQtyDecreaseAbs}
+                            onChange={(e) => setAssessQtyDecreaseAbs(Math.max(0, Number(e.target.value)))}
+                            style={{ width: 80, fontSize: '0.78rem', padding: '2px 4px', background: '#27272a', color: '#e4e4e7', border: '1px solid #52525b', borderRadius: 3 }}
+                          />
+                        )}
+                      </div>
                       <button
                         type="button"
                         onClick={handleAssess}
