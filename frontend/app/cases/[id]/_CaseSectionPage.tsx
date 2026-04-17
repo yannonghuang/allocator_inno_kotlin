@@ -1429,7 +1429,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (supplyFilterDebounce.current) clearTimeout(supplyFilterDebounce.current);
     supplyFilterDebounce.current = setTimeout(async () => {
       try {
-        const res = await fetch(`/api/supplies?q=${encodeURIComponent(val.trim())}`);
+        const res = await fetch(`/allocator/api/supplies?q=${encodeURIComponent(val.trim())}`);
         if (res.ok) {
           setSupplyFilterSuggestions(await res.json());
           setShowSupplyFilterSuggestions(true);
@@ -3998,7 +3998,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     if (materialNewDebounce.current) clearTimeout(materialNewDebounce.current);
                     materialNewDebounce.current = setTimeout(async () => {
                       try {
-                        const res = await fetch(`/api/supplies?q=${encodeURIComponent(val.trim())}`);
+                        const res = await fetch(`/allocator/api/supplies?q=${encodeURIComponent(val.trim())}`);
                         if (res.ok) {
                           setMaterialNewSupplySuggestions(await res.json());
                           setMaterialNewShowSuggestions(true);

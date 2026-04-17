@@ -7,6 +7,7 @@ const nextConfig = {
   reactStrictMode: true,
   output: 'standalone',
   basePath: '/allocator',
+  trailingSlash: true,
   async rewrites() {
     return [
       { source: '/api/:path*', destination: `${apiBackend}/:path*` },

@@ -1,4 +1,4 @@
-const API = typeof window !== 'undefined' ? '/api' : 'http://localhost:8000';
+const API = typeof window !== 'undefined' ? '/allocator/api' : 'http://localhost:8000';
 
 export type Case = { id: number; name: string; created_at: string; demand_count?: number; supply_count?: number; run_count?: number; plan_run_count?: number };
 export type AllocationRun = { id: number; case_id: number; created_at: string; status: string; config?: Record<string, unknown> };
