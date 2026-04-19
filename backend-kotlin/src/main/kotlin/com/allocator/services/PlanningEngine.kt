@@ -16,7 +16,7 @@ private val log = LoggerFactory.getLogger("com.allocator.PlanningEngine")
 private const val MAX_PLAN_DEPTH = 500
 private val DATE_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd")
 private val DEFAULT_SCORE_WEIGHTS = Triple(0.4, 0.35, 0.25)
-private val BENIGN_REASONS = setOf("cycle_stopped", "cycle_detected")
+private val BENIGN_REASONS = setOf("cycle_stopped", "cycle_detected", "inventory")
 private val LATE_DATE = LocalDate.of(9999, 12, 31)
 
 /** True for commit reasons that signal a genuine planning failure — the child contributed
@@ -721,7 +721,7 @@ fun plan(
 
     if (taken > 0) {
         val commitForFulfilled = fulfillCommitTime ?: reqTimeStr
-        demandFulfilledList.add(committedRow(taken, commitForFulfilled))
+        demandFulfilledList.add(committedRow(taken, commitForFulfilled, "inventory"))
         // One supply node per consumed bucket so each node carries its exact supply_id
         for (bucket in consumedBuckets) {
             peggingChildren.add(mapOf(
@@ -1152,6 +1152,80 @@ private fun buildWoNode(
     "children" to woChildren,
 )
 
+// ── Phantom-loop pruning ───────────────────────────────────────────────────────
+
+/**
+ * Remove cycle-stopped demand nodes and any work_order nodes that become childless
+ * after that pruning. This eliminates phantom move cycles (e.g. A@loc1 → move → A@loc2 → move →
+ * A@loc1 [cycle_stopped]) from the pegging tree without touching real demand structure.
+ *
+ * Rules:
+ *   - supply / purchase leaf → always kept
+ *   - demand with commit_reason == "cycle_stopped" → dropped
+ *   - transit demand with no children after recursive pruning → dropped
+ *     A "transit demand" is a demand node that is a direct child of a move WO — it represents
+ *     an intermediate routing stop, not a real component need. Pruning it makes the parent move
+ *     WO childless, which is then also pruned. Real component demands (children of make WOs)
+ *     are kept even when childless.
+ *   - work_order with no children after recursive pruning → dropped
+ *   - everything else → kept with its children recursively pruned
+ */
+@Suppress("UNCHECKED_CAST")
+private fun prunePhantomLoops(
+    node: Map<String, Any?>,
+    isRoot: Boolean = false,
+    parentIsMoveWo: Boolean = false,
+): Map<String, Any?>? {
+    val type = node["type"] as? String
+    if (type == "supply" || type == "purchase") return node
+    if (type == "demand" && node["commit_reason"] == "cycle_stopped") return null
+
+    val isMoveWo = type == "work_order" &&
+        (node["method"] as? String)?.lowercase() == "move"
+
+    val prunedChildren = (node["children"] as? List<Map<String, Any?>>)
+        ?.mapNotNull { prunePhantomLoops(it, isRoot = false, parentIsMoveWo = isMoveWo) } ?: emptyList()
+
+    if (type == "work_order" && prunedChildren.isEmpty()) return null
+    // Only prune childless demand nodes that are transit stops inside a move chain,
+    // not real component demands (children of make WOs or the root).
+    if (type == "demand" && prunedChildren.isEmpty() && !isRoot && parentIsMoveWo) return null
+
+    return node.toMutableMap().apply { put("children", prunedChildren) }
+}
+
+// ── Supply allocation extraction ───────────────────────────────────────────────
+
+/**
+ * Walk the assembled pegging tree and collect every supply/purchase leaf node,
+ * recording which demand they backed and how much was consumed.
+ * Used to persist supply consumption to plan_supply_allocation on plan save.
+ */
+@Suppress("UNCHECKED_CAST")
+private fun extractSupplyAllocations(pegging: List<Map<String, Any?>>): List<Map<String, Any?>> {
+    val result = mutableListOf<Map<String, Any?>>()
+    fun walk(node: Map<String, Any?>, demandId: String?) {
+        val type = node["type"] as? String
+        val supplyId = node["supply_id"] as? String
+        if ((type == "supply" || type == "purchase") && !supplyId.isNullOrBlank()) {
+            result.add(mapOf(
+                "supply_id"    to supplyId,
+                "demand_id"    to (demandId ?: ""),
+                "qty_consumed" to ((node["quantity"] as? Number)?.toDouble() ?: 0.0),
+            ))
+        } else {
+            val nextDemand = if (type == "demand") (node["demand_id"] as? String ?: demandId) else demandId
+            (node["children"] as? List<Map<String, Any?>>)?.forEach { walk(it, nextDemand) }
+        }
+    }
+    for (entry in pegging) {
+        val demandId = entry["demand_id"] as? String
+        val tree = entry["tree"] as? Map<String, Any?> ?: continue
+        walk(tree, demandId)
+    }
+    return result
+}
+
 // ── Main entry point ───────────────────────────────────────────────────────────
 
 /**
@@ -1238,9 +1312,17 @@ fun runPlanning(
         progressCallback?.invoke(mapOf("current" to i + 1, "total" to total, "demand_id" to demandId))
     }
 
+    // Prune cycle_stopped phantom loop nodes from every pegging tree before returning.
+    @Suppress("UNCHECKED_CAST")
+    val allPegging = (consolidatedPegging + planningPegging).mapNotNull { entry ->
+        val tree = entry["tree"] as? Map<String, Any?> ?: return@mapNotNull null
+        val pruned = prunePhantomLoops(tree, isRoot = true) ?: return@mapNotNull null
+        entry.toMutableMap().apply { put("tree", pruned) }
+    }
     return mapOf(
-        "committed_demands" to committedDemands,
-        "work_orders"       to consolidatedWOs + workOrders,
-        "planning_pegging"  to consolidatedPegging + planningPegging,
+        "committed_demands"  to committedDemands,
+        "work_orders"        to consolidatedWOs + workOrders,
+        "planning_pegging"   to allPegging,
+        "supply_allocations" to extractSupplyAllocations(allPegging),
     )
 }

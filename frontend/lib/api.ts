@@ -239,7 +239,14 @@ export type PlanningPeggingNode = {
   children: PlanningPeggingNode[];
 };
 
-export type PlanningPeggingEntry = { demand_id: string | null; tree: PlanningPeggingNode; passthrough?: boolean };
+export type PlanningPeggingEntry = {
+  demand_id: string | null;
+  tree: PlanningPeggingNode;
+  passthrough?: boolean;
+  consolidated?: boolean;
+  /** Demand IDs that share this consolidated supply group (multi-demand consolidation only). */
+  consolidated_demand_ids?: string[];
+};
 
 /** Plan KPI dashboard: delivery, inventory, procurement, manufacturing, logistics. */
 export type PlanKpis = {
@@ -284,7 +291,18 @@ export type PlanningConfig = {
   };
 };
 
-export type PlanResult = { committed_demands: CommittedDemand[]; work_orders: WorkOrder[]; planning_pegging: PlanningPeggingEntry[] };
+export type PlanSupplyAllocation = {
+  supply_id: string;
+  demand_id: string | null;
+  qty_consumed: number;
+};
+
+export type PlanResult = {
+  committed_demands: CommittedDemand[];
+  work_orders: WorkOrder[];
+  planning_pegging: PlanningPeggingEntry[];
+  supply_allocations?: PlanSupplyAllocation[];
+};
 
 export async function runPlan(
   caseId: number,

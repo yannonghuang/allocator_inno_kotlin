@@ -198,6 +198,17 @@ object PlanRuns : Table("plan_run") {
     override val primaryKey = PrimaryKey(id)
 }
 
+/** Supply lots consumed by a saved planning run — written on plan save, read by supply view. */
+object PlanSupplyAllocations : Table("plan_supply_allocation") {
+    val id          = integer("id").autoIncrement()
+    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val planRunId   = integer("plan_run_id").references(PlanRuns.id, onDelete = ReferenceOption.CASCADE)
+    val supplyId    = varchar("supply_id", 255)
+    val demandId    = varchar("demand_id", 255).nullable()
+    val qtyConsumed = double("qty_consumed")
+    override val primaryKey = PrimaryKey(id)
+}
+
 /** Persisted material impact assessment results (rating + LLM explanation per supply change). */
 object MaterialImpactAssessments : Table("material_impact_assessment") {
     val id                  = integer("id").autoIncrement()

@@ -70,6 +70,7 @@ import {
   runAssessment,
   savePlanRun,
   updatePlanRun,
+  type PlanSupplyAllocation,
 } from '@/lib/api';
 
 type SupplySuggestion = {
@@ -123,14 +124,25 @@ function peggingTreeContainsRealMove(node: PlanningPeggingNode, realMoveKeys: Se
   return false;
 }
 
-/** True if any supply node in the pegging tree has a supply_id containing the given substring (case-insensitive). */
-function peggingTreeContainsSupply(node: PlanningPeggingNode, supplySubstr: string): boolean {
+/**
+ * True if any supply node (by supply_id) or any non-root demand node (by product_id)
+ * in the pegging tree matches the given substring (case-insensitive).
+ * isRoot=true skips the top-level demand so FG products don't self-match.
+ */
+function peggingTreeContainsSupply(node: PlanningPeggingNode, supplySubstr: string, isRoot: boolean = false): boolean {
   if (node.type === 'supply') {
     const sid = (node.supply_id ?? '').trim().toLowerCase();
     if (sid && sid.includes(supplySubstr)) return true;
   }
+  // Component demands appear as demand nodes under make WOs — match by product_id.
+  // Supply record IDs have the form "productId_locationId_seq", so also match when the
+  // filter string starts with this demand's product_id (handles typeahead-selected supply IDs).
+  if (node.type === 'demand' && !isRoot) {
+    const pid = (node.product_id ?? '').trim().toLowerCase();
+    if (pid && (pid.includes(supplySubstr) || supplySubstr.startsWith(pid + '_') || supplySubstr === pid)) return true;
+  }
   for (const child of node.children ?? []) {
-    if (peggingTreeContainsSupply(child, supplySubstr)) return true;
+    if (peggingTreeContainsSupply(child, supplySubstr, false)) return true;
   }
   return false;
 }
@@ -361,6 +373,10 @@ type WoEnrichedRow = WorkOrder & {
   _demand_ids?: string[];
   _requested_qty?: number;
   _shortage?: number;
+  // demand-pivot extras
+  _split_qty?: number;     // allocated_qty for this demand's slice of a shared WO
+  _is_shared?: boolean;    // true if WO serves >1 demand
+  _is_inventory?: boolean; // true if this row is a synthetic inventory-fulfilled placeholder
 };
 
 type WoPivotGroup = {
@@ -376,6 +392,15 @@ type WoPivotGroup = {
 };
 
 type WoNestedGroup = WoPivotGroup & { subGroups: WoPivotGroup[] };
+
+interface WoDemandGroup {
+  demand_id: string;
+  label: string;        // product + demand_id
+  demand_qty: number;   // original requested quantity
+  requested_qty: number; // demand_qty - inventory_fulfilled
+  shortage: number;
+  rows: WoEnrichedRow[]; // WO rows + optional synthetic inventory row
+}
 
 function buildWoNestedPivotGroups(rows: WoEnrichedRow[]): WoNestedGroup[] {
   const outerMap = new Map<string, WoEnrichedRow[]>();
@@ -430,6 +455,162 @@ function buildWoPivotGroups(rows: WoEnrichedRow[], pivot: 'prod_area' | 'locatio
       rows: groupRows,
     }))
     .sort((a, b) => b.qty_total - a.qty_total);
+}
+
+function buildWoDemandGroups(
+  committedDemands: CommittedDemand[],
+  woRows: WoEnrichedRow[], // must be enriched rows (not raw groupedRows) so _key/_prod_area/etc. are present
+  demandInventoryMap: Map<string, number>,
+  demandShortageMap: Map<string, number>,
+  demandRequestedMap: Map<string, number>,
+  demandLabelMap: Map<string, string>, // demand_id → product_id label
+): WoDemandGroup[] {
+  // Collect unique demand IDs in order of first appearance
+  const seen = new Set<string>();
+  const demandIds: string[] = [];
+  for (const d of committedDemands) {
+    const did = d.demand_id ?? '';
+    if (did && !seen.has(did)) { seen.add(did); demandIds.push(did); }
+  }
+
+  return demandIds.map((did) => {
+    const inventoryFulfilled = demandInventoryMap.get(did) ?? 0;
+    const demandQty = demandRequestedMap.get(did) ?? 0;
+    const rows: WoEnrichedRow[] = [];
+
+    // Synthetic inventory row (shown first)
+    if (inventoryFulfilled > 0) {
+      rows.push({
+        product_id: demandLabelMap.get(did) ?? did,
+        location_id: '',
+        quantity: inventoryFulfilled,
+        start_time: null,
+        end_time: null,
+        method: 'inventory',
+        demand_id: did,
+        _is_inventory: true,
+        _demand_label: did,
+        _split_qty: inventoryFulfilled,
+      } as WoEnrichedRow);
+    }
+
+    // WO rows for this demand — use enriched rows so _key, _prod_area, _peg_order, etc. are present
+    for (const wo of woRows) {
+      if (wo.demand_id === did) {
+        const isShared = (wo.wo_consolidation_split_details?.length ?? 0) > 1;
+        rows.push({
+          ...wo,
+          _is_shared: isShared,
+          _split_qty: isShared
+            ? (wo.wo_consolidation_split_details?.find((x) => x.demand_id === did)?.allocated_qty ?? wo.quantity)
+            : wo.quantity,
+        });
+      } else if (wo.wo_consolidation_split_details?.some((x) => x.demand_id === did)) {
+        const split = wo.wo_consolidation_split_details!.find((x) => x.demand_id === did)!;
+        rows.push({
+          ...wo,
+          _is_shared: true,
+          _split_qty: split.allocated_qty,
+        });
+      }
+    }
+
+    return {
+      demand_id: did,
+      label: `${demandLabelMap.get(did) ?? did} [${did}]`,
+      demand_qty: demandQty,
+      requested_qty: Math.max(0, demandQty - inventoryFulfilled),
+      shortage: demandShortageMap.get(did) ?? 0,
+      rows,
+    };
+  }).filter((g) => g.rows.length > 0);
+}
+
+/** Recursively collect all supply/purchase leaf nodes at any depth. */
+function collectAllSupplyLeaves(node: PlanningPeggingNode): PlanningPeggingNode[] {
+  if (node.type === 'supply' || node.type === 'purchase') return [node];
+  return (node.children ?? []).flatMap(collectAllSupplyLeaves);
+}
+
+/** Walk the pegging tree and index supply/purchase leaf nodes by WO key.
+ *
+ * Each WO is indexed by `${demandId}|${product_id}|${location_id}|${method}`.
+ * For move/purchase WOs the supply has the same product as the WO, so we
+ * filter leaves to product_id === node.product_id.  For make WOs the
+ * component leaves have different product_ids — those are indexed separately
+ * when the WO for that component is visited.
+ */
+/** Returns:
+ *  - suppliesMap: keyed by `demandId|product|location|method`.
+ *    For make WOs → direct demand children (components consumed).
+ *    For move/purchase WOs → same-product supply/purchase leaf nodes.
+ *  - crossEntrySupplyMap: keyed by `entryDemandId|productId`.
+ *    All supply/purchase leaves from any pegging entry for that top-level demand.
+ *    Used in the expand panel to show inventory that pre-fills the same demand
+ *    independently of the make WO (looked up via the WO row's demand_id).
+ */
+function buildWoMaps(pegging: PlanningPeggingEntry[]): {
+  suppliesMap: Map<string, PlanningPeggingNode[]>;
+  crossEntrySupplyMap: Map<string, PlanningPeggingNode[]>;
+  peggedQtyMap: Map<string, number>;
+} {
+  const suppliesMap = new Map<string, PlanningPeggingNode[]>();
+  // Maps WO key → quantity of the demand node directly above the WO in the pegging tree.
+  // For a component WO this is the component demand qty, not the top-level FG demand qty.
+  const peggedQtyMap = new Map<string, number>();
+
+  // Index all supply/purchase leaf nodes by `${entry.demand_id}|${productId}`.
+  // Used by the expand panel for make WOs: given a WO row with demand_id=X and product_id=P,
+  // look up crossEntrySupplyMap['X|P'] to find inventory that filled the same demand from a
+  // different branch or sibling pegging entry (not via this WO).
+  const crossEntrySupplyMap = new Map<string, PlanningPeggingNode[]>();
+  const collectCrossEntrySupplies = (node: PlanningPeggingNode, entryDemandId: string): void => {
+    if (node.type === 'supply' || node.type === 'purchase') {
+      const k = `${entryDemandId}|${node.product_id ?? ''}`;
+      crossEntrySupplyMap.set(k, [...(crossEntrySupplyMap.get(k) ?? []), node]);
+    }
+    (node.children ?? []).forEach((c) => collectCrossEntrySupplies(c, entryDemandId));
+  };
+  for (const entry of pegging) {
+    collectCrossEntrySupplies(entry.tree, entry.demand_id ?? '');
+  }
+
+  function walk(node: PlanningPeggingNode, demandId: string | null, parentDemand: PlanningPeggingNode | null) {
+    if (node.type === 'work_order') {
+      const key = `${demandId ?? ''}|${node.product_id ?? ''}|${node.location_id ?? ''}|${node.method ?? ''}`;
+      // Record the direct parent demand's quantity for this WO key.
+      // parentDemand is the demand node immediately above — for a component WO this is the
+      // component demand (qty=300), not the root FG demand (qty=600).
+      if (parentDemand?.type === 'demand' && parentDemand.quantity != null) {
+        if (!peggedQtyMap.has(key)) peggedQtyMap.set(key, parentDemand.quantity);
+      }
+      const isMake = (node.method ?? '').toLowerCase() === 'make';
+      if (isMake) {
+        // Component demands (what's consumed to produce this WO's committed qty).
+        const demandChildren = (node.children ?? []).filter((c) => c.type === 'demand');
+        if (demandChildren.length > 0) {
+          suppliesMap.set(key, [...(suppliesMap.get(key) ?? []), ...demandChildren]);
+        }
+      } else {
+        // Move/purchase WOs: show same-product supply/purchase leaf nodes.
+        const woLeaves = collectAllSupplyLeaves(node).filter((s) => s.product_id === node.product_id);
+        if (woLeaves.length > 0) {
+          suppliesMap.set(key, [...(suppliesMap.get(key) ?? []), ...woLeaves]);
+        }
+      }
+      (node.children ?? []).forEach((child) => walk(child, demandId, node));
+    } else if (node.type === 'demand') {
+      const nextDemand = node.demand_id ?? demandId;
+      (node.children ?? []).forEach((child) => walk(child, nextDemand, node));
+    } else {
+      (node.children ?? []).forEach((child) => walk(child, demandId, parentDemand));
+    }
+  }
+
+  for (const entry of pegging) {
+    walk(entry.tree, entry.demand_id ?? null, null);
+  }
+  return { suppliesMap, crossEntrySupplyMap, peggedQtyMap };
 }
 
 export function CaseDetail({ section: sectionProp = 'planning', subsection }: { section?: string; subsection?: string }) {
@@ -508,6 +689,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     committed_demands: CommittedDemand[];
     work_orders: WorkOrder[];
     planning_pegging: PlanningPeggingEntry[];
+    supply_allocations?: PlanSupplyAllocation[];
     supply_summary?: { initial_total: number; consumed_total: number; consumption_rate: number | null };
     plan_kpis?: PlanKpis;
   } | null>(null);
@@ -588,9 +770,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planWoPurchaseOnly, setPlanWoPurchaseOnly] = useState(false);
   const [planWoMoveOnly, setPlanWoMoveOnly] = useState(false);
   const [planWoHasOverride, setPlanWoHasOverride] = useState(false);
-  const [planWoPivot, setPlanWoPivot] = useState<'none' | 'prod_area' | 'location' | 'nested'>('none');
+  const [planWoPivot, setPlanWoPivot] = useState<'none' | 'prod_area' | 'location' | 'nested' | 'demand'>('none');
   const [planWoPivotExpanded, setPlanWoPivotExpanded] = useState<Set<string>>(new Set());
   const [planWoPivotSubExpanded, setPlanWoPivotSubExpanded] = useState<Set<string>>(new Set());
+  const [woExpandedKeys, setWoExpandedKeys] = useState<Set<string>>(new Set());
   const [woExplainOpen, setWoExplainOpen] = useState(false);
   const [woExplainRow, setWoExplainRow] = useState<WorkOrder | null>(null);
   const [woExplainKey, setWoExplainKey] = useState<string | null>(null);
@@ -1517,8 +1700,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
 
   /**
    * Invert demand-centric planning_pegging trees into a supply-centric map.
-   * Key: supply_id. Value: { totalPeggedQty, demands[] }
-   * Consolidated synthetic IDs (consolidated_*) are keyed but won't match any CaseSupplyRow.
+   * Key: supply_id → { totalPeggedQty, demands[] }
+   *
+   * For consolidated entries (demand_id = null), uses the entry's consolidated_demand_ids
+   * to attribute supply consumption across the demands that share the consolidated WO.
+   * Quantity is split equally among the consolidated demands as an approximation
+   * (exact proportions are in each WO's consolidation_split_details).
    */
   const supplyPeggingMap = useMemo(() => {
     const map = new Map<string, { totalPeggedQty: number; demands: PeggedDemandEntry[] }>();
@@ -1529,40 +1716,47 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       if (d.demand_id) demandCustomerMap.set(d.demand_id, d.customer ?? null);
     }
 
-    // activeDemandId: the demand currently in scope as we descend the tree.
-    // For non-consolidated entries it's the entry-level demand_id throughout.
-    // For consolidated entries (entry demand_id = null), demand-type nodes inside
-    // the tree carry their own demand_id — we pick it up as we descend.
-    function walk(node: PlanningPeggingNode, activeDemandId: string | null) {
-      // When we step into a demand node, switch to its own demand_id.
-      const effectiveDemandId =
-        node.type === 'demand' && node.demand_id ? node.demand_id : activeDemandId;
-
-      if (node.type === 'supply' && node.supply_id && effectiveDemandId) {
-        const sid = node.supply_id;
-        const qty = Number(node.quantity ?? 0);
-        const existing = map.get(sid);
-        if (existing) {
-          const existingForDemand = existing.demands.find((d) => d.demandId === effectiveDemandId);
-          if (existingForDemand) {
-            existingForDemand.qtyConsumed += qty;
-          } else {
-            existing.demands.push({ demandId: effectiveDemandId, customer: demandCustomerMap.get(effectiveDemandId) ?? null, qtyConsumed: qty });
-          }
-          existing.totalPeggedQty += qty;
+    function addPegging(sid: string, qty: number, demandId: string) {
+      const existing = map.get(sid);
+      if (existing) {
+        const existingForDemand = existing.demands.find((d) => d.demandId === demandId);
+        if (existingForDemand) {
+          existingForDemand.qtyConsumed += qty;
         } else {
-          map.set(sid, {
-            totalPeggedQty: qty,
-            demands: [{ demandId: effectiveDemandId, customer: demandCustomerMap.get(effectiveDemandId) ?? null, qtyConsumed: qty }],
-          });
+          existing.demands.push({ demandId, customer: demandCustomerMap.get(demandId) ?? null, qtyConsumed: qty });
         }
+        existing.totalPeggedQty += qty;
+      } else {
+        map.set(sid, { totalPeggedQty: qty, demands: [{ demandId, customer: demandCustomerMap.get(demandId) ?? null, qtyConsumed: qty }] });
       }
-      for (const child of node.children ?? []) walk(child, effectiveDemandId);
     }
 
+    // walk is defined here (once) and closes over addPegging and map.
+    // consolidatedDemandIds is passed per-call so different entries can share the function.
+    const walk = (node: PlanningPeggingNode, activeDemandId: string | null, consolidatedDemandIds: string[] | null): void => {
+      const effectiveDemandId = node.type === 'demand' && node.demand_id ? node.demand_id : activeDemandId;
+
+      if (node.type === 'supply' && node.supply_id) {
+        const sid = node.supply_id;
+        const qty = Number(node.quantity ?? 0);
+        if (effectiveDemandId) {
+          // Normal (non-consolidated): peg to the specific demand
+          addPegging(sid, qty, effectiveDemandId);
+        } else if (consolidatedDemandIds && consolidatedDemandIds.length > 0) {
+          // Consolidated: distribute equally among all demands in the group.
+          // This is an approximation; exact split is on each WO's consolidation_split_details.
+          const qtyPerDemand = qty / consolidatedDemandIds.length;
+          for (const demandId of consolidatedDemandIds) {
+            addPegging(sid, qtyPerDemand, demandId);
+          }
+        }
+      }
+      for (const child of node.children ?? []) walk(child, effectiveDemandId, consolidatedDemandIds);
+    };
+
     for (const entry of planResult.planning_pegging) {
-      if (entry.passthrough) continue;
-      walk(entry.tree, entry.demand_id ?? null);
+      // For consolidated entries, consolidated_demand_ids lists the demands that share the supply.
+      walk(entry.tree, entry.demand_id ?? null, entry.consolidated_demand_ids ?? null);
     }
     return map;
   }, [planResult]);
@@ -1577,11 +1771,27 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return m;
   }, [supplyView]);
 
+  /**
+   * Build a supply_id → total consumed qty map from supply_allocations (written on plan save).
+   * Falls back gracefully to undefined when the field is absent (pre-save preview).
+   */
+  const supplyConsumedMap = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const a of planResult?.supply_allocations ?? []) {
+      m.set(a.supply_id, (m.get(a.supply_id) ?? 0) + a.qty_consumed);
+    }
+    return m;
+  }, [planResult?.supply_allocations]);
+
   /** Join caseSupplies rows with supplyPeggingMap to produce the enriched supply view. */
   const planSupplyViewRows = useMemo((): PlanSupplyViewRow[] => {
     return caseSupplies.map((s) => {
       const pegging = supplyPeggingMap.get(s.supplyId);
-      const consumedQty = pegging?.totalPeggedQty ?? 0;
+      // Prefer persisted supply_allocations (written on save); fall back to pegging-tree traversal
+      // so the pre-save preview still shows approximate consumption figures.
+      const consumedQty = supplyConsumedMap.size > 0
+        ? (supplyConsumedMap.get(s.supplyId) ?? 0)
+        : (pegging?.totalPeggedQty ?? 0);
       const residualQty = Math.max(0, s.qty - consumedQty);
       const utilizationRate = s.qty > 0 ? consumedQty / s.qty : null;
       return {
@@ -1594,7 +1804,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         peggedDemands: pegging?.demands ?? [],
       };
     });
-  }, [caseSupplies, supplyPeggingMap]);
+  }, [caseSupplies, supplyPeggingMap, supplyConsumedMap]);
 
   /** Sum of qty per productId across all plan supply view rows (unfiltered). */
   const planSupplyProductTotalMap = useMemo((): Record<string, number> => {
@@ -3109,7 +3319,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         const demandId = r.demand_id ?? (r as unknown as { demand_id?: string }).demand_id;
                         const trees = demandId ? allPeggingTreesByDemandId[demandId] : null;
                         if (!trees?.length) return false;
-                        return trees.some(t => peggingTreeContainsSupply(t, substr));
+                        return trees.some(t => peggingTreeContainsSupply(t, substr, true));
                       });
                     }
                     const byCustomer = list.reduce<Record<string, number>>((acc, r) => {
@@ -3329,6 +3539,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         {mode === 'none' ? 'None' : mode === 'prod_area' ? 'PROD_AREA' : mode === 'location' ? 'Location' : 'PROD_AREA › Location'}
                       </button>
                     ))}
+                    <button
+                      type="button"
+                      className={planWoPivot === 'demand' ? '' : 'secondary'}
+                      style={{ fontSize: '0.75rem', padding: '2px 10px' }}
+                      onClick={() => { setPlanWoPivot('demand'); setPlanWoPivotExpanded(new Set()); setPlanWoPivotSubExpanded(new Set()); }}
+                    >
+                      Demand
+                    </button>
                   </div>
                   {planResult.work_orders.length > 0 && (() => {
                     const workOrdersFiltered = planWorkOrderHideDummyProdArea
@@ -3355,6 +3573,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     let workOrderRows = planWorkOrderHideDummyProdArea
                       ? planResult.work_orders.filter((r) => (r.prod_area ?? '').trim().toLowerCase() !== 'dummy')
                       : planResult.work_orders;
+                    // Compute the supply-backing map early so it can drive the phantom filter below
+                    // and also be used by the WO expand panel later in this block.
+                    const { suppliesMap: woSuppliesMap, crossEntrySupplyMap: woCrossEntrySupplyMap, peggedQtyMap: woPeggedQtyMap } = buildWoMaps(planResult.planning_pegging ?? []);
                     // Build set of demand IDs with shortage > 0 for short-supply filter
                     const shortDemandIds = planDemandShortOnly
                       ? new Set(planResult.committed_demands.filter((d) => (d.shortage ?? 0) > 0.01).map((d) => d.demand_id ?? ''))
@@ -3379,6 +3600,32 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         return true;
                       });
                     }
+                    // Build the set of "backed" WO signatures: product|location|method triples for
+                    // which at least one WO node in the pegging tree has supply leaves.
+                    // We intentionally ignore demand_id here because individual WO rows often carry
+                    // a specific demand_id while the corresponding pegging WO node lives inside a
+                    // consolidated entry (demand_id null) — the keys never reliably match.
+                    // Make WOs are excluded from phantom filtering because their supply leaves are
+                    // components with different product_ids and are not in woSuppliesMap.
+                    const backedWoSigs = new Set<string>();
+                    const collectBackedWos = (node: PlanningPeggingNode): void => {
+                      if (node.type === 'work_order') {
+                        if (collectAllSupplyLeaves(node).length > 0) {
+                          backedWoSigs.add(`${node.product_id ?? ''}|${node.location_id ?? ''}|${(node.method ?? '').toLowerCase()}`);
+                        }
+                        (node.children ?? []).forEach(collectBackedWos);
+                      } else {
+                        (node.children ?? []).forEach(collectBackedWos);
+                      }
+                    };
+                    for (const entry of planResult.planning_pegging ?? []) {
+                      collectBackedWos(entry.tree);
+                    }
+                    workOrderRows = workOrderRows.filter((r) => {
+                      const method = (r.method ?? '').toLowerCase();
+                      if (method === 'make') return true;
+                      return backedWoSigs.has(`${r.product_id ?? ''}|${r.location_id ?? ''}|${(r.method ?? '').toLowerCase()}`);
+                    });
                     // Aggregate lots with the same logical WO key so the table shows total quantity per work order
                     const grouped = new Map<string, WorkOrder>();
                     for (const r of workOrderRows) {
@@ -3406,14 +3653,20 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       }
                     }
                     const groupedRows = Array.from(grouped.values());
-                    // Build demand_id → requested_qty / shortage lookups (mirrors demands-tab pattern)
+                    // Build demand_id → requested_qty / shortage / inventory-fulfilled / product label lookups
                     const demandRequestedMap = new Map<string, number>();
                     const demandShortageMap = new Map<string, number>();
+                    const demandInventoryMap = new Map<string, number>();
+                    const demandLabelMap = new Map<string, string>(); // demand_id → product_id
                     for (const d of planResult.committed_demands) {
                       const id = d.demand_id ?? '';
                       if (!id) continue;
                       if (d.requested_qty != null) demandRequestedMap.set(id, d.requested_qty);
                       if ((d.shortage ?? 0) > 0) demandShortageMap.set(id, d.shortage ?? 0);
+                      if (d.commit_reason === 'inventory') {
+                        demandInventoryMap.set(id, (demandInventoryMap.get(id) ?? 0) + d.quantity);
+                      }
+                      if (!demandLabelMap.has(id)) demandLabelMap.set(id, d.product_id);
                     }
                     const dummyHiddenCount = planResult.work_orders.filter((r) => (r.prod_area ?? '').trim().toLowerCase() === 'dummy').length;
                     const woRows: WoEnrichedRow[] = groupedRows.map((r, i) => {
@@ -3425,9 +3678,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         : splitDemandIds.length > 0
                           ? splitDemandIds.join(', ')
                           : undefined;
-                      const requested = r.demand_id
-                        ? (demandRequestedMap.get(r.demand_id) ?? undefined)
-                        : splitDemandIds.reduce((s, did) => s + (demandRequestedMap.get(did) ?? 0), 0) || undefined;
+                      // Requested = the demand node directly above this WO in the pegging tree
+                      // (component demand qty for component WOs, FG demand qty for top-level WOs).
+                      // Falls back to the committed_demand requested_qty when pegging data is absent.
+                      const woKeyFull = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
+                      const woKeyConsolidated = `|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
+                      const peggedQty = woPeggedQtyMap.get(woKeyFull) ?? woPeggedQtyMap.get(woKeyConsolidated) ?? null;
+                      const demandRequested = peggedQty != null
+                        ? peggedQty
+                        : r.demand_id
+                          ? (demandRequestedMap.get(r.demand_id) ?? undefined)
+                          : splitDemandIds.reduce((s, did) => s + (demandRequestedMap.get(did) ?? 0), 0) || undefined;
+                      const inventoryFulfilled = r.demand_id
+                        ? (demandInventoryMap.get(r.demand_id) ?? 0)
+                        : splitDemandIds.reduce((s, did) => s + (demandInventoryMap.get(did) ?? 0), 0);
+                      const requested = demandRequested != null ? Math.max(0, demandRequested - inventoryFulfilled) : undefined;
+                      // Shortage = demand-level shortage (accounts for both inventory + WO fulfillment)
                       const shortage = r.demand_id
                         ? (demandShortageMap.get(r.demand_id) ?? 0)
                         : splitDemandIds.reduce((s, did) => s + (demandShortageMap.get(did) ?? 0), 0);
@@ -3535,9 +3801,50 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         );
                       }},
                     ];
+                    // ── Demand-pivot column set ──
+                    // • Drop _requested_qty, _shortage, _demand_label: those are demand-level numbers
+                    //   already shown in the group header; displaying them per WO row creates false
+                    //   comparisons when the WO is for a sub-component at a different BOM level.
+                    // • Override product_id / quantity / method to handle synthetic inventory rows.
+                    const woDemandColumns = woColumns
+                      .filter((col) => !['_requested_qty', '_shortage', '_demand_label'].includes(col.key as string))
+                      .map((col) => {
+                        if (col.key === 'product_id') return {
+                          ...col,
+                          render: (r: WoEnrichedRow) => {
+                            if (r._is_inventory) return <span style={{ color: '#16a34a', fontStyle: 'italic' }}>Inventory</span>;
+                            return <span>{r.product_id}</span>;
+                          },
+                        };
+                        if (col.key === 'quantity') return {
+                          ...col,
+                          label: 'Alloc Qty',
+                          render: (r: WoEnrichedRow) => {
+                            if (r._is_inventory) return <span style={{ color: '#16a34a' }}>{Number(r._split_qty ?? r.quantity).toLocaleString()}</span>;
+                            return (
+                              <span>
+                                {Number(r._split_qty ?? r.quantity).toLocaleString()}
+                                {r._is_shared && <span style={{ marginLeft: 5, background: '#0891b2', color: '#fff', borderRadius: 8, padding: '1px 5px', fontSize: '0.7rem', verticalAlign: 'middle' }}>split</span>}
+                              </span>
+                            );
+                          },
+                        };
+                        if (col.key === 'method') return {
+                          ...col,
+                          render: (r: WoEnrichedRow) => {
+                            if (r._is_inventory) return <span style={{ color: '#16a34a', fontStyle: 'italic' }}>inventory</span>;
+                            return col.render ? col.render(r) : (r.method ?? '–');
+                          },
+                        };
+                        return col;
+                      });
                     const pivotGroups = (planWoPivot === 'prod_area' || planWoPivot === 'location') ? buildWoPivotGroups(woRows, planWoPivot) : [];
                     const nestedGroups = planWoPivot === 'nested' ? buildWoNestedPivotGroups(woRows) : [];
+                    const demandGroups = planWoPivot === 'demand'
+                      ? buildWoDemandGroups(planResult.committed_demands, woRows, demandInventoryMap, demandShortageMap, demandRequestedMap, demandLabelMap)
+                      : [];
                     const woRowStyle = (r: WoEnrichedRow) => {
+                      if (r._is_inventory) return { background: 'rgba(34,197,94,0.08)', color: '#16a34a', fontStyle: 'italic' as const };
                       const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
                       if (woExplainKey === k) return { background: 'rgba(167,139,250,0.15)', outline: '1px solid rgba(167,139,250,0.4)' };
                       if (woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
@@ -3651,8 +3958,109 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               })}
                             </tbody>
                           </table>
+                        ) : planWoPivot === 'demand' ? (
+                          /* ── Demand pivot: one collapsible group per demand ── */
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                            {demandGroups.length === 0 && (
+                              <p style={{ color: '#a1a1aa', fontSize: '0.85rem' }}>No demand groups found.</p>
+                            )}
+                            {demandGroups.map((group) => {
+                              const expanded = planWoPivotExpanded.has(group.demand_id);
+                              return (
+                                <div key={group.demand_id} style={{ border: '1px solid #3f3f46', borderRadius: 6, overflow: 'hidden' }}>
+                                  <div
+                                    style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '0.4rem 0.75rem', background: expanded ? 'rgba(59,130,246,0.08)' : '#27272a', cursor: 'pointer', userSelect: 'none' }}
+                                    onClick={() => setPlanWoPivotExpanded((prev) => {
+                                      const next = new Set(prev);
+                                      expanded ? next.delete(group.demand_id) : next.add(group.demand_id);
+                                      return next;
+                                    })}
+                                  >
+                                    <span style={{ color: '#3b82f6', fontSize: '0.85rem' }}>{expanded ? '▼' : '▶'}</span>
+                                    <span style={{ fontWeight: 600, fontSize: '0.9rem' }}>{group.label}</span>
+                                    <span style={{ color: '#a1a1aa', fontSize: '0.8rem' }}>
+                                      Demand: {Number(group.demand_qty).toLocaleString()}
+                                      {' · '}Requested: {Number(group.requested_qty).toLocaleString()}
+                                      {group.shortage > 0 && (
+                                        <span style={{ marginLeft: 6, color: '#f87171' }}>
+                                          Shortage: {Number(group.shortage).toLocaleString()}
+                                        </span>
+                                      )}
+                                    </span>
+                                    <span style={{ marginLeft: 'auto', color: '#71717a', fontSize: '0.75rem' }}>
+                                      {group.rows.filter((r) => !r._is_inventory).length} WO{group.rows.filter((r) => !r._is_inventory).length !== 1 ? 's' : ''}
+                                    </span>
+                                  </div>
+                                  {expanded && (() => {
+                                    // Sub-group rows by product_id to expose OR vs AND BOM structure.
+                                    // Same product → OR alternatives (multiple supply paths for one product slot).
+                                    // Different products → AND (distinct BOM components, all required).
+                                    const invRows = group.rows.filter((r) => r._is_inventory);
+                                    const byProduct = new Map<string, WoEnrichedRow[]>();
+                                    for (const r of group.rows) {
+                                      if (r._is_inventory) continue;
+                                      const pid = r.product_id;
+                                      if (!byProduct.has(pid)) byProduct.set(pid, []);
+                                      byProduct.get(pid)!.push(r);
+                                    }
+                                    const productGroups = Array.from(byProduct.entries());
+                                    const multiProduct = productGroups.length > 1;
+                                    return (
+                                      <div style={{ borderTop: '1px solid #3f3f46' }}>
+                                        {/* Inventory fulfillment summary row */}
+                                        {invRows.length > 0 && (
+                                          <div style={{ padding: '0.3rem 0.75rem', background: 'rgba(34,197,94,0.06)', borderBottom: '1px solid #3f3f46', fontSize: '0.78rem', color: '#16a34a', fontStyle: 'italic' }}>
+                                            Inventory: {invRows.reduce((s, r) => s + (r._split_qty ?? r.quantity), 0).toLocaleString()} units pre-fulfilled from stock
+                                          </div>
+                                        )}
+                                        {productGroups.map(([pid, pidRows], gi) => {
+                                          // OR: multiple WOs for same product where none feeds another
+                                          //     (they're independent parallel sources for the same slot).
+                                          // AND/sequential: WO_B.location_source === WO_A.location_id
+                                          //     (WO_B consumes WO_A's output — a move chain).
+                                          const isSequential = pidRows.some((r) =>
+                                            pidRows.some((other) => other !== r && other.location_id === r.location_source)
+                                          );
+                                          const isOr = !isSequential && pidRows.length > 1;
+                                          return (
+                                            <div key={pid}>
+                                              {/* Product sub-header — only shown when multiple products (AND) or multiple WOs for same product */}
+                                              {(multiProduct || pidRows.length > 1) && (
+                                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.2rem 0.75rem', background: '#1e1e20', borderTop: gi > 0 ? '1px solid #3f3f46' : undefined, borderBottom: '1px solid #3f3f46' }}>
+                                                  {multiProduct && gi > 0 && (
+                                                    <span style={{ fontSize: '0.65rem', color: '#3b82f6', fontWeight: 700, marginRight: 2 }}>AND</span>
+                                                  )}
+                                                  <span style={{ fontSize: '0.75rem', color: '#a1a1aa' }}>{pid}</span>
+                                                  {isOr && (
+                                                    <span style={{ fontSize: '0.65rem', padding: '1px 5px', borderRadius: 8, background: 'rgba(245,158,11,0.15)', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.3)' }}>
+                                                      OR · {pidRows.length} paths · {pidRows.reduce((s, r) => s + (r._split_qty ?? r.quantity), 0).toLocaleString()} total
+                                                    </span>
+                                                  )}
+                                                  {isSequential && (
+                                                    <span style={{ fontSize: '0.65rem', padding: '1px 5px', borderRadius: 8, background: 'rgba(99,102,241,0.15)', color: '#818cf8', border: '1px solid rgba(99,102,241,0.3)' }}>
+                                                      chain · {pidRows.length} steps
+                                                    </span>
+                                                  )}
+                                                </div>
+                                              )}
+                                              <SortFilterTable<WoEnrichedRow>
+                                                columns={woDemandColumns}
+                                                rows={pidRows}
+                                                idKey="_key"
+                                                rowStyle={woRowStyle}
+                                              />
+                                            </div>
+                                          );
+                                        })}
+                                      </div>
+                                    );
+                                  })()}
+                                </div>
+                              );
+                            })}
+                          </div>
                         ) : (
-                          /* ── Flat view (unchanged) ── */
+                          /* ── Flat view with inline supply expansion ── */
                           <SortFilterTable<WoEnrichedRow>
                             columns={woColumns}
                             rows={woRows}
@@ -3667,6 +4075,116 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               if (woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
                               if (!r.override_active && !r.consolidation_override_active && woHasSavedOverride(r)) return { borderLeft: '3px solid #b45309' };
                               return undefined;
+                            }}
+                            expandedKeys={woExpandedKeys}
+                            onToggleExpand={(key) => setWoExpandedKeys((prev) => {
+                              const next = new Set(prev);
+                              prev.has(key) ? next.delete(key) : next.add(key);
+                              return next;
+                            })}
+                            expandedRowContent={(r) => {
+                              const woKey = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
+                              const consolidatedWoKey = `|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
+                              const woSupplies = woSuppliesMap.get(woKey) ?? woSuppliesMap.get(consolidatedWoKey) ?? [];
+                              const isMakeExpand = woSupplies.length > 0 && woSupplies[0].type === 'demand';
+                              // For make WOs: find supply/purchase nodes for the same product in any
+                              // pegging entry with the same top-level demand_id. These represent
+                              // inventory drawn from stock to fill the demand independently of this WO.
+                              const directSupplies = isMakeExpand
+                                ? (woCrossEntrySupplyMap.get(`${r.demand_id ?? ''}|${r.product_id ?? ''}`) ?? [])
+                                : [];
+                              if (woSupplies.length === 0 && directSupplies.length === 0) return null;
+                              const supplyRowStyle: React.CSSProperties = { borderTop: '1px solid #3f3f46' };
+                              const cellP: React.CSSProperties = { paddingRight: '1.25rem', paddingTop: '0.15rem', paddingBottom: '0.15rem' };
+                              return (
+                                <div style={{ padding: '0.3rem 1.75rem 0.5rem', background: 'rgba(59,130,246,0.04)', borderTop: '1px dashed #3f3f46' }}>
+                                  {/* Direct supply section (make WOs only): inventory pre-fulfillment */}
+                                  {directSupplies.length > 0 && (
+                                    <div style={{ marginBottom: woSupplies.length > 0 ? '0.5rem' : 0 }}>
+                                      <div style={{ fontSize: '0.7rem', color: '#16a34a', marginBottom: '0.2rem', fontWeight: 500 }}>
+                                        From supply ({Number(directSupplies.reduce((s, n) => s + (n.quantity ?? 0), 0)).toLocaleString()} units pre-filled from inventory)
+                                      </div>
+                                      <table style={{ fontSize: '0.78rem', borderCollapse: 'collapse', width: '100%' }}>
+                                        <thead>
+                                          <tr style={{ color: '#71717a' }}>
+                                            <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem', paddingBottom: '0.15rem' }}>Type</th>
+                                            <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem' }}>Supply ID</th>
+                                            <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem' }}>Location</th>
+                                            <th style={{ textAlign: 'right', fontWeight: 400, paddingRight: '1.25rem' }}>Qty</th>
+                                          </tr>
+                                        </thead>
+                                        <tbody>
+                                          {directSupplies.map((s, si) => (
+                                            <tr key={si} style={supplyRowStyle}>
+                                              <td style={cellP}>
+                                                <span style={{ fontSize: '0.65rem', padding: '1px 5px', borderRadius: 6, background: 'rgba(34,197,94,0.15)', color: '#16a34a', border: '1px solid rgba(34,197,94,0.3)' }}>{s.type}</span>
+                                              </td>
+                                              <td style={{ ...cellP, fontFamily: 'monospace', fontSize: '0.72rem', color: '#71717a' }}>{s.supply_id ?? '–'}</td>
+                                              <td style={{ ...cellP, color: '#a3a3a3' }}>{s.location_id ?? '–'}</td>
+                                              <td style={{ textAlign: 'right', paddingRight: '1.25rem' }}>{Number(s.quantity ?? 0).toLocaleString()}</td>
+                                            </tr>
+                                          ))}
+                                        </tbody>
+                                      </table>
+                                    </div>
+                                  )}
+                                  {/* Components or supply-leaf section */}
+                                  {woSupplies.length > 0 && (
+                                    <div>
+                                      {isMakeExpand && (
+                                        <div style={{ fontSize: '0.7rem', color: '#60a5fa', marginBottom: '0.2rem', fontWeight: 500 }}>
+                                          Produced by this work order ({Number(r.quantity).toLocaleString()} units — components consumed)
+                                        </div>
+                                      )}
+                                      <table style={{ fontSize: '0.78rem', borderCollapse: 'collapse', width: '100%' }}>
+                                        <thead>
+                                          <tr style={{ color: '#71717a' }}>
+                                            {isMakeExpand ? (
+                                              <>
+                                                <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem', paddingBottom: '0.15rem' }}>Component</th>
+                                                <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem' }}>Location</th>
+                                                <th style={{ textAlign: 'right', fontWeight: 400, paddingRight: '1.25rem' }}>Committed</th>
+                                                <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem' }}>Reason</th>
+                                              </>
+                                            ) : (
+                                              <>
+                                                <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem', paddingBottom: '0.15rem' }}>Type</th>
+                                                <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem' }}>Supply ID</th>
+                                                <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem' }}>Location</th>
+                                                <th style={{ textAlign: 'right', fontWeight: 400, paddingRight: '1.25rem' }}>Qty</th>
+                                              </>
+                                            )}
+                                          </tr>
+                                        </thead>
+                                        <tbody>
+                                          {isMakeExpand ? woSupplies.map((comp, si) => (
+                                            <tr key={si} style={supplyRowStyle}>
+                                              <td style={{ ...cellP, fontFamily: 'monospace', fontSize: '0.72rem' }}>{comp.product_id ?? '–'}</td>
+                                              <td style={{ ...cellP, color: '#a3a3a3' }}>{comp.location_id ?? '–'}</td>
+                                              <td style={{ textAlign: 'right', paddingRight: '1.25rem' }}>{Number(comp.quantity ?? 0).toLocaleString()}</td>
+                                              <td style={{ ...cellP, color: '#a3a3a3', fontSize: '0.72rem' }}>{comp.commit_reason ?? ''}</td>
+                                            </tr>
+                                          )) : woSupplies.map((s, si) => (
+                                            <tr key={si} style={supplyRowStyle}>
+                                              <td style={cellP}>
+                                                <span style={{
+                                                  fontSize: '0.65rem', padding: '1px 5px', borderRadius: 6,
+                                                  background: s.type === 'purchase' ? 'rgba(16,185,129,0.15)' : 'rgba(59,130,246,0.15)',
+                                                  color: s.type === 'purchase' ? '#10b981' : '#60a5fa',
+                                                  border: `1px solid ${s.type === 'purchase' ? 'rgba(16,185,129,0.3)' : 'rgba(59,130,246,0.3)'}`,
+                                                }}>{s.type}</span>
+                                              </td>
+                                              <td style={{ ...cellP, fontFamily: 'monospace', fontSize: '0.72rem', color: '#71717a' }}>{s.supply_id ?? '–'}</td>
+                                              <td style={{ ...cellP, color: '#a3a3a3' }}>{s.location_id ?? '–'}</td>
+                                              <td style={{ textAlign: 'right', paddingRight: '1.25rem' }}>{Number(s.quantity ?? 0).toLocaleString()}</td>
+                                            </tr>
+                                          ))}
+                                        </tbody>
+                                      </table>
+                                    </div>
+                                  )}
+                                </div>
+                              );
                             }}
                           />
                         )}

@@ -80,6 +80,13 @@ data class ComponentNeed(
     val demandId: Any?,
     val priority: Int,
     val parentProductId: String,
+    /**
+     * True when this need was reached by traversing an OR-alternative alt_group (childList.size > 1).
+     * Used by runConsolidation to suppress procurement: if ALL needs in a group are via OR alternatives,
+     * the synthetic demand is capped to available inventory (the component might not be needed at all if
+     * the planner chooses a different BOM variant).
+     */
+    val viaOrAlternative: Boolean = false,
 )
 
 /** A group of component needs sharing the same (productId, locationId, timeBucket). */
@@ -95,7 +102,7 @@ data class ConsolidationGroup(
 data class ConsolidationConfig(
     val enabled: Boolean = false,
     val periodDays: Int = 7,
-    val allocationMode: String = "priority_first",  // "priority_first" | "proportional"
+    val allocationMode: String = "proportional",  // "proportional" | "priority_first"
 )
 
 /** Output of runConsolidation(). */
@@ -206,84 +213,149 @@ fun splitProportional(
 // ── Pre-scan: collect component needs ────────────────────────────────────────
 
 /**
- * Lightweight one-level dry-run expansion of each demand → ComponentNeed entries.
- * Does NOT consume inventory. Does NOT recurse beyond one BOM level.
+ * Build a set of (product_id, location_id) pairs that have available supply in inventory.
+ * Used by the deep-scan to know when to stop recursing and register a consolidation claim.
+ */
+private fun buildSupplyIndex(data: Map<String, List<Map<String, Any?>>>): Set<Pair<String, String>> =
+    (data["supply"] ?: emptyList())
+        .filter { s -> ((s["qty"] as? Number)?.toDouble() ?: 0.0) > 0 }
+        .mapNotNull { s ->
+            val pid = s["product_id"]?.toString()?.trim() ?: return@mapNotNull null
+            val lid = s["location_id"]?.toString()?.trim() ?: return@mapNotNull null
+            if (pid.isBlank() || lid.isBlank()) null else Pair(pid, lid)
+        }
+        .toSet()
+
+/**
+ * Recursively walk the BOM/method tree for (productId, locationId) and register a
+ * ComponentNeed for every inventory-bearing node reachable via unambiguous BOM paths.
+ *
+ * Stopping rule: if the current (product, location) has existing supply in [supplyIndex],
+ * register it and stop — the planner will consume it from inventory directly.  Recurse when
+ * the product must be made (make method), following ALL children in every alt_group, including
+ * OR-alternative groups (multiple children).  Over-claiming across OR-variant paths is harmless
+ * because the proportional split self-corrects to the actual produced qty, and unused tagged
+ * buckets left by unchosen variants are never consumed.
+ *
+ * Move methods: follow the source location, since that is where supply will be consumed.
+ * Purchase methods: terminal — no inventory to pre-claim.
+ *
+ * [addedKeys] prevents the same demand from registering duplicate ComponentNeeds for the
+ * same (product, location) via different BOM paths.
+ */
+private fun collectDeepNeeds(
+    productId: String,
+    locationId: String,
+    qty: Double,
+    demandId: Any?,
+    priority: Int,
+    dueDate: LocalDate?,
+    parentProductId: String,
+    data: Map<String, List<Map<String, Any?>>>,
+    supplyIndex: Set<Pair<String, String>>,
+    visited: Set<Pair<String, String>>,
+    result: MutableList<ComponentNeed>,
+    addedKeys: MutableSet<Triple<Any?, String, String>>,
+    viaOrAlt: Boolean = false,
+) {
+    val key = Pair(productId, locationId)
+    if (key in visited) return
+
+    // Inventory exists here → this is a supply-level item worth pre-allocating.
+    if (key in supplyIndex) {
+        val needKey = Triple(demandId, productId, locationId)
+        if (needKey !in addedKeys) {
+            addedKeys.add(needKey)
+            result.add(ComponentNeed(
+                productId        = productId,
+                locationId       = locationId,
+                dueDate          = dueDate,
+                qty              = qty,
+                demandId         = demandId,
+                priority         = priority,
+                parentProductId  = parentProductId,
+                viaOrAlternative = viaOrAlt,
+            ))
+        }
+        return
+    }
+
+    val methods = getMethods(productId, locationId, data)
+    val method = methods.minByOrNull { (it["preference"] as? Number)?.toInt() ?: 0 } ?: return
+    val leadDays = leadDaysForMethod(method)
+    val componentDueDate = if (dueDate != null) dueDate.minusDays(leadDays.toLong()) else null
+    val nextVisited = visited + key
+
+    when (method["type"]) {
+        "make" -> {
+            // Non-terminal: recurse through BOM children to reach inventory-level components.
+            // Follow all children in every alt_group (including OR-alternatives), but propagate
+            // viaOrAlt=true so that inventory items reached via OR groups are not over-procured.
+            val productionLocation = (method["location_id"] as? String)?.trim() ?: locationId
+            val variants = variantsForMake(productId, productionLocation, qty, method, data)
+            for ((_, childList) in variants) {
+                val isOrGroup = childList.size > 1
+                for (child in childList) {
+                    val cProductId  = (child["product_id"]  as? String)?.trim() ?: continue
+                    val cLocationId = (child["location_id"] as? String)?.trim() ?: continue
+                    val cQty        = (child["quantity"]    as? Number)?.toDouble() ?: continue
+                    if (cQty <= 0) continue
+                    collectDeepNeeds(cProductId, cLocationId, cQty, demandId, priority, componentDueDate,
+                        productId, data, supplyIndex, nextVisited, result, addedKeys,
+                        viaOrAlt = viaOrAlt || isOrGroup)
+                }
+            }
+        }
+        "move" -> {
+            // Follow the move to its source location — that is where inventory will be consumed.
+            for (child in childMaterialsForMove(method, qty)) {
+                val cProductId  = (child["product_id"]  as? String)?.trim() ?: continue
+                val cLocationId = (child["location_id"] as? String)?.trim() ?: continue
+                val cQty        = (child["quantity"]    as? Number)?.toDouble() ?: continue
+                if (cQty <= 0) continue
+                collectDeepNeeds(cProductId, cLocationId, cQty, demandId, priority, componentDueDate,
+                    productId, data, supplyIndex, nextVisited, result, addedKeys,
+                    viaOrAlt = viaOrAlt)
+            }
+        }
+        // "purchase" — purchasable on demand, no inventory to pre-allocate
+    }
+}
+
+/**
+ * Multi-level BOM scan: for every demand, walk its BOM tree via ALL paths (including
+ * OR-alternative alt_groups) and register a ComponentNeed for each inventory-bearing node
+ * reached.  Only nodes that have existing supply in [data["supply"]] are registered —
+ * intermediate make-chain products (e.g. sub-assemblies) are passed through without
+ * claiming, so the main planner's recursive make logic is not short-circuited by
+ * intermediate tagged buckets.
+ *
+ * Result feeds groupByTimeBucket → runConsolidation → proportional split, ensuring that
+ * deep-BOM consumers (e.g. 858_M51 needing 260-0152-02 via a 4-level make chain) compete
+ * fairly with direct consumers for the same inventory.
  */
 fun collectComponentNeeds(
     demands: List<Map<String, Any?>>,
     data: Map<String, List<Map<String, Any?>>>,
     @Suppress("UNUSED_PARAMETER") consolidationConfig: ConsolidationConfig,
 ): List<ComponentNeed> {
-    val result = mutableListOf<ComponentNeed>()
+    val result    = mutableListOf<ComponentNeed>()
+    val supplyIdx = buildSupplyIndex(data)
 
     for (d in demands) {
         val productId  = (d["product_id"]  as? String)?.trim() ?: continue
         val locationId = (d["location_id"] as? String)?.trim() ?: continue
         val qty        = (d["quantity"]    as? Number)?.toDouble() ?: continue
         if (qty <= 0) continue
-        val demandId   = d["demand_id"]
-        val priority   = (d["priority"] as? Number)?.toInt() ?: 0
-        val reqStr     = d["request_due_time"] as? String ?: d["request_time"] as? String
-        val reqDt      = if (reqStr != null) try { LocalDate.parse(reqStr.trim().take(10)) } catch (_: Exception) { null } else null
+        val demandId = d["demand_id"]
+        val priority = (d["priority"] as? Number)?.toInt() ?: 0
+        val reqStr   = d["request_due_time"] as? String ?: d["request_time"] as? String
+        val reqDt    = if (reqStr != null) try { LocalDate.parse(reqStr.trim().take(10)) } catch (_: Exception) { null } else null
 
-        val methods = getMethods(productId, locationId, data)
-        if (methods.isEmpty()) continue
-
-        // Pick preferred method (lowest preference number — same logic as getPreferredMethod)
-        val method = methods.minByOrNull { (it["preference"] as? Number)?.toInt() ?: 0 } ?: continue
-        val leadDays = leadDaysForMethod(method)
-        val componentDueDate = if (reqDt != null) reqDt.minusDays(leadDays.toLong()) else null
-
-        when (method["type"]) {
-            "make" -> {
-                val productionLocation = (method["location_id"] as? String)?.trim() ?: locationId
-                val variants = variantsForMake(productId, productionLocation, qty, method, data)
-                if (variants.isEmpty()) continue
-                // Only consolidate when there is a single, unambiguous BOM variant (a required
-                // component). OR-alternative variants are not required — the runtime planner
-                // chooses among them via getPreferredVariants. Pre-claiming via consolidation
-                // would inject spurious consolidated_* supplies even when there is only one
-                // demand and nothing to actually consolidate.
-                if (variants.size > 1) continue
-                val (_, childList) = variants[0]
-                for (child in childList) {
-                    val cProductId  = (child["product_id"]  as? String)?.trim() ?: continue
-                    val cLocationId = (child["location_id"] as? String)?.trim() ?: continue
-                    val cQty        = (child["quantity"]    as? Number)?.toDouble() ?: continue
-                    if (cQty <= 0) continue
-                    result.add(ComponentNeed(
-                        productId       = cProductId,
-                        locationId      = cLocationId,
-                        dueDate         = componentDueDate,
-                        qty             = cQty,
-                        demandId        = demandId,
-                        priority        = priority,
-                        parentProductId = productId,
-                    ))
-                }
-            }
-            "move" -> {
-                val children = childMaterialsForMove(method, qty)
-                for (child in children) {
-                    val cProductId  = (child["product_id"]  as? String)?.trim() ?: continue
-                    val cLocationId = (child["location_id"] as? String)?.trim() ?: continue
-                    val cQty        = (child["quantity"]    as? Number)?.toDouble() ?: continue
-                    if (cQty <= 0) continue
-                    result.add(ComponentNeed(
-                        productId       = cProductId,
-                        locationId      = cLocationId,
-                        dueDate         = componentDueDate,
-                        qty             = cQty,
-                        demandId        = demandId,
-                        priority        = priority,
-                        parentProductId = productId,
-                    ))
-                }
-            }
-            // "purchase" — no child components
-        }
+        val addedKeys = mutableSetOf<Triple<Any?, String, String>>()
+        collectDeepNeeds(productId, locationId, qty, demandId, priority, reqDt, productId,
+            data, supplyIdx, emptySet(), result, addedKeys)
     }
-
     return result
 }
 
@@ -316,15 +388,20 @@ fun runConsolidation(
     val consolidatedPegging = mutableListOf<Map<String, Any?>>()
 
     // Build override index once — shared across all groups
-    @Suppress("UNCHECKED_CAST")
-    val overrideIndex = buildOverrideIndex((data["overrides"] ?: emptyList()) as List<Map<String, Any?>>)
+    val overrideIndex = buildOverrideIndex(data["overrides"] ?: emptyList())
 
     for (group in groups) {
         val componentKey = "${group.productId}|${group.locationId}"
 
         if (group.needs.size == 1) {
-            // Single-demand group — pass through with original demandId, no change in behavior
+            // Single-demand group — pass through with original demandId, no change in behavior.
+            // If the only claimant reached this component via an OR-alternative path, leave the
+            // supply untouched: let the main planner consume it via FIFO.  Injecting a small
+            // tagged bucket that is insufficient to complete the BOM chain causes child_failed
+            // with consumed-but-wasted supply.  The OR-alternative traversal still serves its
+            // purpose when a non-OR consumer is also present (allViaOr=false, multi-demand branch).
             val need = group.needs[0]
+            if (need.viaOrAlternative) continue
             val syntheticDemand = mapOf(
                 "demand_id"        to need.demandId,
                 "product_id"       to group.productId,
@@ -360,7 +437,14 @@ fun runConsolidation(
             // Consume from real inventory (claim the supply)
             consumeFromInventoryForConsolidation(inventory, group.productId, group.locationId, producedQty)
         } else {
-            // Multi-demand group — consolidate
+            // Multi-demand group — consolidate.
+            // If ALL needs are via OR-alternative paths, skip: leave supply in inventory for FIFO.
+            // Splitting a tiny fraction among many demands causes each to fail with child_failed
+            // while the supply is consumed and wasted.  When at least one demand is a direct
+            // (non-OR) consumer, allViaOr=false and we consolidate normally so OR-path demands
+            // get a fair proportional share alongside the direct consumer.
+            val allViaOr = group.needs.all { it.viaOrAlternative }
+            if (allViaOr) continue
             val syntheticDemand = mapOf(
                 "demand_id"        to null,
                 "product_id"       to group.productId,
@@ -424,7 +508,15 @@ fun runConsolidation(
                     "consolidation_override_active" to splitOverrideActive,
                 ))
             }
-            if (pegging != null) consolidatedPegging.add(mapOf("demand_id" to null, "consolidated" to true, "tree" to pegging))
+            // Include the demand_ids that share this consolidated supply so the frontend
+            // can attribute supply pegging to specific demands (supply view "Pegged Demands" column).
+            val consolidatedDemandIds = split.filter { (_, qty) -> qty > 1e-12 }.keys.filterNotNull().toList()
+            if (pegging != null) consolidatedPegging.add(mapOf(
+                "demand_id" to null,
+                "consolidated" to true,
+                "consolidated_demand_ids" to consolidatedDemandIds,
+                "tree" to pegging,
+            ))
 
             // Consume from real inventory (claim the consolidated supply upfront)
             consumeFromInventoryForConsolidation(inventory, group.productId, group.locationId, producedQty)
