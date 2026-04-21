@@ -39,6 +39,8 @@ fun Application.configurePlugins() {
     install(CORS) {
         allowHost("localhost:3000")
         allowHost("127.0.0.1:3000")
+        allowHost("localhost:3001")
+        allowHost("127.0.0.1:3001")
         allowHeader(HttpHeaders.ContentType)
         allowHeader(HttpHeaders.Authorization)
         allowMethod(HttpMethod.Get)

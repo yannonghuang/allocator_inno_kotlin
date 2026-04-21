@@ -350,6 +350,81 @@ fun Routing.viewRoutes() {
             val caseId = call.parameters["case_id"]?.toIntOrNull() ?: throw IllegalArgumentException("Invalid case_id")
             val runId = call.parameters["run_id"]?.toIntOrNull() ?: throw IllegalArgumentException("Invalid run_id")
             val debugComponentKey = call.request.queryParameters["debug_component_key"]
+            val planRunId = call.request.queryParameters["plan_run_id"]?.toIntOrNull()
+
+            // ── plan-based branch: derive consumption from plan_supply_allocation ──
+            if (planRunId != null) {
+                val rows = transaction {
+                    PlanRuns.selectAll().where {
+                        (PlanRuns.id eq planRunId) and (PlanRuns.caseId eq caseId)
+                    }.singleOrNull() ?: throw NoSuchElementException("Plan run not found")
+
+                    val supplies = Supplies.selectAll().where { Supplies.caseId eq caseId }
+                        .orderBy(Supplies.supplyId, SortOrder.ASC).toList()
+
+                    val allocs = PlanSupplyAllocations.selectAll().where {
+                        (PlanSupplyAllocations.caseId eq caseId) and (PlanSupplyAllocations.planRunId eq planRunId)
+                    }.toList()
+
+                    val consumedBySupplyKey = mutableMapOf<String, Double>()
+                    val demandsBySupplyKey = mutableMapOf<String, MutableSet<String>>()
+                    for (r in allocs) {
+                        val sid = r[PlanSupplyAllocations.supplyId]
+                        consumedBySupplyKey[sid] = (consumedBySupplyKey[sid] ?: 0.0) + r[PlanSupplyAllocations.qtyConsumed]
+                        val did = r[PlanSupplyAllocations.demandId]
+                        if (!did.isNullOrBlank()) {
+                            demandsBySupplyKey.getOrPut(sid) { mutableSetOf() }.add(did)
+                        }
+                    }
+
+                    supplies.map { s ->
+                        val sid = s[Supplies.supplyId]
+                        val initRow = s[Supplies.qty]
+                        val consumedRow = consumedBySupplyKey[sid] ?: 0.0
+                        val residualRow = maxOf(0.0, initRow - consumedRow)
+                        val utilRate = if (initRow > 0) consumedRow / initRow else null
+                        val peggedDemands = demandsBySupplyKey[sid]?.size ?: 0
+                        mapOf(
+                            "id" to s[Supplies.id],
+                            "component_key" to "${s[Supplies.productId]}|${s[Supplies.locationId] ?: ""}",
+                            "supply_id" to sid,
+                            "supply_date" to s[Supplies.supplyDate],
+                            "product_id" to s[Supplies.productId],
+                            "location_id" to (s[Supplies.locationId] ?: ""),
+                            "initial_qty" to Math.round(initRow * 10000).toDouble() / 10000.0,
+                            "consumed_qty" to Math.round(consumedRow * 10000).toDouble() / 10000.0,
+                            "residual_qty" to Math.round(residualRow * 10000).toDouble() / 10000.0,
+                            "utilization_rate" to if (utilRate != null) Math.round(utilRate * 10000).toDouble() / 10000.0 else null,
+                            "pegged_demands" to peggedDemands,
+                            "total_pegged_qty" to Math.round(consumedRow * 10000).toDouble() / 10000.0,
+                        )
+                    }
+                }
+
+                call.respond(buildJsonObject {
+                    put("run_id", runId)
+                    put("plan_run_id", planRunId)
+                    put("source", "plan")
+                    put("supply_view", buildJsonArray {
+                        for (row in rows) add(buildJsonObject {
+                            put("id", row["id"] as? Int ?: 0)
+                            put("component_key", row["component_key"] as? String ?: "")
+                            put("supply_id", row["supply_id"] as? String ?: "")
+                            if (row["supply_date"] != null) put("supply_date", row["supply_date"] as String) else put("supply_date", JsonNull)
+                            put("product_id", row["product_id"] as? String ?: "")
+                            put("location_id", row["location_id"] as? String ?: "")
+                            put("initial_qty", row["initial_qty"] as? Double ?: 0.0)
+                            put("consumed_qty", row["consumed_qty"] as? Double ?: 0.0)
+                            put("residual_qty", row["residual_qty"] as? Double ?: 0.0)
+                            val ur = row["utilization_rate"] as? Double
+                            if (ur != null) put("utilization_rate", ur) else put("utilization_rate", JsonNull)
+                            put("pegged_demands", row["pegged_demands"] as? Int ?: 0)
+                            put("total_pegged_qty", row["total_pegged_qty"] as? Double ?: 0.0)
+                        })
+                    })
+                })
+                return@get
+            }
 
             transaction {
                 AllocationRuns.selectAll().where {

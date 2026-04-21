@@ -586,6 +586,19 @@ fun Routing.allocateRoutes() {
                 if (nameArg != null) it[PlanRuns.name] = nameArg.ifBlank { null }
                 if (notesArg != null) it[PlanRuns.notes] = notesArg.ifBlank { null }
             }
+            @Suppress("UNCHECKED_CAST")
+            val supplyAllocs = (enriched["supply_allocations"] as? List<Map<String, Any?>>).orEmpty()
+            if (supplyAllocs.isNotEmpty()) {
+                // Idempotent: clear any prior allocations for this run before re-inserting
+                PlanSupplyAllocations.deleteWhere { PlanSupplyAllocations.planRunId eq runId }
+                PlanSupplyAllocations.batchInsert(supplyAllocs) { alloc ->
+                    this[PlanSupplyAllocations.caseId]      = caseId
+                    this[PlanSupplyAllocations.planRunId]   = runId
+                    this[PlanSupplyAllocations.supplyId]    = alloc["supply_id"] as String
+                    this[PlanSupplyAllocations.demandId]    = alloc["demand_id"] as? String
+                    this[PlanSupplyAllocations.qtyConsumed] = (alloc["qty_consumed"] as? Number)?.toDouble() ?: 0.0
+                }
+            }
         }
         call.respond(buildJsonObject { put("id", runId); put("status", "success") })
     }
@@ -1294,8 +1307,9 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
             put("enabled",         consolidation["enabled"]      as? Boolean ?: false)
             put("period_days",     ((consolidation["period_days"] as? Number)?.toInt() ?: 7).coerceIn(1, 365))
             put("allocation_mode", when (consolidation["allocation_mode"]?.toString()) {
-                "proportional" -> "proportional"
-                else           -> "priority_first"
+                "proportional"   -> "proportional"
+                "priority_first" -> "priority_first"
+                else             -> "fair"
             })
         }
     }
