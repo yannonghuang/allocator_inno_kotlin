@@ -564,4 +564,58 @@ class ConsolidationEngineTest : FunSpec({
         methodChoices shouldContainKey key
         (methodChoices[key]!!["preference"] as Number).toInt() shouldBe 2
     }
+
+    // ── Scenario 22: probe catches depth-2 child_failed — scoreVariant zero-qty gap ──
+    //
+    // Regression for the residual 888_F30_2024_07_VIRTUAL phantom-WO case. FG's BOM has
+    // two children: C1 (reachable, has supply) and P (intermediate — has its own make
+    // method, but that method's child GRANDCHILD is unreachable).  plan(P) hits the
+    // capped<=1e-9 branch in PlanningEngine.plan (around line 1133) and returns a
+    // committed row with qty=0 and reason="child_failed:GRANDCHILD@PLANT(no_inventory)".
+    //
+    // Pre-fix scoreVariant skipped zero-qty rows before evaluating their commit_reason,
+    // so that hard failure never tripped anyFailed.  firstFeasibleMethod reported FG
+    // feasible, the consolidation gate passed, and C1 was registered as a ComponentNeed
+    // — a phantom pre-allocation for a demand that can never roll up.
+    //
+    // Post-fix the zero-qty row's non-benign reason sets anyFailed=true, the method is
+    // rejected, and no ComponentNeeds are registered.
+    test("Sc22: probe marks zero-qty child_failed rows as failed (no phantom pre-allocation)") {
+        val demands = listOf(demand("D1", "FG", "PLANT", 100.0, 1, "2025-01-20"))
+        val data = mapOf(
+            "method_make" to listOf(
+                // FG's only method: children are C1 (reachable) and P (transitively unreachable).
+                mapOf("product_id" to "FG", "location_id" to "PLANT",
+                      "bom_id" to "BFG", "preference" to 1, "lead_time" to 0),
+                // P's only method: child is GRANDCHILD (terminal no_methods).
+                mapOf("product_id" to "P", "location_id" to "PLANT",
+                      "bom_id" to "BP", "preference" to 1, "lead_time" to 0),
+            ),
+            "bom" to listOf(
+                mapOf("parent_id" to "FG", "child_id" to "C1",         "bom_id" to "BFG", "rate" to 1.0, "alt_group" to null),
+                mapOf("parent_id" to "FG", "child_id" to "P",          "bom_id" to "BFG", "rate" to 1.0, "alt_group" to null),
+                mapOf("parent_id" to "P",  "child_id" to "GRANDCHILD", "bom_id" to "BP",  "rate" to 1.0, "alt_group" to null),
+            ),
+            // C1 has supply; GRANDCHILD has none and no methods → unreachable at depth 2.
+            "supply" to listOf(supply("C1", "PLANT", 1000.0)),
+        )
+        val inventory: List<Map<String, Any?>> = (data["supply"] ?: emptyList()).map { s ->
+            mapOf(
+                "product_id"  to s["product_id"],
+                "location_id" to s["location_id"],
+                "supply_date" to s["supply_date"],
+                "supply_id"   to s["supply_id"],
+                "qty"         to s["qty"],
+                "demand_tag"  to null,
+            )
+        }
+        val methodChoices = mutableMapOf<Triple<String, String, String>, Map<String, Any?>>()
+        val needs = collectComponentNeeds(
+            demands, data, ConsolidationConfig(),
+            inventory = inventory, planConfig = null, methodChoices = methodChoices,
+        )
+        // Gate triggered via sharper probe — no ComponentNeed for C1 even though C1 has supply.
+        needs shouldHaveSize 0
+        methodChoices shouldNotContainKey Triple("FG", "PLANT", "D1")
+    }
 })

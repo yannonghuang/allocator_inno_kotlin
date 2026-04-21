@@ -311,10 +311,12 @@ private fun scoreVariant(
         )
         val (solvedList, cWos, _) = plan(cDemand, invCopy, data, cReqDt, depth = depth - 1, planningPath = planningPath)
         for (s in solvedList) {
-            if ((s["quantity"] as? Number)?.toDouble() ?: 0.0 <= 0) continue
+            val qty = (s["quantity"] as? Number)?.toDouble() ?: 0.0
             val ct = s["commit_time"] as? String
             val reason = s["commit_reason"] as? String ?: ""
-            if (ct == null || (reason.isNotBlank() && reason !in BENIGN_REASONS)) anyFailed = true
+            val hardFailed = ct == null || (reason.isNotBlank() && reason !in BENIGN_REASONS)
+            if (hardFailed) anyFailed = true
+            if (qty <= 0) continue
             if (ct != null) {
                 val dt = parseDate(ct)
                 if (dt != null && (maxCommit == null || dt > maxCommit)) maxCommit = dt
