@@ -3914,25 +3914,40 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         : splitDemandIds.length > 0
                           ? splitDemandIds.join(', ')
                           : undefined;
-                      // Requested = the demand node directly above this WO in the pegging tree
-                      // (component demand qty for component WOs, FG demand qty for top-level WOs).
-                      // Falls back to the committed_demand requested_qty when pegging data is absent.
+                      // Requested = demand-side ask against this WO.
+                      //   shared (consolidation split > 1) → sum of allocated_qty across all
+                      //     sharing demands. peggedQty would only reflect one demand's share,
+                      //     which is less than the WO's committed total and produces the
+                      //     misleading "Committed > Requested" display.
+                      //   single → the demand node directly above this WO in the pegging tree
+                      //     (component demand qty for component WOs, FG for top-level WOs).
+                      //   no peg data → fall back to committed_demand requested_qty.
+                      const isSharedConsolidated = (r.wo_consolidation_split_details?.length ?? 0) > 1;
                       const woKeyFull = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
                       const woKeyConsolidated = `|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
                       const peggedQty = woPeggedQtyMap.get(woKeyFull) ?? woPeggedQtyMap.get(woKeyConsolidated) ?? null;
-                      const demandRequested = peggedQty != null
-                        ? peggedQty
+                      const demandRequested = isSharedConsolidated
+                        ? (r.wo_consolidation_split_details ?? []).reduce(
+                            (s, d) => s + (Number(d.allocated_qty) || 0), 0,
+                          )
+                        : peggedQty != null
+                          ? peggedQty
+                          : r.demand_id
+                            ? (demandRequestedMap.get(r.demand_id) ?? undefined)
+                            : splitDemandIds.reduce((s, did) => s + (demandRequestedMap.get(did) ?? 0), 0) || undefined;
+                      // For shared WOs, allocated_qty already reflects post-inventory
+                      // allocation — no further inventory subtraction needed. For
+                      // non-shared WOs, subtract the demand's inventory fulfillment so
+                      // Requested reflects only what was expected from this WO.
+                      const inventoryFulfilled = isSharedConsolidated
+                        ? 0
                         : r.demand_id
-                          ? (demandRequestedMap.get(r.demand_id) ?? undefined)
-                          : splitDemandIds.reduce((s, did) => s + (demandRequestedMap.get(did) ?? 0), 0) || undefined;
-                      const inventoryFulfilled = r.demand_id
-                        ? (demandInventoryMap.get(r.demand_id) ?? 0)
-                        : splitDemandIds.reduce((s, did) => s + (demandInventoryMap.get(did) ?? 0), 0);
+                          ? (demandInventoryMap.get(r.demand_id) ?? 0)
+                          : splitDemandIds.reduce((s, did) => s + (demandInventoryMap.get(did) ?? 0), 0);
                       const requested = demandRequested != null ? Math.max(0, demandRequested - inventoryFulfilled) : undefined;
-                      // Shortage = demand-level shortage (accounts for both inventory + WO fulfillment)
-                      const shortage = r.demand_id
-                        ? (demandShortageMap.get(r.demand_id) ?? 0)
-                        : splitDemandIds.reduce((s, did) => s + (demandShortageMap.get(did) ?? 0), 0);
+                      // WO-level shortage = WO's own requested minus its committed output.
+                      const committedQty = Number(r.quantity) || 0;
+                      const shortage = requested != null ? Math.max(0, requested - committedQty) : 0;
                       return {
                         ...r,
                         _key: `wo-${i}-${r.product_id}-${r.location_id}`,
@@ -4038,9 +4053,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       }},
                     ];
                     // ── Demand-pivot column set ──
-                    // • Drop _requested_qty, _shortage, _demand_label: those are demand-level numbers
-                    //   already shown in the group header; displaying them per WO row creates false
-                    //   comparisons when the WO is for a sub-component at a different BOM level.
+                    // • Drop _requested_qty, _shortage, _demand_label: the group header already
+                    //   shows demand-level totals, and per-WO Requested/Shortage (WO-scoped) would
+                    //   duplicate or compete with the header instead of adding signal.
                     // • Override product_id / quantity / method to handle synthetic inventory rows.
                     const woDemandColumns = woColumns
                       .filter((col) => !['_requested_qty', '_shortage', '_demand_label'].includes(col.key as string))
