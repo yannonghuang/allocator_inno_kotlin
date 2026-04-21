@@ -2,6 +2,7 @@
 
 import React from 'react';
 import { useTranslations } from 'next-intl';
+import { qtyFmt } from '@/app/lib/format';
 
 /** Unique key for a node at a specific path in the tree (so same nodeId at different positions don't share state). */
 export const PATH_KEY_SEP = '\u001e';
@@ -112,7 +113,7 @@ function PeggingNodeRow({
       )}
       {/* Sum of flows from children into this node; so "from below" matches subordinates */}
       {hasChildren && (
-        <span style={{ color: '#a1a1aa', fontSize: '0.85em' }} title="Sum of edge qtys from rows below (flow into this node)">{t('fromBelow')} {children.reduce((s, c) => s + c.qty, 0).toLocaleString()}</span>
+        <span style={{ color: '#a1a1aa', fontSize: '0.85em' }} title="Sum of edge qtys from rows below (flow into this node)">{t('fromBelow')} {qtyFmt(children.reduce((s, c) => s + c.qty, 0))}</span>
       )}
       {depth === 0 && node.qty != null && node.qty > 0 && node.type !== 'demand' && (
         <span style={{ color: '#71717a', fontSize: '0.85em' }} title="Total inventory at this node (not just for this demand)">{t('inventory')} {node.qty}</span>

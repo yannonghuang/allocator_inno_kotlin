@@ -3,6 +3,7 @@ package com.allocator.api
 import com.allocator.*
 import com.allocator.services.CaseLoader
 import com.allocator.services.getMethods
+import com.allocator.services.roundQty
 import com.allocator.services.runAllocation
 import com.allocator.services.runPlanning
 import com.opencsv.CSVReaderHeaderAware
@@ -365,7 +366,7 @@ fun Routing.allocateRoutes() {
         val treeJson = anyToJson(woNode)
         val finalTree = if (woQtySum > 0 && treeJson is JsonObject) {
             buildJsonObject {
-                treeJson.forEach { (k, v) -> if (k == "quantity") put("quantity", woQtySum) else put(k, v) }
+                treeJson.forEach { (k, v) -> if (k == "quantity") put("quantity", roundQty(woQtySum)) else put(k, v) }
             }
         } else treeJson
         call.respond(buildJsonObject { put("tree", finalTree) })
@@ -983,13 +984,13 @@ private fun planKpis(
             val key = "${wo["demand_id"]}|${wo["product_id"]}|${wo["location_id"]}|${wo["method"]}"
             seen[key] = (seen[key] ?: 0.0) + (wo["quantity"] as? Number ?: 0).toDouble()
         }
-        return mapOf("order_count" to seen.size, "total_quantity" to Math.round(seen.values.sum() * 10000).toDouble() / 10000.0)
+        return mapOf("order_count" to seen.size, "total_quantity" to roundQty(seen.values.sum()))
     }
 
     return mapOf(
         "delivery" to mapOf(
-            "total_requested" to Math.round(totalRequested * 10000).toDouble() / 10000.0,
-            "total_committed" to Math.round(totalCommitted * 10000).toDouble() / 10000.0,
+            "total_requested" to roundQty(totalRequested),
+            "total_committed" to roundQty(totalCommitted),
             "fill_rate_pct" to fillRatePct?.let { Math.round(it * 100).toDouble() / 100.0 },
             "demand_count" to demands.size,
             "on_time_count" to onTimeCount,
@@ -998,8 +999,8 @@ private fun planKpis(
             "fulfilled_by_inventory_only_count" to fulfilledByInventoryOnly,
         ),
         "inventory" to mapOf(
-            "initial_total" to Math.round(initialTotal * 10000).toDouble() / 10000.0,
-            "consumed_total" to Math.round(consumedTotal * 10000).toDouble() / 10000.0,
+            "initial_total" to roundQty(initialTotal),
+            "consumed_total" to roundQty(consumedTotal),
             "consumption_rate" to consumptionRate?.let { Math.round(it * 10000).toDouble() / 10000.0 },
         ),
         "procurement" to methodStats("purchase"),
@@ -1037,7 +1038,7 @@ private fun enrichCommittedDemands(
         val effectiveCommitted = effectiveCommittedByDemandId[id] ?: 0.0
         val shortage = maxOf(0.0, requested - effectiveCommitted)
         val failed = isFailureReason(row["commit_reason"] as? String)
-        row + mapOf("requested_qty" to requested, "shortage" to shortage, "is_failed" to failed)
+        row + mapOf("requested_qty" to roundQty(requested), "shortage" to roundQty(shortage), "is_failed" to failed)
     }
 }
 
@@ -1064,6 +1065,7 @@ private fun enrichPlanResultWithData(
     val kpis = planKpis(data, enriched, bomPairs)
     enriched["plan_kpis"] = kpis
     enriched["supply_summary"] = (kpis["inventory"] ?: emptyMap<String, Any?>())
+
     return enriched
 }
 

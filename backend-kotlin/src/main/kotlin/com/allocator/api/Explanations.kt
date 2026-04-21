@@ -3,6 +3,7 @@ package com.allocator.api
 import com.allocator.*
 import com.allocator.services.CaseLoader
 import com.allocator.services.TimeUtils
+import com.allocator.services.roundQty
 import io.ktor.server.application.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
@@ -76,7 +77,7 @@ fun Routing.explanationRoutes() {
             val items = buildJsonArray {
                 for ((did, qty) in demandQty) add(buildJsonObject {
                     put("demand_id", did)
-                    put("quantity", (Math.round(qty * 10000).toDouble() / 10000.0))
+                    put("quantity", roundQty(qty))
                     put("reason", "Proportional allocation by scarcity order; this supply was consumed by variant(s) serving this demand.")
                 })
             }
@@ -322,8 +323,8 @@ fun Routing.explanationRoutes() {
                         if (vk.isNotEmpty()) avail[vk] = (avail[vk] ?: 0.0) + a[AllocationActions.qty]
                         continue
                     }
-                    val availBefore = Math.round((avail[componentKey] ?: 0.0) * 10000).toDouble() / 10000.0
-                    val qty = Math.round(a[AllocationActions.qty] * 10000).toDouble() / 10000.0
+                    val availBefore = roundQty(avail[componentKey] ?: 0.0)
+                    val qty = roundQty(a[AllocationActions.qty])
                     val toKey = a[AllocationActions.variantKey] ?: ""
                     if (toVariantKey != null && toKey != toVariantKey) {
                         for (ck in reqKeys) avail[ck] = (avail[ck] ?: 0.0) - qty
@@ -344,8 +345,8 @@ fun Routing.explanationRoutes() {
                 R5(avail, sortedActs, totalAvail, availDuringRun, stepsList)
             }
 
-            val totalAvailRounded = Math.round(totalAvailable * 10000).toDouble() / 10000.0
-            val availDuringRounded = Math.round(availableDuringRun * 10000).toDouble() / 10000.0
+            val totalAvailRounded = roundQty(totalAvailable)
+            val availDuringRounded = roundQty(availableDuringRun)
 
             val reason = "Allocation is proportional to target weight (demand pressure). " +
                 "Components are processed in scarcity order (total quantity; scarcest = smallest). " +

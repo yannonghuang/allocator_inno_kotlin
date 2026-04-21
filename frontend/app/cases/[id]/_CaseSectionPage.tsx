@@ -190,7 +190,7 @@ export function PlanKpiDashboard({
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem' }}>
         {card(tK('delivery'), [
           { label: tK('fillRate'), value: d.fill_rate_pct != null ? `${Number(d.fill_rate_pct).toFixed(1)}%` : '–' },
-          { label: tK('committedRequested'), value: `${Number(d.total_committed ?? 0).toLocaleString()} / ${Number(d.total_requested ?? 0).toLocaleString()}` },
+          { label: tK('committedRequested'), value: `${qtyFmt(Number(d.total_committed ?? 0))} / ${qtyFmt(Number(d.total_requested ?? 0))}` },
           { label: tK('onTime'), value: `${d.on_time_count ?? 0} / ${d.demand_count ?? 0}` },
           (() => {
             const denom = d.fulfilled_with_tree_count ?? d.demand_count ?? 0;
@@ -215,20 +215,20 @@ export function PlanKpiDashboard({
         ], '#34d399')}
         {card(tK('inventory'), [
           { label: tK('consumptionRate'), value: inv.consumption_rate != null ? `${(Number(inv.consumption_rate) * 100).toFixed(1)}%` : '–' },
-          { label: tK('consumed'), value: Number(inv.consumed_total ?? 0).toLocaleString() },
-          { label: tK('initialSupply'), value: Number(inv.initial_total ?? 0).toLocaleString() },
+          { label: tK('consumed'), value: qtyFmt(Number(inv.consumed_total ?? 0)) },
+          { label: tK('initialSupply'), value: qtyFmt(Number(inv.initial_total ?? 0)) },
         ], '#a78bfa')}
         {card(tK('procurement'), [
           { label: tK('orders'), value: String(proc.order_count ?? 0) },
-          { label: tK('totalQuantity'), value: Number(proc.total_quantity ?? 0).toLocaleString() },
+          { label: tK('totalQuantity'), value: qtyFmt(Number(proc.total_quantity ?? 0)) },
         ], '#f59e0b')}
         {card(tK('manufacturing'), [
           { label: tK('orders'), value: String(mfg.order_count ?? 0) },
-          { label: tK('totalQuantity'), value: Number(mfg.total_quantity ?? 0).toLocaleString() },
+          { label: tK('totalQuantity'), value: qtyFmt(Number(mfg.total_quantity ?? 0)) },
         ], '#3b82f6')}
         {card(tK('logistics'), [
           { label: tK('orders'), value: String(log.order_count ?? 0) },
-          { label: tK('totalQuantity'), value: Number(log.total_quantity ?? 0).toLocaleString() },
+          { label: tK('totalQuantity'), value: qtyFmt(Number(log.total_quantity ?? 0)) },
         ], '#06b6d4')}
       </div>
     </div>
@@ -308,6 +308,7 @@ function formatCommitReason(reason: string, purchaseAllowed: boolean): { label: 
 }
 import { PeggingTree, pathKeyFromPath, type PeggingGraph } from '@/app/components/PeggingTree';
 import BomGraphTab from '@/app/components/BomGraphTab';
+import { qtyFmt } from '@/app/lib/format';
 
 // ── Assessment criteria helpers ────────────────────────────────────────────────
 
@@ -803,8 +804,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
 
   // ── Override dialog state ───────────────────────────────────────────────────
   const [overrideDialogOpen, setOverrideDialogOpen] = useState(false);
-  const [overrideDialogType, setOverrideDialogType] = useState<'method_selection' | 'variant_selection' | 'component_split' | null>(null);
+  const [overrideDialogType, setOverrideDialogType] = useState<'method_selection' | 'variant_selection' | 'component_split' | 'supply_split' | null>(null);
   const [overrideDialogWo, setOverrideDialogWo] = useState<WorkOrder | null>(null);
+  const [overrideDialogSupply, setOverrideDialogSupply] = useState<PlanSupplyViewRow | null>(null);
   const [overrideDialogSaving, setOverrideDialogSaving] = useState(false);
   const [overrideDialogError, setOverrideDialogError] = useState<string | null>(null);
   // Structured override form state (type-specific; avoids raw JSON editing)
@@ -816,6 +818,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     requested_qty: number;
     priority: number;
     parent_product: string;
+  }>>([]);
+  const [overrideSupplyRows, setOverrideSupplyRows] = useState<Array<{
+    demand_id: string;
+    qty: number;
+    requested_qty: number;
+    consumed_qty: number;
+    customer: string | null;
   }>>([]);
 
   // Panel resize state
@@ -1980,16 +1989,30 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return m;
   }, [planSupplyViewRows]);
 
+  const handleAnalyzeCriticalityForSupply = async (supplyId: string) => {
+    setSupplyCriticalityMap(prev => ({ ...prev, [supplyId]: 'running' }));
+    try {
+      const result = await analyzeMaterialImpact(supplyId, 0, 100, false);
+      setSupplyCriticalityMap(prev => ({ ...prev, [supplyId]: result.impactedDemandCount > 0 ? 'critical' : 'not_critical' }));
+    } catch {
+      setSupplyCriticalityMap(prev => ({ ...prev, [supplyId]: 'error' }));
+    }
+  };
+
   const handleAnalyzeCriticality = async () => {
     const all = planSupplyViewRows.filter(r => !r.supplyId.toLowerCase().endsWith('_dummy'));
     if (all.length === 0) return;
 
-    // Supplies with zero consumption are trivially safe — skip re-plan for them
-    const trivialSafe = all.filter(r => r.consumedQty === 0);
-    const needsAnalysis = all.filter(r => r.consumedQty > 0);
+    // Skip supplies that already have a status (critical / not_critical / error) —
+    // users can retry individual errors via the per-row Analyze button, or Reset to clear.
+    const pending = all.filter(r => !supplyCriticalityMap[r.supplyId]);
+    // Among pending, zero-consumption is trivially safe — skip re-plan for them
+    const trivialSafe = pending.filter(r => r.consumedQty === 0);
+    const needsAnalysis = pending.filter(r => r.consumedQty > 0);
+    const alreadyDone = all.length - pending.length;
 
     setCriticalityRunning(true);
-    setCriticalityProgress({ done: trivialSafe.length, total: all.length });
+    setCriticalityProgress({ done: alreadyDone + trivialSafe.length, total: all.length });
     setSupplyCriticalityMap(prev => {
       const next = { ...prev };
       for (const r of trivialSafe) next[r.supplyId] = 'not_critical';
@@ -1997,20 +2020,36 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       return next;
     });
 
-    const BATCH = 5;
-    let done = trivialSafe.length;
+    const BATCH = 3;
+    const total = all.length;
+    let done = alreadyDone + trivialSafe.length;
     for (let i = 0; i < needsAnalysis.length; i += BATCH) {
-      const batch = needsAnalysis.slice(i, i + BATCH);
-      await Promise.all(batch.map(async (r) => {
-        try {
-          const result = await analyzeMaterialImpact(r.supplyId, 0, 100, false);
-          setSupplyCriticalityMap(prev => ({ ...prev, [r.supplyId]: result.impactedDemandCount > 0 ? 'critical' : 'not_critical' }));
-        } catch {
-          setSupplyCriticalityMap(prev => ({ ...prev, [r.supplyId]: 'error' }));
-        }
-        done++;
-        setCriticalityProgress({ done, total: all.length });
-      }));
+      // Only keep (supplyId, status) — the MaterialImpactResult contains a large
+      // `impacts[]` array we don't need; destructuring immediately lets it be GC'd
+      // as soon as analyzeMaterialImpact's microtask settles.
+      const updates: Array<[string, 'critical' | 'not_critical' | 'error']> = [];
+      await Promise.all(
+        needsAnalysis.slice(i, i + BATCH).map(async (r) => {
+          const sid = r.supplyId;
+          try {
+            const { impactedDemandCount } = await analyzeMaterialImpact(sid, 0, 100, false);
+            updates.push([sid, impactedDemandCount > 0 ? 'critical' : 'not_critical']);
+          } catch {
+            updates.push([sid, 'error']);
+          }
+        })
+      );
+      // Single setState per batch instead of per result → O(N) clones instead of O(N²).
+      done += updates.length;
+      setSupplyCriticalityMap(prev => {
+        const next = { ...prev };
+        for (const [sid, status] of updates) next[sid] = status;
+        return next;
+      });
+      setCriticalityProgress({ done, total });
+      // Yield to the event loop so the browser can run idle GC + paint updates
+      // before we spin up the next batch of re-plans.
+      await new Promise(resolve => setTimeout(resolve, 0));
     }
     setCriticalityRunning(false);
   };
@@ -2271,45 +2310,86 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   };
 
   const handleSaveOverride = async () => {
-    if (!overrideDialogType || !overrideDialogWo) return;
+    if (!overrideDialogType) return;
+    // supply_split uses overrideDialogSupply, not overrideDialogWo
+    if (overrideDialogType !== 'supply_split' && !overrideDialogWo) return;
+    if (overrideDialogType === 'supply_split' && !overrideDialogSupply) return;
     setOverrideDialogSaving(true);
     setOverrideDialogError(null);
     try {
-      const productId = overrideDialogWo.product_id ?? '';
-      const locationId = overrideDialogWo.location_id ?? '';
-      const demandId = overrideDialogWo.demand_id ?? '';
-
       let payload: Record<string, unknown>;
-      if (overrideDialogType === 'method_selection') {
-        if (!overrideMethodValue.trim()) { setOverrideDialogError('Select a method'); setOverrideDialogSaving(false); return; }
-        payload = { method: overrideMethodValue.trim() };
-      } else if (overrideDialogType === 'variant_selection') {
-        if (!overrideVariantValue.trim()) { setOverrideDialogError('Enter an ALT_GROUP value'); setOverrideDialogSaving(false); return; }
-        payload = { alt_group: overrideVariantValue.trim() };
-      } else {
-        // component_split
-        const allocations = overrideSplitRows.map((r) => ({ demand_id: r.demand_id, qty: Number(r.qty) }));
-        payload = { allocations };
-      }
-
       let entityKey: string;
-      if (overrideDialogType === 'component_split') {
-        entityKey = overrideDialogWo.start_time
-          ? `${productId}|${locationId}|${overrideDialogWo.start_time.slice(0, 10)}`
-          : `${productId}|${locationId}`;
+
+      if (overrideDialogType === 'supply_split') {
+        const supply = overrideDialogSupply!;
+        const allocations = overrideSupplyRows
+          .filter((r) => Number(r.qty) > 0)
+          .map((r) => ({ demand_id: r.demand_id, qty: Number(r.qty) }));
+        payload = { allocations };
+        entityKey = supply.supplyId;
       } else {
-        entityKey = demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`;
+        const wo = overrideDialogWo!;
+        const productId = wo.product_id ?? '';
+        const locationId = wo.location_id ?? '';
+        const demandId = wo.demand_id ?? '';
+
+        if (overrideDialogType === 'method_selection') {
+          if (!overrideMethodValue.trim()) { setOverrideDialogError('Select a method'); setOverrideDialogSaving(false); return; }
+          payload = { method: overrideMethodValue.trim() };
+          entityKey = demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`;
+        } else if (overrideDialogType === 'variant_selection') {
+          if (!overrideVariantValue.trim()) { setOverrideDialogError('Enter an ALT_GROUP value'); setOverrideDialogSaving(false); return; }
+          payload = { alt_group: overrideVariantValue.trim() };
+          entityKey = demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`;
+        } else {
+          // component_split
+          const allocations = overrideSplitRows.map((r) => ({ demand_id: r.demand_id, qty: Number(r.qty) }));
+          payload = { allocations };
+          entityKey = wo.start_time
+            ? `${productId}|${locationId}|${wo.start_time.slice(0, 10)}`
+            : `${productId}|${locationId}`;
+        }
       }
       await upsertOverride(id, overrideDialogType, entityKey, payload);
       await loadOverrides();
       setOverrideDialogOpen(false);
       setOverrideDialogWo(null);
+      setOverrideDialogSupply(null);
       setOverrideDialogType(null);
     } catch (e) {
       setOverrideDialogError(e instanceof Error ? e.message : 'Failed to save override');
     } finally {
       setOverrideDialogSaving(false);
     }
+  };
+
+  const openSupplyOverrideDialog = (supply: PlanSupplyViewRow) => {
+    setOverrideDialogType('supply_split');
+    setOverrideDialogSupply(supply);
+    setOverrideDialogWo(null);
+    setOverrideDialogError(null);
+    // Pre-populate: one row per pegged demand, qty = current consumed_qty
+    const existing = overrides.find(
+      (o) => o.entity_type === 'supply_split' && o.entity_key === supply.supplyId
+    );
+    const savedAllocs = existing
+      ? (((existing.payload as Record<string, unknown>).allocations as Array<{ demand_id: string; qty: number }> | undefined) ?? [])
+      : [];
+    const byDemand = new Map<string, number>();
+    for (const a of savedAllocs) byDemand.set(a.demand_id, Number(a.qty));
+
+    const rows = supply.peggedDemands.map((d) => {
+      const requested = feasibleDemands?.find((fd) => fd.demand_id === d.demandId)?.requested_qty ?? 0;
+      return {
+        demand_id: d.demandId,
+        qty: byDemand.has(d.demandId) ? byDemand.get(d.demandId)! : d.qtyConsumed,
+        requested_qty: requested,
+        consumed_qty: d.qtyConsumed,
+        customer: d.customer,
+      };
+    });
+    setOverrideSupplyRows(rows);
+    setOverrideDialogOpen(true);
   };
 
   // ── Assessment handlers ─────────────────────────────────────────────────────
@@ -2374,8 +2454,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         {allocating && allocationProgress != null && (
           <div style={{ marginTop: '0.75rem', maxWidth: 420 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.875rem', marginBottom: '0.25rem', color: '#64748b' }}>
-              <span>{tA('progress.steps')} {(allocationProgress.steps ?? 0).toLocaleString()} / {(allocationProgress.max_steps ?? 0).toLocaleString()}</span>
-              <span>{tA('progress.basket')} {allocationProgress.basket_keys ?? 0} {tA('progress.items')}, {(Number(allocationProgress.basket_total_qty) ?? 0).toLocaleString()} {tA('progress.qty')}</span>
+              <span>{tA('progress.steps')} {qtyFmt(allocationProgress.steps ?? 0)} / {qtyFmt(allocationProgress.max_steps ?? 0)}</span>
+              <span>{tA('progress.basket')} {allocationProgress.basket_keys ?? 0} {tA('progress.items')}, {qtyFmt(Number(allocationProgress.basket_total_qty) ?? 0)} {tA('progress.qty')}</span>
             </div>
             <div style={{ height: 8, backgroundColor: '#e2e8f0', borderRadius: 4, overflow: 'hidden' }}>
               <div
@@ -2473,7 +2553,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   const overallUtil = totalInitial > 0 ? (totalConsumed / totalInitial) * 100 : 0;
                   return (
                     <p style={{ fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
-                      Overall utilization: <strong>{totalConsumed.toLocaleString()}</strong> / <strong>{totalInitial.toLocaleString()}</strong> initial = <strong>{overallUtil.toFixed(1)}%</strong>
+                      Overall utilization: <strong>{qtyFmt(totalConsumed)}</strong> / <strong>{qtyFmt(totalInitial)}</strong> initial = <strong>{overallUtil.toFixed(1)}%</strong>
                     </p>
                   );
                 })()}
@@ -2500,7 +2580,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   { key: 'product_id', label: 'Product', sortable: true },
                   { key: 'location_id', label: 'Location', sortable: true },
                   { key: 'initial_qty', label: 'Initial qty', sortable: true },
-                  { key: 'product_total', label: 'Total per product', sortable: true, render: (r) => r.product_total > 0 ? r.product_total.toLocaleString() : '–' },
+                  { key: 'product_total', label: 'Total per product', sortable: true, render: (r) => r.product_total > 0 ? qtyFmt(r.product_total) : '–' },
                   { key: 'consumed_qty', label: 'Consumed qty', sortable: true },
                   { key: 'residual_qty', label: 'Residual qty', sortable: true },
                   { key: 'utilization_rate', label: 'Utilization', sortable: true, render: (r) => r.utilization_rate != null ? `${(Number(r.utilization_rate) * 100).toFixed(1)}%` : '–' },
@@ -2525,7 +2605,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 {allocationViewError && (allocationActions.length > 0 || allocationActionsLoading) && (
                   <>
                     <p style={{ fontSize: '0.875rem', color: '#71717a', marginBottom: '0.5rem' }}>
-                      Showing raw allocation steps (lightweight, paginated). {allocationActionsTotal > 0 && `Total: ${allocationActionsTotal.toLocaleString()} steps.`}
+                      Showing raw allocation steps (lightweight, paginated). {allocationActionsTotal > 0 && `Total: ${qtyFmt(allocationActionsTotal)} steps.`}
                     </p>
                     {allocationActionsLoading && allocationActions.length === 0 && <p style={{ color: '#71717a' }}>Loading raw steps…</p>}
                     {allocationActions.length > 0 && (
@@ -2549,7 +2629,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             Previous
                           </button>
                           <span style={{ fontSize: '0.875rem', color: '#71717a' }}>
-                            {allocationActionsOffset + 1}–{allocationActionsOffset + allocationActions.length} of {allocationActionsTotal.toLocaleString()}
+                            {allocationActionsOffset + 1}–{allocationActionsOffset + allocationActions.length} of {qtyFmt(allocationActionsTotal)}
                           </span>
                           <button
                             type="button"
@@ -2594,8 +2674,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <>
                 {allocationViewTruncated && (
                   <p style={{ fontSize: '0.875rem', color: '#b45309', marginBottom: '0.5rem', fontWeight: 600 }}>
-                    Showing {allocationView.length.toLocaleString()} of {allocationViewTruncated.total_steps.toLocaleString()} rows
-                    {allocationViewTruncated.total_actions > allocationViewTruncated.limit && ` (${allocationViewTruncated.total_actions.toLocaleString()} steps)`}.
+                    Showing {qtyFmt(allocationView.length)} of {qtyFmt(allocationViewTruncated.total_steps)} rows
+                    {allocationViewTruncated.total_actions > allocationViewTruncated.limit && ` (${qtyFmt(allocationViewTruncated.total_actions)} steps)`}.
                     {' '}
                     {selectedRunId && allocationView.length < allocationViewTruncated.total_steps && (
                       <button
@@ -2630,12 +2710,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 )}
                 {allocating && allocationProgress != null && (
                   <p style={{ fontSize: '0.875rem', color: '#64748b', marginBottom: '0.5rem' }}>
-                    Run progress: <strong>{(allocationProgress.steps ?? 0).toLocaleString()} steps</strong>, basket <strong>{allocationProgress.basket_keys ?? 0} items</strong>. Table is ordered by scarcity; each row’s basket is after the step in <strong>After step</strong> (view may show fewer steps until it refreshes).
+                    Run progress: <strong>{qtyFmt(allocationProgress.steps ?? 0)} steps</strong>, basket <strong>{allocationProgress.basket_keys ?? 0} items</strong>. Table is ordered by scarcity; each row’s basket is after the step in <strong>After step</strong> (view may show fewer steps until it refreshes).
                   </p>
                 )}
                 {(basketDeltas.length > 0 || allocationView.length > 0) && (
                   <p style={{ fontSize: '0.875rem', color: '#64748b', marginBottom: '0.5rem' }}>
-                    View has data through step <strong>{(basketDeltas.length || allocationView.length).toLocaleString()}</strong>
+                    View has data through step <strong>{qtyFmt(basketDeltas.length || allocationView.length)}</strong>
                     {allocationViewTruncated && allocationView.length < allocationViewTruncated.total_steps ? (
                       <> (first chunk loaded; use Load more for rest).</>
                     ) : (
@@ -2643,7 +2723,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     )}{' '}
                     {basketDeltas.length > 0 ? (
                       <>
-                        Basket after last loaded step: <strong>{(basketFinal?.length ?? computeBasketAfterStep(basketDeltas.length - 1).length).toLocaleString()} items</strong>
+                        Basket after last loaded step: <strong>{qtyFmt(basketFinal?.length ?? computeBasketAfterStep(basketDeltas.length - 1).length)} items</strong>
                         {basketFinal != null && (
                           <>
                             {' '}
@@ -2807,7 +2887,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               >
                                 <div style={{ fontSize: '0.75rem', color: '#71717a', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{pattern}</div>
                                 <div style={{ fontSize: '1.25rem', fontWeight: 600, color: '#fafafa' }}>
-                                  {Number(s.total_consumed_qty).toLocaleString()}
+                                  {qtyFmt(Number(s.total_consumed_qty))}
                                 </div>
                                 <div style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>{s.node_count} node(s) consumed</div>
                               </div>
@@ -2824,7 +2904,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             { key: 'product_id', label: 'Product', sortable: true },
                             { key: 'location_id', label: 'Location', sortable: true },
                             { key: 'node', label: 'Node', sortable: true },
-                            { key: 'consumed_qty', label: 'Consumed qty', sortable: true, render: (r) => Number(r.consumed_qty).toLocaleString() },
+                            { key: 'consumed_qty', label: 'Consumed qty', sortable: true, render: (r) => qtyFmt(Number(r.consumed_qty)) },
                           ]}
                         />
                       </>
@@ -2916,7 +2996,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   return (
                     <>
                       <p style={{ fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
-                        Overall fulfillment: <strong>{totalAllocated.toLocaleString()}</strong> / <strong>{totalRequested.toLocaleString()}</strong> requested = <strong>{overallRate.toFixed(1)}%</strong>
+                        Overall fulfillment: <strong>{qtyFmt(totalAllocated)}</strong> / <strong>{qtyFmt(totalRequested)}</strong> requested = <strong>{overallRate.toFixed(1)}%</strong>
                       </p>
                       {Object.keys(byCustomer).length > 1 && (
                         <details style={{ fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
@@ -2926,7 +3006,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               const rate = requested > 0 ? (allocated / requested) * 100 : 0;
                               return (
                                 <li key={cust}>
-                                  <strong>{cust}</strong>: {allocated.toLocaleString()} / {requested.toLocaleString()} = {rate.toFixed(1)}%
+                                  <strong>{cust}</strong>: {qtyFmt(allocated)} / {qtyFmt(requested)} = {rate.toFixed(1)}%
                                 </li>
                               );
                             })}
@@ -3293,7 +3373,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 className={planResultTab === 'supplies' ? '' : 'secondary'}
                 onClick={() => setPlanResultTab('supplies')}
               >
-                {tP('tabs.supplies', { count: planSupplyViewRows.length.toLocaleString() })}
+                {tP('tabs.supplies', { count: qtyFmt(planSupplyViewRows.length) })}
               </button>
             </div>
             <div style={{ border: '1px solid #3d3d40', borderRadius: 6 }}>
@@ -3515,7 +3595,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             <summary style={{ cursor: 'pointer' }}>Rollup by customer (filtered set)</summary>
                             <ul style={{ marginTop: '0.25rem', paddingLeft: '1.25rem' }}>
                               {Object.entries(byCustomer).map(([cust, qty]) => (
-                                <li key={cust}><strong>{cust}</strong>: {Number(qty).toLocaleString()} committed</li>
+                                <li key={cust}><strong>{cust}</strong>: {qtyFmt(Number(qty))} committed</li>
                               ))}
                             </ul>
                           </details>
@@ -3542,14 +3622,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             { key: '_customer', label: 'Customer', sortable: true, render: (r) => (r as { _customer?: string })._customer || (r.customer ?? r.customer_id ?? '–') },
                             { key: 'product_id', label: 'Product', sortable: true },
                             { key: 'location_id', label: 'Location', sortable: true },
-                            { key: 'requested_qty', label: 'Requested', sortable: true, render: (r) => r.requested_qty != null ? Number(r.requested_qty).toLocaleString() : '–' },
+                            { key: 'requested_qty', label: 'Requested', sortable: true, render: (r) => r.requested_qty != null ? qtyFmt(Number(r.requested_qty)) : '–' },
                             { key: 'quantity', label: 'Committed', sortable: true, render: (r) => r.is_failed
                               ? <span style={{ color: '#f87171', fontWeight: 600, fontSize: '0.78rem', background: 'rgba(248,113,113,0.15)', padding: '1px 6px', borderRadius: 4 }}>FAILED</span>
-                              : String(r.quantity) },
+                              : qtyFmt(Number(r.quantity)) },
                             { key: 'shortage', label: 'Shortage', sortable: true, render: (r) => {
                               const s = r.shortage ?? 0;
                               return s > 0.01
-                                ? <span style={{ color: '#f87171', fontWeight: 600 }}>{Number(s).toLocaleString()}</span>
+                                ? <span style={{ color: '#f87171', fontWeight: 600 }}>{qtyFmt(Number(s))}</span>
                                 : <span style={{ color: '#4ade80' }}>0</span>;
                             }},
                             { key: 'request_time', label: 'Request time', sortable: true, render: (r) => r.request_time ?? '–' },
@@ -3720,7 +3800,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         <summary style={{ cursor: 'pointer' }}>Rollup by PROD_AREA</summary>
                         <ul style={{ marginTop: '0.25rem', paddingLeft: '1.25rem' }}>
                           {Object.entries(byProdArea).map(([area, qty]) => (
-                            <li key={area}><strong>{area}</strong>: {Number(qty).toLocaleString()} quantity</li>
+                            <li key={area}><strong>{area}</strong>: {qtyFmt(Number(qty))} quantity</li>
                           ))}
                         </ul>
                       </details>
@@ -3733,12 +3813,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     // Compute the supply-backing map early so it can drive the phantom filter below
                     // and also be used by the WO expand panel later in this block.
                     const { suppliesMap: woSuppliesMap, crossEntrySupplyMap: woCrossEntrySupplyMap, peggedQtyMap: woPeggedQtyMap } = buildWoMaps(planResult.planning_pegging ?? []);
-                    // Build set of demand IDs with shortage > 0 for short-supply filter
-                    const shortDemandIds = planDemandShortOnly
-                      ? new Set(planResult.committed_demands.filter((d) => (d.shortage ?? 0) > 0.01).map((d) => d.demand_id ?? ''))
-                      : null;
+                    // Short-supply filter is WO-level and applied after enrichment (see below),
+                    // since WO-level shortage is computed from the enriched Requested/Committed.
                     // Filters refer to work-order pegging (each WO's supplies subtree), not demand pegging.
-                    const anyPeggingFilter = planDemandRealMakeOnly || planDemandBuyOnly || planDemandRealMoveOnly || planWoDemandedByMultiple || planWoMultiSupply || planWoPurchaseOnly || planWoMoveOnly || planDemandShortOnly || planWoHasOverride;
+                    const anyPeggingFilter = planDemandRealMakeOnly || planDemandBuyOnly || planDemandRealMoveOnly || planWoDemandedByMultiple || planWoMultiSupply || planWoPurchaseOnly || planWoMoveOnly || planWoHasOverride;
                     if (anyPeggingFilter) {
                       workOrderRows = workOrderRows.filter((r) => {
                         if (planDemandRealMakeOnly && !(r.pegging_includes_real_make === true)) return false;
@@ -3748,11 +3826,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         if (planWoMultiSupply && !(r.multi_supply_available === true)) return false;
                         if (planWoPurchaseOnly) { const m = (r.method ?? '').toLowerCase(); if (m !== 'buy' && m !== 'purchase') return false; }
                         if (planWoMoveOnly && (r.method ?? '').toLowerCase() !== 'move') return false;
-                        if (shortDemandIds) {
-                          const matchesDirect = shortDemandIds.has(r.demand_id ?? '');
-                          const matchesConsolidated = !r.demand_id && (r.wo_consolidation_split_details ?? []).some((d) => shortDemandIds.has(d.demand_id ?? ''));
-                          if (!matchesDirect && !matchesConsolidated) return false;
-                        }
                         if (planWoHasOverride && !woHasSavedOverride(r)) return false;
                         return true;
                       });
@@ -3826,7 +3899,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       if (!demandLabelMap.has(id)) demandLabelMap.set(id, d.product_id);
                     }
                     const dummyHiddenCount = planResult.work_orders.filter((r) => (r.prod_area ?? '').trim().toLowerCase() === 'dummy').length;
-                    const woRows: WoEnrichedRow[] = groupedRows.map((r, i) => {
+                    const woRowsAll: WoEnrichedRow[] = groupedRows.map((r, i) => {
                       const splitDemandIds = (r.wo_consolidation_split_details ?? [])
                         .map((d) => d.demand_id)
                         .filter((d): d is string => d != null && d !== '');
@@ -3835,25 +3908,40 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         : splitDemandIds.length > 0
                           ? splitDemandIds.join(', ')
                           : undefined;
-                      // Requested = the demand node directly above this WO in the pegging tree
-                      // (component demand qty for component WOs, FG demand qty for top-level WOs).
-                      // Falls back to the committed_demand requested_qty when pegging data is absent.
+                      // Requested = what this WO was planned to produce.
+                      //   shared/consolidated (split_details > 1) → equals Committed
+                      //     (r.quantity). Per-demand `allocated_qty` in split_details is
+                      //     in parent-product units and does not reconcile with the
+                      //     component/variant-level r.quantity after BOM-rate scaling and
+                      //     lot aggregation — using it produces "Committed > Requested"
+                      //     display artifacts. WO-level shortage is always 0 here; any
+                      //     demand shortage is visible in the committed_demands table.
+                      //   single → the demand node directly above this WO in the pegging tree.
+                      //   no peg data → fall back to committed_demand requested_qty.
+                      const isSharedConsolidated = (r.wo_consolidation_split_details?.length ?? 0) > 1;
                       const woKeyFull = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
                       const woKeyConsolidated = `|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
                       const peggedQty = woPeggedQtyMap.get(woKeyFull) ?? woPeggedQtyMap.get(woKeyConsolidated) ?? null;
-                      const demandRequested = peggedQty != null
-                        ? peggedQty
+                      const demandRequested = isSharedConsolidated
+                        ? (Number(r.quantity) || 0)
+                        : peggedQty != null
+                          ? peggedQty
+                          : r.demand_id
+                            ? (demandRequestedMap.get(r.demand_id) ?? undefined)
+                            : splitDemandIds.reduce((s, did) => s + (demandRequestedMap.get(did) ?? 0), 0) || undefined;
+                      // For shared WOs, allocated_qty already reflects post-inventory
+                      // allocation — no further inventory subtraction needed. For
+                      // non-shared WOs, subtract the demand's inventory fulfillment so
+                      // Requested reflects only what was expected from this WO.
+                      const inventoryFulfilled = isSharedConsolidated
+                        ? 0
                         : r.demand_id
-                          ? (demandRequestedMap.get(r.demand_id) ?? undefined)
-                          : splitDemandIds.reduce((s, did) => s + (demandRequestedMap.get(did) ?? 0), 0) || undefined;
-                      const inventoryFulfilled = r.demand_id
-                        ? (demandInventoryMap.get(r.demand_id) ?? 0)
-                        : splitDemandIds.reduce((s, did) => s + (demandInventoryMap.get(did) ?? 0), 0);
+                          ? (demandInventoryMap.get(r.demand_id) ?? 0)
+                          : splitDemandIds.reduce((s, did) => s + (demandInventoryMap.get(did) ?? 0), 0);
                       const requested = demandRequested != null ? Math.max(0, demandRequested - inventoryFulfilled) : undefined;
-                      // Shortage = demand-level shortage (accounts for both inventory + WO fulfillment)
-                      const shortage = r.demand_id
-                        ? (demandShortageMap.get(r.demand_id) ?? 0)
-                        : splitDemandIds.reduce((s, did) => s + (demandShortageMap.get(did) ?? 0), 0);
+                      // WO-level shortage = WO's own requested minus its committed output.
+                      const committedQty = Number(r.quantity) || 0;
+                      const shortage = requested != null ? Math.max(0, requested - committedQty) : 0;
                       return {
                         ...r,
                         _key: `wo-${i}-${r.product_id}-${r.location_id}`,
@@ -3865,14 +3953,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         _shortage: shortage > 0 ? shortage : undefined,
                       };
                     });
+                    const woRows: WoEnrichedRow[] = planDemandShortOnly
+                      ? woRowsAll.filter((r) => (r._shortage ?? 0) > 0.01)
+                      : woRowsAll;
                     const woColumns: { key: string; label: string; sortable?: boolean; render?: (r: WoEnrichedRow) => React.ReactNode }[] = [
                       { key: 'product_id', label: 'Product', sortable: true },
                       { key: 'location_id', label: 'Location', sortable: true },
                       { key: '_prod_area', label: 'PROD_AREA', sortable: true, render: (r) => r._prod_area || r.prod_area || '–' },
                       { key: '_requested_qty', label: 'Requested', sortable: true, render: (r) =>
-                        r._requested_qty != null ? Number(r._requested_qty).toLocaleString() : '–'
+                        r._requested_qty != null ? qtyFmt(Number(r._requested_qty)) : '–'
                       },
-                      { key: 'quantity', label: 'Committed', sortable: true, render: (r) => Number(r.quantity).toLocaleString() },
+                      { key: 'quantity', label: 'Committed', sortable: true, render: (r) => qtyFmt(Number(r.quantity)) },
                       { key: 'start_time', label: 'Start time', sortable: true, render: (r) => r.start_time ?? '–' },
                       { key: 'end_time', label: 'End time', sortable: true, render: (r) => r.end_time ?? '–' },
                       { key: 'method', label: 'Method', sortable: true, render: (r) => (
@@ -3908,7 +3999,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       { key: '_shortage', label: 'Shortage', sortable: true, render: (r) => {
                         const s = r._shortage;
                         if (!s) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
-                        return <span style={{ color: '#f87171' }}>{Number(s).toLocaleString()}</span>;
+                        return <span style={{ color: '#f87171' }}>{qtyFmt(Number(s))}</span>;
                       } },
                       { key: 'location_source', label: 'Location source', sortable: true, render: (r) => r.location_source ?? '–' },
                       { key: '_peg_order', label: 'Pegging', sortable: true, render: (r) => {
@@ -3959,9 +4050,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       }},
                     ];
                     // ── Demand-pivot column set ──
-                    // • Drop _requested_qty, _shortage, _demand_label: those are demand-level numbers
-                    //   already shown in the group header; displaying them per WO row creates false
-                    //   comparisons when the WO is for a sub-component at a different BOM level.
+                    // • Drop _requested_qty, _shortage, _demand_label: the group header already
+                    //   shows demand-level totals, and per-WO Requested/Shortage (WO-scoped) would
+                    //   duplicate or compete with the header instead of adding signal.
                     // • Override product_id / quantity / method to handle synthetic inventory rows.
                     const woDemandColumns = woColumns
                       .filter((col) => !['_requested_qty', '_shortage', '_demand_label'].includes(col.key as string))
@@ -3977,10 +4068,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           ...col,
                           label: 'Alloc Qty',
                           render: (r: WoEnrichedRow) => {
-                            if (r._is_inventory) return <span style={{ color: '#16a34a' }}>{Number(r._split_qty ?? r.quantity).toLocaleString()}</span>;
+                            if (r._is_inventory) return <span style={{ color: '#16a34a' }}>{qtyFmt(Number(r._split_qty ?? r.quantity))}</span>;
                             return (
                               <span>
-                                {Number(r._split_qty ?? r.quantity).toLocaleString()}
+                                {qtyFmt(Number(r._split_qty ?? r.quantity))}
                                 {r._is_shared && <span style={{ marginLeft: 5, background: '#0891b2', color: '#fff', borderRadius: 8, padding: '1px 5px', fontSize: '0.7rem', verticalAlign: 'middle' }}>split</span>}
                               </span>
                             );
@@ -4028,7 +4119,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       >
                         <td style={{ color: '#3b82f6', fontSize: '0.85rem', userSelect: 'none', paddingLeft: indent > 0 ? `${indent * 1.5 + 0.5}rem` : undefined }}>{expanded ? '▼' : '▶'}</td>
                         <td style={{ fontWeight: indent === 0 ? 600 : 400, paddingLeft: indent > 0 ? `${indent * 0.5}rem` : undefined }}>{group._pivot_key}</td>
-                        <td style={{ textAlign: 'right' }}>{group.qty_total.toLocaleString()}</td>
+                        <td style={{ textAlign: 'right' }}>{qtyFmt(group.qty_total)}</td>
                         <td style={{ textAlign: 'right', color: '#a1a1aa' }}>{group.wo_count}</td>
                         <td style={{ textAlign: 'right', color: '#a1a1aa' }}>{group.product_count}</td>
                         <td style={{ textAlign: 'right', color: '#a1a1aa' }}>{group.demand_count}</td>
@@ -4040,9 +4131,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     return (
                       <>
                         <p style={{ fontSize: '0.8rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
-                          Showing {groupedRows.length.toLocaleString()} work order{groupedRows.length !== 1 ? 's' : ''}
+                          Showing {qtyFmt(groupedRows.length)} work order{groupedRows.length !== 1 ? 's' : ''}
                           {planWorkOrderHideDummyProdArea && dummyHiddenCount > 0
-                            ? ` (${dummyHiddenCount.toLocaleString()} with PROD_AREA = dummy hidden)`
+                            ? ` (${qtyFmt(dummyHiddenCount)} with PROD_AREA = dummy hidden)`
                             : ''}
                           {anyPeggingFilter ? ' (filtered by work-order pegging: real make / buy / real move).' : ''}
                         </p>
@@ -4136,11 +4227,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                     <span style={{ color: '#3b82f6', fontSize: '0.85rem' }}>{expanded ? '▼' : '▶'}</span>
                                     <span style={{ fontWeight: 600, fontSize: '0.9rem' }}>{group.label}</span>
                                     <span style={{ color: '#a1a1aa', fontSize: '0.8rem' }}>
-                                      Demand: {Number(group.demand_qty).toLocaleString()}
-                                      {' · '}Requested: {Number(group.requested_qty).toLocaleString()}
+                                      Demand: {qtyFmt(Number(group.demand_qty))}
+                                      {' · '}Requested: {qtyFmt(Number(group.requested_qty))}
                                       {group.shortage > 0 && (
                                         <span style={{ marginLeft: 6, color: '#f87171' }}>
-                                          Shortage: {Number(group.shortage).toLocaleString()}
+                                          Shortage: {qtyFmt(Number(group.shortage))}
                                         </span>
                                       )}
                                     </span>
@@ -4167,7 +4258,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                         {/* Inventory fulfillment summary row */}
                                         {invRows.length > 0 && (
                                           <div style={{ padding: '0.3rem 0.75rem', background: 'rgba(34,197,94,0.06)', borderBottom: '1px solid #3f3f46', fontSize: '0.78rem', color: '#16a34a', fontStyle: 'italic' }}>
-                                            Inventory: {invRows.reduce((s, r) => s + (r._split_qty ?? r.quantity), 0).toLocaleString()} units pre-fulfilled from stock
+                                            Inventory: {qtyFmt(invRows.reduce((s, r) => s + (r._split_qty ?? r.quantity), 0))} units pre-fulfilled from stock
                                           </div>
                                         )}
                                         {productGroups.map(([pid, pidRows], gi) => {
@@ -4190,7 +4281,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                                   <span style={{ fontSize: '0.75rem', color: '#a1a1aa' }}>{pid}</span>
                                                   {isOr && (
                                                     <span style={{ fontSize: '0.65rem', padding: '1px 5px', borderRadius: 8, background: 'rgba(245,158,11,0.15)', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.3)' }}>
-                                                      OR · {pidRows.length} paths · {pidRows.reduce((s, r) => s + (r._split_qty ?? r.quantity), 0).toLocaleString()} total
+                                                      OR · {pidRows.length} paths · {qtyFmt(pidRows.reduce((s, r) => s + (r._split_qty ?? r.quantity), 0))} total
                                                     </span>
                                                   )}
                                                   {isSequential && (
@@ -4259,7 +4350,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                   {directSupplies.length > 0 && (
                                     <div style={{ marginBottom: woSupplies.length > 0 ? '0.5rem' : 0 }}>
                                       <div style={{ fontSize: '0.7rem', color: '#16a34a', marginBottom: '0.2rem', fontWeight: 500 }}>
-                                        From supply ({Number(directSupplies.reduce((s, n) => s + (n.quantity ?? 0), 0)).toLocaleString()} units pre-filled from inventory)
+                                        From supply ({qtyFmt(Number(directSupplies.reduce((s, n) => s + (n.quantity ?? 0), 0)))} units pre-filled from inventory)
                                       </div>
                                       <table style={{ fontSize: '0.78rem', borderCollapse: 'collapse', width: '100%' }}>
                                         <thead>
@@ -4278,7 +4369,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                               </td>
                                               <td style={{ ...cellP, fontFamily: 'monospace', fontSize: '0.72rem', color: '#71717a' }}>{s.supply_id ?? '–'}</td>
                                               <td style={{ ...cellP, color: '#a3a3a3' }}>{s.location_id ?? '–'}</td>
-                                              <td style={{ textAlign: 'right', paddingRight: '1.25rem' }}>{Number(s.quantity ?? 0).toLocaleString()}</td>
+                                              <td style={{ textAlign: 'right', paddingRight: '1.25rem' }}>{qtyFmt(Number(s.quantity ?? 0))}</td>
                                             </tr>
                                           ))}
                                         </tbody>
@@ -4290,7 +4381,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                     <div>
                                       {isMakeExpand && (
                                         <div style={{ fontSize: '0.7rem', color: '#60a5fa', marginBottom: '0.2rem', fontWeight: 500 }}>
-                                          Produced by this work order ({Number(r.quantity).toLocaleString()} units — components consumed)
+                                          Produced by this work order ({qtyFmt(Number(r.quantity))} units — components consumed)
                                         </div>
                                       )}
                                       <table style={{ fontSize: '0.78rem', borderCollapse: 'collapse', width: '100%' }}>
@@ -4318,7 +4409,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                             <tr key={si} style={supplyRowStyle}>
                                               <td style={{ ...cellP, fontFamily: 'monospace', fontSize: '0.72rem' }}>{comp.product_id ?? '–'}</td>
                                               <td style={{ ...cellP, color: '#a3a3a3' }}>{comp.location_id ?? '–'}</td>
-                                              <td style={{ textAlign: 'right', paddingRight: '1.25rem' }}>{Number(comp.quantity ?? 0).toLocaleString()}</td>
+                                              <td style={{ textAlign: 'right', paddingRight: '1.25rem' }}>{qtyFmt(Number(comp.quantity ?? 0))}</td>
                                               <td style={{ ...cellP, color: '#a3a3a3', fontSize: '0.72rem' }}>{comp.commit_reason ?? ''}</td>
                                             </tr>
                                           )) : woSupplies.map((s, si) => (
@@ -4333,7 +4424,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                               </td>
                                               <td style={{ ...cellP, fontFamily: 'monospace', fontSize: '0.72rem', color: '#71717a' }}>{s.supply_id ?? '–'}</td>
                                               <td style={{ ...cellP, color: '#a3a3a3' }}>{s.location_id ?? '–'}</td>
-                                              <td style={{ textAlign: 'right', paddingRight: '1.25rem' }}>{Number(s.quantity ?? 0).toLocaleString()}</td>
+                                              <td style={{ textAlign: 'right', paddingRight: '1.25rem' }}>{qtyFmt(Number(s.quantity ?? 0))}</td>
                                             </tr>
                                           ))}
                                         </tbody>
@@ -4490,16 +4581,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     return (
                       <>
                         <p style={{ fontSize: '0.8rem', color: '#a1a1aa', marginBottom: '0.5rem', marginTop: 0 }}>
-                          {tP('supplyView.showing', { shown: rows.length.toLocaleString(), total: planSupplyViewRows.length.toLocaleString() })}
+                          {tP('supplyView.showing', { shown: qtyFmt(rows.length), total: qtyFmt(planSupplyViewRows.length) })}
                           {overallUtil != null && (
-                            <span> {tP('supplyView.overallUtilization', { pct: overallUtil, consumed: Number(totalConsumed).toLocaleString(), initial: Number(totalInitial).toLocaleString() })}</span>
+                            <span> {tP('supplyView.overallUtilization', { pct: overallUtil, consumed: qtyFmt(Number(totalConsumed)), initial: qtyFmt(Number(totalInitial)) })}</span>
                           )}
                         </p>
                         <SortFilterTable<PlanSupplyViewRow & { _key: string; productTotal: number; criticalityOrder: number }>
                           idKey="_key"
                           rows={rows.map((r, i) => {
                             const cs = supplyCriticalityMap[r.supplyId];
-                            const criticalityOrder = cs === 'critical' ? 0 : cs === 'not_critical' ? 1 : cs === 'error' ? 2 : cs === 'running' ? 3 : 4;
+                            const autoSafe = !cs && r.consumedQty === 0;
+                            const criticalityOrder = cs === 'critical' ? 0 : (cs === 'not_critical' || autoSafe) ? 1 : cs === 'error' ? 2 : cs === 'running' ? 3 : 4;
                             return { ...r, _key: `psv-${i}-${r.supplyId}`, productTotal: planSupplyProductTotalMap[r.productId] ?? 0, criticalityOrder };
                           })}
                           filterKeys={[]}
@@ -4507,21 +4599,32 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           columns={[
                             { key: 'criticalityOrder', label: 'Criticality', sortable: true, render: (r) => {
                               const cs = supplyCriticalityMap[r.supplyId];
-                              if (!cs) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
                               if (cs === 'running') return <span style={{ color: '#a1a1aa', fontSize: '0.75rem' }}>…</span>;
                               if (cs === 'error') return <span style={{ color: '#f59e0b', fontSize: '0.72rem' }}>err</span>;
                               if (cs === 'critical') return <span style={{ background: 'rgba(248,113,113,0.15)', color: '#f87171', border: '1px solid rgba(248,113,113,0.4)', borderRadius: 8, padding: '1px 8px', fontSize: '0.72rem', fontWeight: 700 }}>Critical</span>;
-                              return <span style={{ background: 'rgba(52,211,153,0.12)', color: '#34d399', border: '1px solid rgba(52,211,153,0.35)', borderRadius: 8, padding: '1px 8px', fontSize: '0.72rem', fontWeight: 700 }}>Safe</span>;
+                              if (cs === 'not_critical') return <span style={{ background: 'rgba(52,211,153,0.12)', color: '#34d399', border: '1px solid rgba(52,211,153,0.35)', borderRadius: 8, padding: '1px 8px', fontSize: '0.72rem', fontWeight: 700 }}>Safe</span>;
+                              // Auto-safe: zero consumption cannot impact any demand.
+                              if (r.consumedQty === 0) return <span title="Zero consumption — cannot impact demands" style={{ background: 'rgba(52,211,153,0.08)', color: '#34d399', border: '1px solid rgba(52,211,153,0.25)', borderRadius: 8, padding: '1px 8px', fontSize: '0.72rem', fontWeight: 600, opacity: 0.85 }}>Safe</span>;
+                              // No status yet AND util > 0 — offer per-row analysis.
+                              return (
+                                <button type="button" className="secondary"
+                                  disabled={criticalityRunning}
+                                  onClick={() => handleAnalyzeCriticalityForSupply(r.supplyId)}
+                                  style={{ fontSize: '0.7rem', padding: '1px 8px' }}
+                                  title="Analyze criticality for this supply">
+                                  Analyze
+                                </button>
+                              );
                             }},
                             { key: 'supplyId', label: tP('supplyView.columns.supplyId'), sortable: true },
                             { key: 'productId', label: tP('supplyView.columns.product'), sortable: true },
                             { key: 'locationId', label: tP('supplyView.columns.location'), sortable: true, render: (r) => r.locationId ?? '–' },
                             { key: 'vendorId', label: tP('supplyView.columns.vendor'), sortable: true, render: (r) => r.vendorId ?? '–' },
                             { key: 'supplyDate', label: tP('supplyView.columns.supplyDate'), sortable: true, render: (r) => r.supplyDate ?? '–' },
-                            { key: 'qty', label: tP('supplyView.columns.initialQty'), sortable: true, render: (r) => Number(r.qty).toLocaleString() },
-                            { key: 'productTotal', label: tP('supplyView.columns.productTotal'), sortable: true, render: (r) => r.productTotal > 0 ? Number(r.productTotal).toLocaleString() : '–' },
-                            { key: 'consumedQty', label: tP('supplyView.columns.consumed'), sortable: true, render: (r) => r.consumedQty > 0 ? <span style={{ color: '#a78bfa' }}>{Number(r.consumedQty).toLocaleString()}</span> : <span style={{ color: '#52525b' }}>0</span> },
-                            { key: 'residualQty', label: tP('supplyView.columns.residual'), sortable: true, render: (r) => r.residualQty > 0 ? <span style={{ color: '#34d399' }}>{Number(r.residualQty).toLocaleString()}</span> : <span style={{ color: '#52525b' }}>0</span> },
+                            { key: 'qty', label: tP('supplyView.columns.initialQty'), sortable: true, render: (r) => qtyFmt(Number(r.qty)) },
+                            { key: 'productTotal', label: tP('supplyView.columns.productTotal'), sortable: true, render: (r) => r.productTotal > 0 ? qtyFmt(Number(r.productTotal)) : '–' },
+                            { key: 'consumedQty', label: tP('supplyView.columns.consumed'), sortable: true, render: (r) => r.consumedQty > 0 ? <span style={{ color: '#a78bfa' }}>{qtyFmt(Number(r.consumedQty))}</span> : <span style={{ color: '#52525b' }}>0</span> },
+                            { key: 'residualQty', label: tP('supplyView.columns.residual'), sortable: true, render: (r) => r.residualQty > 0 ? <span style={{ color: '#34d399' }}>{qtyFmt(Number(r.residualQty))}</span> : <span style={{ color: '#52525b' }}>0</span> },
                             { key: 'utilizationRate', label: tP('supplyView.columns.utilPct'), sortable: true, render: (r) => {
                               if (r.utilizationRate == null) return <span style={{ color: '#52525b' }}>–</span>;
                               const pct = (r.utilizationRate * 100).toFixed(1);
@@ -4530,29 +4633,72 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               return <span style={{ color }} title={overAllocated ? 'Over-allocated: consumed exceeds initial qty' : undefined}>{pct}%{overAllocated ? ' ⚠' : ''}</span>;
                             }},
                             { key: 'peggedDemandCount', label: tP('supplyView.columns.peggedDemands'), sortable: true, render: (r) => r.peggedDemandCount > 0 ? <span style={{ color: '#60a5fa' }}>{r.peggedDemandCount}</span> : <span style={{ color: '#52525b' }}>0</span> },
-                            { key: 'totalPeggedQty', label: tP('supplyView.columns.totalPeggedQty'), sortable: true, render: (r) => r.totalPeggedQty > 0 ? Number(r.totalPeggedQty).toLocaleString() : <span style={{ color: '#52525b' }}>0</span> },
-                            { key: '_sup_splitInfo' as keyof (PlanSupplyViewRow & { _key: string }), label: tP('supplyView.columns.splitInfo'), sortable: false, render: (r) => {
-                              const info = r.splitInfo;
-                              if (!info) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
-                              const short = info.groupTotalProduced < info.groupTotalNeed - 1e-6;
-                              const modeColor = info.mode === 'fair' ? '#34d399' : info.mode === 'proportional' ? '#60a5fa' : '#f59e0b';
-                              const title = [
-                                `Group: ${info.groupProductId} @ ${info.groupLocationId}`,
-                                `Policy: ${info.mode}`,
-                                `Candidates: ${info.candidateCount} demand(s)`,
-                                `Need: ${info.groupTotalNeed.toLocaleString()}`,
-                                `Produced: ${info.groupTotalProduced.toLocaleString()}`,
-                                short ? `Shortage: ${(info.groupTotalNeed - info.groupTotalProduced).toLocaleString()}` : 'No shortage',
-                              ].join('\n');
-                              return (
-                                <span title={title} style={{ fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
-                                  <span style={{ color: modeColor, fontWeight: 600 }}>{info.mode}</span>
-                                  <span style={{ color: '#71717a' }}> · </span>
-                                  <span style={{ color: '#a1a1aa' }}>{info.candidateCount}d</span>
-                                  <span style={{ color: '#71717a' }}> · </span>
-                                  <span style={{ color: short ? '#f87171' : '#a1a1aa' }}>
-                                    {Number(info.groupTotalProduced).toLocaleString()}/{Number(info.groupTotalNeed).toLocaleString()}
+                            { key: 'totalPeggedQty', label: tP('supplyView.columns.totalPeggedQty'), sortable: true, render: (r) => r.totalPeggedQty > 0 ? qtyFmt(Number(r.totalPeggedQty)) : <span style={{ color: '#52525b' }}>0</span> },
+                            { key: '_sup_override' as keyof (PlanSupplyViewRow & { _key: string }), label: tP('supplyView.columns.override'), sortable: false, render: (r) => {
+                              const ov = r.override;
+                              const eligible = r.peggedDemandCount >= 2;
+                              if (ov) {
+                                const n = ov.allocations.length;
+                                const warn = !!ov.warning;
+                                const overrideRecord = overrides.find((o) => o.entity_type === 'supply_split' && o.entity_key === r.supplyId);
+                                return (
+                                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
+                                    <span style={{ color: warn ? '#f87171' : '#fbbf24', fontWeight: 600 }}
+                                          title={warn ? tP('supplyView.overrideWarn') : undefined}>
+                                      {tP('supplyView.overrideActive', { n: String(n) })}{warn ? ' ⚠' : ''}
+                                    </span>
+                                    <button type="button" className="secondary"
+                                      style={{ fontSize: '0.7rem', padding: '1px 6px' }}
+                                      onClick={() => openSupplyOverrideDialog(r)}>
+                                      {tP('supplyView.edit')}
+                                    </button>
+                                    {overrideRecord && (
+                                      <button type="button" className="secondary"
+                                        style={{ fontSize: '0.7rem', padding: '1px 6px', color: '#f87171', borderColor: 'rgba(248,113,113,0.4)' }}
+                                        onClick={async () => {
+                                          try { await deleteOverride(id, overrideRecord.id); await loadOverrides(); }
+                                          catch (e) { setError(e instanceof Error ? e.message : 'Failed to clear override'); }
+                                        }}>
+                                        {tP('supplyView.clear')}
+                                      </button>
+                                    )}
                                   </span>
+                                );
+                              }
+                              const info = r.splitInfo;
+                              const chip = info ? (() => {
+                                const short = info.groupTotalProduced < info.groupTotalNeed - 1e-6;
+                                const modeColor = info.mode === 'fair' ? '#34d399' : info.mode === 'proportional' ? '#60a5fa' : '#f59e0b';
+                                const title = [
+                                  `Group: ${info.groupProductId} @ ${info.groupLocationId}`,
+                                  `Policy: ${info.mode}`,
+                                  `Candidates: ${info.candidateCount} demand(s)`,
+                                  `Need: ${qtyFmt(info.groupTotalNeed)}`,
+                                  `Produced: ${qtyFmt(info.groupTotalProduced)}`,
+                                  short ? `Shortage: ${qtyFmt(info.groupTotalNeed - info.groupTotalProduced)}` : 'No shortage',
+                                ].join('\n');
+                                return (
+                                  <span title={title} style={{ fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
+                                    <span style={{ color: modeColor, fontWeight: 600 }}>{info.mode}</span>
+                                    <span style={{ color: '#71717a' }}> · </span>
+                                    <span style={{ color: '#a1a1aa' }}>{info.candidateCount}d</span>
+                                    <span style={{ color: '#71717a' }}> · </span>
+                                    <span style={{ color: short ? '#f87171' : '#a1a1aa' }}>
+                                      {qtyFmt(Number(info.groupTotalProduced))}/{qtyFmt(Number(info.groupTotalNeed))}
+                                    </span>
+                                  </span>
+                                );
+                              })() : null;
+                              return (
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}>
+                                  {chip ?? <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>}
+                                  {eligible && (
+                                    <button type="button" className="secondary"
+                                      style={{ fontSize: '0.7rem', padding: '1px 6px' }}
+                                      onClick={() => openSupplyOverrideDialog(r)}>
+                                      {tP('supplyView.override')}
+                                    </button>
+                                  )}
                                 </span>
                               );
                             }},
@@ -4723,7 +4869,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         <span style={{ fontWeight: 600 }}>{s.id}</span>
                         {s.productId && <span style={{ marginLeft: 8, color: '#a1a1aa' }}>{s.productId}</span>}
                         {s.supplyDate && <span style={{ marginLeft: 8, color: '#71717a' }}>{s.supplyDate}</span>}
-                        <span style={{ marginLeft: 8, color: '#71717a' }}>qty {Number(s.qty).toLocaleString()}</span>
+                        <span style={{ marginLeft: 8, color: '#71717a' }}>qty {qtyFmt(Number(s.qty))}</span>
                       </div>
                     ))}
                   </div>
@@ -4901,7 +5047,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       </span>
                       {(ev.qtyDecreaseAbs != null && ev.qtyDecreaseAbs > 0) ? (
                         <span style={{ marginLeft: 6, background: '#b45309', color: '#fff', borderRadius: 6, padding: '2px 7px', fontSize: '0.75rem' }}>
-                          −{Number(ev.qtyDecreaseAbs).toLocaleString()} qty
+                          −{qtyFmt(Number(ev.qtyDecreaseAbs))} qty
                         </span>
                       ) : ev.qtyDecreasePct > 0 ? (
                         <span style={{ marginLeft: 6, background: '#b45309', color: '#fff', borderRadius: 6, padding: '2px 7px', fontSize: '0.75rem' }}>
@@ -4973,7 +5119,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         <span style={{ fontSize: '0.82rem', color: '#a1a1aa' }}>
                           Supply: <b style={{ color: '#e4e4e7' }}>{impact.supply.productId}</b>
                           {impact.supply.locationId && <> @ <b style={{ color: '#e4e4e7' }}>{impact.supply.locationId}</b></>}
-                          {' '}· qty {Number(impact.supply.qty).toLocaleString()}
+                          {' '}· qty {qtyFmt(Number(impact.supply.qty))}
                           {impact.supply.vendorId && <> · vendor {impact.supply.vendorId}</>}
                           {impact.supply.supplyDate && <> · {impact.supply.supplyDate}</>}
                         </span>
@@ -5017,11 +5163,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                   <td style={{ padding: '5px 8px', color: '#a1a1aa' }}>{imp.productId}</td>
                                   <td style={{ padding: '5px 8px', color: '#a1a1aa' }}>{imp.customerId}</td>
                                   <td style={{ padding: '5px 8px', color: '#a1a1aa', textAlign: 'right' }}>{imp.requestDueTime ?? '–'}</td>
-                                  <td style={{ padding: '5px 8px', textAlign: 'right', color: '#e4e4e7' }}>{Number(imp.requestedQty).toLocaleString()}</td>
-                                  <td style={{ padding: '5px 8px', textAlign: 'right', color: '#e4e4e7' }}>{Number(baseQty).toLocaleString()}</td>
-                                  <td style={{ padding: '5px 8px', textAlign: 'right', color: contQty < baseQty ? '#f87171' : '#e4e4e7' }}>{Number(contQty).toLocaleString()}</td>
+                                  <td style={{ padding: '5px 8px', textAlign: 'right', color: '#e4e4e7' }}>{qtyFmt(Number(imp.requestedQty))}</td>
+                                  <td style={{ padding: '5px 8px', textAlign: 'right', color: '#e4e4e7' }}>{qtyFmt(Number(baseQty))}</td>
+                                  <td style={{ padding: '5px 8px', textAlign: 'right', color: contQty < baseQty ? '#f87171' : '#e4e4e7' }}>{qtyFmt(Number(contQty))}</td>
                                   <td style={{ padding: '5px 8px', textAlign: 'right', color: shortfall > 0 ? '#f87171' : '#a1a1aa' }}>
-                                    {shortfall > 0 ? `-${Number(shortfall).toLocaleString()}` : '–'}
+                                    {shortfall > 0 ? `-${qtyFmt(Number(shortfall))}` : '–'}
                                   </td>
                                   <td style={{ padding: '5px 8px', textAlign: 'center' }}>
                                     <span style={{ background: statusColor, color: '#fff', borderRadius: 5, padding: '2px 7px', fontSize: '0.73rem' }}>
@@ -5271,20 +5417,29 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       )}
 
       {/* ── Override dialog ────────────────────────────────────────────────────── */}
-      {overrideDialogOpen && overrideDialogWo && typeof document !== 'undefined' && createPortal(
+      {overrideDialogOpen && (overrideDialogWo || overrideDialogSupply) && typeof document !== 'undefined' && createPortal(
         <div style={{ position: 'fixed', inset: 0, zIndex: 10000, display: 'flex', alignItems: 'center', justifyContent: 'center' }} role="dialog" aria-label="Override dialog">
           <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.6)' }} onClick={() => setOverrideDialogOpen(false)} aria-hidden />
-          <div style={{ position: 'relative', zIndex: 10, width: 480, maxWidth: '92vw', background: '#1c1c1e', color: '#e4e4e7', borderRadius: 10, boxShadow: '0 8px 32px rgba(0,0,0,0.5)', padding: '1.5rem' }}>
+          <div style={{ position: 'relative', zIndex: 10, width: overrideDialogType === 'supply_split' ? 640 : 480, maxWidth: '92vw', background: '#1c1c1e', color: '#e4e4e7', borderRadius: 10, boxShadow: '0 8px 32px rgba(0,0,0,0.5)', padding: '1.5rem', boxSizing: 'border-box', overflow: 'hidden' }}>
             <h3 style={{ margin: '0 0 0.25rem', fontSize: '1rem' }}>
               {overrideDialogType === 'method_selection' ? 'Override method selection'
                 : overrideDialogType === 'variant_selection' ? 'Override BOM variant selection'
+                : overrideDialogType === 'supply_split' ? tP('supplyView.overrideSplitTitle')
                 : 'Override component split allocation'}
             </h3>
-            <p style={{ margin: '0 0 1rem', fontSize: '0.8rem', color: '#a1a1aa' }}>
-              <strong>{overrideDialogWo.product_id}</strong> @ {overrideDialogWo.location_id}
-              {overrideDialogWo.demand_id && <> · demand {overrideDialogWo.demand_id}</>}
-              {overrideDialogWo.start_time && <> · {overrideDialogWo.start_time.slice(0, 10)}</>}
-            </p>
+            {overrideDialogType === 'supply_split' && overrideDialogSupply ? (
+              <p style={{ margin: '0 0 1rem', fontSize: '0.8rem', color: '#a1a1aa' }}>
+                <strong>{overrideDialogSupply.supplyId}</strong> · {overrideDialogSupply.productId} @ {overrideDialogSupply.locationId}
+                {overrideDialogSupply.supplyDate && <> · {overrideDialogSupply.supplyDate}</>}
+                {' · qty '}{qtyFmt(Number(overrideDialogSupply.qty))}
+              </p>
+            ) : overrideDialogWo && (
+              <p style={{ margin: '0 0 1rem', fontSize: '0.8rem', color: '#a1a1aa' }}>
+                <strong>{overrideDialogWo.product_id}</strong> @ {overrideDialogWo.location_id}
+                {overrideDialogWo.demand_id && <> · demand {overrideDialogWo.demand_id}</>}
+                {overrideDialogWo.start_time && <> · {overrideDialogWo.start_time.slice(0, 10)}</>}
+              </p>
+            )}
             {/* ── Method selection form ─── */}
             {overrideDialogType === 'method_selection' && overrideDialogWo && (
               <>
@@ -5338,7 +5493,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               return (
                 <>
                   <div style={{ marginBottom: '0.75rem', display: 'flex', gap: '1.5rem', fontSize: '0.8rem', color: '#a1a1aa' }}>
-                    <span>Total planned: <strong style={{ color: '#e4e4e7' }}>{totalPlanned.toLocaleString(undefined, { maximumFractionDigits: 1 })}</strong></span>
+                    <span>Total planned: <strong style={{ color: '#e4e4e7' }}>{qtyFmt(totalPlanned)}</strong></span>
                     <span>Split mode: <strong style={{ color: '#e4e4e7' }}>{overrideDialogWo.wo_consolidation_split_mode === 'proportional' ? 'Proportional' : overrideDialogWo.wo_consolidation_split_mode === 'priority_first' ? 'Priority first' : 'Fair'}</strong></span>
                   </div>
                   <table style={{ width: '100%', fontSize: '0.82rem', borderCollapse: 'collapse', marginBottom: '0.5rem' }}>
@@ -5357,7 +5512,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           <td style={{ padding: '0.3rem 0.5rem 0.3rem 0', color: '#d4d4d8' }}>{row.demand_id ?? '–'}</td>
                           <td style={{ padding: '0.3rem 0.5rem 0.3rem 0', color: '#a1a1aa', fontSize: '0.78rem' }}>{row.parent_product}</td>
                           <td style={{ padding: '0.3rem 0.5rem 0.3rem 0', textAlign: 'right' }}>{row.priority}</td>
-                          <td style={{ padding: '0.3rem 0.5rem 0.3rem 0', textAlign: 'right', color: '#71717a' }}>{row.requested_qty.toLocaleString(undefined, { maximumFractionDigits: 1 })}</td>
+                          <td style={{ padding: '0.3rem 0.5rem 0.3rem 0', textAlign: 'right', color: '#71717a' }}>{qtyFmt(row.requested_qty)}</td>
                           <td style={{ padding: '0.3rem 0', textAlign: 'right' }}>
                             <input
                               type="number"
@@ -5375,7 +5530,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <tr style={{ borderTop: '2px solid #3d3d40' }}>
                         <td colSpan={4} style={{ paddingTop: '0.3rem', color: '#a1a1aa', fontSize: '0.78rem', textAlign: 'right', paddingRight: '0.5rem' }}>Sum</td>
                         <td style={{ paddingTop: '0.3rem', textAlign: 'right', fontWeight: 600, color: over ? '#f87171' : sumQty <= totalPlanned + 0.001 ? '#4ade80' : '#e4e4e7' }}>
-                          {sumQty.toLocaleString(undefined, { maximumFractionDigits: 1 })}
+                          {qtyFmt(sumQty)}
                           {over && <span style={{ marginLeft: 4, fontSize: '0.7rem', color: '#f87171' }}>exceeds total</span>}
                         </td>
                       </tr>
@@ -5385,15 +5540,88 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 </>
               );
             })()}
+            {/* ── Supply split form ─── */}
+            {overrideDialogType === 'supply_split' && overrideDialogSupply && (() => {
+              const supplyQty = overrideDialogSupply.qty ?? 0;
+              const sumQty = overrideSupplyRows.reduce((s, r) => s + (Number(r.qty) || 0), 0);
+              const over = sumQty > supplyQty + 0.001;
+              const warn = !!overrideDialogSupply.override?.warning;
+              return (
+                <>
+                  <p style={{ fontSize: '0.78rem', color: '#a1a1aa', margin: '0 0 0.6rem' }}>
+                    {tP('supplyView.overrideInfo')}
+                  </p>
+                  {warn && (
+                    <div style={{ marginBottom: '0.75rem', padding: '0.5rem 0.75rem', background: 'rgba(248,113,113,0.12)', border: '1px solid rgba(248,113,113,0.4)', borderRadius: 6 }}>
+                      <span style={{ color: '#f87171', fontSize: '0.78rem' }}>{tP('supplyView.overrideWarnBanner')}</span>
+                    </div>
+                  )}
+                  <table style={{ width: '100%', fontSize: '0.82rem', borderCollapse: 'collapse', marginBottom: '0.5rem', tableLayout: 'fixed' }}>
+                    <colgroup>
+                      <col style={{ width: '32%' }} />
+                      <col style={{ width: '22%' }} />
+                      <col style={{ width: '14%' }} />
+                      <col style={{ width: '14%' }} />
+                      <col style={{ width: '18%' }} />
+                    </colgroup>
+                    <thead>
+                      <tr style={{ color: '#71717a', textAlign: 'left', borderBottom: '1px solid #3d3d40' }}>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem' }}>Demand</th>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem' }}>Customer</th>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem', textAlign: 'right' }}>Requested</th>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem', textAlign: 'right' }}>Current</th>
+                        <th style={{ paddingBottom: '0.3rem', textAlign: 'right' }}>Override qty</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {overrideSupplyRows.map((row, i) => (
+                        <tr key={row.demand_id} style={{ borderTop: '1px solid #27272a' }}>
+                          <td style={{ padding: '0.3rem 0.5rem 0.3rem 0', color: '#d4d4d8', overflowWrap: 'anywhere', wordBreak: 'break-all' }}>{row.demand_id}</td>
+                          <td style={{ padding: '0.3rem 0.5rem 0.3rem 0', color: '#a1a1aa', fontSize: '0.78rem', overflowWrap: 'anywhere' }}>{row.customer ?? '–'}</td>
+                          <td style={{ padding: '0.3rem 0.5rem 0.3rem 0', textAlign: 'right', color: '#71717a' }}>{row.requested_qty > 0 ? qtyFmt(row.requested_qty) : '–'}</td>
+                          <td style={{ padding: '0.3rem 0.5rem 0.3rem 0', textAlign: 'right', color: '#71717a' }}>{qtyFmt(row.consumed_qty)}</td>
+                          <td style={{ padding: '0.3rem 0', textAlign: 'right' }}>
+                            <input
+                              type="number"
+                              min={0}
+                              step="any"
+                              value={row.qty}
+                              onChange={(e) => setOverrideSupplyRows((prev) => prev.map((r, j) => j === i ? { ...r, qty: parseFloat(e.target.value) || 0 } : r))}
+                              style={{ width: '100%', boxSizing: 'border-box', padding: '2px 6px', background: '#1c1c1e', border: `1px solid ${over ? '#f87171' : '#3d3d40'}`, borderRadius: 4, color: '#fafafa', fontSize: '0.82rem', textAlign: 'right' }}
+                            />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot>
+                      <tr style={{ borderTop: '2px solid #3d3d40' }}>
+                        <td colSpan={4} style={{ paddingTop: '0.3rem', color: '#a1a1aa', fontSize: '0.78rem', textAlign: 'right', paddingRight: '0.5rem' }}>Sum / Supply qty</td>
+                        <td style={{ paddingTop: '0.3rem', textAlign: 'right', fontWeight: 600, color: over ? '#f87171' : '#e4e4e7' }}>
+                          {qtyFmt(sumQty)} / {qtyFmt(supplyQty)}
+                        </td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                  <p style={{ fontSize: '0.75rem', color: '#71717a', margin: '0.25rem 0 0' }}>Demands not listed here are excluded from this supply. If the sum exceeds supply qty, the backend will scale proportionally. Re-run plan to apply.</p>
+                </>
+              );
+            })()}
             {overrideDialogError && <p style={{ color: '#f87171', fontSize: '0.8rem', marginTop: '0.4rem' }}>{overrideDialogError}</p>}
             {(() => {
-              if (!overrideDialogWo || !overrideDialogType) return null;
-              const productId = overrideDialogWo.product_id ?? '';
-              const locationId = overrideDialogWo.location_id ?? '';
-              const demandId = overrideDialogWo.demand_id ?? '';
-              const entityKey = overrideDialogType === 'component_split'
-                ? (overrideDialogWo.start_time ? `${productId}|${locationId}|${overrideDialogWo.start_time.slice(0, 10)}` : `${productId}|${locationId}`)
-                : (demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`);
+              if (!overrideDialogType) return null;
+              let entityKey: string;
+              if (overrideDialogType === 'supply_split') {
+                if (!overrideDialogSupply) return null;
+                entityKey = overrideDialogSupply.supplyId;
+              } else {
+                if (!overrideDialogWo) return null;
+                const productId = overrideDialogWo.product_id ?? '';
+                const locationId = overrideDialogWo.location_id ?? '';
+                const demandId = overrideDialogWo.demand_id ?? '';
+                entityKey = overrideDialogType === 'component_split'
+                  ? (overrideDialogWo.start_time ? `${productId}|${locationId}|${overrideDialogWo.start_time.slice(0, 10)}` : `${productId}|${locationId}`)
+                  : (demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`);
+              }
               const existingOverride = overrides.find((o) => o.entity_type === overrideDialogType && o.entity_key === entityKey) ?? null;
               if (!existingOverride) return null;
               return (
@@ -5412,6 +5640,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         await loadOverrides();
                         setOverrideDialogOpen(false);
                         setOverrideDialogWo(null);
+                        setOverrideDialogSupply(null);
                         setOverrideDialogType(null);
                       } catch (e) {
                         setOverrideDialogError(e instanceof Error ? e.message : 'Failed to reset');
@@ -5535,7 +5764,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   </div>
                   <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem' }}>
                     This work order was consolidated for <strong>{woExplainRow.wo_consolidation_split_details.length}</strong> demands
-                    (total planned: <strong>{(woExplainRow.wo_consolidation_total_planned ?? 0).toLocaleString(undefined, { maximumFractionDigits: 1 })}</strong>).
+                    (total planned: <strong>{qtyFmt(woExplainRow.wo_consolidation_total_planned ?? 0)}</strong>).
                     Split mode: <strong>{woExplainRow.wo_consolidation_split_mode === 'proportional' ? 'Proportional' : woExplainRow.wo_consolidation_split_mode === 'priority_first' ? 'Priority first' : 'Fair'}</strong>.
                   </p>
                   <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse' }}>
@@ -5554,9 +5783,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           <td style={{ padding: '0.2rem 0.4rem 0.2rem 0' }}>{row.demand_id ?? '–'}</td>
                           <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', color: '#a1a1aa' }}>{row.parent_product}</td>
                           <td style={{ padding: '0.2rem 0', textAlign: 'right' }}>{row.priority}</td>
-                          <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right' }}>{row.requested_qty.toLocaleString(undefined, { maximumFractionDigits: 1 })}</td>
+                          <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right' }}>{qtyFmt(row.requested_qty)}</td>
                           <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right', color: row.allocated_qty < row.requested_qty - 0.01 ? '#f87171' : '#4ade80' }}>
-                            {row.allocated_qty.toLocaleString(undefined, { maximumFractionDigits: 1 })}
+                            {qtyFmt(row.allocated_qty)}
                           </td>
                         </tr>
                       ))}
@@ -5827,8 +6056,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               return (
                 <div>
                   <p style={{ fontSize: '0.8rem', color: '#71717a', margin: '0 0 0.75rem' }}>
-                    {tP('supplyView.peggingPanel.initialQty')} <strong style={{ color: '#e4e4e7' }}>{Number(ctx.initialQty).toLocaleString()}</strong>
-                    {' · '}{tP('supplyView.peggingPanel.consumed')} <strong style={{ color: '#a78bfa' }}>{Number(ctx.consumedQty).toLocaleString()}</strong>
+                    {tP('supplyView.peggingPanel.initialQty')} <strong style={{ color: '#e4e4e7' }}>{qtyFmt(Number(ctx.initialQty))}</strong>
+                    {' · '}{tP('supplyView.peggingPanel.consumed')} <strong style={{ color: '#a78bfa' }}>{qtyFmt(Number(ctx.consumedQty))}</strong>
                     {' · '}{tP('supplyView.peggingPanel.demandCount', { count: ctx.peggedDemands.length })}
                   </p>
                   {/* ── Assessment UI ──────────────────────────────────────── */}
@@ -5995,7 +6224,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               )}
                             </td>
                             <td style={{ padding: '4px 6px', color: '#e4e4e7' }}>{d.customer ?? '–'}</td>
-                            <td style={{ padding: '4px 6px', textAlign: 'right', color: '#a78bfa' }}>{Number(d.qtyConsumed).toLocaleString()}</td>
+                            <td style={{ padding: '4px 6px', textAlign: 'right', color: '#a78bfa' }}>{qtyFmt(Number(d.qtyConsumed))}</td>
                           </tr>
                           );
                         })}
@@ -6200,8 +6429,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       const committedRaw = (node as { committed_qty?: number | null }).committed_qty;
                       const commQty = committedRaw == null ? reqQty : Number(committedRaw);
                       const qtyLabel = commQty < reqQty - 1e-6
-                        ? `${commQty.toLocaleString()} / ${reqQty.toLocaleString()}`
-                        : reqQty.toLocaleString();
+                        ? `${qtyFmt(commQty)} / ${qtyFmt(reqQty)}`
+                        : qtyFmt(reqQty);
                       return `${node.product_id ?? node.demand_id ?? '–'} · ${qtyLabel} @ ${node.location_id ?? '–'}${node.demand_id && node.product_id !== node.demand_id && node.demand_id !== contextDemandId ? ` (demand ${node.demand_id})` : ''}`;
                     })()
                   : node.type === 'work_order'
@@ -6211,13 +6440,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         const maxLotSize = (node as { max_lot_size?: number | null }).max_lot_size ?? null;
                         const lotPart =
                           lotCount && lotCount > 1 && maxLotSize
-                            ? ` · ${lotCount} lots of up to ${Number(maxLotSize).toLocaleString()}`
+                            ? ` · ${lotCount} lots of up to ${qtyFmt(Number(maxLotSize))}`
                             : '';
-                        return `${node.method} ${node.product_id} @ ${node.location_id ?? '–'} · ${qty.toLocaleString()}${node.end_time ? ` · end ${node.end_time}` : ''}${lotPart}`;
+                        return `${node.method} ${node.product_id} @ ${node.location_id ?? '–'} · ${qtyFmt(qty)}${node.end_time ? ` · end ${node.end_time}` : ''}${lotPart}`;
                       })()
                     : node.type === 'supply'
-                      ? `${node.product_id} @ ${node.location_id ?? '–'} · ${Number(node.quantity ?? 0).toLocaleString()}${node.supply_id ? ` · ${node.supply_id}` : ''}`
-                      : `${node.product_id} @ ${node.location_id ?? '–'} · ${Number(node.quantity ?? 0).toLocaleString()}`;
+                      ? `${node.product_id} @ ${node.location_id ?? '–'} · ${qtyFmt(Number(node.quantity ?? 0))}${node.supply_id ? ` · ${node.supply_id}` : ''}`
+                      : `${node.product_id} @ ${node.location_id ?? '–'} · ${qtyFmt(Number(node.quantity ?? 0))}`;
                 const indentPx = 12;
                 let childGroupLabel: string | null = null;
                 let childGroupKind: 'and' | 'or' | null = null;
@@ -6654,9 +6883,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             {peggingData?.direction === 'demand-to-supply' && (peggingData.demand_allocated_qty != null || peggingData.demand_requested_qty != null) && (
               <>
                 <p style={{ margin: 0, marginBottom: '0.25rem', color: '#a1a1aa', fontSize: '0.9rem' }}>
-                  Allocated: <strong style={{ color: '#fafafa' }}>{Number(peggingData.demand_allocated_qty ?? 0).toLocaleString()}</strong>
+                  Allocated: <strong style={{ color: '#fafafa' }}>{qtyFmt(Number(peggingData.demand_allocated_qty ?? 0))}</strong>
                   {peggingData.demand_requested_qty != null && (
-                    <> (requested: {Number(peggingData.demand_requested_qty).toLocaleString()})</>
+                    <> (requested: {qtyFmt(Number(peggingData.demand_requested_qty))})</>
                   )}
                 </p>
                 <p style={{ margin: 0, marginBottom: '1rem', color: '#71717a', fontSize: '0.8rem' }}>

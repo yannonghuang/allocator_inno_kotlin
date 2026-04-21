@@ -504,6 +504,14 @@
       "loading": "加载供应数据…",
       "showing": "显示 {shown} / {total} 条供应。",
       "overallUtilization": "整体利用率：{pct}%（{consumed} / {initial}）",
+      "override": "覆盖",
+      "overrideActive": "已覆盖 ({n})",
+      "overrideWarn": "覆盖导致需求短缺——点击查看",
+      "overrideSplitTitle": "覆盖供应拆分",
+      "overrideInfo": "手动调整该供应在已关联需求间的分配。覆盖总量不得超过供应数量；保存时超额部分将按比例缩减。",
+      "overrideWarnBanner": "在此覆盖下，上次计划运行未能完全满足一个或多个需求。受影响的需求及其短缺量见下方。",
+      "edit": "编辑",
+      "clear": "清除",
       "columns": {
         "supplyId": "供应 ID",
         "product": "产品",
@@ -518,6 +526,7 @@
         "peggedDemands": "关联需求数",
         "totalPeggedQty": "关联需求总量",
         "splitInfo": "拆分信息",
+        "override": "覆盖",
         "pegging": "追溯"
       },
       "peggingPanel": {

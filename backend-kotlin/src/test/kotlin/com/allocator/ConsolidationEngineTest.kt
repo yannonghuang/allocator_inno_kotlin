@@ -305,6 +305,9 @@ class ConsolidationEngineTest : FunSpec({
                 "parent_id" to "FG", "child_id" to "C",
                 "bom_id" to "BOM1", "rate" to 1.0, "alt_group" to null,
             )),
+            // Child C@PLANT must have supply for collectDeepNeeds to register it
+            // (intermediate make-chain nodes without inventory are passed through).
+            "supply" to listOf(supply("C", "PLANT", 100.0)),
         )
         val needs = collectComponentNeeds(demands, data, ConsolidationConfig())
         needs shouldHaveSize 1
@@ -328,6 +331,8 @@ class ConsolidationEngineTest : FunSpec({
                 "product_id" to "P", "from_location_id" to "PLANT-A", "to_location_id" to "PLANT-B",
                 "preference" to 1, "transit_time" to 3.0,
             )),
+            // Source P@PLANT-A must have supply for collectDeepNeeds to register it.
+            "supply" to listOf(supply("P", "PLANT-A", 50.0)),
         )
         val needs = collectComponentNeeds(demands, data, ConsolidationConfig())
         needs shouldHaveSize 1
@@ -380,5 +385,237 @@ class ConsolidationEngineTest : FunSpec({
         split["D1"]!! shouldBe (5.0  plusOrMinus 1e-9)
         split["D2"]!! shouldBe (20.0 plusOrMinus 1e-9)
         split.values.sum() shouldBe (25.0 plusOrMinus 1e-9)
+    }
+
+    // ── Scenario 18: Root method selection aligns with PlanningEngine's cascade ──
+    //
+    // Regression: naive minByOrNull at the root of collectDeepNeeds picked a method
+    // (move) whose cascade probe fails — while PlanningEngine.plan()'s cascade picked
+    // a different method (make) at the same root. The divergence left the tagged-bucket
+    // pre-allocation orphaned because main plan walked a different BOM path.
+    //
+    // Setup: FG@PLANT has two methods — move (pref=1) from SRC where nothing exists, and
+    // make (pref=2) with a BOM child C@PLANT that has supply. Cascade must reject move and
+    // pick make; collectComponentNeeds should walk make's path and register C@PLANT, and
+    // methodChoices should record the pinned method.
+    test("Sc18: collectComponentNeeds aligns root method with PlanningEngine cascade") {
+        val demands = listOf(demand("D1", "FG", "PLANT", 100.0, 1, "2025-01-20"))
+        val data = mapOf(
+            "method_move" to listOf(mapOf(
+                "product_id" to "FG", "from_location_id" to "SRC", "to_location_id" to "PLANT",
+                "preference" to 1, "transit_time" to 0.0,
+            )),
+            "method_make" to listOf(mapOf(
+                "product_id" to "FG", "location_id" to "PLANT",
+                "bom_id" to "B1", "preference" to 2, "lead_time" to 0,
+            )),
+            "bom" to listOf(mapOf(
+                "parent_id" to "FG", "child_id" to "C",
+                "bom_id" to "B1", "rate" to 1.0, "alt_group" to null,
+            )),
+            "supply" to listOf(supply("C", "PLANT", 1000.0)),
+        )
+        val inventory: List<Map<String, Any?>> = (data["supply"] ?: emptyList()).map { s ->
+            mapOf(
+                "product_id"  to s["product_id"],
+                "location_id" to s["location_id"],
+                "supply_date" to s["supply_date"],
+                "supply_id"   to s["supply_id"],
+                "qty"         to s["qty"],
+                "demand_tag"  to null,
+            )
+        }
+        val methodChoices = mutableMapOf<Triple<String, String, String>, Map<String, Any?>>()
+        val needs = collectComponentNeeds(
+            demands, data, ConsolidationConfig(),
+            inventory = inventory, planConfig = null, methodChoices = methodChoices,
+        )
+
+        // Cascade picked make — BOM child C@PLANT registered as a need.
+        needs shouldHaveSize 1
+        needs[0].productId  shouldBe "C"
+        needs[0].locationId shouldBe "PLANT"
+
+        // methodChoices records the root-level pick for synthetic override injection.
+        val key = Triple("FG", "PLANT", "D1")
+        methodChoices shouldContainKey key
+        methodChoices[key]!!["type"] shouldBe "make"
+        (methodChoices[key]!!["preference"] as Number).toInt() shouldBe 2
+    }
+
+    // ── Scenario 19: no divergence — single-method demands don't emit methodChoice ──
+    test("Sc19: single-method demand does not record a methodChoice") {
+        val demands = listOf(demand("D1", "FG", "PLANT", 100.0, 1, "2025-01-20"))
+        val data = mapOf(
+            "method_make" to listOf(mapOf(
+                "product_id" to "FG", "location_id" to "PLANT",
+                "bom_id" to "B1", "preference" to 1, "lead_time" to 0,
+            )),
+            "bom" to listOf(mapOf(
+                "parent_id" to "FG", "child_id" to "C",
+                "bom_id" to "B1", "rate" to 1.0, "alt_group" to null,
+            )),
+            "supply" to listOf(supply("C", "PLANT", 1000.0)),
+        )
+        val methodChoices = mutableMapOf<Triple<String, String, String>, Map<String, Any?>>()
+        collectComponentNeeds(
+            demands, data, ConsolidationConfig(),
+            inventory = emptyList(), planConfig = null, methodChoices = methodChoices,
+        )
+        methodChoices shouldNotContainKey Triple("FG", "PLANT", "D1")
+    }
+
+    // ── Scenario 20: feasibility gate skips demand when every root method is infeasible ──
+    //
+    // Regression test for phantom-WO bug: demand 828 in case 115 had two make methods at
+    // F29__828@VIRTUAL, both with a BOM child (500-6336@VIRTUAL) that has no supply and no
+    // production methods. Consolidation previously walked the reachable siblings and
+    // registered ComponentNeeds anyway — producing WOs (at 500-5522@2000 etc.) that consumed
+    // real inventory without ever rolling up into F29__828 (the unreachable sibling blocked
+    // it). Main plan correctly committed qty=0 with child_failed, leaving the consolidation
+    // WOs orphaned.
+    //
+    // Setup: two make methods for FG@PLANT, each with two children. Every method has at
+    // least one child that has no supply and no methods of its own (BAD1, BAD2). The
+    // reachable siblings (C1, C2) should NOT be registered, because the parent BOM can
+    // never produce FG.
+    test("Sc20: feasibility gate skips demand when every root method has an unreachable child") {
+        val demands = listOf(demand("D1", "FG", "PLANT", 100.0, 1, "2025-01-20"))
+        val data = mapOf(
+            "method_make" to listOf(
+                mapOf("product_id" to "FG", "location_id" to "PLANT",
+                      "bom_id" to "B1", "preference" to 1, "lead_time" to 0),
+                mapOf("product_id" to "FG", "location_id" to "PLANT",
+                      "bom_id" to "B2", "preference" to 2, "lead_time" to 0),
+            ),
+            "bom" to listOf(
+                mapOf("parent_id" to "FG", "child_id" to "C1",   "bom_id" to "B1", "rate" to 1.0, "alt_group" to null),
+                mapOf("parent_id" to "FG", "child_id" to "BAD1", "bom_id" to "B1", "rate" to 1.0, "alt_group" to null),
+                mapOf("parent_id" to "FG", "child_id" to "C2",   "bom_id" to "B2", "rate" to 1.0, "alt_group" to null),
+                mapOf("parent_id" to "FG", "child_id" to "BAD2", "bom_id" to "B2", "rate" to 1.0, "alt_group" to null),
+            ),
+            "supply" to listOf(supply("C1", "PLANT", 1000.0), supply("C2", "PLANT", 1000.0)),
+            // BAD1 / BAD2: no supply, no methods → unreachable
+        )
+        val inventory: List<Map<String, Any?>> = (data["supply"] ?: emptyList()).map { s ->
+            mapOf(
+                "product_id"  to s["product_id"],
+                "location_id" to s["location_id"],
+                "supply_date" to s["supply_date"],
+                "supply_id"   to s["supply_id"],
+                "qty"         to s["qty"],
+                "demand_tag"  to null,
+            )
+        }
+        val methodChoices = mutableMapOf<Triple<String, String, String>, Map<String, Any?>>()
+        val needs = collectComponentNeeds(
+            demands, data, ConsolidationConfig(),
+            inventory = inventory, planConfig = null, methodChoices = methodChoices,
+        )
+        // Gate triggered — no ComponentNeeds registered (no phantom pre-allocation).
+        needs shouldHaveSize 0
+        // And no methodChoice recorded (no override to inject).
+        methodChoices shouldNotContainKey Triple("FG", "PLANT", "D1")
+    }
+
+    // ── Scenario 21: feasibility gate picks feasible method when one exists ──
+    //
+    // When the lowest-preference method has an unreachable child but a higher-preference
+    // method is fully reachable, consolidation should register the reachable method's BOM
+    // and record it in methodChoices (for the synthetic override pinning main plan).
+    test("Sc21: feasibility gate picks the feasible higher-preference method") {
+        val demands = listOf(demand("D1", "FG", "PLANT", 100.0, 1, "2025-01-20"))
+        val data = mapOf(
+            "method_make" to listOf(
+                // pref=1 is infeasible (BAD has no supply/methods)
+                mapOf("product_id" to "FG", "location_id" to "PLANT",
+                      "bom_id" to "B1", "preference" to 1, "lead_time" to 0),
+                // pref=2 is fully reachable (C has supply)
+                mapOf("product_id" to "FG", "location_id" to "PLANT",
+                      "bom_id" to "B2", "preference" to 2, "lead_time" to 0),
+            ),
+            "bom" to listOf(
+                mapOf("parent_id" to "FG", "child_id" to "BAD", "bom_id" to "B1", "rate" to 1.0, "alt_group" to null),
+                mapOf("parent_id" to "FG", "child_id" to "C",   "bom_id" to "B2", "rate" to 1.0, "alt_group" to null),
+            ),
+            "supply" to listOf(supply("C", "PLANT", 1000.0)),
+        )
+        val inventory: List<Map<String, Any?>> = (data["supply"] ?: emptyList()).map { s ->
+            mapOf(
+                "product_id"  to s["product_id"],
+                "location_id" to s["location_id"],
+                "supply_date" to s["supply_date"],
+                "supply_id"   to s["supply_id"],
+                "qty"         to s["qty"],
+                "demand_tag"  to null,
+            )
+        }
+        val methodChoices = mutableMapOf<Triple<String, String, String>, Map<String, Any?>>()
+        val needs = collectComponentNeeds(
+            demands, data, ConsolidationConfig(),
+            inventory = inventory, planConfig = null, methodChoices = methodChoices,
+        )
+        // Gate passed (pref=2 is feasible); walked that BOM path and registered C@PLANT.
+        needs shouldHaveSize 1
+        needs[0].productId  shouldBe "C"
+        needs[0].locationId shouldBe "PLANT"
+        // Cascade's first-feasible is pref=2 (pref=1 failed the probe).
+        val key = Triple("FG", "PLANT", "D1")
+        methodChoices shouldContainKey key
+        (methodChoices[key]!!["preference"] as Number).toInt() shouldBe 2
+    }
+
+    // ── Scenario 22: probe catches depth-2 child_failed — scoreVariant zero-qty gap ──
+    //
+    // Regression for the residual 888_F30_2024_07_VIRTUAL phantom-WO case. FG's BOM has
+    // two children: C1 (reachable, has supply) and P (intermediate — has its own make
+    // method, but that method's child GRANDCHILD is unreachable).  plan(P) hits the
+    // capped<=1e-9 branch in PlanningEngine.plan (around line 1133) and returns a
+    // committed row with qty=0 and reason="child_failed:GRANDCHILD@PLANT(no_inventory)".
+    //
+    // Pre-fix scoreVariant skipped zero-qty rows before evaluating their commit_reason,
+    // so that hard failure never tripped anyFailed.  firstFeasibleMethod reported FG
+    // feasible, the consolidation gate passed, and C1 was registered as a ComponentNeed
+    // — a phantom pre-allocation for a demand that can never roll up.
+    //
+    // Post-fix the zero-qty row's non-benign reason sets anyFailed=true, the method is
+    // rejected, and no ComponentNeeds are registered.
+    test("Sc22: probe marks zero-qty child_failed rows as failed (no phantom pre-allocation)") {
+        val demands = listOf(demand("D1", "FG", "PLANT", 100.0, 1, "2025-01-20"))
+        val data = mapOf(
+            "method_make" to listOf(
+                // FG's only method: children are C1 (reachable) and P (transitively unreachable).
+                mapOf("product_id" to "FG", "location_id" to "PLANT",
+                      "bom_id" to "BFG", "preference" to 1, "lead_time" to 0),
+                // P's only method: child is GRANDCHILD (terminal no_methods).
+                mapOf("product_id" to "P", "location_id" to "PLANT",
+                      "bom_id" to "BP", "preference" to 1, "lead_time" to 0),
+            ),
+            "bom" to listOf(
+                mapOf("parent_id" to "FG", "child_id" to "C1",         "bom_id" to "BFG", "rate" to 1.0, "alt_group" to null),
+                mapOf("parent_id" to "FG", "child_id" to "P",          "bom_id" to "BFG", "rate" to 1.0, "alt_group" to null),
+                mapOf("parent_id" to "P",  "child_id" to "GRANDCHILD", "bom_id" to "BP",  "rate" to 1.0, "alt_group" to null),
+            ),
+            // C1 has supply; GRANDCHILD has none and no methods → unreachable at depth 2.
+            "supply" to listOf(supply("C1", "PLANT", 1000.0)),
+        )
+        val inventory: List<Map<String, Any?>> = (data["supply"] ?: emptyList()).map { s ->
+            mapOf(
+                "product_id"  to s["product_id"],
+                "location_id" to s["location_id"],
+                "supply_date" to s["supply_date"],
+                "supply_id"   to s["supply_id"],
+                "qty"         to s["qty"],
+                "demand_tag"  to null,
+            )
+        }
+        val methodChoices = mutableMapOf<Triple<String, String, String>, Map<String, Any?>>()
+        val needs = collectComponentNeeds(
+            demands, data, ConsolidationConfig(),
+            inventory = inventory, planConfig = null, methodChoices = methodChoices,
+        )
+        // Gate triggered via sharper probe — no ComponentNeed for C1 even though C1 has supply.
+        needs shouldHaveSize 0
+        methodChoices shouldNotContainKey Triple("FG", "PLANT", "D1")
     }
 })

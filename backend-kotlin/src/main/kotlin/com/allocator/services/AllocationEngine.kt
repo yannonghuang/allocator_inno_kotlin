@@ -401,9 +401,9 @@ fun runAllocation(
     progressCallback?.invoke(mapOf(
         "steps" to 0,
         "max_steps" to MAX_ALLOCATION_STEPS,
-        "basket_total_qty" to String.format("%.2f", initialBasketTotalQty).toDouble(),
+        "basket_total_qty" to roundQty(initialBasketTotalQty),
         "basket_keys" to initialBasketKeys,
-        "initial_basket_total_qty" to String.format("%.2f", initialBasketTotalQty).toDouble(),
+        "initial_basket_total_qty" to roundQty(initialBasketTotalQty),
         "initial_basket_keys" to initialBasketKeys,
     ))
 
@@ -487,17 +487,17 @@ fun runAllocation(
                 log.info(
                     "allocation step={} critical_raw_material comp={} pattern={} avail={} → {}",
                     stepCounter, compKey(component), rawPattern, avail,
-                    breakdownByVariant.entries.joinToString("; ") { "${it.key}=${String.format("%.4f", it.value)}" }.ifEmpty { "(none)" }
+                    breakdownByVariant.entries.joinToString("; ") { "${it.key}=${roundQty(it.value).toLong()}" }.ifEmpty { "(none)" }
                 )
                 rawMaterialTrace.add(mapOf(
                     "role" to "critical",
                     "step" to stepCounter,
                     "comp_key" to compKey(component),
                     "pattern" to rawPattern,
-                    "avail" to String.format("%.4f", avail).toDouble(),
+                    "avail" to roundQty(avail),
                     "allocated" to true,
                     "breakdown" to breakdownByVariant.map { (vk, q) ->
-                        mapOf("variant_key" to vk, "output_qty" to String.format("%.4f", q).toDouble())
+                        mapOf("variant_key" to vk, "output_qty" to roundQty(q))
                     },
                 ))
             }
@@ -576,7 +576,7 @@ fun runAllocation(
                             log.info(
                                 "allocation step={} companion_raw_material comp={} pattern={} allocated={} " +
                                 "because critical={} making variant={} output_qty={}",
-                                stepCounter, compKey(c), cPattern, String.format("%.4f", taken),
+                                stepCounter, compKey(c), cPattern, roundQty(taken).toLong(),
                                 compKey(component), variantKey(item.variant), outputQtyActual
                             )
                             rawMaterialTrace.add(mapOf(
@@ -585,11 +585,11 @@ fun runAllocation(
                                 "comp_key" to compKey(c),
                                 "pattern" to cPattern,
                                 "allocated" to (taken > 0),
-                                "taken" to String.format("%.4f", taken).toDouble(),
-                                "need_actual" to String.format("%.4f", need).toDouble(),
+                                "taken" to roundQty(taken),
+                                "need_actual" to roundQty(need),
                                 "critical_component" to compKey(component),
                                 "variant_key" to variantKey(item.variant),
-                                "output_qty_actual" to String.format("%.4f", outputQtyActual).toDouble(),
+                                "output_qty_actual" to roundQty(outputQtyActual),
                             ))
                         }
                     }
@@ -618,7 +618,7 @@ fun runAllocation(
                     "target_location_id" to item.variant.locationId,
                     "req_component_ids" to reqCompList.map { compKey(it) },
                     "req_rates" to reqRates,
-                    "qty" to outputQtyActual,
+                    "qty" to roundQty(outputQtyActual),
                     "demand_id" to null,
                     "output_period" to outputPeriod,
                     "edge_type" to item.edgeType,
@@ -632,7 +632,7 @@ fun runAllocation(
                         "event" to "action_emitted_with_trace_component",
                         "step" to stepCounter,
                         "variant_key" to variantKey(item.variant),
-                        "qty" to outputQtyActual,
+                        "qty" to roundQty(outputQtyActual),
                         "req_component_ids" to reqCompList.map { compKey(it) },
                         "as_critical" to (component == traceComp),
                         "critical_component" to compKey(component),
@@ -649,9 +649,9 @@ fun runAllocation(
                     val payload = mutableMapOf<String, Any>(
                         "steps" to stepCounter,
                         "max_steps" to MAX_ALLOCATION_STEPS,
-                        "basket_total_qty" to String.format("%.2f", bTotalQty).toDouble(),
+                        "basket_total_qty" to roundQty(bTotalQty),
                         "basket_keys" to bKeys,
-                        "initial_basket_total_qty" to String.format("%.2f", initialBasketTotalQty).toDouble(),
+                        "initial_basket_total_qty" to roundQty(initialBasketTotalQty),
                         "initial_basket_keys" to initialBasketKeys,
                     )
                     if (stepCounter % PERSIST_SLICE_INTERVAL == 0) {
@@ -736,7 +736,7 @@ fun runAllocation(
                 "target_location_id" to variant.locationId,
                 "req_component_ids" to (t["req_component_ids"] ?: emptyList<String>()),
                 "req_rates" to (t["req_rates"] ?: emptyList<Double>()),
-                "qty" to give,
+                "qty" to roundQty(give),
                 "demand_id" to did,
                 "output_period" to outPer,
                 "edge_type" to t["edge_type"],
@@ -752,7 +752,7 @@ fun runAllocation(
                 "target_location_id" to variant.locationId,
                 "req_component_ids" to (t["req_component_ids"] ?: emptyList<String>()),
                 "req_rates" to (t["req_rates"] ?: emptyList<Double>()),
-                "qty" to remaining,
+                "qty" to roundQty(remaining),
                 "demand_id" to null,
                 "output_period" to outPer,
                 "edge_type" to t["edge_type"],
@@ -799,14 +799,14 @@ fun runAllocation(
             allocQty > 0 -> "partial"
             else -> "unfulfilled"
         }
-        mapOf("demand_id" to did, "product_id" to pid, "requested_qty" to reqQty, "allocated_qty" to allocQty, "status" to status)
+        mapOf("demand_id" to did, "product_id" to pid, "requested_qty" to roundQty(reqQty), "allocated_qty" to roundQty(allocQty), "status" to status)
     }
 
     // ── Flatten baskets ───────────────────────────────────────────────────────
     fun basketTotalsFlat(b: BasketByTime): Map<String, Double> =
         b.mapNotNull { (comp, buckets) ->
             val total = buckets.sumOf { it.first }
-            if (total > 0) compKey(comp) to total else null
+            if (total > 0) compKey(comp) to roundQty(total) else null
         }.toMap()
 
     return AllocationResult(
@@ -815,7 +815,7 @@ fun runAllocation(
         basketAlloc = basketTotalsFlat(basketAlloc),
         basketProd = basketTotalsFlat(basketProd),
         rawMaterialTrace = rawMaterialTrace,
-        consumedByNode = consumedByNode.mapValues { String.format("%.4f", it.value).toDouble() },
+        consumedByNode = consumedByNode.mapValues { roundQty(it.value) },
         trace = if (traceComp != null) traceEvents else null,
     )
 }

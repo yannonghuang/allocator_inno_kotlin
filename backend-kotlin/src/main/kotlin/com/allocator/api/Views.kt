@@ -4,6 +4,7 @@ import com.allocator.*
 import com.allocator.services.CaseLoader
 import com.allocator.services.TimeUtils
 import com.allocator.services.SkuPatterns
+import com.allocator.services.roundQty
 import com.allocator.services.runAllocation
 import io.ktor.server.application.*
 import io.ktor.server.response.*
@@ -146,7 +147,7 @@ private fun replayBasketSnapshots(
     val initialItems = basket.entries
         .filter { it.value > 0 }
         .sortedWith(compareBy({ compTotals[compFromNode(it.key)] ?: 0.0 }, { it.key }))
-        .map { (k, v) -> mapOf("key" to k, "display" to invNodeDisplay(k, sortedDates), "qty" to Math.round(v * 10000).toDouble() / 10000.0) }
+        .map { (k, v) -> mapOf("key" to k, "display" to invNodeDisplay(k, sortedDates), "qty" to roundQty(v)) }
 
     val basketDeltas = mutableListOf<Map<String, Any?>>()
     val fromInventoryIdToStep = mutableMapOf<String, Int>()
@@ -198,14 +199,14 @@ private fun replayBasketSnapshots(
             }
             val need = if (rate > 0) qty / rate else 0.0
             for ((node, take) in consumeFromBasketFifoReturnDelta(basket, ck, need)) {
-                purged.add(mapOf("key" to node, "display" to invNodeDisplay(node, sortedDates), "qty" to Math.round(take * 10000).toDouble() / 10000.0))
+                purged.add(mapOf("key" to node, "display" to invNodeDisplay(node, sortedDates), "qty" to roundQty(take)))
             }
         }
         val added = mutableListOf<Map<String, Any?>>()
         if (variantKey.isNotEmpty()) {
             val outNode = "$variantKey|$outPer"
             basket[outNode] = (basket[outNode] ?: 0.0) + qty
-            added.add(mapOf("key" to outNode, "display" to invNodeDisplay(outNode, sortedDates), "qty" to Math.round(qty * 10000).toDouble() / 10000.0))
+            added.add(mapOf("key" to outNode, "display" to invNodeDisplay(outNode, sortedDates), "qty" to roundQty(qty)))
         }
 
         if (maxDeltasToKeep == null || stepIndex < maxDeltasToKeep) {
@@ -222,7 +223,7 @@ private fun replayBasketSnapshots(
     }
     val basketFinal = basket.entries.filter { it.value > 0 }
         .sortedWith(compareBy({ compTotalsFinal[compFromNode(it.key)] ?: 0.0 }, { it.key }))
-        .map { (k, v) -> mapOf("key" to k, "display" to invNodeDisplay(k, sortedDates), "qty" to Math.round(v * 10000).toDouble() / 10000.0) }
+        .map { (k, v) -> mapOf("key" to k, "display" to invNodeDisplay(k, sortedDates), "qty" to roundQty(v)) }
 
     return BasketReplayResult(initialItems, basketDeltas, fromInventoryIdToStep, demandIdToStep, basketFinal)
 }
@@ -250,7 +251,7 @@ private fun buildAllocationViewFlat(
     val demandRows = mutableListOf<Map<String, Any?>>()
 
     for (a in actionsSorted) {
-        val qty = Math.round((a[AllocationActions.qty]) * 10000).toDouble() / 10000.0
+        val qty = a[AllocationActions.qty]
         if (qty <= 0) continue
         val targetPid = a[AllocationActions.targetProductId] ?: ""
         val targetLoc = a[AllocationActions.targetLocationId] ?: ""
@@ -309,7 +310,7 @@ private fun buildAllocationViewFlat(
             "to_variant_key_display" to (if (variantKey.isNotEmpty()) compKeyToAtV(variantKey) else ""),
             "output_period" to outPer,
             "output_date" to TimeUtils.periodToDate(outPer, sortedDates),
-            "qty" to qty,
+            "qty" to roundQty(qty),
             "demand_ids" to demandIds,
             "supply_id" to (if (reqKeysNorm.isNotEmpty()) keyToSupplyId[reqKeysNorm[0]] ?: "" else ""),
         ))
@@ -325,7 +326,7 @@ private fun buildAllocationViewFlat(
                 "to_variant_key" to variantKey,
                 "output_period" to outPer,
                 "output_date" to TimeUtils.periodToDate(outPer, sortedDates),
-                "qty" to qty,
+                "qty" to roundQty(qty),
                 "demand_ids" to listOf(demandId),
             ))
         }
@@ -355,7 +356,7 @@ fun Routing.viewRoutes() {
             // ── plan-based branch: derive consumption from plan_supply_allocation ──
             if (planRunId != null) {
                 val rows = transaction {
-                    PlanRuns.selectAll().where {
+                    val planRow = PlanRuns.selectAll().where {
                         (PlanRuns.id eq planRunId) and (PlanRuns.caseId eq caseId)
                     }.singleOrNull() ?: throw NoSuchElementException("Plan run not found")
 
@@ -377,6 +378,27 @@ fun Routing.viewRoutes() {
                         }
                     }
 
+                    // Supply-split overrides + their shortfall warnings from this plan run
+                    val overridesBySupply = mutableMapOf<String, JsonElement>()
+                    ManualOverrides.selectAll().where {
+                        (ManualOverrides.caseId eq caseId) and (ManualOverrides.entityType eq "supply_split")
+                    }.forEach { row ->
+                        val sid = row[ManualOverrides.entityKey]
+                        val payload = runCatching { jViews.parseToJsonElement(row[ManualOverrides.payload]) }.getOrNull()
+                        if (payload != null) overridesBySupply[sid] = payload
+                    }
+                    val warningSupplyIds = mutableSetOf<String>()
+                    val resultJson = planRow[PlanRuns.result]
+                    if (resultJson != null) {
+                        runCatching {
+                            val warnings = jViews.parseToJsonElement(resultJson).jsonObject["override_warnings"]?.jsonArray
+                            warnings?.forEach { w ->
+                                val sid = w.jsonObject["supply_id"]?.jsonPrimitive?.contentOrNull
+                                if (!sid.isNullOrBlank()) warningSupplyIds.add(sid)
+                            }
+                        }
+                    }
+
                     supplies.map { s ->
                         val sid = s[Supplies.supplyId]
                         val initRow = s[Supplies.qty]
@@ -384,6 +406,14 @@ fun Routing.viewRoutes() {
                         val residualRow = maxOf(0.0, initRow - consumedRow)
                         val utilRate = if (initRow > 0) consumedRow / initRow else null
                         val peggedDemands = demandsBySupplyKey[sid]?.size ?: 0
+                        val overridePayload = overridesBySupply[sid]
+                        val overrideEntry: JsonElement? = if (overridePayload != null) {
+                            val allocs = overridePayload.jsonObject["allocations"] ?: JsonArray(emptyList())
+                            buildJsonObject {
+                                put("allocations", allocs)
+                                put("warning", sid in warningSupplyIds)
+                            }
+                        } else null
                         mapOf(
                             "id" to s[Supplies.id],
                             "component_key" to "${s[Supplies.productId]}|${s[Supplies.locationId] ?: ""}",
@@ -391,12 +421,13 @@ fun Routing.viewRoutes() {
                             "supply_date" to s[Supplies.supplyDate],
                             "product_id" to s[Supplies.productId],
                             "location_id" to (s[Supplies.locationId] ?: ""),
-                            "initial_qty" to Math.round(initRow * 10000).toDouble() / 10000.0,
-                            "consumed_qty" to Math.round(consumedRow * 10000).toDouble() / 10000.0,
-                            "residual_qty" to Math.round(residualRow * 10000).toDouble() / 10000.0,
+                            "initial_qty" to roundQty(initRow),
+                            "consumed_qty" to roundQty(consumedRow),
+                            "residual_qty" to roundQty(residualRow),
                             "utilization_rate" to if (utilRate != null) Math.round(utilRate * 10000).toDouble() / 10000.0 else null,
                             "pegged_demands" to peggedDemands,
-                            "total_pegged_qty" to Math.round(consumedRow * 10000).toDouble() / 10000.0,
+                            "total_pegged_qty" to roundQty(consumedRow),
+                            "override" to overrideEntry,
                         )
                     }
                 }
@@ -420,6 +451,8 @@ fun Routing.viewRoutes() {
                             if (ur != null) put("utilization_rate", ur) else put("utilization_rate", JsonNull)
                             put("pegged_demands", row["pegged_demands"] as? Int ?: 0)
                             put("total_pegged_qty", row["total_pegged_qty"] as? Double ?: 0.0)
+                            val ov = row["override"] as? JsonElement
+                            if (ov != null) put("override", ov) else put("override", JsonNull)
                         })
                     })
                 })
@@ -534,9 +567,9 @@ fun Routing.viewRoutes() {
                         "supply_date" to s[Supplies.supplyDate],
                         "product_id" to s[Supplies.productId],
                         "location_id" to (s[Supplies.locationId] ?: ""),
-                        "initial_qty" to Math.round(initRow * 10000).toDouble() / 10000.0,
-                        "consumed_qty" to Math.round(consumedRow * 10000).toDouble() / 10000.0,
-                        "residual_qty" to Math.round(residualRow * 10000).toDouble() / 10000.0,
+                        "initial_qty" to roundQty(initRow),
+                        "consumed_qty" to roundQty(consumedRow),
+                        "residual_qty" to roundQty(residualRow),
                         "utilization_rate" to if (utilRate != null) Math.round(utilRate * 10000).toDouble() / 10000.0 else null,
                     )
                 }
@@ -631,11 +664,11 @@ fun Routing.viewRoutes() {
                     entry["total_consumed_qty"] = (entry["total_consumed_qty"] as? Double ?: 0.0) + qty
                     @Suppress("UNCHECKED_CAST")
                     (entry["nodes_consumed"] as MutableList<Map<String, Any?>>).add(
-                        mapOf("node" to node, "consumed_qty" to Math.round(qty * 10000).toDouble() / 10000.0)
+                        mapOf("node" to node, "consumed_qty" to roundQty(qty))
                     )
                 }
                 for ((_, e) in byPattern) {
-                    e["total_consumed_qty"] = Math.round((e["total_consumed_qty"] as? Double ?: 0.0) * 10000).toDouble() / 10000.0
+                    e["total_consumed_qty"] = roundQty(e["total_consumed_qty"] as? Double ?: 0.0)
                 }
                 byPattern
             }
@@ -737,7 +770,7 @@ fun Routing.viewRoutes() {
                     e["used"] = true
                     e["total_consumed_qty"] = (e["total_consumed_qty"] as? Double ?: 0.0) + qty
                     @Suppress("UNCHECKED_CAST")
-                    (e["nodes_consumed"] as MutableList<Map<String, Any?>>).add(mapOf("node" to node, "consumed_qty" to Math.round(qty * 10000).toDouble() / 10000.0))
+                    (e["nodes_consumed"] as MutableList<Map<String, Any?>>).add(mapOf("node" to node, "consumed_qty" to roundQty(qty)))
                 }
             }
 
@@ -748,7 +781,7 @@ fun Routing.viewRoutes() {
                 val total = info["total_consumed_qty"] as? Double ?: 0.0
                 @Suppress("UNCHECKED_CAST")
                 val nodes = (info["nodes_consumed"] as? List<Map<String, Any?>>) ?: emptyList()
-                summaryMap[pattern] = mapOf("total_consumed_qty" to Math.round(total * 10000).toDouble() / 10000.0, "node_count" to nodes.size)
+                summaryMap[pattern] = mapOf("total_consumed_qty" to roundQty(total), "node_count" to nodes.size)
                 for (item in nodes) {
                     val node = item["node"] as? String ?: ""
                     val parts = node.split("|")
@@ -951,7 +984,7 @@ fun Routing.viewRoutes() {
                         .map { (k, qty) ->
                             val (toId, et) = k
                             mapOf("to_inventory_id" to toId, "to_inventory_display" to (if (toId.isNotEmpty()) invNodeDisplay(toId, sortedDates) else ""),
-                                "qty" to Math.round(qty * 10000).toDouble() / 10000.0, "edge_type" to et,
+                                "qty" to roundQty(qty), "edge_type" to et,
                                 "to_variant_key" to (if (toId.isNotEmpty() && "|" in toId) toId.substringBeforeLast("|") else toId))
                         }
                     if (candidates.isEmpty()) continue
@@ -976,7 +1009,7 @@ fun Routing.viewRoutes() {
                         "to_inventory_id" to null,
                         "to_inventory_display" to null,
                         "candidates" to candidates,
-                        "total_qty" to Math.round(totalQty * 10000).toDouble() / 10000.0,
+                        "total_qty" to roundQty(totalQty),
                         "split_explanation" to splitExplanation,
                         "output_date" to r0["output_date"],
                         "output_period" to r0["output_period"],
