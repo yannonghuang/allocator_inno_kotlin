@@ -2,6 +2,7 @@ package com.allocator.api
 
 import com.allocator.*
 import com.allocator.services.TimeUtils
+import com.allocator.services.roundQty
 import io.ktor.server.application.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
@@ -88,7 +89,7 @@ internal fun feasibleDemandsFromActions(
         val req = v.requested; val alloc = v.allocated
         val status = if (alloc >= req) "fulfilled" else if (alloc > 0) "partial" else "unfulfilled"
         val suggestion = if (alloc >= req) "Fulfilled"
-            else if (alloc > 0) "Reduce to $alloc"
+            else if (alloc > 0) "Reduce to ${roundQty(alloc).toLong()}"
             else "Unfulfilled (0 allocated)"
         val revisedTime = TimeUtils.periodToDate(v.revisedPeriod, sortedDates)
         val fulfillmentRate = if (req > 0) alloc / req else null
@@ -97,8 +98,8 @@ internal fun feasibleDemandsFromActions(
             "customer_id" to v.customerId,
             "customer" to v.customer,
             "product_id" to v.productId,
-            "requested_qty" to req,
-            "allocated_qty" to alloc,
+            "requested_qty" to roundQty(req),
+            "allocated_qty" to roundQty(alloc),
             "fulfillment_rate" to if (fulfillmentRate != null) Math.round(fulfillmentRate * 10000).toDouble() / 10000.0 else null,
             "status" to status,
             "suggested_revision" to suggestion,
@@ -222,7 +223,7 @@ private fun buildInventoryGraph(
         val edges = edgeRealQty.entries
             .filter { it.value.first > 0 }
             .map { (k, v) ->
-                mutableMapOf<String, Any?>("from" to k.first, "to" to k.second, "qty" to Math.round(v.first * 10000).toDouble() / 10000.0,
+                mutableMapOf<String, Any?>("from" to k.first, "to" to k.second, "qty" to roundQty(v.first),
                     "period_from" to v.second, "period_to" to v.third)
             }.toMutableList()
 
@@ -315,9 +316,9 @@ private fun buildInventoryGraph(
                 val alreadyInv = outFlowInvInv[nid] ?: 0.0
                 val alreadyDemand = usedByNodeDemand[nid] ?: 0.0
                 val available = maxOf(0.0, nodeQty - alreadyInv - alreadyDemand)
-                val take = Math.round(minOf(available, remaining) * 10000).toDouble() / 10000.0
+                val take = minOf(available, remaining)
                 if (take > 0) {
-                    edges.add(mutableMapOf("from" to nid, "to" to demandNid, "qty" to take, "period_from" to null, "period_to" to null))
+                    edges.add(mutableMapOf("from" to nid, "to" to demandNid, "qty" to roundQty(take), "period_from" to null, "period_to" to null))
                     usedByNodeDemand[nid] = (usedByNodeDemand[nid] ?: 0.0) + take
                     remaining -= take
                 }
@@ -352,7 +353,7 @@ private fun buildInventoryGraph(
             val invInvSum = total - demandSum
             if (total > 0 && nodeQty >= 0 && demandSum > 0 && total > nodeQty) {
                 val scale = if (demandSum > 0) maxOf(0.0, minOf(1.0, (nodeQty - invInvSum) / demandSum)) else 0.0
-                e["qty"] = Math.round(((e["qty"] as? Double) ?: 0.0) * scale * 10000).toDouble() / 10000.0
+                e["qty"] = roundQty(((e["qty"] as? Double) ?: 0.0) * scale)
             } else if (demandSum <= 0 || nodeQty < 0) {
                 e["qty"] = 0.0
             }
@@ -613,7 +614,7 @@ fun Routing.peggingRoutes() {
                 val currentSum = invToThisDemand.sumOf { (it["qty"] as? Double) ?: 0.0 }
                 if (currentSum > 0 && allocatedQty >= 0) {
                     val scale = allocatedQty / currentSum
-                    for (e in invToThisDemand) e["qty"] = Math.round(((e["qty"] as? Double) ?: 0.0) * scale * 10000).toDouble() / 10000.0
+                    for (e in invToThisDemand) e["qty"] = roundQty(((e["qty"] as? Double) ?: 0.0) * scale)
                 }
 
                 call.respond(buildJsonObject {
@@ -628,8 +629,8 @@ fun Routing.peggingRoutes() {
                     put("sorted_dates", buildJsonArray { sortedDates.forEach { add(it) } })
                     put("demand_id", did)
                     put("demand_root_id", demandRootId)
-                    put("demand_allocated_qty", Math.round(allocatedQty * 10000).toDouble() / 10000.0)
-                    put("demand_requested_qty", Math.round(requestedQty * 10000).toDouble() / 10000.0)
+                    put("demand_allocated_qty", roundQty(allocatedQty))
+                    put("demand_requested_qty", roundQty(requestedQty))
                 })
             }
 
@@ -667,8 +668,8 @@ fun Routing.peggingRoutes() {
                                 val total = outSum[nid] ?: 0.0
                                 add(buildJsonObject {
                                     put("node_id", nid)
-                                    put("node_qty", Math.round(nodeQty * 10000).toDouble() / 10000.0)
-                                    put("demand_edge_sum", Math.round(total * 10000).toDouble() / 10000.0)
+                                    put("node_qty", roundQty(nodeQty))
+                                    put("demand_edge_sum", roundQty(total))
                                     put("ok", total <= nodeQty + 1e-6)
                                 })
                             }

@@ -660,8 +660,8 @@ fun runConsolidation(
                 mapOf(
                     "demand_id"     to need.demandId,
                     "parent_product" to need.parentProductId,
-                    "requested_qty" to need.qty,
-                    "allocated_qty" to (split[need.demandId] ?: 0.0),
+                    "requested_qty" to roundQty(need.qty),
+                    "allocated_qty" to roundQty(split[need.demandId] ?: 0.0),
                     "priority"      to need.priority,
                 )
             }
