@@ -1064,6 +1064,7 @@ private fun enrichPlanResultWithData(
     val kpis = planKpis(data, enriched, bomPairs)
     enriched["plan_kpis"] = kpis
     enriched["supply_summary"] = (kpis["inventory"] ?: emptyMap<String, Any?>())
+
     return enriched
 }
 

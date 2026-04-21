@@ -355,7 +355,7 @@ fun Routing.viewRoutes() {
             // ── plan-based branch: derive consumption from plan_supply_allocation ──
             if (planRunId != null) {
                 val rows = transaction {
-                    PlanRuns.selectAll().where {
+                    val planRow = PlanRuns.selectAll().where {
                         (PlanRuns.id eq planRunId) and (PlanRuns.caseId eq caseId)
                     }.singleOrNull() ?: throw NoSuchElementException("Plan run not found")
 
@@ -377,6 +377,27 @@ fun Routing.viewRoutes() {
                         }
                     }
 
+                    // Supply-split overrides + their shortfall warnings from this plan run
+                    val overridesBySupply = mutableMapOf<String, JsonElement>()
+                    ManualOverrides.selectAll().where {
+                        (ManualOverrides.caseId eq caseId) and (ManualOverrides.entityType eq "supply_split")
+                    }.forEach { row ->
+                        val sid = row[ManualOverrides.entityKey]
+                        val payload = runCatching { jViews.parseToJsonElement(row[ManualOverrides.payload]) }.getOrNull()
+                        if (payload != null) overridesBySupply[sid] = payload
+                    }
+                    val warningSupplyIds = mutableSetOf<String>()
+                    val resultJson = planRow[PlanRuns.result]
+                    if (resultJson != null) {
+                        runCatching {
+                            val warnings = jViews.parseToJsonElement(resultJson).jsonObject["override_warnings"]?.jsonArray
+                            warnings?.forEach { w ->
+                                val sid = w.jsonObject["supply_id"]?.jsonPrimitive?.contentOrNull
+                                if (!sid.isNullOrBlank()) warningSupplyIds.add(sid)
+                            }
+                        }
+                    }
+
                     supplies.map { s ->
                         val sid = s[Supplies.supplyId]
                         val initRow = s[Supplies.qty]
@@ -384,6 +405,14 @@ fun Routing.viewRoutes() {
                         val residualRow = maxOf(0.0, initRow - consumedRow)
                         val utilRate = if (initRow > 0) consumedRow / initRow else null
                         val peggedDemands = demandsBySupplyKey[sid]?.size ?: 0
+                        val overridePayload = overridesBySupply[sid]
+                        val overrideEntry: JsonElement? = if (overridePayload != null) {
+                            val allocs = overridePayload.jsonObject["allocations"] ?: JsonArray(emptyList())
+                            buildJsonObject {
+                                put("allocations", allocs)
+                                put("warning", sid in warningSupplyIds)
+                            }
+                        } else null
                         mapOf(
                             "id" to s[Supplies.id],
                             "component_key" to "${s[Supplies.productId]}|${s[Supplies.locationId] ?: ""}",
@@ -397,6 +426,7 @@ fun Routing.viewRoutes() {
                             "utilization_rate" to if (utilRate != null) Math.round(utilRate * 10000).toDouble() / 10000.0 else null,
                             "pegged_demands" to peggedDemands,
                             "total_pegged_qty" to Math.round(consumedRow * 10000).toDouble() / 10000.0,
+                            "override" to overrideEntry,
                         )
                     }
                 }
@@ -420,6 +450,8 @@ fun Routing.viewRoutes() {
                             if (ur != null) put("utilization_rate", ur) else put("utilization_rate", JsonNull)
                             put("pegged_demands", row["pegged_demands"] as? Int ?: 0)
                             put("total_pegged_qty", row["total_pegged_qty"] as? Double ?: 0.0)
+                            val ov = row["override"] as? JsonElement
+                            if (ov != null) put("override", ov) else put("override", JsonNull)
                         })
                     })
                 })

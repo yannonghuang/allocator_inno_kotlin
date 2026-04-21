@@ -11,11 +11,14 @@ import io.ktor.server.routing.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.*
 import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.slf4j.LoggerFactory
+import java.time.Instant
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 import java.util.UUID
@@ -24,6 +27,10 @@ import java.util.concurrent.ConcurrentHashMap
 private val log = LoggerFactory.getLogger("com.allocator.MaterialImpactRoute")
 private val materialImpactScope = CoroutineScope(Dispatchers.IO)
 private val materialImpactJobs = ConcurrentHashMap<String, MutableMap<String, Any?>>()
+// Cap concurrent re-plans to protect heap during bulk criticality scans.
+private val replanSemaphore = Semaphore(permits = 2)
+// Terminal jobs older than this are swept on GET in case the client abandoned polling.
+private const val JOB_TTL_SECONDS = 600L
 
 // ── DTOs ──────────────────────────────────────────────────────────────────────
 
@@ -213,6 +220,7 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
             materialImpactJobs[jobId]?.apply {
                 set("status", "failed")
                 set("error", "Supply '${req.supplyId}' not found")
+                set("completedAt", Instant.now())
             }
             return
         }
@@ -264,7 +272,11 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
                 quantityDecreaseAbs = req.quantityDecreaseAbs,
                 impactedDemandCount = 0, impacts = emptyList(), note = note,
             )
-            materialImpactJobs[jobId]?.apply { set("status", "completed"); set("result", Json.encodeToJsonElement(resp)) }
+            materialImpactJobs[jobId]?.apply {
+                set("status", "completed")
+                set("result", Json.encodeToJsonElement(resp))
+                set("completedAt", Instant.now())
+            }
             return
         }
 
@@ -305,10 +317,12 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
             }.getOrNull()
         }
 
-        // 5. Re-run planning with the mutated supply
+        // 5. Re-run planning with the mutated supply (bounded concurrency via semaphore)
         log.info("material-impact re-plan: jobId={} supplyId={} delay={} qtyDecrease={}",
             jobId, req.supplyId, req.deliveryDelayDays, req.quantityDecreasePct)
-        val contingentResult = runPlanning(mutatedData, config = parsedConfig)
+        val contingentResult = replanSemaphore.withPermit {
+            runPlanning(mutatedData, config = parsedConfig)
+        }
 
         // 6. Persist contingent plan run + material event record (only when persist=true)
         val contingentPlanRunId: Int? = if (req.persist) {
@@ -369,66 +383,74 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
                 quantityDecreaseAbs = req.quantityDecreaseAbs,
                 impactedDemandCount = 0, impacts = emptyList(),
             )
-            materialImpactJobs[jobId]?.apply { set("status", "completed"); set("result", Json.encodeToJsonElement(resp)) }
+            materialImpactJobs[jobId]?.apply {
+                set("status", "completed")
+                set("result", Json.encodeToJsonElement(resp))
+                set("completedAt", Instant.now())
+            }
             return
         }
 
-        // 8. Fetch demand metadata for impacted demands — read all columns inside transaction
-        val demandMetas: List<DemandMeta> = transaction {
-            Demands.selectAll()
-                .where { (Demands.caseId eq caseId) and (Demands.demandId inList impactedDemandIds.toList()) }
-                .map { d ->
-                    DemandMeta(
-                        demandId = d[Demands.demandId],
-                        productId = d[Demands.productId],
-                        locationId = d[Demands.locationId],
-                        customerId = d[Demands.customerId],
-                        description = d[Demands.description],
-                        priority = d[Demands.priority],
-                        requestDueTime = d[Demands.requestDueTime],
-                        requestedQty = d[Demands.quantity],
+        // 8. Build impacts list — only when persist=true (interactive what-if).
+        // Bulk criticality scans (persist=false) only read `impactedDemandCount`, so skip
+        // the demand-metadata DB fetch + per-demand payload to keep the job map payload small.
+        val impacts: List<MaterialImpactedDemand> = if (req.persist) {
+            val demandMetas: List<DemandMeta> = transaction {
+                Demands.selectAll()
+                    .where { (Demands.caseId eq caseId) and (Demands.demandId inList impactedDemandIds.toList()) }
+                    .map { d ->
+                        DemandMeta(
+                            demandId = d[Demands.demandId],
+                            productId = d[Demands.productId],
+                            locationId = d[Demands.locationId],
+                            customerId = d[Demands.customerId],
+                            description = d[Demands.description],
+                            priority = d[Demands.priority],
+                            requestDueTime = d[Demands.requestDueTime],
+                            requestedQty = d[Demands.quantity],
+                        )
+                    }
+            }
+
+            demandMetas.map { d ->
+                val did = d.demandId
+                val base = baselineOutcomes[did]
+                val cont = contingentOutcomes[did]
+                val baseQty = base?.effectiveQty ?: 0.0
+                val contQty = cont?.effectiveQty ?: 0.0
+                val qtyDelta = contQty - baseQty
+                val contingentFailed = contQty < 1e-9
+                val status = when {
+                    contingentFailed -> "newly_failed"
+                    else -> "qty_reduced"
+                }
+                MaterialImpactedDemand(
+                    demandId = did,
+                    productId = d.productId,
+                    locationId = d.locationId,
+                    customerId = d.customerId,
+                    description = d.description,
+                    priority = d.priority,
+                    requestDueTime = d.requestDueTime,
+                    requestedQty = d.requestedQty,
+                    consumedSupplyQty = baseQty,
+                    status = status,
+                    baselineCommittedQty = baseQty,
+                    contingentCommittedQty = contQty,
+                    qtyDelta = qtyDelta,
+                    baselineFailed = base?.failureReason != null,
+                    contingentFailed = contingentFailed,
+                    contingentCommitReason = cont?.failureReason,
+                )
+            }.also { list ->
+                list.forEach { d ->
+                    log.info(
+                        "  impacted: demandId={} baselineQty={} contingentQty={} delta={} status={}",
+                        d.demandId, d.baselineCommittedQty, d.contingentCommittedQty, d.qtyDelta, d.status,
                     )
                 }
-        }
-
-        val impacts = demandMetas.map { d ->
-            val did = d.demandId
-            val base = baselineOutcomes[did]
-            val cont = contingentOutcomes[did]
-            val baseQty = base?.effectiveQty ?: 0.0
-            val contQty = cont?.effectiveQty ?: 0.0
-            val qtyDelta = contQty - baseQty
-            val contingentFailed = contQty < 1e-9
-            val status = when {
-                contingentFailed -> "newly_failed"
-                else -> "qty_reduced"
             }
-            MaterialImpactedDemand(
-                demandId = did,
-                productId = d.productId,
-                locationId = d.locationId,
-                customerId = d.customerId,
-                description = d.description,
-                priority = d.priority,
-                requestDueTime = d.requestDueTime,
-                requestedQty = d.requestedQty,
-                consumedSupplyQty = baseQty,
-                status = status,
-                baselineCommittedQty = baseQty,
-                contingentCommittedQty = contQty,
-                qtyDelta = qtyDelta,
-                baselineFailed = base?.failureReason != null,
-                contingentFailed = contingentFailed,
-                contingentCommitReason = cont?.failureReason,
-            )
-        }
-
-        impacts.forEach { d ->
-            log.info(
-                "  impacted: demandId={} baselineQty={} contingentQty={} delta={} status={}",
-                d.demandId, d.baselineCommittedQty, d.contingentCommittedQty, d.qtyDelta, d.status,
-            )
-        }
+        } else emptyList()
 
         val resp = MaterialImpactResponse(
             caseId = caseId, planRunId = baselinePlanRunId,
@@ -436,16 +458,21 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
             supply = supply,
             deliveryDelayDays = req.deliveryDelayDays,
             quantityDecreasePct = req.quantityDecreasePct,
-            impactedDemandCount = impacts.size,
+            impactedDemandCount = impactedDemandIds.size,
             impacts = impacts,
         )
-        materialImpactJobs[jobId]?.apply { set("status", "completed"); set("result", Json.encodeToJsonElement(resp)) }
+        materialImpactJobs[jobId]?.apply {
+            set("status", "completed")
+            set("result", Json.encodeToJsonElement(resp))
+            set("completedAt", Instant.now())
+        }
 
     } catch (e: Exception) {
         log.error("material-impact job $jobId failed: ${e.message}", e)
         materialImpactJobs[jobId]?.apply {
             set("status", "failed")
             set("error", e.message ?: "Unknown error")
+            set("completedAt", Instant.now())
         }
     }
 }
@@ -502,13 +529,26 @@ fun Routing.materialImpactRoutes() {
                 ?: throw IllegalArgumentException("jobId required")
             val job = materialImpactJobs[jobId]
                 ?: throw NoSuchElementException("Material impact job '$jobId' not found")
+            val status = job["status"]?.toString() ?: "unknown"
             call.respond(buildJsonObject {
-                put("status", job["status"]?.toString() ?: "unknown")
+                put("status", status)
                 val result = job["result"]
                 if (result != null) put("result", resultToJson(result))
                 val error = job["error"]
                 if (error != null) put("error", error.toString())
             })
+            // Evict on client-observed terminal state so completed/failed jobs don't pile up.
+            if (status == "completed" || status == "failed") {
+                materialImpactJobs.remove(jobId)
+            }
+            // Opportunistic TTL sweep: drop terminal jobs where the client abandoned polling.
+            val cutoff = Instant.now().minusSeconds(JOB_TTL_SECONDS)
+            materialImpactJobs.entries.removeIf { (_, j) ->
+                val s = j["status"]?.toString()
+                val completedAt = j["completedAt"] as? Instant
+                (s == "completed" || s == "failed") &&
+                    completedAt != null && completedAt.isBefore(cutoff)
+            }
         }
     }
 }

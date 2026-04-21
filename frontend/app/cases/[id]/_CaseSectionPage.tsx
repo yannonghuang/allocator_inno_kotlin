@@ -803,8 +803,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
 
   // ── Override dialog state ───────────────────────────────────────────────────
   const [overrideDialogOpen, setOverrideDialogOpen] = useState(false);
-  const [overrideDialogType, setOverrideDialogType] = useState<'method_selection' | 'variant_selection' | 'component_split' | null>(null);
+  const [overrideDialogType, setOverrideDialogType] = useState<'method_selection' | 'variant_selection' | 'component_split' | 'supply_split' | null>(null);
   const [overrideDialogWo, setOverrideDialogWo] = useState<WorkOrder | null>(null);
+  const [overrideDialogSupply, setOverrideDialogSupply] = useState<PlanSupplyViewRow | null>(null);
   const [overrideDialogSaving, setOverrideDialogSaving] = useState(false);
   const [overrideDialogError, setOverrideDialogError] = useState<string | null>(null);
   // Structured override form state (type-specific; avoids raw JSON editing)
@@ -816,6 +817,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     requested_qty: number;
     priority: number;
     parent_product: string;
+  }>>([]);
+  const [overrideSupplyRows, setOverrideSupplyRows] = useState<Array<{
+    demand_id: string;
+    qty: number;
+    requested_qty: number;
+    consumed_qty: number;
+    customer: string | null;
   }>>([]);
 
   // Panel resize state
@@ -1980,16 +1988,30 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return m;
   }, [planSupplyViewRows]);
 
+  const handleAnalyzeCriticalityForSupply = async (supplyId: string) => {
+    setSupplyCriticalityMap(prev => ({ ...prev, [supplyId]: 'running' }));
+    try {
+      const result = await analyzeMaterialImpact(supplyId, 0, 100, false);
+      setSupplyCriticalityMap(prev => ({ ...prev, [supplyId]: result.impactedDemandCount > 0 ? 'critical' : 'not_critical' }));
+    } catch {
+      setSupplyCriticalityMap(prev => ({ ...prev, [supplyId]: 'error' }));
+    }
+  };
+
   const handleAnalyzeCriticality = async () => {
     const all = planSupplyViewRows.filter(r => !r.supplyId.toLowerCase().endsWith('_dummy'));
     if (all.length === 0) return;
 
-    // Supplies with zero consumption are trivially safe — skip re-plan for them
-    const trivialSafe = all.filter(r => r.consumedQty === 0);
-    const needsAnalysis = all.filter(r => r.consumedQty > 0);
+    // Skip supplies that already have a status (critical / not_critical / error) —
+    // users can retry individual errors via the per-row Analyze button, or Reset to clear.
+    const pending = all.filter(r => !supplyCriticalityMap[r.supplyId]);
+    // Among pending, zero-consumption is trivially safe — skip re-plan for them
+    const trivialSafe = pending.filter(r => r.consumedQty === 0);
+    const needsAnalysis = pending.filter(r => r.consumedQty > 0);
+    const alreadyDone = all.length - pending.length;
 
     setCriticalityRunning(true);
-    setCriticalityProgress({ done: trivialSafe.length, total: all.length });
+    setCriticalityProgress({ done: alreadyDone + trivialSafe.length, total: all.length });
     setSupplyCriticalityMap(prev => {
       const next = { ...prev };
       for (const r of trivialSafe) next[r.supplyId] = 'not_critical';
@@ -1997,20 +2019,36 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       return next;
     });
 
-    const BATCH = 5;
-    let done = trivialSafe.length;
+    const BATCH = 3;
+    const total = all.length;
+    let done = alreadyDone + trivialSafe.length;
     for (let i = 0; i < needsAnalysis.length; i += BATCH) {
-      const batch = needsAnalysis.slice(i, i + BATCH);
-      await Promise.all(batch.map(async (r) => {
-        try {
-          const result = await analyzeMaterialImpact(r.supplyId, 0, 100, false);
-          setSupplyCriticalityMap(prev => ({ ...prev, [r.supplyId]: result.impactedDemandCount > 0 ? 'critical' : 'not_critical' }));
-        } catch {
-          setSupplyCriticalityMap(prev => ({ ...prev, [r.supplyId]: 'error' }));
-        }
-        done++;
-        setCriticalityProgress({ done, total: all.length });
-      }));
+      // Only keep (supplyId, status) — the MaterialImpactResult contains a large
+      // `impacts[]` array we don't need; destructuring immediately lets it be GC'd
+      // as soon as analyzeMaterialImpact's microtask settles.
+      const updates: Array<[string, 'critical' | 'not_critical' | 'error']> = [];
+      await Promise.all(
+        needsAnalysis.slice(i, i + BATCH).map(async (r) => {
+          const sid = r.supplyId;
+          try {
+            const { impactedDemandCount } = await analyzeMaterialImpact(sid, 0, 100, false);
+            updates.push([sid, impactedDemandCount > 0 ? 'critical' : 'not_critical']);
+          } catch {
+            updates.push([sid, 'error']);
+          }
+        })
+      );
+      // Single setState per batch instead of per result → O(N) clones instead of O(N²).
+      done += updates.length;
+      setSupplyCriticalityMap(prev => {
+        const next = { ...prev };
+        for (const [sid, status] of updates) next[sid] = status;
+        return next;
+      });
+      setCriticalityProgress({ done, total });
+      // Yield to the event loop so the browser can run idle GC + paint updates
+      // before we spin up the next batch of re-plans.
+      await new Promise(resolve => setTimeout(resolve, 0));
     }
     setCriticalityRunning(false);
   };
@@ -2271,45 +2309,86 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   };
 
   const handleSaveOverride = async () => {
-    if (!overrideDialogType || !overrideDialogWo) return;
+    if (!overrideDialogType) return;
+    // supply_split uses overrideDialogSupply, not overrideDialogWo
+    if (overrideDialogType !== 'supply_split' && !overrideDialogWo) return;
+    if (overrideDialogType === 'supply_split' && !overrideDialogSupply) return;
     setOverrideDialogSaving(true);
     setOverrideDialogError(null);
     try {
-      const productId = overrideDialogWo.product_id ?? '';
-      const locationId = overrideDialogWo.location_id ?? '';
-      const demandId = overrideDialogWo.demand_id ?? '';
-
       let payload: Record<string, unknown>;
-      if (overrideDialogType === 'method_selection') {
-        if (!overrideMethodValue.trim()) { setOverrideDialogError('Select a method'); setOverrideDialogSaving(false); return; }
-        payload = { method: overrideMethodValue.trim() };
-      } else if (overrideDialogType === 'variant_selection') {
-        if (!overrideVariantValue.trim()) { setOverrideDialogError('Enter an ALT_GROUP value'); setOverrideDialogSaving(false); return; }
-        payload = { alt_group: overrideVariantValue.trim() };
-      } else {
-        // component_split
-        const allocations = overrideSplitRows.map((r) => ({ demand_id: r.demand_id, qty: Number(r.qty) }));
-        payload = { allocations };
-      }
-
       let entityKey: string;
-      if (overrideDialogType === 'component_split') {
-        entityKey = overrideDialogWo.start_time
-          ? `${productId}|${locationId}|${overrideDialogWo.start_time.slice(0, 10)}`
-          : `${productId}|${locationId}`;
+
+      if (overrideDialogType === 'supply_split') {
+        const supply = overrideDialogSupply!;
+        const allocations = overrideSupplyRows
+          .filter((r) => Number(r.qty) > 0)
+          .map((r) => ({ demand_id: r.demand_id, qty: Number(r.qty) }));
+        payload = { allocations };
+        entityKey = supply.supplyId;
       } else {
-        entityKey = demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`;
+        const wo = overrideDialogWo!;
+        const productId = wo.product_id ?? '';
+        const locationId = wo.location_id ?? '';
+        const demandId = wo.demand_id ?? '';
+
+        if (overrideDialogType === 'method_selection') {
+          if (!overrideMethodValue.trim()) { setOverrideDialogError('Select a method'); setOverrideDialogSaving(false); return; }
+          payload = { method: overrideMethodValue.trim() };
+          entityKey = demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`;
+        } else if (overrideDialogType === 'variant_selection') {
+          if (!overrideVariantValue.trim()) { setOverrideDialogError('Enter an ALT_GROUP value'); setOverrideDialogSaving(false); return; }
+          payload = { alt_group: overrideVariantValue.trim() };
+          entityKey = demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`;
+        } else {
+          // component_split
+          const allocations = overrideSplitRows.map((r) => ({ demand_id: r.demand_id, qty: Number(r.qty) }));
+          payload = { allocations };
+          entityKey = wo.start_time
+            ? `${productId}|${locationId}|${wo.start_time.slice(0, 10)}`
+            : `${productId}|${locationId}`;
+        }
       }
       await upsertOverride(id, overrideDialogType, entityKey, payload);
       await loadOverrides();
       setOverrideDialogOpen(false);
       setOverrideDialogWo(null);
+      setOverrideDialogSupply(null);
       setOverrideDialogType(null);
     } catch (e) {
       setOverrideDialogError(e instanceof Error ? e.message : 'Failed to save override');
     } finally {
       setOverrideDialogSaving(false);
     }
+  };
+
+  const openSupplyOverrideDialog = (supply: PlanSupplyViewRow) => {
+    setOverrideDialogType('supply_split');
+    setOverrideDialogSupply(supply);
+    setOverrideDialogWo(null);
+    setOverrideDialogError(null);
+    // Pre-populate: one row per pegged demand, qty = current consumed_qty
+    const existing = overrides.find(
+      (o) => o.entity_type === 'supply_split' && o.entity_key === supply.supplyId
+    );
+    const savedAllocs = existing
+      ? (((existing.payload as Record<string, unknown>).allocations as Array<{ demand_id: string; qty: number }> | undefined) ?? [])
+      : [];
+    const byDemand = new Map<string, number>();
+    for (const a of savedAllocs) byDemand.set(a.demand_id, Number(a.qty));
+
+    const rows = supply.peggedDemands.map((d) => {
+      const requested = feasibleDemands?.find((fd) => fd.demand_id === d.demandId)?.requested_qty ?? 0;
+      return {
+        demand_id: d.demandId,
+        qty: byDemand.has(d.demandId) ? byDemand.get(d.demandId)! : d.qtyConsumed,
+        requested_qty: requested,
+        consumed_qty: d.qtyConsumed,
+        customer: d.customer,
+      };
+    });
+    setOverrideSupplyRows(rows);
+    setOverrideDialogOpen(true);
   };
 
   // ── Assessment handlers ─────────────────────────────────────────────────────
@@ -4499,7 +4578,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           idKey="_key"
                           rows={rows.map((r, i) => {
                             const cs = supplyCriticalityMap[r.supplyId];
-                            const criticalityOrder = cs === 'critical' ? 0 : cs === 'not_critical' ? 1 : cs === 'error' ? 2 : cs === 'running' ? 3 : 4;
+                            const autoSafe = !cs && r.consumedQty === 0;
+                            const criticalityOrder = cs === 'critical' ? 0 : (cs === 'not_critical' || autoSafe) ? 1 : cs === 'error' ? 2 : cs === 'running' ? 3 : 4;
                             return { ...r, _key: `psv-${i}-${r.supplyId}`, productTotal: planSupplyProductTotalMap[r.productId] ?? 0, criticalityOrder };
                           })}
                           filterKeys={[]}
@@ -4507,11 +4587,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           columns={[
                             { key: 'criticalityOrder', label: 'Criticality', sortable: true, render: (r) => {
                               const cs = supplyCriticalityMap[r.supplyId];
-                              if (!cs) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
                               if (cs === 'running') return <span style={{ color: '#a1a1aa', fontSize: '0.75rem' }}>…</span>;
                               if (cs === 'error') return <span style={{ color: '#f59e0b', fontSize: '0.72rem' }}>err</span>;
                               if (cs === 'critical') return <span style={{ background: 'rgba(248,113,113,0.15)', color: '#f87171', border: '1px solid rgba(248,113,113,0.4)', borderRadius: 8, padding: '1px 8px', fontSize: '0.72rem', fontWeight: 700 }}>Critical</span>;
-                              return <span style={{ background: 'rgba(52,211,153,0.12)', color: '#34d399', border: '1px solid rgba(52,211,153,0.35)', borderRadius: 8, padding: '1px 8px', fontSize: '0.72rem', fontWeight: 700 }}>Safe</span>;
+                              if (cs === 'not_critical') return <span style={{ background: 'rgba(52,211,153,0.12)', color: '#34d399', border: '1px solid rgba(52,211,153,0.35)', borderRadius: 8, padding: '1px 8px', fontSize: '0.72rem', fontWeight: 700 }}>Safe</span>;
+                              // Auto-safe: zero consumption cannot impact any demand.
+                              if (r.consumedQty === 0) return <span title="Zero consumption — cannot impact demands" style={{ background: 'rgba(52,211,153,0.08)', color: '#34d399', border: '1px solid rgba(52,211,153,0.25)', borderRadius: 8, padding: '1px 8px', fontSize: '0.72rem', fontWeight: 600, opacity: 0.85 }}>Safe</span>;
+                              // No status yet AND util > 0 — offer per-row analysis.
+                              return (
+                                <button type="button" className="secondary"
+                                  disabled={criticalityRunning}
+                                  onClick={() => handleAnalyzeCriticalityForSupply(r.supplyId)}
+                                  style={{ fontSize: '0.7rem', padding: '1px 8px' }}
+                                  title="Analyze criticality for this supply">
+                                  Analyze
+                                </button>
+                              );
                             }},
                             { key: 'supplyId', label: tP('supplyView.columns.supplyId'), sortable: true },
                             { key: 'productId', label: tP('supplyView.columns.product'), sortable: true },
@@ -4531,28 +4622,71 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             }},
                             { key: 'peggedDemandCount', label: tP('supplyView.columns.peggedDemands'), sortable: true, render: (r) => r.peggedDemandCount > 0 ? <span style={{ color: '#60a5fa' }}>{r.peggedDemandCount}</span> : <span style={{ color: '#52525b' }}>0</span> },
                             { key: 'totalPeggedQty', label: tP('supplyView.columns.totalPeggedQty'), sortable: true, render: (r) => r.totalPeggedQty > 0 ? Number(r.totalPeggedQty).toLocaleString() : <span style={{ color: '#52525b' }}>0</span> },
-                            { key: '_sup_splitInfo' as keyof (PlanSupplyViewRow & { _key: string }), label: tP('supplyView.columns.splitInfo'), sortable: false, render: (r) => {
-                              const info = r.splitInfo;
-                              if (!info) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
-                              const short = info.groupTotalProduced < info.groupTotalNeed - 1e-6;
-                              const modeColor = info.mode === 'fair' ? '#34d399' : info.mode === 'proportional' ? '#60a5fa' : '#f59e0b';
-                              const title = [
-                                `Group: ${info.groupProductId} @ ${info.groupLocationId}`,
-                                `Policy: ${info.mode}`,
-                                `Candidates: ${info.candidateCount} demand(s)`,
-                                `Need: ${info.groupTotalNeed.toLocaleString()}`,
-                                `Produced: ${info.groupTotalProduced.toLocaleString()}`,
-                                short ? `Shortage: ${(info.groupTotalNeed - info.groupTotalProduced).toLocaleString()}` : 'No shortage',
-                              ].join('\n');
-                              return (
-                                <span title={title} style={{ fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
-                                  <span style={{ color: modeColor, fontWeight: 600 }}>{info.mode}</span>
-                                  <span style={{ color: '#71717a' }}> · </span>
-                                  <span style={{ color: '#a1a1aa' }}>{info.candidateCount}d</span>
-                                  <span style={{ color: '#71717a' }}> · </span>
-                                  <span style={{ color: short ? '#f87171' : '#a1a1aa' }}>
-                                    {Number(info.groupTotalProduced).toLocaleString()}/{Number(info.groupTotalNeed).toLocaleString()}
+                            { key: '_sup_override' as keyof (PlanSupplyViewRow & { _key: string }), label: tP('supplyView.columns.override'), sortable: false, render: (r) => {
+                              const ov = r.override;
+                              const eligible = r.peggedDemandCount >= 2;
+                              if (ov) {
+                                const n = ov.allocations.length;
+                                const warn = !!ov.warning;
+                                const overrideRecord = overrides.find((o) => o.entity_type === 'supply_split' && o.entity_key === r.supplyId);
+                                return (
+                                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
+                                    <span style={{ color: warn ? '#f87171' : '#fbbf24', fontWeight: 600 }}
+                                          title={warn ? tP('supplyView.overrideWarn') : undefined}>
+                                      {tP('supplyView.overrideActive', { n: String(n) })}{warn ? ' ⚠' : ''}
+                                    </span>
+                                    <button type="button" className="secondary"
+                                      style={{ fontSize: '0.7rem', padding: '1px 6px' }}
+                                      onClick={() => openSupplyOverrideDialog(r)}>
+                                      {tP('supplyView.edit')}
+                                    </button>
+                                    {overrideRecord && (
+                                      <button type="button" className="secondary"
+                                        style={{ fontSize: '0.7rem', padding: '1px 6px', color: '#f87171', borderColor: 'rgba(248,113,113,0.4)' }}
+                                        onClick={async () => {
+                                          try { await deleteOverride(id, overrideRecord.id); await loadOverrides(); }
+                                          catch (e) { setError(e instanceof Error ? e.message : 'Failed to clear override'); }
+                                        }}>
+                                        {tP('supplyView.clear')}
+                                      </button>
+                                    )}
                                   </span>
+                                );
+                              }
+                              const info = r.splitInfo;
+                              const chip = info ? (() => {
+                                const short = info.groupTotalProduced < info.groupTotalNeed - 1e-6;
+                                const modeColor = info.mode === 'fair' ? '#34d399' : info.mode === 'proportional' ? '#60a5fa' : '#f59e0b';
+                                const title = [
+                                  `Group: ${info.groupProductId} @ ${info.groupLocationId}`,
+                                  `Policy: ${info.mode}`,
+                                  `Candidates: ${info.candidateCount} demand(s)`,
+                                  `Need: ${info.groupTotalNeed.toLocaleString()}`,
+                                  `Produced: ${info.groupTotalProduced.toLocaleString()}`,
+                                  short ? `Shortage: ${(info.groupTotalNeed - info.groupTotalProduced).toLocaleString()}` : 'No shortage',
+                                ].join('\n');
+                                return (
+                                  <span title={title} style={{ fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
+                                    <span style={{ color: modeColor, fontWeight: 600 }}>{info.mode}</span>
+                                    <span style={{ color: '#71717a' }}> · </span>
+                                    <span style={{ color: '#a1a1aa' }}>{info.candidateCount}d</span>
+                                    <span style={{ color: '#71717a' }}> · </span>
+                                    <span style={{ color: short ? '#f87171' : '#a1a1aa' }}>
+                                      {Number(info.groupTotalProduced).toLocaleString()}/{Number(info.groupTotalNeed).toLocaleString()}
+                                    </span>
+                                  </span>
+                                );
+                              })() : null;
+                              return (
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}>
+                                  {chip ?? <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>}
+                                  {eligible && (
+                                    <button type="button" className="secondary"
+                                      style={{ fontSize: '0.7rem', padding: '1px 6px' }}
+                                      onClick={() => openSupplyOverrideDialog(r)}>
+                                      {tP('supplyView.override')}
+                                    </button>
+                                  )}
                                 </span>
                               );
                             }},
@@ -5271,20 +5405,29 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       )}
 
       {/* ── Override dialog ────────────────────────────────────────────────────── */}
-      {overrideDialogOpen && overrideDialogWo && typeof document !== 'undefined' && createPortal(
+      {overrideDialogOpen && (overrideDialogWo || overrideDialogSupply) && typeof document !== 'undefined' && createPortal(
         <div style={{ position: 'fixed', inset: 0, zIndex: 10000, display: 'flex', alignItems: 'center', justifyContent: 'center' }} role="dialog" aria-label="Override dialog">
           <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.6)' }} onClick={() => setOverrideDialogOpen(false)} aria-hidden />
-          <div style={{ position: 'relative', zIndex: 10, width: 480, maxWidth: '92vw', background: '#1c1c1e', color: '#e4e4e7', borderRadius: 10, boxShadow: '0 8px 32px rgba(0,0,0,0.5)', padding: '1.5rem' }}>
+          <div style={{ position: 'relative', zIndex: 10, width: overrideDialogType === 'supply_split' ? 640 : 480, maxWidth: '92vw', background: '#1c1c1e', color: '#e4e4e7', borderRadius: 10, boxShadow: '0 8px 32px rgba(0,0,0,0.5)', padding: '1.5rem', boxSizing: 'border-box', overflow: 'hidden' }}>
             <h3 style={{ margin: '0 0 0.25rem', fontSize: '1rem' }}>
               {overrideDialogType === 'method_selection' ? 'Override method selection'
                 : overrideDialogType === 'variant_selection' ? 'Override BOM variant selection'
+                : overrideDialogType === 'supply_split' ? tP('supplyView.overrideSplitTitle')
                 : 'Override component split allocation'}
             </h3>
-            <p style={{ margin: '0 0 1rem', fontSize: '0.8rem', color: '#a1a1aa' }}>
-              <strong>{overrideDialogWo.product_id}</strong> @ {overrideDialogWo.location_id}
-              {overrideDialogWo.demand_id && <> · demand {overrideDialogWo.demand_id}</>}
-              {overrideDialogWo.start_time && <> · {overrideDialogWo.start_time.slice(0, 10)}</>}
-            </p>
+            {overrideDialogType === 'supply_split' && overrideDialogSupply ? (
+              <p style={{ margin: '0 0 1rem', fontSize: '0.8rem', color: '#a1a1aa' }}>
+                <strong>{overrideDialogSupply.supplyId}</strong> · {overrideDialogSupply.productId} @ {overrideDialogSupply.locationId}
+                {overrideDialogSupply.supplyDate && <> · {overrideDialogSupply.supplyDate}</>}
+                {' · qty '}{Number(overrideDialogSupply.qty).toLocaleString()}
+              </p>
+            ) : overrideDialogWo && (
+              <p style={{ margin: '0 0 1rem', fontSize: '0.8rem', color: '#a1a1aa' }}>
+                <strong>{overrideDialogWo.product_id}</strong> @ {overrideDialogWo.location_id}
+                {overrideDialogWo.demand_id && <> · demand {overrideDialogWo.demand_id}</>}
+                {overrideDialogWo.start_time && <> · {overrideDialogWo.start_time.slice(0, 10)}</>}
+              </p>
+            )}
             {/* ── Method selection form ─── */}
             {overrideDialogType === 'method_selection' && overrideDialogWo && (
               <>
@@ -5385,15 +5528,88 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 </>
               );
             })()}
+            {/* ── Supply split form ─── */}
+            {overrideDialogType === 'supply_split' && overrideDialogSupply && (() => {
+              const supplyQty = overrideDialogSupply.qty ?? 0;
+              const sumQty = overrideSupplyRows.reduce((s, r) => s + (Number(r.qty) || 0), 0);
+              const over = sumQty > supplyQty + 0.001;
+              const warn = !!overrideDialogSupply.override?.warning;
+              return (
+                <>
+                  <p style={{ fontSize: '0.78rem', color: '#a1a1aa', margin: '0 0 0.6rem' }}>
+                    {tP('supplyView.overrideInfo')}
+                  </p>
+                  {warn && (
+                    <div style={{ marginBottom: '0.75rem', padding: '0.5rem 0.75rem', background: 'rgba(248,113,113,0.12)', border: '1px solid rgba(248,113,113,0.4)', borderRadius: 6 }}>
+                      <span style={{ color: '#f87171', fontSize: '0.78rem' }}>{tP('supplyView.overrideWarnBanner')}</span>
+                    </div>
+                  )}
+                  <table style={{ width: '100%', fontSize: '0.82rem', borderCollapse: 'collapse', marginBottom: '0.5rem', tableLayout: 'fixed' }}>
+                    <colgroup>
+                      <col style={{ width: '32%' }} />
+                      <col style={{ width: '22%' }} />
+                      <col style={{ width: '14%' }} />
+                      <col style={{ width: '14%' }} />
+                      <col style={{ width: '18%' }} />
+                    </colgroup>
+                    <thead>
+                      <tr style={{ color: '#71717a', textAlign: 'left', borderBottom: '1px solid #3d3d40' }}>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem' }}>Demand</th>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem' }}>Customer</th>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem', textAlign: 'right' }}>Requested</th>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem', textAlign: 'right' }}>Current</th>
+                        <th style={{ paddingBottom: '0.3rem', textAlign: 'right' }}>Override qty</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {overrideSupplyRows.map((row, i) => (
+                        <tr key={row.demand_id} style={{ borderTop: '1px solid #27272a' }}>
+                          <td style={{ padding: '0.3rem 0.5rem 0.3rem 0', color: '#d4d4d8', overflowWrap: 'anywhere', wordBreak: 'break-all' }}>{row.demand_id}</td>
+                          <td style={{ padding: '0.3rem 0.5rem 0.3rem 0', color: '#a1a1aa', fontSize: '0.78rem', overflowWrap: 'anywhere' }}>{row.customer ?? '–'}</td>
+                          <td style={{ padding: '0.3rem 0.5rem 0.3rem 0', textAlign: 'right', color: '#71717a' }}>{row.requested_qty > 0 ? row.requested_qty.toLocaleString(undefined, { maximumFractionDigits: 1 }) : '–'}</td>
+                          <td style={{ padding: '0.3rem 0.5rem 0.3rem 0', textAlign: 'right', color: '#71717a' }}>{row.consumed_qty.toLocaleString(undefined, { maximumFractionDigits: 1 })}</td>
+                          <td style={{ padding: '0.3rem 0', textAlign: 'right' }}>
+                            <input
+                              type="number"
+                              min={0}
+                              step="any"
+                              value={row.qty}
+                              onChange={(e) => setOverrideSupplyRows((prev) => prev.map((r, j) => j === i ? { ...r, qty: parseFloat(e.target.value) || 0 } : r))}
+                              style={{ width: '100%', boxSizing: 'border-box', padding: '2px 6px', background: '#1c1c1e', border: `1px solid ${over ? '#f87171' : '#3d3d40'}`, borderRadius: 4, color: '#fafafa', fontSize: '0.82rem', textAlign: 'right' }}
+                            />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot>
+                      <tr style={{ borderTop: '2px solid #3d3d40' }}>
+                        <td colSpan={4} style={{ paddingTop: '0.3rem', color: '#a1a1aa', fontSize: '0.78rem', textAlign: 'right', paddingRight: '0.5rem' }}>Sum / Supply qty</td>
+                        <td style={{ paddingTop: '0.3rem', textAlign: 'right', fontWeight: 600, color: over ? '#f87171' : '#e4e4e7' }}>
+                          {sumQty.toLocaleString(undefined, { maximumFractionDigits: 1 })} / {supplyQty.toLocaleString()}
+                        </td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                  <p style={{ fontSize: '0.75rem', color: '#71717a', margin: '0.25rem 0 0' }}>Demands not listed here are excluded from this supply. If the sum exceeds supply qty, the backend will scale proportionally. Re-run plan to apply.</p>
+                </>
+              );
+            })()}
             {overrideDialogError && <p style={{ color: '#f87171', fontSize: '0.8rem', marginTop: '0.4rem' }}>{overrideDialogError}</p>}
             {(() => {
-              if (!overrideDialogWo || !overrideDialogType) return null;
-              const productId = overrideDialogWo.product_id ?? '';
-              const locationId = overrideDialogWo.location_id ?? '';
-              const demandId = overrideDialogWo.demand_id ?? '';
-              const entityKey = overrideDialogType === 'component_split'
-                ? (overrideDialogWo.start_time ? `${productId}|${locationId}|${overrideDialogWo.start_time.slice(0, 10)}` : `${productId}|${locationId}`)
-                : (demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`);
+              if (!overrideDialogType) return null;
+              let entityKey: string;
+              if (overrideDialogType === 'supply_split') {
+                if (!overrideDialogSupply) return null;
+                entityKey = overrideDialogSupply.supplyId;
+              } else {
+                if (!overrideDialogWo) return null;
+                const productId = overrideDialogWo.product_id ?? '';
+                const locationId = overrideDialogWo.location_id ?? '';
+                const demandId = overrideDialogWo.demand_id ?? '';
+                entityKey = overrideDialogType === 'component_split'
+                  ? (overrideDialogWo.start_time ? `${productId}|${locationId}|${overrideDialogWo.start_time.slice(0, 10)}` : `${productId}|${locationId}`)
+                  : (demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`);
+              }
               const existingOverride = overrides.find((o) => o.entity_type === overrideDialogType && o.entity_key === entityKey) ?? null;
               if (!existingOverride) return null;
               return (
@@ -5412,6 +5628,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         await loadOverrides();
                         setOverrideDialogOpen(false);
                         setOverrideDialogWo(null);
+                        setOverrideDialogSupply(null);
                         setOverrideDialogType(null);
                       } catch (e) {
                         setOverrideDialogError(e instanceof Error ? e.message : 'Failed to reset');

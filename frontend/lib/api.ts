@@ -4,7 +4,7 @@ export type Case = { id: number; name: string; created_at: string; demand_count?
 export type AllocationRun = { id: number; case_id: number; created_at: string; status: string; config?: Record<string, unknown> };
 export type AllocationAction = { id: number; run_id: number; variant_key: string; req_component_ids: string[]; qty: number; demand_id?: string; target_product_id?: string; target_location_id?: string };
 export type FeasibleDemand = { demand_id: string; customer_id?: string | null; customer?: string | null; product_id: string; requested_qty: number; allocated_qty: number; fulfillment_rate?: number | null; status: string; suggested_revision?: string; request_due_time?: string | null; revised_time?: string | null };
-export type SupplyViewRow = { id?: number; component_key: string; supply_id: string; supply_date?: string | null; product_id: string; location_id: string; initial_qty: number; consumed_qty: number; residual_qty: number; utilization_rate?: number | null };
+export type SupplyViewRow = { id?: number; component_key: string; supply_id: string; supply_date?: string | null; product_id: string; location_id: string; initial_qty: number; consumed_qty: number; residual_qty: number; utilization_rate?: number | null; pegged_demands?: number; total_pegged_qty?: number; override?: { allocations: { demand_id: string; qty: number }[]; warning: boolean } | null };
 export type AllocationViewCandidate = {
   to_inventory_id: string;
   to_inventory_display: string;
@@ -750,6 +750,15 @@ export type SupplySplitInfo = {
   candidateCount: number;
 };
 
+/** Per-demand allocation entry inside a supply_split override. */
+export type SupplyOverrideAllocation = { demand_id: string; qty: number };
+
+/** Supply-split override view: active manual allocations + soft-warn flag from last plan run. */
+export type SupplyOverrideInfo = {
+  allocations: SupplyOverrideAllocation[];
+  warning: boolean;
+};
+
 /** Enriched supply row for the Plan Supply View table (supply metadata + pegging aggregates). */
 export type PlanSupplyViewRow = CaseSupplyRow & {
   consumedQty: number;
@@ -759,6 +768,7 @@ export type PlanSupplyViewRow = CaseSupplyRow & {
   totalPeggedQty: number;
   peggedDemands: PeggedDemandEntry[];
   splitInfo?: SupplySplitInfo | null;
+  override?: SupplyOverrideInfo | null;
 };
 
 /** Fetch all supply records for a case (flat table scan, no run context needed). */

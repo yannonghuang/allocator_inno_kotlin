@@ -261,7 +261,7 @@ fun getMethods(productId: String, locationId: String, data: Map<String, List<Map
 }
 
 /** Pick best method by preference (lowest number). */
-private fun getPreferredMethod(methods: List<Map<String, Any?>>): Pair<Map<String, Any?>?, String> {
+internal fun getPreferredMethod(methods: List<Map<String, Any?>>): Pair<Map<String, Any?>?, String> {
     if (methods.isEmpty()) return Pair(null, "No methods available.")
     val chosen = methods.minBy { (it["preference"] as? Number)?.toInt() ?: 0 }
     val pref = (chosen["preference"] as? Number)?.toInt() ?: 0
@@ -334,11 +334,55 @@ private fun scoreVariant(
 private data class Quadruple<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
 
 /**
+ * Return the first method (in ascending preference order) whose root BOM passes cascade's
+ * feasibility probe, or null if every method fails.  Mirrors the probe inside
+ * [getPreferredMethodCascade]; exposed so consolidation can skip demands whose parent can
+ * never roll up (avoids phantom WOs for reachable siblings of an unreachable component).
+ */
+internal fun firstFeasibleMethod(
+    methods: List<Map<String, Any?>>,
+    demand: Map<String, Any?>,
+    inventory: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+    requestTimeDt: LocalDate?,
+    depth: Int,
+    planningPath: Set<Pair<String, String>>,
+): Map<String, Any?>? {
+    if (methods.isEmpty()) return null
+    val productId = demand["product_id"] as? String ?: ""
+    val locationId = demand["location_id"] as? String ?: ""
+    val quantity = (demand["quantity"] as? Number)?.toDouble() ?: 0.0
+    val reqTimeStr = demand["request_due_time"] as? String ?: demand["request_time"] as? String
+    val reqDt = parseDate(reqTimeStr) ?: requestTimeDt
+    val sorted = methods.sortedBy { (it["preference"] as? Number)?.toInt() ?: 0 }
+    for (m in sorted) {
+        val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
+        val leadDays = leadDaysForMethod(m)
+        val failed = when (m["type"]) {
+            "purchase" -> false
+            "move" -> {
+                val children = childMaterialsForMove(m, quantity)
+                scoreVariant("feasibility", children, inventory, data, reqDt, leadDays, planningPath, depth - 1).fourth
+            }
+            "make" -> {
+                val variants = variantsForMake(productId, productionLocation, quantity, m, data)
+                variants.isEmpty() || variants.all { (altKey, childList) ->
+                    scoreVariant(altKey, childList, inventory, data, reqDt, leadDays, planningPath, depth - 1).fourth
+                }
+            }
+            else -> false
+        }
+        if (!failed) return m
+    }
+    return null
+}
+
+/**
  * Cascade method selection: try each method in ascending preference order.
  * Returns the first method whose children can be successfully planned.
  * Falls back to preference-only when depth is exhausted or only one method exists.
  */
-private fun getPreferredMethodCascade(
+internal fun getPreferredMethodCascade(
     methods: List<Map<String, Any?>>,
     demand: Map<String, Any?>,
     inventory: List<Map<String, Any?>>,
@@ -393,7 +437,7 @@ private fun getPreferredMethodCascade(
  * Elaborate method selection: simulate one planning level per method, score, and pick best.
  * Falls back to preference-only when depth < MAX_PLAN_DEPTH or only 1 method.
  */
-private fun getPreferredMethodElaborate(
+internal fun getPreferredMethodElaborate(
     methods: List<Map<String, Any?>>,
     demand: Map<String, Any?>,
     inventory: List<Map<String, Any?>>,
@@ -1390,9 +1434,40 @@ fun runPlanning(
     val planningPegging = mutableListOf<Map<String, Any?>>()
     val total = demands.size
 
-    // Build override index once — passed through to all plan() calls
+    // Build override index once — passed through to all plan() calls. Mutable so consolidation
+    // can merge synthetic method_selection entries (computed from collectDeepNeeds' cascade walk)
+    // before the main planning loop runs, ensuring consolidation's pre-allocation path matches
+    // main plan's actual path.
     @Suppress("UNCHECKED_CAST")
-    val overrideIndex = buildOverrideIndex((data["overrides"] ?: emptyList()) as List<Map<String, Any?>>)
+    val overrideIndex: MutableMap<String, Map<String, Any?>> =
+        buildOverrideIndex((data["overrides"] ?: emptyList()) as List<Map<String, Any?>>).toMutableMap()
+
+    // Supply-split overrides: split affected inventory buckets into demand-tagged
+    // sub-buckets so the existing preferDemandId/demand_tag two-pass consumption
+    // logic enforces per-(supply,demand) caps during planning.
+    val supplyCapMap = buildSupplyCapMap(overrideIndex, data["supply"] ?: emptyList(), demands)
+    if (supplyCapMap.isNotEmpty()) {
+        for ((supplyId, caps) in supplyCapMap) {
+            val buckets = inventory.filter { it["supply_id"]?.toString() == supplyId }
+            if (buckets.isEmpty()) continue
+            val template = buckets.first()
+            val productId = template["product_id"]
+            val locationId = template["location_id"]
+            val supplyDate = template["supply_date"]
+            inventory.removeAll(buckets.toSet())
+            for ((demandId, cap) in caps) {
+                if (cap <= 1e-12) continue
+                inventory.add(mutableMapOf(
+                    "product_id"  to productId,
+                    "location_id" to locationId,
+                    "supply_date" to supplyDate,
+                    "supply_id"   to supplyId,
+                    "qty"         to cap,
+                    "demand_tag"  to demandId,
+                ))
+            }
+        }
+    }
 
     // ── Consolidation phase ───────────────────────────────────────────────────
     val consolidationConfig = parseConsolidationConfig(config)
@@ -1400,7 +1475,22 @@ fun runPlanning(
     val consolidatedPegging = mutableListOf<Map<String, Any?>>()
 
     if (consolidationConfig.enabled) {
-        val needs  = collectComponentNeeds(demands, data, consolidationConfig)
+        // Record the root-level method each demand's BOM walk chose, then inject them as
+        // synthetic method_selection overrides so the main plan picks the identical method
+        // at depth=MAX_PLAN_DEPTH (and plan() line ~941 filters effectiveMethods to this one).
+        // User-authored overrides already in overrideIndex win: we only insert when absent.
+        val methodChoices = mutableMapOf<Triple<String, String, String>, Map<String, Any?>>()
+        val needs  = collectComponentNeeds(demands, data, consolidationConfig,
+            inventory = inventory, planConfig = config, methodChoices = methodChoices)
+        for ((triple, chosen) in methodChoices) {
+            val (pid, lid, did) = triple
+            val key = "method_selection|$pid|$lid|$did"
+            if (overrideIndex.containsKey(key)) continue
+            val entry = mutableMapOf<String, Any?>()
+            chosen["type"]?.let { entry["method_type"] = it }
+            chosen["preference"]?.let { entry["preference"] = it }
+            if (entry.isNotEmpty()) overrideIndex[key] = entry
+        }
         val groups = groupByTimeBucket(needs, consolidationConfig.periodDays)
         val result = runConsolidation(groups, inventory, data, consolidationConfig, planConfig = config) { dem, inv, dat, reqDt, depth, path, cfg, prefId ->
             plan(dem, inv, dat, reqDt, depth, path, cfg, prefId, overrideIndex = overrideIndex)
@@ -1432,11 +1522,12 @@ fun runPlanning(
     }
     // ── Main planning loop ────────────────────────────────────────────────────
 
+    val useTaggedLookup = consolidationConfig.enabled || supplyCapMap.isNotEmpty()
     demands.forEachIndexed { i, d ->
         val reqStr = d["request_due_time"] as? String ?: d["request_time"] as? String
         val reqDt = parseDate(reqStr)
         val demandId = d["demand_id"]
-        val prefId = if (consolidationConfig.enabled) demandId else null
+        val prefId = if (useTaggedLookup) demandId else null
         val (solvedList, wos, peggingNode) = plan(d, inventory, data, reqDt, config = config, preferDemandId = prefId, overrideIndex = overrideIndex)
         committedDemands.addAll(solvedList)
         workOrders.addAll(wos)
@@ -1456,12 +1547,59 @@ fun runPlanning(
     val suppliesForCap = data["supply"] ?: emptyList()
     val supplyAllocations = extractSupplyAllocations(allPegging, suppliesForCap)
     val supplyCapViolations = verifySupplyCap(suppliesForCap, supplyAllocations)
+
+    // Supply-split override soft-warn: any demand in an override that commits short
+    // of its request is flagged as potentially impacted by the override.
+    // Commit qty is measured from real supply/purchase allocations — committed_demands
+    // rows with hard-failure reasons (no_methods, etc.) record shortfall, not commit.
+    val overrideWarnings = if (supplyCapMap.isEmpty()) emptyList() else {
+        val requestedByDemand = mutableMapOf<String, Double>()
+        for (d in demands) {
+            val did = d["demand_id"]?.toString() ?: continue
+            val q = (d["quantity"] as? Number)?.toDouble() ?: 0.0
+            requestedByDemand[did] = (requestedByDemand[did] ?: 0.0) + q
+        }
+        val committedByDemand = mutableMapOf<String, Double>()
+        for (row in committedDemands) {
+            val reason = row["commit_reason"] as? String
+            if (isHardPlanningFailure(reason)) continue
+            val did = row["demand_id"]?.toString() ?: continue
+            val q = (row["quantity"] as? Number)?.toDouble() ?: 0.0
+            committedByDemand[did] = (committedByDemand[did] ?: 0.0) + q
+        }
+        val warnings = mutableListOf<Map<String, Any?>>()
+        for ((supplyId, caps) in supplyCapMap) {
+            val affected = mutableListOf<Map<String, Any?>>()
+            for ((did, _) in caps) {
+                val req = requestedByDemand[did] ?: continue
+                val com = committedByDemand[did] ?: 0.0
+                val shortfall = req - com
+                if (shortfall > 1e-6) {
+                    affected.add(mapOf(
+                        "demand_id" to did,
+                        "shortfall" to "%.4f".format(shortfall).toDouble(),
+                        "requested" to req,
+                        "committed" to com,
+                    ))
+                }
+            }
+            if (affected.isNotEmpty()) {
+                warnings.add(mapOf(
+                    "supply_id"        to supplyId,
+                    "affected_demands" to affected,
+                ))
+            }
+        }
+        warnings
+    }
+
     return mapOf(
         "committed_demands"     to committedDemands,
         "work_orders"           to consolidatedWOs + workOrders,
         "planning_pegging"      to allPegging,
         "supply_allocations"    to supplyAllocations,
         "supply_cap_violations" to supplyCapViolations,
+        "override_warnings"     to overrideWarnings,
     )
 }
 

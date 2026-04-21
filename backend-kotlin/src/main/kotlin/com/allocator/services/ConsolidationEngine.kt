@@ -43,6 +43,64 @@ fun buildOverrideIndex(overrides: List<Map<String, Any?>>): Map<String, Map<Stri
 }
 
 /**
+ * Build per-supply demand caps from supply_split overrides.
+ *
+ * Returns Map<supplyId, Map<demandId, Double>>. For each supply with an override:
+ *   - Allocations are summed per demand_id.
+ *   - If the total exceeds the supply's qty, all caps are scaled down proportionally.
+ *   - Demand ids that don't appear in the `demands` list are dropped (logged).
+ *
+ * Supplies without an override are absent from the returned map.
+ */
+@Suppress("UNCHECKED_CAST")
+fun buildSupplyCapMap(
+    overrideIndex: Map<String, Map<String, Any?>>,
+    supplies: List<Map<String, Any?>>,
+    demands: List<Map<String, Any?>>,
+): Map<String, Map<String, Double>> {
+    val supplyQty = mutableMapOf<String, Double>()
+    for (s in supplies) {
+        val sid = s["supply_id"]?.toString() ?: continue
+        val q = (s["qty"] as? Number)?.toDouble() ?: 0.0
+        supplyQty[sid] = (supplyQty[sid] ?: 0.0) + q
+    }
+    val knownDemandIds = demands.mapNotNull { it["demand_id"]?.toString() }.toHashSet()
+
+    val out = mutableMapOf<String, Map<String, Double>>()
+    for ((key, payload) in overrideIndex) {
+        if (!key.startsWith("supply_split|")) continue
+        val supplyId = key.removePrefix("supply_split|")
+        val totalAvailable = supplyQty[supplyId]
+        if (totalAvailable == null) {
+            log.warn("supply_split override references unknown supply_id={}; ignoring", supplyId)
+            continue
+        }
+        val allocations = payload["allocations"] as? List<*> ?: continue
+        val raw = mutableMapOf<String, Double>()
+        for (item in allocations) {
+            val m = item as? Map<*, *> ?: continue
+            val demandId = m["demand_id"]?.toString() ?: continue
+            val qty = (m["qty"] as? Number)?.toDouble() ?: continue
+            if (qty <= 0) continue
+            if (demandId !in knownDemandIds) {
+                log.warn("supply_split override for supply={} references unknown demand_id={}; dropping", supplyId, demandId)
+                continue
+            }
+            raw[demandId] = (raw[demandId] ?: 0.0) + qty
+        }
+        if (raw.isEmpty()) continue
+        val total = raw.values.sum()
+        val clamped = if (total > totalAvailable + 1e-9 && total > 1e-12) {
+            val scale = totalAvailable / total
+            log.warn("supply_split override total {} exceeds supply.qty {} for {}; scaled down", total, totalAvailable, supplyId)
+            raw.mapValues { (_, v) -> v * scale }
+        } else raw
+        out[supplyId] = clamped
+    }
+    return out
+}
+
+/**
  * Parse a component_split override payload into a demandId→qty map.
  * Clamps the total to producedQty if the override specifies more than was planned.
  */
@@ -278,6 +336,20 @@ private fun collectDeepNeeds(
     result: MutableList<ComponentNeed>,
     addedKeys: MutableSet<Triple<Any?, String, String>>,
     viaOrAlt: Boolean = false,
+    /** Starting inventory snapshot — used only at the root for cascade/elaborate probing. */
+    inventory: List<Map<String, Any?>> = emptyList(),
+    /** Planning config — carries method_selection (cascade vs elaborate) toggle. */
+    planConfig: Map<String, Any?>? = null,
+    /**
+     * Output map: records the method chosen at the ROOT BOM node for each demand as
+     * (productId, locationId, demandIdStr) → chosen method. Inner nodes are not recorded —
+     * main plan uses simple getPreferredMethod there, which matches this walk's behavior.
+     */
+    methodChoices: MutableMap<Triple<String, String, String>, Map<String, Any?>>? = null,
+    /** True for the outermost call for a demand — selects the method via cascade/elaborate. */
+    isRoot: Boolean = false,
+    /** Starting demand map — required when isRoot=true so cascade/elaborate can probe. */
+    demand: Map<String, Any?>? = null,
 ) {
     val key = Pair(productId, locationId)
     if (key in visited) return
@@ -302,7 +374,43 @@ private fun collectDeepNeeds(
     }
 
     val methods = getMethods(productId, locationId, data)
-    val method = methods.minByOrNull { (it["preference"] as? Number)?.toInt() ?: 0 } ?: return
+    // Feasibility gate (root only): if every root method fails cascade's probe, skip registration.
+    // Otherwise consolidation would pre-allocate components whose parent BOM can't roll up
+    // (e.g. a sibling child has no supply and no methods) — producing phantom WOs that
+    // consume real inventory without any finished-goods output. Main plan will still
+    // independently commit qty=0 with child_failed for the demand.
+    //
+    // Guarded by inventory.isNotEmpty() because the probe uses plan() which consumes from
+    // inventory — an empty-inventory probe would spuriously fail. In production runPlanning
+    // always passes a populated inventory; older unit tests that call collectComponentNeeds
+    // without inventory rely on the supplyIndex-based structural reachability only.
+    if (isRoot && demand != null && methods.isNotEmpty() && inventory.isNotEmpty()) {
+        if (firstFeasibleMethod(methods, demand, inventory, data, dueDate, 500, emptySet()) == null) {
+            return
+        }
+    }
+    val method = if (isRoot && methods.size > 1 && methodChoices != null && demand != null) {
+        // Align with PlanningEngine.plan()'s outermost method selection — the main plan uses
+        // cascade (or elaborate) only at depth == MAX_PLAN_DEPTH. At inner recursion both
+        // engines fall back to simple getPreferredMethod, so we only diverge at the root.
+        val methodSelection = (planConfig?.get("method_selection") as? Map<*, *>)?.let {
+            @Suppress("UNCHECKED_CAST") it as? Map<String, Any?>
+        }
+        val useElaborateMethod = methodSelection?.get("elaborate") == true
+        val chosen = if (useElaborateMethod)
+            getPreferredMethodElaborate(methods, demand, inventory, data, dueDate, planConfig, 500, emptySet()).first
+        else
+            getPreferredMethodCascade(methods, demand, inventory, data, dueDate, planConfig, 500, emptySet()).first
+        if (chosen != null && demandId != null) {
+            val did = demandId.toString().trim()
+            if (did.isNotBlank()) {
+                methodChoices[Triple(productId, locationId, did)] = chosen
+            }
+        }
+        chosen ?: methods.minByOrNull { (it["preference"] as? Number)?.toInt() ?: 0 }
+    } else {
+        methods.minByOrNull { (it["preference"] as? Number)?.toInt() ?: 0 }
+    } ?: return
     val leadDays = leadDaysForMethod(method)
     val componentDueDate = if (dueDate != null) dueDate.minusDays(leadDays.toLong()) else null
     val nextVisited = visited + key
@@ -323,7 +431,9 @@ private fun collectDeepNeeds(
                     if (cQty <= 0) continue
                     collectDeepNeeds(cProductId, cLocationId, cQty, demandId, priority, componentDueDate,
                         productId, data, supplyIndex, nextVisited, result, addedKeys,
-                        viaOrAlt = viaOrAlt || isOrGroup)
+                        viaOrAlt = viaOrAlt || isOrGroup,
+                        inventory = inventory, planConfig = planConfig,
+                        methodChoices = methodChoices, isRoot = false, demand = null)
                 }
             }
         }
@@ -336,7 +446,9 @@ private fun collectDeepNeeds(
                 if (cQty <= 0) continue
                 collectDeepNeeds(cProductId, cLocationId, cQty, demandId, priority, componentDueDate,
                     productId, data, supplyIndex, nextVisited, result, addedKeys,
-                    viaOrAlt = viaOrAlt)
+                    viaOrAlt = viaOrAlt,
+                    inventory = inventory, planConfig = planConfig,
+                    methodChoices = methodChoices, isRoot = false, demand = null)
             }
         }
         // "purchase" — purchasable on demand, no inventory to pre-allocate
@@ -359,6 +471,16 @@ fun collectComponentNeeds(
     demands: List<Map<String, Any?>>,
     data: Map<String, List<Map<String, Any?>>>,
     @Suppress("UNUSED_PARAMETER") consolidationConfig: ConsolidationConfig,
+    /** Starting inventory snapshot — used at the root call for cascade/elaborate probing. */
+    inventory: List<Map<String, Any?>> = emptyList(),
+    /** Planning config — determines cascade vs elaborate method selection. */
+    planConfig: Map<String, Any?>? = null,
+    /**
+     * Output map: (productId, locationId, demandIdStr) → chosen root method. Caller merges
+     * entries into the PlanningEngine overrideIndex as synthetic method_selection overrides
+     * so the main plan's plan() picks the identical method at depth=MAX_PLAN_DEPTH.
+     */
+    methodChoices: MutableMap<Triple<String, String, String>, Map<String, Any?>>? = null,
 ): List<ComponentNeed> {
     val result    = mutableListOf<ComponentNeed>()
     val supplyIdx = buildSupplyIndex(data)
@@ -375,7 +497,9 @@ fun collectComponentNeeds(
 
         val addedKeys = mutableSetOf<Triple<Any?, String, String>>()
         collectDeepNeeds(productId, locationId, qty, demandId, priority, reqDt, productId,
-            data, supplyIdx, emptySet(), result, addedKeys)
+            data, supplyIdx, emptySet(), result, addedKeys,
+            inventory = inventory, planConfig = planConfig,
+            methodChoices = methodChoices, isRoot = true, demand = d)
     }
     return result
 }
