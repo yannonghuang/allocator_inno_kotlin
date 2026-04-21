@@ -61,6 +61,7 @@ import {
   type CaseSupplyRow,
   type PeggedDemandEntry,
   type PlanSupplyViewRow,
+  type SupplySplitInfo,
   getCaseSupplies,
   type AssessmentSummary,
   type AssessmentResponse,
@@ -120,29 +121,6 @@ function peggingTreeContainsRealMove(node: PlanningPeggingNode, realMoveKeys: Se
   }
   for (const child of node.children ?? []) {
     if (peggingTreeContainsRealMove(child, realMoveKeys)) return true;
-  }
-  return false;
-}
-
-/**
- * True if any supply node (by supply_id) or any non-root demand node (by product_id)
- * in the pegging tree matches the given substring (case-insensitive).
- * isRoot=true skips the top-level demand so FG products don't self-match.
- */
-function peggingTreeContainsSupply(node: PlanningPeggingNode, supplySubstr: string, isRoot: boolean = false): boolean {
-  if (node.type === 'supply') {
-    const sid = (node.supply_id ?? '').trim().toLowerCase();
-    if (sid && sid.includes(supplySubstr)) return true;
-  }
-  // Component demands appear as demand nodes under make WOs — match by product_id.
-  // Supply record IDs have the form "productId_locationId_seq", so also match when the
-  // filter string starts with this demand's product_id (handles typeahead-selected supply IDs).
-  if (node.type === 'demand' && !isRoot) {
-    const pid = (node.product_id ?? '').trim().toLowerCase();
-    if (pid && (pid.includes(supplySubstr) || supplySubstr.startsWith(pid + '_') || supplySubstr === pid)) return true;
-  }
-  for (const child of node.children ?? []) {
-    if (peggingTreeContainsSupply(child, supplySubstr, false)) return true;
   }
   return false;
 }
@@ -703,6 +681,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     | null
   >(null);
   const [planPeggingExpanded, setPlanPeggingExpanded] = useState<Set<string>>(new Set(['0']));
+  const [planPeggingSearch, setPlanPeggingSearch] = useState('');
+  const [planPeggingMatchPath, setPlanPeggingMatchPath] = useState<string | null>(null);
+  const [planPeggingMatchIndex, setPlanPeggingMatchIndex] = useState(0);
+  const [planPeggingMatchPaths, setPlanPeggingMatchPaths] = useState<string[]>([]);
+  useEffect(() => {
+    setPlanPeggingSearch('');
+    setPlanPeggingMatchPath(null);
+    setPlanPeggingMatchPaths([]);
+    setPlanPeggingMatchIndex(0);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [planPeggingContext?.type === 'work_order' ? (planPeggingContext.row as WorkOrder).demand_id ?? '' : null,
+      planPeggingContext?.type === 'demand' ? (planPeggingContext.row as CommittedDemand).demand_id ?? '' : null,
+      planPeggingContext?.type === 'supply' ? planPeggingContext.supplyId : null]);
   const [planExplanationExpanded, setPlanExplanationExpanded] = useState<Set<string>>(new Set());
   const [planPeggingPanelWidth, setPlanPeggingPanelWidth] = useState(420);
   const [planWorkOrderPeggingCache, setPlanWorkOrderPeggingCache] = useState<Record<string, PlanningPeggingNode>>({});
@@ -780,7 +771,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [woPeggingRowKey, setWoPeggingRowKey] = useState<string | null>(null);
   const [bomRealPairs, setBomRealPairs] = useState<[string, string][] | null>(null);
   const [realMoveTriples, setRealMoveTriples] = useState<[string, string, string][] | null>(null);
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true }, purchase_allowed: false });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 365, allocation_mode: 'fair' }, purchase_allowed: false });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -843,114 +834,133 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     const cs = currentConfig.consolidation ?? {};
     const multi = vs.multiple;
 
-    if (!t) return { reply: 'You can configure variant selection, method selection, or shared-component consolidation. Say "show config" to see current settings.' };
+    if (!t) return { reply: tP('copilot.replies.empty') };
 
-    if (/show|current|what('s| is)? (my )?config|settings|config/.test(t)) {
-      const variantMode = multi === false ? 'single best variant' : 'all feasible variants (equal split)';
-      const methodMode = ms.multiple === true ? 'equal split across methods' : ms.elaborate === true ? 'one by score (elaborate)' : 'one by preference (cascade — tries preferred first, falls back to next if children fail)';
-      const purchaseMode = currentConfig.purchase_allowed === false ? 'disabled' : 'allowed';
+    // Accept both English and Chinese triggers.
+    if (/show|current|what('s| is)? (my )?config|settings|config|显示配置|当前配置|查看配置/.test(t)) {
+      const variantMode = multi === false ? tP('copilot.singleBest') : tP('copilot.allFeasible');
+      const methodMode = ms.multiple === true ? tP('copilot.equalSplit') : ms.elaborate === true ? tP('copilot.oneByScore') : tP('copilot.oneByPreference');
+      const purchaseMode = currentConfig.purchase_allowed === false ? tP('copilot.disabled') : tP('copilot.allowed');
+      const splitLabel = cs.allocation_mode === 'proportional'
+        ? tP('copilot.splitProportional')
+        : cs.allocation_mode === 'priority_first'
+          ? tP('copilot.splitPriorityFirst')
+          : tP('copilot.splitFair');
       const consolidationMode = cs.enabled
-        ? `on · ${cs.period_days ?? 7}d bucket · ${cs.allocation_mode === 'proportional' ? 'proportional' : 'priority-first'} split`
-        : 'off';
-      return { reply: `Variant selection: **${variantMode}**. Method selection: **${methodMode}**. Purchase: **${purchaseMode}**. Consolidation: **${consolidationMode}**.` };
+        ? tP('copilot.consolidationOnDetail', { days: cs.period_days ?? 365, split: splitLabel })
+        : tP('copilot.off');
+      return { reply: tP('copilot.replies.showConfig', { variantMode, methodMode, purchaseMode, consolidationMode }) };
     }
 
-    if (/single|one variant|only one|best variant|use one/.test(t)) {
+    if (/single|one variant|only one|best variant|use one|单一|一个变体|最优变体/.test(t)) {
       return {
-        reply: 'Set variant selection to **single best variant**. The planner will pick one best BOM/variant per demand (by score: earliest commit, most inventory consumed, least purchase). Re-run plan to apply.',
+        reply: tP('copilot.replies.variantSingle'),
         configUpdate: { variant_selection: { ...vs, multiple: false } },
       };
     }
 
-    if (/all variants|multiple variants|every variant|equal split.*variant|divide (across|among).*variant/.test(t)) {
+    if (/all variants|multiple variants|every variant|equal split.*variant|divide (across|among).*variant|所有变体|全部变体|多变体/.test(t)) {
       return {
-        reply: 'Set variant selection to **all feasible variants** with equal split. Demand will be divided among all feasible BOM/variants. Re-run plan to apply.',
+        reply: tP('copilot.replies.variantAll'),
         configUpdate: { variant_selection: { ...vs, multiple: true } },
       };
     }
 
-    if (/equal.?split.?method|split.?method.?equal|split across method|multiple method|use all method/.test(t)) {
+    if (/equal.?split.?method|split.?method.?equal|split across method|multiple method|use all method|方法等量拆分|等量拆分方法|跨方法拆分/.test(t)) {
       return {
-        reply: 'Set method selection to **equal split across methods**. When multiple make/move/buy methods can fulfill a demand, quantity is divided equally among them. Re-run plan to apply.',
+        reply: tP('copilot.replies.methodEqual'),
         configUpdate: { method_selection: { ...ms, multiple: true, elaborate: false } },
       };
     }
 
-    if (/elaborate method|simulate method|score method|method by score/.test(t)) {
+    if (/elaborate method|simulate method|score method|method by score|精细方法|方法评分|按评分选方法/.test(t)) {
       return {
-        reply: 'Set method selection to **elaborate (score by simulation)**. The planner simulates each method\'s child materials and picks the one with earliest commit, most inventory consumed, and least purchase. Slower. Re-run plan to apply.',
+        reply: tP('copilot.replies.methodElaborate'),
         configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false } },
       };
     }
 
-    if (/by preference|prefer method|cascade method|preferred method|one by preference/.test(t)) {
+    if (/by preference|prefer method|cascade method|preferred method|one by preference|按偏好|偏好方法|级联方法/.test(t)) {
       return {
-        reply: 'Set method selection to **by preference (cascade)**. The planner tries the most preferred method first; if its child materials cannot be planned, it falls back to the next preferred method. Re-run plan to apply.',
+        reply: tP('copilot.replies.methodPreference'),
         configUpdate: { method_selection: { ...ms, multiple: false, elaborate: false } },
       };
     }
 
-    if (/no purchase|disable purchase|disallow purchase|no buy|exclude buy|without purchase/.test(t)) {
+    if (/no purchase|disable purchase|disallow purchase|no buy|exclude buy|without purchase|禁用采购|不采购|不允许采购/.test(t)) {
       return {
-        reply: 'Purchase (buy method) **disabled**. The planner will not use buy methods; demands will be fulfilled from inventory, make, or move only. Re-run plan to apply.',
+        reply: tP('copilot.replies.purchaseOff'),
         configUpdate: { purchase_allowed: false },
       };
     }
 
-    if (/allow purchase|enable purchase|purchase allowed|include buy|with purchase/.test(t)) {
+    if (/allow purchase|enable purchase|purchase allowed|include buy|with purchase|允许采购|启用采购|开启采购/.test(t)) {
       return {
-        reply: 'Purchase (buy method) **allowed**. The planner will use buy methods when available. Re-run plan to apply.',
+        reply: tP('copilot.replies.purchaseOn'),
         configUpdate: { purchase_allowed: true },
       };
     }
 
-    if (/enable consolidat|turn on consolidat|consolidate demand|group demand|shared.?component/.test(t)) {
+    if (/enable consolidat|turn on consolidat|consolidate demand|group demand|shared.?component|启用合并|开启合并|合并需求|共享组件/.test(t)) {
+      const modeLabel = cs.allocation_mode === 'proportional'
+        ? tP('copilot.replies.consolidationOnModeProportional')
+        : cs.allocation_mode === 'priority_first'
+          ? tP('copilot.replies.consolidationOnModePriority')
+          : tP('copilot.replies.consolidationOnModeFair');
       return {
-        reply: `Enabled **shared-component consolidation**. Demands within the same time bucket (currently ${cs.period_days ?? 7} days) that share a component will be grouped into one work order, then output is split by ${cs.allocation_mode === 'proportional' ? 'proportional qty' : 'priority order'}. Re-run plan to apply.`,
+        reply: tP('copilot.replies.consolidationOn', { days: cs.period_days ?? 365, mode: modeLabel }),
         configUpdate: { consolidation: { ...cs, enabled: true } },
       };
     }
 
-    if (/disable consolidat|turn off consolidat|no consolidat/.test(t)) {
+    if (/disable consolidat|turn off consolidat|no consolidat|禁用合并|关闭合并|不合并/.test(t)) {
       return {
-        reply: 'Disabled consolidation. Each demand will plan its components independently. Re-run plan to apply.',
+        reply: tP('copilot.replies.consolidationOff'),
         configUpdate: { consolidation: { ...cs, enabled: false } },
       };
     }
 
     const periodMatch = t.match(/(\d+)\s*(?:-\s*)?day(?:s)?\s*(?:bucket|period|window)/);
-    if (periodMatch || /bucket.*(\d+)|period.*(\d+)/.test(t)) {
+    const zhPeriodMatch = t.match(/(\d+)\s*天(?:桶|窗口|周期)?/);
+    if (periodMatch || zhPeriodMatch || /bucket.*(\d+)|period.*(\d+)|时间桶.*(\d+)/.test(t)) {
       const m2 = t.match(/(\d+)/);
-      const days = Math.max(1, Math.min(365, parseInt(periodMatch?.[1] ?? m2?.[1] ?? '7', 10)));
+      const days = Math.max(1, Math.min(365, parseInt(periodMatch?.[1] ?? zhPeriodMatch?.[1] ?? m2?.[1] ?? '365', 10)));
       return {
-        reply: `Set consolidation time bucket to **${days} day${days === 1 ? '' : 's'}**. Re-run plan to apply.`,
+        reply: tP('copilot.replies.periodBucket', { days, plural: days === 1 ? '' : 's' }),
         configUpdate: { consolidation: { ...cs, period_days: days } },
       };
     }
 
-    if (/proportional|split by (qty|quantity|share)|by share/.test(t)) {
+    if (/proportional|split by (qty|quantity|share)|by share|按比例|按数量|按份额/.test(t)) {
       return {
-        reply: 'Set consolidation split policy to **proportional** — output is divided in proportion to each demand\'s requested quantity. Re-run plan to apply.',
+        reply: tP('copilot.replies.splitProportional'),
         configUpdate: { consolidation: { ...cs, allocation_mode: 'proportional' } },
       };
     }
 
-    if (/priority.?first|fill highest priority|by priority|priority order/.test(t)) {
+    if (/priority.?first|fill highest priority|by priority|priority order|优先级优先|按优先级|优先级顺序/.test(t)) {
       return {
-        reply: 'Set consolidation split policy to **priority-first** — highest-priority demands are filled first from consolidated output. Re-run plan to apply.',
+        reply: tP('copilot.replies.splitPriority'),
         configUpdate: { consolidation: { ...cs, allocation_mode: 'priority_first' } },
       };
     }
 
-    if (/reset|default|clear/.test(t)) {
+    if (/\bfair\b|hybrid split|no one starved|公平|混合拆分/.test(t)) {
       return {
-        reply: 'Reset to defaults: all feasible variants (equal split), by preference (cascade) method selection, purchase allowed, consolidation off. Re-run plan to apply.',
-        configUpdate: { variant_selection: { multiple: true }, method_selection: { multiple: false, elaborate: false }, purchase_allowed: true, consolidation: { enabled: false } },
+        reply: tP('copilot.replies.splitFair'),
+        configUpdate: { consolidation: { ...cs, allocation_mode: 'fair' } },
+      };
+    }
+
+    if (/reset|default|clear|重置|默认|清除/.test(t)) {
+      return {
+        reply: tP('copilot.replies.reset'),
+        configUpdate: { variant_selection: { multiple: true }, method_selection: { multiple: false, elaborate: false }, purchase_allowed: false, consolidation: { enabled: true, period_days: 365, allocation_mode: 'fair' } },
       };
     }
 
     return {
-      reply: 'I handle variant selection, method selection, purchase, and shared-component consolidation. Try: "single best variant", "all variants", "by preference", "elaborate method", "equal split methods", "no purchase", "allow purchase", "enable consolidation", "set 14 day bucket", "proportional split", or "show config".',
+      reply: tP('copilot.replies.help'),
     };
   }
 
@@ -1287,7 +1297,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     }
     allocationViewRunIdRef.current = runId;
     setSupplyViewLoading(true);
-    getSupplyView(id, runId)
+    getSupplyView(id, runId, currentPlanRunId != null ? { plan_run_id: currentPlanRunId } : undefined)
       .then((s) => setSupplyView(s.supply_view))
       .catch(() => setSupplyView([]))
       .finally(() => setSupplyViewLoading(false));
@@ -1368,6 +1378,18 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       allocationViewFetchingRef.current = false;
     }
   }, [selectedRunId, id]);
+
+  // Refetch supply-view when the active plan-run context changes so the Supplies panel
+  // reflects plan_supply_allocation (plan-side utilization) instead of the legacy
+  // allocation_action FIFO replay.
+  useEffect(() => {
+    if (!selectedRunId) return;
+    setSupplyViewLoading(true);
+    getSupplyView(id, selectedRunId, currentPlanRunId != null ? { plan_run_id: currentPlanRunId } : undefined)
+      .then((s) => setSupplyView(s.supply_view))
+      .catch(() => setSupplyView([]))
+      .finally(() => setSupplyViewLoading(false));
+  }, [currentPlanRunId, selectedRunId, id]);
 
   // Lazy-load allocation view only when user opens the Allocation tab (scalable: no heavy request on run select)
   useEffect(() => {
@@ -1702,10 +1724,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
    * Invert demand-centric planning_pegging trees into a supply-centric map.
    * Key: supply_id → { totalPeggedQty, demands[] }
    *
-   * For consolidated entries (demand_id = null), uses the entry's consolidated_demand_ids
-   * to attribute supply consumption across the demands that share the consolidated WO.
-   * Quantity is split equally among the consolidated demands as an approximation
-   * (exact proportions are in each WO's consolidation_split_details).
+   * For consolidated entries (demand_id = null), attribution is driven by each demand's
+   * ACTUAL consumption of its tagged bucket (`consolidated_<demandId>_<pid>`) as observed
+   * in the demand's own main pegging tree. Demands whose upstream chain failed before
+   * reaching the tagged bucket contribute zero weight and are not credited — this keeps
+   * the Supply View's `Pegged Demands` count consistent with what's findable via the
+   * demand-pegging search.
    */
   const supplyPeggingMap = useMemo(() => {
     const map = new Map<string, { totalPeggedQty: number; demands: PeggedDemandEntry[] }>();
@@ -1717,6 +1741,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     }
 
     function addPegging(sid: string, qty: number, demandId: string) {
+      if (qty <= 1e-9) return;
       const existing = map.get(sid);
       if (existing) {
         const existingForDemand = existing.demands.find((d) => d.demandId === demandId);
@@ -1731,32 +1756,92 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       }
     }
 
-    // walk is defined here (once) and closes over addPegging and map.
-    // consolidatedDemandIds is passed per-call so different entries can share the function.
-    const walk = (node: PlanningPeggingNode, activeDemandId: string | null, consolidatedDemandIds: string[] | null): void => {
+    // ── Pre-pass: build per-demand tagged-bucket consumption map from main-loop entries.
+    // Key: "<pid>|<lid>" → demandId → actual qty the demand consumed from its
+    // `consolidated_<demandId>_<pid>` bucket (for that product/location).
+    const taggedConsumption = new Map<string, Map<string, number>>();
+    const collectTagged = (node: PlanningPeggingNode, entryDemandId: string): void => {
+      if (node.type === 'supply' && node.supply_id && node.supply_id.startsWith(`consolidated_${entryDemandId}_`)) {
+        const pid = node.product_id ?? '';
+        const lid = node.location_id ?? '';
+        const qty = Number(node.quantity ?? 0);
+        if (qty > 1e-9 && pid) {
+          const key = `${pid}|${lid}`;
+          let inner = taggedConsumption.get(key);
+          if (!inner) { inner = new Map(); taggedConsumption.set(key, inner); }
+          inner.set(entryDemandId, (inner.get(entryDemandId) ?? 0) + qty);
+        }
+      }
+      for (const child of node.children ?? []) collectTagged(child, entryDemandId);
+    };
+    for (const entry of planResult.planning_pegging) {
+      // Only main-loop entries carry a specific demand_id and are NOT flagged consolidated/passthrough.
+      if (!entry.demand_id || entry.consolidated || entry.passthrough) continue;
+      collectTagged(entry.tree, entry.demand_id);
+    }
+
+    // ── Walk pass.
+    // For non-consolidated entries: peg straight to the entry's demand.
+    // For consolidated entries: distribute each real supply leaf across the demands that
+    // actually consumed the root-level tagged bucket, proportional to that consumption.
+    const walk = (
+      node: PlanningPeggingNode,
+      activeDemandId: string | null,
+      consolidatedWeights: Map<string, number> | null,
+    ): void => {
       const effectiveDemandId = node.type === 'demand' && node.demand_id ? node.demand_id : activeDemandId;
 
       if (node.type === 'supply' && node.supply_id) {
         const sid = node.supply_id;
         const qty = Number(node.quantity ?? 0);
-        if (effectiveDemandId) {
-          // Normal (non-consolidated): peg to the specific demand
-          addPegging(sid, qty, effectiveDemandId);
-        } else if (consolidatedDemandIds && consolidatedDemandIds.length > 0) {
-          // Consolidated: distribute equally among all demands in the group.
-          // This is an approximation; exact split is on each WO's consolidation_split_details.
-          const qtyPerDemand = qty / consolidatedDemandIds.length;
-          for (const demandId of consolidatedDemandIds) {
-            addPegging(sid, qtyPerDemand, demandId);
+        if (qty > 1e-9) {
+          if (effectiveDemandId) {
+            // Normal (non-consolidated): peg to the specific demand.
+            // Skip synthetic tagged buckets — the physical supplies underlying them are
+            // credited via the consolidated entry so we do not double-count.
+            if (!sid.startsWith('consolidated_')) addPegging(sid, qty, effectiveDemandId);
+          } else if (consolidatedWeights && consolidatedWeights.size > 0) {
+            let total = 0;
+            consolidatedWeights.forEach((w) => { total += w; });
+            if (total > 1e-9) {
+              consolidatedWeights.forEach((w, demandId) => {
+                if (w > 1e-9) addPegging(sid, (qty * w) / total, demandId);
+              });
+            }
+            // If total === 0 (no demand actually consumed), we intentionally drop this
+            // contribution rather than fabricating recipients.
           }
         }
       }
-      for (const child of node.children ?? []) walk(child, effectiveDemandId, consolidatedDemandIds);
+      for (const child of node.children ?? []) walk(child, effectiveDemandId, consolidatedWeights);
     };
 
     for (const entry of planResult.planning_pegging) {
-      // For consolidated entries, consolidated_demand_ids lists the demands that share the supply.
-      walk(entry.tree, entry.demand_id ?? null, entry.consolidated_demand_ids ?? null);
+      if (entry.passthrough && entry.demand_id) {
+        // Single-demand consolidation passthrough: all real supplies go to this demand.
+        // The main-loop entry for this demand stops at the synthetic tagged bucket, which
+        // we skip above — so this entry is the one that credits real supplies.
+        walk(entry.tree, entry.demand_id, null);
+      } else if (entry.consolidated && !entry.demand_id) {
+        // Multi-demand consolidated: distribute real supplies by actual tagged consumption.
+        const rootPid = entry.tree?.product_id ?? '';
+        const rootLid = entry.tree?.location_id ?? '';
+        const weights = taggedConsumption.get(`${rootPid}|${rootLid}`) ?? null;
+        let narrowed: Map<string, number> | null = null;
+        if (weights && entry.consolidated_demand_ids && entry.consolidated_demand_ids.length > 0) {
+          narrowed = new Map();
+          for (const demandId of entry.consolidated_demand_ids) {
+            const w = weights.get(demandId);
+            if (w && w > 1e-9) narrowed.set(demandId, w);
+          }
+        } else if (weights) {
+          narrowed = weights;
+        }
+        walk(entry.tree, null, narrowed);
+      } else if (entry.demand_id && !entry.consolidated && !entry.passthrough) {
+        // Main-loop entry for a specific demand — supply leaves peg straight to it.
+        walk(entry.tree, entry.demand_id, null);
+      }
     }
     return map;
   }, [planResult]);
@@ -1783,6 +1868,84 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return m;
   }, [planResult?.supply_allocations]);
 
+  /**
+   * Map supply_id → SupplySplitInfo for supplies consumed by a consolidated WO.
+   * Walks each consolidated pegging entry's tree to find real supply leaves and
+   * attaches the group's policy / total-need / produced figures from any matching
+   * consolidated work order (all WOs in the group share the same split details).
+   */
+  const supplySplitInfoMap = useMemo(() => {
+    const map = new Map<string, SupplySplitInfo>();
+    if (!planResult?.planning_pegging) return map;
+
+    // Index consolidated WOs by "pid|lid" → split details (first match wins).
+    // Raw-material groups have no WO (consumed from inventory directly), so this lookup
+    // may miss — we fall back to deriving split info from the pegging entry itself below.
+    const woSplitByGroup = new Map<string, { mode: string; totalPlanned: number; splitDetails: Array<{ demand_id: string | null; requested_qty: number; allocated_qty: number; priority: number; parent_product: string }> }>();
+    let fallbackMode: string | null = null;
+    for (const wo of planResult.work_orders ?? []) {
+      if (!wo.wo_consolidation_split_mode) continue;
+      if (!fallbackMode) fallbackMode = wo.wo_consolidation_split_mode;
+      const key = `${wo.product_id ?? ''}|${wo.location_id ?? ''}`;
+      if (woSplitByGroup.has(key)) continue;
+      woSplitByGroup.set(key, {
+        mode: wo.wo_consolidation_split_mode,
+        totalPlanned: wo.wo_consolidation_total_planned ?? 0,
+        splitDetails: wo.wo_consolidation_split_details ?? [],
+      });
+    }
+
+    const collectSupplies = (node: PlanningPeggingNode, acc: Set<string>): void => {
+      if (node.type === 'supply' && node.supply_id && !node.supply_id.startsWith('consolidated_')) {
+        acc.add(node.supply_id);
+      }
+      for (const child of node.children ?? []) collectSupplies(child, acc);
+    };
+
+    for (const entry of planResult.planning_pegging) {
+      if (!entry.consolidated || entry.demand_id) continue;
+      const rootPid = entry.tree?.product_id ?? '';
+      const rootLid = entry.tree?.location_id ?? '';
+      const split = woSplitByGroup.get(`${rootPid}|${rootLid}`);
+
+      let info: SupplySplitInfo;
+      if (split) {
+        const totalNeed = split.splitDetails.reduce((s, d) => s + (d.requested_qty ?? 0), 0);
+        info = {
+          mode: split.mode,
+          groupProductId: rootPid,
+          groupLocationId: rootLid,
+          groupTotalNeed: totalNeed,
+          groupTotalProduced: split.totalPlanned,
+          candidateCount: split.splitDetails.length,
+        };
+      } else {
+        // Fallback: raw-material group (no WO). Derive from the pegging entry itself.
+        const tree = entry.tree;
+        const totalNeed = Number(tree?.quantity ?? 0);
+        const committedRaw = (tree as PlanningPeggingNode & { committed_qty?: number })?.committed_qty;
+        const totalProduced = Number(committedRaw ?? 0);
+        const candidateCount = entry.consolidated_demand_ids?.length ?? 0;
+        if (!rootPid || (totalNeed <= 0 && totalProduced <= 0)) continue;
+        info = {
+          mode: fallbackMode ?? (planningConfig.consolidation?.allocation_mode ?? 'fair'),
+          groupProductId: rootPid,
+          groupLocationId: rootLid,
+          groupTotalNeed: totalNeed,
+          groupTotalProduced: totalProduced,
+          candidateCount,
+        };
+      }
+
+      const sids = new Set<string>();
+      collectSupplies(entry.tree, sids);
+      sids.forEach((sid) => {
+        if (!map.has(sid)) map.set(sid, info);
+      });
+    }
+    return map;
+  }, [planResult, planningConfig]);
+
   /** Join caseSupplies rows with supplyPeggingMap to produce the enriched supply view. */
   const planSupplyViewRows = useMemo((): PlanSupplyViewRow[] => {
     return caseSupplies.map((s) => {
@@ -1802,9 +1965,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         peggedDemandCount: pegging?.demands.length ?? 0,
         totalPeggedQty: pegging?.totalPeggedQty ?? 0,
         peggedDemands: pegging?.demands ?? [],
+        splitInfo: supplySplitInfoMap.get(s.supplyId) ?? null,
       };
     });
-  }, [caseSupplies, supplyPeggingMap, supplyConsumedMap]);
+  }, [caseSupplies, supplyPeggingMap, supplyConsumedMap, supplySplitInfoMap]);
 
   /** Sum of qty per productId across all plan supply view rows (unfiltered). */
   const planSupplyProductTotalMap = useMemo((): Record<string, number> => {
@@ -2932,14 +3096,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               />
               <span>{tP('config.consolidate')}</span>
             </label>
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
-              <input
-                type="checkbox"
-                checked={analyzeCriticalityEnabled}
-                onChange={(e) => setAnalyzeCriticalityEnabled(e.target.checked)}
-              />
-              <span style={{ fontSize: '0.875rem' }}>Analyze Criticality</span>
-            </label>
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}>
               <span style={{ color: '#a1a1aa' }}>{tP('config.bucketDays')}</span>
               <input
@@ -2947,9 +3103,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 min={1}
                 max={365}
                 disabled={planningConfig.consolidation?.enabled !== true}
-                value={planningConfig.consolidation?.period_days ?? 7}
+                value={planningConfig.consolidation?.period_days ?? 365}
                 onChange={(e) => {
-                  const v = Math.max(1, Math.min(365, parseInt(e.target.value, 10) || 7));
+                  const v = Math.max(1, Math.min(365, parseInt(e.target.value, 10) || 365));
                   setPlanningConfig((c) => ({ ...c, consolidation: { ...c.consolidation, period_days: v } }));
                 }}
                 style={{ width: 64, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
@@ -2959,16 +3115,25 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               <span style={{ color: '#a1a1aa' }}>{tP('config.splitPolicy')}</span>
               <select
                 disabled={planningConfig.consolidation?.enabled !== true}
-                value={planningConfig.consolidation?.allocation_mode ?? 'priority_first'}
+                value={planningConfig.consolidation?.allocation_mode ?? 'fair'}
                 onChange={(e) => setPlanningConfig((c) => ({
                   ...c,
-                  consolidation: { ...c.consolidation, allocation_mode: e.target.value as 'priority_first' | 'proportional' },
+                  consolidation: { ...c.consolidation, allocation_mode: e.target.value as 'priority_first' | 'proportional' | 'fair' },
                 }))}
                 style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
               >
-                <option value="priority_first">{tP('config.priorityFirst')}</option>
+                <option value="fair">{tP('config.fair')}</option>
                 <option value="proportional">{tP('config.proportional')}</option>
+                <option value="priority_first">{tP('config.priorityFirst')}</option>
               </select>
+            </label>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={analyzeCriticalityEnabled}
+                onChange={(e) => setAnalyzeCriticalityEnabled(e.target.checked)}
+              />
+              <span style={{ fontSize: '0.875rem' }}>Analyze Criticality</span>
             </label>
           </div>
           <br style={{ marginTop: '0.25rem' }} />
@@ -3274,15 +3439,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       if (e.demand_id) acc[e.demand_id] = e;
                       return acc;
                     }, {});
-                    // ALL trees per demand_id — consolidation entries contain original supply IDs
-                    // that the main tree replaces with consolidated_* synthetic IDs.
-                    const allPeggingTreesByDemandId = (planResult.planning_pegging ?? []).reduce<Record<string, PlanningPeggingNode[]>>((acc, e) => {
-                      if (e.demand_id && e.tree) {
-                        if (!acc[e.demand_id]) acc[e.demand_id] = [];
-                        acc[e.demand_id].push(e.tree);
-                      }
-                      return acc;
-                    }, {});
                     let list = planResult.committed_demands;
                     if (planDemandRealMakeOnly && bomRealPairs !== null) {
                       const keys = new Set(bomRealPairs.map(([p, c]) => `${(p ?? '').trim()}|${(c ?? '').trim()}`));
@@ -3314,13 +3470,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       list = list.filter((r) => (r.shortage ?? 0) > 0.01);
                     }
                     if (planDemandSupplyFilter.trim()) {
-                      const substr = planDemandSupplyFilter.trim().toLowerCase();
-                      list = list.filter((r) => {
-                        const demandId = r.demand_id ?? (r as unknown as { demand_id?: string }).demand_id;
-                        const trees = demandId ? allPeggingTreesByDemandId[demandId] : null;
-                        if (!trees?.length) return false;
-                        return trees.some(t => peggingTreeContainsSupply(t, substr, true));
-                      });
+                      // Use the same criterion as the Supply View's "Pegged Demands" column:
+                      // a demand matches iff it actually consumed from this supply_id (per
+                      // supplyPeggingMap). This keeps the two views consistent — no more
+                      // product-prefix false positives or full-shortage demands slipping in.
+                      const sid = planDemandSupplyFilter.trim();
+                      const pegging = supplyPeggingMap.get(sid);
+                      const demandSet = new Set((pegging?.demands ?? []).map((d) => d.demandId));
+                      list = list.filter((r) => demandSet.has(r.demand_id ?? ''));
                     }
                     const byCustomer = list.reduce<Record<string, number>>((acc, r) => {
                       const cName = (r.customer ?? r.customer_id ?? '–') as string;
@@ -4324,7 +4481,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     if (planSupplyHideDummy) rows = rows.filter((r) => !r.supplyId.toLowerCase().endsWith('_dummy'));
                     if (q) rows = rows.filter((r) => r.supplyId.toLowerCase().includes(q) || r.productId.toLowerCase().includes(q) || (r.locationId ?? '').toLowerCase().includes(q));
                     if (planSupplyUnusedOnly) rows = rows.filter((r) => r.peggedDemandCount === 0);
-                    if (planSupplyPartialOnly) rows = rows.filter((r) => r.residualQty > 0 && r.consumedQty > 0);
+                    if (planSupplyPartialOnly) rows = rows.filter((r) => r.consumedQty > 0);
 
                     const totalInitial = planSupplyViewRows.reduce((s, r) => s + r.qty, 0);
                     const totalConsumed = planSupplyViewRows.reduce((s, r) => s + r.consumedQty, 0);
@@ -4374,6 +4531,31 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             }},
                             { key: 'peggedDemandCount', label: tP('supplyView.columns.peggedDemands'), sortable: true, render: (r) => r.peggedDemandCount > 0 ? <span style={{ color: '#60a5fa' }}>{r.peggedDemandCount}</span> : <span style={{ color: '#52525b' }}>0</span> },
                             { key: 'totalPeggedQty', label: tP('supplyView.columns.totalPeggedQty'), sortable: true, render: (r) => r.totalPeggedQty > 0 ? Number(r.totalPeggedQty).toLocaleString() : <span style={{ color: '#52525b' }}>0</span> },
+                            { key: '_sup_splitInfo' as keyof (PlanSupplyViewRow & { _key: string }), label: tP('supplyView.columns.splitInfo'), sortable: false, render: (r) => {
+                              const info = r.splitInfo;
+                              if (!info) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                              const short = info.groupTotalProduced < info.groupTotalNeed - 1e-6;
+                              const modeColor = info.mode === 'fair' ? '#34d399' : info.mode === 'proportional' ? '#60a5fa' : '#f59e0b';
+                              const title = [
+                                `Group: ${info.groupProductId} @ ${info.groupLocationId}`,
+                                `Policy: ${info.mode}`,
+                                `Candidates: ${info.candidateCount} demand(s)`,
+                                `Need: ${info.groupTotalNeed.toLocaleString()}`,
+                                `Produced: ${info.groupTotalProduced.toLocaleString()}`,
+                                short ? `Shortage: ${(info.groupTotalNeed - info.groupTotalProduced).toLocaleString()}` : 'No shortage',
+                              ].join('\n');
+                              return (
+                                <span title={title} style={{ fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
+                                  <span style={{ color: modeColor, fontWeight: 600 }}>{info.mode}</span>
+                                  <span style={{ color: '#71717a' }}> · </span>
+                                  <span style={{ color: '#a1a1aa' }}>{info.candidateCount}d</span>
+                                  <span style={{ color: '#71717a' }}> · </span>
+                                  <span style={{ color: short ? '#f87171' : '#a1a1aa' }}>
+                                    {Number(info.groupTotalProduced).toLocaleString()}/{Number(info.groupTotalNeed).toLocaleString()}
+                                  </span>
+                                </span>
+                              );
+                            }},
                             { key: '_sup_pegging' as keyof (PlanSupplyViewRow & { _key: string }), label: tP('supplyView.columns.pegging'), sortable: false, render: (r) => {
                               if (r.peggedDemandCount === 0) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
                               const k = `supply|${r.supplyId}`;
@@ -5157,7 +5339,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <>
                   <div style={{ marginBottom: '0.75rem', display: 'flex', gap: '1.5rem', fontSize: '0.8rem', color: '#a1a1aa' }}>
                     <span>Total planned: <strong style={{ color: '#e4e4e7' }}>{totalPlanned.toLocaleString(undefined, { maximumFractionDigits: 1 })}</strong></span>
-                    <span>Split mode: <strong style={{ color: '#e4e4e7' }}>{overrideDialogWo.wo_consolidation_split_mode === 'proportional' ? 'Proportional' : 'Priority first'}</strong></span>
+                    <span>Split mode: <strong style={{ color: '#e4e4e7' }}>{overrideDialogWo.wo_consolidation_split_mode === 'proportional' ? 'Proportional' : overrideDialogWo.wo_consolidation_split_mode === 'priority_first' ? 'Priority first' : 'Fair'}</strong></span>
                   </div>
                   <table style={{ width: '100%', fontSize: '0.82rem', borderCollapse: 'collapse', marginBottom: '0.5rem' }}>
                     <thead>
@@ -5354,7 +5536,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem' }}>
                     This work order was consolidated for <strong>{woExplainRow.wo_consolidation_split_details.length}</strong> demands
                     (total planned: <strong>{(woExplainRow.wo_consolidation_total_planned ?? 0).toLocaleString(undefined, { maximumFractionDigits: 1 })}</strong>).
-                    Split mode: <strong>{woExplainRow.wo_consolidation_split_mode === 'proportional' ? 'Proportional' : 'Priority first'}</strong>.
+                    Split mode: <strong>{woExplainRow.wo_consolidation_split_mode === 'proportional' ? 'Proportional' : woExplainRow.wo_consolidation_split_mode === 'priority_first' ? 'Priority first' : 'Fair'}</strong>.
                   </p>
                   <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse' }}>
                     <thead>
@@ -5464,31 +5646,38 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             />
             <div style={{ padding: '1rem 1.25rem', borderBottom: '1px solid #3d3d40', flexShrink: 0 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
-                <h3 style={{ margin: 0, color: '#fafafa' }}>Planning copilot</h3>
-                <button type="button" onClick={() => setCopilotOpen(false)} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
+                <h3 style={{ margin: 0, color: '#fafafa' }}>{tP('copilot.title')}</h3>
+                <button type="button" onClick={() => setCopilotOpen(false)} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tP('copilot.close')}</button>
               </div>
               <p style={{ margin: 0, fontSize: '0.8rem', color: '#a1a1aa' }}>
-                <strong>Variants:</strong> {planningConfig.variant_selection?.multiple === false ? 'single best' : 'all feasible (equal split)'}.{' '}
-                <strong>Methods:</strong> {planningConfig.method_selection?.multiple === true ? 'equal split' : planningConfig.method_selection?.elaborate === true ? 'one by score (elaborate)' : 'one by preference'}.{' '}
-                <strong>Purchase:</strong> {planningConfig.purchase_allowed === false ? 'disabled' : 'allowed'}.{' '}
-                <strong>Consolidation:</strong> {planningConfig.consolidation?.enabled === true
-                  ? `on · ${planningConfig.consolidation.period_days ?? 7}d · ${planningConfig.consolidation.allocation_mode === 'proportional' ? 'proportional' : 'priority-first'}`
-                  : 'off'}. Express your requirements in natural language; the system may ask follow-up questions to clarify.
+                <strong>{tP('copilot.variants')}</strong> {planningConfig.variant_selection?.multiple === false ? tP('copilot.singleBest') : tP('copilot.allFeasible')}.{' '}
+                <strong>{tP('copilot.methods')}</strong> {planningConfig.method_selection?.multiple === true ? tP('copilot.equalSplit') : planningConfig.method_selection?.elaborate === true ? tP('copilot.oneByScore') : tP('copilot.oneByPreference')}.{' '}
+                <strong>{tP('copilot.purchase')}</strong> {planningConfig.purchase_allowed === false ? tP('copilot.disabled') : tP('copilot.allowed')}.{' '}
+                <strong>{tP('copilot.consolidation')}</strong> {planningConfig.consolidation?.enabled === true
+                  ? tP('copilot.consolidationOnDetail', {
+                      days: planningConfig.consolidation.period_days ?? 365,
+                      split: planningConfig.consolidation.allocation_mode === 'proportional'
+                        ? tP('copilot.splitProportional')
+                        : planningConfig.consolidation.allocation_mode === 'priority_first'
+                          ? tP('copilot.splitPriorityFirst')
+                          : tP('copilot.splitFair'),
+                    })
+                  : tP('copilot.off')}. {tP('copilot.naturalLangInfo')}
               </p>
             </div>
             <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
               {copilotMessages.length === 0 && (
                 <p style={{ margin: 0, fontSize: '0.875rem', color: '#71717a' }}>
-                  Ask how to configure <strong>variant</strong> and <strong>method</strong> selection. Examples: &quot;use only one variant per demand&quot;, &quot;split demand across all feasible variants&quot;, &quot;equal split across methods&quot;, &quot;show current config&quot;. With an LLM enabled, you can use natural language and the assistant may ask clarifying questions.
+                  {tP('copilot.examplesTitle')} <strong>{tP('copilot.examplesBody')}</strong> {tP('copilot.examplesMethod')} {tP('copilot.examplesRest')}
                 </p>
               )}
               {copilotMessages.map((m, i) => (
                 <div key={i} style={{ marginBottom: '0.75rem' }}>
-                  <span style={{ fontWeight: 600, color: m.role === 'user' ? '#a78bfa' : '#67e8f9', fontSize: '0.8rem' }}>{m.role === 'user' ? 'You' : 'Copilot'}: </span>
+                  <span style={{ fontWeight: 600, color: m.role === 'user' ? '#a78bfa' : '#67e8f9', fontSize: '0.8rem' }}>{m.role === 'user' ? tP('copilot.roleUser') : tP('copilot.roleCopilot')}: </span>
                   <span style={{ whiteSpace: 'pre-wrap', fontSize: '0.875rem' }}>{m.text.replace(/\*\*(.*?)\*\*/g, '$1')}</span>
                 </div>
               ))}
-              {copilotLoading && <p style={{ margin: 0, fontSize: '0.875rem', color: '#a1a1aa' }}>Thinking…</p>}
+              {copilotLoading && <p style={{ margin: 0, fontSize: '0.875rem', color: '#a1a1aa' }}>{tP('copilot.thinking')}</p>}
               <div ref={copilotMessagesEndRef} />
             </div>
             <form
@@ -5530,12 +5719,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 type="text"
                 value={copilotInput}
                 onChange={(e) => setCopilotInput(e.target.value)}
-                placeholder="e.g. I want to use a single best variant"
+                placeholder={tP('copilot.inputPlaceholder')}
                 disabled={copilotLoading}
                 style={{ width: '100%', padding: '8px 12px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 6, color: '#fafafa' }}
-                aria-label="Chat with planning copilot"
+                aria-label={tP('copilot.title')}
               />
-              <button type="submit" disabled={copilotLoading} className="secondary" style={{ marginTop: '0.5rem' }}>Send</button>
+              <button type="submit" disabled={copilotLoading} className="secondary" style={{ marginTop: '0.5rem' }}>{tP('copilot.send')}</button>
             </form>
           </div>
         </div>,
@@ -5904,6 +6093,58 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 }
               }
 
+              const runSearch = (query: string) => {
+                const q = query.trim().toLowerCase();
+                if (!q || !tree) {
+                  setPlanPeggingMatchPaths([]);
+                  setPlanPeggingMatchPath(null);
+                  setPlanPeggingMatchIndex(0);
+                  return;
+                }
+                const matches: string[] = [];
+                const ancestors = new Set<string>();
+                const nodeMatches = (n: PlanningPeggingNode): boolean => {
+                  const fields = [n.product_id, n.demand_id, n.supply_id, n.location_id, n.method];
+                  return fields.some((f) => typeof f === 'string' && f.toLowerCase().includes(q));
+                };
+                const walk = (n: PlanningPeggingNode, path: string, chain: string[]): void => {
+                  const nextChain = [...chain, path];
+                  if (nodeMatches(n)) {
+                    matches.push(path);
+                    chain.forEach((p) => ancestors.add(p));
+                  }
+                  (n.children ?? []).forEach((c, i) => walk(c, `${path}-${i}`, nextChain));
+                };
+                walk(tree, '0', []);
+                setPlanPeggingMatchPaths(matches);
+                setPlanPeggingMatchIndex(0);
+                setPlanPeggingMatchPath(matches[0] ?? null);
+                if (matches.length > 0) {
+                  setPlanPeggingExpanded((prev) => {
+                    const next = new Set(prev);
+                    ancestors.forEach((p) => next.add(p));
+                    // Also expand the first match itself so its children are visible
+                    next.add(matches[0]);
+                    return next;
+                  });
+                }
+              };
+              const stepMatch = (delta: number) => {
+                if (planPeggingMatchPaths.length === 0) return;
+                const nextIdx = (planPeggingMatchIndex + delta + planPeggingMatchPaths.length) % planPeggingMatchPaths.length;
+                setPlanPeggingMatchIndex(nextIdx);
+                const nextPath = planPeggingMatchPaths[nextIdx];
+                setPlanPeggingMatchPath(nextPath);
+                // Make sure ancestors of the new match are expanded
+                setPlanPeggingExpanded((prev) => {
+                  const next = new Set(prev);
+                  const parts = nextPath.split('-');
+                  for (let i = 1; i <= parts.length; i++) next.add(parts.slice(0, i).join('-'));
+                  next.add(nextPath);
+                  return next;
+                });
+              };
+
               function renderNode(node: PlanningPeggingNode, path: string, depth: number, xlink = false) {
                 const childrenList = node.children ?? [];
 
@@ -5954,7 +6195,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   ? Number((planPeggingContext.row as WorkOrder).quantity ?? 0)
                   : null;
                 const label = node.type === 'demand'
-                  ? `${node.product_id ?? node.demand_id ?? '–'} · ${Number(node.quantity ?? 0).toLocaleString()} @ ${node.location_id ?? '–'}${node.demand_id && node.product_id !== node.demand_id && node.demand_id !== contextDemandId ? ` (demand ${node.demand_id})` : ''}`
+                  ? (() => {
+                      const reqQty = Number(node.quantity ?? 0);
+                      const committedRaw = (node as { committed_qty?: number | null }).committed_qty;
+                      const commQty = committedRaw == null ? reqQty : Number(committedRaw);
+                      const qtyLabel = commQty < reqQty - 1e-6
+                        ? `${commQty.toLocaleString()} / ${reqQty.toLocaleString()}`
+                        : reqQty.toLocaleString();
+                      return `${node.product_id ?? node.demand_id ?? '–'} · ${qtyLabel} @ ${node.location_id ?? '–'}${node.demand_id && node.product_id !== node.demand_id && node.demand_id !== contextDemandId ? ` (demand ${node.demand_id})` : ''}`;
+                    })()
                   : node.type === 'work_order'
                     ? (() => {
                         const qty = woRowQty ?? Number(node.quantity ?? 0);
@@ -5980,12 +6229,30 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   childGroupKind = 'and';
                   childGroupLabel = 'ALL of the inventories / work orders below are required together (AND).';
                 } else if (!relation && hasChildren && childrenList.length > 1 && node.type !== 'work_order') {
-                  // Fallback: multiple inbound options into an inventory/demand node behave as OR.
-                  childGroupKind = 'or';
-                  childGroupLabel = 'ANY of the inventories / work orders below can supply this node (OR).';
+                  // Children under a demand node are additive. When the children are all
+                  // supply/purchase buckets of the SAME product, they're FIFO bucket splits —
+                  // neither AND (different components) nor OR (alternatives). Omit the label.
+                  // Otherwise (distinct components summed under the demand, e.g. a make WO's
+                  // BOM children bubbled up), AND is the honest reading.
+                  const sameProductBucketsOnly =
+                    node.type === 'demand' &&
+                    childrenList.every((c: typeof node) =>
+                      (c.type === 'supply' || c.type === 'purchase') &&
+                      c.product_id === node.product_id,
+                    );
+                  if (!sameProductBucketsOnly) {
+                    childGroupKind = 'and';
+                    childGroupLabel = 'ALL of the inventories / work orders below are required together (AND).';
+                  }
                 }
+                const isActiveMatch = planPeggingMatchPath === path;
+                const isAnyMatch = planPeggingMatchPaths.includes(path);
                 return (
-                  <div key={path} style={{ marginBottom: 4 }}>
+                  <div
+                    key={path}
+                    style={{ marginBottom: 4 }}
+                    ref={isActiveMatch ? ((el) => { if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' }); }) : undefined}
+                  >
                     <button
                       type="button"
                       onClick={toggle}
@@ -5996,8 +6263,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         width: '100%',
                         textAlign: 'left',
                         padding: '4px 6px',
-                        background: depth % 2 === 0 ? 'rgba(255,255,255,0.04)' : 'transparent',
-                        border: 'none',
+                        background: isActiveMatch
+                          ? 'rgba(250, 204, 21, 0.28)'
+                          : isAnyMatch
+                            ? 'rgba(250, 204, 21, 0.12)'
+                            : depth % 2 === 0 ? 'rgba(255,255,255,0.04)' : 'transparent',
+                        border: isActiveMatch ? '1px solid #facc15' : 'none',
                         borderRadius: 4,
                         color: '#e4e4e7',
                         cursor: expandable ? 'pointer' : 'default',
@@ -6093,7 +6364,61 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   </div>
                 );
               }
-              return <div style={{ marginTop: '0.5rem' }}>{tree ? renderNode(tree, '0', 0) : null}</div>;
+              return (
+                <>
+                  <div style={{
+                    display: 'flex', alignItems: 'center', gap: 6,
+                    marginTop: '0.25rem', marginBottom: '0.5rem',
+                    padding: '4px 6px', background: '#1c1c1e',
+                    border: '1px solid #3d3d40', borderRadius: 4,
+                  }}>
+                    <input
+                      type="text"
+                      value={planPeggingSearch}
+                      onChange={(e) => setPlanPeggingSearch(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          if (planPeggingMatchPaths.length > 0) stepMatch(e.shiftKey ? -1 : 1);
+                          else runSearch(planPeggingSearch);
+                        } else if (e.key === 'Escape') {
+                          setPlanPeggingSearch('');
+                          setPlanPeggingMatchPaths([]);
+                          setPlanPeggingMatchPath(null);
+                          setPlanPeggingMatchIndex(0);
+                        } else {
+                          // Any edit invalidates prior matches; user presses Enter/Find to re-search.
+                          if (planPeggingMatchPaths.length > 0) {
+                            setPlanPeggingMatchPaths([]);
+                            setPlanPeggingMatchPath(null);
+                            setPlanPeggingMatchIndex(0);
+                          }
+                        }
+                      }}
+                      placeholder="Find in pegging (product / location / supply / demand id)…"
+                      style={{ flex: 1, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem' }}
+                    />
+                    <button type="button" onClick={() => runSearch(planPeggingSearch)}
+                      style={{ padding: '3px 8px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, cursor: 'pointer', fontSize: '0.78rem' }}>
+                      Find
+                    </button>
+                    <button type="button" onClick={() => stepMatch(-1)} disabled={planPeggingMatchPaths.length === 0}
+                      style={{ padding: '3px 8px', background: '#2d2d30', color: planPeggingMatchPaths.length === 0 ? '#52525b' : '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, cursor: planPeggingMatchPaths.length === 0 ? 'default' : 'pointer', fontSize: '0.78rem' }}>
+                      ↑
+                    </button>
+                    <button type="button" onClick={() => stepMatch(1)} disabled={planPeggingMatchPaths.length === 0}
+                      style={{ padding: '3px 8px', background: '#2d2d30', color: planPeggingMatchPaths.length === 0 ? '#52525b' : '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, cursor: planPeggingMatchPaths.length === 0 ? 'default' : 'pointer', fontSize: '0.78rem' }}>
+                      ↓
+                    </button>
+                    <span style={{ fontSize: '0.72rem', color: '#a1a1aa', minWidth: 60, textAlign: 'right' }}>
+                      {planPeggingMatchPaths.length === 0
+                        ? (planPeggingSearch.trim() ? 'no match' : '')
+                        : `${planPeggingMatchIndex + 1} / ${planPeggingMatchPaths.length}`}
+                    </span>
+                  </div>
+                  <div style={{ marginTop: '0.5rem' }}>{tree ? renderNode(tree, '0', 0) : null}</div>
+                </>
+              );
             })()}
           </div>
         </div>,

@@ -101,8 +101,8 @@ data class ConsolidationGroup(
 /** Parsed from the "consolidation" key in the run config map. */
 data class ConsolidationConfig(
     val enabled: Boolean = false,
-    val periodDays: Int = 7,
-    val allocationMode: String = "proportional",  // "proportional" | "priority_first"
+    val periodDays: Int = 365,
+    val allocationMode: String = "fair",  // "proportional" | "priority_first" | "fair"
 )
 
 /** Output of runConsolidation(). */
@@ -120,10 +120,11 @@ fun parseConsolidationConfig(config: Map<String, Any?>?): ConsolidationConfig {
     @Suppress("UNCHECKED_CAST")
     val m = sub as? Map<String, Any?> ?: return ConsolidationConfig()
     val enabled = m["enabled"] as? Boolean ?: false
-    val periodDays = ((m["period_days"] as? Number)?.toInt() ?: 7).coerceIn(1, 365)
+    val periodDays = ((m["period_days"] as? Number)?.toInt() ?: 365).coerceIn(1, 365)
     val allocationMode = when (m["allocation_mode"]?.toString()) {
-        "proportional" -> "proportional"
-        else -> "priority_first"
+        "proportional"   -> "proportional"
+        "priority_first" -> "priority_first"
+        else             -> "fair"
     }
     return ConsolidationConfig(enabled, periodDays, allocationMode)
 }
@@ -209,6 +210,26 @@ fun splitProportional(
         need.demandId to availableQty * (need.qty / group.totalQty)
     }
 }
+
+/**
+ * Hybrid split: behaves like [splitPriorityFirst] when supply is sufficient
+ * (`availableQty >= totalQty`), but falls back to [splitProportional] when
+ * there is a real shortage. This avoids the priority_first failure mode where
+ * one demand is granted 100 % of a scarce component, can't actually produce
+ * (e.g. because its BOM also needs the same component via another path or
+ * another raw is exhausted), and all remaining demands get zero — producing a
+ * plan that commits nothing at all.
+ *
+ * With `fair`, every demand whose need was > 0 is guaranteed a non-zero share
+ * under shortage, so each per-demand plan can at least partial-commit the
+ * producible fraction of its requested FG quantity.
+ */
+fun splitFair(
+    group: ConsolidationGroup,
+    availableQty: Double,
+): Map<Any?, Double> =
+    if (availableQty >= group.totalQty - 1e-9) splitPriorityFirst(group, availableQty)
+    else splitProportional(group, availableQty)
 
 // ── Pre-scan: collect component needs ────────────────────────────────────────
 
@@ -390,6 +411,13 @@ fun runConsolidation(
     // Build override index once — shared across all groups
     val overrideIndex = buildOverrideIndex(data["overrides"] ?: emptyList())
 
+    val multi = groups.count { it.needs.size > 1 }
+    log.info(
+        "runConsolidation: mode={} period_days={} groups={} (multi-demand={}) sample={}",
+        config.allocationMode, config.periodDays, groups.size, multi,
+        groups.take(3).joinToString { "(${it.productId}@${it.locationId} qty=${it.totalQty} n=${it.needs.size})" }
+    )
+
     for (group in groups) {
         val componentKey = "${group.productId}|${group.locationId}"
 
@@ -434,17 +462,19 @@ fun runConsolidation(
             // via the tagged consolidated supply bucket that is injected below).
             if (pegging != null) consolidatedPegging.add(mapOf("demand_id" to need.demandId, "passthrough" to true, "tree" to pegging))
             allocation.getOrPut(need.demandId) { mutableMapOf() }[componentKey] = producedQty
-            // Consume from real inventory (claim the supply)
-            consumeFromInventoryForConsolidation(inventory, group.productId, group.locationId, producedQty)
+            // Consume from real inventory by walking the pegging tree so every supply leaf
+            // (top-level component AND raw materials deep in the BOM) is depleted.  This is
+            // essential: without it, subsequent groups see undepleted raw supply and over-peg.
+            if (pegging != null) {
+                applyPeggingConsumption(inventory, pegging)
+            } else {
+                consumeFromInventoryForConsolidation(inventory, group.productId, group.locationId, producedQty)
+            }
         } else {
-            // Multi-demand group — consolidate.
-            // If ALL needs are via OR-alternative paths, skip: leave supply in inventory for FIFO.
-            // Splitting a tiny fraction among many demands causes each to fail with child_failed
-            // while the supply is consumed and wasted.  When at least one demand is a direct
-            // (non-OR) consumer, allViaOr=false and we consolidate normally so OR-path demands
-            // get a fair proportional share alongside the direct consumer.
-            val allViaOr = group.needs.all { it.viaOrAlternative }
-            if (allViaOr) continue
+            // Multi-demand group — always consolidate, even when every need reached this
+            // component via an OR-alternative path. With cap-propagation in place, a small
+            // share yields a correspondingly small commit (not child_failed), so the fair
+            // split is what prevents high-priority demands from starving the rest via FIFO.
             val syntheticDemand = mapOf(
                 "demand_id"        to null,
                 "product_id"       to group.productId,
@@ -478,12 +508,27 @@ fun runConsolidation(
             } else {
                 when (config.allocationMode) {
                     "proportional" -> splitProportional(group, producedQty)
+                    "fair"         -> splitFair(group, producedQty)
                     else           -> splitPriorityFirst(group, producedQty)
                 }
             }
             for ((demandId, qty) in split) {
                 if (qty <= 1e-12) continue
                 allocation.getOrPut(demandId) { mutableMapOf() }[componentKey] = qty
+            }
+
+            // Visibility: log any shortage (produced < requested) so the actual split is auditable.
+            if (producedQty < group.totalQty - 1e-6) {
+                val preview = group.needs.take(8).joinToString {
+                    "${it.demandId}:need=${"%.1f".format(it.qty)},got=${"%.1f".format(split[it.demandId] ?: 0.0)}"
+                }
+                val more = if (group.needs.size > 8) " …(+${group.needs.size - 8} more)" else ""
+                log.info(
+                    "consolidation shortage {}@{} bucket={} total={} produced={} mode={} → {}{}",
+                    group.productId, group.locationId, group.timeBucket,
+                    "%.1f".format(group.totalQty), "%.1f".format(producedQty),
+                    config.allocationMode, preview, more,
+                )
             }
 
             // Build split detail list for explanation (one entry per demand in the group)
@@ -518,8 +563,13 @@ fun runConsolidation(
                 "tree" to pegging,
             ))
 
-            // Consume from real inventory (claim the consolidated supply upfront)
-            consumeFromInventoryForConsolidation(inventory, group.productId, group.locationId, producedQty)
+            // Consume from real inventory by walking the pegging tree — depletes the top-level
+            // component AND all raw materials consumed in the BOM chain below it.
+            if (pegging != null) {
+                applyPeggingConsumption(inventory, pegging)
+            } else {
+                consumeFromInventoryForConsolidation(inventory, group.productId, group.locationId, producedQty)
+            }
         }
     }
 
@@ -545,4 +595,43 @@ private fun consumeFromInventoryForConsolidation(
         b["qty"] = avail - take
         remaining -= take
     }
+}
+
+/**
+ * Walk a pegging tree and decrement real inventory by each supply/purchase leaf's qty,
+ * matched on supply_id. This is how consolidation propagates raw-material consumption back
+ * to the shared inventory so that subsequent groups (and the main planner loop) see the
+ * correct depletion. Without this, each consolidation group plans against invCopy (a fresh
+ * snapshot), so raw materials deep in the BOM chain are never drained — leading to over-
+ * pegging and FG qty not being capped by raw supply.
+ *
+ * Supply ids that do not match any inventory bucket (synthetic `consolidated_*` etc.) are
+ * skipped silently: they have no physical cap.
+ */
+private fun applyPeggingConsumption(
+    inventory: MutableList<MutableMap<String, Any?>>,
+    peggingTree: Map<String, Any?>,
+) {
+    @Suppress("UNCHECKED_CAST")
+    fun walk(node: Map<String, Any?>) {
+        val type = node["type"] as? String
+        val supplyId = node["supply_id"] as? String
+        if ((type == "supply" || type == "purchase") && !supplyId.isNullOrBlank()) {
+            val qty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
+            if (qty > 1e-9) {
+                var remaining = qty
+                for (b in inventory) {
+                    if (remaining <= 1e-9) break
+                    if (b["supply_id"]?.toString() != supplyId) continue
+                    val avail = (b["qty"] as? Number)?.toDouble() ?: 0.0
+                    if (avail <= 0) continue
+                    val take = minOf(avail, remaining)
+                    b["qty"] = avail - take
+                    remaining -= take
+                }
+            }
+        }
+        (node["children"] as? List<Map<String, Any?>>)?.forEach { walk(it) }
+    }
+    walk(peggingTree)
 }

@@ -275,7 +275,8 @@
       "bucketDays": "Bucket (days):",
       "splitPolicy": "Split policy:",
       "priorityFirst": "Priority first",
-      "proportional": "Proportional"
+      "proportional": "Proportional",
+      "fair": "Fair"
     },
     "runPlan": "Run plan",
     "running": "Running plan…",
@@ -419,6 +420,8 @@
     },
     "copilot": {
       "title": "Planning copilot",
+      "close": "Close",
+      "send": "Send",
       "variants": "Variants:",
       "singleBest": "single best",
       "allFeasible": "all feasible (equal split)",
@@ -433,6 +436,11 @@
       "on": "on",
       "off": "off",
       "naturalLangInfo": "Express your requirements in natural language; the system may ask follow-up questions to clarify.",
+      "configSummary": "Variants: {variants}. Methods: {methods}. Purchase: {purchase}. Consolidation: {consolidation}.",
+      "consolidationOnDetail": "on · {days}d · {split}",
+      "splitProportional": "proportional",
+      "splitPriorityFirst": "priority-first",
+      "splitFair": "fair",
       "examplesTitle": "Ask how to configure",
       "examplesBody": "variant",
       "examplesMethod": "method",
@@ -440,7 +448,29 @@
       "roleUser": "You",
       "roleCopilot": "Copilot",
       "thinking": "Thinking…",
-      "inputPlaceholder": "e.g. I want to use a single best variant"
+      "inputPlaceholder": "e.g. I want to use a single best variant",
+      "replies": {
+        "empty": "You can configure variant selection, method selection, or shared-component consolidation. Say \"show config\" to see current settings.",
+        "showConfig": "Variant selection: **{variantMode}**. Method selection: **{methodMode}**. Purchase: **{purchaseMode}**. Consolidation: **{consolidationMode}**.",
+        "variantSingle": "Set variant selection to **single best variant**. The planner will pick one best BOM/variant per demand (by score: earliest commit, most inventory consumed, least purchase). Re-run plan to apply.",
+        "variantAll": "Set variant selection to **all feasible variants** with equal split. Demand will be divided among all feasible BOM/variants. Re-run plan to apply.",
+        "methodEqual": "Set method selection to **equal split across methods**. When multiple make/move/buy methods can fulfill a demand, quantity is divided equally among them. Re-run plan to apply.",
+        "methodElaborate": "Set method selection to **elaborate (score by simulation)**. The planner simulates each method's child materials and picks the one with earliest commit, most inventory consumed, and least purchase. Slower. Re-run plan to apply.",
+        "methodPreference": "Set method selection to **by preference (cascade)**. The planner tries the most preferred method first; if its child materials cannot be planned, it falls back to the next preferred method. Re-run plan to apply.",
+        "purchaseOff": "Purchase (buy method) **disabled**. The planner will not use buy methods; demands will be fulfilled from inventory, make, or move only. Re-run plan to apply.",
+        "purchaseOn": "Purchase (buy method) **allowed**. The planner will use buy methods when available. Re-run plan to apply.",
+        "consolidationOn": "Enabled **shared-component consolidation**. Demands within the same time bucket (currently {days} days) that share a component will be grouped into one work order, then output is split by {mode}. Re-run plan to apply.",
+        "consolidationOnModeProportional": "proportional qty",
+        "consolidationOnModePriority": "priority order",
+        "consolidationOnModeFair": "fair (priority when ample, proportional under shortage)",
+        "consolidationOff": "Disabled consolidation. Each demand will plan its components independently. Re-run plan to apply.",
+        "periodBucket": "Set consolidation time bucket to **{days} day{plural}**. Re-run plan to apply.",
+        "splitProportional": "Set consolidation split policy to **proportional** — output is divided in proportion to each demand's requested quantity. Re-run plan to apply.",
+        "splitPriority": "Set consolidation split policy to **priority-first** — highest-priority demands are filled first from consolidated output. Re-run plan to apply.",
+        "splitFair": "Set consolidation split policy to **fair** — priority-first when supply is sufficient, proportional under shortage so no demand is starved. Re-run plan to apply.",
+        "reset": "Reset to defaults: all feasible variants (equal split), by preference (cascade) method selection, purchase disallowed, consolidation on (365-day bucket, fair split). Re-run plan to apply.",
+        "help": "I handle variant selection, method selection, purchase, and shared-component consolidation. Try: \"single best variant\", \"all variants\", \"by preference\", \"elaborate method\", \"equal split methods\", \"no purchase\", \"allow purchase\", \"enable consolidation\", \"set 14 day bucket\", \"proportional split\", or \"show config\"."
+      }
     },
     "runHistory": {
       "title": "Run history",
@@ -469,7 +499,7 @@
       "heading": "Supply universe",
       "filterPlaceholder": "Filter by supply ID, product, location…",
       "filterUnusedOnly": "Unused only",
-      "filterPartialOnly": "Partially consumed",
+      "filterPartialOnly": "Consumed (any)",
       "filterHideDummy": "Hide dummy",
       "loading": "Loading supplies…",
       "showing": "Showing {shown} of {total} supplies.",
@@ -487,6 +517,7 @@
         "utilPct": "Util %",
         "peggedDemands": "Pegged Demands",
         "totalPeggedQty": "Total Pegged Qty",
+        "splitInfo": "Split Info",
         "pegging": "Pegging"
       },
       "peggingPanel": {

@@ -1307,8 +1307,9 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
             put("enabled",         consolidation["enabled"]      as? Boolean ?: false)
             put("period_days",     ((consolidation["period_days"] as? Number)?.toInt() ?: 7).coerceIn(1, 365))
             put("allocation_mode", when (consolidation["allocation_mode"]?.toString()) {
-                "proportional" -> "proportional"
-                else           -> "priority_first"
+                "proportional"   -> "proportional"
+                "priority_first" -> "priority_first"
+                else             -> "fair"
             })
         }
     }

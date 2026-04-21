@@ -284,10 +284,10 @@ export type PlanningConfig = {
   /** Consolidate shared component demands within a time bucket before planning. */
   consolidation?: {
     enabled?: boolean;
-    /** Width of the time bucket in days (1–365). Default: 7. */
+    /** Width of the time bucket in days (1–365). Default: 365. */
     period_days?: number;
-    /** How to split consolidated output among competing demands. Default: priority_first. */
-    allocation_mode?: 'priority_first' | 'proportional';
+    /** How to split consolidated output among competing demands. Default: fair. */
+    allocation_mode?: 'priority_first' | 'proportional' | 'fair';
   };
 };
 
@@ -553,10 +553,11 @@ export async function getPegging(
 export async function getSupplyView(
   caseId: number,
   runId: number,
-  opts?: { debug_component_key?: string },
-): Promise<{ supply_view: SupplyViewRow[]; _debug?: Record<string, unknown> }> {
+  opts?: { debug_component_key?: string; plan_run_id?: number },
+): Promise<{ supply_view: SupplyViewRow[]; _debug?: Record<string, unknown>; source?: string; plan_run_id?: number }> {
   const params = new URLSearchParams();
   if (opts?.debug_component_key) params.set('debug_component_key', opts.debug_component_key);
+  if (opts?.plan_run_id != null) params.set('plan_run_id', String(opts.plan_run_id));
   const qs = params.toString();
   const r = await fetchWithTimeout(`${API}/cases/${caseId}/runs/${runId}/supply-view${qs ? `?${qs}` : ''}`);
   if (!r.ok) throw new Error(await r.text());
@@ -732,6 +733,23 @@ export type PeggedDemandEntry = {
   qtyConsumed: number;
 };
 
+/** Consolidation split context for a supply — populated only when the supply was consumed
+ *  by a consolidated work order (shared-component allocation). Lets the Supply View show
+ *  HOW the shared supply was divided across the consolidation group's candidate demands. */
+export type SupplySplitInfo = {
+  /** "fair" | "proportional" | "priority_first" — policy that drove the split. */
+  mode: string;
+  /** Top-level product/location of the consolidated group (e.g., the FG or intermediate). */
+  groupProductId: string;
+  groupLocationId: string;
+  /** Sum of requested_qty across the group's candidate demands. */
+  groupTotalNeed: number;
+  /** Qty actually produced for the group (what the consolidated WO delivered). */
+  groupTotalProduced: number;
+  /** Number of candidate demands in the consolidation group (including zero-share ones). */
+  candidateCount: number;
+};
+
 /** Enriched supply row for the Plan Supply View table (supply metadata + pegging aggregates). */
 export type PlanSupplyViewRow = CaseSupplyRow & {
   consumedQty: number;
@@ -740,6 +758,7 @@ export type PlanSupplyViewRow = CaseSupplyRow & {
   peggedDemandCount: number;
   totalPeggedQty: number;
   peggedDemands: PeggedDemandEntry[];
+  splitInfo?: SupplySplitInfo | null;
 };
 
 /** Fetch all supply records for a case (flat table scan, no run context needed). */
