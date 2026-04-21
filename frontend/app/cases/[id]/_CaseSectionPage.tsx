@@ -3812,12 +3812,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     // Compute the supply-backing map early so it can drive the phantom filter below
                     // and also be used by the WO expand panel later in this block.
                     const { suppliesMap: woSuppliesMap, crossEntrySupplyMap: woCrossEntrySupplyMap, peggedQtyMap: woPeggedQtyMap } = buildWoMaps(planResult.planning_pegging ?? []);
-                    // Build set of demand IDs with shortage > 0 for short-supply filter
-                    const shortDemandIds = planDemandShortOnly
-                      ? new Set(planResult.committed_demands.filter((d) => (d.shortage ?? 0) > 0.01).map((d) => d.demand_id ?? ''))
-                      : null;
+                    // Short-supply filter is WO-level and applied after enrichment (see below),
+                    // since WO-level shortage is computed from the enriched Requested/Committed.
                     // Filters refer to work-order pegging (each WO's supplies subtree), not demand pegging.
-                    const anyPeggingFilter = planDemandRealMakeOnly || planDemandBuyOnly || planDemandRealMoveOnly || planWoDemandedByMultiple || planWoMultiSupply || planWoPurchaseOnly || planWoMoveOnly || planDemandShortOnly || planWoHasOverride;
+                    const anyPeggingFilter = planDemandRealMakeOnly || planDemandBuyOnly || planDemandRealMoveOnly || planWoDemandedByMultiple || planWoMultiSupply || planWoPurchaseOnly || planWoMoveOnly || planWoHasOverride;
                     if (anyPeggingFilter) {
                       workOrderRows = workOrderRows.filter((r) => {
                         if (planDemandRealMakeOnly && !(r.pegging_includes_real_make === true)) return false;
@@ -3827,11 +3825,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         if (planWoMultiSupply && !(r.multi_supply_available === true)) return false;
                         if (planWoPurchaseOnly) { const m = (r.method ?? '').toLowerCase(); if (m !== 'buy' && m !== 'purchase') return false; }
                         if (planWoMoveOnly && (r.method ?? '').toLowerCase() !== 'move') return false;
-                        if (shortDemandIds) {
-                          const matchesDirect = shortDemandIds.has(r.demand_id ?? '');
-                          const matchesConsolidated = !r.demand_id && (r.wo_consolidation_split_details ?? []).some((d) => shortDemandIds.has(d.demand_id ?? ''));
-                          if (!matchesDirect && !matchesConsolidated) return false;
-                        }
                         if (planWoHasOverride && !woHasSavedOverride(r)) return false;
                         return true;
                       });
@@ -3905,7 +3898,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       if (!demandLabelMap.has(id)) demandLabelMap.set(id, d.product_id);
                     }
                     const dummyHiddenCount = planResult.work_orders.filter((r) => (r.prod_area ?? '').trim().toLowerCase() === 'dummy').length;
-                    const woRows: WoEnrichedRow[] = groupedRows.map((r, i) => {
+                    const woRowsAll: WoEnrichedRow[] = groupedRows.map((r, i) => {
                       const splitDemandIds = (r.wo_consolidation_split_details ?? [])
                         .map((d) => d.demand_id)
                         .filter((d): d is string => d != null && d !== '');
@@ -3914,22 +3907,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         : splitDemandIds.length > 0
                           ? splitDemandIds.join(', ')
                           : undefined;
-                      // Requested = demand-side ask against this WO.
-                      //   shared (consolidation split > 1) → sum of allocated_qty across all
-                      //     sharing demands. peggedQty would only reflect one demand's share,
-                      //     which is less than the WO's committed total and produces the
-                      //     misleading "Committed > Requested" display.
-                      //   single → the demand node directly above this WO in the pegging tree
-                      //     (component demand qty for component WOs, FG for top-level WOs).
+                      // Requested = what this WO was planned to produce.
+                      //   shared/consolidated (split_details > 1) → equals Committed
+                      //     (r.quantity). Per-demand `allocated_qty` in split_details is
+                      //     in parent-product units and does not reconcile with the
+                      //     component/variant-level r.quantity after BOM-rate scaling and
+                      //     lot aggregation — using it produces "Committed > Requested"
+                      //     display artifacts. WO-level shortage is always 0 here; any
+                      //     demand shortage is visible in the committed_demands table.
+                      //   single → the demand node directly above this WO in the pegging tree.
                       //   no peg data → fall back to committed_demand requested_qty.
                       const isSharedConsolidated = (r.wo_consolidation_split_details?.length ?? 0) > 1;
                       const woKeyFull = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
                       const woKeyConsolidated = `|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
                       const peggedQty = woPeggedQtyMap.get(woKeyFull) ?? woPeggedQtyMap.get(woKeyConsolidated) ?? null;
                       const demandRequested = isSharedConsolidated
-                        ? (r.wo_consolidation_split_details ?? []).reduce(
-                            (s, d) => s + (Number(d.allocated_qty) || 0), 0,
-                          )
+                        ? (Number(r.quantity) || 0)
                         : peggedQty != null
                           ? peggedQty
                           : r.demand_id
@@ -3959,6 +3952,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         _shortage: shortage > 0 ? shortage : undefined,
                       };
                     });
+                    const woRows: WoEnrichedRow[] = planDemandShortOnly
+                      ? woRowsAll.filter((r) => (r._shortage ?? 0) > 0.01)
+                      : woRowsAll;
                     const woColumns: { key: string; label: string; sortable?: boolean; render?: (r: WoEnrichedRow) => React.ReactNode }[] = [
                       { key: 'product_id', label: 'Product', sortable: true },
                       { key: 'location_id', label: 'Location', sortable: true },
