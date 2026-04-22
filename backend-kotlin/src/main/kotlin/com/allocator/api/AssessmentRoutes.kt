@@ -27,7 +27,7 @@ the following are criteria for HIGH rating:
 number of impacted demands is equal or greater than 5, or total quantity of impacted demands is equal or greater than 5000.
 
 the following are criteria for LOW rating:
-number of impacted demands is no more than 2, or total quantity of impacted demands is less than 500.
+number of impacted demands is no more than 2, and total quantity of impacted demands is less than 500.
 
 the following are criteria for MEDIUM rating:
 otherwise.
@@ -38,7 +38,7 @@ private val DEFAULT_CRITERIA_ZH = """
 受影响需求数量大于等于5，或受影响需求的总数量大于等于5000。
 
 以下是LOW评级的标准：
-受影响需求数量不超过2，或受影响需求的总数量小于500。
+受影响需求数量不超过2，并且受影响需求的总数量小于500。
 
 以下是MEDIUM评级的标准：
 其他情况。
@@ -50,9 +50,13 @@ private val DEFAULT_CRITERIA_ZH = """
  */
 private fun computeDefaultRating(demandCount: Int, totalShortfall: Double): String = when {
     demandCount >= 5 || totalShortfall >= 5000.0 -> "HIGH"
-    demandCount <= 2 || totalShortfall < 500.0   -> "LOW"
+    demandCount <= 2 && totalShortfall < 500.0   -> "LOW"
     else                                          -> "MEDIUM"
 }
+
+/** Detect CJK Unified Ideographs — drives prompt language selection. */
+private fun containsChinese(s: String): Boolean =
+    s.any { it.code in 0x4E00..0x9FFF }
 
 // ── DTOs ──────────────────────────────────────────────────────────────────────
 
@@ -70,6 +74,9 @@ data class AssessmentRequest(
     val caseId: Int? = null,
     // Optional override: if omitted, case's assessment_criteria is loaded; falls back to DEFAULT_CRITERIA
     val criteria: String? = null,
+    // Locale for the LLM-generated explanation. "zh" → Chinese prompt; anything else → English.
+    // Drives prompt selection even when the stored criteria is English default.
+    val locale: String? = null,
 )
 
 @Serializable
@@ -217,6 +224,93 @@ The impact has been rated: $rating
 Write 2–3 sentences explaining this rating in terms of the criteria above.
 Cite the specific numbers (demand count and total shortfall) that determined the outcome.
 Output ONLY the explanation text — no labels, no preamble.
+""".trimIndent()
+}
+
+private fun buildPromptZh(impact: MaterialImpactResponse, criteria: String): String {
+    val changeDesc = buildString {
+        if (impact.deliveryDelayDays > 0) append("延迟 ${impact.deliveryDelayDays} 天")
+        if (impact.quantityDecreaseAbs != null && impact.quantityDecreaseAbs > 0) {
+            if (isNotEmpty()) append("，")
+            append("数量减少 ${impact.quantityDecreaseAbs} 单位（绝对值）")
+        } else if (impact.quantityDecreasePct > 0) {
+            if (isNotEmpty()) append("，")
+            append("数量减少 ${impact.quantityDecreasePct}%")
+        }
+        if (isEmpty()) append("未指定变更参数")
+    }
+
+    val totalShortfall = impact.impacts.sumOf { d ->
+        if (d.baselineCommittedQty > 0.0 || d.contingentCommittedQty > 0.0)
+            d.baselineCommittedQty - d.contingentCommittedQty
+        else
+            d.consumedSupplyQty
+    }
+    val demandCount = impact.impactedDemandCount
+
+    val demandLines = impact.impacts.joinToString("\n") { d ->
+        val shortfall = d.baselineCommittedQty - d.contingentCommittedQty
+        "- ${d.demandId}  客户=${d.customerId}  优先级=${d.priority ?: "n/a"}  需求时间=${d.requestDueTime ?: "n/a"}  需求量=${d.requestedQty}  基线承诺量=${d.baselineCommittedQty}  应急承诺量=${d.contingentCommittedQty}  缺口=${shortfall}  状态=${d.status}"
+    }.ifEmpty { "  （无）" }
+
+    return """
+你是供应链风险分析师。
+
+待评估的供应变更：
+- 供应 ID：${impact.supply.supplyId}
+- 产品：${impact.supply.productId}  地点：${impact.supply.locationId ?: "n/a"}  供应商：${impact.supply.vendorId ?: "n/a"}
+- 初始数量：${impact.supply.qty}
+- 变更：$changeDesc
+
+预计算摘要（权威数据——请勿根据下方明细重新计算）：
+- 受影响需求数量：$demandCount
+- 总缺口数量：$totalShortfall
+
+受影响需求明细（仅供参考）：
+$demandLines
+
+评估标准：
+$criteria
+
+说明：
+1. 仅使用上方的预计算摘要数值（受影响需求数量=$demandCount，总缺口=$totalShortfall）。
+2. 独立评估标准中的每一个条件，包括所有 OR 分支。
+3. 如果任何一个条件满足某评级，则该评级适用——不要在第一个未满足的条件处停止。
+
+请将整体影响严重程度分类为：LOW、MEDIUM、HIGH 之一。
+
+请严格按照以下格式回答（前后不要有其他文字）：
+RATING: <LOW|MEDIUM|HIGH>
+EXPLANATION: <2-3 句中文说明；请列出触发该评级的具体预计算数值>
+""".trimIndent()
+}
+
+private fun buildExplanationPromptZh(impact: MaterialImpactResponse, criteria: String, rating: String, totalShortfall: Double): String {
+    val changeDesc = buildString {
+        if (impact.deliveryDelayDays > 0) append("延迟 ${impact.deliveryDelayDays} 天")
+        if (impact.quantityDecreaseAbs != null && impact.quantityDecreaseAbs > 0) {
+            if (isNotEmpty()) append("，")
+            append("数量减少 ${impact.quantityDecreaseAbs} 单位（绝对值）")
+        } else if (impact.quantityDecreasePct > 0) {
+            if (isNotEmpty()) append("，")
+            append("数量减少 ${impact.quantityDecreasePct}%")
+        }
+        if (isEmpty()) append("未指定变更参数")
+    }
+    return """
+你是供应链风险分析师，负责撰写影响摘要。
+
+供应变更：${impact.supply.supplyId}（${impact.supply.productId}），$changeDesc
+受影响需求数：${impact.impactedDemandCount}，总缺口数量：$totalShortfall
+
+所用评估标准：
+$criteria
+
+该影响已被评定为：$rating
+
+请用 2-3 句中文说明该评级与上述标准的关系，
+并引用决定该结果的具体数值（需求数量与总缺口）。
+仅输出说明文字——不要添加标签或前言。
 """.trimIndent()
 }
 
@@ -373,29 +467,59 @@ private suspend fun handleAssessment(
         ?: req.impact?.caseId
         ?: throw IllegalArgumentException("caseId required (path param, body.caseId, or body.impact.caseId)")
 
-    // Idempotency: reuse an existing assessment with identical parameters (same agent may be called twice).
-    // Only applies to Mode A (supplyId path) — Mode B always has a fresh impact object.
-    if (req.impact == null && req.supplyId != null) {
+    // Assessments must be tied to the active (saved) plan — never a contingent re-plan.
+    // Validate both the caller-supplied planRunId and (Mode B) the one carried in the impact payload.
+    fun requireActivePlanRun(planRunId: Int, source: String) {
+        val status = transaction {
+            PlanRuns.selectAll()
+                .where { (PlanRuns.id eq planRunId) and (PlanRuns.caseId eq effectiveCaseId) }
+                .firstOrNull()?.get(PlanRuns.status)
+        } ?: throw IllegalArgumentException("$source planRunId=$planRunId not found for caseId=$effectiveCaseId")
+        if (status != "success") {
+            throw IllegalArgumentException(
+                "$source planRunId=$planRunId has status='$status'; assessment requires an active (success) plan run"
+            )
+        }
+    }
+    req.planRunId?.let { requireActivePlanRun(it, "request") }
+    req.impact?.planRunId?.let { requireActivePlanRun(it, "impact") }
+
+    // Idempotency: reuse an existing assessment with identical parameters to prevent duplicate rows
+    // when the agent pipeline traverses both order_engine (Mode B) and planning_engine (Mode A)
+    // for the same material event.
+    // Skip the cache when the caller's criteria language differs from the cached explanation's language,
+    // so a locale switch (zh ↔ en) regenerates rather than returning a stale translation.
+    val idempotencySupplyId = req.supplyId ?: req.impact?.supply?.supplyId
+    val idempotencyPlanRunId = req.planRunId ?: req.impact?.planRunId
+    if (idempotencySupplyId != null) {
         val existing = transaction {
             var q = MaterialImpactAssessments.selectAll()
                 .where { MaterialImpactAssessments.caseId eq effectiveCaseId }
-                .andWhere { MaterialImpactAssessments.supplyId eq req.supplyId }
+                .andWhere { MaterialImpactAssessments.supplyId eq idempotencySupplyId }
                 .andWhere { MaterialImpactAssessments.deliveryDelayDays eq req.deliveryDelayDays }
                 .andWhere { MaterialImpactAssessments.quantityDecreasePct eq req.quantityDecreasePct }
-            if (req.planRunId != null)
-                q = q.andWhere { MaterialImpactAssessments.planRunId eq req.planRunId }
+            if (idempotencyPlanRunId != null)
+                q = q.andWhere { MaterialImpactAssessments.planRunId eq idempotencyPlanRunId }
             q.orderBy(MaterialImpactAssessments.id, SortOrder.DESC).firstOrNull()
         }
-        if (existing != null) {
+        val requestedZh: Boolean? = when {
+            req.locale?.startsWith("zh", ignoreCase = true) == true -> true
+            req.locale != null -> false
+            req.criteria != null -> containsChinese(req.criteria)
+            else -> null
+        }
+        val cachedExplanationZh = existing?.get(MaterialImpactAssessments.explanation)?.let { containsChinese(it) }
+        val languageMatches = requestedZh == null || cachedExplanationZh == null || requestedZh == cachedExplanationZh
+        if (existing != null && languageMatches) {
             log.info("assessment cache hit: id={} supplyId={} planRunId={} rating={}",
-                existing[MaterialImpactAssessments.id], req.supplyId, req.planRunId, existing[MaterialImpactAssessments.rating])
-            // Re-run impact analysis to get current demand details (cheap — no LLM).
-            val impact = computeMaterialImpact(MaterialImpactRequest(
-                supplyId = req.supplyId,
+                existing[MaterialImpactAssessments.id], idempotencySupplyId, idempotencyPlanRunId, existing[MaterialImpactAssessments.rating])
+            // Prefer the caller-supplied impact; otherwise re-run impact analysis to get current demand details (cheap — no LLM).
+            val impact = req.impact ?: computeMaterialImpact(MaterialImpactRequest(
+                supplyId = idempotencySupplyId,
                 deliveryDelayDays = req.deliveryDelayDays,
                 quantityDecreasePct = req.quantityDecreasePct,
                 quantityDecreaseAbs = req.quantityDecreaseAbs,
-                planRunId = req.planRunId,
+                planRunId = idempotencyPlanRunId,
             ))
             call.respond(
                 AssessmentResponse(
@@ -454,15 +578,19 @@ private suspend fun handleAssessment(
             d.consumedSupplyQty
     }
     val isDefaultCriteria = criteria.trim() == DEFAULT_CRITERIA.trim() || criteria.trim() == DEFAULT_CRITERIA_ZH.trim()
+    val useZh = req.locale?.startsWith("zh", ignoreCase = true) == true || containsChinese(criteria)
     val (rating, explanation) = if (isDefaultCriteria) {
         val computedRating = computeDefaultRating(impact.impactedDemandCount, totalShortfall)
         log.info("assessment: using programmatic rating={} (demandCount={} totalShortfall={})",
             computedRating, impact.impactedDemandCount, totalShortfall)
-        val explanationPrompt = buildExplanationPrompt(impact, criteria, computedRating, totalShortfall)
+        val explanationPrompt = if (useZh)
+            buildExplanationPromptZh(impact, criteria, computedRating, totalShortfall)
+        else
+            buildExplanationPrompt(impact, criteria, computedRating, totalShortfall)
         val explanationText = callLlmForText(explanationPrompt)
         Pair(computedRating, explanationText)
     } else {
-        val prompt = buildPrompt(impact, criteria)
+        val prompt = if (useZh) buildPromptZh(impact, criteria) else buildPrompt(impact, criteria)
         callLlm(prompt)
     }
 

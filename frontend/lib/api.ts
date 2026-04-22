@@ -976,11 +976,13 @@ export async function runAssessment(
   planRunId?: number | null,
   impact?: MaterialImpactResult | null,
   quantityDecreaseAbs?: number | null,
+  locale?: string | null,
 ): Promise<AssessmentResponse> {
   const body: Record<string, unknown> = { supplyId, deliveryDelayDays, quantityDecreasePct, caseId };
   if (planRunId != null) body.planRunId = planRunId;
   if (impact != null) body.impact = impact;
   if (quantityDecreaseAbs != null && quantityDecreaseAbs > 0) body.quantityDecreaseAbs = quantityDecreaseAbs;
+  if (locale) body.locale = locale;
   const r = await fetchWithTimeout(
     `${API}/material-impact-assessment`,
     { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },

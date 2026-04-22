@@ -550,7 +550,7 @@
         "criteriaHeaderAfter": " rating:",
         "criteriaPlaceholderTier": "Describe what makes an impact {tier}…",
         "criteriaDefaultHigh": "number of impacted demands is equal or greater than 5, or total quantity of impacted demands is equal or greater than 5000.",
-        "criteriaDefaultLow": "number of impacted demands is no more than 2, or total quantity of impacted demands is less than 500.",
+        "criteriaDefaultLow": "number of impacted demands is no more than 2, and total quantity of impacted demands is less than 500.",
         "criteriaDefaultMedium": "otherwise.",
         "criteriaPageTitle": "Assessment Criteria",
         "criteriaPageDesc": "Define what classifies a material impact as HIGH, MEDIUM, or LOW risk. These criteria guide the AI agent's impact assessment.",

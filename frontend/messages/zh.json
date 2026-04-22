@@ -550,7 +550,7 @@
         "criteriaHeaderAfter": "评级的标准：",
         "criteriaPlaceholderTier": "描述何种情况属于 {tier} 影响…",
         "criteriaDefaultHigh": "受影响需求数量大于等于5，或受影响需求的总数量大于等于5000。",
-        "criteriaDefaultLow": "受影响需求数量不超过2，或受影响需求的总数量小于500。",
+        "criteriaDefaultLow": "受影响需求数量不超过2，并且受影响需求的总数量小于500。",
         "criteriaDefaultMedium": "其他情况。",
         "criteriaPageTitle": "评估标准",
         "criteriaPageDesc": "定义物料影响的高、中、低风险分类标准。这些标准将指导 AI 代理进行影响评估。",

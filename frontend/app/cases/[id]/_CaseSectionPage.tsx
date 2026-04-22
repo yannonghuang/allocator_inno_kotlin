@@ -4,7 +4,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import {
   getCase,
   getFeasibleDemands,
@@ -236,6 +236,7 @@ export function PlanKpiDashboard({
 }
 
 import { SortFilterTable } from '@/app/components/SortFilterTable';
+import { AssessmentHistoryTable } from '@/app/components/AssessmentHistoryTable';
 
 /** Extract a human-readable message from an API error.
  *  The backend often returns JSON bodies like {"detail":"..."} or {"error":"..."}.
@@ -598,11 +599,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const tA = useTranslations('allocation');
   const tP = useTranslations('planning');
   const tc = useTranslations('common');
+  const locale = useLocale();
   // Locale-aware section headers used when assembling / saving criteria text
   const criteriaHeaders = {
-    high:   tP('assessment.criteriaHeader', { tier: 'HIGH' }),
-    low:    tP('assessment.criteriaHeader', { tier: 'LOW' }),
-    medium: tP('assessment.criteriaHeader', { tier: 'MEDIUM' }),
+    high:   tP('supplyView.assessment.criteriaHeader', { tier: 'HIGH' }),
+    low:    tP('supplyView.assessment.criteriaHeader', { tier: 'LOW' }),
+    medium: tP('supplyView.assessment.criteriaHeader', { tier: 'MEDIUM' }),
   };
   const params = useParams();
   const id = Number(params.id);
@@ -1131,9 +1133,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           setAssessCriteriaMedium(parts.medium);
         } else {
           // No custom criteria saved — pre-fill with locale defaults as a starting point
-          setAssessCriteriaHigh(tP('assessment.criteriaDefaultHigh'));
-          setAssessCriteriaLow(tP('assessment.criteriaDefaultLow'));
-          setAssessCriteriaMedium(tP('assessment.criteriaDefaultMedium'));
+          setAssessCriteriaHigh(tP('supplyView.assessment.criteriaDefaultHigh'));
+          setAssessCriteriaLow(tP('supplyView.assessment.criteriaDefaultLow'));
+          setAssessCriteriaMedium(tP('supplyView.assessment.criteriaDefaultMedium'));
         }
         setAssessCriteriaLoaded(true);
       })
@@ -2407,6 +2409,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         currentPlanRunId,
         undefined,
         assessQtyDecreaseMode === 'abs' ? assessQtyDecreaseAbs : null,
+        locale,
       );
       setAssessmentResult(result);
       const hist = await listAssessments(id, planPeggingContext.supplyId);
@@ -4510,7 +4513,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       onClick={() => setAssessCriteriaOpen((o) => !o)}
                       style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '0.75rem', padding: 0 }}
                     >
-                      {assessCriteriaOpen ? '▾' : '▸'} {tP('assessment.criteria')}
+                      {assessCriteriaOpen ? '▾' : '▸'} {tP('supplyView.assessment.criteria')}
                     </button>
                     {assessCriteriaOpen && (
                       <div style={{ marginTop: '0.5rem' }}>
@@ -4523,15 +4526,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           return (
                             <div key={tier} style={{ marginBottom: '0.6rem' }}>
                               <p style={{ fontSize: '0.75rem', margin: '0 0 3px', color: '#a1a1aa' }}>
-                                {tP('assessment.criteriaHeaderBefore')}
+                                {tP('supplyView.assessment.criteriaHeaderBefore')}
                                 <span style={{ padding: '1px 7px', borderRadius: 10, background: tierBg, color: tierColor, border: `1px solid ${tierColor}`, fontWeight: 700, fontSize: '0.72rem' }}>{tier.toUpperCase()}</span>
-                                {tP('assessment.criteriaHeaderAfter')}
+                                {tP('supplyView.assessment.criteriaHeaderAfter')}
                               </p>
                               <textarea
                                 value={tierValue}
                                 onChange={(e) => tierSetter(e.target.value)}
                                 rows={2}
-                                placeholder={tP('assessment.criteriaPlaceholderTier', { tier: tier.toUpperCase() })}
+                                placeholder={tP('supplyView.assessment.criteriaPlaceholderTier', { tier: tier.toUpperCase() })}
                                 style={{ width: '100%', fontSize: '0.8rem', background: '#27272a', color: '#e4e4e7', border: `1px solid ${tierBorder}`, borderRadius: 4, padding: '0.4rem', resize: 'vertical', boxSizing: 'border-box' }}
                               />
                             </div>
@@ -4544,7 +4547,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             disabled={assessCriteriaSaving || buildCriteriaText(assessCriteriaHigh, assessCriteriaLow, assessCriteriaMedium, criteriaHeaders) === assessCriteria}
                             style={{ fontSize: '0.8rem' }}
                           >
-                            {assessCriteriaSaving ? tP('assessment.criteriaSaving') : tP('assessment.criteriaSave')}
+                            {assessCriteriaSaving ? tP('supplyView.assessment.criteriaSaving') : tP('supplyView.assessment.criteriaSave')}
                           </button>
                           <button
                             type="button"
@@ -4558,7 +4561,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             }}
                             style={{ fontSize: '0.8rem' }}
                           >
-                            {tP('assessment.criteriaCancel')}
+                            {tP('supplyView.assessment.criteriaCancel')}
                           </button>
                         </div>
                       </div>
@@ -4756,7 +4759,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             onClick={() => setAssessCriteriaOpen((o) => !o)}
             style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '0.8rem', padding: 0 }}
           >
-            {assessCriteriaOpen ? '▾' : '▸'} {tP('assessment.criteria')}
+            {assessCriteriaOpen ? '▾' : '▸'} {tP('supplyView.assessment.criteria')}
           </button>
           {assessCriteriaOpen && (
             <div style={{ marginTop: '0.5rem', maxWidth: 640 }}>
@@ -4769,15 +4772,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 return (
                   <div key={tier} style={{ marginBottom: '0.6rem' }}>
                     <p style={{ fontSize: '0.75rem', margin: '0 0 3px', color: '#a1a1aa' }}>
-                      {tP('assessment.criteriaHeaderBefore')}
+                      {tP('supplyView.assessment.criteriaHeaderBefore')}
                       <span style={{ padding: '1px 7px', borderRadius: 10, background: tierBg, color: tierColor, border: `1px solid ${tierColor}`, fontWeight: 700, fontSize: '0.72rem' }}>{tier.toUpperCase()}</span>
-                      {tP('assessment.criteriaHeaderAfter')}
+                      {tP('supplyView.assessment.criteriaHeaderAfter')}
                     </p>
                     <textarea
                       value={tierValue}
                       onChange={(e) => tierSetter(e.target.value)}
                       rows={2}
-                      placeholder={tP('assessment.criteriaPlaceholderTier', { tier: tier.toUpperCase() })}
+                      placeholder={tP('supplyView.assessment.criteriaPlaceholderTier', { tier: tier.toUpperCase() })}
                       style={{ width: '100%', fontSize: '0.8rem', background: '#27272a', color: '#e4e4e7', border: `1px solid ${tierBorder}`, borderRadius: 4, padding: '0.4rem', resize: 'vertical', boxSizing: 'border-box' }}
                     />
                   </div>
@@ -4790,7 +4793,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   disabled={assessCriteriaSaving || buildCriteriaText(assessCriteriaHigh, assessCriteriaLow, assessCriteriaMedium, criteriaHeaders) === assessCriteria}
                   style={{ fontSize: '0.8rem' }}
                 >
-                  {assessCriteriaSaving ? tP('assessment.criteriaSaving') : tP('assessment.criteriaSave')}
+                  {assessCriteriaSaving ? tP('supplyView.assessment.criteriaSaving') : tP('supplyView.assessment.criteriaSave')}
                 </button>
                 <button
                   type="button"
@@ -4804,7 +4807,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   }}
                   style={{ fontSize: '0.8rem' }}
                 >
-                  {tP('assessment.criteriaCancel')}
+                  {tP('supplyView.assessment.criteriaCancel')}
                 </button>
               </div>
             </div>
@@ -5095,7 +5098,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           setMaterialAssessmentLoading(m => ({ ...m, [ev.id]: true }));
                           setMaterialAssessmentError(m => ({ ...m, [ev.id]: null }));
                           try {
-                            const result = await runAssessment(id, ev.supplyId, ev.delayDays, ev.qtyDecreasePct, undefined, impact, ev.qtyDecreaseAbs);
+                            const result = await runAssessment(id, ev.supplyId, ev.delayDays, ev.qtyDecreasePct, undefined, impact, ev.qtyDecreaseAbs, locale);
                             setMaterialAssessments(m => ({ ...m, [ev.id]: result }));
                             const hist = await listAssessments(id, ev.supplyId);
                             setMaterialAssessmentHistory(m => ({ ...m, [ev.id]: hist }));
@@ -5192,7 +5195,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     return (
                       <div style={{ marginTop: '0.875rem', borderTop: '1px solid #27272a', paddingTop: '0.875rem' }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: '0.25rem' }}>
-                          <span style={{ fontSize: '0.82rem', color: '#a1a1aa' }}>{tP('assessment.ratingLabel')} </span>
+                          <span style={{ fontSize: '0.82rem', color: '#a1a1aa' }}>{tP('supplyView.assessment.ratingLabel')} </span>
                           <span style={{
                             display: 'inline-block',
                             padding: '1px 10px',
@@ -5225,44 +5228,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       }}
                       style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '0.75rem', padding: 0 }}
                     >
-                      {(materialAssessmentHistoryOpen[ev.id] ?? false) ? '▾' : '▸'} {tP('assessment.history')}
+                      {(materialAssessmentHistoryOpen[ev.id] ?? false) ? '▾' : '▸'} {tP('supplyView.assessment.history')}
                     </button>
                     {(materialAssessmentHistoryOpen[ev.id] ?? false) && (
                       <div style={{ marginTop: '0.5rem' }}>
                         {!(materialAssessmentHistory[ev.id]?.length) ? (
-                          <p style={{ fontSize: '0.75rem', color: '#71717a', margin: 0 }}>{tP('assessment.noHistory')}</p>
+                          <p style={{ fontSize: '0.75rem', color: '#71717a', margin: 0 }}>{tP('supplyView.assessment.noHistory')}</p>
                         ) : (
-                          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.75rem' }}>
-                            <thead>
-                              <tr style={{ borderBottom: '1px solid #3d3d40', color: '#a1a1aa' }}>
-                                <th style={{ textAlign: 'left', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.date')}</th>
-                                <th style={{ textAlign: 'center', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.rating')}</th>
-                                <th style={{ textAlign: 'right', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.delay')}</th>
-                                <th style={{ textAlign: 'right', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.qtyPct')}</th>
-                                <th style={{ textAlign: 'left', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.explanation')}</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {materialAssessmentHistory[ev.id]!.map((h) => (
-                                <tr key={h.id} style={{ borderBottom: '1px solid #27272a' }}>
-                                  <td style={{ padding: '3px 5px', color: '#71717a', whiteSpace: 'nowrap' }}>{h.createdAt.slice(0, 10)}</td>
-                                  <td style={{ padding: '3px 5px', textAlign: 'center' }}>
-                                    <span style={{
-                                      padding: '0 6px',
-                                      borderRadius: 10,
-                                      fontWeight: 600,
-                                      fontSize: '0.72rem',
-                                      background: h.rating === 'LOW' ? 'rgba(52,211,153,0.15)' : h.rating === 'HIGH' ? 'rgba(248,113,113,0.15)' : 'rgba(251,191,36,0.15)',
-                                      color: h.rating === 'LOW' ? '#34d399' : h.rating === 'HIGH' ? '#f87171' : '#fbbf24',
-                                    }}>{h.rating}</span>
-                                  </td>
-                                  <td style={{ padding: '3px 5px', textAlign: 'right', color: '#e4e4e7' }}>{h.deliveryDelayDays}</td>
-                                  <td style={{ padding: '3px 5px', textAlign: 'right', color: '#e4e4e7' }}>{h.quantityDecreasePct}</td>
-                                  <td style={{ padding: '3px 5px', color: '#a1a1aa', maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={h.explanation}>{h.explanation}</td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
+                          <AssessmentHistoryTable rows={materialAssessmentHistory[ev.id]!} storageKey="event" />
                         )}
                       </div>
                     )}
@@ -6065,7 +6038,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     {/* Input row */}
                     <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
                       <label style={{ fontSize: '0.78rem', color: '#a1a1aa', display: 'flex', alignItems: 'center', gap: 4 }}>
-                        {tP('assessment.delayDays')}
+                        {tP('supplyView.assessment.delayDays')}
                         <input
                           type="number" min={0}
                           value={assessDelayDays}
@@ -6074,7 +6047,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         />
                       </label>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                        <span style={{ fontSize: '0.78rem', color: '#a1a1aa' }}>{tP('assessment.qtyDecreasePct')}</span>
+                        <span style={{ fontSize: '0.78rem', color: '#a1a1aa' }}>{tP('supplyView.assessment.qtyDecreasePct')}</span>
                         <div style={{ display: 'flex', border: '1px solid #4c1d95', borderRadius: 4, overflow: 'hidden' }}>
                           <button type="button"
                             onClick={() => setAssessQtyDecreaseMode('pct')}
@@ -6110,7 +6083,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         disabled={assessmentRunning}
                         style={{ fontSize: '0.8rem' }}
                       >
-                        {assessmentRunning ? tP('assessment.assessing') : tP('assessment.assess')}
+                        {assessmentRunning ? tP('supplyView.assessment.assessing') : tP('supplyView.assessment.assess')}
                       </button>
                     </div>
                     {/* Error */}
@@ -6120,7 +6093,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     {/* Rating result */}
                     {assessmentResult && (
                       <div style={{ marginBottom: '0.4rem' }}>
-                        <span style={{ fontSize: '0.82rem', color: '#a1a1aa' }}>{tP('assessment.ratingLabel')} </span>
+                        <span style={{ fontSize: '0.82rem', color: '#a1a1aa' }}>{tP('supplyView.assessment.ratingLabel')} </span>
                         <span style={{
                           display: 'inline-block',
                           padding: '1px 10px',
@@ -6141,44 +6114,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       onClick={handleLoadHistory}
                       style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '0.75rem', padding: 0 }}
                     >
-                      {assessmentHistoryOpen ? '▾' : '▸'} {tP('assessment.history')}
+                      {assessmentHistoryOpen ? '▾' : '▸'} {tP('supplyView.assessment.history')}
                     </button>
                     {assessmentHistoryOpen && (
                       <div style={{ marginTop: '0.5rem' }}>
                         {assessmentHistory.length === 0 ? (
-                          <p style={{ fontSize: '0.75rem', color: '#71717a', margin: 0 }}>{tP('assessment.noHistory')}</p>
+                          <p style={{ fontSize: '0.75rem', color: '#71717a', margin: 0 }}>{tP('supplyView.assessment.noHistory')}</p>
                         ) : (
-                          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.75rem' }}>
-                            <thead>
-                              <tr style={{ borderBottom: '1px solid #3d3d40', color: '#a1a1aa' }}>
-                                <th style={{ textAlign: 'left', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.date')}</th>
-                                <th style={{ textAlign: 'center', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.rating')}</th>
-                                <th style={{ textAlign: 'right', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.delay')}</th>
-                                <th style={{ textAlign: 'right', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.qtyPct')}</th>
-                                <th style={{ textAlign: 'left', padding: '3px 5px', fontWeight: 500 }}>{tP('assessment.historyColumns.explanation')}</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {assessmentHistory.map((h) => (
-                                <tr key={h.id} style={{ borderBottom: '1px solid #27272a' }}>
-                                  <td style={{ padding: '3px 5px', color: '#71717a', whiteSpace: 'nowrap' }}>{h.createdAt.slice(0, 10)}</td>
-                                  <td style={{ padding: '3px 5px', textAlign: 'center' }}>
-                                    <span style={{
-                                      padding: '0 6px',
-                                      borderRadius: 10,
-                                      fontWeight: 600,
-                                      fontSize: '0.72rem',
-                                      background: h.rating === 'LOW' ? 'rgba(52,211,153,0.15)' : h.rating === 'HIGH' ? 'rgba(248,113,113,0.15)' : 'rgba(251,191,36,0.15)',
-                                      color: h.rating === 'LOW' ? '#34d399' : h.rating === 'HIGH' ? '#f87171' : '#fbbf24',
-                                    }}>{h.rating}</span>
-                                  </td>
-                                  <td style={{ padding: '3px 5px', textAlign: 'right', color: '#e4e4e7' }}>{h.deliveryDelayDays}</td>
-                                  <td style={{ padding: '3px 5px', textAlign: 'right', color: '#e4e4e7' }}>{h.quantityDecreasePct}</td>
-                                  <td style={{ padding: '3px 5px', color: '#a1a1aa', maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={h.explanation}>{h.explanation}</td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
+                          <AssessmentHistoryTable rows={assessmentHistory} storageKey="main" />
                         )}
                       </div>
                     )}
