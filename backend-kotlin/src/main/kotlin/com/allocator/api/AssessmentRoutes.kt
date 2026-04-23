@@ -492,7 +492,14 @@ private suspend fun handleAssessment(
     val idempotencySupplyId = req.supplyId ?: req.impact?.supply?.supplyId
     val idempotencyPlanRunId = req.planRunId ?: req.impact?.planRunId
     if (idempotencySupplyId != null) {
-        val existing = transaction {
+        data class CachedAssessment(
+            val id: Int,
+            val rating: String,
+            val explanation: String,
+            val criteria: String,
+            val createdAt: String,
+        )
+        val cached: CachedAssessment? = transaction {
             var q = MaterialImpactAssessments.selectAll()
                 .where { MaterialImpactAssessments.caseId eq effectiveCaseId }
                 .andWhere { MaterialImpactAssessments.supplyId eq idempotencySupplyId }
@@ -500,7 +507,15 @@ private suspend fun handleAssessment(
                 .andWhere { MaterialImpactAssessments.quantityDecreasePct eq req.quantityDecreasePct }
             if (idempotencyPlanRunId != null)
                 q = q.andWhere { MaterialImpactAssessments.planRunId eq idempotencyPlanRunId }
-            q.orderBy(MaterialImpactAssessments.id, SortOrder.DESC).firstOrNull()
+            q.orderBy(MaterialImpactAssessments.id, SortOrder.DESC).firstOrNull()?.let {
+                CachedAssessment(
+                    id = it[MaterialImpactAssessments.id],
+                    rating = it[MaterialImpactAssessments.rating],
+                    explanation = it[MaterialImpactAssessments.explanation],
+                    criteria = it[MaterialImpactAssessments.criteria],
+                    createdAt = it[MaterialImpactAssessments.createdAt].toString(),
+                )
+            }
         }
         val requestedZh: Boolean? = when {
             req.locale?.startsWith("zh", ignoreCase = true) == true -> true
@@ -508,11 +523,11 @@ private suspend fun handleAssessment(
             req.criteria != null -> containsChinese(req.criteria)
             else -> null
         }
-        val cachedExplanationZh = existing?.get(MaterialImpactAssessments.explanation)?.let { containsChinese(it) }
+        val cachedExplanationZh = cached?.explanation?.let { containsChinese(it) }
         val languageMatches = requestedZh == null || cachedExplanationZh == null || requestedZh == cachedExplanationZh
-        if (existing != null && languageMatches) {
+        if (cached != null && languageMatches) {
             log.info("assessment cache hit: id={} supplyId={} planRunId={} rating={}",
-                existing[MaterialImpactAssessments.id], idempotencySupplyId, idempotencyPlanRunId, existing[MaterialImpactAssessments.rating])
+                cached.id, idempotencySupplyId, idempotencyPlanRunId, cached.rating)
             // Prefer the caller-supplied impact; otherwise re-run impact analysis to get current demand details (cheap — no LLM).
             val impact = req.impact ?: computeMaterialImpact(MaterialImpactRequest(
                 supplyId = idempotencySupplyId,
@@ -523,16 +538,16 @@ private suspend fun handleAssessment(
             ))
             call.respond(
                 AssessmentResponse(
-                    id = existing[MaterialImpactAssessments.id],
-                    rating = existing[MaterialImpactAssessments.rating],
-                    explanation = existing[MaterialImpactAssessments.explanation],
-                    criteria = existing[MaterialImpactAssessments.criteria],
+                    id = cached.id,
+                    rating = cached.rating,
+                    explanation = cached.explanation,
+                    criteria = cached.criteria,
                     caseId = effectiveCaseId,
                     planRunId = impact.planRunId,
                     supply = impact.supply,
                     impactedDemandCount = impact.impactedDemandCount,
                     impacts = impact.impacts,
-                    createdAt = existing[MaterialImpactAssessments.createdAt].toString(),
+                    createdAt = cached.createdAt,
                 )
             )
             return

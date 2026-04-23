@@ -964,6 +964,103 @@ export async function listAssessments(caseId: number, supplyId?: string): Promis
   return r.json();
 }
 
+// ── Negotiation Chain ─────────────────────────────────────────────────────────
+
+export type NegotiationChainEntry = {
+  planRunId: number;
+  round: number | null;
+  parentPlanRunId: number | null;
+  supersededByPlanRunId: number | null;
+  status: string;
+  supplyId: string | null;
+  deliveryDelayDays: number | null;
+  quantityDecreasePct: number | null;
+  baselinePlanRunId: number | null;
+  rating: 'LOW' | 'MEDIUM' | 'HIGH' | null;
+  explanation: string | null;
+  createdAt: string;
+};
+
+export async function getNegotiationChain(
+  caseId: number,
+  baselinePlanRunId: number,
+): Promise<NegotiationChainEntry[]> {
+  const r = await fetch(`${API}/cases/${caseId}/negotiation-chains/${baselinePlanRunId}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export type NegotiationReplyAction = 'accept' | 'abandon' | 'counter';
+
+export type NegotiationReplyPayload = {
+  sessionKey: string;
+  action: NegotiationReplyAction;
+  round?: number;
+  delayDays?: number;
+  qtyPct?: number;
+  baselinePlanRunId?: number;
+  contingentPlanRunId?: number;
+  supplyId?: string;
+};
+
+export async function sendNegotiationReply(
+  caseId: number,
+  payload: NegotiationReplyPayload,
+): Promise<{ status: string; sessionKey: string; action: string }> {
+  const r = await fetch(`${API}/cases/${caseId}/negotiation-reply`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export type NegotiationWait = {
+  id: number;
+  caseId: number;
+  sessionKey: string;
+  round: number;
+  rating: 'LOW' | 'MEDIUM' | 'HIGH';
+  explanation: string | null;
+  currentDelayDays: number;
+  currentQtyPct: number;
+  baselinePlanRunId: number;
+  contingentPlanRunId: number | null;
+  supplyId: string;
+  impactedDemandCount: number;
+  createdAt: string;
+  resolvedAt: string | null;
+  resolvedAction: string | null;
+};
+
+export async function getActiveNegotiationWait(
+  caseId: number,
+  baselinePlanRunId?: number,
+): Promise<NegotiationWait | null> {
+  const sp = new URLSearchParams();
+  if (baselinePlanRunId != null) sp.set('baselinePlanRunId', String(baselinePlanRunId));
+  const q = sp.toString() ? `?${sp}` : '';
+  const r = await fetch(`${API}/cases/${caseId}/negotiation-waits/active${q}`);
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return data === null ? null : (data as NegotiationWait);
+}
+
+export async function listNegotiationWaits(
+  caseId: number,
+  baselinePlanRunId?: number,
+): Promise<NegotiationWait[]> {
+  const sp = new URLSearchParams();
+  if (baselinePlanRunId != null) sp.set('baselinePlanRunId', String(baselinePlanRunId));
+  const q = sp.toString() ? `?${sp}` : '';
+  const r = await fetch(`${API}/cases/${caseId}/negotiation-waits${q}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+
 /** Run a new assessment.
  *  Mode B (preferred): pass `impact` to skip re-computation and use the already-run re-plan result.
  *  Mode A (fallback):  omit `impact`; backend computes impact via pegging-tree walk (less accurate).

@@ -194,6 +194,9 @@ object PlanRuns : Table("plan_run") {
     val metadata = text("metadata").nullable()                   // JSON: {"type":"contingent","supplyId":"...","deliveryDelayDays":N,"quantityDecreasePct":N,"baselinePlanRunId":M}
     val name = varchar("name", 255).nullable()
     val notes = text("notes").nullable()
+    val negotiationRound       = integer("negotiation_round").nullable()          // 0 = initial contingent; 1..N = counter-proposal rounds
+    val parentPlanRunId        = integer("parent_plan_run_id").nullable()         // self-ref: previous round's contingent in a negotiation chain
+    val supersededByPlanRunId  = integer("superseded_by_plan_run_id").nullable()  // self-ref: next round's contingent (NULL = chain tail, promotable)
     val createdAt = timestamp("created_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 }
@@ -222,5 +225,29 @@ object MaterialImpactAssessments : Table("material_impact_assessment") {
     val rating              = varchar("rating", 10)   // LOW | MEDIUM | HIGH
     val explanation         = text("explanation")
     val createdAt           = timestamp("created_at").defaultExpression(CurrentTimestamp)
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
+ * In-flight negotiation waits — one row per (case, sessionKey) while the
+ * material agent is paused at Step 1.6 awaiting a planner reply. Rows are
+ * inserted by the agent and marked resolved by the reply handler.
+ */
+object NegotiationWaits : Table("negotiation_wait") {
+    val id                    = integer("id").autoIncrement()
+    val caseId                = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val sessionKey            = varchar("session_key", 255)
+    val round                 = integer("round")
+    val rating                = varchar("rating", 10)        // LOW | MEDIUM | HIGH
+    val explanation           = text("explanation").nullable()
+    val currentDelayDays      = integer("current_delay_days")
+    val currentQtyPct         = double("current_qty_pct")
+    val baselinePlanRunId     = integer("baseline_plan_run_id")
+    val contingentPlanRunId   = integer("contingent_plan_run_id").nullable()
+    val supplyId              = varchar("supply_id", 255)
+    val impactedDemandCount   = integer("impacted_demand_count").default(0)
+    val createdAt             = timestamp("created_at").defaultExpression(CurrentTimestamp)
+    val resolvedAt            = timestamp("resolved_at").nullable()
+    val resolvedAction        = varchar("resolved_action", 16).nullable()  // accept | abandon | counter
     override val primaryKey = PrimaryKey(id)
 }

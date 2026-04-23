@@ -49,6 +49,14 @@ data class MaterialImpactRequest(
      * Default: true (persist, for interactive what-if analysis).
      */
     val persist: Boolean = true,
+    /**
+     * Negotiation-chain index. 0 = initial contingent; 1..N = counter-proposal rounds.
+     * When set, the persist path deduplicates by (caseId, supplyId, delay, qty, baseline, round)
+     * so agent replay/retry returns the existing contingent id instead of inserting a duplicate.
+     */
+    val negotiationRound: Int? = null,
+    /** Id of the prior round's contingent. When provided, the new row supersedes it. */
+    val parentPlanRunId: Int? = null,
 )
 
 @Serializable
@@ -332,26 +340,70 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
                 put("deliveryDelayDays", req.deliveryDelayDays)
                 put("quantityDecreasePct", req.quantityDecreasePct)
                 put("baselinePlanRunId", baselinePlanRunId)
+                if (req.negotiationRound != null) put("negotiationRound", req.negotiationRound)
+                if (req.parentPlanRunId != null) put("parentPlanRunId", req.parentPlanRunId)
             }.toString()
             val contingentResultJson = runCatching { resultToJson(contingentResult).toString() }.getOrNull()
             transaction {
-                val planRunId = PlanRuns.insert {
-                    it[PlanRuns.caseId] = caseId
-                    it[PlanRuns.jobId] = jobId
-                    it[PlanRuns.status] = "contingent"
-                    it[PlanRuns.config] = baselineLookup.configJson
-                    it[PlanRuns.result] = contingentResultJson
-                    it[PlanRuns.metadata] = metadataJson
-                }[PlanRuns.id]
-                // Record the material event so it appears in the case view
-                MaterialEvents.insert {
-                    it[MaterialEvents.caseId]         = caseId
-                    it[MaterialEvents.supplyId]       = req.supplyId.trim()
-                    it[MaterialEvents.delayDays]      = req.deliveryDelayDays
-                    it[MaterialEvents.qtyDecreasePct] = req.quantityDecreasePct
-                    it[MaterialEvents.note]           = "AI agent analysis (planRun=$planRunId)"
+                // Idempotency: when a negotiation round is declared, dedup on
+                // (caseId, supplyId, delay, qty, baseline, round) so agent replay
+                // doesn't create duplicate contingent rows.
+                val existingId: Int? = if (req.negotiationRound != null) {
+                    val candidates = PlanRuns.selectAll()
+                        .where {
+                            (PlanRuns.caseId eq caseId) and
+                            (PlanRuns.status eq "contingent") and
+                            (PlanRuns.negotiationRound eq req.negotiationRound) and
+                            PlanRuns.supersededByPlanRunId.isNull() and
+                            (if (req.parentPlanRunId != null)
+                                (PlanRuns.parentPlanRunId eq req.parentPlanRunId)
+                             else
+                                PlanRuns.parentPlanRunId.isNull())
+                        }
+                        .toList()
+                    candidates.firstOrNull { row ->
+                        val meta = row[PlanRuns.metadata]?.let {
+                            runCatching { Json.parseToJsonElement(it).jsonObject }.getOrNull()
+                        } ?: return@firstOrNull false
+                        meta["supplyId"]?.jsonPrimitive?.contentOrNull == req.supplyId.trim() &&
+                        meta["deliveryDelayDays"]?.jsonPrimitive?.intOrNull == req.deliveryDelayDays &&
+                        meta["quantityDecreasePct"]?.jsonPrimitive?.doubleOrNull == req.quantityDecreasePct &&
+                        meta["baselinePlanRunId"]?.jsonPrimitive?.intOrNull == baselinePlanRunId
+                    }?.get(PlanRuns.id)
+                } else null
+
+                if (existingId != null) {
+                    log.info(
+                        "material-impact upsert hit: contingentPlanRunId={} round={} parent={} (skipping insert)",
+                        existingId, req.negotiationRound, req.parentPlanRunId,
+                    )
+                    existingId
+                } else {
+                    val planRunId = PlanRuns.insert {
+                        it[PlanRuns.caseId] = caseId
+                        it[PlanRuns.jobId] = jobId
+                        it[PlanRuns.status] = "contingent"
+                        it[PlanRuns.config] = baselineLookup.configJson
+                        it[PlanRuns.result] = contingentResultJson
+                        it[PlanRuns.metadata] = metadataJson
+                        if (req.negotiationRound != null) it[PlanRuns.negotiationRound] = req.negotiationRound
+                        if (req.parentPlanRunId != null) it[PlanRuns.parentPlanRunId] = req.parentPlanRunId
+                    }[PlanRuns.id]
+                    if (req.parentPlanRunId != null) {
+                        PlanRuns.update({ PlanRuns.id eq req.parentPlanRunId }) {
+                            it[PlanRuns.supersededByPlanRunId] = planRunId
+                        }
+                    }
+                    // Record the material event so it appears in the case view
+                    MaterialEvents.insert {
+                        it[MaterialEvents.caseId]         = caseId
+                        it[MaterialEvents.supplyId]       = req.supplyId.trim()
+                        it[MaterialEvents.delayDays]      = req.deliveryDelayDays
+                        it[MaterialEvents.qtyDecreasePct] = req.quantityDecreasePct
+                        it[MaterialEvents.note]           = "AI agent analysis (planRun=$planRunId)"
+                    }
+                    planRunId
                 }
-                planRunId
             }
         } else null
 
@@ -556,11 +608,32 @@ fun Routing.materialImpactRoutes() {
 @Serializable
 private data class PromoteResponse(val planRunId: Int, val caseId: Int, val status: String)
 
+@Serializable
+data class NegotiationChainEntry(
+    val planRunId: Int,
+    val round: Int?,
+    val parentPlanRunId: Int?,
+    val supersededByPlanRunId: Int?,
+    val status: String,
+    val supplyId: String?,
+    val deliveryDelayDays: Int?,
+    val quantityDecreasePct: Double?,
+    val baselinePlanRunId: Int?,
+    val rating: String?,
+    val explanation: String?,
+    val createdAt: String,
+)
+
 /**
  * POST /cases/{caseId}/plan-runs/{planRunId}/promote
  * Promotes a contingent plan run to "success" status, making it the active plan for the case.
  * Only plan runs with status="contingent" can be promoted.
+ * Rejects promotion of a run that has been superseded by a later round in a negotiation chain.
  * Idempotent: already-promoted runs return 200 without error.
+ *
+ * GET /cases/{caseId}/negotiation-chains/{baselinePlanRunId}
+ * Returns all contingent plan runs derived from the given baseline, ordered by round/creation,
+ * joined with their MaterialImpactAssessments rating/explanation where available.
  */
 fun Routing.planRunRoutes() {
     post("/cases/{caseId}/plan-runs/{planRunId}/promote") {
@@ -574,9 +647,17 @@ fun Routing.planRunRoutes() {
                 .firstOrNull()
                 ?: throw NoSuchElementException("PlanRun $planRunId not found for case $caseId")
             val status = row[PlanRuns.status]
+            val supersededBy = row[PlanRuns.supersededByPlanRunId]
             when (status) {
-                "contingent" -> PlanRuns.update({ PlanRuns.id eq planRunId }) {
-                    it[PlanRuns.status] = "success"
+                "contingent" -> {
+                    if (supersededBy != null) {
+                        throw IllegalArgumentException(
+                            "PlanRun $planRunId has been superseded by $supersededBy; promote the latest round in the chain."
+                        )
+                    }
+                    PlanRuns.update({ PlanRuns.id eq planRunId }) {
+                        it[PlanRuns.status] = "success"
+                    }
                 }
                 "success" -> { /* already promoted — idempotent, no-op */ }
                 else -> throw IllegalArgumentException(
@@ -586,6 +667,68 @@ fun Routing.planRunRoutes() {
         }
         log.info("plan-run promoted: caseId={} planRunId={} status=success", caseId, planRunId)
         call.respond(PromoteResponse(planRunId = planRunId, caseId = caseId, status = "success"))
+    }
+
+    get("/cases/{caseId}/negotiation-chains/{baselinePlanRunId}") {
+        val caseId = call.parameters["caseId"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid caseId")
+        val baselinePlanRunId = call.parameters["baselinePlanRunId"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid baselinePlanRunId")
+
+        val entries: List<NegotiationChainEntry> = transaction {
+            // Select all contingent plan_runs whose metadata declares this baseline.
+            val allContingents = PlanRuns.selectAll()
+                .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status.inList(listOf("contingent", "success"))) }
+                .orderBy(PlanRuns.id, SortOrder.ASC)
+                .toList()
+
+            val chainRows = allContingents.filter { row ->
+                val meta = row[PlanRuns.metadata]?.let {
+                    runCatching { Json.parseToJsonElement(it).jsonObject }.getOrNull()
+                } ?: return@filter false
+                meta["baselinePlanRunId"]?.jsonPrimitive?.intOrNull == baselinePlanRunId
+            }
+
+            // Collect assessments keyed by (supplyId, delay, qty, planRunId=baseline) for rating lookup.
+            // Rating rows are created against the baseline plan, not against the contingent,
+            // so we key on baselinePlanRunId + the per-round params.
+            val assessments = MaterialImpactAssessments.selectAll()
+                .where { (MaterialImpactAssessments.caseId eq caseId) and (MaterialImpactAssessments.planRunId eq baselinePlanRunId) }
+                .orderBy(MaterialImpactAssessments.id, SortOrder.DESC)
+                .toList()
+            fun latestAssessment(supplyId: String, delay: Int, qtyPct: Double) =
+                assessments.firstOrNull { a ->
+                    a[MaterialImpactAssessments.supplyId] == supplyId &&
+                    a[MaterialImpactAssessments.deliveryDelayDays] == delay &&
+                    kotlin.math.abs(a[MaterialImpactAssessments.quantityDecreasePct] - qtyPct) < 1e-9
+                }
+
+            chainRows.map { row ->
+                val meta = row[PlanRuns.metadata]?.let {
+                    runCatching { Json.parseToJsonElement(it).jsonObject }.getOrNull()
+                }
+                val supplyId = meta?.get("supplyId")?.jsonPrimitive?.contentOrNull
+                val delay = meta?.get("deliveryDelayDays")?.jsonPrimitive?.intOrNull
+                val qty = meta?.get("quantityDecreasePct")?.jsonPrimitive?.doubleOrNull
+                val assessment = if (supplyId != null && delay != null && qty != null)
+                    latestAssessment(supplyId, delay, qty) else null
+                NegotiationChainEntry(
+                    planRunId = row[PlanRuns.id],
+                    round = row[PlanRuns.negotiationRound],
+                    parentPlanRunId = row[PlanRuns.parentPlanRunId],
+                    supersededByPlanRunId = row[PlanRuns.supersededByPlanRunId],
+                    status = row[PlanRuns.status],
+                    supplyId = supplyId,
+                    deliveryDelayDays = delay,
+                    quantityDecreasePct = qty,
+                    baselinePlanRunId = baselinePlanRunId,
+                    rating = assessment?.get(MaterialImpactAssessments.rating),
+                    explanation = assessment?.get(MaterialImpactAssessments.explanation),
+                    createdAt = row[PlanRuns.createdAt].toString(),
+                )
+            }
+        }
+        call.respond(entries)
     }
 }
 

@@ -99,7 +99,7 @@ private fun createTables() {
         Demands, MethodBuys, MethodMakes, ProductLocations,
         Supplies, MethodMoves, AllocationRuns, AllocationActions,
         ManualOverrides, PlanRuns, MaterialEvents, MaterialImpactAssessments,
-        PlanSupplyAllocations
+        PlanSupplyAllocations, NegotiationWaits
     )
 }
 
@@ -207,6 +207,12 @@ private fun migrateSchema() {
         "ALTER TABLE material_event ADD COLUMN IF NOT EXISTS qty_decrease_abs DOUBLE PRECISION",
         // Absolute qty decrease on material_impact_assessment
         "ALTER TABLE material_impact_assessment ADD COLUMN IF NOT EXISTS quantity_decrease_abs DOUBLE PRECISION",
+        // Negotiation-chain columns on plan_run (multi-round material-agent negotiation)
+        "ALTER TABLE plan_run ADD COLUMN IF NOT EXISTS negotiation_round INTEGER",
+        "ALTER TABLE plan_run ADD COLUMN IF NOT EXISTS parent_plan_run_id INTEGER",
+        "ALTER TABLE plan_run ADD COLUMN IF NOT EXISTS superseded_by_plan_run_id INTEGER",
+        "CREATE INDEX IF NOT EXISTS ix_plan_run_parent ON plan_run (parent_plan_run_id)",
+        "CREATE INDEX IF NOT EXISTS ix_plan_run_superseded_by ON plan_run (superseded_by_plan_run_id)",
         // Fix FK constraints to use ON DELETE CASCADE (idempotent: drop if exists, re-add)
         *cascadeFkMigrations()
     )
