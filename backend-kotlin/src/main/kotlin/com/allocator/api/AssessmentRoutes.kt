@@ -1,19 +1,13 @@
 package com.allocator.api
 
 import com.allocator.*
-import io.ktor.client.*
-import io.ktor.client.call.*
-import io.ktor.client.engine.cio.*
-import io.ktor.client.plugins.contentnegotiation.*
-import io.ktor.client.plugins.*
-import io.ktor.client.request.*
+import com.allocator.services.LlmMessage
+import com.allocator.services.llmChat
 import io.ktor.http.*
-import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
-import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.*
 import org.jetbrains.exposed.sql.*
@@ -106,31 +100,6 @@ data class AssessmentResponse(
     val impacts: List<MaterialImpactedDemand>,
     val createdAt: String,
 )
-
-// ── OpenAI client (lazily created, shared) ────────────────────────────────────
-
-private val openAiClient: HttpClient by lazy {
-    HttpClient(CIO) {
-        install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
-        install(HttpTimeout) { requestTimeoutMillis = 90_000 }
-    }
-}
-
-@Serializable
-private data class OpenAiMessage(val role: String, val content: String)
-
-@Serializable
-private data class OpenAiRequest(
-    val model: String,
-    @SerialName("max_tokens") val maxTokens: Int,
-    val messages: List<OpenAiMessage>,
-)
-
-@Serializable
-private data class OpenAiChoice(val message: OpenAiMessage)
-
-@Serializable
-private data class OpenAiResponse(val choices: List<OpenAiChoice>)
 
 // ── LLM helpers ───────────────────────────────────────────────────────────────
 
@@ -315,29 +284,10 @@ $criteria
 }
 
 private suspend fun callLlm(prompt: String): Pair<String, String> {
-    val apiKey = config.openAiApiKey
-        ?: throw IllegalStateException("OPENAI_API_KEY is not configured")
-
-    val reqBody = OpenAiRequest(
-        model = config.assessmentModel,
+    val text = llmChat(
+        messages = listOf(LlmMessage("user", prompt)),
         maxTokens = 512,
-        messages = listOf(OpenAiMessage(role = "user", content = prompt)),
     )
-
-    val resp = openAiClient.post("https://api.openai.com/v1/chat/completions") {
-        header("Authorization", "Bearer $apiKey")
-        contentType(ContentType.Application.Json)
-        setBody(reqBody)
-    }
-
-    if (!resp.status.isSuccess()) {
-        val body = resp.body<String>()
-        throw IllegalStateException("OpenAI API error ${resp.status.value}: $body")
-    }
-
-    val openAiResp = resp.body<OpenAiResponse>()
-    val text = openAiResp.choices.firstOrNull()?.message?.content
-        ?: throw IllegalStateException("OpenAI response contained no content")
 
     val ratingLine = text.lines().firstOrNull { it.startsWith("RATING:") }
         ?: throw IllegalStateException("LLM response missing RATING line. Raw: $text")
@@ -352,30 +302,11 @@ private suspend fun callLlm(prompt: String): Pair<String, String> {
 }
 
 /** Call LLM and return the raw response text (no RATING: parsing — for explanation-only prompts). */
-private suspend fun callLlmForText(prompt: String): String {
-    val apiKey = config.openAiApiKey
-        ?: throw IllegalStateException("OPENAI_API_KEY is not configured")
-
-    val reqBody = OpenAiRequest(
-        model = config.assessmentModel,
+private suspend fun callLlmForText(prompt: String): String =
+    llmChat(
+        messages = listOf(LlmMessage("user", prompt)),
         maxTokens = 256,
-        messages = listOf(OpenAiMessage(role = "user", content = prompt)),
-    )
-
-    val resp = openAiClient.post("https://api.openai.com/v1/chat/completions") {
-        header("Authorization", "Bearer $apiKey")
-        contentType(ContentType.Application.Json)
-        setBody(reqBody)
-    }
-
-    if (!resp.status.isSuccess()) {
-        val body = resp.body<String>()
-        throw IllegalStateException("OpenAI API error ${resp.status.value}: $body")
-    }
-
-    return resp.body<OpenAiResponse>().choices.firstOrNull()?.message?.content?.trim()
-        ?: throw IllegalStateException("OpenAI response contained no content")
-}
+    ).trim()
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 

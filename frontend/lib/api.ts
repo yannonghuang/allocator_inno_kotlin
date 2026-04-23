@@ -990,7 +990,7 @@ export async function getNegotiationChain(
   return r.json();
 }
 
-export type NegotiationReplyAction = 'accept' | 'abandon' | 'counter';
+export type NegotiationReplyAction = 'keep' | 'abandon' | 'counter';
 
 export type NegotiationReplyPayload = {
   sessionKey: string;

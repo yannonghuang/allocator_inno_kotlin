@@ -45,7 +45,7 @@ private val openClawDispatchScope = CoroutineScope(SupervisorJob() + Dispatchers
 @Serializable
 data class NegotiationReplyRequest(
     val sessionKey: String,
-    val action: String, // "accept" | "abandon" | "counter" | "nl"
+    val action: String, // "keep" | "abandon" | "counter" | "nl"
     val round: Int? = null,
     val delayDays: Int? = null,
     val qtyPct: Double? = null,
@@ -103,8 +103,8 @@ fun Routing.negotiationRoutes() {
         val req = call.receive<NegotiationReplyRequest>()
 
         val action = req.action.lowercase()
-        if (action !in setOf("accept", "abandon", "counter", "nl")) {
-            throw IllegalArgumentException("action must be one of: accept | abandon | counter | nl")
+        if (action !in setOf("keep", "abandon", "counter", "nl")) {
+            throw IllegalArgumentException("action must be one of: keep | abandon | counter | nl")
         }
         if (action == "counter" && (req.delayDays == null || req.qtyPct == null)) {
             throw IllegalArgumentException("counter requires delayDays and qtyPct")

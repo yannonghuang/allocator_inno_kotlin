@@ -248,6 +248,6 @@ object NegotiationWaits : Table("negotiation_wait") {
     val impactedDemandCount   = integer("impacted_demand_count").default(0)
     val createdAt             = timestamp("created_at").defaultExpression(CurrentTimestamp)
     val resolvedAt            = timestamp("resolved_at").nullable()
-    val resolvedAction        = varchar("resolved_action", 16).nullable()  // accept | abandon | counter
+    val resolvedAction        = varchar("resolved_action", 16).nullable()  // keep | abandon | counter | superseded (historical rows may contain "accept")
     override val primaryKey = PrimaryKey(id)
 }
