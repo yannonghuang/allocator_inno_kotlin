@@ -272,13 +272,28 @@ export type PlanKpis = {
 
 /** Config for planning (e.g. get_preferred_variants). Sent in POST body to /plan. */
 export type PlanningConfig = {
+  /**
+   * Legacy knobs — kept for backwards compat with stored plan runs.
+   * BOM-level variety is modeled as distinct make methods now, so the UI no
+   * longer exposes variant-level selection.
+   */
   variant_selection?: {
     multiple?: boolean | null;
     top_n?: number;
     score_weights?: { commit_time?: number; inventory_consumed?: number; purchase?: number };
   };
-  /** When true, score methods by commit_time/inventory/purchase (slower; run is async with progress). */
-  method_selection?: { elaborate?: boolean; multiple?: boolean };
+  /**
+   * Method selection shape: `mode` + `depth` + `multiple`.
+   * `mode: "elaborate"` scores each candidate by commit_time/inventory/purchase;
+   * `depth` (≥1, default 1) controls how many recursion levels elaborate applies at.
+   * Legacy `elaborate: boolean` is still accepted by the backend.
+   */
+  method_selection?: {
+    mode?: 'preference' | 'elaborate';
+    depth?: number;
+    elaborate?: boolean;
+    multiple?: boolean;
+  };
   /** When false, the buy/purchase method is excluded from planning. Default: true. */
   purchase_allowed?: boolean;
   /** Consolidate shared component demands within a time bucket before planning. */

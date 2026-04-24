@@ -19,6 +19,85 @@ private val DEFAULT_SCORE_WEIGHTS = Triple(0.4, 0.35, 0.25)
 private val BENIGN_REASONS = setOf("cycle_stopped", "cycle_detected", "inventory")
 private val LATE_DATE = LocalDate.of(9999, 12, 31)
 
+// ── Selection config (method_selection / variant_selection) ───────────────────
+//
+// Method-level selection supports two modes: `preference` (cheap, preference-
+// ordered cascade) and `elaborate` (scored against each candidate's simulated
+// sub-plan). `depth` controls how many recursion levels elaborate applies at
+// (≥ 1, default 1 = root only). Legacy shape `{ elaborate: true }` is accepted.
+//
+// Variants are NOT rectified symmetrically: BOM-level variety is now modeled
+// as distinct make methods, so there is no "variant mode" or "variant depth"
+// concept. Variant config is just the equal-split / scoring knobs it has
+// always been (`multiple`, `score_weights`, `top_n`).
+//
+// Phase-1 note: `depth` on the method side is parsed and threaded, but the
+// elaborate envelope still runs root-only at runtime — widening it to > 1 is
+// a follow-up change.
+
+/** Effective method_selection config. */
+internal data class MethodSelectionConfig(
+    val mode: String,        // "preference" | "elaborate"
+    val depth: Int,          // >= 1
+    val multiple: Boolean,
+) {
+    val elaborate: Boolean get() = mode == "elaborate"
+}
+
+/** Effective variant_selection config. */
+internal data class VariantSelectionConfig(
+    val multiple: Boolean?,                 // null → equal-split among feasible; false → single best
+    val scoreWeights: Map<String, Any?>?,
+    val topN: Int?,
+)
+
+/** Clamp method_selection.depth to int ≥ 1; warn and default to 1 on garbage input. */
+private fun parseMethodDepth(raw: Any?): Int {
+    if (raw == null) return 1
+    val n = (raw as? Number)?.toInt()
+    if (n == null || n < 1) {
+        log.warn("Invalid method_selection.depth={}; clamping to 1", raw)
+        return 1
+    }
+    return n
+}
+
+/**
+ * Resolve the effective method_selection config.
+ *
+ * Accepts both the new shape (`mode`, `depth`) and the legacy shape
+ * (`elaborate: bool`). When both are present, `mode` wins.
+ */
+internal fun resolveMethodSelection(config: Map<String, Any?>?): MethodSelectionConfig {
+    val raw = (config?.get("method_selection") as? Map<*, *>)?.let {
+        @Suppress("UNCHECKED_CAST") it as? Map<String, Any?>
+    } ?: emptyMap()
+    val modeStr = (raw["mode"] as? String)?.trim()?.lowercase()
+    val mode = when (modeStr) {
+        "preference", "elaborate" -> modeStr
+        null -> if (raw["elaborate"] == true) "elaborate" else "preference"
+        else -> {
+            log.warn("Invalid method_selection.mode='{}'; defaulting to preference", modeStr)
+            "preference"
+        }
+    }
+    val depth = parseMethodDepth(raw["depth"])
+    val multiple = raw["multiple"] == true
+    return MethodSelectionConfig(mode = mode, depth = depth, multiple = multiple)
+}
+
+/** Resolve the effective variant_selection config. */
+internal fun resolveVariantSelection(config: Map<String, Any?>?): VariantSelectionConfig {
+    val raw = (config?.get("variant_selection") as? Map<*, *>)?.let {
+        @Suppress("UNCHECKED_CAST") it as? Map<String, Any?>
+    } ?: emptyMap()
+    val multiple = raw["multiple"] as? Boolean
+    @Suppress("UNCHECKED_CAST")
+    val scoreWeights = raw["score_weights"] as? Map<String, Any?>
+    val topN = (raw["top_n"] as? Number)?.toInt()?.let { max(1, it) }
+    return VariantSelectionConfig(multiple = multiple, scoreWeights = scoreWeights, topN = topN)
+}
+
 /** Round a quantity-like double to a whole-unit double for API emission.
  *  Used at the JSON boundary for fields like quantity, committed_qty, shortage, etc.
  *  Internal math stays in Double; only the value handed to the caller is rounded.
@@ -459,12 +538,7 @@ internal fun getPreferredMethodElaborate(
     if (methods.isEmpty()) return Pair(null, "No methods available.")
     if (depth < MAX_PLAN_DEPTH || methods.size <= 1) return getPreferredMethod(methods)
 
-    val variantSelection = (config?.get("variant_selection") as? Map<*, *>)?.let { m ->
-        @Suppress("UNCHECKED_CAST") m as? Map<String, Any?>
-    }
-    val scoreWeights = (variantSelection?.get("score_weights") as? Map<*, *>)?.let { m ->
-        @Suppress("UNCHECKED_CAST") m as? Map<String, Any?>
-    }
+    val scoreWeights = resolveVariantSelection(config).scoreWeights
     val (wCommit, wInv, wPurchase) = normalizeScoreWeights(scoreWeights)
     val productId = demand["product_id"] as? String ?: ""
     val locationId = demand["location_id"] as? String ?: ""
@@ -813,14 +887,13 @@ fun plan(
             demandId, productId, locationId, methods.size, methods.map { it["type"] })
     }
 
-    val methodSelection = (config?.get("method_selection") as? Map<*, *>)?.let { @Suppress("UNCHECKED_CAST") it as? Map<String, Any?> }
-    val useElaborateMethod = methodSelection?.get("elaborate") == true
-    val useMultipleMethods = methodSelection?.get("multiple") == true && methods.size > 1
-    val variantSelection = (config?.get("variant_selection") as? Map<*, *>)?.let { @Suppress("UNCHECKED_CAST") it as? Map<String, Any?> }
-    val useSingleVariant = variantSelection?.get("multiple") == false
-    @Suppress("UNCHECKED_CAST")
-    val scoreWeights = variantSelection?.get("score_weights")?.let { it as? Map<String, Any?> }
-    val topN = variantSelection?.get("top_n")?.let { (it as? Number)?.toInt()?.let { n -> max(1, n) } }
+    val methodCfg = resolveMethodSelection(config)
+    val variantCfg = resolveVariantSelection(config)
+    val useElaborateMethod = methodCfg.elaborate
+    val useMultipleMethods = methodCfg.multiple && methods.size > 1
+    val useSingleVariant = variantCfg.multiple == false
+    val scoreWeights = variantCfg.scoreWeights
+    val topN = variantCfg.topN
 
     // Shortage tolerance: tiny partial-fulfillment gaps are collapsed to "no bottleneck".
     // Tolerance = max(absolute, relative * qty). Absolute floor kills sub-unit drift;

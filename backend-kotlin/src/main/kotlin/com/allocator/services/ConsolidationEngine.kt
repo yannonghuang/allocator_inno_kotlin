@@ -393,10 +393,7 @@ private fun collectDeepNeeds(
         // Align with PlanningEngine.plan()'s outermost method selection — the main plan uses
         // cascade (or elaborate) only at depth == MAX_PLAN_DEPTH. At inner recursion both
         // engines fall back to simple getPreferredMethod, so we only diverge at the root.
-        val methodSelection = (planConfig?.get("method_selection") as? Map<*, *>)?.let {
-            @Suppress("UNCHECKED_CAST") it as? Map<String, Any?>
-        }
-        val useElaborateMethod = methodSelection?.get("elaborate") == true
+        val useElaborateMethod = resolveMethodSelection(planConfig).elaborate
         val chosen = if (useElaborateMethod)
             getPreferredMethodElaborate(methods, demand, inventory, data, dueDate, planConfig, 500, emptySet()).first
         else

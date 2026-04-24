@@ -3,6 +3,8 @@ package com.allocator.api
 import com.allocator.*
 import com.allocator.services.CaseLoader
 import com.allocator.services.getMethods
+import com.allocator.services.resolveMethodSelection
+import com.allocator.services.resolveVariantSelection
 import com.allocator.services.roundQty
 import com.allocator.services.runAllocation
 import com.allocator.services.runPlanning
@@ -1459,20 +1461,22 @@ private fun markRunFailed(runId: Int, caseId: Int, error: String) {
 @Suppress("UNCHECKED_CAST")
 private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
     val c = config ?: emptyMap()
-    val methodSel     = (c["method_selection"]  as? Map<*, *>)?.let { it as Map<String, Any?> } ?: emptyMap()
-    val variantSel    = (c["variant_selection"] as? Map<*, *>)?.let { it as Map<String, Any?> } ?: emptyMap()
     val consolidation = (c["consolidation"]     as? Map<*, *>)?.let { it as Map<String, Any?> } ?: emptyMap()
+    val methodCfg = resolveMethodSelection(c)
+    val variantCfg = resolveVariantSelection(c)
 
     return buildJsonObject {
         put("purchase_allowed", c["purchase_allowed"] as? Boolean ?: true)
         putJsonObject("method_selection") {
-            put("elaborate", methodSel["elaborate"] as? Boolean ?: false)
-            put("multiple",  methodSel["multiple"]  as? Boolean ?: false)
+            put("mode",      methodCfg.mode)
+            put("depth",     methodCfg.depth)
+            put("elaborate", methodCfg.elaborate)  // legacy mirror — consumers still read this
+            put("multiple",  methodCfg.multiple)
         }
         putJsonObject("variant_selection") {
-            put("multiple", variantSel["multiple"] as? Boolean ?: true)
-            variantSel["score_weights"]?.let { put("score_weights", anyToJson(it)) }
-            variantSel["top_n"]?.let { put("top_n", (it as? Number)?.toInt() ?: 0) }
+            put("multiple", variantCfg.multiple ?: true)
+            variantCfg.scoreWeights?.let { put("score_weights", anyToJson(it)) }
+            variantCfg.topN?.let { put("top_n", it) }
         }
         putJsonObject("consolidation") {
             put("enabled",         consolidation["enabled"]      as? Boolean ?: false)
