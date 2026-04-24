@@ -376,30 +376,41 @@ fun Routing.allocateRoutes() {
     get("/cases/{case_id}/plan-runs") {
         val caseId = call.parameters["case_id"]?.toIntOrNull()
             ?: throw IllegalArgumentException("Invalid case_id")
-        transaction {
-            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
+        val designatedId = transaction {
+            val caseRow = Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
                 ?: throw NoSuchElementException("Case not found")
+            caseRow[Cases.designatedActivePlanRunId]
         }
         val runs = transaction {
-            PlanRuns.selectAll().where { (PlanRuns.caseId eq caseId) and (PlanRuns.status neq "ready") and (PlanRuns.status neq "running") }
+            val rows = PlanRuns.selectAll().where { (PlanRuns.caseId eq caseId) and (PlanRuns.status neq "ready") and (PlanRuns.status neq "running") }
                 .orderBy(PlanRuns.createdAt, SortOrder.DESC)
-                .map { row ->
-                    val snapshot = row[PlanRuns.overrideSnapshot]
-                    val overrideCount = if (snapshot != null) {
-                        runCatching { (Json.parseToJsonElement(snapshot) as? JsonArray)?.size ?: 0 }.getOrElse { 0 }
-                    } else 0
-                    PlanRunResponse(
-                        id = row[PlanRuns.id],
-                        caseId = row[PlanRuns.caseId],
-                        jobId = row[PlanRuns.jobId],
-                        status = row[PlanRuns.status],
-                        config = row[PlanRuns.config]?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
-                        overrideCount = overrideCount,
-                        name = row[PlanRuns.name],
-                        notes = row[PlanRuns.notes],
-                        createdAt = formatTs(row[PlanRuns.createdAt]),
-                    )
-                }
+                .toList()
+            val successIds = rows.filter { it[PlanRuns.status] == "success" }.map { it[PlanRuns.id] }
+            val activeRunId = com.allocator.services.resolveActiveRunId(designatedId, successIds)
+            val idStatusPairs = rows.map { it[PlanRuns.id] to it[PlanRuns.status] }
+            val initialRunId = com.allocator.services.resolveInitialRunId(idStatusPairs)
+            rows.map { row ->
+                val snapshot = row[PlanRuns.overrideSnapshot]
+                val parsedSnapshot = snapshot?.let { runCatching { Json.parseToJsonElement(it) as? JsonArray }.getOrNull() }
+                val overrideCount = parsedSnapshot?.size ?: 0
+                val preview: JsonElement? = parsedSnapshot?.take(3)?.let { JsonArray(it) }
+                val runId = row[PlanRuns.id]
+                PlanRunResponse(
+                    id = runId,
+                    caseId = row[PlanRuns.caseId],
+                    jobId = row[PlanRuns.jobId],
+                    status = row[PlanRuns.status],
+                    config = row[PlanRuns.config]?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
+                    overrideCount = overrideCount,
+                    overrideSnapshotPreview = preview,
+                    name = row[PlanRuns.name],
+                    notes = row[PlanRuns.notes],
+                    isInitial = (runId == initialRunId),
+                    isActive = (runId == activeRunId),
+                    isActiveDesignated = (runId == activeRunId && designatedId != null && runId == designatedId),
+                    createdAt = formatTs(row[PlanRuns.createdAt]),
+                )
+            }
         }
         call.respond(runs)
     }
@@ -511,6 +522,33 @@ fun Routing.allocateRoutes() {
             } else raw.result
         } else raw.result
 
+        // Compute active/initial flags + load events timeline
+        data class Flags(val isInitial: Boolean, val isActive: Boolean, val isActiveDesignated: Boolean, val events: List<PlanRunEventDto>)
+        val flags = transaction {
+            val designatedId = Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()?.get(Cases.designatedActivePlanRunId)
+            val caseRuns = PlanRuns.selectAll().where { (PlanRuns.caseId eq caseId) and (PlanRuns.status neq "ready") and (PlanRuns.status neq "running") }
+                .map { it[PlanRuns.id] to it[PlanRuns.status] }
+            val successIds = caseRuns.filter { it.second == "success" }.map { it.first }
+            val activeRunId = com.allocator.services.resolveActiveRunId(designatedId, successIds)
+            val initialRunId = com.allocator.services.resolveInitialRunId(caseRuns)
+            val events = PlanRunEvents.selectAll().where { PlanRunEvents.planRunId eq raw.id }
+                .orderBy(PlanRunEvents.createdAt, SortOrder.ASC)
+                .map { row ->
+                    PlanRunEventDto(
+                        id = row[PlanRunEvents.id],
+                        kind = row[PlanRunEvents.kind],
+                        payload = row[PlanRunEvents.payload]?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
+                        createdAt = formatTs(row[PlanRunEvents.createdAt]),
+                    )
+                }
+            Flags(
+                isInitial = (raw.id == initialRunId),
+                isActive = (raw.id == activeRunId),
+                isActiveDesignated = (raw.id == activeRunId && designatedId != null && raw.id == designatedId),
+                events = events,
+            )
+        }
+
         val response = PlanRunFullResponse(
             id = raw.id,
             caseId = raw.caseId,
@@ -522,6 +560,10 @@ fun Routing.allocateRoutes() {
             error = raw.error,
             name = raw.name,
             notes = raw.notes,
+            isInitial = flags.isInitial,
+            isActive = flags.isActive,
+            isActiveDesignated = flags.isActiveDesignated,
+            events = flags.events,
             createdAt = formatTs(raw.createdAt),
         )
         call.respond(response)
@@ -554,19 +596,87 @@ fun Routing.allocateRoutes() {
                       else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrElse { JsonObject(emptyMap()) }
         val nameArg = payload["name"]?.jsonPrimitive?.contentOrNull
         val notesArg = payload["notes"]?.jsonPrimitive?.contentOrNull
+        val mode = payload["mode"]?.jsonPrimitive?.contentOrNull ?: "new"
+        val targetRunId = payload["target_run_id"]?.jsonPrimitive?.intOrNull
 
         val runRow = transaction {
             PlanRuns.selectAll().where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }.singleOrNull()
         } ?: throw NoSuchElementException("Plan run $runId not found for case $caseId")
 
         val currentStatus = runRow[PlanRuns.status]
+
+        // ── Override mode: copy ready run's result/config/overrides into an existing success run ──
+        if (mode == "override") {
+            if (targetRunId == null) throw IllegalArgumentException("target_run_id is required when mode='override'")
+            if (targetRunId == runId) throw IllegalArgumentException("target_run_id cannot equal the ready run id")
+            if (currentStatus != "ready") throw IllegalStateException("Override source must be a ready run (got '$currentStatus')")
+
+            val targetRow = transaction {
+                PlanRuns.selectAll().where { (PlanRuns.id eq targetRunId) and (PlanRuns.caseId eq caseId) }.singleOrNull()
+            } ?: throw NoSuchElementException("Target plan run $targetRunId not found for case $caseId")
+            val targetStatus = targetRow[PlanRuns.status]
+            if (targetStatus != "success") {
+                throw IllegalStateException("Override target must have status 'success' (got '$targetStatus')")
+            }
+
+            val enriched = casePlanResults[caseId]
+                ?: throw NoSuchElementException("No in-memory plan result for case $caseId. Re-run plan first.")
+            val resultJson = runCatching { anyToJson(enriched).toString() }.getOrElse { null }
+            val newConfig = runRow[PlanRuns.config]
+            val newOverrideSnapshot = runRow[PlanRuns.overrideSnapshot]
+
+            transaction {
+                PlanRuns.update({ PlanRuns.id eq targetRunId }) {
+                    it[PlanRuns.result] = resultJson
+                    it[PlanRuns.config] = newConfig
+                    it[PlanRuns.overrideSnapshot] = newOverrideSnapshot
+                    if (nameArg != null) it[PlanRuns.name] = nameArg.ifBlank { null }
+                    if (notesArg != null) it[PlanRuns.notes] = notesArg.ifBlank { null }
+                }
+                // Replace supply allocations on the target from the fresh enriched result
+                PlanSupplyAllocations.deleteWhere { PlanSupplyAllocations.planRunId eq targetRunId }
+                @Suppress("UNCHECKED_CAST")
+                val supplyAllocs = (enriched["supply_allocations"] as? List<Map<String, Any?>>).orEmpty()
+                if (supplyAllocs.isNotEmpty()) {
+                    PlanSupplyAllocations.batchInsert(supplyAllocs) { alloc ->
+                        this[PlanSupplyAllocations.caseId]      = caseId
+                        this[PlanSupplyAllocations.planRunId]   = targetRunId
+                        this[PlanSupplyAllocations.supplyId]    = alloc["supply_id"] as String
+                        this[PlanSupplyAllocations.demandId]    = alloc["demand_id"] as? String
+                        this[PlanSupplyAllocations.qtyConsumed] = (alloc["qty_consumed"] as? Number)?.toDouble() ?: 0.0
+                    }
+                }
+                // Delete the ready row (cascade wipes its plan_run_event rows)
+                PlanRuns.deleteWhere { PlanRuns.id eq runId }
+                com.allocator.services.emitPlanRunEvent(caseId, targetRunId, "overridden", buildJsonObject {
+                    put("replaced_ready_run_id", JsonPrimitive(runId))
+                    nameArg?.ifBlank { null }?.let { put("name", JsonPrimitive(it)) }
+                    notesArg?.ifBlank { null }?.let { put("notes", JsonPrimitive(it)) }
+                })
+            }
+            call.respond(buildJsonObject { put("id", targetRunId); put("status", "success") })
+            return@post
+        }
+
         if (currentStatus == "success" || currentStatus == "contingent") {
             // Already persisted — apply name/notes update if provided, then return
             if (nameArg != null || notesArg != null) {
+                val oldName = runRow[PlanRuns.name]
+                val oldNotes = runRow[PlanRuns.notes]
+                val newName = nameArg?.ifBlank { null } ?: oldName
+                val newNotes = notesArg?.ifBlank { null } ?: oldNotes
                 transaction {
                     PlanRuns.update({ PlanRuns.id eq runId }) {
                         if (nameArg != null) it[PlanRuns.name] = nameArg.ifBlank { null }
                         if (notesArg != null) it[PlanRuns.notes] = notesArg.ifBlank { null }
+                    }
+                    if (oldName != newName || oldNotes != newNotes) {
+                        com.allocator.services.emitPlanRunEvent(caseId, runId, "renamed", buildJsonObject {
+                            put("old_name", oldName?.let(::JsonPrimitive) ?: JsonNull)
+                            put("new_name", newName?.let(::JsonPrimitive) ?: JsonNull)
+                            put("old_notes", oldNotes?.let(::JsonPrimitive) ?: JsonNull)
+                            put("new_notes", newNotes?.let(::JsonPrimitive) ?: JsonNull)
+                        })
                     }
                 }
             }
@@ -600,6 +710,10 @@ fun Routing.allocateRoutes() {
                     this[PlanSupplyAllocations.qtyConsumed] = (alloc["qty_consumed"] as? Number)?.toDouble() ?: 0.0
                 }
             }
+            com.allocator.services.emitPlanRunEvent(caseId, runId, "saved", buildJsonObject {
+                nameArg?.ifBlank { null }?.let { put("name", JsonPrimitive(it)) }
+                notesArg?.ifBlank { null }?.let { put("notes", JsonPrimitive(it)) }
+            })
         }
         call.respond(buildJsonObject { put("id", runId); put("status", "success") })
     }
@@ -616,14 +730,64 @@ fun Routing.allocateRoutes() {
                       else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrElse { JsonObject(emptyMap()) }
 
         transaction {
-            val exists = PlanRuns.selectAll().where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }.any()
-            if (!exists) throw NoSuchElementException("Plan run $runId not found for case $caseId")
+            val existingRow = PlanRuns.selectAll().where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }.singleOrNull()
+                ?: throw NoSuchElementException("Plan run $runId not found for case $caseId")
+            val oldName = existingRow[PlanRuns.name]
+            val oldNotes = existingRow[PlanRuns.notes]
+            val newName = if (payload.containsKey("name")) payload["name"]?.jsonPrimitive?.contentOrNull?.ifBlank { null } else oldName
+            val newNotes = if (payload.containsKey("notes")) payload["notes"]?.jsonPrimitive?.contentOrNull?.ifBlank { null } else oldNotes
             PlanRuns.update({ (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }) {
-                if (payload.containsKey("name")) it[PlanRuns.name] = payload["name"]?.jsonPrimitive?.contentOrNull?.ifBlank { null }
-                if (payload.containsKey("notes")) it[PlanRuns.notes] = payload["notes"]?.jsonPrimitive?.contentOrNull?.ifBlank { null }
+                if (payload.containsKey("name")) it[PlanRuns.name] = newName
+                if (payload.containsKey("notes")) it[PlanRuns.notes] = newNotes
+            }
+            if (oldName != newName || oldNotes != newNotes) {
+                com.allocator.services.emitPlanRunEvent(caseId, runId, "renamed", buildJsonObject {
+                    put("old_name", oldName?.let(::JsonPrimitive) ?: JsonNull)
+                    put("new_name", newName?.let(::JsonPrimitive) ?: JsonNull)
+                    put("old_notes", oldNotes?.let(::JsonPrimitive) ?: JsonNull)
+                    put("new_notes", newNotes?.let(::JsonPrimitive) ?: JsonNull)
+                })
             }
         }
         call.respond(buildJsonObject { put("id", runId) })
+    }
+
+    // ── POST /cases/{case_id}/plan-runs/{run_id}/designate-active ────────────
+    // Pin this run as the case's active plan run. Only successful runs are eligible.
+    post("/cases/{case_id}/plan-runs/{run_id}/designate-active") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val runId = call.parameters["run_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid run_id")
+
+        transaction {
+            val row = PlanRuns.selectAll().where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }.singleOrNull()
+                ?: throw NoSuchElementException("Plan run $runId not found for case $caseId")
+            val status = row[PlanRuns.status]
+            if (status != "success") {
+                throw IllegalStateException("Only runs with status='success' can be designated active (got '$status')")
+            }
+            Cases.update({ Cases.id eq caseId }) {
+                it[Cases.designatedActivePlanRunId] = runId
+            }
+            com.allocator.services.emitPlanRunEvent(caseId, runId, "designated_active")
+        }
+        call.respond(buildJsonObject { put("id", runId); put("designated_active_plan_run_id", runId) })
+    }
+
+    // ── DELETE /cases/{case_id}/designated-active — clear pinned active ──────
+    delete("/cases/{case_id}/designated-active") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val priorId = transaction {
+            val caseRow = Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
+                ?: throw NoSuchElementException("Case not found")
+            val prior = caseRow[Cases.designatedActivePlanRunId]
+            Cases.update({ Cases.id eq caseId }) { it[Cases.designatedActivePlanRunId] = null }
+            if (prior != null) com.allocator.services.emitPlanRunEvent(caseId, prior, "undesignated")
+            prior
+        }
+        call.respond(buildJsonObject { put("prior_designated_active_plan_run_id", priorId?.let(::JsonPrimitive) ?: JsonNull) })
     }
 }
 
@@ -1089,13 +1253,18 @@ private suspend fun runPlanBackground(
             }
         val overrideSnapshotJson = JsonArray(overrides).toString()
         val configJson = resolveEffectiveConfig(config).toString()
-        PlanRuns.insert {
+        val insertedId = PlanRuns.insert {
             it[PlanRuns.caseId] = caseId
             it[PlanRuns.jobId] = jobId
             it[PlanRuns.status] = "running"
             it[PlanRuns.config] = configJson
             it[PlanRuns.overrideSnapshot] = overrideSnapshotJson
         }[PlanRuns.id]
+        com.allocator.services.emitPlanRunEvent(caseId, insertedId, "created", buildJsonObject {
+            put("source", "plan")
+            put("override_count", JsonPrimitive(overrides.size))
+        })
+        insertedId
     }
     planJobRunIds[jobId] = planRunId
 

@@ -436,8 +436,19 @@ export type PlanRun = {
   status: 'running' | 'success' | 'failed' | 'contingent';
   config: Record<string, unknown> | null;
   override_count: number;
+  override_snapshot_preview: ManualOverride[] | null;
   name: string | null;
   notes: string | null;
+  is_initial?: boolean;
+  is_active?: boolean;
+  is_active_designated?: boolean;
+  created_at: string;
+};
+
+export type PlanRunEvent = {
+  id: number;
+  kind: 'created' | 'saved' | 'renamed' | 'promoted' | 'designated_active' | 'undesignated' | string;
+  payload: Record<string, unknown> | null;
   created_at: string;
 };
 
@@ -445,6 +456,7 @@ export type PlanRunFull = PlanRun & {
   override_snapshot: ManualOverride[] | null;
   result: PlanResult | null;
   error: string | null;
+  events?: PlanRunEvent[];
 };
 
 export async function listPlanRuns(caseId: number): Promise<PlanRun[]> {
@@ -473,7 +485,11 @@ export async function deletePlanRun(caseId: number, runId: number): Promise<void
   if (!r.ok) throw new Error(await r.text());
 }
 
-export async function savePlanRun(caseId: number, runId: number, opts?: { name?: string; notes?: string }): Promise<{ id: number; status: string }> {
+export async function savePlanRun(
+  caseId: number,
+  runId: number,
+  opts?: { name?: string; notes?: string; mode?: 'new' | 'override'; target_run_id?: number },
+): Promise<{ id: number; status: string }> {
   const r = await fetch(`${API}/cases/${caseId}/plan-runs/${runId}/save`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -489,6 +505,16 @@ export async function updatePlanRun(caseId: number, runId: number, data: { name?
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
   });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+export async function designateActivePlanRun(caseId: number, runId: number): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/plan-runs/${runId}/designate-active`, { method: 'POST' });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+export async function clearDesignatedActivePlanRun(caseId: number): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/designated-active`, { method: 'DELETE' });
   if (!r.ok) throw new Error(await r.text());
 }
 
