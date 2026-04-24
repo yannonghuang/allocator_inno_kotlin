@@ -1401,7 +1401,18 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         setPlanResult(full.result as typeof planResult);
         setCurrentPlanRunId(latest.id);
         setPlanWorkOrderPeggingCache({});
-        if (full.config) setPlanningConfig(full.config as PlanningConfig);
+        if (full.config) {
+          const cfg = full.config as PlanningConfig;
+          const chosen = full.chosen_depth ?? null;
+          setPlanningConfig({
+            ...cfg,
+            method_selection: {
+              ...cfg.method_selection,
+              depth: chosen ?? cfg.method_selection?.depth ?? 1,
+              depth_optimal: false,
+            },
+          });
+        }
         restoreCriticality(latest.id);
       }
     } catch {

@@ -1650,6 +1650,8 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
             put("depth",     methodCfg.depth)
             put("elaborate", methodCfg.elaborate)  // legacy mirror — consumers still read this
             put("multiple",  methodCfg.multiple)
+            put("depth_optimal", methodCfg.depthOptimal)
+            methodCfg.scoreWeights?.let { put("score_weights", anyToJson(it)) }
         }
         putJsonObject("variant_selection") {
             put("multiple", variantCfg.multiple ?: true)
