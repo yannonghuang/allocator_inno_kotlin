@@ -293,6 +293,8 @@ export type PlanningConfig = {
     depth?: number;
     elaborate?: boolean;
     multiple?: boolean;
+    /** Relative weights for elaborate scoring. Backend normalizes so absolute values don't matter. */
+    score_weights?: { commit_time?: number; inventory_consumed?: number; purchase?: number };
   };
   /** When false, the buy/purchase method is excluded from planning. Default: true. */
   purchase_allowed?: boolean;

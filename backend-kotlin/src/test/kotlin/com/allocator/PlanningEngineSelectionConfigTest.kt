@@ -97,6 +97,40 @@ class PlanningEngineSelectionConfigTest : FunSpec({
         resolveMethodSelection(mapOf("method_selection" to mapOf("multiple" to false))).multiple shouldBe false
     }
 
+    // ── method_selection.score_weights (drives elaborate scoring) ────────────
+
+    test("method_selection.score_weights is passed through") {
+        val w = mapOf("commit_time" to 1, "inventory_consumed" to 2, "purchase" to 3)
+        val cfg = resolveMethodSelection(mapOf(
+            "method_selection" to mapOf("mode" to "elaborate", "score_weights" to w)
+        ))
+        cfg.scoreWeights shouldBe w
+    }
+
+    test("method_selection.score_weights falls back to variant_selection.score_weights") {
+        val w = mapOf("commit_time" to 1, "inventory_consumed" to 0, "purchase" to 0)
+        val cfg = resolveMethodSelection(mapOf(
+            "method_selection" to mapOf("mode" to "elaborate"),
+            "variant_selection" to mapOf("score_weights" to w),
+        ))
+        cfg.scoreWeights shouldBe w
+    }
+
+    test("method_selection.score_weights wins over variant_selection.score_weights") {
+        val methodW = mapOf("commit_time" to 5, "inventory_consumed" to 5, "purchase" to 5)
+        val variantW = mapOf("commit_time" to 1, "inventory_consumed" to 0, "purchase" to 0)
+        val cfg = resolveMethodSelection(mapOf(
+            "method_selection" to mapOf("score_weights" to methodW),
+            "variant_selection" to mapOf("score_weights" to variantW),
+        ))
+        cfg.scoreWeights shouldBe methodW
+    }
+
+    test("method_selection.score_weights is null when absent from both groups") {
+        resolveMethodSelection(null).scoreWeights shouldBe null
+        resolveMethodSelection(mapOf("method_selection" to mapOf("mode" to "elaborate"))).scoreWeights shouldBe null
+    }
+
     // ── variant_selection ────────────────────────────────────────────────────
 
     test("variant_selection defaults: multiple null, no weights/topN") {

@@ -41,6 +41,7 @@ internal data class MethodSelectionConfig(
     val mode: String,        // "preference" | "elaborate"
     val depth: Int,          // >= 1
     val multiple: Boolean,
+    val scoreWeights: Map<String, Any?>?,  // drives elaborate scoring (commit_time / inventory_consumed / purchase)
 ) {
     val elaborate: Boolean get() = mode == "elaborate"
 }
@@ -66,8 +67,10 @@ private fun parseMethodDepth(raw: Any?): Int {
 /**
  * Resolve the effective method_selection config.
  *
- * Accepts both the new shape (`mode`, `depth`) and the legacy shape
- * (`elaborate: bool`). When both are present, `mode` wins.
+ * Accepts both the new shape (`mode`, `depth`, `score_weights`) and the legacy shape
+ * (`elaborate: bool`). When both are present, `mode` wins. Score weights fall back
+ * to `variant_selection.score_weights` when not set at the method level, since the
+ * two groups used to share weights before the variant surface was removed.
  */
 internal fun resolveMethodSelection(config: Map<String, Any?>?): MethodSelectionConfig {
     val raw = (config?.get("method_selection") as? Map<*, *>)?.let {
@@ -84,7 +87,16 @@ internal fun resolveMethodSelection(config: Map<String, Any?>?): MethodSelection
     }
     val depth = parseMethodDepth(raw["depth"])
     val multiple = raw["multiple"] == true
-    return MethodSelectionConfig(mode = mode, depth = depth, multiple = multiple)
+    @Suppress("UNCHECKED_CAST")
+    val methodWeights = raw["score_weights"] as? Map<String, Any?>
+    val weights = methodWeights ?: run {
+        val vs = (config?.get("variant_selection") as? Map<*, *>)?.let {
+            @Suppress("UNCHECKED_CAST") it as? Map<String, Any?>
+        }
+        @Suppress("UNCHECKED_CAST")
+        vs?.get("score_weights") as? Map<String, Any?>
+    }
+    return MethodSelectionConfig(mode = mode, depth = depth, multiple = multiple, scoreWeights = weights)
 }
 
 /**
@@ -551,10 +563,10 @@ internal fun getPreferredMethodElaborate(
     planningPath: Set<Pair<String, String>>,
 ): Pair<Map<String, Any?>?, String> {
     if (methods.isEmpty()) return Pair(null, "No methods available.")
-    val levels = resolveMethodSelection(config).depth
-    if (!shouldElaborateAtDepth(depth, levels) || methods.size <= 1) return getPreferredMethod(methods)
+    val methodCfg = resolveMethodSelection(config)
+    if (!shouldElaborateAtDepth(depth, methodCfg.depth) || methods.size <= 1) return getPreferredMethod(methods)
 
-    val scoreWeights = resolveVariantSelection(config).scoreWeights
+    val scoreWeights = methodCfg.scoreWeights
     val (wCommit, wInv, wPurchase) = normalizeScoreWeights(scoreWeights)
     val productId = demand["product_id"] as? String ?: ""
     val locationId = demand["location_id"] as? String ?: ""

@@ -905,6 +905,27 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       };
     }
 
+    if (/earliest (commit|delivery|ship)|fastest (commit|delivery|ship)|soonest (commit|delivery|ship)|prioriti[sz]e (commit|delivery|ship)|最早交付|最快交付|优先交付|按交付/.test(t)) {
+      return {
+        reply: tP('copilot.replies.methodWeightCommit'),
+        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false, score_weights: { commit_time: 1, inventory_consumed: 0, purchase: 0 } } },
+      };
+    }
+
+    if (/prefer inventor(y|ies)|use (existing )?inventor(y|ies)|favou?r inventor(y|ies)|consume inventor(y|ies)|existing stock|maximi[sz]e inventor(y|ies)|优先库存|使用库存|消耗库存|最多库存/.test(t)) {
+      return {
+        reply: tP('copilot.replies.methodWeightInventory'),
+        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false, score_weights: { commit_time: 0, inventory_consumed: 1, purchase: 0 } } },
+      };
+    }
+
+    if (/minim(al|i[sz]e) (additional )?purchase|minim(al|i[sz]e) (additional )?buy|least purchase|least buy|fewest purchase|avoid purchase|最少采购|最小采购|减少采购|最少购买/.test(t)) {
+      return {
+        reply: tP('copilot.replies.methodWeightPurchase'),
+        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false, score_weights: { commit_time: 0, inventory_consumed: 0, purchase: 1 } } },
+      };
+    }
+
     if (/no purchase|disable purchase|disallow purchase|no buy|exclude buy|without purchase|禁用采购|不采购|不允许采购/.test(t)) {
       return {
         reply: tP('copilot.replies.purchaseOff'),
@@ -973,7 +994,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (/reset|default|clear|重置|默认|清除/.test(t)) {
       return {
         reply: tP('copilot.replies.reset'),
-        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1 }, purchase_allowed: false, consolidation: { enabled: true, period_days: 365, allocation_mode: 'fair' } },
+        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 365, allocation_mode: 'fair' } },
       };
     }
 
@@ -3219,6 +3240,61 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               />
             </label>
           </div>
+          {(() => {
+            const elaborateOn = planningConfig.method_selection?.elaborate === true;
+            const weights = planningConfig.method_selection?.score_weights;
+            const wCommit = weights?.commit_time ?? 0.4;
+            const wInv = weights?.inventory_consumed ?? 0.35;
+            const wPurchase = weights?.purchase ?? 0.25;
+            const updateWeight = (key: 'commit_time' | 'inventory_consumed' | 'purchase', v: number) => {
+              const clamped = Math.max(0, Math.min(1, isNaN(v) ? 0 : v));
+              setPlanningConfig((c) => ({
+                ...c,
+                method_selection: {
+                  ...c.method_selection,
+                  score_weights: {
+                    commit_time: key === 'commit_time' ? clamped : (c.method_selection?.score_weights?.commit_time ?? 0.4),
+                    inventory_consumed: key === 'inventory_consumed' ? clamped : (c.method_selection?.score_weights?.inventory_consumed ?? 0.35),
+                    purchase: key === 'purchase' ? clamped : (c.method_selection?.score_weights?.purchase ?? 0.25),
+                  },
+                },
+              }));
+            };
+            const inputStyle: React.CSSProperties = { width: 64, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' };
+            const labelStyle: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.875rem', opacity: elaborateOn ? 1 : 0.4 };
+            return (
+              <div
+                style={{ display: 'flex', alignItems: 'center', gap: '0.9rem', flexWrap: 'wrap', marginBottom: '0.5rem', marginLeft: '1rem' }}
+                title={tP('config.weightsHint')}
+              >
+                <span style={{ color: '#a1a1aa', fontSize: '0.8rem', opacity: elaborateOn ? 1 : 0.5 }}>{tP('config.weightsLabel')}</span>
+                <label style={labelStyle}>
+                  <span style={{ color: '#a1a1aa' }}>{tP('config.weightCommit')}</span>
+                  <input type="number" min={0} max={1} step={0.05}
+                    disabled={!elaborateOn}
+                    value={wCommit}
+                    onChange={(e) => updateWeight('commit_time', parseFloat(e.target.value))}
+                    style={inputStyle} />
+                </label>
+                <label style={labelStyle}>
+                  <span style={{ color: '#a1a1aa' }}>{tP('config.weightInventory')}</span>
+                  <input type="number" min={0} max={1} step={0.05}
+                    disabled={!elaborateOn}
+                    value={wInv}
+                    onChange={(e) => updateWeight('inventory_consumed', parseFloat(e.target.value))}
+                    style={inputStyle} />
+                </label>
+                <label style={labelStyle}>
+                  <span style={{ color: '#a1a1aa' }}>{tP('config.weightPurchase')}</span>
+                  <input type="number" min={0} max={1} step={0.05}
+                    disabled={!elaborateOn}
+                    value={wPurchase}
+                    onChange={(e) => updateWeight('purchase', parseFloat(e.target.value))}
+                    style={inputStyle} />
+                </label>
+              </div>
+            );
+          })()}
           <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem', cursor: 'pointer' }}>
             <input
               type="checkbox"
@@ -3318,7 +3394,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             className="secondary"
             disabled={planLoading}
             onClick={() => setPlanningConfig({
-              method_selection: { multiple: false, elaborate: false, depth: 1 },
+              method_selection: {
+                multiple: false,
+                elaborate: false,
+                depth: 1,
+                score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 },
+              },
               purchase_allowed: false,
               consolidation: { enabled: true, period_days: 365, allocation_mode: 'fair' },
             })}

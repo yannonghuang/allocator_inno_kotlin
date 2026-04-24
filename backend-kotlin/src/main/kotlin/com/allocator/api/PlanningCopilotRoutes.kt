@@ -68,6 +68,15 @@ Intent → config mapping (interpret any phrasing that conveys the same intent):
 4) **Set the elaborate search depth to N** (e.g. "method depth 3", "search depth 2", "方法深度 3", "深度 2")
    → method_selection: { "depth": N } (clamp N ≥ 1). Only meaningful when mode is elaborate.
 
+4a) **Earliest delivery / fastest commit** (weights-only intent; only meaningful when mode is elaborate)
+    → method_selection: { "score_weights": { "commit_time": 1, "inventory_consumed": 0, "purchase": 0 } }.
+
+4b) **Prioritize existing inventory / use what we have / consume more stock**
+    → method_selection: { "score_weights": { "commit_time": 0, "inventory_consumed": 1, "purchase": 0 } }.
+
+4c) **Minimize new purchases / least additional supply / avoid new buy**
+    → method_selection: { "score_weights": { "commit_time": 0, "inventory_consumed": 0, "purchase": 1 } }.
+
 5) **Allow / enable / use / permit purchase (buy)** (e.g. "allow purchase", "enable buy", "可以使用采购", "允许采购", "启用采购", "开启采购")
    → purchase_allowed: true.
 
@@ -96,7 +105,7 @@ Intent → config mapping (interpret any phrasing that conveys the same intent):
     method_selection: { "multiple": false, "mode": "preference", "depth": 1 }, purchase_allowed: false, consolidation: { "enabled": true, "period_days": 365, "allocation_mode": "fair" }.
 
 Valid config_update keys:
-- method_selection: object with optional "multiple" (bool), "mode" ("preference" | "elaborate"), "depth" (int ≥ 1).
+- method_selection: object with optional "multiple" (bool), "mode" ("preference" | "elaborate"), "depth" (int ≥ 1), "score_weights" ({ commit_time, inventory_consumed, purchase } — numeric, backend normalizes).
 - purchase_allowed: boolean (top-level, not nested).
 - consolidation: object with optional "enabled" (bool), "period_days" (int 1..365), "allocation_mode" ("fair" | "proportional" | "priority_first").
 
@@ -145,7 +154,7 @@ private suspend fun llmParse(
         val ms = cu["method_selection"] as? JsonObject
         val cs = cu["consolidation"] as? JsonObject
         val pa = cu["purchase_allowed"]?.jsonPrimitive?.booleanOrNull
-        val msOk = ms?.let { "multiple" in it || "elaborate" in it || "mode" in it || "depth" in it } == true
+        val msOk = ms?.let { "multiple" in it || "elaborate" in it || "mode" in it || "depth" in it || "score_weights" in it } == true
         val csOk = cs?.let { "enabled" in it || "period_days" in it || "allocation_mode" in it } == true
         val paOk = pa != null
         if (msOk || csOk || paOk) cu else null
@@ -191,8 +200,25 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
         when {
             ms["multiple"]?.jsonPrimitive?.booleanOrNull == true ->
                 parts.add("method equal split (demand divided across all feasible methods)")
-            msElaborate ->
-                parts.add("elaborate method selection (depth $depth)")
+            msElaborate -> {
+                val sw = ms["score_weights"] as? JsonObject
+                val wc = sw?.get("commit_time")?.jsonPrimitive?.doubleOrNull
+                val wi = sw?.get("inventory_consumed")?.jsonPrimitive?.doubleOrNull
+                val wp = sw?.get("purchase")?.jsonPrimitive?.doubleOrNull
+                val label = when {
+                    wc != null && wi != null && wp != null -> {
+                        val weightDesc = when {
+                            wc > 0 && wi == 0.0 && wp == 0.0 -> ", earliest delivery"
+                            wi > 0 && wc == 0.0 && wp == 0.0 -> ", most inventory"
+                            wp > 0 && wc == 0.0 && wi == 0.0 -> ", least purchase"
+                            else -> ", weights commit=${"%.2f".format(wc)} inv=${"%.2f".format(wi)} purch=${"%.2f".format(wp)}"
+                        }
+                        "elaborate method selection (depth $depth$weightDesc)"
+                    }
+                    else -> "elaborate method selection (depth $depth)"
+                }
+                parts.add(label)
+            }
             else -> parts.add("method by preference (single best)")
         }
         parts.add(if (purchaseAllowed == false) "purchase disabled" else "purchase allowed")
@@ -225,6 +251,31 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
         val d = n.coerceAtLeast(1)
         return "Setting elaborate method depth to $d. Re-run plan to apply (depth only takes effect when method mode is elaborate)." to
             mergeMethodSelection(current, mapOf("depth" to JsonPrimitive(d)))
+    }
+
+    // ── Score weights (only applicable when elaborate mode is on) ──
+    fun scoreWeightsPatch(commit: Double, inv: Double, purchase: Double): JsonElement = JsonObject(mapOf(
+        "commit_time" to JsonPrimitive(commit),
+        "inventory_consumed" to JsonPrimitive(inv),
+        "purchase" to JsonPrimitive(purchase),
+    ))
+    if (Regex("earliest commit|earliest (delivery|fulfillment|time)|fastest|prefer.*earliest|commit time.*(earliest|first)|minim(ize|ise) (commit )?time").containsMatchIn(t) ||
+        Regex("最早交付|最快交付|最早提交").containsMatchIn(raw)
+    ) {
+        return "Weighting elaborate scoring toward earliest commit time (commit=1, inventory=0, purchase=0). Re-run plan to apply (takes effect when method mode is elaborate)." to
+            mergeMethodSelection(current, mapOf("score_weights" to scoreWeightsPatch(1.0, 0.0, 0.0)))
+    }
+    if (Regex("inventor(y|ies)|existing (stock|inventory|supply)|use (what we have|existing|current)|most (existing |current )?inventory|consume (more |existing )?inventory|prefer (existing |current )?stock").containsMatchIn(t) ||
+        Regex("优先(使用)?库存|消耗库存|现有库存").containsMatchIn(raw)
+    ) {
+        return "Weighting elaborate scoring toward most inventory consumed (commit=0, inventory=1, purchase=0). Re-run plan to apply (takes effect when method mode is elaborate)." to
+            mergeMethodSelection(current, mapOf("score_weights" to scoreWeightsPatch(0.0, 1.0, 0.0)))
+    }
+    if (Regex("minimum additional (supply|supplies)|minim(ize|ise) (additional |new )?(supply|supplies|purchase|buy)|least (additional |new )?(supply|supplies|purchase)|avoid (new )?purchase|avoid (new )?buy").containsMatchIn(t) ||
+        Regex("最少采购|减少采购|避免采购").containsMatchIn(raw)
+    ) {
+        return "Weighting elaborate scoring toward least purchase (commit=0, inventory=0, purchase=1). Re-run plan to apply (takes effect when method mode is elaborate)." to
+            mergeMethodSelection(current, mapOf("score_weights" to scoreWeightsPatch(0.0, 0.0, 1.0)))
     }
 
     // ── Equal split across methods ──
@@ -322,6 +373,11 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
                 put("multiple", false)
                 put("mode", "preference")
                 put("depth", 1)
+                put("score_weights", buildJsonObject {
+                    put("commit_time", 0.4)
+                    put("inventory_consumed", 0.35)
+                    put("purchase", 0.25)
+                })
             })
             put("purchase_allowed", false)
             put("consolidation", buildJsonObject {
