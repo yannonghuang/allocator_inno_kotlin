@@ -2,6 +2,7 @@ package com.allocator
 
 import com.allocator.services.resolveMethodSelection
 import com.allocator.services.resolveVariantSelection
+import com.allocator.services.shouldElaborateAtDepth
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.shouldBe
 
@@ -143,5 +144,36 @@ class PlanningEngineSelectionConfigTest : FunSpec({
         val cfg = resolveMethodSelection(mapOf("method_selection" to "not a map"))
         cfg.mode shouldBe "preference"
         cfg.depth shouldBe 1
+    }
+
+    // ── shouldElaborateAtDepth (runtime gate) ───────────────────────────────
+    //
+    // Engine depth counts down from MAX_PLAN_DEPTH (500) at root. Level k has
+    // depth == 500 - k. For N levels we want to cover levels 0..N-1, i.e.
+    // depth > 500 - N.
+
+    test("shouldElaborateAtDepth: levels=1 (default) covers root only") {
+        shouldElaborateAtDepth(depth = 500, levels = 1) shouldBe true
+        shouldElaborateAtDepth(depth = 499, levels = 1) shouldBe false
+        shouldElaborateAtDepth(depth = 0,   levels = 1) shouldBe false
+    }
+
+    test("shouldElaborateAtDepth: levels=2 covers root + one level down") {
+        shouldElaborateAtDepth(depth = 500, levels = 2) shouldBe true
+        shouldElaborateAtDepth(depth = 499, levels = 2) shouldBe true
+        shouldElaborateAtDepth(depth = 498, levels = 2) shouldBe false
+    }
+
+    test("shouldElaborateAtDepth: levels=5 covers levels 0..4") {
+        shouldElaborateAtDepth(depth = 500, levels = 5) shouldBe true
+        shouldElaborateAtDepth(depth = 496, levels = 5) shouldBe true
+        shouldElaborateAtDepth(depth = 495, levels = 5) shouldBe false
+    }
+
+    test("shouldElaborateAtDepth: levels<=0 is clamped to 1 (root-only)") {
+        shouldElaborateAtDepth(depth = 500, levels = 0)  shouldBe true
+        shouldElaborateAtDepth(depth = 499, levels = 0)  shouldBe false
+        shouldElaborateAtDepth(depth = 500, levels = -5) shouldBe true
+        shouldElaborateAtDepth(depth = 499, levels = -5) shouldBe false
     }
 })
