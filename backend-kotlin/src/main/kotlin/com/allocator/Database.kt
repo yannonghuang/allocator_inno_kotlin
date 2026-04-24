@@ -99,7 +99,7 @@ private fun createTables() {
         Demands, MethodBuys, MethodMakes, ProductLocations,
         Supplies, MethodMoves, AllocationRuns, AllocationActions,
         ManualOverrides, PlanRuns, MaterialEvents, MaterialImpactAssessments,
-        PlanSupplyAllocations, NegotiationWaits
+        PlanSupplyAllocations, NegotiationWaits, PlanRunEvents
     )
 }
 
@@ -213,6 +213,23 @@ private fun migrateSchema() {
         "ALTER TABLE plan_run ADD COLUMN IF NOT EXISTS superseded_by_plan_run_id INTEGER",
         "CREATE INDEX IF NOT EXISTS ix_plan_run_parent ON plan_run (parent_plan_run_id)",
         "CREATE INDEX IF NOT EXISTS ix_plan_run_superseded_by ON plan_run (superseded_by_plan_run_id)",
+        // User-designated active plan run (overrides default "latest success" resolver)
+        "ALTER TABLE cases ADD COLUMN IF NOT EXISTS designated_active_plan_run_id INTEGER",
+        """
+        DO ${'$'}${'$'}
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.table_constraints
+            WHERE constraint_name = 'fk_cases_designated_active_plan_run_id__id' AND table_name = 'cases'
+          ) THEN
+            ALTER TABLE cases ADD CONSTRAINT fk_cases_designated_active_plan_run_id__id
+              FOREIGN KEY (designated_active_plan_run_id) REFERENCES plan_run(id) ON DELETE SET NULL;
+          END IF;
+        END
+        ${'$'}${'$'};
+        """.trimIndent(),
+        "CREATE INDEX IF NOT EXISTS ix_plan_run_event_run ON plan_run_event (plan_run_id)",
+        "CREATE INDEX IF NOT EXISTS ix_plan_run_event_case ON plan_run_event (case_id)",
         // Fix FK constraints to use ON DELETE CASCADE (idempotent: drop if exists, re-add)
         *cascadeFkMigrations()
     )

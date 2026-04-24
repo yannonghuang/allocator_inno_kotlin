@@ -2,6 +2,7 @@ package com.allocator.api
 
 import com.allocator.*
 import com.allocator.services.CaseLoader
+import com.allocator.services.emitPlanRunEvent
 import com.allocator.services.runPlanning
 import io.ktor.http.*
 import io.ktor.server.application.*
@@ -425,6 +426,13 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
                         it[MaterialEvents.qtyDecreasePct] = req.quantityDecreasePct
                         it[MaterialEvents.note]           = "AI agent analysis (planRun=$planRunId)"
                     }
+                    emitPlanRunEvent(caseId, planRunId, "created", buildJsonObject {
+                        put("source", "material_impact")
+                        put("supply_id", JsonPrimitive(req.supplyId.trim()))
+                        put("baseline_plan_run_id", JsonPrimitive(baselinePlanRunId))
+                        if (req.negotiationRound != null) put("negotiation_round", JsonPrimitive(req.negotiationRound))
+                        if (req.parentPlanRunId != null) put("parent_plan_run_id", JsonPrimitive(req.parentPlanRunId))
+                    })
                     planRunId
                 }
             } else null
@@ -681,6 +689,10 @@ fun Routing.planRunRoutes() {
                     PlanRuns.update({ PlanRuns.id eq planRunId }) {
                         it[PlanRuns.status] = "success"
                     }
+                    emitPlanRunEvent(caseId, planRunId, "promoted", buildJsonObject {
+                        put("from_status", JsonPrimitive("contingent"))
+                        put("to_status", JsonPrimitive("success"))
+                    })
                 }
                 "success" -> { /* already promoted — idempotent, no-op */ }
                 else -> throw IllegalArgumentException(

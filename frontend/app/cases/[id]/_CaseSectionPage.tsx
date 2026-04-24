@@ -71,6 +71,9 @@ import {
   runAssessment,
   savePlanRun,
   updatePlanRun,
+  designateActivePlanRun,
+  clearDesignatedActivePlanRun,
+  type PlanRunEvent,
   type PlanSupplyAllocation,
 } from '@/lib/api';
 
@@ -715,6 +718,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [currentPlanRunId, setCurrentPlanRunId] = useState<number | null>(null);
   // DB run ID for the current fresh (unsaved) plan result; null once saved or when loading from history
   const [freshPlanRunId, setFreshPlanRunId] = useState<number | null>(null);
+  // Run ID loaded at the moment re-plan was dispatched — candidate target for "Save as override".
+  // Survives past freshPlanRunId's arrival (unlike currentPlanRunId, which gets cleared).
+  const [overrideCandidateRunId, setOverrideCandidateRunId] = useState<number | null>(null);
   const [planRunSaving, setPlanRunSaving] = useState(false);
   const [planRunSaveError, setPlanRunSaveError] = useState<string | null>(null);
   // Name/notes for the fresh unsaved run
@@ -803,6 +809,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planRunHistoryOpen, setPlanRunHistoryOpen] = useState(false);
   const [planRunHistoryLoading, setPlanRunHistoryLoading] = useState(false);
   const [planRunLoadingId, setPlanRunLoadingId] = useState<number | null>(null);
+  // Per-run expansion: which tab, plus lazy-loaded full detail (for overrides + events)
+  const [planRunExpandedTab, setPlanRunExpandedTab] = useState<Record<number, 'config' | 'overrides' | 'events' | null>>({});
+  const [planRunDetailCache, setPlanRunDetailCache] = useState<Record<number, PlanRunFull>>({});
+  const [planRunDetailLoading, setPlanRunDetailLoading] = useState<Record<number, boolean>>({});
+  const [planRunDesignating, setPlanRunDesignating] = useState<Record<number, boolean>>({});
 
   // ── Override dialog state ───────────────────────────────────────────────────
   const [overrideDialogOpen, setOverrideDialogOpen] = useState(false);
@@ -998,6 +1009,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               await savePlanRun(Number(id), freshId);
               setCurrentPlanRunId(freshId);
               setFreshPlanRunId(null);
+              setOverrideCandidateRunId(null);
             } catch {
               // Auto-save failed — leave as unsaved; user can save manually.
               setCurrentPlanRunId(null);
@@ -2256,6 +2268,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         setPlanResult(full.result as typeof planResult);
         setCurrentPlanRunId(runId);
         setFreshPlanRunId(null);
+        setOverrideCandidateRunId(null);
         setPlanRunSaveError(null);
         setPlanWorkOrderPeggingCache({});
         if (full.config) setPlanningConfig(full.config as PlanningConfig);
@@ -2274,6 +2287,50 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       setPlanRunHistory((prev) => prev.filter((r) => r.id !== runId));
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to delete plan run');
+    }
+  };
+
+  // ── Active-run designation: pin a specific run, or clear the pin to fall back
+  //    to the default resolver (latest successful run).
+  const handleDesignateActive = async (runId: number) => {
+    setPlanRunDesignating((prev) => ({ ...prev, [runId]: true }));
+    try {
+      await designateActivePlanRun(id, runId);
+      await loadPlanRunHistory();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to designate active plan run');
+    } finally {
+      setPlanRunDesignating((prev) => { const n = { ...prev }; delete n[runId]; return n; });
+    }
+  };
+  const handleUnpinActive = async (runId: number) => {
+    setPlanRunDesignating((prev) => ({ ...prev, [runId]: true }));
+    try {
+      await clearDesignatedActivePlanRun(id);
+      await loadPlanRunHistory();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to clear active designation');
+    } finally {
+      setPlanRunDesignating((prev) => { const n = { ...prev }; delete n[runId]; return n; });
+    }
+  };
+
+  // Toggle an expansion tab for a run. Lazy-fetches full detail (which carries
+  // override_snapshot + events) the first time any tab opens.
+  const handleTogglePlanRunTab = async (runId: number, tab: 'config' | 'overrides' | 'events') => {
+    const current = planRunExpandedTab[runId];
+    const next = current === tab ? null : tab;
+    setPlanRunExpandedTab((prev) => ({ ...prev, [runId]: next }));
+    if (next && (tab === 'overrides' || tab === 'events') && !planRunDetailCache[runId]) {
+      setPlanRunDetailLoading((prev) => ({ ...prev, [runId]: true }));
+      try {
+        const full = await getPlanRun(id, runId);
+        setPlanRunDetailCache((prev) => ({ ...prev, [runId]: full }));
+      } catch {
+        // Leave tab open; user can click again to retry.
+      } finally {
+        setPlanRunDetailLoading((prev) => { const n = { ...prev }; delete n[runId]; return n; });
+      }
     }
   };
 
@@ -3235,6 +3292,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               setAutoCriticalityPending(false);
               setSupplyCriticalityMap({});
               setCriticalityProgress(null);
+              // Capture the currently-loaded run as override candidate (only if it's a success run).
+              // Contingent runs are blocked from re-plan by the disabled guard, so currentPlanRunId
+              // here is always either null or a success run.
+              setOverrideCandidateRunId(currentPlanRunId);
               const config = Object.keys(planningConfig).length ? planningConfig : undefined;
               try {
                 const { job_id } = await runPlanAsync(id, config);
@@ -3295,33 +3356,96 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         {planError && <p style={{ color: '#f87171', marginTop: '0.5rem' }}>{planError}</p>}
         {planResult && !planLoading && (
           <>
+            {(() => {
+              // Loaded-in-memory indicator. Shown for every non-contingent, non-unsaved state
+              // (contingent and unsaved have their own banners below).
+              if (currentRunIsContingent) return null;
+              if (currentPlanRunId === null && freshPlanRunId !== null) return null;
+              const loadedRunId = currentPlanRunId ?? freshPlanRunId;
+              if (loadedRunId == null) return null;
+              const loadedRow = planRunHistory.find(r => r.id === loadedRunId);
+              const label = loadedRow?.name?.trim() || tP('runHistory.viewing.unnamed');
+              return (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#0f1f33', border: '1px solid #1d4ed8', borderRadius: 6, padding: '6px 12px', marginBottom: '0.75rem', fontSize: '0.82rem', color: '#bfdbfe' }}>
+                  <span style={{ fontWeight: 700, color: '#93c5fd' }}>{tP('runHistory.viewing.banner', { id: loadedRunId })}</span>
+                  <span style={{ color: '#cbd5e1' }}>— {label}</span>
+                  {loadedRow?.is_active && (
+                    <span title={loadedRow.is_active_designated ? tP('runHistory.chips.activeDesignatedTitle') : tP('runHistory.chips.activeLatestTitle')} style={{ background: '#14532d', color: '#bbf7d0', borderRadius: 8, padding: '1px 7px', fontSize: '0.7rem', fontWeight: 600 }}>
+                      {loadedRow.is_active_designated ? tP('runHistory.chips.activeDesignated') : tP('runHistory.chips.active')}
+                    </span>
+                  )}
+                  {loadedRow?.is_initial && (
+                    <span title={tP('runHistory.chips.initialTitle')} style={{ background: '#1e3a8a', color: '#bfdbfe', borderRadius: 8, padding: '1px 7px', fontSize: '0.7rem', fontWeight: 600 }}>
+                      {tP('runHistory.chips.initial')}
+                    </span>
+                  )}
+                </div>
+              );
+            })()}
             {currentRunIsContingent && (
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#2e1065', border: '1px solid #7c3aed', borderRadius: 6, padding: '6px 12px', marginBottom: '0.75rem', fontSize: '0.82rem', color: '#ddd6fe' }}>
-                <span style={{ fontWeight: 700, color: '#a78bfa' }}>Contingent run #{currentPlanRunId}</span>
-                <span>— what-if branch. Run a fresh plan to create a new baseline.</span>
+                <span style={{ fontWeight: 700, color: '#a78bfa' }}>{tP('runHistory.viewing.contingentBanner', { id: currentPlanRunId ?? 0 })}</span>
+                <span>{tP('runHistory.viewing.contingentNote')}</span>
               </div>
             )}
             {currentPlanRunId === null && freshPlanRunId !== null && (
               <div style={{ marginBottom: '0.75rem', padding: '0.6rem 0.75rem', background: '#1a2e1a', border: '1px solid #166534', borderRadius: 6 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: '0.5rem' }}>
-                  <span style={{ fontSize: '0.78rem', color: '#86efac', fontWeight: 600 }}>Unsaved</span>
-                  <span style={{ fontSize: '0.75rem', color: '#71717a' }}>— results are in memory only</span>
+                  <span style={{ fontSize: '0.78rem', color: '#86efac', fontWeight: 600 }}>{tP('runHistory.unsaved.title', { id: freshPlanRunId })}</span>
+                  <span style={{ fontSize: '0.75rem', color: '#71717a' }}>
+                    {tP('runHistory.unsaved.note')}
+                    {overrideCandidateRunId !== null && tP('runHistory.unsaved.reranOn', { id: overrideCandidateRunId })}
+                  </span>
                 </div>
                 <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start', flexWrap: 'wrap' }}>
                   <input
                     type="text"
-                    placeholder="Run name (optional)"
+                    placeholder={tP('runHistory.unsaved.namePlaceholder')}
                     value={freshRunName}
                     onChange={(e) => setFreshRunName(e.target.value)}
                     style={{ flex: '1 1 180px', minWidth: 0, padding: '4px 8px', background: '#27272a', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, fontSize: '0.82rem' }}
                   />
                   <input
                     type="text"
-                    placeholder="Notes (optional)"
+                    placeholder={tP('runHistory.unsaved.notesPlaceholder')}
                     value={freshRunNotes}
                     onChange={(e) => setFreshRunNotes(e.target.value)}
                     style={{ flex: '2 1 240px', minWidth: 0, padding: '4px 8px', background: '#27272a', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, fontSize: '0.82rem' }}
                   />
+                  {overrideCandidateRunId !== null && (
+                    <button
+                      type="button"
+                      disabled={planRunSaving}
+                      title={tP('runHistory.unsaved.saveOverrideTitle', { id: overrideCandidateRunId })}
+                      onClick={async () => {
+                        if (!freshPlanRunId || !id || overrideCandidateRunId == null) return;
+                        setPlanRunSaving(true);
+                        setPlanRunSaveError(null);
+                        try {
+                          await savePlanRun(id, freshPlanRunId, {
+                            name: freshRunName.trim() || undefined,
+                            notes: freshRunNotes.trim() || undefined,
+                            mode: 'override',
+                            target_run_id: overrideCandidateRunId,
+                          });
+                          setCurrentPlanRunId(overrideCandidateRunId);
+                          setFreshPlanRunId(null);
+                          setOverrideCandidateRunId(null);
+                          setFreshRunName('');
+                          setFreshRunNotes('');
+                          const runs = await listPlanRuns(id);
+                          setPlanRunHistory(runs);
+                        } catch (e) {
+                          setPlanRunSaveError(e instanceof Error ? e.message : 'Save failed');
+                        } finally {
+                          setPlanRunSaving(false);
+                        }
+                      }}
+                      style={{ padding: '5px 14px', background: '#2563eb', color: '#fff', border: 'none', borderRadius: 6, cursor: planRunSaving ? 'wait' : 'pointer', fontWeight: 600, fontSize: '0.82rem', whiteSpace: 'nowrap' }}
+                    >
+                      {planRunSaving ? tP('runHistory.unsaved.saving') : tP('runHistory.unsaved.saveOverride', { id: overrideCandidateRunId })}
+                    </button>
+                  )}
                   <button
                     type="button"
                     disabled={planRunSaving}
@@ -3336,6 +3460,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         });
                         setCurrentPlanRunId(freshPlanRunId);
                         setFreshPlanRunId(null);
+                        setOverrideCandidateRunId(null);
                         setFreshRunName('');
                         setFreshRunNotes('');
                         const runs = await listPlanRuns(id);
@@ -3348,7 +3473,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     }}
                     style={{ padding: '5px 14px', background: '#16a34a', color: '#fff', border: 'none', borderRadius: 6, cursor: planRunSaving ? 'wait' : 'pointer', fontWeight: 600, fontSize: '0.82rem', whiteSpace: 'nowrap' }}
                   >
-                    {planRunSaving ? 'Saving…' : 'Save run'}
+                    {planRunSaving ? tP('runHistory.unsaved.saving') : (overrideCandidateRunId !== null ? tP('runHistory.unsaved.saveAsNew') : tP('runHistory.unsaved.saveRun'))}
                   </button>
                 </div>
                 {planRunSaveError && <p style={{ margin: '0.4rem 0 0', fontSize: '0.75rem', color: '#f87171' }}>{planRunSaveError}</p>}
@@ -5261,32 +5386,67 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: 6, cursor: 'col-resize', zIndex: 11 }}
             />
             <div style={{ padding: '1rem 1.25rem', borderBottom: '1px solid #3d3d40', flexShrink: 0, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <h3 style={{ margin: 0, fontSize: '1rem' }}>Plan run history</h3>
-              <button type="button" onClick={() => setPlanRunHistoryOpen(false)} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
+              <h3 style={{ margin: 0, fontSize: '1rem' }}>{tP('runHistory.panelTitle')}</h3>
+              <button type="button" onClick={() => setPlanRunHistoryOpen(false)} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tP('runHistory.close')}</button>
             </div>
             <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
-              {planRunHistoryLoading && <p style={{ color: '#71717a' }}>Loading…</p>}
-              {!planRunHistoryLoading && planRunHistory.length === 0 && <p style={{ color: '#71717a' }}>No persisted plan runs found. Run a plan with async mode to persist results.</p>}
+              {planRunHistoryLoading && <p style={{ color: '#71717a' }}>{tP('runHistory.loading')}</p>}
+              {!planRunHistoryLoading && planRunHistory.length === 0 && <p style={{ color: '#71717a' }}>{tP('runHistory.empty')}</p>}
               {!planRunHistoryLoading && planRunHistory.map((run) => {
                 const editing = planRunEditing[run.id];
                 const isSavingEdit = !!planRunEditSaving[run.id];
+                const isActive = run.is_active === true;
+                const isInitial = run.is_initial === true;
+                const isDesignated = run.is_active_designated === true;
+                const isDesignating = !!planRunDesignating[run.id];
+                // Left border: green for active, blue for initial, transparent otherwise.
+                // Active wins when a run is both (we still show both chips).
+                const accent = isActive ? '#4ade80' : isInitial ? '#60a5fa' : 'transparent';
+                const expandedTab = planRunExpandedTab[run.id] ?? null;
+                const detail = planRunDetailCache[run.id];
+                const detailLoading = !!planRunDetailLoading[run.id];
                 return (
-                <div key={run.id} style={{ borderBottom: '1px solid #27272a', paddingBottom: '0.75rem', marginBottom: '0.75rem' }}>
+                <div key={run.id} style={{
+                  borderBottom: '1px solid #27272a',
+                  borderLeft: `3px solid ${accent}`,
+                  paddingLeft: '0.75rem',
+                  paddingBottom: '0.75rem',
+                  marginBottom: '0.75rem',
+                  background: isActive ? 'rgba(74,222,128,0.04)' : isInitial ? 'rgba(96,165,250,0.04)' : 'transparent',
+                }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                    <div>
+                    <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
                       <span style={{ fontSize: '0.85rem', fontWeight: 600, color: run.status === 'success' ? '#4ade80' : run.status === 'failed' ? '#f87171' : run.status === 'contingent' ? '#a78bfa' : '#fbbf24' }}>
                         {run.status}
                       </span>
-                      <span style={{ marginLeft: 8, fontSize: '0.8rem', color: '#a1a1aa' }}>
+                      {run.id === currentPlanRunId && (
+                        <span title={tP('runHistory.chips.viewingTitle')} style={{ background: '#1e40af', color: '#dbeafe', borderRadius: 8, padding: '1px 7px', fontSize: '0.7rem', fontWeight: 600 }}>
+                          {tP('runHistory.chips.viewing')}
+                        </span>
+                      )}
+                      {isInitial && (
+                        <span title={tP('runHistory.chips.initialTitle')} style={{ background: '#1e3a8a', color: '#bfdbfe', borderRadius: 8, padding: '1px 7px', fontSize: '0.7rem', fontWeight: 600 }}>
+                          {tP('runHistory.chips.initial')}
+                        </span>
+                      )}
+                      {isActive && (
+                        <span
+                          title={isDesignated ? tP('runHistory.chips.activeDesignatedTitle') : tP('runHistory.chips.activeLatestTitle')}
+                          style={{ background: '#14532d', color: '#bbf7d0', borderRadius: 8, padding: '1px 7px', fontSize: '0.7rem', fontWeight: 600 }}
+                        >
+                          {isDesignated ? tP('runHistory.chips.activeDesignated') : tP('runHistory.chips.active')}
+                        </span>
+                      )}
+                      <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>
                         {new Date(run.created_at).toLocaleString()}
                       </span>
                       {run.override_count > 0 && (
-                        <span style={{ marginLeft: 8, background: '#7c3aed', color: '#fff', borderRadius: 8, padding: '1px 6px', fontSize: '0.72rem' }}>
-                          {run.override_count} override{run.override_count !== 1 ? 's' : ''}
+                        <span style={{ background: '#7c3aed', color: '#fff', borderRadius: 8, padding: '1px 6px', fontSize: '0.72rem' }}>
+                          {tP('runHistory.overrideCount', { n: run.override_count })}
                         </span>
                       )}
                     </div>
-                    <div style={{ display: 'flex', gap: 6 }}>
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                       {(run.status === 'success' || run.status === 'contingent') && (
                         <button
                           type="button"
@@ -5295,7 +5455,33 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           disabled={planRunLoadingId === run.id}
                           onClick={() => handleRestorePlanRun(run.id)}
                         >
-                          {planRunLoadingId === run.id ? 'Loading…' : 'Load'}
+                          {planRunLoadingId === run.id ? tP('runHistory.actions.loading') : tP('runHistory.load')}
+                        </button>
+                      )}
+                      {/* Set active: only for successful runs that aren't already active */}
+                      {run.status === 'success' && !isActive && (
+                        <button
+                          type="button"
+                          className="secondary"
+                          style={{ fontSize: '0.8rem', padding: '3px 10px' }}
+                          disabled={isDesignating}
+                          onClick={() => handleDesignateActive(run.id)}
+                          title={tP('runHistory.actions.setActiveTitle')}
+                        >
+                          {isDesignating ? tP('runHistory.actions.working') : tP('runHistory.actions.setActive')}
+                        </button>
+                      )}
+                      {/* Unpin: only when this run is the pinned (designated) active */}
+                      {isDesignated && (
+                        <button
+                          type="button"
+                          className="secondary"
+                          style={{ fontSize: '0.8rem', padding: '3px 10px' }}
+                          disabled={isDesignating}
+                          onClick={() => handleUnpinActive(run.id)}
+                          title={tP('runHistory.actions.unpinTitle')}
+                        >
+                          {isDesignating ? tP('runHistory.actions.working') : tP('runHistory.actions.unpin')}
                         </button>
                       )}
                       {!editing && (
@@ -5305,7 +5491,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           style={{ fontSize: '0.8rem', padding: '3px 10px' }}
                           onClick={() => setPlanRunEditing((prev) => ({ ...prev, [run.id]: { name: run.name ?? '', notes: run.notes ?? '' } }))}
                         >
-                          Edit
+                          {tP('runHistory.edit')}
                         </button>
                       )}
                       <button
@@ -5314,7 +5500,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         style={{ fontSize: '0.8rem', padding: '3px 10px', color: '#f87171', borderColor: '#f87171' }}
                         onClick={() => handleDeletePlanRun(run.id)}
                       >
-                        Delete
+                        {tP('runHistory.delete')}
                       </button>
                     </div>
                   </div>
@@ -5323,13 +5509,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     <div style={{ marginTop: '0.5rem', display: 'flex', flexDirection: 'column', gap: 6 }}>
                       <input
                         type="text"
-                        placeholder="Name (optional)"
+                        placeholder={tP('runHistory.namePlaceholder')}
                         value={editing.name}
                         onChange={(e) => setPlanRunEditing((prev) => ({ ...prev, [run.id]: { ...prev[run.id], name: e.target.value } }))}
                         style={{ padding: '4px 8px', background: '#27272a', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, fontSize: '0.82rem' }}
                       />
                       <textarea
-                        placeholder="Notes (optional)"
+                        placeholder={tP('runHistory.notesPlaceholder')}
                         value={editing.notes}
                         rows={2}
                         onChange={(e) => setPlanRunEditing((prev) => ({ ...prev, [run.id]: { ...prev[run.id], notes: e.target.value } }))}
@@ -5354,14 +5540,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           }}
                           style={{ padding: '3px 10px', background: '#3b82f6', color: '#fff', border: 'none', borderRadius: 4, fontSize: '0.8rem', cursor: isSavingEdit ? 'wait' : 'pointer' }}
                         >
-                          {isSavingEdit ? 'Saving…' : 'Save'}
+                          {isSavingEdit ? tP('runHistory.saving') : tP('runHistory.save')}
                         </button>
                         <button
                           type="button"
                           onClick={() => setPlanRunEditing((prev) => { const n = { ...prev }; delete n[run.id]; return n; })}
                           style={{ padding: '3px 10px', background: 'transparent', color: '#a1a1aa', border: '1px solid #3d3d40', borderRadius: 4, fontSize: '0.8rem', cursor: 'pointer' }}
                         >
-                          Cancel
+                          {tP('runHistory.cancel')}
                         </button>
                       </div>
                     </div>
@@ -5371,15 +5557,105 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       {run.notes && <p style={{ margin: '0.15rem 0 0', fontSize: '0.78rem', color: '#a1a1aa', whiteSpace: 'pre-wrap' }}>{run.notes}</p>}
                     </div>
                   ) : null}
-                  <div style={{ fontSize: '0.75rem', color: '#71717a', marginTop: '0.25rem' }}>
-                    Run #{run.id}{run.job_id ? ` · job ${run.job_id.slice(0, 8)}…` : ''}
-                    {run.config && Object.keys(run.config).length > 0 && (
-                      <details style={{ display: 'inline-block', marginLeft: 8 }}>
-                        <summary style={{ cursor: 'pointer' }}>config</summary>
-                        <pre style={{ margin: '0.25rem 0', fontSize: '0.7rem', color: '#a1a1aa', whiteSpace: 'pre-wrap' }}>{JSON.stringify(run.config, null, 2)}</pre>
-                      </details>
-                    )}
+                  <div style={{ fontSize: '0.75rem', color: '#71717a', marginTop: '0.35rem' }}>
+                    {tP('runHistory.runLabel', { id: run.id })}{run.job_id ? tP('runHistory.jobSuffix', { job: run.job_id.slice(0, 8) }) : ''}
                   </div>
+                  {/* Tabbed expansion: Config / Overrides / Events */}
+                  <div style={{ marginTop: '0.4rem', display: 'flex', gap: 4 }}>
+                    {(['config', 'overrides', 'events'] as const).map((tab) => {
+                      const open = expandedTab === tab;
+                      const label = tab === 'config' ? tP('runHistory.tabs.config')
+                        : tab === 'overrides' ? (run.override_count ? tP('runHistory.tabs.overridesWithCount', { count: run.override_count }) : tP('runHistory.tabs.overrides'))
+                        : tP('runHistory.tabs.events');
+                      return (
+                        <button
+                          key={tab}
+                          type="button"
+                          onClick={() => handleTogglePlanRunTab(run.id, tab)}
+                          style={{
+                            fontSize: '0.72rem',
+                            padding: '2px 8px',
+                            background: open ? '#3d3d40' : 'transparent',
+                            color: open ? '#e4e4e7' : '#a1a1aa',
+                            border: '1px solid #3d3d40',
+                            borderRadius: 4,
+                            cursor: 'pointer',
+                          }}
+                        >
+                          {label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {expandedTab === 'config' && (
+                    run.config && Object.keys(run.config).length > 0 ? (
+                      <pre style={{ margin: '0.4rem 0 0', fontSize: '0.7rem', color: '#a1a1aa', whiteSpace: 'pre-wrap', background: '#111113', padding: '0.5rem', borderRadius: 4 }}>{JSON.stringify(run.config, null, 2)}</pre>
+                    ) : (
+                      <p style={{ margin: '0.4rem 0 0', fontSize: '0.72rem', color: '#71717a' }}>{tP('runHistory.details.noConfig')}</p>
+                    )
+                  )}
+                  {expandedTab === 'overrides' && (
+                    detailLoading ? (
+                      <p style={{ margin: '0.4rem 0 0', fontSize: '0.72rem', color: '#71717a' }}>{tP('runHistory.loading')}</p>
+                    ) : (() => {
+                      const snap = detail?.override_snapshot ?? null;
+                      if (!snap || snap.length === 0) return <p style={{ margin: '0.4rem 0 0', fontSize: '0.72rem', color: '#71717a' }}>{tP('runHistory.details.noOverrides')}</p>;
+                      return (
+                        <div style={{ marginTop: '0.4rem', background: '#111113', padding: '0.5rem', borderRadius: 4, overflowX: 'auto' }}>
+                          <table style={{ width: '100%', fontSize: '0.7rem', color: '#a1a1aa', borderCollapse: 'collapse' }}>
+                            <thead>
+                              <tr style={{ textAlign: 'left', borderBottom: '1px solid #3d3d40' }}>
+                                <th style={{ padding: '2px 6px' }}>{tP('runHistory.details.overrideHeaderType')}</th>
+                                <th style={{ padding: '2px 6px' }}>{tP('runHistory.details.overrideHeaderKey')}</th>
+                                <th style={{ padding: '2px 6px' }}>{tP('runHistory.details.overrideHeaderPayload')}</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {snap.map((o) => (
+                                <tr key={o.id} style={{ borderBottom: '1px solid #1f1f22' }}>
+                                  <td style={{ padding: '2px 6px', whiteSpace: 'nowrap' }}>{o.entity_type}</td>
+                                  <td style={{ padding: '2px 6px', whiteSpace: 'nowrap' }}>{o.entity_key}</td>
+                                  <td style={{ padding: '2px 6px', fontFamily: 'monospace', fontSize: '0.68rem' }}>{JSON.stringify(o.payload)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      );
+                    })()
+                  )}
+                  {expandedTab === 'events' && (
+                    detailLoading ? (
+                      <p style={{ margin: '0.4rem 0 0', fontSize: '0.72rem', color: '#71717a' }}>{tP('runHistory.loading')}</p>
+                    ) : (() => {
+                      const events: PlanRunEvent[] = detail?.events ?? [];
+                      if (events.length === 0) return <p style={{ margin: '0.4rem 0 0', fontSize: '0.72rem', color: '#71717a' }}>{tP('runHistory.details.noEvents')}</p>;
+                      const kindLabel = (k: string) =>
+                        k === 'created' ? tP('runHistory.events.created')
+                        : k === 'saved' ? tP('runHistory.events.saved')
+                        : k === 'renamed' ? tP('runHistory.events.renamed')
+                        : k === 'promoted' ? tP('runHistory.events.promoted')
+                        : k === 'designated_active' ? tP('runHistory.events.designatedActive')
+                        : k === 'undesignated' ? tP('runHistory.events.undesignated')
+                        : k === 'overridden' ? tP('runHistory.events.overridden')
+                        : k;
+                      return (
+                        <ol style={{ margin: '0.4rem 0 0', padding: 0, listStyle: 'none' }}>
+                          {events.map((ev) => (
+                            <li key={ev.id} style={{ fontSize: '0.72rem', color: '#a1a1aa', padding: '2px 0', borderLeft: '2px solid #3d3d40', paddingLeft: 8, marginLeft: 2 }}>
+                              <span style={{ color: '#e4e4e7', fontWeight: 500 }}>{kindLabel(ev.kind)}</span>
+                              <span style={{ marginLeft: 6, color: '#71717a' }}>{new Date(ev.created_at).toLocaleString()}</span>
+                              {ev.payload && Object.keys(ev.payload).length > 0 && (
+                                <div style={{ marginTop: 2, fontFamily: 'monospace', fontSize: '0.68rem', color: '#6b7280' }}>
+                                  {JSON.stringify(ev.payload)}
+                                </div>
+                              )}
+                            </li>
+                          ))}
+                        </ol>
+                      );
+                    })()
+                  )}
                 </div>
                 );
               })}

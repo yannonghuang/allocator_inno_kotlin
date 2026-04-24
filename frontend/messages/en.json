@@ -474,9 +474,81 @@
     },
     "runHistory": {
       "title": "Run history",
+      "panelTitle": "Plan run history",
+      "close": "Close",
       "load": "Load",
       "loading": "Loading…",
       "delete": "Delete",
+      "edit": "Edit",
+      "save": "Save",
+      "saving": "Saving…",
+      "cancel": "Cancel",
+      "empty": "No persisted plan runs found. Run a plan with async mode to persist results.",
+      "runLabel": "Run #{id}",
+      "jobSuffix": " · job {job}…",
+      "overrideCount": "{n, plural, one {# override} other {# overrides}}",
+      "namePlaceholder": "Name (optional)",
+      "notesPlaceholder": "Notes (optional)",
+      "chips": {
+        "viewing": "👁 Viewing",
+        "viewingTitle": "This run's result is currently loaded in memory",
+        "initial": "Initial",
+        "initialTitle": "First baseline run for this case",
+        "active": "Active",
+        "activeDesignated": "📌 Active",
+        "activeDesignatedTitle": "Pinned by user as the active run",
+        "activeLatestTitle": "Latest successful run (default active)"
+      },
+      "actions": {
+        "loading": "Loading…",
+        "setActive": "Set active",
+        "setActiveTitle": "Pin this run as the case's active plan run",
+        "unpin": "Unpin",
+        "unpinTitle": "Clear the pin — active will fall back to the latest successful run",
+        "working": "…"
+      },
+      "tabs": {
+        "config": "Config",
+        "overrides": "Overrides",
+        "overridesWithCount": "Overrides ({count})",
+        "events": "Events"
+      },
+      "details": {
+        "noConfig": "No config recorded.",
+        "noOverrides": "No overrides were active when this run started.",
+        "noEvents": "No events recorded.",
+        "overrideHeaderType": "type",
+        "overrideHeaderKey": "key",
+        "overrideHeaderPayload": "payload"
+      },
+      "events": {
+        "created": "Created",
+        "saved": "Saved",
+        "renamed": "Renamed",
+        "promoted": "Promoted",
+        "designatedActive": "Pinned as active",
+        "undesignated": "Unpinned",
+        "overridden": "Overridden"
+      },
+      "viewing": {
+        "banner": "👁 Viewing run #{id}",
+        "contingentBanner": "👁 Contingent run #{id}",
+        "contingentNote": "— what-if branch. Run a fresh plan to create a new baseline.",
+        "unnamed": "(unnamed)"
+      },
+      "unsaved": {
+        "title": "👁 Viewing unsaved run #{id}",
+        "note": "— results are in memory only",
+        "reranOn": " (re-ran on top of run #{id})",
+        "namePlaceholder": "Run name (optional)",
+        "notesPlaceholder": "Notes (optional)",
+        "saveRun": "Save run",
+        "saveAsNew": "Save as new",
+        "saveOverride": "Save (override #{id})",
+        "saveOverrideTitle": "Replace run #{id}'s result/config/overrides in place; id, name, notes, and chain metadata stay intact.",
+        "saving": "Saving…",
+        "saveFailed": "Save failed"
+      },
       "errors": {
         "loadFailed": "Failed to load plan run",
         "deleteFailed": "Failed to delete plan run"

@@ -95,8 +95,20 @@ data class PlanRunResponse(
     val status: String,
     val config: JsonElement? = null,
     @SerialName("override_count") val overrideCount: Int = 0,
+    @SerialName("override_snapshot_preview") val overrideSnapshotPreview: JsonElement? = null,
     val name: String? = null,
     val notes: String? = null,
+    @SerialName("is_initial") val isInitial: Boolean = false,
+    @SerialName("is_active") val isActive: Boolean = false,
+    @SerialName("is_active_designated") val isActiveDesignated: Boolean = false,
+    @SerialName("created_at") val createdAt: String,
+)
+
+@Serializable
+data class PlanRunEventDto(
+    val id: Int,
+    val kind: String,
+    val payload: JsonElement? = null,
     @SerialName("created_at") val createdAt: String,
 )
 
@@ -112,6 +124,10 @@ data class PlanRunFullResponse(
     val error: String? = null,
     val name: String? = null,
     val notes: String? = null,
+    @SerialName("is_initial") val isInitial: Boolean = false,
+    @SerialName("is_active") val isActive: Boolean = false,
+    @SerialName("is_active_designated") val isActiveDesignated: Boolean = false,
+    val events: List<PlanRunEventDto> = emptyList(),
     @SerialName("created_at") val createdAt: String,)
 
 @Serializable

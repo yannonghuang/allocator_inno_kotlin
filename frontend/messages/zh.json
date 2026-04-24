@@ -474,9 +474,81 @@
     },
     "runHistory": {
       "title": "运行历史",
+      "panelTitle": "计划运行历史",
+      "close": "关闭",
       "load": "加载",
       "loading": "加载中…",
       "delete": "删除",
+      "edit": "编辑",
+      "save": "保存",
+      "saving": "保存中…",
+      "cancel": "取消",
+      "empty": "未找到已持久化的计划运行。使用异步模式运行计划以持久化结果。",
+      "runLabel": "运行 #{id}",
+      "jobSuffix": " · 任务 {job}…",
+      "overrideCount": "{n} 条覆盖",
+      "namePlaceholder": "名称（可选）",
+      "notesPlaceholder": "备注（可选）",
+      "chips": {
+        "viewing": "👁 正在查看",
+        "viewingTitle": "此运行的结果当前已加载到内存",
+        "initial": "初始",
+        "initialTitle": "该案例的首次基线运行",
+        "active": "当前",
+        "activeDesignated": "📌 当前",
+        "activeDesignatedTitle": "由用户固定为当前运行",
+        "activeLatestTitle": "最新成功的运行（默认当前）"
+      },
+      "actions": {
+        "loading": "加载中…",
+        "setActive": "设为当前",
+        "setActiveTitle": "将此运行固定为案例的当前计划运行",
+        "unpin": "取消固定",
+        "unpinTitle": "清除固定 — 当前将回退到最新的成功运行",
+        "working": "…"
+      },
+      "tabs": {
+        "config": "配置",
+        "overrides": "覆盖",
+        "overridesWithCount": "覆盖 ({count})",
+        "events": "事件"
+      },
+      "details": {
+        "noConfig": "未记录配置。",
+        "noOverrides": "此运行启动时没有活动的覆盖。",
+        "noEvents": "未记录事件。",
+        "overrideHeaderType": "类型",
+        "overrideHeaderKey": "键",
+        "overrideHeaderPayload": "数据"
+      },
+      "events": {
+        "created": "已创建",
+        "saved": "已保存",
+        "renamed": "已重命名",
+        "promoted": "已提升",
+        "designatedActive": "已固定为当前",
+        "undesignated": "已取消固定",
+        "overridden": "已覆盖"
+      },
+      "viewing": {
+        "banner": "👁 正在查看运行 #{id}",
+        "contingentBanner": "👁 应急运行 #{id}",
+        "contingentNote": " — 假设分支。请运行新计划以创建新的基线。",
+        "unnamed": "（未命名）"
+      },
+      "unsaved": {
+        "title": "👁 正在查看未保存的运行 #{id}",
+        "note": " — 结果仅在内存中",
+        "reranOn": "（在运行 #{id} 之上重新运行）",
+        "namePlaceholder": "运行名称（可选）",
+        "notesPlaceholder": "备注（可选）",
+        "saveRun": "保存运行",
+        "saveAsNew": "另存为新运行",
+        "saveOverride": "保存（覆盖 #{id}）",
+        "saveOverrideTitle": "就地替换运行 #{id} 的结果/配置/覆盖；id、名称、备注和链路元数据保持不变。",
+        "saving": "保存中…",
+        "saveFailed": "保存失败"
+      },
       "errors": {
         "loadFailed": "加载计划运行失败",
         "deleteFailed": "删除计划运行失败"

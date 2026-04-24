@@ -15,6 +15,9 @@ object Cases : Table("cases") {
     val name = varchar("name", 255)
     val createdAt = timestamp("created_at").defaultExpression(CurrentTimestamp)
     val assessmentCriteria = text("assessment_criteria").nullable()
+    // User-pinned active plan run; null => resolver falls back to latest success.
+    // ON DELETE SET NULL so deleting the pinned run reverts the case to the default resolver.
+    val designatedActivePlanRunId = integer("designated_active_plan_run_id").nullable()
     override val primaryKey = PrimaryKey(id)
 }
 
@@ -249,5 +252,21 @@ object NegotiationWaits : Table("negotiation_wait") {
     val createdAt             = timestamp("created_at").defaultExpression(CurrentTimestamp)
     val resolvedAt            = timestamp("resolved_at").nullable()
     val resolvedAction        = varchar("resolved_action", 16).nullable()  // keep | abandon | counter | superseded (historical rows may contain "accept")
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
+ * Append-only lifecycle log for a plan run. Each mutation emits a row.
+ * Event kinds: "created" | "saved" | "renamed" | "promoted" | "designated_active" | "undesignated".
+ * payload is a kind-specific JSON blob (e.g., {"old_name": "...", "new_name": "..."}).
+ * Cascades with the run — deleting a run discards its history.
+ */
+object PlanRunEvents : Table("plan_run_event") {
+    val id          = integer("id").autoIncrement()
+    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val planRunId   = integer("plan_run_id").references(PlanRuns.id, onDelete = ReferenceOption.CASCADE)
+    val kind        = varchar("kind", 32)
+    val payload     = text("payload").nullable()
+    val createdAt   = timestamp("created_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 }
