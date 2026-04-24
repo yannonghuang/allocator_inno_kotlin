@@ -295,6 +295,8 @@ export type PlanningConfig = {
     multiple?: boolean;
     /** Relative weights for elaborate scoring. Backend normalizes so absolute values don't matter. */
     score_weights?: { commit_time?: number; inventory_consumed?: number; purchase?: number };
+    /** When true, backend iterates depth=1..N picking the first non-improving step (using score_weights). */
+    depth_optimal?: boolean;
   };
   /** When false, the buy/purchase method is excluded from planning. Default: true. */
   purchase_allowed?: boolean;
@@ -460,6 +462,9 @@ export type PlanRun = {
   is_active?: boolean;
   is_active_designated?: boolean;
   created_at: string;
+  finished_at?: string | null;
+  duration_ms?: number | null;
+  chosen_depth?: number | null;
 };
 
 export type PlanRunEvent = {

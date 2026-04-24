@@ -68,6 +68,12 @@ Intent → config mapping (interpret any phrasing that conveys the same intent):
 4) **Set the elaborate search depth to N** (e.g. "method depth 3", "search depth 2", "方法深度 3", "深度 2")
    → method_selection: { "depth": N } (clamp N ≥ 1). Only meaningful when mode is elaborate.
 
+4d) **Optimal / auto depth — let the planner pick the best depth** (e.g. "optimal depth", "auto depth", "find best depth", "自动深度", "最优深度")
+    → method_selection: { "mode": "elaborate", "depth_optimal": true }. Planner iterates depth=1,2,3… and stops at the first depth where the weighted plan score does not improve. Capped at 10. Re-run plan to apply.
+
+4e) **Manual / fixed depth — disable auto-depth** (e.g. "fixed depth", "manual depth", "固定深度")
+    → method_selection: { "depth_optimal": false }.
+
 4a) **Earliest delivery / fastest commit** (weights-only intent; only meaningful when mode is elaborate)
     → method_selection: { "score_weights": { "commit_time": 1, "inventory_consumed": 0, "purchase": 0 } }.
 
@@ -105,7 +111,7 @@ Intent → config mapping (interpret any phrasing that conveys the same intent):
     method_selection: { "multiple": false, "mode": "preference", "depth": 1 }, purchase_allowed: false, consolidation: { "enabled": true, "period_days": 365, "allocation_mode": "fair" }.
 
 Valid config_update keys:
-- method_selection: object with optional "multiple" (bool), "mode" ("preference" | "elaborate"), "depth" (int ≥ 1), "score_weights" ({ commit_time, inventory_consumed, purchase } — numeric, backend normalizes).
+- method_selection: object with optional "multiple" (bool), "mode" ("preference" | "elaborate"), "depth" (int ≥ 1), "depth_optimal" (bool), "score_weights" ({ commit_time, inventory_consumed, purchase } — numeric, backend normalizes).
 - purchase_allowed: boolean (top-level, not nested).
 - consolidation: object with optional "enabled" (bool), "period_days" (int 1..365), "allocation_mode" ("fair" | "proportional" | "priority_first").
 
@@ -154,7 +160,7 @@ private suspend fun llmParse(
         val ms = cu["method_selection"] as? JsonObject
         val cs = cu["consolidation"] as? JsonObject
         val pa = cu["purchase_allowed"]?.jsonPrimitive?.booleanOrNull
-        val msOk = ms?.let { "multiple" in it || "elaborate" in it || "mode" in it || "depth" in it || "score_weights" in it } == true
+        val msOk = ms?.let { "multiple" in it || "elaborate" in it || "mode" in it || "depth" in it || "depth_optimal" in it || "score_weights" in it } == true
         val csOk = cs?.let { "enabled" in it || "period_days" in it || "allocation_mode" in it } == true
         val paOk = pa != null
         if (msOk || csOk || paOk) cu else null
@@ -205,6 +211,8 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
                 val wc = sw?.get("commit_time")?.jsonPrimitive?.doubleOrNull
                 val wi = sw?.get("inventory_consumed")?.jsonPrimitive?.doubleOrNull
                 val wp = sw?.get("purchase")?.jsonPrimitive?.doubleOrNull
+                val depthOptimal = ms["depth_optimal"]?.jsonPrimitive?.booleanOrNull == true
+                val depthLabel = if (depthOptimal) "auto-depth (optimal search)" else "depth $depth"
                 val label = when {
                     wc != null && wi != null && wp != null -> {
                         val weightDesc = when {
@@ -213,9 +221,9 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
                             wp > 0 && wc == 0.0 && wi == 0.0 -> ", least purchase"
                             else -> ", weights commit=${"%.2f".format(wc)} inv=${"%.2f".format(wi)} purch=${"%.2f".format(wp)}"
                         }
-                        "elaborate method selection (depth $depth$weightDesc)"
+                        "elaborate method selection ($depthLabel$weightDesc)"
                     }
-                    else -> "elaborate method selection (depth $depth)"
+                    else -> "elaborate method selection ($depthLabel)"
                 }
                 parts.add(label)
             }
@@ -241,6 +249,20 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
             ) to null
     }
 
+    // ── Optimal depth search (auto-pick depth) ──
+    if (Regex("optimal depth|auto depth|auto-depth|best depth|find depth|search depth").containsMatchIn(t) ||
+        Regex("自动深度|最优深度|最佳深度").containsMatchIn(raw)
+    ) {
+        return "Enabling optimal depth search: planner will iterate depth=1, 2, 3 … and stop at the first depth where the weighted plan score does not improve. Capped at 10. Re-run plan to apply." to
+            mergeMethodSelection(current, mapOf("mode" to JsonPrimitive("elaborate"), "depth_optimal" to JsonPrimitive(true)))
+    }
+    if (Regex("manual depth|fixed depth|disable optimal depth|disable auto[- ]depth|turn off auto[- ]depth").containsMatchIn(t) ||
+        Regex("固定深度|手动深度|关闭自动深度|关闭最优深度").containsMatchIn(raw)
+    ) {
+        return "Disabling optimal depth search. Planner will use the fixed depth value." to
+            mergeMethodSelection(current, mapOf("depth_optimal" to JsonPrimitive(false)))
+    }
+
     // ── Method depth (e.g. "method depth 3", "depth to 2", "方法深度 3", "深度 2") ──
     val depthMatch = Regex("(?:method\\s+)?depth\\s*(?:=|:|to)?\\s*(\\d+)").find(t)
     val zhDepthMatch = Regex("方法深度\\s*[:=]?\\s*(\\d+)|深度\\s*[:=]?\\s*(\\d+)").find(raw)
@@ -250,7 +272,7 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
             ?: "1").toIntOrNull() ?: 1
         val d = n.coerceAtLeast(1)
         return "Setting elaborate method depth to $d. Re-run plan to apply (depth only takes effect when method mode is elaborate)." to
-            mergeMethodSelection(current, mapOf("depth" to JsonPrimitive(d)))
+            mergeMethodSelection(current, mapOf("depth" to JsonPrimitive(d), "depth_optimal" to JsonPrimitive(false)))
     }
 
     // ── Score weights (only applicable when elaborate mode is on) ──

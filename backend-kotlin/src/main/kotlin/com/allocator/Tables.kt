@@ -201,6 +201,8 @@ object PlanRuns : Table("plan_run") {
     val parentPlanRunId        = integer("parent_plan_run_id").nullable()         // self-ref: previous round's contingent in a negotiation chain
     val supersededByPlanRunId  = integer("superseded_by_plan_run_id").nullable()  // self-ref: next round's contingent (NULL = chain tail, promotable)
     val createdAt = timestamp("created_at").defaultExpression(CurrentTimestamp)
+    val finishedAt = timestamp("finished_at").nullable()
+    val chosenDepth = integer("chosen_depth").nullable()  // depth picked by optimal-depth search; null when search not run
     override val primaryKey = PrimaryKey(id)
 }
 

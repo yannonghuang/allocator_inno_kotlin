@@ -42,6 +42,7 @@ internal data class MethodSelectionConfig(
     val depth: Int,          // >= 1
     val multiple: Boolean,
     val scoreWeights: Map<String, Any?>?,  // drives elaborate scoring (commit_time / inventory_consumed / purchase)
+    val depthOptimal: Boolean = false,     // when true, caller iterates depth=1..N picking the first non-improving step
 ) {
     val elaborate: Boolean get() = mode == "elaborate"
 }
@@ -96,8 +97,12 @@ internal fun resolveMethodSelection(config: Map<String, Any?>?): MethodSelection
         @Suppress("UNCHECKED_CAST")
         vs?.get("score_weights") as? Map<String, Any?>
     }
-    return MethodSelectionConfig(mode = mode, depth = depth, multiple = multiple, scoreWeights = weights)
+    val depthOptimal = raw["depth_optimal"] == true
+    return MethodSelectionConfig(mode = mode, depth = depth, multiple = multiple, scoreWeights = weights, depthOptimal = depthOptimal)
 }
+
+/** Soft cap on how many depths the optimal-depth search will try. Each iteration costs a full plan. */
+internal const val MAX_OPTIMAL_DEPTH = 10
 
 /**
  * True when we are still within the top `levels` recursion levels and should

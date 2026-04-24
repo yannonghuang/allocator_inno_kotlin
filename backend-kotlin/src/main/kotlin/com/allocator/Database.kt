@@ -230,6 +230,10 @@ private fun migrateSchema() {
         """.trimIndent(),
         "CREATE INDEX IF NOT EXISTS ix_plan_run_event_run ON plan_run_event (plan_run_id)",
         "CREATE INDEX IF NOT EXISTS ix_plan_run_event_case ON plan_run_event (case_id)",
+        // Elapsed time tracking on plan_run
+        "ALTER TABLE plan_run ADD COLUMN IF NOT EXISTS finished_at TIMESTAMP",
+        // Depth chosen by optimal-depth search (null when not used)
+        "ALTER TABLE plan_run ADD COLUMN IF NOT EXISTS chosen_depth INTEGER",
         // Fix FK constraints to use ON DELETE CASCADE (idempotent: drop if exists, re-add)
         *cascadeFkMigrations()
     )

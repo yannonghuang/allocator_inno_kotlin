@@ -882,12 +882,26 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       };
     }
 
+    if (/optimal depth|auto depth|auto-depth|best depth|find depth|search depth|自动深度|最优深度|最佳深度/.test(t)) {
+      return {
+        reply: tP('copilot.replies.methodDepthOptimal'),
+        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false, depth_optimal: true } },
+      };
+    }
+
+    if (/manual depth|fixed depth|固定深度|手动深度|关闭(自动|最优)深度/.test(t)) {
+      return {
+        reply: tP('copilot.replies.methodDepthManual'),
+        configUpdate: { method_selection: { ...ms, depth_optimal: false } },
+      };
+    }
+
     const depthMatch = t.match(/(?:method\s+)?depth\s*(?:=|:|to)?\s*(\d+)|方法深度\s*[:=]?\s*(\d+)|深度\s*[:=]?\s*(\d+)/);
     if (depthMatch) {
       const d = Math.max(1, Math.min(500, parseInt(depthMatch[1] ?? depthMatch[2] ?? depthMatch[3] ?? '1', 10)));
       return {
         reply: tP('copilot.replies.methodDepth', { depth: d }),
-        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false, depth: d } },
+        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false, depth: d, depth_optimal: false } },
       };
     }
 
@@ -994,7 +1008,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (/reset|default|clear|重置|默认|清除/.test(t)) {
       return {
         reply: tP('copilot.replies.reset'),
-        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 365, allocation_mode: 'fair' } },
+        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, depth_optimal: false, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 365, allocation_mode: 'fair' } },
       };
     }
 
@@ -2288,7 +2302,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         setOverrideCandidateRunId(null);
         setPlanRunSaveError(null);
         setPlanWorkOrderPeggingCache({});
-        if (full.config) setPlanningConfig(full.config as PlanningConfig);
+        if (full.config) {
+          // Default the depth to the run's chosen_depth (from optimal search) when present;
+          // fall back to 1 so the form starts from a sane baseline rather than carrying
+          // over whatever depth was in the saved config snapshot.
+          const cfg = full.config as PlanningConfig;
+          const chosen = full.chosen_depth ?? null;
+          setPlanningConfig({
+            ...cfg,
+            method_selection: {
+              ...cfg.method_selection,
+              depth: chosen ?? 1,
+              depth_optimal: false,
+            },
+          });
+        }
         setPlanRunHistoryOpen(false);
       }
     } catch (e) {
@@ -3230,7 +3258,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 type="number"
                 min={1}
                 max={500}
-                disabled={planningConfig.method_selection?.elaborate !== true}
+                disabled={planningConfig.method_selection?.elaborate !== true || planningConfig.method_selection?.depth_optimal === true}
                 value={planningConfig.method_selection?.depth ?? 1}
                 onChange={(e) => {
                   const v = Math.max(1, Math.min(500, parseInt(e.target.value, 10) || 1));
@@ -3238,6 +3266,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 }}
                 style={{ width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
               />
+            </label>
+            <label
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', cursor: 'pointer', opacity: planningConfig.method_selection?.elaborate === true ? 1 : 0.4 }}
+              title={tP('config.depthOptimalHint')}
+            >
+              <input
+                type="checkbox"
+                disabled={planningConfig.method_selection?.elaborate !== true}
+                checked={planningConfig.method_selection?.depth_optimal === true}
+                onChange={(e) => setPlanningConfig((c) => ({
+                  ...c,
+                  method_selection: { ...c.method_selection, depth_optimal: e.target.checked },
+                }))}
+              />
+              <span style={{ color: '#a1a1aa' }}>{tP('config.depthOptimal')}</span>
             </label>
           </div>
           {(() => {
@@ -3398,6 +3441,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 multiple: false,
                 elaborate: false,
                 depth: 1,
+                depth_optimal: false,
                 score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 },
               },
               purchase_allowed: false,
@@ -5539,6 +5583,26 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>
                         {new Date(run.created_at).toLocaleString()}
                       </span>
+                      {typeof run.duration_ms === 'number' && run.duration_ms >= 0 && (
+                        <span
+                          title={tP('runHistory.elapsedTitle')}
+                          style={{ fontSize: '0.75rem', color: '#a1a1aa', background: '#27272a', borderRadius: 8, padding: '1px 7px' }}
+                        >
+                          {run.duration_ms < 1000
+                            ? `${run.duration_ms}ms`
+                            : run.duration_ms < 60000
+                              ? `${(run.duration_ms / 1000).toFixed(1)}s`
+                              : `${Math.floor(run.duration_ms / 60000)}m ${Math.round((run.duration_ms % 60000) / 1000)}s`}
+                        </span>
+                      )}
+                      {typeof run.chosen_depth === 'number' && (
+                        <span
+                          title={tP('runHistory.chosenDepthTitle')}
+                          style={{ fontSize: '0.72rem', color: '#fde68a', background: '#422006', borderRadius: 8, padding: '1px 7px' }}
+                        >
+                          {tP('runHistory.chosenDepthChip', { depth: run.chosen_depth })}
+                        </span>
+                      )}
                       {run.override_count > 0 && (
                         <span style={{ background: '#7c3aed', color: '#fff', borderRadius: 8, padding: '1px 6px', fontSize: '0.72rem' }}>
                           {tP('runHistory.overrideCount', { n: run.override_count })}

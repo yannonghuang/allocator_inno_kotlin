@@ -102,6 +102,9 @@ data class PlanRunResponse(
     @SerialName("is_active") val isActive: Boolean = false,
     @SerialName("is_active_designated") val isActiveDesignated: Boolean = false,
     @SerialName("created_at") val createdAt: String,
+    @SerialName("finished_at") val finishedAt: String? = null,
+    @SerialName("duration_ms") val durationMs: Long? = null,
+    @SerialName("chosen_depth") val chosenDepth: Int? = null,
 )
 
 @Serializable
@@ -128,7 +131,11 @@ data class PlanRunFullResponse(
     @SerialName("is_active") val isActive: Boolean = false,
     @SerialName("is_active_designated") val isActiveDesignated: Boolean = false,
     val events: List<PlanRunEventDto> = emptyList(),
-    @SerialName("created_at") val createdAt: String,)
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("finished_at") val finishedAt: String? = null,
+    @SerialName("duration_ms") val durationMs: Long? = null,
+    @SerialName("chosen_depth") val chosenDepth: Int? = null,
+)
 
 @Serializable
 data class BomGraphNode(
