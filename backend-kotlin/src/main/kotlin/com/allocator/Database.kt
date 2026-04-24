@@ -234,6 +234,8 @@ private fun migrateSchema() {
         "ALTER TABLE plan_run ADD COLUMN IF NOT EXISTS finished_at TIMESTAMP",
         // Depth chosen by optimal-depth search (null when not used)
         "ALTER TABLE plan_run ADD COLUMN IF NOT EXISTS chosen_depth INTEGER",
+        // Per-depth attempt durations for optimal-depth search (JSON array)
+        "ALTER TABLE plan_run ADD COLUMN IF NOT EXISTS attempts TEXT",
         // Fix FK constraints to use ON DELETE CASCADE (idempotent: drop if exists, re-add)
         *cascadeFkMigrations()
     )

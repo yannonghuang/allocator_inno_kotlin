@@ -502,6 +502,8 @@
       "jobSuffix": " · 任务 {job}…",
       "overrideCount": "{n} 条覆盖",
       "elapsedTitle": "耗时（开始 → 完成）",
+      "elapsedBreakdownTitle": "最优深度搜索 — 各深度耗时：",
+      "elapsedBreakdownTotal": "  搜索总计：{ms}",
       "chosenDepthChip": "最优深度：{depth}",
       "chosenDepthTitle": "本次运行通过最优深度搜索选定的深度",
       "namePlaceholder": "名称（可选）",

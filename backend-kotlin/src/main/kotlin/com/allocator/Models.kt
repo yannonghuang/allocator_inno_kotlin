@@ -105,6 +105,7 @@ data class PlanRunResponse(
     @SerialName("finished_at") val finishedAt: String? = null,
     @SerialName("duration_ms") val durationMs: Long? = null,
     @SerialName("chosen_depth") val chosenDepth: Int? = null,
+    val attempts: JsonElement? = null,  // [{depth, duration_ms}, ...] for optimal-depth runs
 )
 
 @Serializable
@@ -135,6 +136,7 @@ data class PlanRunFullResponse(
     @SerialName("finished_at") val finishedAt: String? = null,
     @SerialName("duration_ms") val durationMs: Long? = null,
     @SerialName("chosen_depth") val chosenDepth: Int? = null,
+    val attempts: JsonElement? = null,  // [{depth, duration_ms}, ...] for optimal-depth runs
 )
 
 @Serializable

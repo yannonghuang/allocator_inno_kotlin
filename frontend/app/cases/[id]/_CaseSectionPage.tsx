@@ -245,6 +245,12 @@ import { AssessmentHistoryTable } from '@/app/components/AssessmentHistoryTable'
  *  The backend often returns JSON bodies like {"detail":"..."} or {"error":"..."}.
  *  If the raw string is valid JSON with one of those fields, return that field's value;
  *  otherwise return the raw string as-is. */
+function formatElapsedMs(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.floor(ms / 60000)}m ${Math.round((ms % 60000) / 1000)}s`;
+}
+
 function parseApiError(raw: unknown): string {
   const s = raw instanceof Error ? raw.message : String(raw ?? 'Unknown error');
   try {
@@ -5583,18 +5589,27 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>
                         {new Date(run.created_at).toLocaleString()}
                       </span>
-                      {typeof run.duration_ms === 'number' && run.duration_ms >= 0 && (
-                        <span
-                          title={tP('runHistory.elapsedTitle')}
-                          style={{ fontSize: '0.75rem', color: '#a1a1aa', background: '#27272a', borderRadius: 8, padding: '1px 7px' }}
-                        >
-                          {run.duration_ms < 1000
-                            ? `${run.duration_ms}ms`
-                            : run.duration_ms < 60000
-                              ? `${(run.duration_ms / 1000).toFixed(1)}s`
-                              : `${Math.floor(run.duration_ms / 60000)}m ${Math.round((run.duration_ms % 60000) / 1000)}s`}
-                        </span>
-                      )}
+                      {typeof run.duration_ms === 'number' && run.duration_ms >= 0 && (() => {
+                        const attempts = run.attempts ?? null;
+                        const hasAttempts = Array.isArray(attempts) && attempts.length > 0;
+                        const elapsedTitle = hasAttempts
+                          ? [
+                              tP('runHistory.elapsedBreakdownTitle'),
+                              ...attempts.map((a) => `  depth ${a.depth}: ${formatElapsedMs(a.duration_ms)}`),
+                              tP('runHistory.elapsedBreakdownTotal', {
+                                ms: formatElapsedMs(attempts.reduce((s, a) => s + a.duration_ms, 0)),
+                              }),
+                            ].join('\n')
+                          : tP('runHistory.elapsedTitle');
+                        return (
+                          <span
+                            title={elapsedTitle}
+                            style={{ fontSize: '0.75rem', color: '#a1a1aa', background: '#27272a', borderRadius: 8, padding: '1px 7px' }}
+                          >
+                            {formatElapsedMs(run.duration_ms)}
+                          </span>
+                        );
+                      })()}
                       {typeof run.chosen_depth === 'number' && (
                         <span
                           title={tP('runHistory.chosenDepthTitle')}

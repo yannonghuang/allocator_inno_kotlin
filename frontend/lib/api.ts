@@ -465,6 +465,7 @@ export type PlanRun = {
   finished_at?: string | null;
   duration_ms?: number | null;
   chosen_depth?: number | null;
+  attempts?: Array<{ depth: number; duration_ms: number }> | null;
 };
 
 export type PlanRunEvent = {
