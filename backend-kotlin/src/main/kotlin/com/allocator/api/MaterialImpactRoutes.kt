@@ -325,60 +325,83 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
             }.getOrNull()
         }
 
-        // 5. Re-run planning with the mutated supply (bounded concurrency via semaphore)
-        log.info("material-impact re-plan: jobId={} supplyId={} delay={} qtyDecrease={}",
-            jobId, req.supplyId, req.deliveryDelayDays, req.quantityDecreasePct)
-        val contingentResult = replanSemaphore.withPermit {
-            runPlanning(mutatedData, config = parsedConfig)
+        // 4b. Cache lookup: has an earlier call already re-planned these exact params?
+        // Key: (caseId, baselinePlanRunId, supplyId, deliveryDelayDays, quantityDecreasePct)
+        // plus negotiationRound / parentPlanRunId when the caller declares them.
+        //
+        // Fires for all callers (persist=true or false): material_engine persists the
+        // contingent on its first pass, and order_engine's later persist=false call
+        // matches on the same params and skips the second 10s runPlanning. Planning
+        // agent goes through /material-impact-assessment (not this endpoint), so it is
+        // already free of this redundancy — but any future caller of /material-impact
+        // picks up the cache automatically via this lookup.
+        val cachedHit: Pair<Int, Map<String, Any>>? = transaction {
+            val candidates = PlanRuns.selectAll()
+                .where {
+                    var cond: Op<Boolean> = (PlanRuns.caseId eq caseId) and
+                        (PlanRuns.status inList listOf("contingent", "success")) and
+                        PlanRuns.supersededByPlanRunId.isNull()
+                    if (req.negotiationRound != null) {
+                        cond = cond and (PlanRuns.negotiationRound eq req.negotiationRound)
+                    }
+                    if (req.parentPlanRunId != null) {
+                        cond = cond and (PlanRuns.parentPlanRunId eq req.parentPlanRunId)
+                    }
+                    cond
+                }
+                .orderBy(PlanRuns.id, SortOrder.DESC)
+                .toList()
+            candidates.firstNotNullOfOrNull { row ->
+                val meta = row[PlanRuns.metadata]?.let {
+                    runCatching { Json.parseToJsonElement(it).jsonObject }.getOrNull()
+                } ?: return@firstNotNullOfOrNull null
+                val matches = meta["supplyId"]?.jsonPrimitive?.contentOrNull == req.supplyId.trim() &&
+                    meta["deliveryDelayDays"]?.jsonPrimitive?.intOrNull == req.deliveryDelayDays &&
+                    meta["quantityDecreasePct"]?.jsonPrimitive?.doubleOrNull == req.quantityDecreasePct &&
+                    meta["baselinePlanRunId"]?.jsonPrimitive?.intOrNull == baselinePlanRunId
+                if (!matches) return@firstNotNullOfOrNull null
+                val resultJson = row[PlanRuns.result] ?: return@firstNotNullOfOrNull null
+                val parsed = runCatching {
+                    @Suppress("UNCHECKED_CAST")
+                    jsonElementToNative(Json.parseToJsonElement(resultJson)) as? Map<String, Any>
+                }.getOrNull() ?: return@firstNotNullOfOrNull null
+                row[PlanRuns.id] to parsed
+            }
         }
 
-        // 6. Persist contingent plan run + material event record (only when persist=true)
-        val contingentPlanRunId: Int? = if (req.persist) {
-            val metadataJson = buildJsonObject {
-                put("type", "contingent")
-                put("supplyId", req.supplyId)
-                put("deliveryDelayDays", req.deliveryDelayDays)
-                put("quantityDecreasePct", req.quantityDecreasePct)
-                put("baselinePlanRunId", baselinePlanRunId)
-                if (req.negotiationRound != null) put("negotiationRound", req.negotiationRound)
-                if (req.parentPlanRunId != null) put("parentPlanRunId", req.parentPlanRunId)
-            }.toString()
-            val contingentResultJson = runCatching { resultToJson(contingentResult).toString() }.getOrNull()
-            transaction {
-                // Idempotency: when a negotiation round is declared, dedup on
-                // (caseId, supplyId, delay, qty, baseline, round) so agent replay
-                // doesn't create duplicate contingent rows.
-                val existingId: Int? = if (req.negotiationRound != null) {
-                    val candidates = PlanRuns.selectAll()
-                        .where {
-                            (PlanRuns.caseId eq caseId) and
-                            (PlanRuns.status eq "contingent") and
-                            (PlanRuns.negotiationRound eq req.negotiationRound) and
-                            PlanRuns.supersededByPlanRunId.isNull() and
-                            (if (req.parentPlanRunId != null)
-                                (PlanRuns.parentPlanRunId eq req.parentPlanRunId)
-                             else
-                                PlanRuns.parentPlanRunId.isNull())
-                        }
-                        .toList()
-                    candidates.firstOrNull { row ->
-                        val meta = row[PlanRuns.metadata]?.let {
-                            runCatching { Json.parseToJsonElement(it).jsonObject }.getOrNull()
-                        } ?: return@firstOrNull false
-                        meta["supplyId"]?.jsonPrimitive?.contentOrNull == req.supplyId.trim() &&
-                        meta["deliveryDelayDays"]?.jsonPrimitive?.intOrNull == req.deliveryDelayDays &&
-                        meta["quantityDecreasePct"]?.jsonPrimitive?.doubleOrNull == req.quantityDecreasePct &&
-                        meta["baselinePlanRunId"]?.jsonPrimitive?.intOrNull == baselinePlanRunId
-                    }?.get(PlanRuns.id)
-                } else null
+        val contingentResult: Map<String, Any>
+        val contingentPlanRunId: Int?
 
-                if (existingId != null) {
-                    log.info(
-                        "material-impact upsert hit: contingentPlanRunId={} round={} parent={} (skipping insert)",
-                        existingId, req.negotiationRound, req.parentPlanRunId,
-                    )
-                    existingId
-                } else {
+        if (cachedHit != null) {
+            log.info(
+                "material-impact cache hit: contingentPlanRunId={} baseline={} supplyId={} delay={} qtyPct={} (skipping re-plan)",
+                cachedHit.first, baselinePlanRunId, req.supplyId, req.deliveryDelayDays, req.quantityDecreasePct,
+            )
+            contingentResult = cachedHit.second
+            contingentPlanRunId = cachedHit.first
+        } else {
+            // 5. Re-run planning with the mutated supply (bounded concurrency via semaphore)
+            log.info("material-impact re-plan: jobId={} supplyId={} delay={} qtyDecrease={}",
+                jobId, req.supplyId, req.deliveryDelayDays, req.quantityDecreasePct)
+            contingentResult = replanSemaphore.withPermit {
+                runPlanning(mutatedData, config = parsedConfig)
+            }
+
+            // 6. Persist contingent plan run + material event record (only when persist=true).
+            // Cache-miss path: insert a fresh contingent row so the next identical request
+            // (e.g. order_engine's follow-up with persist=false) hits the cache above.
+            contingentPlanRunId = if (req.persist) {
+                val metadataJson = buildJsonObject {
+                    put("type", "contingent")
+                    put("supplyId", req.supplyId)
+                    put("deliveryDelayDays", req.deliveryDelayDays)
+                    put("quantityDecreasePct", req.quantityDecreasePct)
+                    put("baselinePlanRunId", baselinePlanRunId)
+                    if (req.negotiationRound != null) put("negotiationRound", req.negotiationRound)
+                    if (req.parentPlanRunId != null) put("parentPlanRunId", req.parentPlanRunId)
+                }.toString()
+                val contingentResultJson = runCatching { resultToJson(contingentResult).toString() }.getOrNull()
+                transaction {
                     val planRunId = PlanRuns.insert {
                         it[PlanRuns.caseId] = caseId
                         it[PlanRuns.jobId] = jobId
@@ -404,8 +427,8 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
                     }
                     planRunId
                 }
-            }
-        } else null
+            } else null
+        }
 
         // 7. Diff baseline vs contingent
         val baselineOutcomes = parseCommittedDemands(baselineLookup.resultMap)
