@@ -19,6 +19,114 @@ private val DEFAULT_SCORE_WEIGHTS = Triple(0.4, 0.35, 0.25)
 private val BENIGN_REASONS = setOf("cycle_stopped", "cycle_detected", "inventory")
 private val LATE_DATE = LocalDate.of(9999, 12, 31)
 
+// ── Selection config (method_selection / variant_selection) ───────────────────
+//
+// Method-level selection supports two modes: `preference` (cheap, preference-
+// ordered cascade) and `elaborate` (scored against each candidate's simulated
+// sub-plan). `depth` controls how many recursion levels elaborate applies at
+// (≥ 1, default 1 = root only). Legacy shape `{ elaborate: true }` is accepted.
+//
+// Runtime mapping: engine `depth` counts *down* from `MAX_PLAN_DEPTH` at root,
+// so level k has depth == MAX_PLAN_DEPTH - k. Elaborate applies when
+// `depth > MAX_PLAN_DEPTH - methodCfg.depth` (N=1 → root only; N=2 → root +
+// one level down; etc.). See `shouldElaborateAtDepth`.
+//
+// Variants are NOT rectified symmetrically: BOM-level variety is now modeled
+// as distinct make methods, so there is no "variant mode" or "variant depth"
+// concept. Variant config is just the equal-split / scoring knobs it has
+// always been (`multiple`, `score_weights`, `top_n`).
+
+/** Effective method_selection config. */
+internal data class MethodSelectionConfig(
+    val mode: String,        // "preference" | "elaborate"
+    val depth: Int,          // >= 1
+    val multiple: Boolean,
+    val scoreWeights: Map<String, Any?>?,  // drives elaborate scoring (commit_time / inventory_consumed / purchase)
+    val depthOptimal: Boolean = false,     // when true, caller iterates depth=1..N picking the first non-improving step
+) {
+    val elaborate: Boolean get() = mode == "elaborate"
+}
+
+/** Effective variant_selection config. */
+internal data class VariantSelectionConfig(
+    val multiple: Boolean?,                 // null → equal-split among feasible; false → single best
+    val scoreWeights: Map<String, Any?>?,
+    val topN: Int?,
+)
+
+/** Clamp method_selection.depth to int ≥ 1; warn and default to 1 on garbage input. */
+private fun parseMethodDepth(raw: Any?): Int {
+    if (raw == null) return 1
+    val n = (raw as? Number)?.toInt()
+    if (n == null || n < 1) {
+        log.warn("Invalid method_selection.depth={}; clamping to 1", raw)
+        return 1
+    }
+    return n
+}
+
+/**
+ * Resolve the effective method_selection config.
+ *
+ * Accepts both the new shape (`mode`, `depth`, `score_weights`) and the legacy shape
+ * (`elaborate: bool`). When both are present, `mode` wins. Score weights fall back
+ * to `variant_selection.score_weights` when not set at the method level, since the
+ * two groups used to share weights before the variant surface was removed.
+ */
+internal fun resolveMethodSelection(config: Map<String, Any?>?): MethodSelectionConfig {
+    val raw = (config?.get("method_selection") as? Map<*, *>)?.let {
+        @Suppress("UNCHECKED_CAST") it as? Map<String, Any?>
+    } ?: emptyMap()
+    val modeStr = (raw["mode"] as? String)?.trim()?.lowercase()
+    val mode = when (modeStr) {
+        "preference", "elaborate" -> modeStr
+        null -> if (raw["elaborate"] == true) "elaborate" else "preference"
+        else -> {
+            log.warn("Invalid method_selection.mode='{}'; defaulting to preference", modeStr)
+            "preference"
+        }
+    }
+    val depth = parseMethodDepth(raw["depth"])
+    val multiple = raw["multiple"] == true
+    @Suppress("UNCHECKED_CAST")
+    val methodWeights = raw["score_weights"] as? Map<String, Any?>
+    val weights = methodWeights ?: run {
+        val vs = (config?.get("variant_selection") as? Map<*, *>)?.let {
+            @Suppress("UNCHECKED_CAST") it as? Map<String, Any?>
+        }
+        @Suppress("UNCHECKED_CAST")
+        vs?.get("score_weights") as? Map<String, Any?>
+    }
+    val depthOptimal = raw["depth_optimal"] == true
+    return MethodSelectionConfig(mode = mode, depth = depth, multiple = multiple, scoreWeights = weights, depthOptimal = depthOptimal)
+}
+
+/** Soft cap on how many depths the optimal-depth search will try. Each iteration costs a full plan. */
+internal const val MAX_OPTIMAL_DEPTH = 10
+
+/**
+ * True when we are still within the top `levels` recursion levels and should
+ * therefore run elaborate/cascade scoring rather than plain preference lookup.
+ *
+ * Engine `depth` counts down from `MAX_PLAN_DEPTH`; level 0 (root) has
+ * depth == MAX_PLAN_DEPTH, level 1 has depth == MAX_PLAN_DEPTH - 1, etc.
+ * For `levels = N` we want to cover levels 0..N-1, i.e. depth > MAX_PLAN_DEPTH - N.
+ */
+internal fun shouldElaborateAtDepth(depth: Int, levels: Int): Boolean =
+    depth > MAX_PLAN_DEPTH - levels.coerceAtLeast(1)
+
+/** Resolve the effective variant_selection config. */
+internal fun resolveVariantSelection(config: Map<String, Any?>?): VariantSelectionConfig {
+    val raw = (config?.get("variant_selection") as? Map<*, *>)?.let {
+        @Suppress("UNCHECKED_CAST") it as? Map<String, Any?>
+    } ?: emptyMap()
+    val multiple = raw["multiple"] as? Boolean
+    @Suppress("UNCHECKED_CAST")
+    val scoreWeights = raw["score_weights"] as? Map<String, Any?>
+    val topN = (raw["top_n"] as? Number)?.toInt()?.let { max(1, it) }
+    return VariantSelectionConfig(multiple = multiple, scoreWeights = scoreWeights, topN = topN)
+}
+
 /** Round a quantity-like double to a whole-unit double for API emission.
  *  Used at the JSON boundary for fields like quantity, committed_qty, shortage, etc.
  *  Internal math stays in Double; only the value handed to the caller is rounded.
@@ -389,7 +497,8 @@ internal fun firstFeasibleMethod(
 /**
  * Cascade method selection: try each method in ascending preference order.
  * Returns the first method whose children can be successfully planned.
- * Falls back to preference-only when depth is exhausted or only one method exists.
+ * Falls back to preference-only when we're past method_selection.depth levels
+ * from the root, or when only one method exists.
  */
 internal fun getPreferredMethodCascade(
     methods: List<Map<String, Any?>>,
@@ -402,7 +511,8 @@ internal fun getPreferredMethodCascade(
     planningPath: Set<Pair<String, String>>,
 ): Pair<Map<String, Any?>?, String> {
     if (methods.isEmpty()) return Pair(null, "No methods available.")
-    if (depth < MAX_PLAN_DEPTH || methods.size <= 1) return getPreferredMethod(methods)
+    val levels = resolveMethodSelection(config).depth
+    if (!shouldElaborateAtDepth(depth, levels) || methods.size <= 1) return getPreferredMethod(methods)
 
     val productId = demand["product_id"] as? String ?: ""
     val locationId = demand["location_id"] as? String ?: ""
@@ -444,7 +554,8 @@ internal fun getPreferredMethodCascade(
 
 /**
  * Elaborate method selection: simulate one planning level per method, score, and pick best.
- * Falls back to preference-only when depth < MAX_PLAN_DEPTH or only 1 method.
+ * Falls back to preference-only when we're past method_selection.depth levels from the
+ * root, or when only one method exists.
  */
 internal fun getPreferredMethodElaborate(
     methods: List<Map<String, Any?>>,
@@ -457,14 +568,10 @@ internal fun getPreferredMethodElaborate(
     planningPath: Set<Pair<String, String>>,
 ): Pair<Map<String, Any?>?, String> {
     if (methods.isEmpty()) return Pair(null, "No methods available.")
-    if (depth < MAX_PLAN_DEPTH || methods.size <= 1) return getPreferredMethod(methods)
+    val methodCfg = resolveMethodSelection(config)
+    if (!shouldElaborateAtDepth(depth, methodCfg.depth) || methods.size <= 1) return getPreferredMethod(methods)
 
-    val variantSelection = (config?.get("variant_selection") as? Map<*, *>)?.let { m ->
-        @Suppress("UNCHECKED_CAST") m as? Map<String, Any?>
-    }
-    val scoreWeights = (variantSelection?.get("score_weights") as? Map<*, *>)?.let { m ->
-        @Suppress("UNCHECKED_CAST") m as? Map<String, Any?>
-    }
+    val scoreWeights = methodCfg.scoreWeights
     val (wCommit, wInv, wPurchase) = normalizeScoreWeights(scoreWeights)
     val productId = demand["product_id"] as? String ?: ""
     val locationId = demand["location_id"] as? String ?: ""
@@ -813,14 +920,13 @@ fun plan(
             demandId, productId, locationId, methods.size, methods.map { it["type"] })
     }
 
-    val methodSelection = (config?.get("method_selection") as? Map<*, *>)?.let { @Suppress("UNCHECKED_CAST") it as? Map<String, Any?> }
-    val useElaborateMethod = methodSelection?.get("elaborate") == true
-    val useMultipleMethods = methodSelection?.get("multiple") == true && methods.size > 1
-    val variantSelection = (config?.get("variant_selection") as? Map<*, *>)?.let { @Suppress("UNCHECKED_CAST") it as? Map<String, Any?> }
-    val useSingleVariant = variantSelection?.get("multiple") == false
-    @Suppress("UNCHECKED_CAST")
-    val scoreWeights = variantSelection?.get("score_weights")?.let { it as? Map<String, Any?> }
-    val topN = variantSelection?.get("top_n")?.let { (it as? Number)?.toInt()?.let { n -> max(1, n) } }
+    val methodCfg = resolveMethodSelection(config)
+    val variantCfg = resolveVariantSelection(config)
+    val useElaborateMethod = methodCfg.elaborate
+    val useMultipleMethods = methodCfg.multiple && methods.size > 1
+    val useSingleVariant = variantCfg.multiple == false
+    val scoreWeights = variantCfg.scoreWeights
+    val topN = variantCfg.topN
 
     // Shortage tolerance: tiny partial-fulfillment gaps are collapsed to "no bottleneck".
     // Tolerance = max(absolute, relative * qty). Absolute floor kills sub-unit drift;
@@ -1017,13 +1123,14 @@ fun plan(
     } else methods
 
     // ── Single method selection ────────────────────────────────────────────────
+    val elaborateAtThisLevel = shouldElaborateAtDepth(depth, methodCfg.depth)
     val (m, methodChoiceExplanation) = when {
         effectiveMethods.size == 1 -> {
             val m = effectiveMethods[0]; val loc = (m["location_id"] ?: m["to_location_id"] ?: "").toString()
             val base = "Only option: ${m["type"]} @ $loc."
             Pair(m, if (methodOverride != null) "$base [method override active]" else base)
         }
-        useElaborateMethod && depth >= MAX_PLAN_DEPTH ->
+        useElaborateMethod && elaborateAtThisLevel ->
             getPreferredMethodElaborate(effectiveMethods, demand, inventory, data, requestTimeDt, config, depth, path)
         else -> getPreferredMethodCascade(effectiveMethods, demand, inventory, data, requestTimeDt, config, depth, path)
     }
@@ -1031,7 +1138,7 @@ fun plan(
     // Override is active only when it actually changed the selected method vs auto-selection.
     // For elaborate mode (expensive), fall back to checking whether choices were restricted.
     val methodOverrideActive = methodOverride != null && when {
-        useElaborateMethod && depth >= MAX_PLAN_DEPTH -> effectiveMethods.size < methods.size
+        useElaborateMethod && elaborateAtThisLevel -> effectiveMethods.size < methods.size
         else -> getPreferredMethod(methods).first?.get("type")?.toString() != m?.get("type")?.toString()
     }
     val overrideActive = methodOverrideActive || variantOverride != null

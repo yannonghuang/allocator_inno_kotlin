@@ -245,6 +245,12 @@ import { AssessmentHistoryTable } from '@/app/components/AssessmentHistoryTable'
  *  The backend often returns JSON bodies like {"detail":"..."} or {"error":"..."}.
  *  If the raw string is valid JSON with one of those fields, return that field's value;
  *  otherwise return the raw string as-is. */
+function formatElapsedMs(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.floor(ms / 60000)}m ${Math.round((ms % 60000) / 1000)}s`;
+}
+
 function parseApiError(raw: unknown): string {
   const s = raw instanceof Error ? raw.message : String(raw ?? 'Unknown error');
   try {
@@ -848,20 +854,18 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const planRunHistoryResizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [planRunHistoryResizing, setPlanRunHistoryResizing] = useState(false);
 
-  /** Rule-based intent: map user message to config updates and a reply for variant, method, and consolidation selection. */
+  /** Rule-based intent: map user message to config updates and a reply for method selection and consolidation. */
   function parseCopilotIntent(message: string, currentConfig: PlanningConfig): { reply: string; configUpdate?: PlanningConfig } {
     const t = message.trim().toLowerCase();
-    const vs = currentConfig.variant_selection ?? {};
     const ms = currentConfig.method_selection ?? {};
     const cs = currentConfig.consolidation ?? {};
-    const multi = vs.multiple;
 
     if (!t) return { reply: tP('copilot.replies.empty') };
 
     // Accept both English and Chinese triggers.
     if (/show|current|what('s| is)? (my )?config|settings|config|显示配置|当前配置|查看配置/.test(t)) {
-      const variantMode = multi === false ? tP('copilot.singleBest') : tP('copilot.allFeasible');
       const methodMode = ms.multiple === true ? tP('copilot.equalSplit') : ms.elaborate === true ? tP('copilot.oneByScore') : tP('copilot.oneByPreference');
+      const methodDepth = ms.elaborate === true ? (ms.depth ?? 1) : null;
       const purchaseMode = currentConfig.purchase_allowed === false ? tP('copilot.disabled') : tP('copilot.allowed');
       const splitLabel = cs.allocation_mode === 'proportional'
         ? tP('copilot.splitProportional')
@@ -871,27 +875,39 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       const consolidationMode = cs.enabled
         ? tP('copilot.consolidationOnDetail', { days: cs.period_days ?? 365, split: splitLabel })
         : tP('copilot.off');
-      return { reply: tP('copilot.replies.showConfig', { variantMode, methodMode, purchaseMode, consolidationMode }) };
-    }
-
-    if (/single|one variant|only one|best variant|use one|单一|一个变体|最优变体/.test(t)) {
-      return {
-        reply: tP('copilot.replies.variantSingle'),
-        configUpdate: { variant_selection: { ...vs, multiple: false } },
-      };
-    }
-
-    if (/all variants|multiple variants|every variant|equal split.*variant|divide (across|among).*variant|所有变体|全部变体|多变体/.test(t)) {
-      return {
-        reply: tP('copilot.replies.variantAll'),
-        configUpdate: { variant_selection: { ...vs, multiple: true } },
-      };
+      const methodLine = methodDepth != null
+        ? tP('copilot.replies.showConfigMethodDepth', { methodMode, depth: methodDepth })
+        : tP('copilot.replies.showConfigMethod', { methodMode });
+      return { reply: tP('copilot.replies.showConfig', { methodLine, purchaseMode, consolidationMode }) };
     }
 
     if (/equal.?split.?method|split.?method.?equal|split across method|multiple method|use all method|方法等量拆分|等量拆分方法|跨方法拆分/.test(t)) {
       return {
         reply: tP('copilot.replies.methodEqual'),
         configUpdate: { method_selection: { ...ms, multiple: true, elaborate: false } },
+      };
+    }
+
+    if (/optimal depth|auto depth|auto-depth|best depth|find depth|search depth|自动深度|最优深度|最佳深度/.test(t)) {
+      return {
+        reply: tP('copilot.replies.methodDepthOptimal'),
+        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false, depth_optimal: true } },
+      };
+    }
+
+    if (/manual depth|fixed depth|固定深度|手动深度|关闭(自动|最优)深度/.test(t)) {
+      return {
+        reply: tP('copilot.replies.methodDepthManual'),
+        configUpdate: { method_selection: { ...ms, depth_optimal: false } },
+      };
+    }
+
+    const depthMatch = t.match(/(?:method\s+)?depth\s*(?:=|:|to)?\s*(\d+)|方法深度\s*[:=]?\s*(\d+)|深度\s*[:=]?\s*(\d+)/);
+    if (depthMatch) {
+      const d = Math.max(1, Math.min(500, parseInt(depthMatch[1] ?? depthMatch[2] ?? depthMatch[3] ?? '1', 10)));
+      return {
+        reply: tP('copilot.replies.methodDepth', { depth: d }),
+        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false, depth: d, depth_optimal: false } },
       };
     }
 
@@ -906,6 +922,27 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       return {
         reply: tP('copilot.replies.methodPreference'),
         configUpdate: { method_selection: { ...ms, multiple: false, elaborate: false } },
+      };
+    }
+
+    if (/earliest (commit|delivery|ship)|fastest (commit|delivery|ship)|soonest (commit|delivery|ship)|prioriti[sz]e (commit|delivery|ship)|最早交付|最快交付|优先交付|按交付/.test(t)) {
+      return {
+        reply: tP('copilot.replies.methodWeightCommit'),
+        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false, score_weights: { commit_time: 1, inventory_consumed: 0, purchase: 0 } } },
+      };
+    }
+
+    if (/prefer inventor(y|ies)|use (existing )?inventor(y|ies)|favou?r inventor(y|ies)|consume inventor(y|ies)|existing stock|maximi[sz]e inventor(y|ies)|优先库存|使用库存|消耗库存|最多库存/.test(t)) {
+      return {
+        reply: tP('copilot.replies.methodWeightInventory'),
+        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false, score_weights: { commit_time: 0, inventory_consumed: 1, purchase: 0 } } },
+      };
+    }
+
+    if (/minim(al|i[sz]e) (additional )?purchase|minim(al|i[sz]e) (additional )?buy|least purchase|least buy|fewest purchase|avoid purchase|最少采购|最小采购|减少采购|最少购买/.test(t)) {
+      return {
+        reply: tP('copilot.replies.methodWeightPurchase'),
+        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false, score_weights: { commit_time: 0, inventory_consumed: 0, purchase: 1 } } },
       };
     }
 
@@ -977,7 +1014,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (/reset|default|clear|重置|默认|清除/.test(t)) {
       return {
         reply: tP('copilot.replies.reset'),
-        configUpdate: { variant_selection: { multiple: true }, method_selection: { multiple: false, elaborate: false }, purchase_allowed: false, consolidation: { enabled: true, period_days: 365, allocation_mode: 'fair' } },
+        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, depth_optimal: false, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 365, allocation_mode: 'fair' } },
       };
     }
 
@@ -1364,7 +1401,18 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         setPlanResult(full.result as typeof planResult);
         setCurrentPlanRunId(latest.id);
         setPlanWorkOrderPeggingCache({});
-        if (full.config) setPlanningConfig(full.config as PlanningConfig);
+        if (full.config) {
+          const cfg = full.config as PlanningConfig;
+          const chosen = full.chosen_depth ?? null;
+          setPlanningConfig({
+            ...cfg,
+            method_selection: {
+              ...cfg.method_selection,
+              depth: chosen ?? cfg.method_selection?.depth ?? 1,
+              depth_optimal: false,
+            },
+          });
+        }
         restoreCriticality(latest.id);
       }
     } catch {
@@ -2271,7 +2319,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         setOverrideCandidateRunId(null);
         setPlanRunSaveError(null);
         setPlanWorkOrderPeggingCache({});
-        if (full.config) setPlanningConfig(full.config as PlanningConfig);
+        if (full.config) {
+          // Default the depth to the run's chosen_depth (from optimal search) when present;
+          // fall back to 1 so the form starts from a sane baseline rather than carrying
+          // over whatever depth was in the saved config snapshot.
+          const cfg = full.config as PlanningConfig;
+          const chosen = full.chosen_depth ?? null;
+          setPlanningConfig({
+            ...cfg,
+            method_selection: {
+              ...cfg.method_selection,
+              depth: chosen ?? 1,
+              depth_optimal: false,
+            },
+          });
+        }
         setPlanRunHistoryOpen(false);
       }
     } catch (e) {
@@ -3183,39 +3245,116 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           </div>
         </details>
         <div style={{ marginBottom: '0.75rem' }}>
-          <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem', cursor: 'pointer' }}>
-            <input
-              type="checkbox"
-              checked={planningConfig.variant_selection?.multiple === false}
-              onChange={(e) => setPlanningConfig((c) => ({
+          <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap', marginBottom: '0.5rem' }}>
+            <span style={{ color: '#a1a1aa', fontSize: '0.875rem' }}>{tP('config.methodSelection')}</span>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={planningConfig.method_selection?.multiple === true}
+                onChange={(e) => setPlanningConfig((c) => ({
+                  ...c,
+                  method_selection: { ...c.method_selection, multiple: e.target.checked },
+                }))}
+              />
+              <span>{tP('config.equalSplitMethods')}</span>
+            </label>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={planningConfig.method_selection?.elaborate === true}
+                onChange={(e) => setPlanningConfig((c) => ({
+                  ...c,
+                  method_selection: { ...c.method_selection, elaborate: e.target.checked },
+                }))}
+              />
+              <span>{tP('config.elaborateMethod')}</span>
+            </label>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.method_selection?.elaborate === true ? 1 : 0.4 }}>
+              <span style={{ color: '#a1a1aa' }}>{tP('config.methodDepth')}</span>
+              <input
+                type="number"
+                min={1}
+                max={500}
+                disabled={planningConfig.method_selection?.elaborate !== true || planningConfig.method_selection?.depth_optimal === true}
+                value={planningConfig.method_selection?.depth ?? 1}
+                onChange={(e) => {
+                  const v = Math.max(1, Math.min(500, parseInt(e.target.value, 10) || 1));
+                  setPlanningConfig((c) => ({ ...c, method_selection: { ...c.method_selection, depth: v } }));
+                }}
+                style={{ width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+              />
+            </label>
+            <label
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', cursor: 'pointer', opacity: planningConfig.method_selection?.elaborate === true ? 1 : 0.4 }}
+              title={tP('config.depthOptimalHint')}
+            >
+              <input
+                type="checkbox"
+                disabled={planningConfig.method_selection?.elaborate !== true}
+                checked={planningConfig.method_selection?.depth_optimal === true}
+                onChange={(e) => setPlanningConfig((c) => ({
+                  ...c,
+                  method_selection: { ...c.method_selection, depth_optimal: e.target.checked },
+                }))}
+              />
+              <span style={{ color: '#a1a1aa' }}>{tP('config.depthOptimal')}</span>
+            </label>
+          </div>
+          {(() => {
+            const elaborateOn = planningConfig.method_selection?.elaborate === true;
+            const weights = planningConfig.method_selection?.score_weights;
+            const wCommit = weights?.commit_time ?? 0.4;
+            const wInv = weights?.inventory_consumed ?? 0.35;
+            const wPurchase = weights?.purchase ?? 0.25;
+            const updateWeight = (key: 'commit_time' | 'inventory_consumed' | 'purchase', v: number) => {
+              const clamped = Math.max(0, Math.min(1, isNaN(v) ? 0 : v));
+              setPlanningConfig((c) => ({
                 ...c,
-                variant_selection: { ...c.variant_selection, multiple: e.target.checked ? false : undefined },
-              }))}
-            />
-            <span>{tP('config.singleBestVariant')}</span>
-          </label>
-          <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem', cursor: 'pointer' }}>
-            <input
-              type="checkbox"
-              checked={planningConfig.method_selection?.multiple === true}
-              onChange={(e) => setPlanningConfig((c) => ({
-                ...c,
-                method_selection: { ...c.method_selection, multiple: e.target.checked },
-              }))}
-            />
-            <span>{tP('config.equalSplitMethods')}</span>
-          </label>
-          <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem', cursor: 'pointer' }}>
-            <input
-              type="checkbox"
-              checked={planningConfig.method_selection?.elaborate === true}
-              onChange={(e) => setPlanningConfig((c) => ({
-                ...c,
-                method_selection: { ...c.method_selection, elaborate: e.target.checked },
-              }))}
-            />
-            <span>{tP('config.elaborateMethod')}</span>
-          </label>
+                method_selection: {
+                  ...c.method_selection,
+                  score_weights: {
+                    commit_time: key === 'commit_time' ? clamped : (c.method_selection?.score_weights?.commit_time ?? 0.4),
+                    inventory_consumed: key === 'inventory_consumed' ? clamped : (c.method_selection?.score_weights?.inventory_consumed ?? 0.35),
+                    purchase: key === 'purchase' ? clamped : (c.method_selection?.score_weights?.purchase ?? 0.25),
+                  },
+                },
+              }));
+            };
+            const inputStyle: React.CSSProperties = { width: 64, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' };
+            const labelStyle: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.875rem', opacity: elaborateOn ? 1 : 0.4 };
+            return (
+              <div
+                style={{ display: 'flex', alignItems: 'center', gap: '0.9rem', flexWrap: 'wrap', marginBottom: '0.5rem', marginLeft: '1rem' }}
+                title={tP('config.weightsHint')}
+              >
+                <span style={{ color: '#a1a1aa', fontSize: '0.8rem', opacity: elaborateOn ? 1 : 0.5 }}>{tP('config.weightsLabel')}</span>
+                <label style={labelStyle}>
+                  <span style={{ color: '#a1a1aa' }}>{tP('config.weightCommit')}</span>
+                  <input type="number" min={0} max={1} step={0.05}
+                    disabled={!elaborateOn}
+                    value={wCommit}
+                    onChange={(e) => updateWeight('commit_time', parseFloat(e.target.value))}
+                    style={inputStyle} />
+                </label>
+                <label style={labelStyle}>
+                  <span style={{ color: '#a1a1aa' }}>{tP('config.weightInventory')}</span>
+                  <input type="number" min={0} max={1} step={0.05}
+                    disabled={!elaborateOn}
+                    value={wInv}
+                    onChange={(e) => updateWeight('inventory_consumed', parseFloat(e.target.value))}
+                    style={inputStyle} />
+                </label>
+                <label style={labelStyle}>
+                  <span style={{ color: '#a1a1aa' }}>{tP('config.weightPurchase')}</span>
+                  <input type="number" min={0} max={1} step={0.05}
+                    disabled={!elaborateOn}
+                    value={wPurchase}
+                    onChange={(e) => updateWeight('purchase', parseFloat(e.target.value))}
+                    style={inputStyle} />
+                </label>
+              </div>
+            );
+          })()}
           <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem', cursor: 'pointer' }}>
             <input
               type="checkbox"
@@ -3308,6 +3447,27 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             }}
           >
             {planLoading ? tP('running') : tP('runPlan')}
+          </button>
+          <span style={{ marginLeft: '0.5rem' }} />
+          <button
+            type="button"
+            className="secondary"
+            disabled={planLoading}
+            onClick={() => setPlanningConfig({
+              method_selection: {
+                multiple: false,
+                elaborate: false,
+                depth: 1,
+                depth_optimal: false,
+                score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 },
+              },
+              purchase_allowed: false,
+              consolidation: { enabled: true, period_days: 365, allocation_mode: 'fair' },
+            })}
+            title={tP('config.resetDefaultsTitle')}
+            style={{ padding: '6px 12px' }}
+          >
+            {tP('config.resetDefaults')}
           </button>
           <span style={{ marginLeft: '0.5rem' }} />
           <button
@@ -5399,9 +5559,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 const isInitial = run.is_initial === true;
                 const isDesignated = run.is_active_designated === true;
                 const isDesignating = !!planRunDesignating[run.id];
-                // Left border: green for active, blue for initial, transparent otherwise.
-                // Active wins when a run is both (we still show both chips).
-                const accent = isActive ? '#4ade80' : isInitial ? '#60a5fa' : 'transparent';
+                const isOptimal = typeof run.chosen_depth === 'number';
+                // Left border priority: green (active) > blue (initial) > amber (optimal-depth).
+                // Optimal-depth runs get an amber accent so they're distinguishable at a glance
+                // without overriding the active/initial cues, which carry stronger meaning.
+                const accent = isActive ? '#4ade80' : isInitial ? '#60a5fa' : isOptimal ? '#f59e0b' : 'transparent';
                 const expandedTab = planRunExpandedTab[run.id] ?? null;
                 const detail = planRunDetailCache[run.id];
                 const detailLoading = !!planRunDetailLoading[run.id];
@@ -5412,7 +5574,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   paddingLeft: '0.75rem',
                   paddingBottom: '0.75rem',
                   marginBottom: '0.75rem',
-                  background: isActive ? 'rgba(74,222,128,0.04)' : isInitial ? 'rgba(96,165,250,0.04)' : 'transparent',
+                  background: isActive ? 'rgba(74,222,128,0.04)' : isInitial ? 'rgba(96,165,250,0.04)' : isOptimal ? 'rgba(245,158,11,0.04)' : 'transparent',
                 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                     <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
@@ -5437,9 +5599,46 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           {isDesignated ? tP('runHistory.chips.activeDesignated') : tP('runHistory.chips.active')}
                         </span>
                       )}
+                      {typeof run.chosen_depth === 'number' && (
+                        <span
+                          title={tP('runHistory.chosenDepthTitle')}
+                          style={{
+                            fontSize: '0.75rem',
+                            fontWeight: 600,
+                            color: '#fef3c7',
+                            background: '#92400e',
+                            border: '1px solid #f59e0b',
+                            borderRadius: 8,
+                            padding: '1px 8px',
+                          }}
+                        >
+                          {tP('runHistory.chosenDepthChip', { depth: run.chosen_depth })}
+                        </span>
+                      )}
                       <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>
                         {new Date(run.created_at).toLocaleString()}
                       </span>
+                      {typeof run.duration_ms === 'number' && run.duration_ms >= 0 && (() => {
+                        const attempts = run.attempts ?? null;
+                        const hasAttempts = Array.isArray(attempts) && attempts.length > 0;
+                        const elapsedTitle = hasAttempts
+                          ? [
+                              tP('runHistory.elapsedBreakdownTitle'),
+                              ...attempts.map((a) => `  depth ${a.depth}: ${formatElapsedMs(a.duration_ms)}`),
+                              tP('runHistory.elapsedBreakdownTotal', {
+                                ms: formatElapsedMs(attempts.reduce((s, a) => s + a.duration_ms, 0)),
+                              }),
+                            ].join('\n')
+                          : tP('runHistory.elapsedTitle');
+                        return (
+                          <span
+                            title={elapsedTitle}
+                            style={{ fontSize: '0.75rem', color: '#a1a1aa', background: '#27272a', borderRadius: 8, padding: '1px 7px' }}
+                          >
+                            {formatElapsedMs(run.duration_ms)}
+                          </span>
+                        );
+                      })()}
                       {run.override_count > 0 && (
                         <span style={{ background: '#7c3aed', color: '#fff', borderRadius: 8, padding: '1px 6px', fontSize: '0.72rem' }}>
                           {tP('runHistory.overrideCount', { n: run.override_count })}
@@ -6128,8 +6327,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <button type="button" onClick={() => setCopilotOpen(false)} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tP('copilot.close')}</button>
               </div>
               <p style={{ margin: 0, fontSize: '0.8rem', color: '#a1a1aa' }}>
-                <strong>{tP('copilot.variants')}</strong> {planningConfig.variant_selection?.multiple === false ? tP('copilot.singleBest') : tP('copilot.allFeasible')}.{' '}
-                <strong>{tP('copilot.methods')}</strong> {planningConfig.method_selection?.multiple === true ? tP('copilot.equalSplit') : planningConfig.method_selection?.elaborate === true ? tP('copilot.oneByScore') : tP('copilot.oneByPreference')}.{' '}
+                <strong>{tP('copilot.methods')}</strong> {planningConfig.method_selection?.multiple === true
+                  ? tP('copilot.equalSplit')
+                  : planningConfig.method_selection?.elaborate === true
+                    ? tP('copilot.oneByScoreWithDepth', { depth: planningConfig.method_selection?.depth ?? 1 })
+                    : tP('copilot.oneByPreference')}.{' '}
                 <strong>{tP('copilot.purchase')}</strong> {planningConfig.purchase_allowed === false ? tP('copilot.disabled') : tP('copilot.allowed')}.{' '}
                 <strong>{tP('copilot.consolidation')}</strong> {planningConfig.consolidation?.enabled === true
                   ? tP('copilot.consolidationOnDetail', {
@@ -6172,7 +6374,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   if (res.config_update) setPlanningConfig((prev) => ({
                     ...prev,
                     ...res.config_update!,
-                    variant_selection: res.config_update!.variant_selection ? { ...prev.variant_selection, ...res.config_update!.variant_selection } : prev.variant_selection,
                     method_selection: res.config_update!.method_selection ? { ...prev.method_selection, ...res.config_update!.method_selection } : prev.method_selection,
                     purchase_allowed: 'purchase_allowed' in res.config_update! ? res.config_update!.purchase_allowed : prev.purchase_allowed,
                     consolidation: res.config_update!.consolidation ? { ...prev.consolidation, ...res.config_update!.consolidation } : prev.consolidation,
@@ -6183,7 +6384,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   if (configUpdate) setPlanningConfig((prev) => ({
                     ...prev,
                     ...configUpdate,
-                    variant_selection: configUpdate.variant_selection ? { ...prev.variant_selection, ...configUpdate.variant_selection } : prev.variant_selection,
                     method_selection: configUpdate.method_selection ? { ...prev.method_selection, ...configUpdate.method_selection } : prev.method_selection,
                     consolidation: configUpdate.consolidation ? { ...prev.consolidation, ...configUpdate.consolidation } : prev.consolidation,
                   }));

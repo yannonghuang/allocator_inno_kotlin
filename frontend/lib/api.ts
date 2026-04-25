@@ -272,13 +272,32 @@ export type PlanKpis = {
 
 /** Config for planning (e.g. get_preferred_variants). Sent in POST body to /plan. */
 export type PlanningConfig = {
+  /**
+   * Legacy knobs — kept for backwards compat with stored plan runs.
+   * BOM-level variety is modeled as distinct make methods now, so the UI no
+   * longer exposes variant-level selection.
+   */
   variant_selection?: {
     multiple?: boolean | null;
     top_n?: number;
     score_weights?: { commit_time?: number; inventory_consumed?: number; purchase?: number };
   };
-  /** When true, score methods by commit_time/inventory/purchase (slower; run is async with progress). */
-  method_selection?: { elaborate?: boolean; multiple?: boolean };
+  /**
+   * Method selection shape: `mode` + `depth` + `multiple`.
+   * `mode: "elaborate"` scores each candidate by commit_time/inventory/purchase;
+   * `depth` (≥1, default 1) controls how many recursion levels elaborate applies at.
+   * Legacy `elaborate: boolean` is still accepted by the backend.
+   */
+  method_selection?: {
+    mode?: 'preference' | 'elaborate';
+    depth?: number;
+    elaborate?: boolean;
+    multiple?: boolean;
+    /** Relative weights for elaborate scoring. Backend normalizes so absolute values don't matter. */
+    score_weights?: { commit_time?: number; inventory_consumed?: number; purchase?: number };
+    /** When true, backend iterates depth=1..N picking the first non-improving step (using score_weights). */
+    depth_optimal?: boolean;
+  };
   /** When false, the buy/purchase method is excluded from planning. Default: true. */
   purchase_allowed?: boolean;
   /** Consolidate shared component demands within a time bucket before planning. */
@@ -443,6 +462,10 @@ export type PlanRun = {
   is_active?: boolean;
   is_active_designated?: boolean;
   created_at: string;
+  finished_at?: string | null;
+  duration_ms?: number | null;
+  chosen_depth?: number | null;
+  attempts?: Array<{ depth: number; duration_ms: number }> | null;
 };
 
 export type PlanRunEvent = {

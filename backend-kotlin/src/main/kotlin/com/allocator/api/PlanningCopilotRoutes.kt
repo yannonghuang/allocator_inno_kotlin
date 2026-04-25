@@ -52,70 +52,74 @@ private data class PlanningCopilotResponse(
 
 private const val SYSTEM_PROMPT = """You are a friendly planning configuration assistant. Users express their requirements in many different ways, in English or Chinese. Your job is to infer their intent from whatever wording they use—do not expect or require specific phrases. Be conversational and natural. Mirror the user's language (reply in Chinese if they wrote in Chinese).
 
-The plan config has four groups: **variant_selection**, **method_selection**, **purchase_allowed** (top-level boolean), and **consolidation** (demand grouping / bucket settings). Any of these can appear in `config_update`.
+The plan config has three groups: **method_selection** (how make/move/buy methods are chosen), **purchase_allowed** (top-level boolean), and **consolidation** (demand grouping / bucket settings). Any of these can appear in `config_update`. (BOM variants are modeled as distinct make methods, so there is no separate variant config.)
 
 Intent → config mapping (interpret any phrasing that conveys the same intent):
 
-1) **Treat multiple alternatives equally / split demand across options / distribute workload / use all options when multiple exist** (for both variants and methods)
-   → variant_selection: { "multiple": true }, method_selection: { "multiple": true }. (Variants: demand split equally across all feasible variants; integer qty when demand is integer. Methods: demand split equally across all feasible methods make/move/buy.)
-   In your reply, say you're applying equal split to **both** variants and methods.
+1) **Treat multiple methods equally / split demand across make/move/buy / distribute workload across all feasible methods**
+   → method_selection: { "multiple": true }. Demand is split equally across all feasible methods (make/move/buy).
 
-2) **Use only one best option per demand** (e.g. single best variant, pick one, prefer one)
-   → variant_selection: { "multiple": false }. (Engine picks one by: earliest commit, most inventory used, least purchase.)
+2) **Use only one best method per demand / pick one method / by preference**
+   → method_selection: { "multiple": false, "mode": "preference" }. Engine picks one method by the preference number.
 
-3) **Prioritize existing inventory / use what we have / consume more stock** (even if delivery is later)
-   → variant_selection: { "multiple": false, "score_weights": { "commit_time": 0, "inventory_consumed": 1, "purchase": 0 } }.
+3) **Elaborate method selection / score methods (make/move/buy) by criteria** (slower run)
+   → method_selection: { "mode": "elaborate" }. Methods are scored rather than picked by preference.
 
-4) **Minimize new purchases / least additional supply / avoid new buy**
-   → variant_selection: { "multiple": false, "score_weights": { "commit_time": 0, "inventory_consumed": 0, "purchase": 1 } }.
+4) **Set the elaborate search depth to N** (e.g. "method depth 3", "search depth 2", "方法深度 3", "深度 2")
+   → method_selection: { "depth": N } (clamp N ≥ 1). Only meaningful when mode is elaborate.
 
-5) **Earliest delivery / fastest commit**
-   → variant_selection: { "multiple": false, "score_weights": { "commit_time": 1, "inventory_consumed": 0, "purchase": 0 } }.
+4d) **Optimal / auto depth — let the planner pick the best depth** (e.g. "optimal depth", "auto depth", "find best depth", "自动深度", "最优深度")
+    → method_selection: { "mode": "elaborate", "depth_optimal": true }. Planner iterates depth=1,2,3… and stops at the first depth where the weighted plan score does not improve. Capped at 10. Re-run plan to apply.
 
-6) **Split among top N variants** (e.g. top 2, top 3), optionally **by least supply / by inventory**
-   → variant_selection: { "multiple": true, "top_n": N }. Add "score_weights" only if they specify a criterion (e.g. least supply => purchase: 1).
+4e) **Manual / fixed depth — disable auto-depth** (e.g. "fixed depth", "manual depth", "固定深度")
+    → method_selection: { "depth_optimal": false }.
 
-7) **Score methods (make/move/buy) by same criteria as variants** (slower run)
-   → method_selection: { "elaborate": true }. **Use preference only for methods** → method_selection: { "elaborate": false }.
+4a) **Earliest delivery / fastest commit** (weights-only intent; only meaningful when mode is elaborate)
+    → method_selection: { "score_weights": { "commit_time": 1, "inventory_consumed": 0, "purchase": 0 } }.
 
-8) **Allow / enable / use / permit purchase (buy)** (e.g. "allow purchase", "enable buy", "可以使用采购", "允许采购", "启用采购", "开启采购")
+4b) **Prioritize existing inventory / use what we have / consume more stock**
+    → method_selection: { "score_weights": { "commit_time": 0, "inventory_consumed": 1, "purchase": 0 } }.
+
+4c) **Minimize new purchases / least additional supply / avoid new buy**
+    → method_selection: { "score_weights": { "commit_time": 0, "inventory_consumed": 0, "purchase": 1 } }.
+
+5) **Allow / enable / use / permit purchase (buy)** (e.g. "allow purchase", "enable buy", "可以使用采购", "允许采购", "启用采购", "开启采购")
    → purchase_allowed: true.
 
-9) **Disallow / disable / forbid purchase (buy)** (e.g. "no purchase", "disable purchase", "without buy", "禁用采购", "不采购", "不允许采购")
+6) **Disallow / disable / forbid purchase (buy)** (e.g. "no purchase", "disable purchase", "without buy", "禁用采购", "不采购", "不允许采购")
    → purchase_allowed: false.
 
-10) **Enable demand consolidation / group demands / share work orders across demands** (e.g. "enable consolidation", "consolidate demand", "启用合并", "开启合并", "合并需求", "共享组件")
-    → consolidation: { "enabled": true }.
+7) **Enable demand consolidation / group demands / share work orders across demands** (e.g. "enable consolidation", "consolidate demand", "启用合并", "开启合并", "合并需求", "共享组件")
+   → consolidation: { "enabled": true }.
 
-11) **Disable consolidation / turn it off / do not group** (e.g. "禁用合并", "关闭合并", "不合并")
-    → consolidation: { "enabled": false }.
+8) **Disable consolidation / turn it off / do not group** (e.g. "禁用合并", "关闭合并", "不合并")
+   → consolidation: { "enabled": false }.
 
-12) **Set the consolidation bucket / period / window to N days** (e.g. "30 day bucket", "60天窗口", "period 90 days")
-    → consolidation: { "period_days": N } (clamp 1..365).
+9) **Set the consolidation bucket / period / window to N days** (e.g. "30 day bucket", "60天窗口", "period 90 days")
+   → consolidation: { "period_days": N } (clamp 1..365).
 
-13) **Consolidation split policy — proportional / by share / by quantity** (e.g. "proportional split", "按比例", "按数量", "按份额")
+10) **Consolidation split policy — proportional / by share / by quantity** (e.g. "proportional split", "按比例", "按数量", "按份额")
     → consolidation: { "allocation_mode": "proportional" }.
 
-14) **Consolidation split policy — priority-first / fill highest priority first** (e.g. "priority first", "by priority", "优先级优先", "按优先级")
+11) **Consolidation split policy — priority-first / fill highest priority first** (e.g. "priority first", "by priority", "优先级优先", "按优先级")
     → consolidation: { "allocation_mode": "priority_first" }.
 
-15) **Consolidation split policy — fair / hybrid / no one starved** (e.g. "fair split", "公平", "混合拆分")
+12) **Consolidation split policy — fair / hybrid / no one starved** (e.g. "fair split", "公平", "混合拆分")
     → consolidation: { "allocation_mode": "fair" }.
 
-16) **Reset / clear / default** → full defaults:
-    variant_selection: { "multiple": true }, method_selection: { "multiple": false, "elaborate": false }, purchase_allowed: false, consolidation: { "enabled": true, "period_days": 365, "allocation_mode": "fair" }.
+13) **Reset / clear / default** → full defaults:
+    method_selection: { "multiple": false, "mode": "preference", "depth": 1 }, purchase_allowed: false, consolidation: { "enabled": true, "period_days": 365, "allocation_mode": "fair" }.
 
 Valid config_update keys:
-- variant_selection: object with optional "multiple" (bool), "top_n" (int), "score_weights" ({ commit_time, inventory_consumed, purchase } — numeric, normalized to sum 1).
-- method_selection: object with optional "multiple" (bool), "elaborate" (bool).
+- method_selection: object with optional "multiple" (bool), "mode" ("preference" | "elaborate"), "depth" (int ≥ 1), "depth_optimal" (bool), "score_weights" ({ commit_time, inventory_consumed, purchase } — numeric, backend normalizes).
 - purchase_allowed: boolean (top-level, not nested).
 - consolidation: object with optional "enabled" (bool), "period_days" (int 1..365), "allocation_mode" ("fair" | "proportional" | "priority_first").
 
 Respond with valid JSON only, no markdown code fences:
-- "reply": string (required). Acknowledge their intent in their words, say what you set, and mention re-run plan if you changed config. If the user asks to see the current config, describe all four groups (variants, methods, purchase, consolidation) from the supplied current_config.
+- "reply": string (required). Acknowledge their intent in their words, say what you set, and mention re-run plan if you changed config. If the user asks to see the current config, describe all three groups (methods, purchase, consolidation) from the supplied current_config.
 - "config_update": object (optional). Include when you inferred a clear intent. Merge by setting only the keys that change.
 
-Interpret freely: e.g. "equally distribute among alternatives if present", "treat multiple alternatives equally", "handle workload", "when there are multiple ways do X", "split across options", "use all options" → all map to (1). "可以使用采购" / "use purchase" / "turn on buying" → (8). Always mention both variants and methods in your reply for (1). Never say you only handle specific phrases."""
+Interpret freely: e.g. "equally distribute across methods", "handle workload across make/move/buy", "split across options" → (1). "可以使用采购" / "use purchase" / "turn on buying" → (5). Never say you only handle specific phrases."""
 
 private suspend fun llmParse(
     message: String,
@@ -153,26 +157,18 @@ private suspend fun llmParse(
         ?: "I didn't quite get that. Could you rephrase?"
     val configUpdate = parsed["config_update"] as? JsonObject
     val valid = configUpdate?.let { cu ->
-        val vs = cu["variant_selection"] as? JsonObject
         val ms = cu["method_selection"] as? JsonObject
         val cs = cu["consolidation"] as? JsonObject
         val pa = cu["purchase_allowed"]?.jsonPrimitive?.booleanOrNull
-        val vsOk = vs?.let { "multiple" in it || "score_weights" in it || "top_n" in it } == true
-        val msOk = ms?.let { "multiple" in it || "elaborate" in it } == true
+        val msOk = ms?.let { "multiple" in it || "elaborate" in it || "mode" in it || "depth" in it || "depth_optimal" in it || "score_weights" in it } == true
         val csOk = cs?.let { "enabled" in it || "period_days" in it || "allocation_mode" in it } == true
         val paOk = pa != null
-        if (vsOk || msOk || csOk || paOk) cu else null
+        if (msOk || csOk || paOk) cu else null
     }
     return reply to valid
 }
 
 // ── Rule-based fallback (mirrors planning_copilot.py::_rule_based_parse) ─────
-
-private fun mergeVariantSelection(current: JsonObject, patch: Map<String, JsonElement>): JsonObject {
-    val existing = (current["variant_selection"] as? JsonObject)?.toMutableMap() ?: mutableMapOf()
-    existing.putAll(patch)
-    return JsonObject(mapOf("variant_selection" to JsonObject(existing)))
-}
 
 private fun mergeMethodSelection(current: JsonObject, patch: Map<String, JsonElement>): JsonObject {
     val existing = (current["method_selection"] as? JsonObject)?.toMutableMap() ?: mutableMapOf()
@@ -186,26 +182,17 @@ private fun mergeConsolidation(current: JsonObject, patch: Map<String, JsonEleme
     return JsonObject(mapOf("consolidation" to JsonObject(existing)))
 }
 
-private fun scoreWeights(commit: Int, inventory: Int, purchase: Int): JsonObject = JsonObject(
-    mapOf(
-        "commit_time" to JsonPrimitive(commit),
-        "inventory_consumed" to JsonPrimitive(inventory),
-        "purchase" to JsonPrimitive(purchase),
-    )
-)
-
 private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, JsonObject?> {
     val raw = message.trim()
     val t = raw.lowercase()
-    val vs = (current["variant_selection"] as? JsonObject) ?: JsonObject(emptyMap())
     val ms = (current["method_selection"] as? JsonObject) ?: JsonObject(emptyMap())
     val cs = (current["consolidation"] as? JsonObject) ?: JsonObject(emptyMap())
     val purchaseAllowed = current["purchase_allowed"]?.jsonPrimitive?.booleanOrNull
 
     if (t.isBlank()) {
         return (
-            "You can tell me how you'd like planning to behave—for example prefer a single best variant per demand, " +
-                "or split demand across all feasible variants. You can also ask to see the current settings."
+            "You can tell me how you'd like planning to behave—for example use elaborate method selection, " +
+                "split demand across all feasible methods, or allow purchase. You can also ask to see the current settings."
             ) to null
     }
 
@@ -213,32 +200,34 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
         Regex("显示配置|当前配置|查看配置").containsMatchIn(raw)
     ) {
         val parts = mutableListOf<String>()
-        val multi = vs["multiple"]?.jsonPrimitive?.booleanOrNull
-        if (multi == false) {
-            parts.add("single best variant")
-        } else {
-            val topN = vs["top_n"]?.jsonPrimitive?.intOrNull
-            if (topN != null && topN >= 1) parts.add("top $topN variants (split demand among them)")
-            else parts.add("all feasible variants (equal split)")
-        }
-        val sw = vs["score_weights"] as? JsonObject
-        if (sw != null) {
-            val p = sw["purchase"]?.jsonPrimitive?.intOrNull ?: 0
-            val i = sw["inventory_consumed"]?.jsonPrimitive?.intOrNull ?: 0
-            val c = sw["commit_time"]?.jsonPrimitive?.intOrNull ?: 0
-            when {
-                p > 0 && i == 0 && c == 0 -> parts.add("ranked by least additional supply")
-                i > 0 && p == 0 && c == 0 -> parts.add("ranked by most existing inventory used")
-                c > 0 && i == 0 && p == 0 -> parts.add("ranked by earliest commit time")
-                p > 0 || i > 0 || c > 0 -> parts.add("with custom score weights")
-            }
-        }
+        val msElaborate = ms["elaborate"]?.jsonPrimitive?.booleanOrNull == true ||
+            ms["mode"]?.jsonPrimitive?.contentOrNull?.lowercase() == "elaborate"
+        val depth = ms["depth"]?.jsonPrimitive?.intOrNull?.coerceAtLeast(1) ?: 1
         when {
             ms["multiple"]?.jsonPrimitive?.booleanOrNull == true ->
                 parts.add("method equal split (demand divided across all feasible methods)")
-            ms["elaborate"]?.jsonPrimitive?.booleanOrNull == true ->
-                parts.add("elaborate method selection (methods scored by commit/inventory/purchase, same weights as variants)")
-            else -> parts.add("simple method selection (methods by preference only)")
+            msElaborate -> {
+                val sw = ms["score_weights"] as? JsonObject
+                val wc = sw?.get("commit_time")?.jsonPrimitive?.doubleOrNull
+                val wi = sw?.get("inventory_consumed")?.jsonPrimitive?.doubleOrNull
+                val wp = sw?.get("purchase")?.jsonPrimitive?.doubleOrNull
+                val depthOptimal = ms["depth_optimal"]?.jsonPrimitive?.booleanOrNull == true
+                val depthLabel = if (depthOptimal) "auto-depth (optimal search)" else "depth $depth"
+                val label = when {
+                    wc != null && wi != null && wp != null -> {
+                        val weightDesc = when {
+                            wc > 0 && wi == 0.0 && wp == 0.0 -> ", earliest delivery"
+                            wi > 0 && wc == 0.0 && wp == 0.0 -> ", most inventory"
+                            wp > 0 && wc == 0.0 && wi == 0.0 -> ", least purchase"
+                            else -> ", weights commit=${"%.2f".format(wc)} inv=${"%.2f".format(wi)} purch=${"%.2f".format(wp)}"
+                        }
+                        "elaborate method selection ($depthLabel$weightDesc)"
+                    }
+                    else -> "elaborate method selection ($depthLabel)"
+                }
+                parts.add(label)
+            }
+            else -> parts.add("method by preference (single best)")
         }
         parts.add(if (purchaseAllowed == false) "purchase disabled" else "purchase allowed")
         val csEnabled = cs["enabled"]?.jsonPrimitive?.booleanOrNull
@@ -256,79 +245,81 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
         }
         val desc = if (parts.isEmpty()) "default" else parts.joinToString(", ")
         return (
-            "Right now we're using $desc. If you'd like to switch, just say so—e.g. \"use single variant\", \"split across all\", \"allow purchase\", or \"disable consolidation\"."
+            "Right now we're using $desc. If you'd like to switch, just say so—e.g. \"elaborate methods\", \"method depth 3\", \"split across all methods\", \"allow purchase\", or \"disable consolidation\"."
             ) to null
     }
 
-    // Split among top N variants
-    val topNMatch = Regex("top\\s+(\\d+)\\s+variants?").find(t)
-    if (Regex("split|among|divide").containsMatchIn(t) && topNMatch != null) {
-        val n = topNMatch.groupValues[1].toInt().coerceIn(1, 99)
-        return if (Regex("least (additional |new )?(supply|supplies|purchase)|minimum additional|minim(ize|ise) (additional |new )?(supply|supplies|purchase)").containsMatchIn(t)) {
-            "Splitting demand among the top $n variants ranked by least additional supply—the $n variants that need the least new purchase will share the demand equally. Re-run plan to apply." to
-                mergeVariantSelection(current, mapOf(
-                    "multiple" to JsonPrimitive(true),
-                    "top_n" to JsonPrimitive(n),
-                    "score_weights" to scoreWeights(0, 0, 1),
-                ))
-        } else {
-            "Splitting demand among the top $n variants (by current score). Each will get an equal share. Re-run plan to apply." to
-                mergeVariantSelection(current, mapOf(
-                    "multiple" to JsonPrimitive(true),
-                    "top_n" to JsonPrimitive(n),
-                ))
-        }
-    }
-
-    if (Regex("minimum additional (supply|supplies)|minim(ize|ise) (additional |new )?(supply|supplies|purchase|buy)|least (additional |new )?(supply|supplies|purchase)|use minimum additional").containsMatchIn(t)) {
-        return "Changing the score weight distribution so that minimizing new purchase gets all the weight—we'll prefer variants that need the least additional supply, at the expense of fulfillment time and inventory use. Re-run plan to apply." to
-            mergeVariantSelection(current, mapOf(
-                "multiple" to JsonPrimitive(false),
-                "score_weights" to scoreWeights(0, 0, 1),
-            ))
-    }
-
-    if (Regex("inventor(y|ies)|existing (stock|inventory|supply)|use (what we have|existing|current)|most (existing |current )?inventory|minim(ize|ise) (buy|purchase)|least (buy|purchase)|consume (more |existing )?inventory|prefer (existing |current )?stock").containsMatchIn(t)) {
-        return "Changing the score weight distribution so that inventory consumption gets all the weight—at the expense of fulfillment time. The planner will prefer variants that use the most existing inventory; commit times may be later. Re-run plan to apply." to
-            mergeVariantSelection(current, mapOf(
-                "multiple" to JsonPrimitive(false),
-                "score_weights" to scoreWeights(0, 1, 0),
-            ))
-    }
-
-    if (Regex("earliest commit|earliest (delivery|fulfillment|time)|fastest|select.*(alternative|option|variant).*earliest|prefer.*earliest|commit time.*(earliest|first)|minim(ize|ise) (commit )?time").containsMatchIn(t)) {
-        return "Using single best with earliest commit time as the only criterion—the planner will pick the alternative (variant or method when scored) that commits soonest. Re-run plan to apply." to
-            mergeVariantSelection(current, mapOf(
-                "multiple" to JsonPrimitive(false),
-                "score_weights" to scoreWeights(1, 0, 0),
-            ))
-    }
-
-    if (Regex("single|one variant|only one|best variant|use one").containsMatchIn(t)) {
-        return "Got it—I'll use single best variant. The planner will pick one option per demand using earliest commit, most inventory consumed, and least new purchase. Re-run plan to apply." to
-            mergeVariantSelection(current, mapOf("multiple" to JsonPrimitive(false)))
-    }
-
-    if (Regex("all variants|split|multiple variants|every variant|equal split|divide (across|among)|equally distribute|distribute equally|(demand )?among multiple alternatives|multiple alternatives.*(equal|distribute)|equal(ly)? (split|distribute)|alternatives if present|treat multiple alternatives equally|workload").containsMatchIn(t)) {
-        val patch = JsonObject(mapOf(
-            "variant_selection" to JsonObject((vs.toMutableMap()).also { it["multiple"] = JsonPrimitive(true) }),
-            "method_selection" to JsonObject((ms.toMutableMap()).also { it["multiple"] = JsonPrimitive(true) }),
-        ))
-        return "Treating multiple alternatives equally for variants and methods: variants use an equal split across all feasible options (integer quantities when demand is integer); methods use an equal split across all feasible methods (make/move/buy) when multiple can fulfill a demand. Re-run plan to apply." to patch
-    }
-
-    if (Regex("elaborate method|score methods?|method selection.*score|methods? by (commit|inventory|purchase)|turn on elaborate|use elaborate method|enable elaborate").containsMatchIn(t) ||
-        Regex("精细方法|方法评分|按评分选方法").containsMatchIn(raw)
+    // ── Optimal depth search (auto-pick depth) ──
+    if (Regex("optimal depth|auto depth|auto-depth|best depth|find depth|search depth").containsMatchIn(t) ||
+        Regex("自动深度|最优深度|最佳深度").containsMatchIn(raw)
     ) {
-        return "Turning on elaborate method selection. Methods (make/move/buy) will be scored by the same criteria as variants: earliest commit time, most inventory consumed, least new purchase—using the same score weights you set for variant selection. Re-run plan to apply (this mode is slower)." to
-            mergeMethodSelection(current, mapOf("elaborate" to JsonPrimitive(true)))
+        return "Enabling optimal depth search: planner will iterate depth=1, 2, 3 … and stop at the first depth where the weighted plan score does not improve. Capped at 10. Re-run plan to apply." to
+            mergeMethodSelection(current, mapOf("mode" to JsonPrimitive("elaborate"), "depth_optimal" to JsonPrimitive(true)))
+    }
+    if (Regex("manual depth|fixed depth|disable optimal depth|disable auto[- ]depth|turn off auto[- ]depth").containsMatchIn(t) ||
+        Regex("固定深度|手动深度|关闭自动深度|关闭最优深度").containsMatchIn(raw)
+    ) {
+        return "Disabling optimal depth search. Planner will use the fixed depth value." to
+            mergeMethodSelection(current, mapOf("depth_optimal" to JsonPrimitive(false)))
     }
 
-    if (Regex("simple method|preference only|methods? by preference|turn off elaborate|disable elaborate|use simple method|prefer methods? by preference").containsMatchIn(t) ||
-        Regex("按偏好|偏好方法|级联方法").containsMatchIn(raw)
+    // ── Method depth (e.g. "method depth 3", "depth to 2", "方法深度 3", "深度 2") ──
+    val depthMatch = Regex("(?:method\\s+)?depth\\s*(?:=|:|to)?\\s*(\\d+)").find(t)
+    val zhDepthMatch = Regex("方法深度\\s*[:=]?\\s*(\\d+)|深度\\s*[:=]?\\s*(\\d+)").find(raw)
+    if (depthMatch != null || zhDepthMatch != null) {
+        val n = (depthMatch?.groupValues?.get(1)
+            ?: zhDepthMatch?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }
+            ?: "1").toIntOrNull() ?: 1
+        val d = n.coerceAtLeast(1)
+        return "Setting elaborate method depth to $d. Re-run plan to apply (depth only takes effect when method mode is elaborate)." to
+            mergeMethodSelection(current, mapOf("depth" to JsonPrimitive(d), "depth_optimal" to JsonPrimitive(false)))
+    }
+
+    // ── Score weights (only applicable when elaborate mode is on) ──
+    fun scoreWeightsPatch(commit: Double, inv: Double, purchase: Double): JsonElement = JsonObject(mapOf(
+        "commit_time" to JsonPrimitive(commit),
+        "inventory_consumed" to JsonPrimitive(inv),
+        "purchase" to JsonPrimitive(purchase),
+    ))
+    if (Regex("earliest commit|earliest (delivery|fulfillment|time)|fastest|prefer.*earliest|commit time.*(earliest|first)|minim(ize|ise) (commit )?time").containsMatchIn(t) ||
+        Regex("最早交付|最快交付|最早提交").containsMatchIn(raw)
     ) {
-        return "Using simple method selection (preference only). The planner will pick make/move/buy by the preference number only, not by scoring. Re-run plan to apply." to
-            mergeMethodSelection(current, mapOf("elaborate" to JsonPrimitive(false)))
+        return "Weighting elaborate scoring toward earliest commit time (commit=1, inventory=0, purchase=0). Re-run plan to apply (takes effect when method mode is elaborate)." to
+            mergeMethodSelection(current, mapOf("score_weights" to scoreWeightsPatch(1.0, 0.0, 0.0)))
+    }
+    if (Regex("inventor(y|ies)|existing (stock|inventory|supply)|use (what we have|existing|current)|most (existing |current )?inventory|consume (more |existing )?inventory|prefer (existing |current )?stock").containsMatchIn(t) ||
+        Regex("优先(使用)?库存|消耗库存|现有库存").containsMatchIn(raw)
+    ) {
+        return "Weighting elaborate scoring toward most inventory consumed (commit=0, inventory=1, purchase=0). Re-run plan to apply (takes effect when method mode is elaborate)." to
+            mergeMethodSelection(current, mapOf("score_weights" to scoreWeightsPatch(0.0, 1.0, 0.0)))
+    }
+    if (Regex("minimum additional (supply|supplies)|minim(ize|ise) (additional |new )?(supply|supplies|purchase|buy)|least (additional |new )?(supply|supplies|purchase)|avoid (new )?purchase|avoid (new )?buy").containsMatchIn(t) ||
+        Regex("最少采购|减少采购|避免采购").containsMatchIn(raw)
+    ) {
+        return "Weighting elaborate scoring toward least purchase (commit=0, inventory=0, purchase=1). Re-run plan to apply (takes effect when method mode is elaborate)." to
+            mergeMethodSelection(current, mapOf("score_weights" to scoreWeightsPatch(0.0, 0.0, 1.0)))
+    }
+
+    // ── Equal split across methods ──
+    if (Regex("equal(ly)? (split|distribute)|split across (all )?methods?|divide (across|among) methods?|all methods?|every method|distribute.*methods?|workload across methods?").containsMatchIn(t) ||
+        Regex("方法.*平均|方法.*等分|方法均分|按方法平均分配").containsMatchIn(raw)
+    ) {
+        return "Splitting demand equally across all feasible methods (make/move/buy). Re-run plan to apply." to
+            mergeMethodSelection(current, mapOf("multiple" to JsonPrimitive(true)))
+    }
+
+    if (Regex("elaborate method|score methods?|method selection.*score|methods? by (commit|inventory|purchase)|turn on elaborate|use elaborate method|enable elaborate|elaborate mode").containsMatchIn(t) ||
+        Regex("精细方法|方法评分|按评分选方法|精细模式").containsMatchIn(raw)
+    ) {
+        return "Turning on elaborate method selection. Methods (make/move/buy) will be scored rather than picked by preference. Re-run plan to apply (this mode is slower)." to
+            mergeMethodSelection(current, mapOf("mode" to JsonPrimitive("elaborate")))
+    }
+
+    if (Regex("simple method|preference only|methods? by preference|turn off elaborate|disable elaborate|use simple method|prefer methods? by preference|preference mode").containsMatchIn(t) ||
+        Regex("按偏好|偏好方法|偏好模式|级联方法").containsMatchIn(raw)
+    ) {
+        return "Using method selection by preference (single best). The planner will pick make/move/buy by the preference number only. Re-run plan to apply." to
+            mergeMethodSelection(current, mapOf("mode" to JsonPrimitive("preference"), "multiple" to JsonPrimitive(false)))
     }
 
     // ── Purchase toggle ──
@@ -400,8 +391,16 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
         Regex("重置|默认|清除").containsMatchIn(raw)
     ) {
         val patch = buildJsonObject {
-            put("variant_selection", buildJsonObject { put("multiple", true) })
-            put("method_selection", buildJsonObject { put("multiple", false); put("elaborate", false) })
+            put("method_selection", buildJsonObject {
+                put("multiple", false)
+                put("mode", "preference")
+                put("depth", 1)
+                put("score_weights", buildJsonObject {
+                    put("commit_time", 0.4)
+                    put("inventory_consumed", 0.35)
+                    put("purchase", 0.25)
+                })
+            })
             put("purchase_allowed", false)
             put("consolidation", buildJsonObject {
                 put("enabled", true)
@@ -409,11 +408,11 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
                 put("allocation_mode", "fair")
             })
         }
-        return "Reset to defaults: all feasible variants (equal split), simple method selection, purchase disabled, consolidation on (365-day bucket, fair split). Re-run plan to apply." to patch
+        return "Reset to defaults: method by preference, purchase disabled, consolidation on (365-day bucket, fair split). Re-run plan to apply." to patch
     }
 
     return (
-        "I'm not sure I caught that. I can configure four things: variant selection (single best / split / top-N), method selection (preference / elaborate / equal-split), purchase allowed, and consolidation (on/off, bucket days, split mode). What would you like?"
+        "I'm not sure I caught that. I can configure three things: method selection (preference / elaborate / equal-split, plus elaborate depth), purchase allowed, and consolidation (on/off, bucket days, split mode). What would you like?"
         ) to null
 }
 

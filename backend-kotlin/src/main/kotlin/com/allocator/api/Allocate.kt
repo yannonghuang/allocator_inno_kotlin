@@ -3,6 +3,8 @@ package com.allocator.api
 import com.allocator.*
 import com.allocator.services.CaseLoader
 import com.allocator.services.getMethods
+import com.allocator.services.resolveMethodSelection
+import com.allocator.services.resolveVariantSelection
 import com.allocator.services.roundQty
 import com.allocator.services.runAllocation
 import com.allocator.services.runPlanning
@@ -395,6 +397,10 @@ fun Routing.allocateRoutes() {
                 val overrideCount = parsedSnapshot?.size ?: 0
                 val preview: JsonElement? = parsedSnapshot?.take(3)?.let { JsonArray(it) }
                 val runId = row[PlanRuns.id]
+                val startedInstant = row[PlanRuns.createdAt]
+                val finishedInstant = row[PlanRuns.finishedAt]
+                val chosenDepth = row[PlanRuns.chosenDepth]
+                val attempts = parseAttempts(row[PlanRuns.attempts])
                 PlanRunResponse(
                     id = runId,
                     caseId = row[PlanRuns.caseId],
@@ -408,7 +414,11 @@ fun Routing.allocateRoutes() {
                     isInitial = (runId == initialRunId),
                     isActive = (runId == activeRunId),
                     isActiveDesignated = (runId == activeRunId && designatedId != null && runId == designatedId),
-                    createdAt = formatTs(row[PlanRuns.createdAt]),
+                    createdAt = formatTs(startedInstant),
+                    finishedAt = finishedInstant?.let { formatTs(it) },
+                    durationMs = displayedDurationMs(startedInstant, finishedInstant, chosenDepth, attempts),
+                    chosenDepth = chosenDepth,
+                    attempts = attempts,
                 )
             }
         }
@@ -427,13 +437,15 @@ fun Routing.allocateRoutes() {
         data class ReadyRow(
             val id: Int, val name: String?, val notes: String?,
             val config: String?, val createdAt: kotlinx.datetime.Instant,
+            val finishedAt: kotlinx.datetime.Instant?, val chosenDepth: Int?,
+            val attempts: String?,
         )
         val readyRow = transaction {
             PlanRuns.selectAll()
                 .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "ready") }
                 .orderBy(PlanRuns.id, SortOrder.DESC)
                 .firstOrNull()
-                ?.let { r -> ReadyRow(r[PlanRuns.id], r[PlanRuns.name], r[PlanRuns.notes], r[PlanRuns.config], r[PlanRuns.createdAt]) }
+                ?.let { r -> ReadyRow(r[PlanRuns.id], r[PlanRuns.name], r[PlanRuns.notes], r[PlanRuns.config], r[PlanRuns.createdAt], r[PlanRuns.finishedAt], r[PlanRuns.chosenDepth], r[PlanRuns.attempts]) }
         }
 
         if (readyRow == null) {
@@ -449,6 +461,7 @@ fun Routing.allocateRoutes() {
             return@get
         }
 
+        val readyAttempts = parseAttempts(readyRow.attempts)
         call.respond(PlanRunFullResponse(
             id = readyRow.id,
             caseId = caseId,
@@ -461,6 +474,10 @@ fun Routing.allocateRoutes() {
             name = readyRow.name,
             notes = readyRow.notes,
             createdAt = formatTs(readyRow.createdAt),
+            finishedAt = readyRow.finishedAt?.let { formatTs(it) },
+            durationMs = displayedDurationMs(readyRow.createdAt, readyRow.finishedAt, readyRow.chosenDepth, readyAttempts),
+            chosenDepth = readyRow.chosenDepth,
+            attempts = readyAttempts,
         ))
     }
 
@@ -477,6 +494,9 @@ fun Routing.allocateRoutes() {
             val result: String?, val error: String?,
             val name: String?, val notes: String?,
             val createdAt: kotlinx.datetime.Instant,
+            val finishedAt: kotlinx.datetime.Instant?,
+            val chosenDepth: Int?,
+            val attempts: String?,
         )
         val raw = transaction {
             val row = PlanRuns.selectAll().where {
@@ -489,6 +509,9 @@ fun Routing.allocateRoutes() {
                 result = row[PlanRuns.result], error = row[PlanRuns.error],
                 name = row[PlanRuns.name], notes = row[PlanRuns.notes],
                 createdAt = row[PlanRuns.createdAt],
+                finishedAt = row[PlanRuns.finishedAt],
+                chosenDepth = row[PlanRuns.chosenDepth],
+                attempts = row[PlanRuns.attempts],
             )
         }
 
@@ -549,6 +572,7 @@ fun Routing.allocateRoutes() {
             )
         }
 
+        val rawAttempts = parseAttempts(raw.attempts)
         val response = PlanRunFullResponse(
             id = raw.id,
             caseId = raw.caseId,
@@ -565,6 +589,10 @@ fun Routing.allocateRoutes() {
             isActiveDesignated = flags.isActiveDesignated,
             events = flags.events,
             createdAt = formatTs(raw.createdAt),
+            finishedAt = raw.finishedAt?.let { formatTs(it) },
+            durationMs = displayedDurationMs(raw.createdAt, raw.finishedAt, raw.chosenDepth, rawAttempts),
+            chosenDepth = raw.chosenDepth,
+            attempts = rawAttempts,
         )
         call.respond(response)
     }
@@ -1233,6 +1261,128 @@ private fun enrichPlanResultWithData(
     return enriched
 }
 
+/** Parse the persisted `attempts` JSON column into a JsonArray (or null on bad/missing input). */
+private fun parseAttempts(raw: String?): JsonArray? {
+    if (raw == null) return null
+    return runCatching { Json.parseToJsonElement(raw) as? JsonArray }.getOrNull()
+}
+
+/** When optimal-depth search ran, the meaningful elapsed time is the chosen
+ *  depth's own attempt — not the cumulative search. Falls back to (finish - start)
+ *  for fixed-depth runs or when the chosen attempt isn't present in the log. */
+private fun displayedDurationMs(
+    createdAt: kotlinx.datetime.Instant,
+    finishedAt: kotlinx.datetime.Instant?,
+    chosenDepth: Int?,
+    attempts: JsonArray?,
+): Long? {
+    if (chosenDepth != null && attempts != null) {
+        val match = attempts.firstOrNull { el ->
+            (el as? JsonObject)?.get("depth")?.jsonPrimitive?.intOrNull == chosenDepth
+        } as? JsonObject
+        val ms = match?.get("duration_ms")?.jsonPrimitive?.longOrNull
+        if (ms != null) return ms
+    }
+    return finishedAt?.let { it.toEpochMilliseconds() - createdAt.toEpochMilliseconds() }
+}
+
+/** Read a single dimension out of plan_kpis (defaulting to 0.0 when missing). */
+private fun kpiTriplet(enriched: Map<String, Any>): Triple<Double, Double, Double> {
+    @Suppress("UNCHECKED_CAST")
+    val kpis = enriched["plan_kpis"] as? Map<String, Any?> ?: emptyMap()
+    @Suppress("UNCHECKED_CAST")
+    val delivery = kpis["delivery"] as? Map<String, Any?> ?: emptyMap()
+    @Suppress("UNCHECKED_CAST")
+    val inventory = kpis["inventory"] as? Map<String, Any?> ?: emptyMap()
+    @Suppress("UNCHECKED_CAST")
+    val procurement = kpis["procurement"] as? Map<String, Any?> ?: emptyMap()
+    val onTime = (delivery["on_time_count"] as? Number)?.toDouble() ?: 0.0
+    val invConsumed = (inventory["consumed_total"] as? Number)?.toDouble() ?: 0.0
+    val purchaseQty = (procurement["total_quantity"] as? Number)?.toDouble() ?: 0.0
+    return Triple(onTime, invConsumed, purchaseQty)
+}
+
+/** Compute the weighted relative improvement of `cur` vs `prev` using the user's
+ *  score_weights (commit_time / inventory_consumed / purchase). Returns a scale-free
+ *  number; positive ⇒ improvement, ≤ 0 ⇒ stop.
+ *
+ *  Each dimension is normalized by its previous magnitude so weights act on
+ *  fractional change. Purchase is inverted (lower is better). */
+private fun weightedImprovement(
+    prev: Triple<Double, Double, Double>,
+    cur: Triple<Double, Double, Double>,
+    weights: Map<String, Any?>?,
+): Double {
+    val wc = (weights?.get("commit_time") as? Number)?.toDouble() ?: 0.4
+    val wi = (weights?.get("inventory_consumed") as? Number)?.toDouble() ?: 0.35
+    val wp = (weights?.get("purchase") as? Number)?.toDouble() ?: 0.25
+    val (oP, iP, pP) = prev
+    val (oC, iC, pC) = cur
+    val rc = (oC - oP) / kotlin.math.max(1.0, kotlin.math.abs(oP))
+    val ri = (iC - iP) / kotlin.math.max(1.0, kotlin.math.abs(iP))
+    val rp = (pP - pC) / kotlin.math.max(1.0, kotlin.math.abs(pP))   // lower purchase is better
+    return wc * rc + wi * ri + wp * rp
+}
+
+/** Build a fresh config map with method_selection.depth = `depth` and elaborate forced on. */
+private fun configForDepth(config: Map<String, Any?>?, depth: Int): Map<String, Any?> {
+    val base = config?.toMutableMap() ?: mutableMapOf()
+    @Suppress("UNCHECKED_CAST")
+    val ms = (base["method_selection"] as? Map<String, Any?>)?.toMutableMap() ?: mutableMapOf()
+    ms["mode"] = "elaborate"
+    ms["depth"] = depth
+    ms["depth_optimal"] = false   // collapse to a normal elaborate run within the loop
+    base["method_selection"] = ms
+    return base
+}
+
+/** Same shape as configForDepth, but emits JSON for the persisted config snapshot. */
+private fun overrideConfigDepth(config: Map<String, Any?>?, depth: Int): JsonElement {
+    return resolveEffectiveConfig(configForDepth(config, depth))
+}
+
+/** Iterate elaborate planning at depth=1, 2, … until the weighted improvement
+ *  vs. the previous depth is non-positive, or MAX_OPTIMAL_DEPTH is reached.
+ *  Returns the enriched best plan, the depth that produced it, and a per-attempt
+ *  duration log so the UI can show what each depth cost. */
+private suspend fun runOptimalDepthPlanning(
+    data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
+    caseId: Int,
+    progressCallback: (Map<String, Any?>) -> Unit,
+    methodCfg: com.allocator.services.MethodSelectionConfig,
+): Triple<Map<String, Any>, Int, List<Map<String, Long>>> {
+    var bestEnriched: Map<String, Any>? = null
+    var bestDepth = 1
+    var prevTriplet: Triple<Double, Double, Double>? = null
+    val attempts = mutableListOf<Map<String, Long>>()
+    val cap = kotlin.math.min(com.allocator.services.MAX_OPTIMAL_DEPTH, 500)
+    for (d in 1..cap) {
+        val cfg = configForDepth(config, d)
+        val attemptStart = kotlinx.datetime.Clock.System.now()
+        val raw = runPlanning(data, config = cfg, progressCallback = progressCallback)
+        val enriched = enrichPlanResultWithData(caseId, raw, data)
+        val attemptMs = kotlinx.datetime.Clock.System.now().toEpochMilliseconds() - attemptStart.toEpochMilliseconds()
+        attempts.add(mapOf("depth" to d.toLong(), "duration_ms" to attemptMs))
+        val triplet = kpiTriplet(enriched)
+        if (prevTriplet == null) {
+            bestEnriched = enriched
+            bestDepth = d
+            prevTriplet = triplet
+            continue
+        }
+        val delta = weightedImprovement(prevTriplet, triplet, methodCfg.scoreWeights)
+        if (delta > 1e-6) {
+            bestEnriched = enriched
+            bestDepth = d
+            prevTriplet = triplet
+        } else {
+            break  // first non-improvement: keep the previous depth's plan
+        }
+    }
+    return Triple(bestEnriched!!, bestDepth, attempts.toList())
+}
+
 private suspend fun runPlanBackground(
     jobId: String,
     caseId: Int,
@@ -1277,14 +1427,43 @@ private suspend fun runPlanBackground(
                 }
             }
         }
-        val result = runPlanning(data, config = config, progressCallback = progressCb)
-        val enriched = enrichPlanResultWithData(caseId, result, data)
+
+        val methodCfg = com.allocator.services.resolveMethodSelection(config)
+        val (enriched, chosenDepth, attempts) = if (methodCfg.depthOptimal) {
+            val (e, d, a) = runOptimalDepthPlanning(data, config, caseId, progressCb, methodCfg)
+            Triple(e, d as Int?, a)
+        } else {
+            val raw = runPlanning(data, config = config, progressCallback = progressCb)
+            Triple(enrichPlanResultWithData(caseId, raw, data), null as Int?, emptyList<Map<String, Long>>())
+        }
         casePlanResults[caseId] = enriched
 
-        // Mark run as ready (result not yet persisted — user must explicitly save)
+        // Mark run as ready (result not yet persisted — user must explicitly save).
+        // When optimal-depth search ran, rewrite the config snapshot so subsequent
+        // "view config" displays reflect the depth that was actually used, and
+        // persist per-depth attempt durations so the UI can attribute elapsed
+        // time to the depth that was actually chosen.
         transaction {
             PlanRuns.update({ PlanRuns.id eq planRunId }) {
                 it[PlanRuns.status] = "ready"
+                it[PlanRuns.finishedAt] = kotlinx.datetime.Clock.System.now()
+                if (chosenDepth != null) {
+                    it[PlanRuns.config] = overrideConfigDepth(config, chosenDepth).toString()
+                    it[PlanRuns.chosenDepth] = chosenDepth
+                }
+                if (attempts.isNotEmpty()) {
+                    it[PlanRuns.attempts] = JsonArray(attempts.map { a ->
+                        buildJsonObject {
+                            put("depth", JsonPrimitive(a["depth"]))
+                            put("duration_ms", JsonPrimitive(a["duration_ms"]))
+                        }
+                    }).toString()
+                }
+            }
+            if (chosenDepth != null) {
+                com.allocator.services.emitPlanRunEvent(caseId, planRunId, "optimal_depth_chosen", buildJsonObject {
+                    put("depth", JsonPrimitive(chosenDepth))
+                })
             }
         }
 
@@ -1299,6 +1478,7 @@ private suspend fun runPlanBackground(
             PlanRuns.update({ PlanRuns.id eq planRunId }) {
                 it[PlanRuns.status] = "failed"
                 it[PlanRuns.error] = e.message ?: "Unknown error"
+                it[PlanRuns.finishedAt] = kotlinx.datetime.Clock.System.now()
             }
         }
         planJobs[jobId]?.let { job ->
@@ -1459,20 +1639,32 @@ private fun markRunFailed(runId: Int, caseId: Int, error: String) {
 @Suppress("UNCHECKED_CAST")
 private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
     val c = config ?: emptyMap()
-    val methodSel     = (c["method_selection"]  as? Map<*, *>)?.let { it as Map<String, Any?> } ?: emptyMap()
-    val variantSel    = (c["variant_selection"] as? Map<*, *>)?.let { it as Map<String, Any?> } ?: emptyMap()
     val consolidation = (c["consolidation"]     as? Map<*, *>)?.let { it as Map<String, Any?> } ?: emptyMap()
+    val methodCfg = resolveMethodSelection(c)
+    val variantCfg = resolveVariantSelection(c)
 
     return buildJsonObject {
         put("purchase_allowed", c["purchase_allowed"] as? Boolean ?: true)
         putJsonObject("method_selection") {
-            put("elaborate", methodSel["elaborate"] as? Boolean ?: false)
-            put("multiple",  methodSel["multiple"]  as? Boolean ?: false)
+            put("mode",      methodCfg.mode)
+            put("depth",     methodCfg.depth)
+            put("elaborate", methodCfg.elaborate)  // legacy mirror — consumers still read this
+            put("multiple",  methodCfg.multiple)
+            put("depth_optimal", methodCfg.depthOptimal)
+            // Always materialize score_weights (with engine defaults) so the persisted
+            // snapshot is self-describing — viewing config later shows the exact weights
+            // that were in effect, not a hole the reader has to know to fill in.
+            val w = methodCfg.scoreWeights
+            putJsonObject("score_weights") {
+                put("commit_time",        (w?.get("commit_time")        as? Number)?.toDouble() ?: 0.4)
+                put("inventory_consumed", (w?.get("inventory_consumed") as? Number)?.toDouble() ?: 0.35)
+                put("purchase",           (w?.get("purchase")           as? Number)?.toDouble() ?: 0.25)
+            }
         }
         putJsonObject("variant_selection") {
-            put("multiple", variantSel["multiple"] as? Boolean ?: true)
-            variantSel["score_weights"]?.let { put("score_weights", anyToJson(it)) }
-            variantSel["top_n"]?.let { put("top_n", (it as? Number)?.toInt() ?: 0) }
+            put("multiple", variantCfg.multiple ?: true)
+            variantCfg.scoreWeights?.let { put("score_weights", anyToJson(it)) }
+            variantCfg.topN?.let { put("top_n", it) }
         }
         putJsonObject("consolidation") {
             put("enabled",         consolidation["enabled"]      as? Boolean ?: false)
