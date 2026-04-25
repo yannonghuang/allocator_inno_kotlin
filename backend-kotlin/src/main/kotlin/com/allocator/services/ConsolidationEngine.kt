@@ -581,7 +581,16 @@ fun runConsolidation(
             // planKpis to exclude this entry from the supply-consumption sum, which prevents
             // double-counting (the main planning loop's tree already accounts for those units
             // via the tagged consolidated supply bucket that is injected below).
-            if (pegging != null) consolidatedPegging.add(mapOf("demand_id" to need.demandId, "passthrough" to true, "tree" to pegging))
+            // per_demand_allocations: weights used by PlanningEngine.extractSupplyAllocations and
+            // by the frontend supplyPeggingMap to attribute supply consumption to demands directly,
+            // instead of relying on the synthetic tagged-bucket inversion (which under-counts raw
+            // materials consumed inside the BOM chain — they have no consolidated_<demandId> bucket).
+            if (pegging != null) consolidatedPegging.add(mapOf(
+                "demand_id" to need.demandId,
+                "passthrough" to true,
+                "per_demand_allocations" to mapOf(need.demandId to producedQty),
+                "tree" to pegging,
+            ))
             allocation.getOrPut(need.demandId) { mutableMapOf() }[componentKey] = producedQty
             // Consume from real inventory by walking the pegging tree so every supply leaf
             // (top-level component AND raw materials deep in the BOM) is depleted.  This is
@@ -677,10 +686,17 @@ fun runConsolidation(
             // Include the demand_ids that share this consolidated supply so the frontend
             // can attribute supply pegging to specific demands (supply view "Pegged Demands" column).
             val consolidatedDemandIds = split.filter { (_, qty) -> qty > 1e-12 }.keys.filterNotNull().toList()
+            // per_demand_allocations: actual allocated quantities per demand. Used by
+            // PlanningEngine.extractSupplyAllocations to split each supply leaf qty proportionally
+            // across demands, and by the frontend supplyPeggingMap to attribute consumed quantities.
+            val perDemandAllocations: Map<String, Double> = split.entries
+                .filter { (k, v) -> k != null && v > 1e-12 }
+                .associate { (k, v) -> (k as String) to v }
             if (pegging != null) consolidatedPegging.add(mapOf(
                 "demand_id" to null,
                 "consolidated" to true,
                 "consolidated_demand_ids" to consolidatedDemandIds,
+                "per_demand_allocations" to perDemandAllocations,
                 "tree" to pegging,
             ))
 

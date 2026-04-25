@@ -316,6 +316,28 @@ function formatCommitReason(reason: string, purchaseAllowed: boolean): { label: 
   const tooltip = chain.map(c => `${c.product} @ ${c.location}`).join(' → ') + ` → ${rootCause}`;
   return { label, tooltip };
 }
+/**
+ * Human-readable description of a consolidation split policy.
+ * Used in both the WO and Supply Explain panels so users can see what
+ * "Fair" / "Proportional" / "Priority first" actually mean — the formula,
+ * what it splits with respect to, and the shortage behaviour.
+ */
+function splitPolicyExplanation(
+  mode: string | null | undefined,
+  tP: (k: string) => string,
+): { headline: string; detail: string } {
+  switch (mode) {
+    case 'proportional':
+      return { headline: tP('policyExp.proportionalHeadline'), detail: tP('policyExp.proportionalDetail') };
+    case 'priority_first':
+      return { headline: tP('policyExp.priorityFirstHeadline'), detail: tP('policyExp.priorityFirstDetail') };
+    case 'fair':
+      return { headline: tP('policyExp.fairHeadline'), detail: tP('policyExp.fairDetail') };
+    default:
+      return { headline: mode ?? tP('policyExp.unknownHeadline'), detail: tP('policyExp.unknownDetail') };
+  }
+}
+
 import { PeggingTree, pathKeyFromPath, type PeggingGraph } from '@/app/components/PeggingTree';
 import BomGraphTab from '@/app/components/BomGraphTab';
 import { qtyFmt } from '@/app/lib/format';
@@ -1912,19 +1934,31 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         // we skip above — so this entry is the one that credits real supplies.
         walk(entry.tree, entry.demand_id, null);
       } else if (entry.consolidated && !entry.demand_id) {
-        // Multi-demand consolidated: distribute real supplies by actual tagged consumption.
-        const rootPid = entry.tree?.product_id ?? '';
-        const rootLid = entry.tree?.location_id ?? '';
-        const weights = taggedConsumption.get(`${rootPid}|${rootLid}`) ?? null;
+        // Multi-demand consolidated: distribute real supplies across the demands that
+        // share this group. Prefer the backend-supplied `per_demand_allocations` weights
+        // (covers raw-material groups where there is no synthetic tagged bucket); fall
+        // back to the tagged-consumption inversion for older runs without that field.
         let narrowed: Map<string, number> | null = null;
-        if (weights && entry.consolidated_demand_ids && entry.consolidated_demand_ids.length > 0) {
+        if (entry.per_demand_allocations && Object.keys(entry.per_demand_allocations).length > 0) {
           narrowed = new Map();
-          for (const demandId of entry.consolidated_demand_ids) {
-            const w = weights.get(demandId);
-            if (w && w > 1e-9) narrowed.set(demandId, w);
+          for (const [demandId, w] of Object.entries(entry.per_demand_allocations)) {
+            if (typeof w === 'number' && w > 1e-9) narrowed.set(demandId, w);
           }
-        } else if (weights) {
-          narrowed = weights;
+          if (narrowed.size === 0) narrowed = null;
+        }
+        if (!narrowed) {
+          const rootPid = entry.tree?.product_id ?? '';
+          const rootLid = entry.tree?.location_id ?? '';
+          const weights = taggedConsumption.get(`${rootPid}|${rootLid}`) ?? null;
+          if (weights && entry.consolidated_demand_ids && entry.consolidated_demand_ids.length > 0) {
+            narrowed = new Map();
+            for (const demandId of entry.consolidated_demand_ids) {
+              const w = weights.get(demandId);
+              if (w && w > 1e-9) narrowed.set(demandId, w);
+            }
+          } else if (weights) {
+            narrowed = weights;
+          }
         }
         walk(entry.tree, null, narrowed);
       } else if (entry.demand_id && !entry.consolidated && !entry.passthrough) {
@@ -1997,9 +2031,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       const rootLid = entry.tree?.location_id ?? '';
       const split = woSplitByGroup.get(`${rootPid}|${rootLid}`);
 
+      // Prefer backend-supplied per_demand_allocations (covers raw-material groups too);
+      // fall back to deriving from split details when not present.
+      const perDemandAllocations: Record<string, number> | null = entry.per_demand_allocations
+        ? Object.fromEntries(
+            Object.entries(entry.per_demand_allocations).filter(([, v]) => typeof v === 'number' && (v as number) > 1e-9) as [string, number][]
+          )
+        : null;
+
       let info: SupplySplitInfo;
       if (split) {
         const totalNeed = split.splitDetails.reduce((s, d) => s + (d.requested_qty ?? 0), 0);
+        const fallbackPda: Record<string, number> = {};
+        for (const d of split.splitDetails) {
+          if (d.demand_id && d.allocated_qty > 1e-9) fallbackPda[d.demand_id] = d.allocated_qty;
+        }
         info = {
           mode: split.mode,
           groupProductId: rootPid,
@@ -2007,6 +2053,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           groupTotalNeed: totalNeed,
           groupTotalProduced: split.totalPlanned,
           candidateCount: split.splitDetails.length,
+          perDemandAllocations: perDemandAllocations ?? (Object.keys(fallbackPda).length > 0 ? fallbackPda : null),
+          policySource: 'wo',
         };
       } else {
         // Fallback: raw-material group (no WO). Derive from the pegging entry itself.
@@ -2023,6 +2071,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           groupTotalNeed: totalNeed,
           groupTotalProduced: totalProduced,
           candidateCount,
+          perDemandAllocations,
+          policySource: 'config',
         };
       }
 
@@ -5879,35 +5929,39 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       {overrideDialogOpen && (overrideDialogWo || overrideDialogSupply) && typeof document !== 'undefined' && createPortal(
         <div style={{ position: 'fixed', inset: 0, zIndex: 10000, display: 'flex', alignItems: 'center', justifyContent: 'center' }} role="dialog" aria-label="Override dialog">
           <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.6)' }} onClick={() => setOverrideDialogOpen(false)} aria-hidden />
-          <div style={{ position: 'relative', zIndex: 10, width: overrideDialogType === 'supply_split' ? 640 : 480, maxWidth: '92vw', background: '#1c1c1e', color: '#e4e4e7', borderRadius: 10, boxShadow: '0 8px 32px rgba(0,0,0,0.5)', padding: '1.5rem', boxSizing: 'border-box', overflow: 'hidden' }}>
-            <h3 style={{ margin: '0 0 0.25rem', fontSize: '1rem' }}>
-              {overrideDialogType === 'method_selection' ? 'Override method selection'
-                : overrideDialogType === 'supply_split' ? tP('supplyView.overrideSplitTitle')
-                : 'Override component split allocation'}
-            </h3>
-            {overrideDialogType === 'supply_split' && overrideDialogSupply ? (
-              <p style={{ margin: '0 0 1rem', fontSize: '0.8rem', color: '#a1a1aa' }}>
-                <strong>{overrideDialogSupply.supplyId}</strong> · {overrideDialogSupply.productId} @ {overrideDialogSupply.locationId}
-                {overrideDialogSupply.supplyDate && <> · {overrideDialogSupply.supplyDate}</>}
-                {' · qty '}{qtyFmt(Number(overrideDialogSupply.qty))}
-              </p>
-            ) : overrideDialogWo && (
-              <p style={{ margin: '0 0 1rem', fontSize: '0.8rem', color: '#a1a1aa' }}>
-                <strong>{overrideDialogWo.product_id}</strong> @ {overrideDialogWo.location_id}
-                {overrideDialogWo.demand_id && <> · demand {overrideDialogWo.demand_id}</>}
-                {overrideDialogWo.start_time && <> · {overrideDialogWo.start_time.slice(0, 10)}</>}
-              </p>
-            )}
+          <div style={{ position: 'relative', zIndex: 10, width: overrideDialogType === 'supply_split' ? 640 : 480, maxWidth: '92vw', maxHeight: '90vh', background: '#1c1c1e', color: '#e4e4e7', borderRadius: 10, boxShadow: '0 8px 32px rgba(0,0,0,0.5)', padding: '1.5rem', boxSizing: 'border-box', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+            <div style={{ flexShrink: 0 }}>
+              <h3 style={{ margin: '0 0 0.25rem', fontSize: '1rem' }}>
+                {overrideDialogType === 'method_selection' ? tP('overrideDialog.titleMethod')
+                  : overrideDialogType === 'supply_split' ? tP('supplyView.overrideSplitTitle')
+                  : tP('overrideDialog.titleComponentSplit')}
+              </h3>
+              {overrideDialogType === 'supply_split' && overrideDialogSupply ? (
+                <p style={{ margin: '0 0 1rem', fontSize: '0.8rem', color: '#a1a1aa' }}>
+                  <strong>{overrideDialogSupply.supplyId}</strong> · {overrideDialogSupply.productId} @ {overrideDialogSupply.locationId}
+                  {overrideDialogSupply.supplyDate && <> · {overrideDialogSupply.supplyDate}</>}
+                  {' · '}{tP('woExplain.qtyLabel')}{' '}{qtyFmt(Number(overrideDialogSupply.qty))}
+                </p>
+              ) : overrideDialogWo && (
+                <p style={{ margin: '0 0 1rem', fontSize: '0.8rem', color: '#a1a1aa' }}>
+                  <strong>{overrideDialogWo.product_id}</strong> @ {overrideDialogWo.location_id}
+                  {overrideDialogWo.demand_id && <> · {tP('woExplain.peggedDemand')} {overrideDialogWo.demand_id}</>}
+                  {overrideDialogWo.start_time && <> · {overrideDialogWo.start_time.slice(0, 10)}</>}
+                </p>
+              )}
+            </div>
+            {/* Scrollable body — accommodates long demand lists in component/supply split forms. */}
+            <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', margin: '0 -1.5rem', padding: '0 1.5rem' }}>
             {/* ── Method selection form ─── */}
             {overrideDialogType === 'method_selection' && overrideDialogWo && (
               <>
                 {overrideDialogWo.wo_explanation_method && (
                   <div style={{ marginBottom: '1rem', padding: '0.6rem 0.75rem', background: '#27272a', borderRadius: 6, borderLeft: '3px solid #a78bfa' }}>
-                    <div style={{ fontSize: '0.7rem', color: '#71717a', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '0.3rem' }}>Auto-selected reason</div>
+                    <div style={{ fontSize: '0.7rem', color: '#71717a', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '0.3rem' }}>{tP('overrideDialog.autoSelectedReason')}</div>
                     <p style={{ margin: 0, fontSize: '0.8rem', color: '#d4d4d8', lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{overrideDialogWo.wo_explanation_method}</p>
                   </div>
                 )}
-                <label style={{ display: 'block', fontSize: '0.85rem', color: '#e4e4e7', marginBottom: '0.4rem' }}>Force method</label>
+                <label style={{ display: 'block', fontSize: '0.85rem', color: '#e4e4e7', marginBottom: '0.4rem' }}>{tP('overrideDialog.forceMethod')}</label>
                 <div style={{ display: 'flex', gap: '0.5rem' }}>
                   {(overrideDialogWo?.wo_explanation_method
                     ? Array.from(new Set(Array.from(overrideDialogWo.wo_explanation_method.matchAll(/\b(make|move|buy)\b/gi), (match) => match[1].toLowerCase())))
@@ -5919,7 +5973,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     </label>
                   ))}
                 </div>
-                <p style={{ fontSize: '0.75rem', color: '#71717a', marginTop: '0.5rem' }}>This overrides the planner&apos;s auto-selected method for <strong>{overrideDialogWo.product_id} @ {overrideDialogWo.location_id}</strong>. Re-run plan to apply.</p>
+                <p style={{ fontSize: '0.75rem', color: '#71717a', marginTop: '0.5rem' }}>{tP('overrideDialog.methodOverrideHelpPre')}<strong>{overrideDialogWo.product_id} @ {overrideDialogWo.location_id}</strong>{tP('overrideDialog.methodOverrideHelpPost')}</p>
               </>
             )}
             {/* ── Component split form ─── */}
@@ -5930,17 +5984,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               return (
                 <>
                   <div style={{ marginBottom: '0.75rem', display: 'flex', gap: '1.5rem', fontSize: '0.8rem', color: '#a1a1aa' }}>
-                    <span>Total planned: <strong style={{ color: '#e4e4e7' }}>{qtyFmt(totalPlanned)}</strong></span>
-                    <span>Split mode: <strong style={{ color: '#e4e4e7' }}>{overrideDialogWo.wo_consolidation_split_mode === 'proportional' ? 'Proportional' : overrideDialogWo.wo_consolidation_split_mode === 'priority_first' ? 'Priority first' : 'Fair'}</strong></span>
+                    <span>{tP('overrideDialog.totalPlanned')}: <strong style={{ color: '#e4e4e7' }}>{qtyFmt(totalPlanned)}</strong></span>
+                    <span>{tP('overrideDialog.splitMode')}: <strong style={{ color: '#e4e4e7' }}>{overrideDialogWo.wo_consolidation_split_mode === 'proportional' ? tP('overrideDialog.splitProportional') : overrideDialogWo.wo_consolidation_split_mode === 'priority_first' ? tP('overrideDialog.splitPriorityFirst') : tP('overrideDialog.splitFair')}</strong></span>
                   </div>
                   <table style={{ width: '100%', fontSize: '0.82rem', borderCollapse: 'collapse', marginBottom: '0.5rem' }}>
                     <thead>
                       <tr style={{ color: '#71717a', textAlign: 'left', borderBottom: '1px solid #3d3d40' }}>
-                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem' }}>Demand</th>
-                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem' }}>Parent product</th>
-                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem', textAlign: 'right' }}>Pri</th>
-                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem', textAlign: 'right' }}>Requested</th>
-                        <th style={{ paddingBottom: '0.3rem', textAlign: 'right' }}>Override qty</th>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem' }}>{tP('overrideDialog.colDemand')}</th>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem' }}>{tP('overrideDialog.colParentProduct')}</th>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem', textAlign: 'right' }}>{tP('overrideDialog.colPri')}</th>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem', textAlign: 'right' }}>{tP('overrideDialog.colRequested')}</th>
+                        <th style={{ paddingBottom: '0.3rem', textAlign: 'right' }}>{tP('overrideDialog.colOverrideQty')}</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -5965,15 +6019,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     </tbody>
                     <tfoot>
                       <tr style={{ borderTop: '2px solid #3d3d40' }}>
-                        <td colSpan={4} style={{ paddingTop: '0.3rem', color: '#a1a1aa', fontSize: '0.78rem', textAlign: 'right', paddingRight: '0.5rem' }}>Sum</td>
+                        <td colSpan={4} style={{ paddingTop: '0.3rem', color: '#a1a1aa', fontSize: '0.78rem', textAlign: 'right', paddingRight: '0.5rem' }}>{tP('overrideDialog.sum')}</td>
                         <td style={{ paddingTop: '0.3rem', textAlign: 'right', fontWeight: 600, color: over ? '#f87171' : sumQty <= totalPlanned + 0.001 ? '#4ade80' : '#e4e4e7' }}>
                           {qtyFmt(sumQty)}
-                          {over && <span style={{ marginLeft: 4, fontSize: '0.7rem', color: '#f87171' }}>exceeds total</span>}
+                          {over && <span style={{ marginLeft: 4, fontSize: '0.7rem', color: '#f87171' }}>{tP('overrideDialog.exceedsTotal')}</span>}
                         </td>
                       </tr>
                     </tfoot>
                   </table>
-                  <p style={{ fontSize: '0.75rem', color: '#71717a', margin: '0.25rem 0 0' }}>If the sum exceeds the total planned qty the backend will scale all quantities down proportionally. Re-run plan to apply.</p>
+                  <p style={{ fontSize: '0.75rem', color: '#71717a', margin: '0.25rem 0 0' }}>{tP('overrideDialog.componentSplitHelp')}</p>
                 </>
               );
             })()}
@@ -6003,11 +6057,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     </colgroup>
                     <thead>
                       <tr style={{ color: '#71717a', textAlign: 'left', borderBottom: '1px solid #3d3d40' }}>
-                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem' }}>Demand</th>
-                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem' }}>Customer</th>
-                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem', textAlign: 'right' }}>Requested</th>
-                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem', textAlign: 'right' }}>Current</th>
-                        <th style={{ paddingBottom: '0.3rem', textAlign: 'right' }}>Override qty</th>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem' }}>{tP('overrideDialog.colDemand')}</th>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem' }}>{tP('overrideDialog.colCustomer')}</th>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem', textAlign: 'right' }}>{tP('overrideDialog.colRequested')}</th>
+                        <th style={{ paddingBottom: '0.3rem', paddingRight: '0.5rem', textAlign: 'right' }}>{tP('overrideDialog.colCurrent')}</th>
+                        <th style={{ paddingBottom: '0.3rem', textAlign: 'right' }}>{tP('overrideDialog.colOverrideQty')}</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -6032,17 +6086,20 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     </tbody>
                     <tfoot>
                       <tr style={{ borderTop: '2px solid #3d3d40' }}>
-                        <td colSpan={4} style={{ paddingTop: '0.3rem', color: '#a1a1aa', fontSize: '0.78rem', textAlign: 'right', paddingRight: '0.5rem' }}>Sum / Supply qty</td>
+                        <td colSpan={4} style={{ paddingTop: '0.3rem', color: '#a1a1aa', fontSize: '0.78rem', textAlign: 'right', paddingRight: '0.5rem' }}>{tP('overrideDialog.sumSupplyLabel')}</td>
                         <td style={{ paddingTop: '0.3rem', textAlign: 'right', fontWeight: 600, color: over ? '#f87171' : '#e4e4e7' }}>
                           {qtyFmt(sumQty)} / {qtyFmt(supplyQty)}
                         </td>
                       </tr>
                     </tfoot>
                   </table>
-                  <p style={{ fontSize: '0.75rem', color: '#71717a', margin: '0.25rem 0 0' }}>Demands not listed here are excluded from this supply. If the sum exceeds supply qty, the backend will scale proportionally. Re-run plan to apply.</p>
+                  <p style={{ fontSize: '0.75rem', color: '#71717a', margin: '0.25rem 0 0' }}>{tP('overrideDialog.supplySplitHelp')}</p>
                 </>
               );
             })()}
+            </div>
+            {/* Pinned footer: error message + reset banner + Cancel/Save buttons. */}
+            <div style={{ flexShrink: 0, paddingTop: '0.75rem' }}>
             {overrideDialogError && <p style={{ color: '#f87171', fontSize: '0.8rem', marginTop: '0.4rem' }}>{overrideDialogError}</p>}
             {(() => {
               if (!overrideDialogType) return null;
@@ -6063,7 +6120,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               if (!existingOverride) return null;
               return (
                 <div style={{ marginTop: '0.75rem', padding: '0.5rem 0.75rem', background: 'rgba(180,83,9,0.12)', border: '1px solid rgba(180,83,9,0.4)', borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-                  <span style={{ fontSize: '0.8rem', color: '#fbbf24' }}>Override already saved — re-run plan to apply, or reset to auto.</span>
+                  <span style={{ fontSize: '0.8rem', color: '#fbbf24' }}>{tP('overrideDialog.alreadySaved')}</span>
                   <button
                     type="button"
                     className="secondary"
@@ -6080,22 +6137,23 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         setOverrideDialogSupply(null);
                         setOverrideDialogType(null);
                       } catch (e) {
-                        setOverrideDialogError(e instanceof Error ? e.message : 'Failed to reset');
+                        setOverrideDialogError(e instanceof Error ? e.message : tP('overrideDialog.failedReset'));
                       } finally {
                         setOverrideDialogSaving(false);
                       }
                     }}
                   >
-                    Reset to auto
+                    {tP('overrideDialog.resetToAuto')}
                   </button>
                 </div>
               );
             })()}
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: '1rem' }}>
-              <button type="button" className="secondary" onClick={() => setOverrideDialogOpen(false)}>Cancel</button>
+              <button type="button" className="secondary" onClick={() => setOverrideDialogOpen(false)}>{tP('overrideDialog.cancel')}</button>
               <button type="button" disabled={overrideDialogSaving} onClick={handleSaveOverride}>
-                {overrideDialogSaving ? 'Saving…' : 'Save override'}
+                {overrideDialogSaving ? tP('overrideDialog.saving') : tP('overrideDialog.save')}
               </button>
+            </div>
             </div>
           </div>
         </div>,
@@ -6125,13 +6183,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               role="separator"
               aria-label="Resize panel"
               onMouseDown={(e) => { e.preventDefault(); woExplainResizeRef.current = { startX: e.clientX, startW: woExplainPanelWidth }; setWoExplainResizing(true); }}
-              style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: 6, cursor: 'col-resize', zIndex: 11 }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(99, 102, 241, 0.5)'; }}
+              onMouseLeave={(e) => { if (!woExplainResizing) e.currentTarget.style.background = 'transparent'; }}
+              style={{
+                position: 'absolute', left: 0, top: 0, bottom: 0, width: 8, cursor: 'col-resize', zIndex: 11,
+                background: woExplainResizing ? 'rgba(99, 102, 241, 0.5)' : 'transparent',
+                transition: 'background-color 120ms',
+              }}
             />
             {/* Header */}
             <div style={{ padding: '1rem 1.25rem', borderBottom: '1px solid #3d3d40', flexShrink: 0 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.25rem' }}>
-                <h3 style={{ margin: 0, color: '#fafafa', fontSize: '1rem' }}>Work order explanation</h3>
-                <button type="button" onClick={() => { setWoExplainOpen(false); setWoExplainKey(null); setWoExplainRow(null); }} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
+                <h3 style={{ margin: 0, color: '#fafafa', fontSize: '1rem' }}>{tP('woExplain.title')}</h3>
+                <button type="button" onClick={() => { setWoExplainOpen(false); setWoExplainKey(null); setWoExplainRow(null); }} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tP('woExplain.close')}</button>
               </div>
               <p style={{ margin: 0, fontSize: '0.8rem', color: '#a1a1aa' }}>
                 <strong>{woExplainRow.product_id}</strong> @ {woExplainRow.location_id}
@@ -6145,26 +6209,42 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               {woExplainRow.wo_explanation_method && (
                 <section style={{ marginBottom: '1.25rem' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
-                    <h4 style={{ margin: 0, color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Method selection</h4>
+                    <h4 style={{ margin: 0, color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('woExplain.methodSelection')}</h4>
                     {woExplainRow.multi_supply_available && (
                       <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 8px' }}
                         onClick={() => { setWoExplainOpen(false); setWoExplainKey(null); openOverrideDialog('method_selection', woExplainRow); }}>
-                        Override
+                        {tP('woExplain.override')}
                       </button>
                     )}
                   </div>
                   <p style={{ margin: 0, fontSize: '0.875rem', lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{woExplainRow.wo_explanation_method}</p>
                 </section>
               )}
+              {/* Pegged demand(s) — answers "which final demand(s) does this WO contribute to?".
+                  For consolidated WOs the existing Consolidation split section already breaks
+                  it down, so we only show this for single-demand WOs. */}
+              {woExplainRow.demand_id && !(woExplainRow.wo_consolidation_split_details && woExplainRow.wo_consolidation_split_details.length > 1) && (() => {
+                const customer = (planResult?.committed_demands ?? []).find(d => d.demand_id === woExplainRow.demand_id)?.customer ?? null;
+                return (
+                  <section style={{ marginBottom: '1.25rem' }}>
+                    <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('woExplain.peggedDemand')}</h4>
+                    <p style={{ margin: 0, fontSize: '0.875rem', lineHeight: 1.6 }}>
+                      {tP('woExplain.producesForDemand')} <strong>{woExplainRow.demand_id}</strong>
+                      {customer && <> · {tP('woExplain.customerLabel')} <strong style={{ color: '#a1a1aa' }}>{customer}</strong></>}
+                      {woExplainRow.quantity != null && <> · {tP('woExplain.qtyLabel')} <strong>{qtyFmt(Number(woExplainRow.quantity))}</strong></>}
+                    </p>
+                  </section>
+                );
+              })()}
               {/* Demand competition */}
               <section style={{ marginBottom: '1.25rem' }}>
-                <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Demand competition (BOM graph)</h4>
+                <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('woExplain.demandCompetition')}</h4>
                 {(woExplainRow.wo_competing_demands?.length ?? 0) <= 1 ? (
-                  <p style={{ margin: 0, fontSize: '0.875rem', color: '#71717a' }}>Only one demand product requires this component — no competition.</p>
+                  <p style={{ margin: 0, fontSize: '0.875rem', color: '#71717a' }}>{tP('woExplain.oneDemand')}</p>
                 ) : (
                   <>
                     <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem' }}>
-                      <strong>{woExplainRow.wo_competing_demands!.length}</strong> demand product(s) require this component per the BOM graph:
+                      <strong>{woExplainRow.wo_competing_demands!.length}</strong> {tP('woExplain.multipleDemands')}
                     </p>
                     <ul style={{ margin: 0, paddingLeft: '1.25rem', fontSize: '0.8rem', color: '#d4d4d8', lineHeight: 1.6 }}>
                       {woExplainRow.wo_competing_demands!.map((d) => <li key={d}>{d}</li>)}
@@ -6176,29 +6256,43 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               {woExplainRow.wo_consolidation_split_details && woExplainRow.wo_consolidation_split_details.length > 1 && (
                 <section style={{ marginBottom: '1.25rem' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
-                    <h4 style={{ margin: 0, color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Consolidation split</h4>
+                    <h4 style={{ margin: 0, color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('woExplain.consolidationSplit')}</h4>
                     <button
                       type="button"
                       className="secondary"
                       style={{ fontSize: '0.72rem', padding: '2px 8px' }}
                       onClick={() => { setWoExplainOpen(false); setWoExplainKey(null); openOverrideDialog('component_split', woExplainRow); }}
                     >
-                      Override split
+                      {tP('woExplain.overrideSplit')}
                     </button>
                   </div>
                   <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem' }}>
-                    This work order was consolidated for <strong>{woExplainRow.wo_consolidation_split_details.length}</strong> demands
-                    (total planned: <strong>{qtyFmt(woExplainRow.wo_consolidation_total_planned ?? 0)}</strong>).
-                    Split mode: <strong>{woExplainRow.wo_consolidation_split_mode === 'proportional' ? 'Proportional' : woExplainRow.wo_consolidation_split_mode === 'priority_first' ? 'Priority first' : 'Fair'}</strong>.
+                    {tP('woExplain.consolidatedFor')} <strong>{woExplainRow.wo_consolidation_split_details.length}</strong> {tP('woExplain.demandsTotal')} <strong>{qtyFmt(woExplainRow.wo_consolidation_total_planned ?? 0)}</strong>).
+                    {' '}{tP('woExplain.splitMode')} <strong>{woExplainRow.wo_consolidation_split_mode === 'proportional' ? tP('woExplain.proportional') : woExplainRow.wo_consolidation_split_mode === 'priority_first' ? tP('woExplain.priorityFirst') : tP('woExplain.splitFair')}</strong>.
                   </p>
+                  {(() => {
+                    const exp = splitPolicyExplanation(woExplainRow.wo_consolidation_split_mode, tP);
+                    const overrideActive = woExplainRow.consolidation_override_active === true;
+                    return (
+                      <div style={{ margin: '0 0 0.6rem', padding: '0.55rem 0.75rem', background: '#27272a', borderRadius: 6, borderLeft: '3px solid #67e8f9' }}>
+                        <div style={{ fontSize: '0.78rem', color: '#67e8f9', marginBottom: '0.25rem', fontWeight: 600 }}>{exp.headline}</div>
+                        <p style={{ margin: 0, fontSize: '0.78rem', color: '#a1a1aa', lineHeight: 1.5 }}>{exp.detail}</p>
+                        <p style={{ margin: '0.4rem 0 0', fontSize: '0.72rem', color: '#71717a', fontStyle: 'italic' }}>
+                          {overrideActive
+                            ? <>{tP('woExplain.policySourceOverridePre')} <code style={{ background: '#1c1c1e', padding: '0 4px', borderRadius: 3 }}>component_split</code> {tP('woExplain.policySourceOverridePost')}</>
+                            : <>{tP('woExplain.policySourceConfigPre')} <code style={{ background: '#1c1c1e', padding: '0 4px', borderRadius: 3 }}>consolidation.allocation_mode</code> {tP('woExplain.policySourceConfigMid')} <em>{tP('woExplain.overrideSplit')}</em> {tP('woExplain.policySourceConfigSuffix')}</>}
+                        </p>
+                      </div>
+                    );
+                  })()}
                   <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse' }}>
                     <thead>
                       <tr style={{ color: '#a1a1aa', textAlign: 'left' }}>
-                        <th style={{ paddingBottom: '0.2rem' }}>Demand</th>
-                        <th style={{ paddingBottom: '0.2rem' }}>Parent product</th>
-                        <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>Priority</th>
-                        <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>Requested</th>
-                        <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>Allocated</th>
+                        <th style={{ paddingBottom: '0.2rem' }}>{tP('woExplain.columns.demand')}</th>
+                        <th style={{ paddingBottom: '0.2rem' }}>{tP('woExplain.columns.parentProduct')}</th>
+                        <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('woExplain.columns.priority')}</th>
+                        <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('woExplain.columns.requested')}</th>
+                        <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('woExplain.columns.allocated')}</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -6219,22 +6313,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               )}
               {/* Supply alternatives */}
               <section style={{ marginBottom: '1.25rem' }}>
-                <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Supply alternatives (BOM graph)</h4>
+                <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('woExplain.supplyAlts')}</h4>
                 {woExplainRow.multi_supply_available ? (
                   <p style={{ margin: 0, fontSize: '0.875rem' }}>
-                    Multiple supply methods are available for this component in the BOM graph.
+                    {tP('woExplain.multipleSupply')}
                     {woExplainRow.wo_explanation_method
-                      ? <> See <em>Method selection</em> above for the choice made.</>
-                      : <> No method selection explanation was recorded (this may be a pre-existing inventory supply).</>}
+                      ? <> {tP('woExplain.seeMethodSelection')} <em>{tP('woExplain.methodSelectionRef')}</em> {tP('woExplain.aboveForChoice')}</>
+                      : <> {tP('woExplain.noMethodExplain')}</>}
                   </p>
                 ) : (
-                  <p style={{ margin: 0, fontSize: '0.875rem', color: '#71717a' }}>Only one supply method available for this component — no alternatives.</p>
+                  <p style={{ margin: 0, fontSize: '0.875rem', color: '#71717a' }}>{tP('woExplain.oneSupply')}</p>
                 )}
               </section>
               {/* No explanation available */}
               {!woExplainRow.wo_explanation_method && (
                 <p style={{ margin: 0, fontSize: '0.875rem', color: '#71717a' }}>
-                  No method explanation available for this work order. This may occur for consolidated work orders or when only one option existed.
+                  {tP('woExplain.noExplain')}
                 </p>
               )}
             </div>
@@ -6264,115 +6358,172 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               role="separator"
               aria-label="Resize panel"
               onMouseDown={(e) => { e.preventDefault(); supExplainResizeRef.current = { startX: e.clientX, startW: supExplainPanelWidth }; setSupExplainResizing(true); }}
-              style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: 6, cursor: 'col-resize', zIndex: 11 }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(99, 102, 241, 0.5)'; }}
+              onMouseLeave={(e) => { if (!supExplainResizing) e.currentTarget.style.background = 'transparent'; }}
+              style={{
+                position: 'absolute', left: 0, top: 0, bottom: 0, width: 8, cursor: 'col-resize', zIndex: 11,
+                background: supExplainResizing ? 'rgba(99, 102, 241, 0.5)' : 'transparent',
+                transition: 'background-color 120ms',
+              }}
             />
             <div style={{ padding: '1rem 1.25rem', borderBottom: '1px solid #3d3d40', flexShrink: 0 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.25rem' }}>
-                <h3 style={{ margin: 0, color: '#fafafa', fontSize: '1rem' }}>Supply explanation</h3>
-                <button type="button" onClick={() => { setSupExplainOpen(false); setSupExplainKey(null); setSupExplainRow(null); }} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
+                <h3 style={{ margin: 0, color: '#fafafa', fontSize: '1rem' }}>{tP('supExplain.title')}</h3>
+                <button type="button" onClick={() => { setSupExplainOpen(false); setSupExplainKey(null); setSupExplainRow(null); }} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tP('supExplain.close')}</button>
               </div>
               <p style={{ margin: 0, fontSize: '0.8rem', color: '#a1a1aa' }}>
                 <strong>{supExplainRow.supplyId}</strong> · {supExplainRow.productId} @ {supExplainRow.locationId ?? '–'}
                 {supExplainRow.supplyDate && <> · {supExplainRow.supplyDate}</>}
-                {' · qty '}{qtyFmt(Number(supExplainRow.qty))}
+                {' · '}{tP('woExplain.qtyLabel')} {qtyFmt(Number(supExplainRow.qty))}
               </p>
             </div>
             <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
               {(() => {
                 const cs = supplyCriticalityMap[supExplainRow.supplyId];
-                const csLabel = cs === 'critical' ? 'Critical' : cs === 'not_critical' ? 'Safe' : (supExplainRow.consumedQty === 0 ? 'Safe (zero consumption)' : null);
+                const csLabel = cs === 'critical' ? tP('supExplain.critical') : cs === 'not_critical' ? tP('supExplain.safe') : (supExplainRow.consumedQty === 0 ? tP('supExplain.safeZero') : null);
                 if (!csLabel) return null;
                 return (
                   <section style={{ marginBottom: '1.25rem' }}>
-                    <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Criticality</h4>
+                    <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('supExplain.criticalityHeading')}</h4>
                     <p style={{ margin: 0, fontSize: '0.875rem' }}>
                       <strong style={{ color: cs === 'critical' ? '#f87171' : '#34d399' }}>{csLabel}</strong>
-                      {cs === 'critical' && <> — removing or reducing this supply would impact pegged demand fulfillment.</>}
-                      {(cs === 'not_critical' || (!cs && supExplainRow.consumedQty === 0)) && <> — this supply is not on the critical path of any demand.</>}
+                      {cs === 'critical' && <> {tP('supExplain.criticalDetail')}</>}
+                      {(cs === 'not_critical' || (!cs && supExplainRow.consumedQty === 0)) && <> {tP('supExplain.safeDetail')}</>}
                     </p>
                   </section>
                 );
               })()}
               <section style={{ marginBottom: '1.25rem' }}>
-                <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Utilization</h4>
+                <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('supExplain.utilizationHeading')}</h4>
                 <p style={{ margin: 0, fontSize: '0.875rem', lineHeight: 1.6 }}>
-                  Initial <strong>{qtyFmt(Number(supExplainRow.qty))}</strong>
-                  {' · '}Consumed <strong style={{ color: '#a78bfa' }}>{qtyFmt(Number(supExplainRow.consumedQty))}</strong>
-                  {' · '}Residual <strong style={{ color: '#34d399' }}>{qtyFmt(Number(supExplainRow.residualQty))}</strong>
+                  {tP('supExplain.utilInitial')} <strong>{qtyFmt(Number(supExplainRow.qty))}</strong>
+                  {' · '}{tP('supExplain.utilConsumed')} <strong style={{ color: '#a78bfa' }}>{qtyFmt(Number(supExplainRow.consumedQty))}</strong>
+                  {' · '}{tP('supExplain.utilResidual')} <strong style={{ color: '#34d399' }}>{qtyFmt(Number(supExplainRow.residualQty))}</strong>
                   {supExplainRow.utilizationRate != null && (
                     <> {' · '}<strong>{(supExplainRow.utilizationRate * 100).toFixed(1)}%</strong></>
                   )}
                 </p>
               </section>
               <section style={{ marginBottom: '1.25rem' }}>
-                <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Pegged demands</h4>
+                <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('supExplain.peggedHeading')}</h4>
                 {supExplainRow.peggedDemands.length === 0 ? (
-                  <p style={{ margin: 0, fontSize: '0.875rem', color: '#71717a' }}>This supply was not consumed by any demand.</p>
+                  <p style={{ margin: 0, fontSize: '0.875rem', color: '#71717a' }}>{tP('supExplain.peggedEmpty')}</p>
                 ) : (
                   <>
                     <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem' }}>
-                      <strong>{supExplainRow.peggedDemandCount}</strong> demand(s) consumed this supply
-                      ({' '}total <strong>{qtyFmt(Number(supExplainRow.totalPeggedQty))}</strong>{' '}):
+                      <strong>{supExplainRow.peggedDemandCount}</strong> {tP('supExplain.peggedConsumedSuffix')}
+                      ({' '}{tP('supExplain.peggedTotal')} <strong>{qtyFmt(Number(supExplainRow.totalPeggedQty))}</strong>{' '}):
                     </p>
                     <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse' }}>
                       <thead>
                         <tr style={{ color: '#a1a1aa', textAlign: 'left' }}>
-                          <th style={{ paddingBottom: '0.2rem' }}>Demand</th>
-                          <th style={{ paddingBottom: '0.2rem' }}>Customer</th>
-                          <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>Qty consumed</th>
+                          <th style={{ paddingBottom: '0.2rem' }}>{tP('supExplain.peggedColDemand')}</th>
+                          <th style={{ paddingBottom: '0.2rem' }}>{tP('supExplain.peggedColCustomer')}</th>
+                          <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('supExplain.peggedColQty')}</th>
+                          <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('supExplain.peggedColShare')}</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {supExplainRow.peggedDemands.map((d, i) => (
-                          <tr key={`${d.demandId}-${i}`} style={{ borderTop: '1px solid #3d3d40' }}>
-                            <td style={{ padding: '0.2rem 0.4rem 0.2rem 0' }}>{d.demandId}</td>
-                            <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', color: '#a1a1aa' }}>{d.customer ?? '–'}</td>
-                            <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right' }}>{qtyFmt(Number(d.qtyConsumed))}</td>
-                          </tr>
-                        ))}
+                        {supExplainRow.peggedDemands.map((d, i) => {
+                          const total = Number(supExplainRow.totalPeggedQty) || 0;
+                          const share = total > 1e-9 ? (Number(d.qtyConsumed) / total) * 100 : 0;
+                          return (
+                            <tr key={`${d.demandId}-${i}`} style={{ borderTop: '1px solid #3d3d40' }}>
+                              <td style={{ padding: '0.2rem 0.4rem 0.2rem 0' }}>{d.demandId}</td>
+                              <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', color: '#a1a1aa' }}>{d.customer ?? '–'}</td>
+                              <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right' }}>{qtyFmt(Number(d.qtyConsumed))}</td>
+                              <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right', color: '#a1a1aa' }}>{share.toFixed(1)}%</td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
+                    <p style={{ margin: '0.4rem 0 0', fontSize: '0.75rem', color: '#71717a', lineHeight: 1.5 }}>
+                      {tP('supExplain.peggedShareNote')}
+                    </p>
                   </>
                 )}
               </section>
               {supExplainRow.splitInfo && (() => {
                 const info = supExplainRow.splitInfo!;
                 const short = info.groupTotalProduced < info.groupTotalNeed - 1e-6;
+                const exp = splitPolicyExplanation(info.mode, tP);
+                const policyLabel = info.mode === 'proportional' ? tP('woExplain.proportional') : info.mode === 'priority_first' ? tP('woExplain.priorityFirst') : tP('woExplain.splitFair');
+                const pda = info.perDemandAllocations ?? null;
+                const pdaTotal = pda ? Object.values(pda).reduce((s, v) => s + v, 0) : 0;
+                const pdaRows = pda
+                  ? Object.entries(pda).sort((a, b) => b[1] - a[1])
+                  : [];
                 return (
                   <section style={{ marginBottom: '1.25rem' }}>
-                    <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Consolidation split</h4>
+                    <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('supExplain.splitHeading')}</h4>
                     <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem', lineHeight: 1.6 }}>
-                      Group <strong>{info.groupProductId}</strong> @ {info.groupLocationId}
-                      {' · '}Policy <strong>{info.mode}</strong>
-                      {' · '}<strong>{info.candidateCount}</strong> candidate demand(s)
+                      {tP('supExplain.splitGroup')} <strong>{info.groupProductId}</strong> @ {info.groupLocationId}
+                      {' · '}{tP('supExplain.splitPolicy')} <strong>{policyLabel}</strong>
+                      {' · '}<strong>{info.candidateCount}</strong> {tP('supExplain.splitCandidates')}
                     </p>
-                    <p style={{ margin: 0, fontSize: '0.875rem' }}>
-                      Need <strong>{qtyFmt(info.groupTotalNeed)}</strong>
-                      {' · '}Produced <strong>{qtyFmt(info.groupTotalProduced)}</strong>
-                      {short && <> {' · '}<strong style={{ color: '#f87171' }}>Shortage {qtyFmt(info.groupTotalNeed - info.groupTotalProduced)}</strong></>}
-                      {!short && <> {' · '}<span style={{ color: '#34d399' }}>No shortage</span></>}
+                    <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem' }}>
+                      {tP('supExplain.splitNeed')} <strong>{qtyFmt(info.groupTotalNeed)}</strong>
+                      {' · '}{tP('supExplain.splitProduced')} <strong>{qtyFmt(info.groupTotalProduced)}</strong>
+                      {short && <> {' · '}<strong style={{ color: '#f87171' }}>{tP('supExplain.splitShortage')} {qtyFmt(info.groupTotalNeed - info.groupTotalProduced)}</strong></>}
+                      {!short && <> {' · '}<span style={{ color: '#34d399' }}>{tP('supExplain.splitNoShortage')}</span></>}
                     </p>
+                    <div style={{ padding: '0.55rem 0.75rem', background: '#27272a', borderRadius: 6, borderLeft: '3px solid #67e8f9', marginBottom: pdaRows.length > 0 ? '0.5rem' : 0 }}>
+                      <div style={{ fontSize: '0.78rem', color: '#67e8f9', marginBottom: '0.25rem', fontWeight: 600 }}>{exp.headline}</div>
+                      <p style={{ margin: 0, fontSize: '0.78rem', color: '#a1a1aa', lineHeight: 1.5 }}>{exp.detail}</p>
+                      <p style={{ margin: '0.4rem 0 0', fontSize: '0.72rem', color: '#71717a', fontStyle: 'italic' }}>
+                        {info.policySource === 'wo'
+                          ? <>{tP('supExplain.splitPolicySourceWo')}</>
+                          : <>{tP('supExplain.splitPolicySourceConfigPre')} <code style={{ background: '#1c1c1e', padding: '0 4px', borderRadius: 3 }}>consolidation.allocation_mode</code> {tP('supExplain.splitPolicySourceConfigPost')}</>}
+                      </p>
+                    </div>
+                    {pdaRows.length > 0 && (
+                      <>
+                        <p style={{ margin: '0.5rem 0 0.3rem', fontSize: '0.78rem', color: '#a1a1aa' }}>{tP('supExplain.splitPerDemandHeading')}</p>
+                        <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse' }}>
+                          <thead>
+                            <tr style={{ color: '#a1a1aa', textAlign: 'left' }}>
+                              <th style={{ paddingBottom: '0.2rem' }}>{tP('supExplain.peggedColDemand')}</th>
+                              <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('supExplain.splitColAllocated')}</th>
+                              <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('supExplain.splitColWeight')}</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {pdaRows.map(([demandId, qty]) => {
+                              const w = pdaTotal > 1e-9 ? (qty / pdaTotal) * 100 : 0;
+                              return (
+                                <tr key={demandId} style={{ borderTop: '1px solid #3d3d40' }}>
+                                  <td style={{ padding: '0.2rem 0.4rem 0.2rem 0' }}>{demandId}</td>
+                                  <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right' }}>{qtyFmt(qty)}</td>
+                                  <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right', color: '#a1a1aa' }}>{w.toFixed(1)}%</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </>
+                    )}
                   </section>
                 );
               })()}
               {supExplainRow.override && (
                 <section style={{ marginBottom: '1.25rem' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
-                    <h4 style={{ margin: 0, color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Manual override</h4>
+                    <h4 style={{ margin: 0, color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('supExplain.overrideHeading')}</h4>
                     <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 8px' }}
                       onClick={() => { setSupExplainOpen(false); setSupExplainKey(null); openSupplyOverrideDialog(supExplainRow); }}>
-                      Edit
+                      {tP('supExplain.overrideEdit')}
                     </button>
                   </div>
                   <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem' }}>
-                    <strong>{supExplainRow.override.allocations.length}</strong> manual allocation(s) active
-                    {supExplainRow.override.warning && <> {' · '}<strong style={{ color: '#f87171' }}>warning: split disagrees with planner</strong></>}
+                    <strong>{supExplainRow.override.allocations.length}</strong> {tP('supExplain.overrideSummarySuffix')}
+                    {supExplainRow.override.warning && <> {' · '}<strong style={{ color: '#f87171' }}>{tP('supExplain.overrideWarn')}</strong></>}
                   </p>
                   <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse' }}>
                     <thead>
                       <tr style={{ color: '#a1a1aa', textAlign: 'left' }}>
-                        <th style={{ paddingBottom: '0.2rem' }}>Demand</th>
-                        <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>Qty</th>
+                        <th style={{ paddingBottom: '0.2rem' }}>{tP('supExplain.overrideColDemand')}</th>
+                        <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('supExplain.overrideColQty')}</th>
                       </tr>
                     </thead>
                     <tbody>

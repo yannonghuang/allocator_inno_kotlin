@@ -1502,6 +1502,8 @@ internal fun extractSupplyAllocations(
     }
 
     val result = mutableListOf<Map<String, Any?>>()
+
+    // Walk variant 1: attribute every supply leaf to a single demand id (default behavior).
     fun walk(node: Map<String, Any?>, demandId: String?) {
         val type = node["type"] as? String
         val supplyId = node["supply_id"] as? String
@@ -1527,9 +1529,64 @@ internal fun extractSupplyAllocations(
             (node["children"] as? List<Map<String, Any?>>)?.forEach { walk(it, nextDemand) }
         }
     }
+
+    // Walk variant 2: split every supply leaf across multiple demands by weights.
+    // Used for consolidated entries (passthrough or multi-demand) so that raw materials
+    // consumed inside the BOM chain are attributed to the demands that share the parent
+    // consolidated supply, rather than to a synthetic null/unknown demand.
+    fun walkSplit(node: Map<String, Any?>, weights: Map<String, Double>) {
+        val type = node["type"] as? String
+        val supplyId = node["supply_id"] as? String
+        if ((type == "supply" || type == "purchase") && !supplyId.isNullOrBlank()) {
+            val rawQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
+            val effectiveQty = if (supplyId in remainingBySupply) {
+                val remaining = remainingBySupply[supplyId] ?: 0.0
+                val take = minOf(rawQty, remaining)
+                remainingBySupply[supplyId] = remaining - take
+                take
+            } else {
+                rawQty  // synthetic/non-physical bucket — no cap
+            }
+            if (effectiveQty > 1e-9) {
+                val totalWeight = weights.values.sum()
+                if (totalWeight > 1e-12) {
+                    for ((did, w) in weights) {
+                        val share = effectiveQty * (w / totalWeight)
+                        if (share > 1e-9) {
+                            result.add(mapOf(
+                                "supply_id"    to supplyId,
+                                "demand_id"    to did,
+                                "qty_consumed" to share,
+                            ))
+                        }
+                    }
+                } else {
+                    result.add(mapOf(
+                        "supply_id"    to supplyId,
+                        "demand_id"    to "",
+                        "qty_consumed" to effectiveQty,
+                    ))
+                }
+            }
+        } else {
+            (node["children"] as? List<Map<String, Any?>>)?.forEach { walkSplit(it, weights) }
+        }
+    }
+
     for (entry in pegging) {
-        val demandId = entry["demand_id"] as? String
         val tree = entry["tree"] as? Map<String, Any?> ?: continue
+        val perDemand = entry["per_demand_allocations"] as? Map<String, Any?>
+        if (perDemand != null && perDemand.isNotEmpty()) {
+            val weights = perDemand
+                .mapNotNull { (k, v) -> (v as? Number)?.toDouble()?.let { k to it } }
+                .filter { it.second > 1e-12 }
+                .toMap()
+            if (weights.isNotEmpty()) {
+                walkSplit(tree, weights)
+                continue
+            }
+        }
+        val demandId = entry["demand_id"] as? String
         walk(tree, demandId)
     }
     return result

@@ -242,6 +242,12 @@ export type PlanningPeggingEntry = {
   consolidated?: boolean;
   /** Demand IDs that share this consolidated supply group (multi-demand consolidation only). */
   consolidated_demand_ids?: string[];
+  /**
+   * Demand → allocated qty weights for consolidated entries (passthrough or multi-demand).
+   * Used to attribute every supply leaf in the tree (including raw materials deep in the BOM)
+   * to the right demands without relying on synthetic tagged consolidated buckets.
+   */
+  per_demand_allocations?: Record<string, number> | null;
 };
 
 /** Plan KPI dashboard: delivery, inventory, procurement, manufacturing, logistics. */
@@ -783,6 +789,15 @@ export type SupplySplitInfo = {
   groupTotalProduced: number;
   /** Number of candidate demands in the consolidation group (including zero-share ones). */
   candidateCount: number;
+  /**
+   * Demand → allocated qty inside the consolidation group (from the pegging entry's
+   * per_demand_allocations). Lets the Supply Explain panel show the math behind each
+   * per-demand consumed qty: share % = allocated[d] / Σ allocated.
+   */
+  perDemandAllocations?: Record<string, number> | null;
+  /** Source of the policy: "wo" (carried on a real consolidated WO) or "config" (raw-material
+   *  fallback — no WO; uses the planning configuration's allocation_mode). */
+  policySource?: 'wo' | 'config';
 };
 
 /** Per-demand allocation entry inside a supply_split override. */

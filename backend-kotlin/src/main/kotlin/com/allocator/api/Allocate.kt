@@ -325,9 +325,16 @@ fun Routing.allocateRoutes() {
         val planningPegging = result["planning_pegging"] as? List<Map<String, Any?>> ?: emptyList()
 
         // A demand can have multiple pegging trees (one per component group when consolidation is on).
-        // Search all matching trees until the work order node is found.
+        // It can also live inside a cross-demand consolidated entry (demand_id=null, but
+        // consolidated_demand_ids includes this demand). Search both kinds of trees.
         val woNode: Map<String, Any?>? = if (demandId.isNotBlank()) {
-            val matchingEntries = planningPegging.filter { (it["demand_id"]?.toString() ?: "").trim() == demandId }
+            val matchingEntries = planningPegging.filter { e ->
+                val entryDemand = (e["demand_id"]?.toString() ?: "").trim()
+                if (entryDemand == demandId) return@filter true
+                @Suppress("UNCHECKED_CAST")
+                val members = e["consolidated_demand_ids"] as? List<String> ?: return@filter false
+                entryDemand.isBlank() && members.contains(demandId)
+            }
             log.warn("[WO pegging] demand={} productId={} locationId={} method={} planningPegging.size={} matchingEntries.size={}",
                 demandId, productId, locationId, method, planningPegging.size, matchingEntries.size)
             if (matchingEntries.isEmpty()) {
@@ -1036,6 +1043,20 @@ private fun enrichWorkOrders(
     val consolidatedTrees = planningPegging
         .filter { (it["demand_id"]?.toString() ?: "").isBlank() }
         .mapNotNull { it["tree"] }
+    // Cross-demand consolidated entries: a WO with a real demand_id may live inside one of these
+    // when ConsolidationEngine merges multiple demands wanting the same product+location.
+    // Index each consolidated tree under every demand_id listed in its consolidated_demand_ids.
+    val consolidatedTreesByMember: Map<String, List<Any?>> = run {
+        val acc = mutableMapOf<String, MutableList<Any?>>()
+        for (e in planningPegging) {
+            if ((e["demand_id"]?.toString() ?: "").isNotBlank()) continue
+            @Suppress("UNCHECKED_CAST")
+            val members = e["consolidated_demand_ids"] as? List<String> ?: continue
+            val tree = e["tree"] ?: continue
+            for (m in members) acc.getOrPut(m) { mutableListOf() }.add(tree)
+        }
+        acc
+    }
 
     // BOM-graph traversal: for each unique demand product+location, BFS through BOM graph
     // to find all reachable nodes. Build: "pid|lid" → count of distinct demand products that reach it.
@@ -1072,8 +1093,10 @@ private fun enrichWorkOrders(
         val demandId = (wo["demand_id"]?.toString() ?: "").trim()
         val method = (wo["method"] as? String ?: "").trim()
         val woNode = if (demandId.isNotBlank()) {
-            // Search all trees for this demand (may be multiple from consolidation component groups)
-            treesByDemand[demandId]?.firstNotNullOfOrNull { findWoNode(it, pid, lid, method) }
+            // Search per-demand trees first, then cross-demand consolidated trees that include this demand
+            val candidates = (treesByDemand[demandId] ?: emptyList()) +
+                (consolidatedTreesByMember[demandId] ?: emptyList())
+            candidates.firstNotNullOfOrNull { findWoNode(it, pid, lid, method) }
         } else {
             // Consolidated WO — search through all consolidated pegging trees
             consolidatedTrees.firstNotNullOfOrNull { findWoNode(it, pid, lid, method) }

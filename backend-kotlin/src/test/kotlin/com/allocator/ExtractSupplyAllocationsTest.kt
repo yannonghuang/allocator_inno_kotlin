@@ -122,4 +122,40 @@ class ExtractSupplyAllocationsTest : FunSpec({
         allocs shouldHaveSize 1
         (allocs[0]["qty_consumed"] as Double) shouldBe (100.0 plusOrMinus 1e-9)
     }
+
+    test("per_demand_allocations splits a consolidated supply leaf across demands by weight") {
+        val supplies = listOf(supplyRow("RM1", 100.0))
+        // Consolidated raw-material entry: no demand_id on the entry, but per_demand_allocations
+        // tells us how the produced qty was split between D1 and D2 (60/40).
+        val pegging = listOf(
+            mapOf(
+                "demand_id" to null,
+                "consolidated" to true,
+                "per_demand_allocations" to mapOf("D1" to 60.0, "D2" to 40.0),
+                "tree" to demandTree(null, listOf(supplyLeaf("RM1", 100.0))),
+            ),
+        )
+        val allocs = extractSupplyAllocations(pegging, supplies)
+        allocs shouldHaveSize 2
+        val byDemand = allocs.associateBy { it["demand_id"] as String }
+        (byDemand["D1"]!!["qty_consumed"] as Double) shouldBe (60.0 plusOrMinus 1e-9)
+        (byDemand["D2"]!!["qty_consumed"] as Double) shouldBe (40.0 plusOrMinus 1e-9)
+        verifySupplyCap(supplies, allocs).shouldBeEmpty()
+    }
+
+    test("per_demand_allocations on passthrough entry keeps single-demand attribution") {
+        val supplies = listOf(supplyRow("RM1", 50.0))
+        val pegging = listOf(
+            mapOf(
+                "demand_id" to "D1",
+                "passthrough" to true,
+                "per_demand_allocations" to mapOf("D1" to 30.0),
+                "tree" to demandTree("D1", listOf(supplyLeaf("RM1", 30.0))),
+            ),
+        )
+        val allocs = extractSupplyAllocations(pegging, supplies)
+        allocs shouldHaveSize 1
+        allocs[0]["demand_id"] shouldBe "D1"
+        (allocs[0]["qty_consumed"] as Double) shouldBe (30.0 plusOrMinus 1e-9)
+    }
 })
