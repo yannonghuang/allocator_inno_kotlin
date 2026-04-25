@@ -1651,7 +1651,15 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
             put("elaborate", methodCfg.elaborate)  // legacy mirror — consumers still read this
             put("multiple",  methodCfg.multiple)
             put("depth_optimal", methodCfg.depthOptimal)
-            methodCfg.scoreWeights?.let { put("score_weights", anyToJson(it)) }
+            // Always materialize score_weights (with engine defaults) so the persisted
+            // snapshot is self-describing — viewing config later shows the exact weights
+            // that were in effect, not a hole the reader has to know to fill in.
+            val w = methodCfg.scoreWeights
+            putJsonObject("score_weights") {
+                put("commit_time",        (w?.get("commit_time")        as? Number)?.toDouble() ?: 0.4)
+                put("inventory_consumed", (w?.get("inventory_consumed") as? Number)?.toDouble() ?: 0.35)
+                put("purchase",           (w?.get("purchase")           as? Number)?.toDouble() ?: 0.25)
+            }
         }
         putJsonObject("variant_selection") {
             put("multiple", variantCfg.multiple ?: true)

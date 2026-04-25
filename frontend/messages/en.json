@@ -504,7 +504,7 @@
       "elapsedTitle": "Elapsed time (run start → finish)",
       "elapsedBreakdownTitle": "Optimal-depth search — per-depth elapsed:",
       "elapsedBreakdownTotal": "  search total: {ms}",
-      "chosenDepthChip": "optimal depth: {depth}",
+      "chosenDepthChip": "⚡ optimal depth: {depth}",
       "chosenDepthTitle": "Depth picked by the optimal-depth search for this run",
       "namePlaceholder": "Name (optional)",
       "notesPlaceholder": "Notes (optional)",

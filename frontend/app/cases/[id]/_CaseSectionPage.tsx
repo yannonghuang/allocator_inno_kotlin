@@ -5559,9 +5559,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 const isInitial = run.is_initial === true;
                 const isDesignated = run.is_active_designated === true;
                 const isDesignating = !!planRunDesignating[run.id];
-                // Left border: green for active, blue for initial, transparent otherwise.
-                // Active wins when a run is both (we still show both chips).
-                const accent = isActive ? '#4ade80' : isInitial ? '#60a5fa' : 'transparent';
+                const isOptimal = typeof run.chosen_depth === 'number';
+                // Left border priority: green (active) > blue (initial) > amber (optimal-depth).
+                // Optimal-depth runs get an amber accent so they're distinguishable at a glance
+                // without overriding the active/initial cues, which carry stronger meaning.
+                const accent = isActive ? '#4ade80' : isInitial ? '#60a5fa' : isOptimal ? '#f59e0b' : 'transparent';
                 const expandedTab = planRunExpandedTab[run.id] ?? null;
                 const detail = planRunDetailCache[run.id];
                 const detailLoading = !!planRunDetailLoading[run.id];
@@ -5572,7 +5574,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   paddingLeft: '0.75rem',
                   paddingBottom: '0.75rem',
                   marginBottom: '0.75rem',
-                  background: isActive ? 'rgba(74,222,128,0.04)' : isInitial ? 'rgba(96,165,250,0.04)' : 'transparent',
+                  background: isActive ? 'rgba(74,222,128,0.04)' : isInitial ? 'rgba(96,165,250,0.04)' : isOptimal ? 'rgba(245,158,11,0.04)' : 'transparent',
                 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                     <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
@@ -5595,6 +5597,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           style={{ background: '#14532d', color: '#bbf7d0', borderRadius: 8, padding: '1px 7px', fontSize: '0.7rem', fontWeight: 600 }}
                         >
                           {isDesignated ? tP('runHistory.chips.activeDesignated') : tP('runHistory.chips.active')}
+                        </span>
+                      )}
+                      {typeof run.chosen_depth === 'number' && (
+                        <span
+                          title={tP('runHistory.chosenDepthTitle')}
+                          style={{
+                            fontSize: '0.75rem',
+                            fontWeight: 600,
+                            color: '#fef3c7',
+                            background: '#92400e',
+                            border: '1px solid #f59e0b',
+                            borderRadius: 8,
+                            padding: '1px 8px',
+                          }}
+                        >
+                          {tP('runHistory.chosenDepthChip', { depth: run.chosen_depth })}
                         </span>
                       )}
                       <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>
@@ -5621,14 +5639,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           </span>
                         );
                       })()}
-                      {typeof run.chosen_depth === 'number' && (
-                        <span
-                          title={tP('runHistory.chosenDepthTitle')}
-                          style={{ fontSize: '0.72rem', color: '#fde68a', background: '#422006', borderRadius: 8, padding: '1px 7px' }}
-                        >
-                          {tP('runHistory.chosenDepthChip', { depth: run.chosen_depth })}
-                        </span>
-                      )}
                       {run.override_count > 0 && (
                         <span style={{ background: '#7c3aed', color: '#fff', borderRadius: 8, padding: '1px 6px', fontSize: '0.72rem' }}>
                           {tP('runHistory.overrideCount', { n: run.override_count })}
