@@ -251,7 +251,7 @@
     "infoSuffix": "to set how methods are chosen (preference cascade, scored elaborate, or equal split), or enable shared-component consolidation.",
     "overridesPanel": {
       "title": "User overrides",
-      "info": "Overrides let you manually control: method selection (make/move/buy), BOM variant selection (ALT_GROUP), or component split allocation among competing demands. Active overrides are applied on the next plan run.",
+      "info": "Overrides let you manually control: method selection (make/move/buy) or component split allocation among competing demands. Active overrides are applied on the next plan run.",
       "noOverrides": "No overrides set. Use the \"Override\" button on a work order in the results table to create one.",
       "columns": {
         "type": "Type",
@@ -373,7 +373,6 @@
       "title": "Work order explanation",
       "methodSelection": "Method selection",
       "override": "Override",
-      "variantSelection": "BOM variant selection",
       "demandCompetition": "Demand competition (BOM graph)",
       "oneDemand": "Only one demand product requires this component — no competition.",
       "multipleDemands": "demand product(s) require this component per the BOM graph:",
@@ -575,15 +574,12 @@
     },
     "overrideDialog": {
       "titleMethod": "Override method selection",
-      "titleVariant": "Override variant selection",
       "titleSplit": "Override component split",
       "selectMethod": "Select a method",
-      "enterAltGroup": "Enter an ALT_GROUP value",
       "invalidJson": "Invalid JSON payload",
       "saveFailed": "Failed to save override",
       "errors": {
-        "selectMethod": "Select a method",
-        "enterAltGroup": "Enter an ALT_GROUP value"
+        "selectMethod": "Select a method"
       }
     },
     "supplyView": {

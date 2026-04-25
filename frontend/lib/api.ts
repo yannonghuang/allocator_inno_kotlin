@@ -189,8 +189,6 @@ export type WorkOrder = {
   multi_supply_available?: boolean;
   /** Why this supply method (make/move/buy) was chosen — propagated from pegging node. */
   wo_explanation_method?: string | null;
-  /** Why this BOM variant (ALT_GROUP) was chosen — propagated from pegging node. */
-  wo_explanation_variant?: string | null;
   /** BOM-graph demand products that also require this component (pid|lid format). */
   wo_competing_demands?: string[];
   /** Present on consolidated WOs: "priority_first" | "proportional". */
@@ -205,7 +203,7 @@ export type WorkOrder = {
     allocated_qty: number;
     priority: number;
   }> | null;
-  /** True if a user override (method_selection or variant_selection) was applied for this WO. */
+  /** True if a user override (method_selection) was applied for this WO. */
   override_active?: boolean;
   /** True if a user override (component_split) was applied during consolidation for this WO. */
   consolidation_override_active?: boolean;
@@ -227,8 +225,6 @@ export type PlanningPeggingNode = {
   location_source?: string | null;
   /** Why this method was chosen when multiple alternatives exist. */
   method_choice_explanation?: string | null;
-  /** Why this BOM/variant was chosen when multiple ALT_GROUP variants exist (make only). */
-  variant_choice_explanation?: string | null;
   /** How this node's children relate logically, when known. 'or' is used when single-component variants are alternatives. */
   children_relation?: 'and' | 'or';
   /** For make work orders: how many production lots were created and the max lot size used. */
@@ -270,18 +266,8 @@ export type PlanKpis = {
   logistics: { order_count: number; total_quantity: number };
 };
 
-/** Config for planning (e.g. get_preferred_variants). Sent in POST body to /plan. */
+/** Config for planning. Sent in POST body to /plan. */
 export type PlanningConfig = {
-  /**
-   * Legacy knobs — kept for backwards compat with stored plan runs.
-   * BOM-level variety is modeled as distinct make methods now, so the UI no
-   * longer exposes variant-level selection.
-   */
-  variant_selection?: {
-    multiple?: boolean | null;
-    top_n?: number;
-    score_weights?: { commit_time?: number; inventory_consumed?: number; purchase?: number };
-  };
   /**
    * Method selection shape: `mode` + `depth` + `multiple`.
    * `mode: "elaborate"` scores each candidate by commit_time/inventory/purchase;

@@ -783,6 +783,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [woExplainOpen, setWoExplainOpen] = useState(false);
   const [woExplainRow, setWoExplainRow] = useState<WorkOrder | null>(null);
   const [woExplainKey, setWoExplainKey] = useState<string | null>(null);
+  const [supExplainOpen, setSupExplainOpen] = useState(false);
+  const [supExplainRow, setSupExplainRow] = useState<PlanSupplyViewRow | null>(null);
+  const [supExplainKey, setSupExplainKey] = useState<string | null>(null);
   const [woPeggingRowKey, setWoPeggingRowKey] = useState<string | null>(null);
   const [bomRealPairs, setBomRealPairs] = useState<[string, string][] | null>(null);
   const [realMoveTriples, setRealMoveTriples] = useState<[string, string, string][] | null>(null);
@@ -823,14 +826,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
 
   // ── Override dialog state ───────────────────────────────────────────────────
   const [overrideDialogOpen, setOverrideDialogOpen] = useState(false);
-  const [overrideDialogType, setOverrideDialogType] = useState<'method_selection' | 'variant_selection' | 'component_split' | 'supply_split' | null>(null);
+  const [overrideDialogType, setOverrideDialogType] = useState<'method_selection' | 'component_split' | 'supply_split' | null>(null);
   const [overrideDialogWo, setOverrideDialogWo] = useState<WorkOrder | null>(null);
   const [overrideDialogSupply, setOverrideDialogSupply] = useState<PlanSupplyViewRow | null>(null);
   const [overrideDialogSaving, setOverrideDialogSaving] = useState(false);
   const [overrideDialogError, setOverrideDialogError] = useState<string | null>(null);
   // Structured override form state (type-specific; avoids raw JSON editing)
   const [overrideMethodValue, setOverrideMethodValue] = useState<string>('make');
-  const [overrideVariantValue, setOverrideVariantValue] = useState('');
   const [overrideSplitRows, setOverrideSplitRows] = useState<Array<{
     demand_id: string | null;
     qty: number;
@@ -850,6 +852,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [woExplainPanelWidth, setWoExplainPanelWidth] = useState(420);
   const woExplainResizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [woExplainResizing, setWoExplainResizing] = useState(false);
+  const [supExplainPanelWidth, setSupExplainPanelWidth] = useState(420);
+  const supExplainResizeRef = useRef<{ startX: number; startW: number } | null>(null);
+  const [supExplainResizing, setSupExplainResizing] = useState(false);
   const [planRunHistoryPanelWidth, setPlanRunHistoryPanelWidth] = useState(520);
   const planRunHistoryResizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [planRunHistoryResizing, setPlanRunHistoryResizing] = useState(false);
@@ -1652,6 +1657,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   }, [woExplainResizing]);
 
   useEffect(() => {
+    if (!supExplainResizing) return;
+    const onMove = (e: MouseEvent) => {
+      const r = supExplainResizeRef.current;
+      if (!r) return;
+      setSupExplainPanelWidth(Math.min(window.innerWidth * 0.9, Math.max(280, r.startW + (r.startX - e.clientX))));
+    };
+    const onUp = () => { supExplainResizeRef.current = null; setSupExplainResizing(false); window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+  }, [supExplainResizing]);
+
+  useEffect(() => {
     if (!planRunHistoryResizing) return;
     const onMove = (e: MouseEvent) => {
       const r = planRunHistoryResizeRef.current;
@@ -1767,7 +1785,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       const demandId = r.demand_id ?? '';
       const methodKey = demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`;
       const splitKey = r.start_time ? `${productId}|${locationId}|${r.start_time.slice(0, 10)}` : `${productId}|${locationId}`;
-      return s.has(`method_selection|${methodKey}`) || s.has(`variant_selection|${methodKey}`) || s.has(`component_split|${splitKey}`);
+      return s.has(`method_selection|${methodKey}`) || s.has(`component_split|${splitKey}`);
     };
   }, [overrides]);
 
@@ -2396,7 +2414,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     }
   };
 
-  const openOverrideDialog = (type: 'method_selection' | 'variant_selection' | 'component_split', wo: WorkOrder) => {
+  const openOverrideDialog = (type: 'method_selection' | 'component_split', wo: WorkOrder) => {
     setOverrideDialogType(type);
     setOverrideDialogWo(wo);
     setOverrideDialogError(null);
@@ -2408,14 +2426,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       const existing = overrides.find((o) => o.entity_type === 'method_selection' && o.entity_key === entityKey);
       const savedMethod = existing ? (existing.payload as Record<string, unknown>).method as string | undefined : undefined;
       setOverrideMethodValue(savedMethod?.toLowerCase() ?? (wo.method ?? 'make').toLowerCase());
-    } else if (type === 'variant_selection') {
-      const productId = wo.product_id ?? '';
-      const locationId = wo.location_id ?? '';
-      const demandId = wo.demand_id ?? '';
-      const entityKey = demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`;
-      const existing = overrides.find((o) => o.entity_type === 'variant_selection' && o.entity_key === entityKey);
-      const savedAltGroup = existing ? (existing.payload as Record<string, unknown>).alt_group as string | undefined : undefined;
-      setOverrideVariantValue(savedAltGroup ?? '');
     } else {
       setOverrideSplitRows(
         (wo.wo_consolidation_split_details ?? []).map((d) => ({
@@ -2457,10 +2467,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         if (overrideDialogType === 'method_selection') {
           if (!overrideMethodValue.trim()) { setOverrideDialogError('Select a method'); setOverrideDialogSaving(false); return; }
           payload = { method: overrideMethodValue.trim() };
-          entityKey = demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`;
-        } else if (overrideDialogType === 'variant_selection') {
-          if (!overrideVariantValue.trim()) { setOverrideDialogError('Enter an ALT_GROUP value'); setOverrideDialogSaving(false); return; }
-          payload = { alt_group: overrideVariantValue.trim() };
           entityKey = demandId ? `${productId}|${locationId}|${demandId}` : `${productId}|${locationId}`;
         } else {
           // component_split
@@ -3224,7 +3230,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   style={{ padding: '4px 8px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem' }}
                 >
                   <option value="method_selection">method_selection</option>
-                  <option value="variant_selection">variant_selection</option>
                   <option value="component_split">component_split</option>
                 </select>
                 <input
@@ -4254,21 +4259,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       { key: 'quantity', label: 'Committed', sortable: true, render: (r) => qtyFmt(Number(r.quantity)) },
                       { key: 'start_time', label: 'Start time', sortable: true, render: (r) => r.start_time ?? '–' },
                       { key: 'end_time', label: 'End time', sortable: true, render: (r) => r.end_time ?? '–' },
-                      { key: 'method', label: 'Method', sortable: true, render: (r) => (
-                        <span>
-                          {r.method ?? '–'}
-                          {(r.override_active || r.consolidation_override_active) && (
-                            <span title={r.override_active ? 'User override active (method/variant)' : 'User override active (consolidation split)'} style={{ marginLeft: 5, background: r.override_active ? '#7c3aed' : '#0891b2', color: '#fff', borderRadius: 8, padding: '1px 6px', fontSize: '0.7rem', verticalAlign: 'middle' }}>
-                              override
-                            </span>
-                          )}
-                          {!r.override_active && !r.consolidation_override_active && woHasSavedOverride(r) && (
-                            <span title="Saved override — re-run plan to apply" style={{ marginLeft: 5, background: '#b45309', color: '#fff', borderRadius: 8, padding: '1px 6px', fontSize: '0.7rem', verticalAlign: 'middle' }}>
-                              pending
-                            </span>
-                          )}
-                        </span>
-                      ) },
+                      { key: 'method', label: 'Method', sortable: true, render: (r) => r.method ?? '–' },
                       { key: '_demand_label', label: 'Demand', sortable: true, render: (r) => {
                         const ids = r._demand_ids ?? [];
                         const label = r._demand_label;
@@ -4309,7 +4300,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       { key: '_explain', label: 'Explain', sortable: false, render: (r) => {
                         const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
                         const isSelected = woExplainKey === k;
-                        if (!(r.wo_explanation_method || r.wo_explanation_variant || (r.wo_competing_demands?.length ?? 0) > 0 || (r.wo_consolidation_split_details?.length ?? 0) > 1))
+                        if (!(r.wo_explanation_method || (r.wo_competing_demands?.length ?? 0) > 0 || (r.wo_consolidation_split_details?.length ?? 0) > 1))
                           return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
                         return (
                           <button
@@ -4324,14 +4315,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         );
                       }},
                       { key: '_override', label: 'Override', sortable: false, render: (r) => {
-                        const hasMethod = r.multi_supply_available === true && r.wo_explanation_method != null;
-                        const hasVariant = r.wo_explanation_variant != null;
+                        const methodOptions = r.wo_explanation_method
+                          ? new Set(Array.from(r.wo_explanation_method.matchAll(/\b(make|move|buy)\b/gi), (m) => m[1].toLowerCase()))
+                          : new Set<string>();
+                        const hasMethod = r.multi_supply_available === true && methodOptions.size > 1;
                         const hasSplit = (r.wo_consolidation_split_details?.length ?? 0) > 1;
-                        if (!hasMethod && !hasVariant && !hasSplit) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                        if (!hasMethod && !hasSplit) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
                         return (
                           <div style={{ display: 'flex', gap: 4 }}>
                             {hasMethod && <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 6px' }} onClick={() => openOverrideDialog('method_selection', r)}>Method</button>}
-                            {hasVariant && <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 6px' }} onClick={() => openOverrideDialog('variant_selection', r)}>Variant</button>}
                             {hasSplit && <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 6px' }} onClick={() => openOverrideDialog('component_split', r)}>Split</button>}
                           </div>
                         );
@@ -5013,6 +5005,25 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                     }
                                   }}
                                 >Show</button>
+                              );
+                            }},
+                            { key: '_sup_explain' as keyof (PlanSupplyViewRow & { _key: string }), label: 'Explain', sortable: false, render: (r) => {
+                              const cs = supplyCriticalityMap[r.supplyId];
+                              const hasCriticality = cs === 'critical' || cs === 'not_critical';
+                              const eligible = r.peggedDemandCount > 0 || !!r.splitInfo || !!r.override || hasCriticality;
+                              if (!eligible) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                              const k = `supply|${r.supplyId}`;
+                              const isSelected = supExplainKey === k;
+                              return (
+                                <button
+                                  type="button"
+                                  className="secondary"
+                                  style={isSelected ? { background: 'rgba(167,139,250,0.25)', borderColor: '#a78bfa' } : undefined}
+                                  onClick={() => {
+                                    if (isSelected) { setSupExplainOpen(false); setSupExplainKey(null); setSupExplainRow(null); }
+                                    else { setSupExplainRow(r); setSupExplainKey(k); setSupExplainOpen(true); }
+                                  }}
+                                >Why</button>
                               );
                             }},
                           ]}
@@ -5871,7 +5882,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           <div style={{ position: 'relative', zIndex: 10, width: overrideDialogType === 'supply_split' ? 640 : 480, maxWidth: '92vw', background: '#1c1c1e', color: '#e4e4e7', borderRadius: 10, boxShadow: '0 8px 32px rgba(0,0,0,0.5)', padding: '1.5rem', boxSizing: 'border-box', overflow: 'hidden' }}>
             <h3 style={{ margin: '0 0 0.25rem', fontSize: '1rem' }}>
               {overrideDialogType === 'method_selection' ? 'Override method selection'
-                : overrideDialogType === 'variant_selection' ? 'Override BOM variant selection'
                 : overrideDialogType === 'supply_split' ? tP('supplyView.overrideSplitTitle')
                 : 'Override component split allocation'}
             </h3>
@@ -5910,27 +5920,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   ))}
                 </div>
                 <p style={{ fontSize: '0.75rem', color: '#71717a', marginTop: '0.5rem' }}>This overrides the planner&apos;s auto-selected method for <strong>{overrideDialogWo.product_id} @ {overrideDialogWo.location_id}</strong>. Re-run plan to apply.</p>
-              </>
-            )}
-            {/* ── Variant selection form ─── */}
-            {overrideDialogType === 'variant_selection' && overrideDialogWo && (
-              <>
-                {overrideDialogWo.wo_explanation_variant && (
-                  <div style={{ marginBottom: '1rem', padding: '0.6rem 0.75rem', background: '#27272a', borderRadius: 6, borderLeft: '3px solid #a78bfa' }}>
-                    <div style={{ fontSize: '0.7rem', color: '#71717a', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '0.3rem' }}>Auto-selected reason</div>
-                    <p style={{ margin: 0, fontSize: '0.8rem', color: '#d4d4d8', lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{overrideDialogWo.wo_explanation_variant}</p>
-                  </div>
-                )}
-                <label style={{ display: 'block', fontSize: '0.85rem', color: '#e4e4e7', marginBottom: '0.4rem' }}>Force ALT_GROUP</label>
-                <input
-                  type="text"
-                  placeholder="Type the ALT_GROUP name to force (e.g. GROUP1)"
-                  value={overrideVariantValue}
-                  onChange={(e) => setOverrideVariantValue(e.target.value)}
-                  style={{ width: '100%', padding: '0.5rem 0.75rem', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 6, color: '#fafafa', fontSize: '0.85rem', boxSizing: 'border-box' }}
-                  autoFocus
-                />
-                <p style={{ fontSize: '0.75rem', color: '#71717a', marginTop: '0.5rem' }}>Read the reason above to see which ALT_GROUP was chosen and its alternatives. Re-run plan to apply.</p>
               </>
             )}
             {/* ── Component split form ─── */}
@@ -6167,19 +6156,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   <p style={{ margin: 0, fontSize: '0.875rem', lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{woExplainRow.wo_explanation_method}</p>
                 </section>
               )}
-              {/* Variant choice */}
-              {woExplainRow.wo_explanation_variant && (
-                <section style={{ marginBottom: '1.25rem' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
-                    <h4 style={{ margin: 0, color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>BOM variant selection</h4>
-                    <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 8px' }}
-                      onClick={() => { setWoExplainOpen(false); setWoExplainKey(null); openOverrideDialog('variant_selection', woExplainRow); }}>
-                      Override
-                    </button>
-                  </div>
-                  <p style={{ margin: 0, fontSize: '0.875rem', lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{woExplainRow.wo_explanation_variant}</p>
-                </section>
-              )}
               {/* Demand competition */}
               <section style={{ marginBottom: '1.25rem' }}>
                 <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Demand competition (BOM graph)</h4>
@@ -6256,10 +6232,159 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 )}
               </section>
               {/* No explanation available */}
-              {!woExplainRow.wo_explanation_method && !woExplainRow.wo_explanation_variant && (
+              {!woExplainRow.wo_explanation_method && (
                 <p style={{ margin: 0, fontSize: '0.875rem', color: '#71717a' }}>
-                  No method or variant explanation available for this work order. This may occur for consolidated work orders or when only one option existed.
+                  No method explanation available for this work order. This may occur for consolidated work orders or when only one option existed.
                 </p>
+              )}
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+      {supExplainOpen && supExplainRow && typeof document !== 'undefined' && createPortal(
+        <div
+          style={{ position: 'fixed', inset: 0, zIndex: 9997, display: 'flex', justifyContent: 'flex-end', pointerEvents: 'none' }}
+          role="dialog"
+          aria-label="Supply explanation"
+        >
+          <div
+            style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.4)', pointerEvents: 'auto' }}
+            onClick={() => { setSupExplainOpen(false); setSupExplainKey(null); setSupExplainRow(null); }}
+            aria-hidden
+          />
+          <div
+            style={{
+              position: 'relative', zIndex: 10, width: supExplainPanelWidth, maxWidth: '90vw', height: '100vh',
+              display: 'flex', flexDirection: 'column', background: '#1c1c1e', color: '#e4e4e7',
+              boxShadow: '-4px 0 24px rgba(0,0,0,0.4)', pointerEvents: 'auto',
+            }}
+          >
+            <div
+              role="separator"
+              aria-label="Resize panel"
+              onMouseDown={(e) => { e.preventDefault(); supExplainResizeRef.current = { startX: e.clientX, startW: supExplainPanelWidth }; setSupExplainResizing(true); }}
+              style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: 6, cursor: 'col-resize', zIndex: 11 }}
+            />
+            <div style={{ padding: '1rem 1.25rem', borderBottom: '1px solid #3d3d40', flexShrink: 0 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.25rem' }}>
+                <h3 style={{ margin: 0, color: '#fafafa', fontSize: '1rem' }}>Supply explanation</h3>
+                <button type="button" onClick={() => { setSupExplainOpen(false); setSupExplainKey(null); setSupExplainRow(null); }} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
+              </div>
+              <p style={{ margin: 0, fontSize: '0.8rem', color: '#a1a1aa' }}>
+                <strong>{supExplainRow.supplyId}</strong> · {supExplainRow.productId} @ {supExplainRow.locationId ?? '–'}
+                {supExplainRow.supplyDate && <> · {supExplainRow.supplyDate}</>}
+                {' · qty '}{qtyFmt(Number(supExplainRow.qty))}
+              </p>
+            </div>
+            <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
+              {(() => {
+                const cs = supplyCriticalityMap[supExplainRow.supplyId];
+                const csLabel = cs === 'critical' ? 'Critical' : cs === 'not_critical' ? 'Safe' : (supExplainRow.consumedQty === 0 ? 'Safe (zero consumption)' : null);
+                if (!csLabel) return null;
+                return (
+                  <section style={{ marginBottom: '1.25rem' }}>
+                    <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Criticality</h4>
+                    <p style={{ margin: 0, fontSize: '0.875rem' }}>
+                      <strong style={{ color: cs === 'critical' ? '#f87171' : '#34d399' }}>{csLabel}</strong>
+                      {cs === 'critical' && <> — removing or reducing this supply would impact pegged demand fulfillment.</>}
+                      {(cs === 'not_critical' || (!cs && supExplainRow.consumedQty === 0)) && <> — this supply is not on the critical path of any demand.</>}
+                    </p>
+                  </section>
+                );
+              })()}
+              <section style={{ marginBottom: '1.25rem' }}>
+                <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Utilization</h4>
+                <p style={{ margin: 0, fontSize: '0.875rem', lineHeight: 1.6 }}>
+                  Initial <strong>{qtyFmt(Number(supExplainRow.qty))}</strong>
+                  {' · '}Consumed <strong style={{ color: '#a78bfa' }}>{qtyFmt(Number(supExplainRow.consumedQty))}</strong>
+                  {' · '}Residual <strong style={{ color: '#34d399' }}>{qtyFmt(Number(supExplainRow.residualQty))}</strong>
+                  {supExplainRow.utilizationRate != null && (
+                    <> {' · '}<strong>{(supExplainRow.utilizationRate * 100).toFixed(1)}%</strong></>
+                  )}
+                </p>
+              </section>
+              <section style={{ marginBottom: '1.25rem' }}>
+                <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Pegged demands</h4>
+                {supExplainRow.peggedDemands.length === 0 ? (
+                  <p style={{ margin: 0, fontSize: '0.875rem', color: '#71717a' }}>This supply was not consumed by any demand.</p>
+                ) : (
+                  <>
+                    <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem' }}>
+                      <strong>{supExplainRow.peggedDemandCount}</strong> demand(s) consumed this supply
+                      ({' '}total <strong>{qtyFmt(Number(supExplainRow.totalPeggedQty))}</strong>{' '}):
+                    </p>
+                    <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse' }}>
+                      <thead>
+                        <tr style={{ color: '#a1a1aa', textAlign: 'left' }}>
+                          <th style={{ paddingBottom: '0.2rem' }}>Demand</th>
+                          <th style={{ paddingBottom: '0.2rem' }}>Customer</th>
+                          <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>Qty consumed</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {supExplainRow.peggedDemands.map((d, i) => (
+                          <tr key={`${d.demandId}-${i}`} style={{ borderTop: '1px solid #3d3d40' }}>
+                            <td style={{ padding: '0.2rem 0.4rem 0.2rem 0' }}>{d.demandId}</td>
+                            <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', color: '#a1a1aa' }}>{d.customer ?? '–'}</td>
+                            <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right' }}>{qtyFmt(Number(d.qtyConsumed))}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </>
+                )}
+              </section>
+              {supExplainRow.splitInfo && (() => {
+                const info = supExplainRow.splitInfo!;
+                const short = info.groupTotalProduced < info.groupTotalNeed - 1e-6;
+                return (
+                  <section style={{ marginBottom: '1.25rem' }}>
+                    <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Consolidation split</h4>
+                    <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem', lineHeight: 1.6 }}>
+                      Group <strong>{info.groupProductId}</strong> @ {info.groupLocationId}
+                      {' · '}Policy <strong>{info.mode}</strong>
+                      {' · '}<strong>{info.candidateCount}</strong> candidate demand(s)
+                    </p>
+                    <p style={{ margin: 0, fontSize: '0.875rem' }}>
+                      Need <strong>{qtyFmt(info.groupTotalNeed)}</strong>
+                      {' · '}Produced <strong>{qtyFmt(info.groupTotalProduced)}</strong>
+                      {short && <> {' · '}<strong style={{ color: '#f87171' }}>Shortage {qtyFmt(info.groupTotalNeed - info.groupTotalProduced)}</strong></>}
+                      {!short && <> {' · '}<span style={{ color: '#34d399' }}>No shortage</span></>}
+                    </p>
+                  </section>
+                );
+              })()}
+              {supExplainRow.override && (
+                <section style={{ marginBottom: '1.25rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
+                    <h4 style={{ margin: 0, color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Manual override</h4>
+                    <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 8px' }}
+                      onClick={() => { setSupExplainOpen(false); setSupExplainKey(null); openSupplyOverrideDialog(supExplainRow); }}>
+                      Edit
+                    </button>
+                  </div>
+                  <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem' }}>
+                    <strong>{supExplainRow.override.allocations.length}</strong> manual allocation(s) active
+                    {supExplainRow.override.warning && <> {' · '}<strong style={{ color: '#f87171' }}>warning: split disagrees with planner</strong></>}
+                  </p>
+                  <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse' }}>
+                    <thead>
+                      <tr style={{ color: '#a1a1aa', textAlign: 'left' }}>
+                        <th style={{ paddingBottom: '0.2rem' }}>Demand</th>
+                        <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>Qty</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {supExplainRow.override.allocations.map((a, i) => (
+                        <tr key={`${a.demand_id}-${i}`} style={{ borderTop: '1px solid #3d3d40' }}>
+                          <td style={{ padding: '0.2rem 0.4rem 0.2rem 0' }}>{a.demand_id}</td>
+                          <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right' }}>{qtyFmt(Number(a.qty))}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </section>
               )}
             </div>
           </div>
@@ -6927,7 +7052,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <span style={{ width: 18, flexShrink: 0, fontSize: '0.9em', color: typeColor }} title={typeLabel}>{icon}</span>
                       <span style={{ flex: 1, color: typeColor }}>{label}</span>
                     </button>
-                    {node.type === 'work_order' && (node.method_choice_explanation || node.variant_choice_explanation) && (() => {
+                    {node.type === 'work_order' && node.method_choice_explanation && (() => {
                       const explanationPath = `explain-${path}`;
                       const isExplanationOpen = planExplanationExpanded.has(explanationPath);
                       const toggleExplanation = () => setPlanExplanationExpanded((prev) => {
@@ -6954,16 +7079,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             }}
                           >
                             {isExplanationOpen ? '▼' : '▶'}
-                            Why (method / variant)
+                            Why (method)
                           </button>
                           {isExplanationOpen && (
                             <div style={{ paddingLeft: 8, borderLeft: '2px solid #3d3d40', marginTop: 2 }}>
-                              {node.method_choice_explanation && (
-                                <p style={{ margin: '0 0 4px', lineHeight: 1.35 }}><strong>Method:</strong> {node.method_choice_explanation}</p>
-                              )}
-                              {node.variant_choice_explanation && (
-                                <p style={{ margin: 0, lineHeight: 1.35 }}><strong>Variant:</strong> {node.variant_choice_explanation}</p>
-                              )}
+                              <p style={{ margin: 0, lineHeight: 1.35 }}><strong>Method:</strong> {node.method_choice_explanation}</p>
                             </div>
                           )}
                         </div>

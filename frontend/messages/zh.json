@@ -251,7 +251,7 @@
     "infoSuffix": "来设置方法选择方式（按偏好级联、精细评分或等量拆分），或启用共享组件合并。",
     "overridesPanel": {
       "title": "用户手工覆盖",
-      "info": "覆盖允许您手动控制：方法选择（制造/调拨/采购）、BOM 变体选择（ALT_GROUP）或需求竞争时的组件拆分配置。活跃的覆盖将在下次计划运行时应用。",
+      "info": "覆盖允许您手动控制：方法选择（制造/调拨/采购）或需求竞争时的组件拆分配置。活跃的覆盖将在下次计划运行时应用。",
       "noOverrides": "未设置覆盖。请在结果表中点击生产订单的「手工覆盖」按钮创建。",
       "columns": {
         "type": "类型",
@@ -373,7 +373,6 @@
       "title": "生产订单说明",
       "methodSelection": "方法选择",
       "override": "手工覆盖",
-      "variantSelection": "BOM 变体选择",
       "demandCompetition": "需求竞争（BOM 图）",
       "oneDemand": "只有一个需求产品需要此组件 — 无竞争。",
       "multipleDemands": "个需求产品在 BOM 图中需要此组件：",
@@ -575,15 +574,12 @@
     },
     "overrideDialog": {
       "titleMethod": "手工覆盖方法选择",
-      "titleVariant": "手工覆盖变体选择",
       "titleSplit": "手工覆盖组件拆分",
       "selectMethod": "选择方法",
-      "enterAltGroup": "输入 ALT_GROUP 值",
       "invalidJson": "无效的 JSON 载荷",
       "saveFailed": "保存覆盖失败",
       "errors": {
-        "selectMethod": "请选择方法",
-        "enterAltGroup": "请输入 ALT_GROUP 值"
+        "selectMethod": "请选择方法"
       }
     },
     "supplyView": {
