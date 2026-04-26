@@ -48,46 +48,63 @@ Consolidate at the **supply** level. For every inventory-bearing node `(pid, lid
 
 Single layer of competition. Single allocation policy per supply. UI consistency by construction.
 
-## 3. Mental model — three phases, strictly separated
+## 3. Mental model — three phases with compensation inside commit
 
 ```
-┌─ PLAN (once, outside the iteration loop) ─────────────────────────┐
-│  Walk every demand's BOM symbolically with union-alt. For each    │
-│  (demand, supply-bearing-node) pair, record:                      │
-│    needsMatrix[D][S] = D.requestedQty × cumulativeRate(D → S)     │
-│    summed over alt branches when a demand has multiple paths.     │
-│                                                                   │
-│  No inventory awareness. No work-order emission. No allocation.   │
-│  Pure need collection.                                            │
-└───────────────────────────────────────────────────────────────────┘
-              │ matrix is fixed; only caps refine across iterations
+┌─ PLAN (once, outside any iteration loop) ──────────────────────────┐
+│  Walk every demand's BOM symbolically with union-alt. For each     │
+│  (demand, supply-bearing-node) pair, record:                       │
+│    needsMatrix[D][S] = D.requestedQty × cumulativeRate(D → S)      │
+│    summed over alt branches when a demand has multiple paths.      │
+│                                                                    │
+│  No inventory awareness. No work-order emission. No allocation.    │
+│  Pure need collection.                                             │
+└────────────────────────────────────────────────────────────────────┘
+              │  matrix is fixed; only allocations refine
               ▼
-┌─ ITERATE ─────────────────────────────────────────────────────────┐
-│                                                                   │
-│  Phase 2 (ALLOCATE) — one allocation per supply:                  │
-│    For each column S of the matrix:                               │
-│      iter 1:  denom[D][S] = needsMatrix[D][S]                     │
-│      iter k:  denom[D][S] = min(prev allocation, last actual draw)│
-│      allocation[D][S] = applyPolicy(denom[*][S], supply[S].qty)   │
-│                                                                   │
-│    The same fair / proportional / priority_first machinery as     │
-│    today, applied uniformly at supply scope.                      │
-│                                                                   │
-│  Phase 3 (COMMIT) — per-demand BOM walk:                          │
-│    For each demand D:                                             │
-│      Walk D's BOM. At every supply-bearing node S, draw up to     │
-│      allocation[D][S]. Recurse for produced components.           │
-│      Emit committed rows + pegging tree.                          │
-│                                                                   │
-│    For each produced component C with non-zero production needed: │
-│      Emit one consolidated WO sized at Σ_D actual draws via C.    │
-│                                                                   │
-│  Converged iff actual draws == allocations for every (D, S).      │
-│  Else feed actual draws into iter k+1's caps and loop.            │
-└───────────────────────────────────────────────────────────────────┘
+┌─ ALLOCATE (Phase 2) ───────────────────────────────────────────────┐
+│  For each column S of needsMatrix:                                 │
+│    allocation[D][S] = applyPolicy(needsMatrix[*][S], supply[S].qty)│
+│                                                                    │
+│  Same fair / proportional / priority_first machinery as today,     │
+│  applied uniformly at supply scope. One pass per outer iteration.  │
+└────────────────────────────────────────────────────────────────────┘
+              │
+              ▼
+┌─ COMMIT (Phase 3) — two sub-phases ────────────────────────────────┐
+│                                                                    │
+│  3a. Initial commit:                                               │
+│      For each demand D:                                            │
+│        walk D's BOM (with D's alt-pick rule)                       │
+│        draw from each supply S up to allocation[D][S]              │
+│      Emit committed rows + per-demand pegging tree.                │
+│                                                                    │
+│  3b. Compensation — runs after 3a stabilizes:                      │
+│      For each supply S where actualDraw_total < allocation_total:  │
+│        unused[S]  = allocation_total[S] − actualDraw_total[S]      │
+│        candidates = demands at S whose actualDraw < allocation     │
+│                     AND have unmet need at S after 3a              │
+│        redistribute unused[S] across candidates by the policy      │
+│        extend each candidate's draw at S accordingly               │
+│                                                                    │
+│      May iterate internally (each round only adds drawn qty,       │
+│      bounded above by Σ allocation[*][S]; converges quickly).      │
+│                                                                    │
+│  After 3a + 3b: for each produced component C, emit one            │
+│  consolidated WO sized to Σ_D actual qty drawn through C.          │
+└────────────────────────────────────────────────────────────────────┘
+              │
+              ▼
+   Outer iteration: only if 3b leaves residual at produced-component
+   level that re-allocation could redistribute. Typical: 1 outer
+   pass. Pathological: 2-3.
 ```
 
 The architecture preserves the existing 3-phase shape (plan → consolidate → commit) but sharpens what each phase does. Each phase has one input domain and one output domain. No conflations.
+
+**Crucially, commit (Phase 3) has two sub-phases:** an initial commit (each demand walks once and draws within its allocations), then a *compensation* sub-phase that redistributes any allocation a demand left unused — typically because that demand picked an alt path that bypassed the supply, or because intermediate inventory absorbed need before the supply was reached. Compensation runs after initial commit stabilizes, in a single pass (or a tiny finite inner loop). It allows competitors who were capped during initial commit to draw additional quantity from the freed-up capacity, by the same allocation policy.
+
+This means the outer Phase 2 → Phase 3 iteration loop, which today is doing heavy lifting to chase cross-group equilibrium, becomes vestigial. Compensation handles within-iter rebalancing in one shot. Outer iteration is reserved for the rare case where compensation reveals that a *produced component's* WO needs to be re-sized, requiring a fresh Phase 2 allocation round at sub-supplies.
 
 ## 4. What changes in the model
 
@@ -138,26 +155,55 @@ Where `C_synthetic` is the synthetic supply Phase 3 emits at `C` (still keyed th
 
 The WO's own BOM consumes from raw materials, *also constrained by the per-supply allocation*. Recursion bottoms out when all consumed supplies are within their caps.
 
-## 5. Iteration
+## 5. Iteration: compensation first, outer loop as fallback
 
-Three sources of refinement on iter 2+:
+The bulk of refinement happens **inside Phase 3** via the compensation sub-phase (3b in §3's diagram). Outer Phase 2/3 iteration becomes a fallback for cases compensation can't fix in place.
 
-| Source | iter 2 effect |
+### 5.1 What compensation handles
+
+After Phase 3a's initial commit, every supply `S` has a measured `actualDraw[D][S]` for each demand. If `actualDraw[D][S] < allocation[D][S]`, demand `D` left unused capacity at `S`. Reasons:
+
+| Source of unused allocation | Why it happens |
 |---|---|
-| **Alt-divergence** | Demand allocated supply on alt path A but committed via A' → unused allocation on A's supplies. iter 2 caps that to actualDraw=0; supplies redistributed to other competitors |
-| **Symbolic over-estimate** | `needsMatrix` ignored intermediate inventory; demand's actual draw at deep supply is less than allocated. iter 2 caps to actual draw |
-| **Production cascade** | Iter 1 allocations at raw materials assumed cumulative-rate from symbolic need; iter 1's actual `toMake[C]` is smaller (intermediate inventory absorbed). iter 2 reconciles |
+| **Alt-divergence** | `D` was allocated on supplies along alt path A, but its commit walked alt path A' instead. Allocations on A's supplies sit untouched |
+| **Intermediate-inventory absorption** | `D`'s upstream BOM nodes had inventory; the BOM walk shortcut before reaching deeper supplies. Those deeper allocations are unused |
+| **Demand quantity less than modeled** | Rare, but possible for upstream rounding |
+| **Hard failure upstream** | `D`'s walk hit an unsatisfiable raw-material need and stopped before reaching `S` |
 
-Convergence:
+Compensation 3b redistributes this unused capacity to *other* demands at `S` who were capped during 3a — using the same allocation policy. It can iterate internally (a tiny inner loop bounded by `Σ allocation[*][S]`) until no more capacity can be redistributed.
+
+### 5.2 What compensation can't handle — outer iteration
+
+One refinement source crosses the Phase 2 / Phase 3 boundary and so can't be resolved inside compensation: **production cascade**.
+
+When demand `D` ends up consuming less of produced component `C` than allocation predicted (for any of the reasons above), `toMake[C]` shrinks. The WO at `C` was sized to a smaller production quantity, and the raw materials it consumes are correspondingly smaller. The raw-material allocations on iter 1 were sized for the predicted (larger) `toMake[C]`. Now those raw-material allocations have residual that compensation at the raw-material level *would* handle — but only if the WO at `C` was already correctly sized.
+
+So if iter 1's `toMake[C]` was over-estimated, iter 2 needs:
+
+1. Re-run Phase 2: re-allocate raw materials with the revised `toMake[C]` as the new total need at `C`'s sub-supplies.
+2. Re-run Phase 3 (3a + 3b): re-commit with new caps; compensation redistributes within the new caps.
+
+Convergence is by the same monotone clamp:
 
 ```
 allocation_k[D][S] = min(allocation_{k-1}[D][S], actualDraw_{k-1}[D][S])
-                     ── monotone clamp ──
+                     ── monotone clamp at outer-iter scope ──
 ```
 
-Same `min(prev, current)` rule we proved out for the leaf-level cap loop. Each `(D, S)` cap is a non-increasing sequence bounded below by 0 → converges by the monotone-decreasing-bounded-sequence theorem.
+Each `(D, S)` cap forms a non-increasing sequence bounded below by 0 → outer iteration converges in finitely many passes.
 
-Crucially, the **only** rebound source today (cross-group RM contention not governed by policy) is gone by construction. Expected iteration count drops dramatically — likely 2–3 iters typical, with 5–8 reserved for pathological alt-fanout cases. The current `MAX_PLANNING_ITERATIONS = 15` is comfortable headroom.
+### 5.3 Expected iter counts
+
+| Case | Outer iters | Compensation passes per outer iter |
+|---|---|---|
+| Simple BOM, no alts, no shared deep RM | 1 | 0 (or 1 trivial) |
+| Diamond BOM, shared raw materials | 1 | 1–2 (handles alt-divergence + intermediate-inventory) |
+| Multi-level production cascade with intermediate inventory | 2–3 | 1–2 |
+| Pathological: deep BOM + heavy alt-fanout + tight RM | 5–8 | 2–4 |
+
+Ceiling stays at `MAX_PLANNING_ITERATIONS = 15` for safety. In practice we expect dramatic reduction from today's typical 5–8 iters — most cases land in 1–2 outer passes because compensation handles within-iter rebalancing inline.
+
+The **only** rebound source today (cross-group RM contention not governed by policy) is gone by construction.
 
 ## 6. What disappears
 
@@ -233,15 +279,18 @@ Once side-by-side validation shows the supply engine is at least as good on a re
 
 | Phase | Deliverable | Files | LOC est | Risk |
 |---|---|---|---|---|
-| **A** | `needsMatrix` builder (pure function over `ResolutionGraph` + BOM) | `services/SupplyDemandMatrix.kt` + tests | 300 | Low — symbolic computation, well-tested |
+| **A** | `needsMatrix` builder (pure function over `ResolutionGraph` + BOM, walks every supply-bearing node not just leaves) | `services/SupplyDemandMatrix.kt` + tests | 300 | Low — symbolic computation, well-tested |
 | **B** | Per-supply allocator (adapts existing `splitFair`/`splitProportional`/`splitPriorityFirst` to the new input shape) | `services/SupplyAllocator.kt` + tests | 200 | Low |
-| **C** | Per-demand commit with supply-level caps | `services/PlanningEngine.kt` modifications | 150 | Low — `budgetCap` plumbing exists |
-| **D** | Produced-component WO synthesizer | `services/PlanningEngine.kt` modifications | 400 | Medium — sizing toMake[C] across demands is subtle |
-| **E** | `runV2Supply` orchestrator (replaces `runV2Iterated` when `engine="supply"`) | `services/PlanningEngine.kt` modifications | 250 | Medium |
-| **F** | Frontend: chip + slide-in show single supply-level allocation | `frontend/lib/api.ts`, `_CaseSectionPage.tsx` | 200 | Low |
-| **G** | Migration / config flag / soak test | Various | n/a | Medium |
+| **C** | Per-demand initial commit (3a) with supply-level caps | `services/PlanningEngine.kt` modifications | 150 | Low — `budgetCap` plumbing already exists |
+| **D** | Compensation sub-phase (3b): redistribute unused allocation, extend capped commits | `services/PlanningEngine.kt` modifications + tests | 250 | Medium — inner convergence test + extending an in-progress walk needs care |
+| **E** | Produced-component WO synthesizer (sizes `toMake[C]` from post-compensation actual draws) | `services/PlanningEngine.kt` modifications | 300 | Medium — recursive WO emission across produced components |
+| **F** | `runV2Supply` orchestrator (replaces `runV2Iterated` when `engine="supply"`) | `services/PlanningEngine.kt` modifications | 200 | Medium |
+| **G** | Frontend: chip + slide-in show single supply-level allocation | `frontend/lib/api.ts`, `_CaseSectionPage.tsx` | 200 | Low |
+| **H** | Migration / config flag / soak test | Various | n/a | Medium |
 
-Total: ~1300 LOC backend + ~200 frontend. Estimated 2 weeks of focused work + 1 week soak.
+Total: ~1400 LOC backend + ~200 frontend. Estimated 2.5 weeks of focused work + 1 week soak.
+
+Phase D (compensation) is the new central piece relative to today's planner. It's the place where alt-divergence and intermediate-inventory absorption are reconciled in-place, eliminating most of today's outer-iteration churn. Worth a careful test plan: synthetic fixtures covering each unused-allocation source (alt-divergence, intermediate absorption, hard failure upstream, demand-qty rounding) plus a combined diamond-BOM stress case.
 
 ## 11. Open questions
 
@@ -253,13 +302,11 @@ Phase 2 transposes implicitly when iterating columns, which on a sparse map requ
 
 ### Q2: Initial allocation when iter 1's matrix is over-estimated
 
-Iter 1's `needsMatrix` is symbolic — typically much larger than realisable need. For an under-supplied raw material, this means iter 1 distributes the supply across many demands that won't actually use it, leaving real consumers under-allocated.
+**Resolved.** Compensation (Phase 3b) redistributes unused allocation in-place after each initial commit. Demands that pick alt paths or whose intermediate inventory absorbed need leave allocations on the table; compensation lets capped competitors draw the freed-up capacity by the same policy. No outer iteration needed for these cases — compensation handles them within the same pass.
 
-Two responses:
-- **Accept the over-distribution and let iter 2 redistribute via the monotone clamp.** Simple, cheap. Probably the right default.
-- **Pre-deflate iter 1's matrix using inventory at intermediate levels.** Requires running a quick BOM-walk simulation per demand (with shared inventory accounting), which has its own ordering problem. More accurate iter 1, more code.
+Outer iteration is reserved for production-cascade refinement (when a produced component's `toMake[C]` shrinks relative to iter 1's prediction, requiring re-allocation at sub-supplies). See §5.
 
-I'd start with the first option and measure. If iter count exceeds ~5 on representative cases, consider deflation.
+The earlier suggestion to "pre-deflate iter 1's matrix using inventory at intermediate levels" is moot under this design — Phase 1 stays purely symbolic (need collection, no inventory awareness), and the compensation sub-phase + outer monotone clamp drive convergence.
 
 ### Q3: WO emission for a produced component drawn by demands with different alt-branches below
 
