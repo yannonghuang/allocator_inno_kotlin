@@ -296,9 +296,9 @@ Phase D (compensation) is the new central piece relative to today's planner. It'
 
 ### Q1: How aggressive is matrix sparsity?
 
-For a case with ~2,000 demands and ~10,000 supplies (case 162-scale), a dense matrix is `2,000 × 10,000 = 20M cells`. Most cells will be zero (most supplies aren't reachable from most demands). Need a sparse representation: `Map<demandId, Map<supplyKey, qty>>` is the obvious starting shape — same as the current `allocation` field on `ConsolidationResult`.
+**Resolved.** Sparse representation: `needsMatrix: Map<demandId, Map<supplyKey, qty>>` (same shape as today's `allocation` field on `ConsolidationResult`). Phase 2 needs to iterate columns, so build an inverted index `byColumn: Map<supplyKey, Map<demandId, qty>>` once at Phase 1 end — O(N) memory paid once, O(1) column lookup forever.
 
-Phase 2 transposes implicitly when iterating columns, which on a sparse map requires an inverted index `Map<supplyKey, Map<demandId, qty>>`. Build both at Phase 1 end; pay the O(N) memory once.
+For case-162-scale (~2,000 demands × ~10,000 supplies), most cells are zero (only the cells along each demand's BOM paths). Sparse maps stay cheap.
 
 ### Q2: Initial allocation when iter 1's matrix is over-estimated
 
@@ -331,13 +331,18 @@ No spike needed.
 
 ### Q4: How do supply overrides interact?
 
-Today's `supply_split` override lets a user manually allocate qty across demands at a given supply. Under supply-level allocation this is exactly what Phase 2 already does — overrides become explicit override entries that bypass `applyPolicy` for a specific supply. Cleaner mapping than today's "override the consolidated WO's split". Should simplify the override UI.
+**Resolved.** With clean separation between demand (need formulation) and supply (manufacture / allocation), overrides are straightforward: a `supply_split` override is just a manual allocation at Phase 2 that bypasses `applyPolicy` for a specific supply. The override entry replaces the policy result for that one column of the matrix; everything else flows through unchanged.
+
+Today's override has to navigate the consolidated WO's split-detail structure and the demand-tag tracking around synthetic buckets. Under supply-level allocation, the override directly addresses what the user wants to manipulate — the per-`(demand, supply)` cap. The override UI gets simpler: one allocation table per supply, one row per demand, qty fields the user can set freely (sum-validated against `supply.qty`).
+
+The same UI primitive can be reused as the supply-level analogue of today's per-WO override.
 
 ## 12. Next steps
 
-1. **Discuss this draft.** Open questions in §11 are the focal points (Q3 already resolved).
-2. **Implement Phase A (matrix builder).** Land it on `feat/supply-level-consolidation` along with unit tests. Reviewable in isolation.
-3. **Implement Phase B (allocator).** Reuses existing policy code; should be small.
-4. **Implement Phases C–E.** The orchestrator is the pivot point — once `runV2Supply` works on a single-demand fixture, layer up complexity.
-5. **Frontend (Phase F).** Should be a simplification, not an expansion.
-6. **Validate (Phase G).** Side-by-side on case 162 + representative cases. If the supply engine is clean and the leaf engine is the one with patches, the migration writes itself.
+Design is settled — all four open questions in §11 resolved.
+
+1. **Implement Phase A (matrix builder).** Land it on `feat/supply-level-consolidation` along with unit tests. Reviewable in isolation. ~300 LOC.
+2. **Implement Phase B (allocator).** Reuses existing policy code; small.
+3. **Implement Phases C–F.** Phase D (compensation) is the central new piece — most attention goes there. Phase F (orchestrator) is the pivot: once `runV2Supply` works on a single-demand fixture, layer up complexity.
+4. **Frontend (Phase G).** Should be a simplification, not an expansion.
+5. **Validate (Phase H).** Side-by-side on case 162 + representative cases under the feature flag. If the supply engine is clean and the leaf engine is the one with patches, the migration writes itself.
