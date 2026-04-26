@@ -185,6 +185,36 @@ class ConsolidationEngineTest : FunSpec({
         groups shouldHaveSize 2
     }
 
+    // ── Scenario 7b: period_days=0 sentinel collapses all dates ───────────────
+
+    test("Sc7b: timeBucket(period_days=0) returns EPOCH for all dates") {
+        val jan3   = LocalDate.of(2025, 1, 3)
+        val jan14  = LocalDate.of(2025, 1, 14)
+        val dec31  = LocalDate.of(2030, 12, 31)
+        timeBucket(jan3,  0) shouldBe LocalDate.EPOCH
+        timeBucket(jan14, 0) shouldBe LocalDate.EPOCH
+        timeBucket(dec31, 0) shouldBe LocalDate.EPOCH
+    }
+
+    test("Sc7c: groupByTimeBucket(period_days=0) merges across all dates") {
+        val needs = listOf(
+            ComponentNeed("C", "L", LocalDate.of(2025, 1, 3),   10.0, "D1", 1, "FG1"),
+            ComponentNeed("C", "L", LocalDate.of(2025, 6, 15),  40.0, "D2", 2, "FG2"),
+            ComponentNeed("C", "L", LocalDate.of(2030, 12, 31), 50.0, "D3", 3, "FG3"),
+        )
+        val groups = groupByTimeBucket(needs, 0)
+        groups shouldHaveSize 1
+        groups[0].timeBucket shouldBe LocalDate.EPOCH
+        groups[0].totalQty shouldBe (100.0 plusOrMinus 1e-9)
+    }
+
+    test("Sc7d: parseConsolidationConfig accepts period_days=0") {
+        val cfg = parseConsolidationConfig(mapOf(
+            "consolidation" to mapOf("enabled" to true, "period_days" to 0)
+        ))
+        cfg.periodDays shouldBe 0
+    }
+
     // ── Scenario 8: Same time bucket → consolidated ───────────────────────────
 
     test("Sc8: Jan 3 and Jan 5 with period_days=7 land in same bucket") {
