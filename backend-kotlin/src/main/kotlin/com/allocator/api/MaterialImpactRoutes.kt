@@ -384,8 +384,20 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
             // 5. Re-run planning with the mutated supply (bounded concurrency via semaphore)
             log.info("material-impact re-plan: jobId={} supplyId={} delay={} qtyDecrease={}",
                 jobId, req.supplyId, req.deliveryDelayDays, req.quantityDecreasePct)
+            val demandTotal = (mutatedData["demand"] as? List<*>)?.size ?: 0
+            val progressCb: (Map<String, Any?>) -> Unit = { p ->
+                materialImpactJobs[jobId]?.let { job ->
+                    val payload = mutableMapOf<String, Any?>(
+                        "current" to (p["current"] ?: 0),
+                        "total" to demandTotal,
+                    )
+                    p["iteration"]?.let { payload["iteration"] = it }
+                    p["iterations_max"]?.let { payload["iterations_max"] = it }
+                    job["progress"] = payload
+                }
+            }
             contingentResult = replanSemaphore.withPermit {
-                runPlanning(mutatedData, config = parsedConfig)
+                runPlanning(mutatedData, config = parsedConfig, progressCallback = progressCb)
             }
 
             // 6. Persist contingent plan run + material event record (only when persist=true).
@@ -595,6 +607,7 @@ fun Routing.materialImpactRoutes() {
                 "status" to "running",
                 "result" to null,
                 "error" to null,
+                "progress" to mapOf("current" to 0, "total" to 0),
             )
             materialImpactScope.launch { runMaterialImpactBackground(jobId, req) }
 
@@ -615,6 +628,15 @@ fun Routing.materialImpactRoutes() {
             val status = job["status"]?.toString() ?: "unknown"
             call.respond(buildJsonObject {
                 put("status", status)
+                @Suppress("UNCHECKED_CAST")
+                (job["progress"] as? Map<String, Any?>)?.let { p ->
+                    put("progress", buildJsonObject {
+                        put("current", JsonPrimitive((p["current"] as? Number)?.toLong() ?: 0L))
+                        put("total", JsonPrimitive((p["total"] as? Number)?.toLong() ?: 0L))
+                        (p["iteration"] as? Number)?.let { put("iteration", JsonPrimitive(it.toLong())) }
+                        (p["iterations_max"] as? Number)?.let { put("iterations_max", JsonPrimitive(it.toLong())) }
+                    })
+                }
                 val result = job["result"]
                 if (result != null) put("result", resultToJson(result))
                 val error = job["error"]

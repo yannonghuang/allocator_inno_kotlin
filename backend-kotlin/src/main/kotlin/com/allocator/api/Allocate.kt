@@ -1446,7 +1446,13 @@ private suspend fun runPlanBackground(
         val progressCb: (Map<String, Any?>) -> Unit = { p ->
             planJobs[jobId]?.let { job ->
                 if (job["status"] == "running") {
-                    job["progress"] = mapOf("current" to (p["current"] ?: 0), "total" to total)
+                    val payload = mutableMapOf<String, Any?>(
+                        "current" to (p["current"] ?: 0),
+                        "total" to total,
+                    )
+                    p["iteration"]?.let { payload["iteration"] = it }
+                    p["iterations_max"]?.let { payload["iterations_max"] = it }
+                    job["progress"] = payload
                 }
             }
         }

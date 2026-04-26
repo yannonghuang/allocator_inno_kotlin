@@ -295,7 +295,7 @@ export type PlanningConfig = {
   /** Consolidate shared component demands within a time bucket before planning. */
   consolidation?: {
     enabled?: boolean;
-    /** Width of the time bucket in days (1–365). Default: 365. */
+    /** Width of the time bucket in days (0–365). 0 (default) collapses every demand into a single bucket regardless of due date. */
     period_days?: number;
     /** How to split consolidated output among competing demands. Default: fair. */
     allocation_mode?: 'priority_first' | 'proportional' | 'fair';
@@ -378,7 +378,14 @@ export async function runPlanAsync(caseId: number, config?: PlanningConfig | nul
 
 export type PlanStatusResponse = {
   status: 'running' | 'completed' | 'failed';
-  progress?: { current: number; total: number };
+  progress?: {
+    current: number;
+    total: number;
+    /** Fixed-point iteration number (1-indexed) the planner is currently running. Absent when consolidation is off. */
+    iteration?: number;
+    /** Max iterations the fixed-point controller will run before giving up and falling back to single-pass trim. */
+    iterations_max?: number;
+  };
   result?: PlanResult;
   error?: string;
   plan_run_id?: number;
@@ -918,12 +925,20 @@ export async function deleteMaterialEvent(caseId: number, eventId: number): Prom
   if (!r.ok) throw new Error(await r.text());
 }
 
+export type MaterialImpactProgress = {
+  current: number;
+  total: number;
+  iteration?: number;
+  iterations_max?: number;
+};
+
 export async function analyzeMaterialImpact(
   supplyId: string,
   deliveryDelayDays: number,
   quantityDecreasePct: number,
   persist = true,
   quantityDecreaseAbs?: number | null,
+  onProgress?: (p: MaterialImpactProgress) => void,
 ): Promise<MaterialImpactResult> {
   // 1. Submit async re-plan job
   const submit = await fetch(`${API}/material-impact`, {
@@ -935,10 +950,12 @@ export async function analyzeMaterialImpact(
   const { jobId } = await submit.json();
   if (!jobId) throw new Error('No jobId returned from material-impact');
 
-  // 2. Poll until completed (exponential back-off: 1→2→4→8→8s, max 120s)
-  let delay = 1000;
-  const maxDelay = 8000;
-  const maxWait = 120_000;
+  // 2. Poll until completed. Fast initial cadence so progress feels live, then
+  // back off; total budget is generous because v2 fixed-point iteration can
+  // run 5x for hard cases.
+  let delay = 500;
+  const maxDelay = 2000;
+  const maxWait = 600_000; // 10 min
   const start = Date.now();
   while (Date.now() - start < maxWait) {
     await new Promise(res => setTimeout(res, delay));
@@ -947,6 +964,7 @@ export async function analyzeMaterialImpact(
     const poll = await fetch(`${API}/material-impact/status/${encodeURIComponent(jobId)}`);
     if (!poll.ok) throw new Error(`Poll failed: ${poll.status}`);
     const body = await poll.json();
+    if (body.progress && onProgress) onProgress(body.progress as MaterialImpactProgress);
     if (body.status === 'completed') return body.result as MaterialImpactResult;
     if (body.status === 'failed') throw new Error(body.error ?? 'Re-plan job failed');
   }

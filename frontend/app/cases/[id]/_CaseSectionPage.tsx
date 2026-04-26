@@ -53,6 +53,7 @@ import {
   type AllocationProgress,
   type MaterialEvent,
   type MaterialImpactResult,
+  type MaterialImpactProgress,
   listMaterialEvents,
   createMaterialEvent,
   updateMaterialEvent,
@@ -683,6 +684,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [materialEventsLoading, setMaterialEventsLoading] = useState(false);
   const [materialImpacts, setMaterialImpacts] = useState<Record<number, MaterialImpactResult | null>>({});
   const [materialImpactLoading, setMaterialImpactLoading] = useState<Record<number, boolean>>({});
+  const [materialImpactProgress, setMaterialImpactProgress] = useState<Record<number, MaterialImpactProgress | null>>({});
+  const [materialImpactError, setMaterialImpactError] = useState<Record<number, string | null>>({});
   const [materialAssessments, setMaterialAssessments] = useState<Record<number, AssessmentResponse | null>>({});
   const [materialAssessmentLoading, setMaterialAssessmentLoading] = useState<Record<number, boolean>>({});
   const [materialAssessmentError, setMaterialAssessmentError] = useState<Record<number, string | null>>({});
@@ -811,9 +814,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [woPeggingRowKey, setWoPeggingRowKey] = useState<string | null>(null);
   const [bomRealPairs, setBomRealPairs] = useState<[string, string][] | null>(null);
   const [realMoveTriples, setRealMoveTriples] = useState<[string, string, string][] | null>(null);
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 365, allocation_mode: 'fair' }, purchase_allowed: false });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' }, purchase_allowed: false });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
-  const [planProgress, setPlanProgress] = useState<{ current: number; total: number } | null>(null);
+  const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [copilotOpen, setCopilotOpen] = useState(false);
   const [copilotMessages, setCopilotMessages] = useState<PlanningCopilotMessage[]>([]);
@@ -900,7 +903,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           ? tP('copilot.splitPriorityFirst')
           : tP('copilot.splitFair');
       const consolidationMode = cs.enabled
-        ? tP('copilot.consolidationOnDetail', { days: cs.period_days ?? 365, split: splitLabel })
+        ? tP('copilot.consolidationOnDetail', { days: cs.period_days ?? 0, split: splitLabel })
         : tP('copilot.off');
       const methodLine = methodDepth != null
         ? tP('copilot.replies.showConfigMethodDepth', { methodMode, depth: methodDepth })
@@ -994,7 +997,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           ? tP('copilot.replies.consolidationOnModePriority')
           : tP('copilot.replies.consolidationOnModeFair');
       return {
-        reply: tP('copilot.replies.consolidationOn', { days: cs.period_days ?? 365, mode: modeLabel }),
+        reply: tP('copilot.replies.consolidationOn', { days: cs.period_days ?? 0, mode: modeLabel }),
         configUpdate: { consolidation: { ...cs, enabled: true } },
       };
     }
@@ -1041,7 +1044,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (/reset|default|clear|重置|默认|清除/.test(t)) {
       return {
         reply: tP('copilot.replies.reset'),
-        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, depth_optimal: false, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 365, allocation_mode: 'fair' } },
+        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, depth_optimal: false, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' } },
       };
     }
 
@@ -3434,12 +3437,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               <span style={{ color: '#a1a1aa' }}>{tP('config.bucketDays')}</span>
               <input
                 type="number"
-                min={1}
+                min={0}
                 max={365}
                 disabled={planningConfig.consolidation?.enabled !== true}
-                value={planningConfig.consolidation?.period_days ?? 365}
+                value={planningConfig.consolidation?.period_days ?? 0}
                 onChange={(e) => {
-                  const v = Math.max(1, Math.min(365, parseInt(e.target.value, 10) || 365));
+                  const raw = parseInt(e.target.value, 10);
+                  const v = Math.max(0, Math.min(365, Number.isNaN(raw) ? 0 : raw));
                   setPlanningConfig((c) => ({ ...c, consolidation: { ...c.consolidation, period_days: v } }));
                 }}
                 style={{ width: 64, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
@@ -3517,7 +3521,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 },
               },
               purchase_allowed: false,
-              consolidation: { enabled: true, period_days: 365, allocation_mode: 'fair' },
+              consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' },
             })}
             title={tP('config.resetDefaultsTitle')}
             style={{ padding: '6px 12px' }}
@@ -3554,7 +3558,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         {planLoading && planProgress && planProgress.total > 0 && (
           <div style={{ marginTop: '0.5rem', maxWidth: 400 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.25rem' }}>
-              <span>{tP('planProgress')} {planProgress.current} / {planProgress.total} {tP('demands')}</span>
+              <span>
+                {tP('planProgress')} {planProgress.current} / {planProgress.total} {tP('demands')}
+                {planProgress.iteration && planProgress.iterations_max
+                  ? ` (iter ${planProgress.iteration}/${planProgress.iterations_max})`
+                  : ''}
+              </span>
             </div>
             <div style={{ height: 8, backgroundColor: '#27272a', borderRadius: 4, overflow: 'hidden' }}>
               <div
@@ -5429,11 +5438,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         onClick={async () => {
                           setMaterialImpactLoading(m => ({ ...m, [ev.id]: true }));
                           setMaterialImpacts(m => ({ ...m, [ev.id]: null }));
+                          setMaterialImpactError(m => ({ ...m, [ev.id]: null }));
+                          setMaterialImpactProgress(m => ({ ...m, [ev.id]: null }));
                           try {
-                            const result = await analyzeMaterialImpact(ev.supplyId, ev.delayDays, ev.qtyDecreasePct, true, ev.qtyDecreaseAbs);
+                            const result = await analyzeMaterialImpact(
+                              ev.supplyId, ev.delayDays, ev.qtyDecreasePct, true, ev.qtyDecreaseAbs,
+                              (p) => setMaterialImpactProgress(m => ({ ...m, [ev.id]: p })),
+                            );
                             setMaterialImpacts(m => ({ ...m, [ev.id]: result }));
-                          } catch { /* ignore */ } finally {
+                          } catch (e) {
+                            setMaterialImpactError(m => ({ ...m, [ev.id]: e instanceof Error ? e.message : 'Impact analysis failed' }));
+                          } finally {
                             setMaterialImpactLoading(m => ({ ...m, [ev.id]: false }));
+                            setMaterialImpactProgress(m => ({ ...m, [ev.id]: null }));
                           }
                         }}>
                         {impactLoading ? 'Analyzing…' : 'Analyze impact'}
@@ -5459,6 +5476,32 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       </button>
                     </div>
                   </div>
+
+                  {impactLoading && materialImpactProgress[ev.id] && (materialImpactProgress[ev.id]?.total ?? 0) > 0 && (
+                    <div style={{ marginTop: '0.5rem', maxWidth: 400 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.78rem', color: '#a1a1aa', marginBottom: '0.25rem' }}>
+                        <span>
+                          Re-planning: {materialImpactProgress[ev.id]?.current} / {materialImpactProgress[ev.id]?.total} demands
+                          {materialImpactProgress[ev.id]?.iteration && materialImpactProgress[ev.id]?.iterations_max
+                            ? ` (iter ${materialImpactProgress[ev.id]?.iteration}/${materialImpactProgress[ev.id]?.iterations_max})`
+                            : ''}
+                        </span>
+                      </div>
+                      <div style={{ height: 6, backgroundColor: '#27272a', borderRadius: 3, overflow: 'hidden' }}>
+                        <div
+                          style={{
+                            height: '100%',
+                            width: `${Math.min(100, 100 * (materialImpactProgress[ev.id]?.current ?? 0) / Math.max(1, materialImpactProgress[ev.id]?.total ?? 1))}%`,
+                            backgroundColor: '#3b82f6',
+                            transition: 'width 0.2s ease',
+                          }}
+                        />
+                      </div>
+                    </div>
+                  )}
+                  {materialImpactError[ev.id] && (
+                    <p style={{ color: '#f87171', fontSize: '0.78rem', margin: '0.5rem 0 0' }}>{materialImpactError[ev.id]}</p>
+                  )}
 
                   {!isCollapsed && (<>
                   {/* ── Impact results ── */}
@@ -6611,7 +6654,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <strong>{tP('copilot.purchase')}</strong> {planningConfig.purchase_allowed === false ? tP('copilot.disabled') : tP('copilot.allowed')}.{' '}
                 <strong>{tP('copilot.consolidation')}</strong> {planningConfig.consolidation?.enabled === true
                   ? tP('copilot.consolidationOnDetail', {
-                      days: planningConfig.consolidation.period_days ?? 365,
+                      days: planningConfig.consolidation.period_days ?? 0,
                       split: planningConfig.consolidation.allocation_mode === 'proportional'
                         ? tP('copilot.splitProportional')
                         : planningConfig.consolidation.allocation_mode === 'priority_first'
