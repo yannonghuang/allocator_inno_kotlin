@@ -193,7 +193,7 @@ val REAL_BOM_PAIRS: Set<Pair<String, String>> by lazy { loadRealBomPairsFromCsv(
 
 // ── Date helpers ───────────────────────────────────────────────────────────────
 
-private fun parseDate(s: String?): LocalDate? {
+internal fun parseDate(s: String?): LocalDate? {
     if (s.isNullOrBlank()) return null
     val raw = s.trim().take(10)
     if (raw.length < 10) return null
