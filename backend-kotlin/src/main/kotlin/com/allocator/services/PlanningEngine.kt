@@ -1763,6 +1763,17 @@ private fun reconcileOverProduction(
 /**
  * v2 fixed-point iteration controller (Stages 1-4b).
  *
+ * Drives convergence by minimizing **over-production** at merged leaves.
+ * Over-production = `Σ_(d,c) max(0, initialBudgets[d][c] − consumed[d][c])`,
+ * where `c` ranges over merged-leaf componentKeys and `d` ranges over demands;
+ * `initialBudgets` is consolidation's per-demand allocation share at each leaf,
+ * and `consumed` is what each demand actually drew from that share during
+ * Phase 3. A positive residual at `(d, c)` means Phase 2 emitted synthetic
+ * supply for demand `d` at leaf `c` that `d` never picked up — typically because
+ * intermediate inventory above `c` satisfied `d`'s BOM walk before recursion
+ * reached the leaf. See the "## Over-production" section below for the full
+ * definition and contrast with what it is *not*.
+ *
  * Runs phase 1 (resolution graph) once, builds merged groups once, then loops
  * phases 2+3 with progressively tighter member caps until production at the
  * merged leaf matches what the demand chain actually consumes:
@@ -1784,6 +1795,42 @@ private fun reconcileOverProduction(
  * leaf — those were sized for the over-produced leaf qty. Iterating with
  * shrunken caps drives phase 2 to plan smaller leaf qty, which in turn shrinks
  * the BOM-child WOs naturally.
+ *
+ * ## Over-production (definition)
+ *
+ * Over-production is the **allocated-but-never-drawn** budget summed across
+ * every (demand, merged-leaf-component) pair after Phase 3. It's a per-iter
+ * accounting residual, not a physical excess.
+ *
+ *   initialBudgets[d][c]  -- qty consolidation allocated to demand d at leaf c
+ *                            (set by Phase 2 from consResult.allocation)
+ *   consumed[d][c]        -- qty d actually drew from c's synthetic supply
+ *                            during Phase 3 (initialBudgets - remaining-budget)
+ *   over[d][c]            -- max(0, initialBudgets[d][c] - consumed[d][c])
+ *   totalOver             -- Σ_(d,c) over[d][c]   ← what runV2Iterated logs
+ *
+ * `c` is always a *merged leaf* (one entry per `(productId, locationId)`
+ * group from `mergeGroups`), never a BOM intermediate. Phase 1 builds the
+ * resolution graph **symbolically** (BOM rates × due-date arithmetic, no
+ * inventory check). Phase 2 sizes consolidated WOs to satisfy that symbolic
+ * need. Phase 3 commits each demand against actual inventory; when intermediate
+ * inventory above the leaf satisfies the demand's request, the BOM walk
+ * shortcuts and the leaf-level allocation goes unused — that's `over[d][c]`.
+ *
+ * If left uncorrected, `over[d][c] > 0` means the consolidated WO at leaf `c`
+ * was sized for `d`'s share but produced units `d` never needed — i.e. qty
+ * manufactured into the void. Driving `totalOver → 0` via the cap mechanism
+ * shrinks both the merged-leaf WO and (transitively, via the leaf's internal
+ * `plan()` call) every BOM-child WO cascaded from it.
+ *
+ * What over-production is **not**:
+ *  - Not excess physical production from misconfigured WO sizing.
+ *  - Not the planner exceeding demand quantity (Phase 3 is bounded by the row).
+ *  - Not raw-material waste (tracked separately by inventory consumption).
+ *  - Not measured at BOM children of merged leaves; children are corrected
+ *    transitively via the cap mechanism, never measured directly. That's why
+ *    [reconcileOverProduction]'s fallback log warns "sub-component WOs NOT
+ *    cascade-trimmed" — it only fixes the leaf-level WO.
  *
  * ## Convergence design (why it terminates)
  *
