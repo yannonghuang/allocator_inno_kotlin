@@ -1813,9 +1813,12 @@ private fun reconcileOverProduction(
  * group from `mergeGroups`), never a BOM intermediate. Phase 1 builds the
  * resolution graph **symbolically** (BOM rates × due-date arithmetic, no
  * inventory check). Phase 2 sizes consolidated WOs to satisfy that symbolic
- * need. Phase 3 commits each demand against actual inventory; when intermediate
- * inventory above the leaf satisfies the demand's request, the BOM walk
- * shortcuts and the leaf-level allocation goes unused — that's `over[d][c]`.
+ * need. Phase 3 commits each demand against actual inventory and picks one
+ * alternative per alt_group; the leaf-level allocation goes unused when (a)
+ * Phase 3 picks a different alt_group child than the path Phase 1 enumerated
+ * for this leaf, or (b) post-Phase-2 synthetic supply at an intermediate level
+ * (created by some other group's leaf production) satisfies the demand before
+ * its BOM walk recurses to leaf `c`.
  *
  * If left uncorrected, `over[d][c] > 0` means the consolidated WO at leaf `c`
  * was sized for `d`'s share but produced units `d` never needed — i.e. qty

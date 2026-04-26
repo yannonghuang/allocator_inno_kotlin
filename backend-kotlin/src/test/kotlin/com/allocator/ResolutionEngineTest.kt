@@ -171,8 +171,10 @@ class ResolutionEngineTest : FunSpec({
         byLeaf["C2"]!! shouldBe (40.0 plusOrMinus 1e-9)
     }
 
-    test("buildResolutionGraph: OR alt_group picks one child deterministically") {
-        // FG → (C1 OR C2): same alt_group; resolution must pick exactly one.
+    test("buildResolutionGraph: OR alt_group enumerates every child (union-alt)") {
+        // FG → (C1 OR C2): same alt_group; resolution emits one path per alternative
+        // so consolidation can form merged groups at every candidate leaf. Phase 3
+        // picks the actual alt at runtime; the cap loop drives unpicked alts to zero.
         val data = mapOf(
             "bom" to listOf(
                 bom("FG", "C1", 1.0, altGroup = "or1"),
@@ -189,10 +191,10 @@ class ResolutionEngineTest : FunSpec({
         val demands = listOf(demand("D1", "FG", "L1", 10.0))
 
         val graph = buildResolutionGraph(demands, data)
-        graph.paths shouldHaveSize 1
-        // Deterministic choice — first row in BOM list wins; either C1 or C2 is acceptable but
-        // running this test twice must yield the identical answer. The current chooser picks first.
-        graph.paths[0].leaf.productId shouldBe "C1"
+        graph.paths shouldHaveSize 2
+        val byLeaf = graph.paths.associate { it.leaf.productId to it.leafQuantity() }
+        byLeaf["C1"]!! shouldBe (10.0 plusOrMinus 1e-9)
+        byLeaf["C2"]!! shouldBe (10.0 plusOrMinus 1e-9)
     }
 
     // ── Inventory-blindness ──────────────────────────────────────────────────

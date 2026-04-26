@@ -17,10 +17,10 @@ private val log = LoggerFactory.getLogger("com.allocator.ResolutionEngine")
  * `descendant`, how many units does that imply 1 unit of `ancestor` consume?"
  *
  * The traversal is purely structural — it ignores alt_groups (treats every
- * child as reachable). That is intentional: this index supports the merge
- * step which already knows which alternative each demand resolved through
- * (recorded in the [ResolutionGraph]), so ancestry-level rate is just the
- * arithmetic of multiplying rates along the chosen chain.
+ * child as reachable). Since [walkResolution] now enumerates every alt
+ * branch into its own [ResolutionPath], each path records exactly one
+ * alternative chain; ancestry-level rate is just the arithmetic of
+ * multiplying rates along that chain.
  */
 class BomAncestry(bom: List<Map<String, Any?>>) {
 
@@ -126,16 +126,24 @@ data class ResolutionGraph(
 /**
  * Build a [ResolutionGraph] for the given demands. Walks BOM/methods
  * inventory-blind: every method is selected via simple preference, with no
- * cascade probe. At each `make` step every alt_group contributes one chosen
- * child (lowest preference if the BOM rows carry preference, else first by
- * row order — same behavior as the legacy [variantsForMake] picks at
- * non-root levels). Stops at the first inventory-bearing (pid, lid).
+ * cascade probe. **Each alt_group enumerates every child** — the walk emits
+ * one [ResolutionPath] per alternative branch, not one per chosen alternative.
+ * Stops at the first inventory-bearing (pid, lid).
  *
- * Inventory-blindness is intentional. Phase 1's job is to declare *what is
- * needed*; Phase 3 (commit) is the one that actually decides how to satisfy
- * each need against current supply. Letting inventory steer Phase 1 produces
- * the cascade thrash we are trying to avoid (different demands picking
- * different alternatives for the same component).
+ * Inventory-blindness is intentional. Phase 1's job is to declare *what
+ * candidate leaves merged-group consolidation could land at*; Phase 3 (commit)
+ * is the one that actually picks the alternative against current supply +
+ * preference scoring. Letting inventory steer Phase 1 produces the cascade
+ * thrash we are trying to avoid (different demands picking different
+ * alternatives for the same component, breaking the merge-structure
+ * invariant the cap loop relies on).
+ *
+ * Union-alt rationale: with pick-one, when Phase 3 routes through alt B'
+ * but Phase 1 picked B, the consolidation benefit is lost — D's C' WO is
+ * built standalone instead of merged with peers. Worst when many demands
+ * diverge together to the same actually-used alt. Union-alt provisions
+ * merged groups at every alt's leaf; the cap loop drives unpicked alts
+ * to zero in 1-2 iters; the picked alt retains full consolidation.
  */
 fun buildResolutionGraph(
     demands: List<Map<String, Any?>>,
@@ -188,7 +196,8 @@ fun ResolutionGraph.toComponentNeeds(): List<ComponentNeed> =
             demandId         = p.demandId,
             priority         = p.priority,
             parentProductId  = if (p.nodes.size >= 2) p.nodes[p.nodes.size - 2].productId else p.root.productId,
-            // v2 chooses one alternative per alt_group at every level, so no path is "via OR".
+            // v2 enumerates every alt_group child as its own path, so no individual
+            // path is "via OR" — each path records exactly one alternative chain.
             viaOrAlternative = false,
         )
     }
@@ -394,8 +403,11 @@ private fun parseDateOrNull(s: String?): LocalDate? {
  *   - no methods available → drop the branch.
  *
  * Recursion:
- *   - `make`: each alt_group contributes one chosen child (lowest-preference row, deterministic
- *     fallback to first row). All alt_groups are followed (they represent independent BOM lines).
+ *   - `make`: each alt_group enumerates **every** child (union-alts). Independent
+ *     BOM lines (different alt_groups) are AND-combined; alternatives within an
+ *     alt_group are OR-combined and become parallel paths in the resolution graph.
+ *     Phase 3's plan() picks which alt to use at runtime; the cap loop drives
+ *     unpicked alts to zero within a couple of iterations.
  *   - `move`: one synthetic child = the source (pid, fromLocationId).
  */
 private fun walkResolution(
@@ -438,27 +450,35 @@ private fun walkResolution(
             val nextVisited = visited + key
             val productionLocation = (method["location_id"] as? String)?.trim() ?: locationId
             val variants = variantsForMake(productId, productionLocation, 1.0, method, data) // unit-rate walk
+            // Union-alts: each alt_group emits a path through EVERY child, not just one.
+            // Phase 3's plan() picks the actual alt at runtime based on preference scoring +
+            // supply availability. Phase 1 can't predict that pick reliably (BOM rows don't
+            // carry per-alt preference), so it provisions all alts so consolidation can form
+            // merged groups at every candidate leaf. The cap loop drives unpicked alts to
+            // zero in 1-2 iters; the picked alt retains the consolidation benefit (one merged
+            // WO per leaf instead of N standalone WOs when many demands diverge together).
             for ((_, childList) in variants) {
-                val chosenChild = chooseAltChild(childList) ?: continue
-                val cPid = (chosenChild["product_id"]  as? String)?.trim() ?: continue
-                val cLid = (chosenChild["location_id"] as? String)?.trim() ?: continue
-                val cRate = (chosenChild["quantity"]    as? Number)?.toDouble() ?: continue
-                if (cRate <= 0) continue
-                walkResolution(
-                    productId = cPid,
-                    locationId = cLid,
-                    cumulativeRate = cumulativeRate * cRate,
-                    depth = depth + 1,
-                    data = data,
-                    supplyIndex = supplyIndex,
-                    visited = nextVisited,
-                    chain = nextChain,
-                    demandId = demandId,
-                    priority = priority,
-                    dueDate = dueDate,
-                    requestedQty = requestedQty,
-                    out = out,
-                )
+                for (alt in childList) {
+                    val cPid = (alt["product_id"]  as? String)?.trim() ?: continue
+                    val cLid = (alt["location_id"] as? String)?.trim() ?: continue
+                    val cRate = (alt["quantity"]    as? Number)?.toDouble() ?: continue
+                    if (cRate <= 0) continue
+                    walkResolution(
+                        productId = cPid,
+                        locationId = cLid,
+                        cumulativeRate = cumulativeRate * cRate,
+                        depth = depth + 1,
+                        data = data,
+                        supplyIndex = supplyIndex,
+                        visited = nextVisited,
+                        chain = nextChain,
+                        demandId = demandId,
+                        priority = priority,
+                        dueDate = dueDate,
+                        requestedQty = requestedQty,
+                        out = out,
+                    )
+                }
             }
         }
         "move" -> {
@@ -490,15 +510,3 @@ private fun walkResolution(
     }
 }
 
-/**
- * Pick one child from an alt_group's child list. When multiple children share an alt_group
- * they are mutually exclusive alternatives; we pick deterministically (first by row order — this
- * matches how variantsForMake is iterated in legacy code at non-root levels). When the alt_group
- * has only one child it is non-OR and we just return it.
- *
- * NOTE: BOM rows do not currently carry a per-alternative preference, so "first" is the only
- * deterministic option short of adding new schema. If we later add a preference column the
- * selection should change here only.
- */
-private fun chooseAltChild(childList: List<Map<String, Any?>>): Map<String, Any?>? =
-    childList.firstOrNull()
