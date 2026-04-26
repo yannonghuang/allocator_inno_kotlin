@@ -136,7 +136,14 @@ private suspend fun llmParse(
     }
 
     val text = try {
-        llmChat(systemPrompt = SYSTEM_PROMPT, messages = msgs, maxTokens = 500).trim()
+        // Pin to OpenAI regardless of global LLM_PROVIDER — see ASSESSMENT_PROVIDER in
+        // AssessmentRoutes.kt for the rationale.
+        llmChat(
+            systemPrompt = SYSTEM_PROMPT,
+            messages = msgs,
+            maxTokens = 500,
+            provider = "openai",
+        ).trim()
     } catch (e: LlmNotConfiguredException) {
         log.info("Planning copilot: {}, using rule-based fallback", e.message)
         return null

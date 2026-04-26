@@ -283,10 +283,16 @@ $criteria
 """.trimIndent()
 }
 
+// Pin assessment LLM calls to OpenAI regardless of the global LLM_PROVIDER. OpenClaw's
+// /v1/chat/completions and the Claude Pro sub token both have caps/quirks that surface as
+// opaque 5xx; OpenAI's API is the most reliable for short structured prompts like RATING.
+private const val ASSESSMENT_PROVIDER = "openai"
+
 private suspend fun callLlm(prompt: String): Pair<String, String> {
     val text = llmChat(
         messages = listOf(LlmMessage("user", prompt)),
         maxTokens = 512,
+        provider = ASSESSMENT_PROVIDER,
     )
 
     val ratingLine = text.lines().firstOrNull { it.startsWith("RATING:") }
@@ -306,6 +312,7 @@ private suspend fun callLlmForText(prompt: String): String =
     llmChat(
         messages = listOf(LlmMessage("user", prompt)),
         maxTokens = 256,
+        provider = ASSESSMENT_PROVIDER,
     ).trim()
 
 // ── Routes ────────────────────────────────────────────────────────────────────
