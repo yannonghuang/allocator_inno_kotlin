@@ -263,11 +263,24 @@ I'd start with the first option and measure. If iter count exceeds ~5 on represe
 
 ### Q3: WO emission for a produced component drawn by demands with different alt-branches below
 
-A produced component `C` may be a node on multiple alt paths. Each demand reaches `C` via its chosen alt (in commit), and `C`'s sub-tree below differs per alt. The single consolidated WO at `C` produces qty = `Σ_D actualDraw[D][C_synthetic]`. The WO's own BOM walk consumes raw materials within their supply allocations.
+**Resolved.** This question conflated two kinds of "alt" that operate at different scopes and don't interact:
 
-If `C`'s sub-BOMs differ structurally per alt, the consolidated WO's BOM is taken from the union of sub-trees — same as the union-alt logic at the resolution-graph level, applied recursively at production. Consumes raw materials at union-alt-determined leaves; iter 2+ reconciles unused alt branches.
+| Scope | Source | Resolution |
+|---|---|---|
+| **Demand-side alts** | A demand's BOM has OR-branches near the top (e.g., `A → B \| B'`). Different demands may reach the same component via different branches | Phase 1 enumerates both via union-alt; Phase 3 picks one per demand at commit; iter 2+ caps the unpicked-alt allocations to zero via the monotone clamp |
+| **Supply-side alts** | A produced component's own recipe has OR-branches in its sub-BOM (e.g., `C → X \| Y`) | Resolved entirely by C's own plan() invocation when the WO is synthesized — preference scoring, inventory check, cascade probe — same logic that already makes alt-picks for non-consolidated demands |
 
-This is the trickiest piece. Worth a separate spike before committing to the implementation.
+The principle: **supply-side manufacture is independent of which demands triggered production.** Demands contribute quantity to a produced component; the component's recipe (including alt sub-tree picks) is its own decision, driven by `plan()` and the operator-configured rules.
+
+Concretely: WO synthesis at `C` is
+
+```
+plan(syntheticDemand{ product_id=C.pid, location_id=C.lid, quantity=totalNeed[C] }, ...)
+```
+
+`totalNeed[C] = Σ_D actualDraw[D][C_synthetic]` over the demands that walked through `C`. `plan()` chooses C's alt sub-tree based on its own logic (preferences, sub-supply availability) without reference to which demands contributed. The downstream raw materials it consumes are constrained by their own supply-level allocations.
+
+No spike needed.
 
 ### Q4: How do supply overrides interact?
 
@@ -275,10 +288,9 @@ Today's `supply_split` override lets a user manually allocate qty across demands
 
 ## 12. Next steps
 
-1. **Discuss this draft.** Iterate on the design before writing code. Open questions in §11 are the focal points.
-2. **Spike Q3 (WO emission across alt-branches)** in isolation — write a small fixture and walk through it manually. The cleanliness of the rest of the design depends on this not being a hidden complexity.
-3. **Implement Phase A (matrix builder).** Land it on `feat/supply-level-consolidation` along with unit tests. Reviewable in isolation.
-4. **Implement Phase B (allocator).** Reuses existing policy code; should be small.
-5. **Implement Phases C–E.** The orchestrator is the pivot point — once `runV2Supply` works on a single-demand fixture, layer up complexity.
-6. **Frontend (Phase F).** Should be a simplification, not an expansion.
-7. **Validate (Phase G).** Side-by-side on case 162 + representative cases. If the supply engine is clean and the leaf engine is the one with patches, the migration writes itself.
+1. **Discuss this draft.** Open questions in §11 are the focal points (Q3 already resolved).
+2. **Implement Phase A (matrix builder).** Land it on `feat/supply-level-consolidation` along with unit tests. Reviewable in isolation.
+3. **Implement Phase B (allocator).** Reuses existing policy code; should be small.
+4. **Implement Phases C–E.** The orchestrator is the pivot point — once `runV2Supply` works on a single-demand fixture, layer up complexity.
+5. **Frontend (Phase F).** Should be a simplification, not an expansion.
+6. **Validate (Phase G).** Side-by-side on case 162 + representative cases. If the supply engine is clean and the leaf engine is the one with patches, the migration writes itself.
