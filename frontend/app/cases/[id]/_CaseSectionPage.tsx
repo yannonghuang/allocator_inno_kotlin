@@ -2001,7 +2001,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
    * consolidated work order (all WOs in the group share the same split details).
    */
   const supplySplitInfoMap = useMemo(() => {
-    const map = new Map<string, SupplySplitInfo>();
+    // supplyId → list of SupplySplitInfo, one per consolidation group that drew from this
+    // supply. Deduped by (groupProductId, groupLocationId): the same group may appear via
+    // multiple sub-trees of a pegging entry, but should be counted once. Multiple distinct
+    // groups for the same supply are common — a deep raw material is typically pulled by
+    // every merged-leaf group whose internal plan() walks the BOM down to it.
+    const map = new Map<string, SupplySplitInfo[]>();
     if (!planResult?.planning_pegging) return map;
 
     // Index consolidated WOs by "pid|lid" → split details (first match wins).
@@ -2081,12 +2086,69 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
 
       const sids = new Set<string>();
       collectSupplies(entry.tree, sids);
+      const groupKey = `${info.groupProductId}|${info.groupLocationId}`;
       sids.forEach((sid) => {
-        if (!map.has(sid)) map.set(sid, info);
+        const list = map.get(sid);
+        if (!list) {
+          map.set(sid, [info]);
+        } else if (!list.some((x) => `${x.groupProductId}|${x.groupLocationId}` === groupKey)) {
+          list.push(info);
+        }
       });
     }
     return map;
   }, [planResult, planningConfig]);
+
+  /**
+   * Map (supplyId, demandId) → "<groupPid>@<groupLid>" describing the consolidation path
+   * the demand took to reach this supply. Covers BOTH:
+   *   - multi-demand consolidated entries (entry.consolidated && !entry.demand_id):
+   *     the per_demand_allocations keys link to the entry's tree pid/lid
+   *   - passthrough entries (entry.passthrough && entry.demand_id): single-demand
+   *     consolidation; the demand's path is the entry's tree pid/lid
+   *
+   * Demands whose pegging comes only via main-loop entries (entry.demand_id &&
+   * !entry.consolidated && !entry.passthrough) are intentionally absent here — they
+   * walked their own BOM directly to this supply, no consolidation involved. Those
+   * surface as "direct" in the slide-in's Path column.
+   *
+   * Keyed as `${supplyId}|${demandId}` for O(1) lookup during render.
+   */
+  const supplyDemandPathMap = useMemo(() => {
+    const map = new Map<string, string>();
+    if (!planResult?.planning_pegging) return map;
+
+    const collectSupplies = (node: PlanningPeggingNode, acc: Set<string>): void => {
+      if (node.type === 'supply' && node.supply_id && !node.supply_id.startsWith('consolidated_')) {
+        acc.add(node.supply_id);
+      }
+      for (const child of node.children ?? []) collectSupplies(child, acc);
+    };
+
+    for (const entry of planResult.planning_pegging) {
+      const treePid = entry.tree?.product_id ?? '';
+      const treeLid = entry.tree?.location_id ?? '';
+      const label = `${treePid}@${treeLid}`;
+      const sids = new Set<string>();
+      collectSupplies(entry.tree, sids);
+
+      if (entry.passthrough && entry.demand_id) {
+        // Single-demand consolidation: bind every supply in this tree to the one demand.
+        sids.forEach((sid) => map.set(`${sid}|${entry.demand_id}`, label));
+      } else if (entry.consolidated && !entry.demand_id) {
+        // Multi-demand: bind each supply to every demand whose per_demand_allocation > 0.
+        const pda = entry.per_demand_allocations ?? {};
+        for (const did of Object.keys(pda)) {
+          if (typeof pda[did] === 'number' && pda[did] > 1e-9) {
+            sids.forEach((sid) => map.set(`${sid}|${did}`, label));
+          }
+        }
+      }
+      // Main-loop entries (entry.demand_id && !consolidated && !passthrough) deliberately
+      // skipped: their consumption of this supply is direct, not via any merged group.
+    }
+    return map;
+  }, [planResult]);
 
   /** Join caseSupplies rows with supplyPeggingMap to produce the enriched supply view. */
   const planSupplyViewRows = useMemo((): PlanSupplyViewRow[] => {
@@ -2099,6 +2161,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         : (pegging?.totalPeggedQty ?? 0);
       const residualQty = Math.max(0, s.qty - consumedQty);
       const utilizationRate = s.qty > 0 ? consumedQty / s.qty : null;
+      // Pre-extract the demand→path entries for this supply so the slide-in can do an
+      // O(1) lookup without re-scanning the global map. Keys in supplyDemandPathMap
+      // are "<supplyId>|<demandId>"; we strip the supplyId prefix here.
+      const demandPath: Record<string, string> = {};
+      const sidPrefix = `${s.supplyId}|`;
+      supplyDemandPathMap.forEach((v, k) => {
+        if (k.startsWith(sidPrefix)) demandPath[k.slice(sidPrefix.length)] = v;
+      });
       return {
         ...s,
         consumedQty,
@@ -2107,10 +2177,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         peggedDemandCount: pegging?.demands.length ?? 0,
         totalPeggedQty: pegging?.totalPeggedQty ?? 0,
         peggedDemands: pegging?.demands ?? [],
-        splitInfo: supplySplitInfoMap.get(s.supplyId) ?? null,
+        splitInfos: supplySplitInfoMap.get(s.supplyId) ?? [],
+        demandPath,
       };
     });
-  }, [caseSupplies, supplyPeggingMap, supplyConsumedMap, supplySplitInfoMap]);
+  }, [caseSupplies, supplyPeggingMap, supplyConsumedMap, supplySplitInfoMap, supplyDemandPathMap]);
 
   /** Sum of qty per productId across all plan supply view rows (unfiltered). */
   const planSupplyProductTotalMap = useMemo((): Record<string, number> => {
@@ -5004,27 +5075,66 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                   </span>
                                 );
                               }
-                              const info = r.splitInfo;
-                              const chip = info ? (() => {
-                                const short = info.groupTotalProduced < info.groupTotalNeed - 1e-6;
-                                const modeColor = info.mode === 'fair' ? '#34d399' : info.mode === 'proportional' ? '#60a5fa' : '#f59e0b';
+                              const infos = r.splitInfos;
+                              // Chip's headline number is peggedDemandCount — the true count of
+                              // user demands consuming this supply across every path (multi-demand
+                              // groups + passthrough singletons + direct main-loop). Using a
+                              // narrower per-group candidate count would disagree with the slide-in's
+                              // Pegged Demands table and create the kind of "is it 41 or 13?"
+                              // confusion that prompted this fix. Policy/colour come from the
+                              // primary multi-demand group when one exists.
+                              const chip = (r.peggedDemandCount > 0 || infos.length > 0) ? (() => {
+                                const totalNeed = infos.reduce((s, i) => s + i.groupTotalNeed, 0);
+                                const totalProduced = infos.reduce((s, i) => s + i.groupTotalProduced, 0);
+                                const short = infos.length > 0 && totalProduced < totalNeed - 1e-6;
+                                const primary = infos[0];
+                                const modeColor = !primary
+                                  ? '#a1a1aa'
+                                  : primary.mode === 'fair' ? '#34d399'
+                                  : primary.mode === 'proportional' ? '#60a5fa'
+                                  : '#f59e0b';
                                 const title = [
-                                  `Group: ${info.groupProductId} @ ${info.groupLocationId}`,
-                                  `Policy: ${info.mode}`,
-                                  `Candidates: ${info.candidateCount} demand(s)`,
-                                  `Need: ${qtyFmt(info.groupTotalNeed)}`,
-                                  `Produced: ${qtyFmt(info.groupTotalProduced)}`,
-                                  short ? `Shortage: ${qtyFmt(info.groupTotalNeed - info.groupTotalProduced)}` : 'No shortage',
+                                  `${r.peggedDemandCount} demand(s) consume this supply (total ${qtyFmt(Number(r.totalPeggedQty))})`,
+                                  ...(infos.length > 0
+                                    ? [
+                                        '─── multi-demand consolidation group(s) ───',
+                                        ...infos.map((info) => {
+                                          const s = info.groupTotalProduced < info.groupTotalNeed - 1e-6;
+                                          return [
+                                            `Group: ${info.groupProductId} @ ${info.groupLocationId}`,
+                                            `  Policy: ${info.mode}`,
+                                            `  Candidates: ${info.candidateCount} demand(s)`,
+                                            `  Need: ${qtyFmt(info.groupTotalNeed)}`,
+                                            `  Produced: ${qtyFmt(info.groupTotalProduced)}`,
+                                            s ? `  Shortage: ${qtyFmt(info.groupTotalNeed - info.groupTotalProduced)}` : '  No shortage',
+                                          ].join('\n');
+                                        }),
+                                      ]
+                                    : []),
                                 ].join('\n');
                                 return (
                                   <span title={title} style={{ fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
-                                    <span style={{ color: modeColor, fontWeight: 600 }}>{info.mode}</span>
-                                    <span style={{ color: '#71717a' }}> · </span>
-                                    <span style={{ color: '#a1a1aa' }}>{info.candidateCount}d</span>
-                                    <span style={{ color: '#71717a' }}> · </span>
-                                    <span style={{ color: short ? '#f87171' : '#a1a1aa' }}>
-                                      {qtyFmt(Number(info.groupTotalProduced))}/{qtyFmt(Number(info.groupTotalNeed))}
-                                    </span>
+                                    {primary && (
+                                      <>
+                                        <span style={{ color: modeColor, fontWeight: 600 }}>{primary.mode}</span>
+                                        <span style={{ color: '#71717a' }}> · </span>
+                                      </>
+                                    )}
+                                    <span style={{ color: '#a1a1aa' }}>{r.peggedDemandCount}d shared</span>
+                                    {infos.length > 0 && (
+                                      <>
+                                        <span style={{ color: '#71717a' }}> · </span>
+                                        <span style={{ color: short ? '#f87171' : '#a1a1aa' }}>
+                                          {qtyFmt(totalProduced)}/{qtyFmt(totalNeed)}
+                                        </span>
+                                      </>
+                                    )}
+                                    {infos.length > 1 && (
+                                      <>
+                                        <span style={{ color: '#71717a' }}> · </span>
+                                        <span style={{ color: '#a1a1aa' }}>{infos.length}g</span>
+                                      </>
+                                    )}
                                   </span>
                                 );
                               })() : null;
@@ -5069,7 +5179,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             { key: '_sup_explain' as keyof (PlanSupplyViewRow & { _key: string }), label: 'Explain', sortable: false, render: (r) => {
                               const cs = supplyCriticalityMap[r.supplyId];
                               const hasCriticality = cs === 'critical' || cs === 'not_critical';
-                              const eligible = r.peggedDemandCount > 0 || !!r.splitInfo || !!r.override || hasCriticality;
+                              const eligible = r.peggedDemandCount > 0 || r.splitInfos.length > 0 || !!r.override || hasCriticality;
                               if (!eligible) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
                               const k = `supply|${r.supplyId}`;
                               const isSelected = supExplainKey === k;
@@ -5086,6 +5196,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               );
                             }},
                           ]}
+                          rowStyle={(r) => {
+                            // Highlight the row whose Explain or Pegging slide-in is currently open.
+                            // Both buttons key on `supply|<supplyId>` so a single comparison covers both.
+                            const k = `supply|${r.supplyId}`;
+                            if (supExplainKey === k || woPeggingRowKey === k) {
+                              return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
+                            }
+                            return undefined;
+                          }}
                         />
                       </>
                     );
@@ -6457,11 +6576,24 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <strong>{supExplainRow.peggedDemandCount}</strong> {tP('supExplain.peggedConsumedSuffix')}
                       ({' '}{tP('supExplain.peggedTotal')} <strong>{qtyFmt(Number(supExplainRow.totalPeggedQty))}</strong>{' '}):
                     </p>
-                    <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse' }}>
+                    {/* New "Path" column annotates each pegged demand with which consolidation
+                        group it flowed through (or "direct" for main-loop / passthrough). This
+                        makes the row counts of the two tables on this slide-in semantically
+                        reconcile: every pegged demand reveals its provenance, and the user
+                        can see how the totals line up across paths. */}
+                    <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
+                      <colgroup>
+                        <col style={{ width: '28%' }} />
+                        <col style={{ width: '24%' }} />
+                        <col style={{ width: '18%' }} />
+                        <col style={{ width: '15%' }} />
+                        <col style={{ width: '15%' }} />
+                      </colgroup>
                       <thead>
                         <tr style={{ color: '#a1a1aa', textAlign: 'left' }}>
                           <th style={{ paddingBottom: '0.2rem' }}>{tP('supExplain.peggedColDemand')}</th>
                           <th style={{ paddingBottom: '0.2rem' }}>{tP('supExplain.peggedColCustomer')}</th>
+                          <th style={{ paddingBottom: '0.2rem' }}>{tP('supExplain.peggedColPath') /* 'Path' / '路径' */}</th>
                           <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('supExplain.peggedColQty')}</th>
                           <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('supExplain.peggedColShare')}</th>
                         </tr>
@@ -6470,10 +6602,20 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         {supExplainRow.peggedDemands.map((d, i) => {
                           const total = Number(supExplainRow.totalPeggedQty) || 0;
                           const share = total > 1e-9 ? (Number(d.qtyConsumed) / total) * 100 : 0;
+                          // Path label covers BOTH multi-demand consolidation groups AND
+                          // passthrough singletons; absent = main-loop direct consumption.
+                          const groupLabel = supExplainRow.demandPath[d.demandId] ?? null;
                           return (
                             <tr key={`${d.demandId}-${i}`} style={{ borderTop: '1px solid #3d3d40' }}>
-                              <td style={{ padding: '0.2rem 0.4rem 0.2rem 0' }}>{d.demandId}</td>
-                              <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', color: '#a1a1aa' }}>{d.customer ?? '–'}</td>
+                              <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.demandId}</td>
+                              <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', color: '#a1a1aa', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.customer ?? '–'}</td>
+                              <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '0.74rem' }}>
+                                {groupLabel ? (
+                                  <span style={{ color: '#67e8f9' }} title={`via consolidation group ${groupLabel}`}>{groupLabel}</span>
+                                ) : (
+                                  <span style={{ color: '#a1a1aa', fontStyle: 'italic' }} title="Direct main-loop / passthrough consumption (no consolidation split)">{tP('supExplain.peggedPathDirect') /* 'direct' / '直接' */}</span>
+                                )}
+                              </td>
                               <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right' }}>{qtyFmt(Number(d.qtyConsumed))}</td>
                               <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right', color: '#a1a1aa' }}>{share.toFixed(1)}%</td>
                             </tr>
@@ -6487,68 +6629,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   </>
                 )}
               </section>
-              {supExplainRow.splitInfo && (() => {
-                const info = supExplainRow.splitInfo!;
-                const short = info.groupTotalProduced < info.groupTotalNeed - 1e-6;
-                const exp = splitPolicyExplanation(info.mode, tP);
-                const policyLabel = info.mode === 'proportional' ? tP('woExplain.proportional') : info.mode === 'priority_first' ? tP('woExplain.priorityFirst') : tP('woExplain.splitFair');
-                const pda = info.perDemandAllocations ?? null;
-                const pdaTotal = pda ? Object.values(pda).reduce((s, v) => s + v, 0) : 0;
-                const pdaRows = pda
-                  ? Object.entries(pda).sort((a, b) => b[1] - a[1])
-                  : [];
-                return (
-                  <section style={{ marginBottom: '1.25rem' }}>
-                    <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('supExplain.splitHeading')}</h4>
-                    <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem', lineHeight: 1.6 }}>
-                      {tP('supExplain.splitGroup')} <strong>{info.groupProductId}</strong> @ {info.groupLocationId}
-                      {' · '}{tP('supExplain.splitPolicy')} <strong>{policyLabel}</strong>
-                      {' · '}<strong>{info.candidateCount}</strong> {tP('supExplain.splitCandidates')}
-                    </p>
-                    <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem' }}>
-                      {tP('supExplain.splitNeed')} <strong>{qtyFmt(info.groupTotalNeed)}</strong>
-                      {' · '}{tP('supExplain.splitProduced')} <strong>{qtyFmt(info.groupTotalProduced)}</strong>
-                      {short && <> {' · '}<strong style={{ color: '#f87171' }}>{tP('supExplain.splitShortage')} {qtyFmt(info.groupTotalNeed - info.groupTotalProduced)}</strong></>}
-                      {!short && <> {' · '}<span style={{ color: '#34d399' }}>{tP('supExplain.splitNoShortage')}</span></>}
-                    </p>
-                    <div style={{ padding: '0.55rem 0.75rem', background: '#27272a', borderRadius: 6, borderLeft: '3px solid #67e8f9', marginBottom: pdaRows.length > 0 ? '0.5rem' : 0 }}>
-                      <div style={{ fontSize: '0.78rem', color: '#67e8f9', marginBottom: '0.25rem', fontWeight: 600 }}>{exp.headline}</div>
-                      <p style={{ margin: 0, fontSize: '0.78rem', color: '#a1a1aa', lineHeight: 1.5 }}>{exp.detail}</p>
-                      <p style={{ margin: '0.4rem 0 0', fontSize: '0.72rem', color: '#71717a', fontStyle: 'italic' }}>
-                        {info.policySource === 'wo'
-                          ? <>{tP('supExplain.splitPolicySourceWo')}</>
-                          : <>{tP('supExplain.splitPolicySourceConfigPre')} <code style={{ background: '#1c1c1e', padding: '0 4px', borderRadius: 3 }}>consolidation.allocation_mode</code> {tP('supExplain.splitPolicySourceConfigPost')}</>}
-                      </p>
-                    </div>
-                    {pdaRows.length > 0 && (
-                      <>
-                        <p style={{ margin: '0.5rem 0 0.3rem', fontSize: '0.78rem', color: '#a1a1aa' }}>{tP('supExplain.splitPerDemandHeading')}</p>
-                        <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse' }}>
-                          <thead>
-                            <tr style={{ color: '#a1a1aa', textAlign: 'left' }}>
-                              <th style={{ paddingBottom: '0.2rem' }}>{tP('supExplain.peggedColDemand')}</th>
-                              <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('supExplain.splitColAllocated')}</th>
-                              <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('supExplain.splitColWeight')}</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {pdaRows.map(([demandId, qty]) => {
-                              const w = pdaTotal > 1e-9 ? (qty / pdaTotal) * 100 : 0;
-                              return (
-                                <tr key={demandId} style={{ borderTop: '1px solid #3d3d40' }}>
-                                  <td style={{ padding: '0.2rem 0.4rem 0.2rem 0' }}>{demandId}</td>
-                                  <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right' }}>{qtyFmt(qty)}</td>
-                                  <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right', color: '#a1a1aa' }}>{w.toFixed(1)}%</td>
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
-                      </>
-                    )}
-                  </section>
-                );
-              })()}
+              {/* CONSOLIDATION SPLIT sections were collapsed into the Pegged Demands table
+                  above (the "Path" column annotates each demand with its consolidation
+                  group), and the policy/totals chip in the supply-table row carries the
+                  per-group summary. One view per shared component, no duplication. */}
               {supExplainRow.override && (
                 <section style={{ marginBottom: '1.25rem' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>

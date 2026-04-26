@@ -824,7 +824,19 @@ export type PlanSupplyViewRow = CaseSupplyRow & {
   peggedDemandCount: number;
   totalPeggedQty: number;
   peggedDemands: PeggedDemandEntry[];
-  splitInfo?: SupplySplitInfo | null;
+  /**
+   * Every consolidation group that drew from this supply. A single raw-material supply is
+   * commonly consumed by multiple merged-leaf groups (each merged leaf's plan() walks down
+   * to shared raw-material inventory), so this is an array, not a single entry. Empty when
+   * the supply is consumed only by non-consolidated demands.
+   */
+  splitInfos: SupplySplitInfo[];
+  /**
+   * demand_id → "<groupPid>@<groupLid>" describing the consolidation path each pegged demand
+   * took to reach this supply. Covers passthrough singletons + multi-demand groups. Demands
+   * absent from this map consumed via the main-loop (direct walk, no consolidation).
+   */
+  demandPath: Record<string, string>;
   override?: SupplyOverrideInfo | null;
 };
 
