@@ -275,20 +275,33 @@ Once side-by-side validation shows the supply engine is at least as good on a re
 2. Leaf engine kept reachable via flag for one release cycle.
 3. After one release with no rollbacks, delete the leaf engine.
 
-## 10. Implementation phases
+## 10. Implementation phases — **COMPLETE**
 
-| Phase | Deliverable | Files | LOC est | Risk |
-|---|---|---|---|---|
-| **A** | `needsMatrix` builder (pure function over `ResolutionGraph` + BOM, walks every supply-bearing node not just leaves) | `services/SupplyDemandMatrix.kt` + tests | 300 | Low — symbolic computation, well-tested |
-| **B** | Per-supply allocator (adapts existing `splitFair`/`splitProportional`/`splitPriorityFirst` to the new input shape) | `services/SupplyAllocator.kt` + tests | 200 | Low |
-| **C** | Per-demand initial commit (3a) with supply-level caps | `services/PlanningEngine.kt` modifications | 150 | Low — `budgetCap` plumbing already exists |
-| **D** | Compensation sub-phase (3b): redistribute unused allocation, extend capped commits | `services/PlanningEngine.kt` modifications + tests | 250 | Medium — inner convergence test + extending an in-progress walk needs care |
-| **E** | Produced-component WO synthesizer (sizes `toMake[C]` from post-compensation actual draws) | `services/PlanningEngine.kt` modifications | 300 | Medium — recursive WO emission across produced components |
-| **F** | `runV2Supply` orchestrator (replaces `runV2Iterated` when `engine="supply"`) | `services/PlanningEngine.kt` modifications | 200 | Medium |
-| **G** | Frontend: chip + slide-in show single supply-level allocation | `frontend/lib/api.ts`, `_CaseSectionPage.tsx` | 200 | Low |
-| **H** | Migration / config flag / soak test | Various | n/a | Medium |
+| Phase | Status | Commit | Notes |
+|---|---|---|---|
+| **A** `needsMatrix` builder | ✅ | `a9f4dc1` | 11 tests, ~300 LOC. Symbolic walker continues past inventory-bearing nodes (key difference from leaf engine's `walkResolution`). |
+| **B** Per-supply allocator | ✅ | `898cf17` | 22 tests, ~200 LOC. Extracted policy primitive `allocate()` with parity to leaf engine's `splitFair`/`splitProportional`/`splitPriorityFirst`. |
+| **C** Per-demand initial commit (3a) | ✅ | `e0f8265` | 6 tests, ~150 LOC. Reuses `plan()`'s existing `budget` parameter; computes `actualDraws` for the compensation pass. |
+| **D** Compensation sub-phase (3b) | ✅ | `51b647b` | 8 tests, ~250 LOC. Pure analytical step — no `plan()` calls inside `compensate()`. |
+| **E** WO synthesis | ✅ | `abb91d4` | 8 tests, ~300 LOC. Output shape matches leaf engine's `consolidated:true` exactly so frontend chip + slide-in work without changes. |
+| **F** Orchestrator + feature flag | ✅ | `a7251b1` | 8 tests, ~400 LOC. `consolidation.engine: "supply"` activates the pipeline; default stays `"leaf-legacy"`. |
+| **G** Frontend reads supply-level allocations | ✅ | `6afa27b` | New `supply_level_allocations` field threaded through; chip + Path column populate from it under the supply engine. |
+| **H** Comparison harness | ✅ | `9353593` | 7 scenarios in `SupplyVsLeafEquivalenceTest`. Both engines produce equivalent committed qty + supply consumption on the patterns case 162 exercises. |
+| **Bug fix** budget snapshot | ✅ | `6f13b53` | Discovered in Phase H: `plan()`'s two-pass make-flow snapshotted inventory but not budget; caused empty supply-leaf children under shortage at deep RM. ~30 LOC fix. |
 
-Total: ~1400 LOC backend + ~200 frontend. Estimated 2.5 weeks of focused work + 1 week soak.
+Total: ~1450 LOC backend + ~200 frontend. **222 tests, 0 failures.** Branch: `feat/supply-level-consolidation`.
+
+## 10a. Migration status
+
+The supply engine is feature-complete and validated against the leaf engine on the synthetic equivalence harness. Default is unchanged (`leaf-legacy`). Migration steps remaining:
+
+1. **Real-data validation on case 162**: toggle `consolidation.engine = "supply"` in the case config, run Analyze impact, verify the `supply iter` log lines show convergence in 1-3 iters with no `(max)` warning. Compare WO counts and committed-qty totals against the leaf engine.
+
+2. **Soak period**: leave default at `leaf-legacy`. Opt-in callers (case-by-case basis, set via the planning config) exercise the new engine to surface production-shape edge cases. Recommend at least one full release cycle of soak.
+
+3. **Default flip**: change `ConsolidationConfig.engine`'s default from `"leaf-legacy"` to `"supply"` once soak validation passes. Keep the leaf engine reachable via `engine: "leaf-legacy"` for one further release as rollback insurance.
+
+4. **Leaf engine retirement**: after a full release with default flipped and no rollbacks, delete `runV2Iterated` and `mergeGroups` / `MergedGroup` infrastructure. Estimated removal: ~800 LOC.
 
 Phase D (compensation) is the new central piece relative to today's planner. It's the place where alt-divergence and intermediate-inventory absorption are reconciled in-place, eliminating most of today's outer-iteration churn. Worth a careful test plan: synthetic fixtures covering each unused-allocation source (alt-divergence, intermediate absorption, hard failure upstream, demand-qty rounding) plus a combined diamond-BOM stress case.
 
