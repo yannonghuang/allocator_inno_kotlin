@@ -1628,7 +1628,7 @@ internal fun extractSupplyAllocations(
 // without touching the orchestrator. Behavior is identical to pre-refactor —
 // these functions wrap the previously inlined regions of runPlanning().
 
-private data class LegacyCommitResult(
+internal data class LegacyCommitResult(
     val committedDemands: List<Map<String, Any?>>,
     val workOrders: List<Map<String, Any?>>,
     val planningPegging: List<Map<String, Any?>>,
@@ -2172,12 +2172,29 @@ fun runPlanning(
     // is needed only for supply-split overrides (real buckets split per demand).
     val commitResult: LegacyCommitResult
     if (consolidationConfig.enabled) {
-        val iterated = runV2Iterated(
-            demands, inventory, data, config, consolidationConfig, overrideIndex, progressCallback,
-        )
-        consolidatedWOs.addAll(iterated.consolidatedWOs)
-        consolidatedPegging.addAll(iterated.consolidatedPegging)
-        commitResult = iterated.commitResult
+        // Dispatch by configured engine. Default ("leaf-legacy") preserves the
+        // original v2 fixed-point pipeline; "supply" routes to the new supply-
+        // level orchestrator (see docs/supply-level-consolidation.md).
+        when (consolidationConfig.engine) {
+            "supply" -> {
+                val supply = runV2Supply(
+                    demands, inventory, data, config, consolidationConfig, overrideIndex, progressCallback,
+                )
+                // Supply engine puts ALL WOs (consolidated + passthrough) into one
+                // list. consolidatedPegging stays empty; per-demand pegging trees
+                // come through commitResult.planningPegging.
+                consolidatedWOs.addAll(supply.workOrders)
+                commitResult = supply.commitResult
+            }
+            else -> {
+                val iterated = runV2Iterated(
+                    demands, inventory, data, config, consolidationConfig, overrideIndex, progressCallback,
+                )
+                consolidatedWOs.addAll(iterated.consolidatedWOs)
+                consolidatedPegging.addAll(iterated.consolidatedPegging)
+                commitResult = iterated.commitResult
+            }
+        }
     } else {
         commitResult = legacyCommit(
             demands, inventory, data, config, overrideIndex,
