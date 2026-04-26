@@ -1023,6 +1023,10 @@ fun plan(
 
             // Snapshot inventory so we can restore before the second pass if a deeper cap is found.
             val methodInvSnap = copyInventory(inventory)
+            // Snapshot budget — same reason as the single-method path: the first
+            // pass's exploratory consumeFromInventory calls decrement budget;
+            // the second pass needs the original cap to draw at the rescaled qty.
+            val methodBudgetSnap: Map<String, Double>? = budget?.toMap()
 
             // ── First pass: plan each child at its full needed qty ───────────
             val methodChildResults = mutableListOf<ChildPassResult>()
@@ -1090,9 +1094,13 @@ fun plan(
                 methodAchievable = capped
                 anyMethodShort = true
 
-                // ── Second pass: restore inventory and re-plan at scaled qty ──
+                // ── Second pass: restore inventory + budget and re-plan at scaled qty ──
                 inventory.clear()
                 inventory.addAll(methodInvSnap)
+                if (budget != null && methodBudgetSnap != null) {
+                    budget.clear()
+                    budget.putAll(methodBudgetSnap)
+                }
                 val scale = methodAchievable / methodQty
                 val scaledChildren = scaleChildMaterials(childMaterials, scale)
                 for (c in scaledChildren) {
@@ -1231,6 +1239,13 @@ fun plan(
 
     // Snapshot inventory before any child planning.
     val inventorySnap = copyInventory(inventory)
+    // Snapshot budget too: the first pass is exploratory (measures how much each
+    // child can produce so we can compute the bottleneck-scaled second pass). It
+    // mutates `budget` in-place via consumeFromInventory's decrement. Without
+    // restoring before the second pass, the second pass sees a depleted budget
+    // and can't draw from inventory at the rescaled qty — which surfaces as a
+    // child-tree with no supply leaves under shortage at deep raw materials.
+    val budgetSnap: Map<String, Double>? = budget?.toMap()
 
     // ── First pass: plan all children at full demandNetQty ────────────────────
     val childPassResults = mutableListOf<ChildPassResult>()
@@ -1318,11 +1333,18 @@ fun plan(
         }
         achievableParentQty = capped
 
-        // ── Second pass: restore inventory and re-plan at achievable qty ──────
+        // ── Second pass: restore inventory + budget and re-plan at achievable qty ──────
         // Because scale = capped/demandNetQty, each child is asked for exactly
         // what it committed in the first pass (minus epsilon), so this pass succeeds.
         inventory.clear()
         inventory.addAll(inventorySnap)
+        if (budget != null && budgetSnap != null) {
+            // Reset budget to pre-first-pass state. The second pass's draws will
+            // re-decrement it as it walks; final budget reflects actual final
+            // consumption, not exploratory + commit double-counting.
+            budget.clear()
+            budget.putAll(budgetSnap)
+        }
         val scale = achievableParentQty / demandNetQty
         val scaledChildren = scaleChildMaterials(childMaterials, scale)
         for (c in scaledChildren) {

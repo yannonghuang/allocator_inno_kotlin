@@ -155,24 +155,18 @@ class SupplyVsLeafEquivalenceTest : FunSpec({
         val supply = runPlanning(data, consConfig("supply", mode = "fair"))
 
         // Both engines fully commit 12 of FG total (supply-limited, BOM rate 1:1).
-        // This is the user-visible correctness signal — fulfillment qty matches
-        // available supply, no over- or under-commit.
         committedQty(leaf) shouldBe (12.0 plusOrMinus 1e-6)
         committedQty(supply) shouldBe (12.0 plusOrMinus 1e-6)
 
-        // KNOWN GAP: under shortage with a deep-RM budget cap, the supply
-        // engine's per-demand pegging trees omit the consumed-supply leaf
-        // nodes (the make-recursion records the BOM-walk-failure but the
-        // inventory-consumed portion's "type=supply" peg is missing). So
-        // supplyConsumed reports 0 for the supply engine even though plan()
-        // actually drew 12 from inventory (proven by committed_qty=12).
-        //
-        // Tracking as a separate Phase E/F refinement; the planning result
-        // is correct, only the supply_allocations bookkeeping is incomplete.
-        // We assert the leaf engine's bookkeeping is correct here and skip
-        // strict equivalence on the supply engine's bookkeeping until that's
-        // fixed.
+        // Both engines now correctly book 12 of S_RM as consumed. The earlier
+        // bookkeeping gap (per-demand pegging trees missing supply leaves
+        // when budgetCap fires mid-make-recursion) was traced to plan()'s
+        // first-pass exploratory call decrementing budget in-place, leaving
+        // the second pass with no headroom. Fixed by snapshotting budget
+        // alongside inventory before the first pass and restoring before
+        // the second.
         supplyConsumed(leaf, "S_RM") shouldBe (12.0 plusOrMinus 1e-6)
+        supplyConsumed(supply, "S_RM") shouldBe (12.0 plusOrMinus 1e-6)
     }
 
     // ── Scenario 3: alt-branch divergence ─────────────────────────────────────
