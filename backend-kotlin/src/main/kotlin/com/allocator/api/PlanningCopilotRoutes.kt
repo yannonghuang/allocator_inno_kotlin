@@ -95,8 +95,8 @@ Intent → config mapping (interpret any phrasing that conveys the same intent):
 8) **Disable consolidation / turn it off / do not group** (e.g. "禁用合并", "关闭合并", "不合并")
    → consolidation: { "enabled": false }.
 
-9) **Set the consolidation bucket / period / window to N days** (e.g. "30 day bucket", "60天窗口", "period 90 days")
-   → consolidation: { "period_days": N } (clamp 1..365).
+9) **Set the consolidation bucket / period / window to N days** (e.g. "30 day bucket", "60天窗口", "period 90 days", "single bucket", "全部合并")
+   → consolidation: { "period_days": N } (clamp 0..365). 0 = single bucket (collapse every demand into one bucket regardless of due date).
 
 10) **Consolidation split policy — proportional / by share / by quantity** (e.g. "proportional split", "按比例", "按数量", "按份额")
     → consolidation: { "allocation_mode": "proportional" }.
@@ -113,7 +113,7 @@ Intent → config mapping (interpret any phrasing that conveys the same intent):
 Valid config_update keys:
 - method_selection: object with optional "multiple" (bool), "mode" ("preference" | "elaborate"), "depth" (int ≥ 1), "depth_optimal" (bool), "score_weights" ({ commit_time, inventory_consumed, purchase } — numeric, backend normalizes).
 - purchase_allowed: boolean (top-level, not nested).
-- consolidation: object with optional "enabled" (bool), "period_days" (int 1..365), "allocation_mode" ("fair" | "proportional" | "priority_first").
+- consolidation: object with optional "enabled" (bool), "period_days" (int 0..365; 0 = single bucket), "allocation_mode" ("fair" | "proportional" | "priority_first").
 
 Respond with valid JSON only, no markdown code fences:
 - "reply": string (required). Acknowledge their intent in their words, say what you set, and mention re-run plan if you changed config. If the user asks to see the current config, describe all three groups (methods, purchase, consolidation) from the supplied current_config.
@@ -248,7 +248,8 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
                 "priority_first" -> "priority-first split"
                 else -> "fair split"
             }
-            parts.add("consolidation on ($days-day bucket, $modeLabel)")
+            val bucketLabel = if (days == 0) "single bucket" else "$days-day bucket"
+            parts.add("consolidation on ($bucketLabel, $modeLabel)")
         }
         val desc = if (parts.isEmpty()) "default" else parts.joinToString(", ")
         return (
@@ -355,8 +356,17 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
     ) {
         val days = cs["period_days"]?.jsonPrimitive?.intOrNull ?: 365
         val mode = cs["allocation_mode"]?.jsonPrimitive?.contentOrNull ?: "fair"
-        return "Enabling consolidation ($days-day bucket, $mode split). Demands for the same component in the same bucket will share work orders. Re-run plan to apply." to
+        val bucketLabel = if (days == 0) "single-bucket" else "$days-day bucket"
+        return "Enabling consolidation ($bucketLabel, $mode split). Demands for the same component in the same bucket will share work orders. Re-run plan to apply." to
             mergeConsolidation(current, mapOf("enabled" to JsonPrimitive(true)))
+    }
+
+    // ── Consolidation single-bucket / period_days = 0 ──
+    if (Regex("single (bucket|period)|one (bucket|period)|no (bucket|period)|merge all|consolidate all").containsMatchIn(t) ||
+        Regex("单桶|单一桶|不分桶|全部合并|合并所有").containsMatchIn(raw)
+    ) {
+        return "Setting consolidation to single-bucket (period_days=0): every demand collapses into one bucket regardless of due date. Re-run plan to apply." to
+            mergeConsolidation(current, mapOf("period_days" to JsonPrimitive(0)))
     }
 
     // ── Consolidation bucket / period_days ──
@@ -367,9 +377,10 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
         val n = (periodMatch?.groupValues?.get(1)
             ?: zhPeriodMatch?.groupValues?.get(1)
             ?: bucketMatch?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }
-            ?: "365").toIntOrNull() ?: 365
-        val days = n.coerceIn(1, 365)
-        return "Setting consolidation bucket to $days day${if (days == 1) "" else "s"}. Demands within that window may share work orders. Re-run plan to apply." to
+            ?: "0").toIntOrNull() ?: 0
+        val days = n.coerceIn(0, 365)
+        val msg = if (days == 0) "single-bucket" else "$days day${if (days == 1) "" else "s"}"
+        return "Setting consolidation bucket to $msg. Demands within that window may share work orders. Re-run plan to apply." to
             mergeConsolidation(current, mapOf("period_days" to JsonPrimitive(days)))
     }
 

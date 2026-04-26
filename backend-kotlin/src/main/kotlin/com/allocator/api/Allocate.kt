@@ -1697,7 +1697,8 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
         }
         putJsonObject("consolidation") {
             put("enabled",         consolidation["enabled"]      as? Boolean ?: false)
-            put("period_days",     ((consolidation["period_days"] as? Number)?.toInt() ?: 7).coerceIn(1, 365))
+            // 0 = single-bucket sentinel (collapses every demand into LocalDate.EPOCH); legal value, do NOT clamp up to 1.
+            put("period_days",     ((consolidation["period_days"] as? Number)?.toInt() ?: 0).coerceIn(0, 365))
             put("allocation_mode", when (consolidation["allocation_mode"]?.toString()) {
                 "proportional"   -> "proportional"
                 "priority_first" -> "priority_first"
