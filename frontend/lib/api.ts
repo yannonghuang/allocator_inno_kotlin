@@ -308,11 +308,31 @@ export type PlanSupplyAllocation = {
   qty_consumed: number;
 };
 
+/**
+ * Per-(supply_id) allocation record emitted by the supply-level consolidation
+ * engine (Phase 2's per-supply policy split + Phase 3b compensation results).
+ * Frontend reads this list (when present in the plan result) to populate the
+ * supply-view chip + slide-in's per-supply allocation info under the supply
+ * engine. Empty/absent under the leaf engine — its splitInfos come from
+ * consolidated pegging entries instead.
+ */
+export type SupplyLevelAllocation = {
+  supply_id: string;
+  group_product_id: string;
+  group_location_id: string;
+  mode: string;
+  group_total_need: number;
+  group_total_produced: number;
+  candidate_count: number;
+  per_demand_allocations: Record<string, number>;
+};
+
 export type PlanResult = {
   committed_demands: CommittedDemand[];
   work_orders: WorkOrder[];
   planning_pegging: PlanningPeggingEntry[];
   supply_allocations?: PlanSupplyAllocation[];
+  supply_level_allocations?: SupplyLevelAllocation[];
 };
 
 export async function runPlan(

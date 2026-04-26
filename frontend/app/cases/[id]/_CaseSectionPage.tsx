@@ -62,6 +62,7 @@ import {
   type CaseSupplyRow,
   type PeggedDemandEntry,
   type PlanSupplyViewRow,
+  type SupplyLevelAllocation,
   type SupplySplitInfo,
   getCaseSupplies,
   type AssessmentSummary,
@@ -705,6 +706,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     work_orders: WorkOrder[];
     planning_pegging: PlanningPeggingEntry[];
     supply_allocations?: PlanSupplyAllocation[];
+    supply_level_allocations?: SupplyLevelAllocation[];
     supply_summary?: { initial_total: number; consumed_total: number; consumption_rate: number | null };
     plan_kpis?: PlanKpis;
   } | null>(null);
@@ -2096,6 +2098,33 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         }
       });
     }
+
+    // Supply-engine path: when planResult carries supply_level_allocations,
+    // each record is a per-supply_id allocation summary that becomes its own
+    // SupplySplitInfo entry. Multiple records for the same supply (different
+    // groupKeys) are deduped by groupProductId|groupLocationId, just like the
+    // leaf-engine path above. The leaf engine emits an empty list here, so
+    // this loop is a no-op under it.
+    for (const rec of planResult.supply_level_allocations ?? []) {
+      const info: SupplySplitInfo = {
+        mode: rec.mode,
+        groupProductId: rec.group_product_id,
+        groupLocationId: rec.group_location_id,
+        groupTotalNeed: rec.group_total_need,
+        groupTotalProduced: rec.group_total_produced,
+        candidateCount: rec.candidate_count,
+        perDemandAllocations: rec.per_demand_allocations,
+        policySource: 'config',
+      };
+      const groupKey = `${info.groupProductId}|${info.groupLocationId}`;
+      const list = map.get(rec.supply_id);
+      if (!list) {
+        map.set(rec.supply_id, [info]);
+      } else if (!list.some((x) => `${x.groupProductId}|${x.groupLocationId}` === groupKey)) {
+        list.push(info);
+      }
+    }
+
     return map;
   }, [planResult, planningConfig]);
 
@@ -2147,6 +2176,20 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       // Main-loop entries (entry.demand_id && !consolidated && !passthrough) deliberately
       // skipped: their consumption of this supply is direct, not via any merged group.
     }
+
+    // Supply-engine path: every demand allocated at a supply is bound to that
+    // supply's group label. No "direct" semantics under the supply engine —
+    // every consumption goes through supply-level allocation. Empty/absent
+    // under the leaf engine, so this loop is a no-op there.
+    for (const rec of planResult.supply_level_allocations ?? []) {
+      const label = `${rec.group_product_id}@${rec.group_location_id}`;
+      for (const did of Object.keys(rec.per_demand_allocations)) {
+        if (rec.per_demand_allocations[did] > 1e-9) {
+          map.set(`${rec.supply_id}|${did}`, label);
+        }
+      }
+    }
+
     return map;
   }, [planResult]);
 

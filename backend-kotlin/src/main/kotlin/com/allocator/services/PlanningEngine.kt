@@ -2171,6 +2171,9 @@ fun runPlanning(
     // Disabled → run phase 3 directly against real inventory; useTaggedLookup
     // is needed only for supply-split overrides (real buckets split per demand).
     val commitResult: LegacyCommitResult
+    // Per-(supply_id) allocation records emitted only by the supply engine. Empty under
+    // the leaf engine (it expresses splitInfo via consolidated pegging entries instead).
+    var supplyLevelAllocations: List<Map<String, Any?>> = emptyList()
     if (consolidationConfig.enabled) {
         // Dispatch by configured engine. Default ("leaf-legacy") preserves the
         // original v2 fixed-point pipeline; "supply" routes to the new supply-
@@ -2185,6 +2188,7 @@ fun runPlanning(
                 // come through commitResult.planningPegging.
                 consolidatedWOs.addAll(supply.workOrders)
                 commitResult = supply.commitResult
+                supplyLevelAllocations = supply.supplyLevelAllocations
             }
             else -> {
                 val iterated = runV2Iterated(
@@ -2263,12 +2267,13 @@ fun runPlanning(
     }
 
     return mapOf(
-        "committed_demands"     to committedDemands,
-        "work_orders"           to consolidatedWOs + workOrders,
-        "planning_pegging"      to allPegging,
-        "supply_allocations"    to supplyAllocations,
-        "supply_cap_violations" to supplyCapViolations,
-        "override_warnings"     to overrideWarnings,
+        "committed_demands"      to committedDemands,
+        "work_orders"            to consolidatedWOs + workOrders,
+        "planning_pegging"       to allPegging,
+        "supply_allocations"     to supplyAllocations,
+        "supply_cap_violations"  to supplyCapViolations,
+        "override_warnings"      to overrideWarnings,
+        "supply_level_allocations" to supplyLevelAllocations,
     )
 }
 
