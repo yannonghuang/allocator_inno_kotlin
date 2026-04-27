@@ -958,15 +958,18 @@ fun plan(
     val topN = variantCfg.topN
 
     // Shortage tolerance: tiny partial-fulfillment gaps are collapsed to "no bottleneck".
-    // Tolerance = max(absolute, relative * qty). Absolute floor kills sub-unit drift;
-    // relative floor kills cascade-ratio artifacts on large demands. Configurable via
-    //   shortage_tolerance: { absolute: 1.0, relative: 0.01 }
+    // Tolerance = max(absolute, relative * qty), capped at 50% of qty so the
+    // absolute floor never absorbs > 50% relative shortage on small demands
+    // (without the cap, demandNetQty=1 with rawAchievable=0.5 — a real 50%
+    // bottleneck — would be treated as noise because 0.5 < 1.0). Configurable
+    // via shortage_tolerance: { absolute: 1.0, relative: 0.01 }.
     val shortageToleranceCfg = (config?.get("shortage_tolerance") as? Map<*, *>)?.let {
         @Suppress("UNCHECKED_CAST") it as? Map<String, Any?>
     }
     val shortageAbs = (shortageToleranceCfg?.get("absolute") as? Number)?.toDouble() ?: 1.0
     val shortageRel = (shortageToleranceCfg?.get("relative") as? Number)?.toDouble() ?: 0.01
-    fun shortageTolerance(qty: Double) = maxOf(shortageAbs, shortageRel * qty)
+    fun shortageTolerance(qty: Double) =
+        maxOf(shortageRel * qty, minOf(shortageAbs, qty * 0.5))
 
     // ── Multiple methods: equal split (with per-method two-pass probe) ─────────
     //
