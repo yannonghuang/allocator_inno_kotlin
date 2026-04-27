@@ -1072,9 +1072,12 @@ fun plan(
                 val rawAchievable = methodChildResults.minOf { cr ->
                     if (cr.neededQty > 1e-9) cr.effectiveQty * methodQty / cr.neededQty else methodQty
                 }
-                // Close-enough collapse: tiny shortages are numerical noise, not real bottlenecks.
-                // Threshold sourced from config.shortage_tolerance (see top of plan()).
-                val capped = if (methodQty - rawAchievable < shortageTolerance(methodQty)) methodQty
+                // Close-enough collapse: tiny shortages are numerical noise, not real
+                // bottlenecks. Conservation guard: when rawAchievable is essentially
+                // zero, NEVER absorb (would commit a phantom WO under shortage). See
+                // single-method path for full rationale.
+                val capped = if (rawAchievable > 1e-9 &&
+                                 methodQty - rawAchievable < shortageTolerance(methodQty)) methodQty
                              else rawAchievable.coerceIn(0.0, methodQty)
                 if (capped <= 1e-9) {
                     // This method is completely blocked — deep raw material is exhausted.
@@ -1283,6 +1286,7 @@ fun plan(
 
     val anyChildShort = childPassResults.any { cr -> cr.effectiveQty < cr.neededQty - 1e-9 }
 
+
     // ── Determine achievable parent qty ────────────────────────────────────────
     val achievableParentQty: Double
     if (!anyChildShort || childMaterials.isEmpty()) {
@@ -1298,9 +1302,17 @@ fun plan(
         val rawAchievable = childPassResults.minOf { cr ->
             if (cr.neededQty > 1e-9) cr.effectiveQty * demandNetQty / cr.neededQty else demandNetQty
         }
-        // Close-enough collapse: tiny shortages are numerical noise, not real bottlenecks.
-        // Threshold sourced from config.shortage_tolerance (see top of plan()).
-        val capped = if (demandNetQty - rawAchievable < shortageTolerance(demandNetQty)) demandNetQty
+        // Close-enough collapse: tiny shortages are numerical noise, not real
+        // bottlenecks. Threshold sourced from config.shortage_tolerance.
+        //
+        // Conservation guard: when rawAchievable is essentially zero, NEVER
+        // absorb the shortage as noise — that path commits a phantom WO with
+        // children that delivered nothing (R4 conservation violation surfaced
+        // by case 171's soundness check). The shortage_tolerance default is
+        // 1.0 absolute, which means a 100%-short demand of qty=0.985 was
+        // being treated as noise simply because demandNetQty < 1.0.
+        val capped = if (rawAchievable > 1e-9 &&
+                         demandNetQty - rawAchievable < shortageTolerance(demandNetQty)) demandNetQty
                      else rawAchievable.coerceIn(0.0, demandNetQty)
 
         if (capped <= 1e-9) {
