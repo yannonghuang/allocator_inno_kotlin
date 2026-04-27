@@ -204,6 +204,12 @@ object PlanRuns : Table("plan_run") {
     val finishedAt = timestamp("finished_at").nullable()
     val chosenDepth = integer("chosen_depth").nullable()  // depth picked by optimal-depth search; null when search not run
     val attempts = text("attempts").nullable()           // JSON array: [{"depth":1,"duration_ms":1200}, ...] for optimal-depth search; null for fixed-depth runs
+    /** Soundness check state: "unchecked" | "checking" | "sound" | "unsound" | "error". See SoundnessChecker. */
+    val soundnessStatus = varchar("soundness_status", 16).default("unchecked")
+    /** JSON-serialized SoundnessReport (null when unchecked or in flight). */
+    val soundnessReport = text("soundness_report").nullable()
+    /** When the most recent soundness check finished; null when never run. */
+    val soundnessCheckedAt = timestamp("soundness_checked_at").nullable()
     override val primaryKey = PrimaryKey(id)
 }
 
