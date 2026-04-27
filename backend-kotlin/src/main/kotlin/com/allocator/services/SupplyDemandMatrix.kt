@@ -189,10 +189,56 @@ private fun walkBomSymbolic(
         val key = toVisit.removeFirst()
         val (pid, lid) = key
 
+        val outEdges = edges.getOrPut(key) { mutableListOf() }
+
+        // VIRTUAL → concrete-location resolution. plan()'s elaborate scoring
+        // can land a VIRTUAL demand on inventory at any concrete (pid, L)
+        // where the product has a method or a supply — even when the BOM walk
+        // through VIRTUAL never re-materializes (X, L) as its own node. To
+        // ensure the matrix records every supply plan() can reach, at any
+        // VIRTUAL node we add a rate=1 edge to (X, L) for every concrete L
+        // where X exists. Each (X, L) is then walked normally (its methods,
+        // children, moves) and its supply (if in supplyIndex) is emitted.
+        val isVirtual = lid.isBlank() || lid == "VIRTUAL"
+        if (isVirtual) {
+            val concreteLocations = mutableSetOf<String>()
+            // Make + purchase methods at concrete lids
+            for (m in (data["method_make"] ?: emptyList())) {
+                if ((m["product_id"] as? String)?.trim() == pid) {
+                    val mLoc = (m["location_id"] as? String)?.trim()
+                    if (!mLoc.isNullOrBlank() && mLoc != "VIRTUAL") concreteLocations.add(mLoc)
+                }
+            }
+            for (m in (data["method_buy"] ?: emptyList())) {
+                if ((m["product_id"] as? String)?.trim() == pid) {
+                    val mLoc = (m["location_id"] as? String)?.trim()
+                    if (!mLoc.isNullOrBlank() && mLoc != "VIRTUAL") concreteLocations.add(mLoc)
+                }
+            }
+            // Moves — both endpoints are reachable concrete locations
+            for (m in (data["method_move"] ?: emptyList())) {
+                if ((m["product_id"] as? String)?.trim() == pid) {
+                    (m["to_location_id"] as? String)?.trim()?.takeIf { it.isNotBlank() && it != "VIRTUAL" }
+                        ?.let { concreteLocations.add(it) }
+                    (m["from_location_id"] as? String)?.trim()?.takeIf { it.isNotBlank() && it != "VIRTUAL" }
+                        ?.let { concreteLocations.add(it) }
+                }
+            }
+            // Supplies: if a concrete location has supply for this pid, plan()
+            // can consume from there even if no method explicitly produces it.
+            for (sk in supplyIndex) {
+                if (sk.productId == pid) concreteLocations.add(sk.locationId)
+            }
+            for (concreteLid in concreteLocations) {
+                val childKey = pid to concreteLid
+                outEdges.add(childKey to 1.0)
+                if (discovered.add(childKey)) toVisit.addLast(childKey)
+            }
+        }
+
         val methods = getMethods(pid, lid, data)
         if (methods.isEmpty()) continue
 
-        val outEdges = edges.getOrPut(key) { mutableListOf() }
         for (method in methods) {
             when (method["type"]) {
                 "purchase" -> {
