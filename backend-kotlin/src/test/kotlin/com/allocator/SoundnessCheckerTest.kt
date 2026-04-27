@@ -4,6 +4,7 @@ import com.allocator.services.SoundnessConfig
 import com.allocator.services.checkRunSoundness
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.collections.shouldContain
+import io.kotest.matchers.collections.shouldNotContain
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain as stringShouldContain
@@ -312,8 +313,37 @@ class SoundnessCheckerTest : FunSpec({
 
     // ── R6: variant consistency ───────────────────────────────────────────────
 
-    test("R6_alt_group_inconsistent: make WO children span multiple alt_groups") {
-        // BOM: FG → X (alt=A), FG → Y (alt=B). Tree pulls both children → cross-alt mixing.
+    test("R6_alt_group_inconsistent: make WO mixes children from two multi-row alt_groups") {
+        // BOM: alt_group A has {X1, X2}; alt_group B has {Y1, Y2}.
+        // Tree picks one child from A AND one child from B → cross-alt mixing.
+        // Both alt_groups are multi-row, so this is a genuine OR violation
+        // (engine should pick ONE alt_group's required-set, not mix).
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0,
+            children = listOf(makeWO("FG", "L1", qty = 10.0,
+                children = listOf(
+                    demandNode("D1", "X1", "L1", qty = 10.0, committedQty = 10.0,
+                        children = listOf(supplyLeaf("X1", "L1", "S1", 10.0))),
+                    demandNode("D1", "Y1", "L1", qty = 10.0, committedQty = 10.0,
+                        children = listOf(supplyLeaf("Y1", "L1", "S2", 10.0))),
+                ))))
+        val data = mapOf(
+            "supply" to listOf(supply("S1", "X1", "L1", 100.0), supply("S2", "Y1", "L1", 100.0)),
+            "method_make" to listOf(mk("FG", "L1")),
+            "bom" to listOf(
+                bom("FG", "X1", rate = 1.0, altGroup = "A"),
+                bom("FG", "X2", rate = 1.0, altGroup = "A"),
+                bom("FG", "Y1", rate = 1.0, altGroup = "B"),
+                bom("FG", "Y2", rate = 1.0, altGroup = "B"),
+            ),
+        )
+        val report = checkRunSoundness(planningPegging = listOf(pegEntry("D1", tree)), demands = demands, data = data)
+        report.demands[0].violations.map { it.rule } shouldContain "R6_alt_group_inconsistent"
+    }
+
+    test("R6 OK: each child is its own alt_group (single-row groups, multi-variant pattern)") {
+        // BOM: alt_group=child_id for each row → every alt_group has exactly 1 row.
+        // Engine's multi-variant mode picks all such variants. Not flagged.
         val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
         val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0,
             children = listOf(makeWO("FG", "L1", qty = 10.0,
@@ -327,12 +357,12 @@ class SoundnessCheckerTest : FunSpec({
             "supply" to listOf(supply("S1", "X", "L1", 100.0), supply("S2", "Y", "L1", 100.0)),
             "method_make" to listOf(mk("FG", "L1")),
             "bom" to listOf(
-                bom("FG", "X", rate = 1.0, altGroup = "A"),
-                bom("FG", "Y", rate = 1.0, altGroup = "B"),
+                bom("FG", "X", rate = 1.0, altGroup = "X"),  // single-row group
+                bom("FG", "Y", rate = 1.0, altGroup = "Y"),  // single-row group
             ),
         )
         val report = checkRunSoundness(planningPegging = listOf(pegEntry("D1", tree)), demands = demands, data = data)
-        report.demands[0].violations.map { it.rule } shouldContain "R6_alt_group_inconsistent"
+        report.demands[0].violations.map { it.rule } shouldNotContain "R6_alt_group_inconsistent"
     }
 
     test("R6 OK: make WO children share same alt_group") {

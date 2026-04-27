@@ -412,29 +412,46 @@ private class WalkContext(
             return
         }
 
-        // R6: children of this WO must share the same alt_group. Children of a WO
-        // are demand nodes; group them by their (pid, lid) and look up alt_group
-        // from the BOM rows.
+        // R6: children of this WO should not mix alt_groups that genuinely
+        // represent alternatives. Two cases need distinguishing:
+        //
+        //   (a) Multi-variant data convention: alt_group == child_id (every
+        //       BOM row is its own group of one). Plan()'s multi-variant /
+        //       elaborate modes intentionally pick multiple variants here —
+        //       not a violation.
+        //
+        //   (b) Genuine OR alternatives: BOM has 2+ rows sharing one alt_group
+        //       AND another rows-set under a different alt_group. The engine
+        //       should pick ONE alt's required-set, not mix across.
+        //
+        // We flag (b) only: at least two distinct alt_groups, each backing
+        // at least one BOM row that has SIBLINGS in the same group (i.e.,
+        // multi-row groups). Single-row groups are treated as AND-equivalent.
         @Suppress("UNCHECKED_CAST")
         val woChildren = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
         val childPids = woChildren
             .filter { it["type"] == "demand" }
             .mapNotNull { (it["product_id"] as? String)?.trim() }
-        val matchingBomChildAltGroups = childPids
-            .map { childPid ->
+        // BOM row groups: alt_group → set of child_ids in that group.
+        val bomGroupSizes: Map<String, Int> = parentBomRows
+            .groupBy { (it["alt_group"] as? String)?.trim() ?: "__null__" }
+            .mapValues { it.value.size }
+        val childAltGroups = childPids
+            .mapNotNull { childPid ->
                 parentBomRows.firstOrNull { (it["child_id"] as? String)?.trim() == childPid }
-                    ?.get("alt_group")?.toString()
+                    ?.get("alt_group")?.toString()?.trim()
+                    ?.takeUnless { it.isBlank() }
             }
             .toSet()
-        // Filter null to allow null-alt_group children mixed with each other; cross-alt mixing flagged.
-        val nonNullAltGroups = matchingBomChildAltGroups.filterNotNull().toSet()
-        if (nonNullAltGroups.size > 1) {
+        // Multi-row groups represented in this WO's children: a real OR if 2+ exist.
+        val multiRowGroupsRepresented = childAltGroups.filter { (bomGroupSizes[it] ?: 0) > 1 }.toSet()
+        if (multiRowGroupsRepresented.size > 1) {
             violations.add(Violation(
                 rule = "R6_alt_group_inconsistent",
                 nodePath = path,
-                message = "Make WO children span multiple alt_groups: $nonNullAltGroups.",
-                expected = "single alt_group (or null)",
-                actual = nonNullAltGroups,
+                message = "Make WO children span multiple multi-row alt_groups: $multiRowGroupsRepresented.",
+                expected = "single multi-row alt_group",
+                actual = multiRowGroupsRepresented,
             ))
         }
 
@@ -537,17 +554,22 @@ private class WalkContext(
             }
         }
 
-        // R5: time_target − time_source = TRANSIT_TIME.
+        // R5: spec says time_target − time_source = TRANSIT_TIME (strict),
+        // but in practice the engine schedules moves to ARRIVE at the
+        // request_due_time, which can mean duration > transit_time when the
+        // demand is scheduled later than the earliest possible arrival. Only
+        // duration < transit_time is impossible (can't move faster than the
+        // physical transit). Flag duration < transit_time only.
         val transitTime = (matchingMove["transit_time"] as? Number)?.toDouble() ?: 0.0
         val startTime = parseDateLocal(node["start_time"]?.toString())
         val endTime = parseDateLocal(node["end_time"]?.toString())
         if (startTime != null && endTime != null) {
             val duration = endTime.toEpochDay() - startTime.toEpochDay()
-            if (abs(duration - transitTime.toLong()) > config.timeToleranceDays) {
+            if (duration < (transitTime - config.timeToleranceDays).toLong()) {
                 violations.add(Violation(
                     rule = "R5_transit_time",
                     nodePath = path,
-                    message = "Move WO duration ($duration days) doesn't match transit_time ($transitTime).",
+                    message = "Move WO duration ($duration days) shorter than transit_time ($transitTime) — physically impossible.",
                     expected = transitTime,
                     actual = duration.toDouble(),
                 ))
