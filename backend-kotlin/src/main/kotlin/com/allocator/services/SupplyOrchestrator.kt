@@ -149,14 +149,17 @@ internal fun runV2Supply(
         val progressFraction = if (prevRedistributed.isFinite() && prevRedistributed > 0.0) {
             (prevRedistributed - comp.qtyRedistributed) / prevRedistributed
         } else 1.0
+        val dropped = comp.qtyRedistributed - comp.qtyAbsorbed
         if (iter > 0 && progressFraction < CONVERGENCE_PROGRESS_THRESHOLD) {
             log.info(
-                "supply iter {}: converged (progress {}% below {}% threshold; redistributed {} qty across {} supply(ies))",
+                "supply iter {}: converged (progress {}% below {}% threshold; over-production {} qty across {} supply(ies); {} absorbed by candidates, {} dropped)",
                 iterations,
                 "%.2f".format(progressFraction * 100),
                 "%.0f".format(CONVERGENCE_PROGRESS_THRESHOLD * 100),
                 "%.2f".format(comp.qtyRedistributed),
                 comp.supplyCount,
+                "%.2f".format(comp.qtyAbsorbed),
+                "%.2f".format(dropped),
             )
             allocations = comp.allocations
             converged = true
@@ -164,8 +167,12 @@ internal fun runV2Supply(
         }
 
         log.info(
-            "supply iter {}: redistributed {} qty across {} supply(ies); refining caps for next iter",
-            iterations, "%.2f".format(comp.qtyRedistributed), comp.supplyCount,
+            "supply iter {}: over-production {} qty across {} supply(ies) ({} absorbed by candidates, {} dropped); refining caps for next iter",
+            iterations,
+            "%.2f".format(comp.qtyRedistributed),
+            comp.supplyCount,
+            "%.2f".format(comp.qtyAbsorbed),
+            "%.2f".format(dropped),
         )
         allocations = comp.allocations
         prevRedistributed = comp.qtyRedistributed

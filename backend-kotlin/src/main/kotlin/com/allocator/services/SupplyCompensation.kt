@@ -42,8 +42,20 @@ data class CompensationResult(
     val redistributed: Boolean,
     /** Number of (supply) columns where redistribution happened — for telemetry. */
     val supplyCount: Int,
-    /** Total qty redistributed across all supplies — for telemetry. */
+    /**
+     * Total qty revoked from under-utilizers across all supplies — equivalent
+     * to the leaf engine's "over-production" metric (allocated minus actually
+     * drawn, summed). Always equal to `qtyAbsorbed + qtyDropped`.
+     */
     val qtyRedistributed: Double,
+    /**
+     * Subset of [qtyRedistributed] that landed in cap-bound candidates with
+     * residual symbolic need. The remainder (qtyRedistributed − qtyAbsorbed)
+     * is dropped: revoked from under-utilizers but with no eligible recipient,
+     * so total allocation at that supply shrinks. Dropping is the conservative
+     * safety valve that keeps the loop bounded.
+     */
+    val qtyAbsorbed: Double,
 )
 
 /**
@@ -85,6 +97,7 @@ fun compensate(
 
     var supplyCount = 0
     var qtyRedistributed = 0.0
+    var qtyAbsorbed = 0.0
 
     // Iterate every supply that has a non-zero need column. (Includes supplies
     // that may have been allocated 0 to all demands — still candidates for
@@ -160,8 +173,9 @@ fun compensate(
             byRow[supplyKey] = (byRow[supplyKey] ?: 0.0) + addQty
             val byCol = newByColumn.getOrPut(supplyKey) { mutableMapOf() }
             byCol[demandId] = (byCol[demandId] ?: 0.0) + addQty
-            // Don't double-count for telemetry — the revoke step already added `revoked`
-            // to redistributedAtS, and `Σ addQty ≤ unused = Σ revoked`.
+            qtyAbsorbed += addQty
+            // qtyRedistributed already tracks the gross revoked qty from Phase 1.
+            // qtyAbsorbed is the subset that found a candidate (≤ unused = revoked).
         }
         if (redistributedAtS > 1e-9) {
             supplyCount++
@@ -174,5 +188,6 @@ fun compensate(
         redistributed = qtyRedistributed > 1e-9,
         supplyCount = supplyCount,
         qtyRedistributed = qtyRedistributed,
+        qtyAbsorbed = qtyAbsorbed,
     )
 }
