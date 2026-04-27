@@ -151,9 +151,12 @@ internal fun runV2Supply(
         } else 1.0
         if (iter > 0 && progressFraction < CONVERGENCE_PROGRESS_THRESHOLD) {
             log.info(
-                "supply iter {}: converged (progress {:.2}% below {:.0}% threshold; redistributed {} qty across {} supply(ies))",
-                iterations, progressFraction * 100, CONVERGENCE_PROGRESS_THRESHOLD * 100,
-                "%.2f".format(comp.qtyRedistributed), comp.supplyCount,
+                "supply iter {}: converged (progress {}% below {}% threshold; redistributed {} qty across {} supply(ies))",
+                iterations,
+                "%.2f".format(progressFraction * 100),
+                "%.0f".format(CONVERGENCE_PROGRESS_THRESHOLD * 100),
+                "%.2f".format(comp.qtyRedistributed),
+                comp.supplyCount,
             )
             allocations = comp.allocations
             converged = true
