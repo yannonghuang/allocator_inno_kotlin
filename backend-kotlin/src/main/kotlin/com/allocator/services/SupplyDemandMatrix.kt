@@ -168,8 +168,21 @@ private fun walkBomSymbolic(
 
     val nextVisited = visited + key
 
-    // Walk every method at this node (union-method). plan() picks one method
-    // per node at runtime based on config; the matrix records the union.
+    // Collect every child this node could lead to, across all methods.
+    // Dedupe by (cPid, cLid) with MAX rate so each unique child is walked
+    // exactly once. Without dedupe, methods with overlapping children
+    // (common: a node has both "make" and "move" methods, or multiple make
+    // variants whose alts overlap) cause the walk to recurse multiple times
+    // through the same subtree — combinatorial blowup that hangs Phase 1
+    // on real BOMs.
+    //
+    // Within a single method (e.g., a make's alts), the alts go into
+    // childrenByKey at their own (cPid, cLid) keys; if alts have distinct
+    // pid|lid (the typical case) they all land in the map and each walks
+    // independently, preserving union-alt's sum-into-out semantics. Across
+    // methods, taking max picks the worst-case rate plan() might use when
+    // it ends up choosing that method — conservative but bounded.
+    val childrenByKey = mutableMapOf<Pair<String, String>, Double>()
     for (method in methods) {
         when (method["type"]) {
             "purchase" -> {
@@ -179,22 +192,12 @@ private fun walkBomSymbolic(
                 val productionLocation = (method["location_id"] as? String)?.trim() ?: locationId
                 val variants = variantsForMake(productId, productionLocation, 1.0, method, data)
                 for ((_, childList) in variants) {
-                    // Union-alt: recurse into every alt child, not just the first.
                     for (alt in childList) {
                         val cPid = (alt["product_id"] as? String)?.trim() ?: continue
                         val cLid = (alt["location_id"] as? String)?.trim() ?: continue
                         val cRate = (alt["quantity"] as? Number)?.toDouble() ?: continue
                         if (cRate <= 0) continue
-                        walkBomSymbolic(
-                            productId = cPid,
-                            locationId = cLid,
-                            cumulativeRate = cumulativeRate * cRate,
-                            demandQty = demandQty,
-                            data = data,
-                            supplyIndex = supplyIndex,
-                            visited = nextVisited,
-                            out = out,
-                        )
+                        childrenByKey.merge(cPid to cLid, cRate, ::maxOf)
                     }
                 }
             }
@@ -204,18 +207,22 @@ private fun walkBomSymbolic(
                     val cLid = (child["location_id"] as? String)?.trim() ?: continue
                     val cRate = (child["quantity"] as? Number)?.toDouble() ?: continue
                     if (cRate <= 0) continue
-                    walkBomSymbolic(
-                        productId = cPid,
-                        locationId = cLid,
-                        cumulativeRate = cumulativeRate * cRate,
-                        demandQty = demandQty,
-                        data = data,
-                        supplyIndex = supplyIndex,
-                        visited = nextVisited,
-                        out = out,
-                    )
+                    childrenByKey.merge(cPid to cLid, cRate, ::maxOf)
                 }
             }
         }
+    }
+
+    for ((childKey, cRate) in childrenByKey) {
+        walkBomSymbolic(
+            productId = childKey.first,
+            locationId = childKey.second,
+            cumulativeRate = cumulativeRate * cRate,
+            demandQty = demandQty,
+            data = data,
+            supplyIndex = supplyIndex,
+            visited = nextVisited,
+            out = out,
+        )
     }
 }
