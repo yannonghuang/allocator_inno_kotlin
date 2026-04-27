@@ -492,6 +492,29 @@ export type PlanRun = {
   duration_ms?: number | null;
   chosen_depth?: number | null;
   attempts?: Array<{ depth: number; duration_ms: number }> | null;
+  soundness_status?: 'unchecked' | 'checking' | 'sound' | 'unsound' | 'error';
+  soundness_checked_at?: string | null;
+};
+
+export type SoundnessViolation = {
+  rule: string;
+  node_path: string;
+  message: string;
+  expected?: unknown;
+  actual?: unknown;
+};
+
+export type SoundnessReport = {
+  overall_sound: boolean;
+  demand_count: number;
+  sound_count: number;
+  deep_check: boolean;
+  demands: Array<{
+    demand_id: string;
+    sound: boolean;
+    violations: SoundnessViolation[];
+  }>;
+  cross_demand_violations: SoundnessViolation[];
 };
 
 export type PlanRunEvent = {
@@ -565,6 +588,29 @@ export async function designateActivePlanRun(caseId: number, runId: number): Pro
 export async function clearDesignatedActivePlanRun(caseId: number): Promise<void> {
   const r = await fetch(`${API}/cases/${caseId}/designated-active`, { method: 'DELETE' });
   if (!r.ok) throw new Error(await r.text());
+}
+
+/** Run the soundness check synchronously and return the persisted report. */
+export async function checkPlanRunSoundness(
+  caseId: number,
+  runId: number,
+  opts?: { deep_check?: boolean },
+): Promise<SoundnessReport> {
+  const r = await fetch(`${API}/cases/${caseId}/plan-runs/${runId}/check-soundness`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(opts ?? {}),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+/** Fetch a previously computed soundness report. Returns null if never run. */
+export async function getPlanRunSoundness(caseId: number, runId: number): Promise<SoundnessReport | null> {
+  const r = await fetch(`${API}/cases/${caseId}/plan-runs/${runId}/soundness`);
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
 }
 
 export async function getExplanations(caseId: number, runId: number, supplyId: string): Promise<{ supply_id: string; split: { demand_id: string; quantity: number; reason: string }[] }> {

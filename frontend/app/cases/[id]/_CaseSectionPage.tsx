@@ -75,6 +75,8 @@ import {
   updatePlanRun,
   designateActivePlanRun,
   clearDesignatedActivePlanRun,
+  checkPlanRunSoundness,
+  type SoundnessReport,
   type PlanRunEvent,
   type PlanSupplyAllocation,
 } from '@/lib/api';
@@ -850,6 +852,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planRunDetailCache, setPlanRunDetailCache] = useState<Record<number, PlanRunFull>>({});
   const [planRunDetailLoading, setPlanRunDetailLoading] = useState<Record<number, boolean>>({});
   const [planRunDesignating, setPlanRunDesignating] = useState<Record<number, boolean>>({});
+  // Soundness check state: per-run busy flag + currently-displayed report (when slide-in open).
+  const [soundnessChecking, setSoundnessChecking] = useState<Record<number, boolean>>({});
+  const [soundnessReportOpen, setSoundnessReportOpen] = useState<{ runId: number; report: SoundnessReport } | null>(null);
+  const [soundnessDeepCheck, setSoundnessDeepCheck] = useState(false);
 
   // ── Override dialog state ───────────────────────────────────────────────────
   const [overrideDialogOpen, setOverrideDialogOpen] = useState(false);
@@ -5926,6 +5932,32 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           {tP('runHistory.overrideCount', { n: run.override_count })}
                         </span>
                       )}
+                      {run.soundness_status && run.soundness_status !== 'unchecked' && (() => {
+                        const s = run.soundness_status;
+                        const palette: Record<string, { bg: string; fg: string; label: string }> = {
+                          checking: { bg: '#1e40af', fg: '#dbeafe', label: 'checking…' },
+                          sound:    { bg: '#14532d', fg: '#bbf7d0', label: 'sound' },
+                          unsound:  { bg: '#7f1d1d', fg: '#fecaca', label: 'unsound' },
+                          error:    { bg: '#78350f', fg: '#fed7aa', label: 'check error' },
+                        };
+                        const p = palette[s] ?? { bg: '#27272a', fg: '#a1a1aa', label: s };
+                        const clickable = s === 'sound' || s === 'unsound';
+                        return (
+                          <span
+                            title={run.soundness_checked_at ? `Soundness ${s} (checked ${new Date(run.soundness_checked_at).toLocaleString()})` : `Soundness: ${s}`}
+                            onClick={async () => {
+                              if (!clickable || !id) return;
+                              try {
+                                const report = await checkPlanRunSoundness(id, run.id, { deep_check: false });
+                                setSoundnessReportOpen({ runId: run.id, report });
+                              } catch {/* noop */}
+                            }}
+                            style={{ background: p.bg, color: p.fg, borderRadius: 8, padding: '1px 7px', fontSize: '0.72rem', fontWeight: 600, cursor: clickable ? 'pointer' : 'default' }}
+                          >
+                            {p.label}
+                          </span>
+                        );
+                      })()}
                     </div>
                     <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                       {(run.status === 'success' || run.status === 'contingent') && (
@@ -5937,6 +5969,32 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           onClick={() => handleRestorePlanRun(run.id)}
                         >
                           {planRunLoadingId === run.id ? tP('runHistory.actions.loading') : tP('runHistory.load')}
+                        </button>
+                      )}
+                      {(run.status === 'success' || run.status === 'contingent') && (
+                        <button
+                          type="button"
+                          className="secondary"
+                          style={{ fontSize: '0.8rem', padding: '3px 10px' }}
+                          disabled={!!soundnessChecking[run.id] || run.soundness_status === 'checking'}
+                          title="Validate this plan run's pegging trees against the spec.md soundness rules"
+                          onClick={async () => {
+                            if (!id) return;
+                            setSoundnessChecking((prev) => ({ ...prev, [run.id]: true }));
+                            try {
+                              const report = await checkPlanRunSoundness(id, run.id, { deep_check: soundnessDeepCheck });
+                              setSoundnessReportOpen({ runId: run.id, report });
+                              // Refresh history list so the badge reflects the new state.
+                              const updated = await listPlanRuns(id);
+                              setPlanRunHistory(updated);
+                            } catch (e) {
+                              setSoundnessReportOpen({ runId: run.id, report: { overall_sound: false, demand_count: 0, sound_count: 0, deep_check: soundnessDeepCheck, demands: [], cross_demand_violations: [{ rule: 'check_failed', node_path: '', message: e instanceof Error ? e.message : 'Soundness check failed.' }] } });
+                            } finally {
+                              setSoundnessChecking((prev) => { const n = { ...prev }; delete n[run.id]; return n; });
+                            }
+                          }}
+                        >
+                          {soundnessChecking[run.id] ? 'checking…' : 'check soundness'}
                         </button>
                       )}
                       {/* Set active: only for successful runs that aren't already active */}
@@ -6140,6 +6198,96 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 </div>
                 );
               })}
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* ── Soundness report slide-in ─────────────────────────────────────────── */}
+      {soundnessReportOpen && typeof document !== 'undefined' && createPortal(
+        <div style={{ position: 'fixed', inset: 0, zIndex: 9997, display: 'flex', justifyContent: 'flex-end' }} role="dialog" aria-label="Soundness report">
+          <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)' }} onClick={() => setSoundnessReportOpen(null)} aria-hidden />
+          <div style={{ position: 'relative', zIndex: 10, width: 720, maxWidth: '90vw', height: '100vh', display: 'flex', flexDirection: 'column', background: '#1c1c1e', color: '#e4e4e7', boxShadow: '-4px 0 24px rgba(0,0,0,0.4)' }}>
+            <div style={{ padding: '1rem 1.25rem', borderBottom: '1px solid #3d3d40', flexShrink: 0, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div>
+                <h3 style={{ margin: 0, fontSize: '1rem' }}>
+                  Soundness — Run #{soundnessReportOpen.runId}
+                  <span style={{
+                    marginLeft: 10,
+                    fontSize: '0.78rem',
+                    fontWeight: 600,
+                    padding: '2px 8px',
+                    borderRadius: 8,
+                    background: soundnessReportOpen.report.overall_sound ? '#14532d' : '#7f1d1d',
+                    color: soundnessReportOpen.report.overall_sound ? '#bbf7d0' : '#fecaca',
+                  }}>
+                    {soundnessReportOpen.report.overall_sound ? 'sound' : 'unsound'}
+                  </span>
+                </h3>
+                <p style={{ margin: '4px 0 0', fontSize: '0.78rem', color: '#a1a1aa' }}>
+                  {soundnessReportOpen.report.sound_count} / {soundnessReportOpen.report.demand_count} demands sound
+                  {soundnessReportOpen.report.deep_check && ' · deep check'}
+                  {soundnessReportOpen.report.cross_demand_violations.length > 0 && ` · ${soundnessReportOpen.report.cross_demand_violations.length} cross-demand violation(s)`}
+                </p>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <label style={{ fontSize: '0.78rem', color: '#a1a1aa', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                  <input
+                    type="checkbox"
+                    checked={soundnessDeepCheck}
+                    onChange={(e) => setSoundnessDeepCheck(e.target.checked)}
+                  />
+                  deep check
+                </label>
+                <button type="button" onClick={() => setSoundnessReportOpen(null)} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
+              </div>
+            </div>
+            <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
+              {soundnessReportOpen.report.cross_demand_violations.length > 0 && (
+                <div style={{ marginBottom: '1rem' }}>
+                  <h4 style={{ margin: '0 0 0.5rem', fontSize: '0.85rem', color: '#fca5a5' }}>Cross-demand violations</h4>
+                  {soundnessReportOpen.report.cross_demand_violations.map((v, i) => (
+                    <div key={i} style={{ background: '#2d1818', border: '1px solid #7f1d1d', borderRadius: 6, padding: '8px 10px', marginBottom: 6, fontSize: '0.8rem' }}>
+                      <div style={{ fontWeight: 600, color: '#fca5a5' }}>{v.rule} · <span style={{ color: '#a1a1aa', fontWeight: 400 }}>{v.node_path}</span></div>
+                      <div style={{ color: '#e4e4e7', marginTop: 2 }}>{v.message}</div>
+                      {(v.expected !== undefined || v.actual !== undefined) && (
+                        <div style={{ color: '#a1a1aa', marginTop: 2, fontSize: '0.74rem' }}>
+                          expected: {String(v.expected)} · actual: {String(v.actual)}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+              <h4 style={{ margin: '0 0 0.5rem', fontSize: '0.85rem' }}>Per-demand</h4>
+              {soundnessReportOpen.report.demands.map((d) => (
+                <div key={d.demand_id} style={{
+                  borderLeft: `3px solid ${d.sound ? '#4ade80' : '#f87171'}`,
+                  paddingLeft: '0.6rem',
+                  marginBottom: '0.6rem',
+                  background: d.sound ? 'transparent' : 'rgba(248,113,113,0.06)',
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: '0.78rem', fontWeight: 600, color: d.sound ? '#4ade80' : '#f87171' }}>
+                      {d.sound ? '✓' : '✗'}
+                    </span>
+                    <span style={{ fontSize: '0.85rem' }}>{d.demand_id}</span>
+                    {!d.sound && <span style={{ fontSize: '0.74rem', color: '#a1a1aa' }}>· {d.violations.length} violation(s)</span>}
+                  </div>
+                  {d.violations.map((v, i) => (
+                    <div key={i} style={{ marginLeft: '1rem', marginTop: 4, padding: '6px 8px', background: '#27272a', borderRadius: 4, fontSize: '0.78rem' }}>
+                      <div style={{ color: '#fca5a5', fontWeight: 600 }}>{v.rule} · <span style={{ color: '#71717a', fontWeight: 400 }}>{v.node_path}</span></div>
+                      <div style={{ color: '#d4d4d8', marginTop: 2 }}>{v.message}</div>
+                      {(v.expected !== undefined || v.actual !== undefined) && (
+                        <div style={{ color: '#a1a1aa', marginTop: 2, fontSize: '0.72rem' }}>
+                          expected: {String(v.expected)} · actual: {String(v.actual)}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ))}
             </div>
           </div>
         </div>,
