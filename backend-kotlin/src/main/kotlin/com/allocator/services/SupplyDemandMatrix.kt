@@ -117,104 +117,159 @@ fun buildNeedsMatrix(
 }
 
 /**
- * Recursive symbolic BOM walker. Records needs at every supply-bearing node
- * encountered, and continues past inventory-bearing nodes (unlike the
- * leaf-engine's [walkResolution] which stops at the first one).
+ * Symbolic BOM walker via DAG rate propagation. For each demand, computes
+ * the symbolic required qty at every supply-bearing node reachable through
+ * **any combination of methods and alts** (union-method × union-alt), in
+ * O(V + E) time regardless of DAG path count.
  *
- * Termination:
- *   - cycle (already in `visited`): stop
- *   - no methods at this node: stop
- *   - method type `purchase`: terminal (purchase materializes here)
- *   - method type `make`: recurse into every alt_group child (union-alt)
- *   - method type `move`: recurse into the source location
+ * ## Why rate propagation, not recursion
  *
- * **Method selection: preferred only.** The walker follows [getPreferredMethod]
- * at each node — same single-method strategy [walkResolution] uses in the
- * leaf engine. We tried union-method (walking every method at every node) to
- * make the matrix a strict superset of plan()'s reachable supplies, but
- * combined with union-alt and DAG-shaped real BOMs the walk explodes
- * combinatorially (case 169 hangs Phase 1 indefinitely). Coverage of
- * non-preferred-method paths is restored by the **runtime matrix-miss
- * capture** in [runInitialCommit]: any demand that draws from a supply
- * without a Phase 2 allocation surfaces as a non-zero inventory delta, and
- * the orchestrator patches allocations to include that pair before the
- * next iter's commit. By Phase 3c (final commit) every demand has a cap.
+ * The naive recursive walker explores each path from root to leaf
+ * independently. In real BOMs that are DAGs (a common raw material reachable
+ * from many parents), the path count is exponential in graph size, and a
+ * union-method / union-alt walk hangs Phase 1 (case 169 stuck > 10 minutes).
  *
- * `visited` is the chain of (pid, lid) pairs from this demand's root down
- * to the current node — used for cycle detection only. It does **not**
- * accumulate across demands; each demand starts with `emptySet()`.
+ * Rate propagation collapses this: each (pid, lid) is visited once. Its
+ * accumulated rate equals the sum of `demandQty × path-rate-product` over
+ * every path from root to this node — exactly what we want for the matrix
+ * entry, computed in linear time.
+ *
+ * ## Algorithm
+ *
+ *  1. **Edge discovery** (BFS): walk the reachable subgraph from the demand
+ *     root. At each node, enumerate every method, every alt within make,
+ *     and every move source. Record outgoing edges (cPid, cLid, edge_rate).
+ *     Cycles are broken by the visited set; cycle-nodes are dropped.
+ *
+ *  2. **Topological sort** (Kahn's): order nodes so each node is processed
+ *     after all its in-edges. Cycle members have non-zero in-degree forever
+ *     and silently fall out — same coverage gap the leaf engine has.
+ *
+ *  3. **Rate propagation**: initialize rate[root] = demandQty. For each
+ *     node in topo order, propagate `rate[node] × edge_rate` to each child.
+ *     Where parent has multiple edges to the same child (e.g. two alts of
+ *     the same make leading to the same component), they sum naturally —
+ *     matching the recursive walker's union-alt semantics.
+ *
+ *  4. **Supply emission**: for any node whose key is in `supplyIndex`,
+ *     emit `out[SupplyKey] += rate[node]`.
+ *
+ * ## Union-method semantics
+ *
+ * At each node we collect children from every method (purchase contributes
+ * none; make contributes its alt children; move contributes its source).
+ * plan() picks one method per node at runtime, but the matrix records the
+ * union: any supply reachable through any method gets a cell. If the
+ * resulting matrix over-allocates Phase 2 (almost always — typical iter-1
+ * dropped is 95%+), compensation revokes the unused. Architectural promise:
+ * by Phase 3c every demand-supply pair plan() touches is bounded by an
+ * explicit cap.
  */
 private fun walkBomSymbolic(
     productId: String,
     locationId: String,
-    cumulativeRate: Double,
+    @Suppress("UNUSED_PARAMETER") cumulativeRate: Double,
     demandQty: Double,
     data: Map<String, List<Map<String, Any?>>>,
     supplyIndex: Set<SupplyKey>,
-    visited: Set<Pair<String, String>>,
+    @Suppress("UNUSED_PARAMETER") visited: Set<Pair<String, String>>,
     out: MutableMap<SupplyKey, Double>,
 ) {
-    val key = productId to locationId
-    if (key in visited) return
+    val rootKey = productId to locationId
 
-    val supplyKey = SupplyKey(productId, locationId)
-    if (supplyKey in supplyIndex) {
-        // Record symbolic need: demandQty × cumulative rate from demand to here.
-        // Sum across multiple paths (union-alt may reach the same supply twice).
-        out.merge(supplyKey, demandQty * cumulativeRate, Double::plus)
-        // KEY: do NOT stop here. Keep walking past supply-bearing nodes.
-    }
+    // ── Step 1: edge discovery via BFS. Each (pid, lid) is visited once;
+    //            its outgoing edges are collected from every method.
+    val edges = mutableMapOf<Pair<String, String>, MutableList<Pair<Pair<String, String>, Double>>>()
+    val discovered = mutableSetOf<Pair<String, String>>()
+    val toVisit = ArrayDeque<Pair<String, String>>()
+    toVisit.addLast(rootKey)
+    discovered.add(rootKey)
 
-    val methods = getMethods(productId, locationId, data)
-    val (method, _) = getPreferredMethod(methods)
-    if (method == null) return  // terminal — no way to make/buy/move
+    while (toVisit.isNotEmpty()) {
+        val key = toVisit.removeFirst()
+        val (pid, lid) = key
 
-    val nextVisited = visited + key
+        val methods = getMethods(pid, lid, data)
+        if (methods.isEmpty()) continue
 
-    when (method["type"]) {
-        "purchase" -> {
-            // Purchase materializes inventory here; nothing to recurse into.
-        }
-        "make" -> {
-            val productionLocation = (method["location_id"] as? String)?.trim() ?: locationId
-            val variants = variantsForMake(productId, productionLocation, 1.0, method, data)
-            for ((_, childList) in variants) {
-                // Union-alt: recurse into every alt child, not just the first.
-                for (alt in childList) {
-                    val cPid = (alt["product_id"] as? String)?.trim() ?: continue
-                    val cLid = (alt["location_id"] as? String)?.trim() ?: continue
-                    val cRate = (alt["quantity"] as? Number)?.toDouble() ?: continue
-                    if (cRate <= 0) continue
-                    walkBomSymbolic(
-                        productId = cPid,
-                        locationId = cLid,
-                        cumulativeRate = cumulativeRate * cRate,
-                        demandQty = demandQty,
-                        data = data,
-                        supplyIndex = supplyIndex,
-                        visited = nextVisited,
-                        out = out,
-                    )
+        val outEdges = edges.getOrPut(key) { mutableListOf() }
+        for (method in methods) {
+            when (method["type"]) {
+                "purchase" -> {
+                    // Purchase materializes here; no children.
+                }
+                "make" -> {
+                    val productionLocation = (method["location_id"] as? String)?.trim() ?: lid
+                    val variants = variantsForMake(pid, productionLocation, 1.0, method, data)
+                    for ((_, childList) in variants) {
+                        for (alt in childList) {
+                            val cPid = (alt["product_id"] as? String)?.trim() ?: continue
+                            val cLid = (alt["location_id"] as? String)?.trim() ?: continue
+                            val cRate = (alt["quantity"] as? Number)?.toDouble() ?: continue
+                            if (cRate <= 0) continue
+                            val childKey = cPid to cLid
+                            outEdges.add(childKey to cRate)
+                            if (discovered.add(childKey)) toVisit.addLast(childKey)
+                        }
+                    }
+                }
+                "move" -> {
+                    for (child in childMaterialsForMove(method, 1.0)) {
+                        val cPid = (child["product_id"] as? String)?.trim() ?: continue
+                        val cLid = (child["location_id"] as? String)?.trim() ?: continue
+                        val cRate = (child["quantity"] as? Number)?.toDouble() ?: continue
+                        if (cRate <= 0) continue
+                        val childKey = cPid to cLid
+                        outEdges.add(childKey to cRate)
+                        if (discovered.add(childKey)) toVisit.addLast(childKey)
+                    }
                 }
             }
         }
-        "move" -> {
-            for (child in childMaterialsForMove(method, 1.0)) {
-                val cPid = (child["product_id"] as? String)?.trim() ?: continue
-                val cLid = (child["location_id"] as? String)?.trim() ?: continue
-                val cRate = (child["quantity"] as? Number)?.toDouble() ?: continue
-                if (cRate <= 0) continue
-                walkBomSymbolic(
-                    productId = cPid,
-                    locationId = cLid,
-                    cumulativeRate = cumulativeRate * cRate,
-                    demandQty = demandQty,
-                    data = data,
-                    supplyIndex = supplyIndex,
-                    visited = nextVisited,
-                    out = out,
-                )
-            }
+    }
+
+    // ── Step 2: topological sort via Kahn's algorithm. Cycle members never
+    //            reach in-degree 0 and are dropped — same as the leaf
+    //            engine's cycle-handling.
+    val inDegree = mutableMapOf<Pair<String, String>, Int>()
+    for ((_, edgeList) in edges) {
+        for ((child, _) in edgeList) {
+            inDegree[child] = (inDegree[child] ?: 0) + 1
+        }
+    }
+    // Root is always a source. If a cycle (e.g. A → B → A) gives the root
+    // an in-edge, Kahn's natural calculation would never put it in the ready
+    // queue and the entire walk would emit nothing. Force the root in.
+    val ready = ArrayDeque<Pair<String, String>>()
+    ready.addLast(rootKey)
+    for (node in discovered) {
+        if (node != rootKey && (inDegree[node] ?: 0) == 0) ready.addLast(node)
+    }
+    val topoOrder = mutableListOf<Pair<String, String>>()
+    val processed = mutableSetOf<Pair<String, String>>()
+    while (ready.isNotEmpty()) {
+        val node = ready.removeFirst()
+        if (!processed.add(node)) continue  // already processed (forced root + cycle revived it)
+        topoOrder.add(node)
+        for ((child, _) in edges[node] ?: emptyList()) {
+            val newIn = (inDegree[child] ?: 0) - 1
+            inDegree[child] = newIn
+            if (newIn == 0 && child !in processed) ready.addLast(child)
+        }
+    }
+
+    // ── Step 3: rate propagation in topo order. ── Step 4: emit supply needs.
+    val rate = mutableMapOf<Pair<String, String>, Double>()
+    rate[rootKey] = demandQty
+    for (node in topoOrder) {
+        val accumQty = rate[node] ?: continue
+        if (accumQty <= 1e-12) continue
+        val supplyKey = SupplyKey(node.first, node.second)
+        if (supplyKey in supplyIndex) {
+            out.merge(supplyKey, accumQty, Double::plus)
+        }
+        for ((child, edgeRate) in edges[node] ?: emptyList()) {
+            rate[child] = (rate[child] ?: 0.0) + accumQty * edgeRate
         }
     }
 }
