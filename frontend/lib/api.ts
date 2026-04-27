@@ -299,6 +299,13 @@ export type PlanningConfig = {
     period_days?: number;
     /** How to split consolidated output among competing demands. Default: fair. */
     allocation_mode?: 'priority_first' | 'proportional' | 'fair';
+    /**
+     * Which consolidation engine to use.
+     *   'leaf-legacy' (default) — original leaf-level cap loop.
+     *   'supply'                — supply-level allocation policy + compensation
+     *                             (see docs/supply-level-consolidation.md).
+     */
+    engine?: 'leaf-legacy' | 'supply';
   };
 };
 

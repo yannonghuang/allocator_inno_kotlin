@@ -1704,6 +1704,10 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
                 "priority_first" -> "priority_first"
                 else             -> "fair"
             })
+            put("engine", when (consolidation["engine"]?.toString()) {
+                "supply" -> "supply"
+                else     -> "leaf-legacy"
+            })
         }
     }
 }

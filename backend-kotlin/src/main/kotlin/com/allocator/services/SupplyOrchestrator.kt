@@ -127,9 +127,23 @@ internal fun runV2Supply(
         inventory.clear()
         for (b in initialInventory) inventory.add(b.toMutableMap())
 
+        // Wrap the progress callback to inject iter K/MAX so the UI's
+        // demand-progress bar carries an "iter K/N" suffix the same way the
+        // leaf engine does. Phase 3c (final commit) emits no iter info — the
+        // bar will render plain "X/N demands" for that pass, which the user
+        // can read as "post-convergence final commit."
+        val iterCb: ((Map<String, Any?>) -> Unit)? = progressCallback?.let { cb ->
+            { payload ->
+                cb(payload + mapOf(
+                    "iteration" to iter + 1,
+                    "iterations_max" to MAX_SUPPLY_ITERATIONS,
+                ))
+            }
+        }
+
         // 3a — initial / re-commit with current caps.
         commit = runInitialCommit(
-            demands, inventory, data, config, overrideIndex, allocations, progressCallback,
+            demands, inventory, data, config, overrideIndex, allocations, iterCb,
         )
 
         // 3b — compensation.
