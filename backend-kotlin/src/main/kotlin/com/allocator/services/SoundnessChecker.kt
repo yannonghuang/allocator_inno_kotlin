@@ -483,10 +483,12 @@ private class WalkContext(
             }
             val rate = (bomRow["rate"] as? Number)?.toDouble() ?: 1.0
             val expectedChildQty = parentQty * rate
-            // Allow either absolute or 1% relative tolerance to absorb integer-rounding
-            // artifacts in the engine's qty quantization.
+            // Tolerance accommodates the engine's integer lot quantization (off-by-one
+            // when expected is fractional). Allow max(1.0, 1% of expected) — small qtys
+            // get the absolute floor, large qtys get the relative slack.
+            val toleranceQty = maxOf(1.0, expectedChildQty * 0.01)
             val absDiff = abs(childCommitted - expectedChildQty)
-            if (absDiff > config.tolerance && absDiff > expectedChildQty * 0.01) {
+            if (absDiff > toleranceQty) {
                 violations.add(Violation(
                     rule = "R4_qty_propagation",
                     nodePath = path,
