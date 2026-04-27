@@ -128,14 +128,17 @@ fun buildNeedsMatrix(
  *   - method type `make`: recurse into every alt_group child (union-alt)
  *   - method type `move`: recurse into the source location
  *
- * **Union-method.** When a node has multiple methods (e.g., a make-method
- * AND a purchase-method, or a make-method AND a move-method), [plan] under
- * elaborate / multiple-methods config may walk any of them depending on
- * scoring. The matrix must be a superset of every supply plan() might reach,
- * so the walker recurses into ALL methods at a node, not just the preferred
- * one. Demands that reach the same supply through multiple methods sum
- * their contributions, which is conservative — compensation revokes the
- * unused allocation in iter 1 (the bulk-shrinkage pass).
+ * **Method selection: preferred only.** The walker follows [getPreferredMethod]
+ * at each node — same single-method strategy [walkResolution] uses in the
+ * leaf engine. We tried union-method (walking every method at every node) to
+ * make the matrix a strict superset of plan()'s reachable supplies, but
+ * combined with union-alt and DAG-shaped real BOMs the walk explodes
+ * combinatorially (case 169 hangs Phase 1 indefinitely). Coverage of
+ * non-preferred-method paths is restored by the **runtime matrix-miss
+ * capture** in [runInitialCommit]: any demand that draws from a supply
+ * without a Phase 2 allocation surfaces as a non-zero inventory delta, and
+ * the orchestrator patches allocations to include that pair before the
+ * next iter's commit. By Phase 3c (final commit) every demand has a cap.
  *
  * `visited` is the chain of (pid, lid) pairs from this demand's root down
  * to the current node — used for cycle detection only. It does **not**
@@ -157,72 +160,61 @@ private fun walkBomSymbolic(
     val supplyKey = SupplyKey(productId, locationId)
     if (supplyKey in supplyIndex) {
         // Record symbolic need: demandQty × cumulative rate from demand to here.
-        // Sum across multiple paths (union-alt + union-method may reach the same
-        // supply more than once).
+        // Sum across multiple paths (union-alt may reach the same supply twice).
         out.merge(supplyKey, demandQty * cumulativeRate, Double::plus)
         // KEY: do NOT stop here. Keep walking past supply-bearing nodes.
     }
 
     val methods = getMethods(productId, locationId, data)
-    if (methods.isEmpty()) return  // terminal — no way to make/buy/move
+    val (method, _) = getPreferredMethod(methods)
+    if (method == null) return  // terminal — no way to make/buy/move
 
     val nextVisited = visited + key
 
-    // Collect every child this node could lead to, across all methods.
-    // Dedupe by (cPid, cLid) with MAX rate so each unique child is walked
-    // exactly once. Without dedupe, methods with overlapping children
-    // (common: a node has both "make" and "move" methods, or multiple make
-    // variants whose alts overlap) cause the walk to recurse multiple times
-    // through the same subtree — combinatorial blowup that hangs Phase 1
-    // on real BOMs.
-    //
-    // Within a single method (e.g., a make's alts), the alts go into
-    // childrenByKey at their own (cPid, cLid) keys; if alts have distinct
-    // pid|lid (the typical case) they all land in the map and each walks
-    // independently, preserving union-alt's sum-into-out semantics. Across
-    // methods, taking max picks the worst-case rate plan() might use when
-    // it ends up choosing that method — conservative but bounded.
-    val childrenByKey = mutableMapOf<Pair<String, String>, Double>()
-    for (method in methods) {
-        when (method["type"]) {
-            "purchase" -> {
-                // Purchase materializes inventory here; nothing to recurse into.
-            }
-            "make" -> {
-                val productionLocation = (method["location_id"] as? String)?.trim() ?: locationId
-                val variants = variantsForMake(productId, productionLocation, 1.0, method, data)
-                for ((_, childList) in variants) {
-                    for (alt in childList) {
-                        val cPid = (alt["product_id"] as? String)?.trim() ?: continue
-                        val cLid = (alt["location_id"] as? String)?.trim() ?: continue
-                        val cRate = (alt["quantity"] as? Number)?.toDouble() ?: continue
-                        if (cRate <= 0) continue
-                        childrenByKey.merge(cPid to cLid, cRate, ::maxOf)
-                    }
-                }
-            }
-            "move" -> {
-                for (child in childMaterialsForMove(method, 1.0)) {
-                    val cPid = (child["product_id"] as? String)?.trim() ?: continue
-                    val cLid = (child["location_id"] as? String)?.trim() ?: continue
-                    val cRate = (child["quantity"] as? Number)?.toDouble() ?: continue
+    when (method["type"]) {
+        "purchase" -> {
+            // Purchase materializes inventory here; nothing to recurse into.
+        }
+        "make" -> {
+            val productionLocation = (method["location_id"] as? String)?.trim() ?: locationId
+            val variants = variantsForMake(productId, productionLocation, 1.0, method, data)
+            for ((_, childList) in variants) {
+                // Union-alt: recurse into every alt child, not just the first.
+                for (alt in childList) {
+                    val cPid = (alt["product_id"] as? String)?.trim() ?: continue
+                    val cLid = (alt["location_id"] as? String)?.trim() ?: continue
+                    val cRate = (alt["quantity"] as? Number)?.toDouble() ?: continue
                     if (cRate <= 0) continue
-                    childrenByKey.merge(cPid to cLid, cRate, ::maxOf)
+                    walkBomSymbolic(
+                        productId = cPid,
+                        locationId = cLid,
+                        cumulativeRate = cumulativeRate * cRate,
+                        demandQty = demandQty,
+                        data = data,
+                        supplyIndex = supplyIndex,
+                        visited = nextVisited,
+                        out = out,
+                    )
                 }
             }
         }
-    }
-
-    for ((childKey, cRate) in childrenByKey) {
-        walkBomSymbolic(
-            productId = childKey.first,
-            locationId = childKey.second,
-            cumulativeRate = cumulativeRate * cRate,
-            demandQty = demandQty,
-            data = data,
-            supplyIndex = supplyIndex,
-            visited = nextVisited,
-            out = out,
-        )
+        "move" -> {
+            for (child in childMaterialsForMove(method, 1.0)) {
+                val cPid = (child["product_id"] as? String)?.trim() ?: continue
+                val cLid = (child["location_id"] as? String)?.trim() ?: continue
+                val cRate = (child["quantity"] as? Number)?.toDouble() ?: continue
+                if (cRate <= 0) continue
+                walkBomSymbolic(
+                    productId = cPid,
+                    locationId = cLid,
+                    cumulativeRate = cumulativeRate * cRate,
+                    demandQty = demandQty,
+                    data = data,
+                    supplyIndex = supplyIndex,
+                    visited = nextVisited,
+                    out = out,
+                )
+            }
+        }
     }
 }
