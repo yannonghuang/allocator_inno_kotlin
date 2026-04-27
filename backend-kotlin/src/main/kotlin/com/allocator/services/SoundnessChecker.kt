@@ -468,6 +468,51 @@ private class WalkContext(
         //     the inconsistency isn't a quantity-propagation violation).
         val parentQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
         if (parentQty <= config.tolerance) return  // failed make WO; child commitments orphaned
+        val childrenRelation = (node["children_relation"] as? String)?.trim()
+        // Tolerance accommodates the engine's integer lot quantization (off-by-one
+        // when expected is fractional). max(1.0, 1% of expected) — small qtys
+        // get the absolute floor, large qtys keep the relative slack.
+        fun toleranceFor(qty: Double): Double = maxOf(1.0, qty * 0.01)
+
+        if (childrenRelation == "or") {
+            // OR / multi-variant: parent_qty is split across alternative branches.
+            // Each child contributes (committed / rate) to the parent's production.
+            // Σ over children of (committed / rate) ≈ parent_qty.
+            var summed = 0.0
+            var anyMissingBom = false
+            for (childNode in woChildren.filter { it["type"] == "demand" }) {
+                val childPid = (childNode["product_id"] as? String)?.trim() ?: continue
+                val childCommitted = (childNode["committed_qty"] as? Number)?.toDouble()
+                    ?: (childNode["quantity"] as? Number)?.toDouble() ?: 0.0
+                val bomRow = parentBomRows.firstOrNull { (it["child_id"] as? String)?.trim() == childPid }
+                if (bomRow == null) {
+                    violations.add(Violation(
+                        rule = "R2_child_not_in_bom",
+                        nodePath = path,
+                        message = "Make WO child pid=$childPid not in BOM for parent=$pid.",
+                    ))
+                    anyMissingBom = true
+                    continue
+                }
+                val rate = (bomRow["rate"] as? Number)?.toDouble() ?: 1.0
+                if (rate > 0) summed += childCommitted / rate
+            }
+            if (!anyMissingBom) {
+                val absDiff = abs(summed - parentQty)
+                if (absDiff > toleranceFor(parentQty)) {
+                    violations.add(Violation(
+                        rule = "R4_qty_propagation",
+                        nodePath = path,
+                        message = "Make WO (children_relation=or) Σ (child_committed_qty / rate) = $summed doesn't match parent_qty = $parentQty.",
+                        expected = parentQty,
+                        actual = summed,
+                    ))
+                }
+            }
+            return
+        }
+
+        // AND (or null): each required child contributes parent × rate independently.
         for (childNode in woChildren.filter { it["type"] == "demand" }) {
             val childPid = (childNode["product_id"] as? String)?.trim() ?: continue
             val childCommitted = (childNode["committed_qty"] as? Number)?.toDouble()
@@ -483,12 +528,8 @@ private class WalkContext(
             }
             val rate = (bomRow["rate"] as? Number)?.toDouble() ?: 1.0
             val expectedChildQty = parentQty * rate
-            // Tolerance accommodates the engine's integer lot quantization (off-by-one
-            // when expected is fractional). Allow max(1.0, 1% of expected) — small qtys
-            // get the absolute floor, large qtys get the relative slack.
-            val toleranceQty = maxOf(1.0, expectedChildQty * 0.01)
             val absDiff = abs(childCommitted - expectedChildQty)
-            if (absDiff > toleranceQty) {
+            if (absDiff > toleranceFor(expectedChildQty)) {
                 violations.add(Violation(
                     rule = "R4_qty_propagation",
                     nodePath = path,
