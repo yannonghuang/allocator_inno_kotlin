@@ -106,6 +106,35 @@ data class PlanRunResponse(
     @SerialName("duration_ms") val durationMs: Long? = null,
     @SerialName("chosen_depth") val chosenDepth: Int? = null,
     val attempts: JsonElement? = null,  // [{depth, duration_ms}, ...] for optimal-depth runs
+    @SerialName("soundness_status") val soundnessStatus: String = "unchecked",
+    @SerialName("soundness_checked_at") val soundnessCheckedAt: String? = null,
+)
+
+@Serializable
+data class SoundnessReportDto(
+    @SerialName("overall_sound") val overallSound: Boolean,
+    @SerialName("demand_count") val demandCount: Int,
+    @SerialName("sound_count") val soundCount: Int,
+    val demands: List<DemandSoundnessDto>,
+    @SerialName("cross_demand_violations") val crossDemandViolations: List<ViolationDto>,
+    @SerialName("deep_check") val deepCheck: Boolean,
+    @SerialName("checked_at") val checkedAt: String? = null,
+)
+
+@Serializable
+data class DemandSoundnessDto(
+    @SerialName("demand_id") val demandId: String,
+    val sound: Boolean,
+    val violations: List<ViolationDto>,
+)
+
+@Serializable
+data class ViolationDto(
+    val rule: String,
+    @SerialName("node_path") val nodePath: String,
+    val message: String,
+    val expected: JsonElement? = null,
+    val actual: JsonElement? = null,
 )
 
 @Serializable
