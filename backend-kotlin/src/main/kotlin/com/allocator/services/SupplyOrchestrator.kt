@@ -288,6 +288,7 @@ private fun patchMatrixMisses(
     var missQty = 0.0
     val newByRow = allocations.byRow.mapValues { (_, m) -> m.toMutableMap() }.toMutableMap()
     val newByColumn = allocations.byColumn.mapValues { (_, m) -> m.toMutableMap() }.toMutableMap()
+    val sample = mutableListOf<Triple<Any?, SupplyKey, Double>>()  // for diagnostic logging
 
     for ((demandId, draws) in actualDraws) {
         val rowAllocs = newByRow[demandId]
@@ -306,8 +307,14 @@ private fun patchMatrixMisses(
                 byCol[demandId] = drew
                 missQty += drew - currentAlloc
                 missCount++
+                if (sample.size < 10) sample.add(Triple(demandId, sk, drew))
             }
         }
+    }
+
+    if (sample.isNotEmpty()) {
+        val rendered = sample.joinToString("; ") { (d, sk, q) -> "$d→$sk:${"%.2f".format(q)}" }
+        log.warn("supply matrix-miss sample (first ${sample.size} of $missCount): $rendered")
     }
 
     return Triple(SupplyAllocations(byRow = newByRow, byColumn = newByColumn), missCount, missQty)
