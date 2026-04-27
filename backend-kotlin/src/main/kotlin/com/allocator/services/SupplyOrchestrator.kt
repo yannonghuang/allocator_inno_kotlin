@@ -72,6 +72,15 @@ internal data class V2SupplyResult(
      * splitInfos come from the consolidated pegging entries instead.
      */
     val supplyLevelAllocations: List<Map<String, Any?>>,
+    /**
+     * Consolidated-WO pegging entries (`demand_id = null`) so the WO-pegging
+     * endpoint can locate trees for merged work orders. One entry per
+     * multi-demand group from Phase E. The tree is a representative
+     * per-demand tree from one of the contributing demands; the frontend's
+     * findWoNode walks it by (pid, lid, method) and ignores root-level
+     * demand_id, so any contributor's tree suffices for lookup.
+     */
+    val consolidatedPegging: List<Map<String, Any?>>,
 )
 
 /**
@@ -255,6 +264,14 @@ internal fun runV2Supply(
         mode = mode,
     )
 
+    // Build consolidated-WO pegging entries so the WO-pegging endpoint can
+    // locate trees for the merged WOs Phase E produced.
+    val consolidatedPegging = buildConsolidatedPegging(
+        perDemandWOs = commit.workOrders,
+        perDemandPegging = commit.planningPegging,
+        priorities = priorities,
+    )
+
     return V2SupplyResult(
         workOrders = mergedWOs,
         commitResult = LegacyCommitResult(
@@ -265,7 +282,78 @@ internal fun runV2Supply(
         iterations = iterations,
         converged = converged,
         supplyLevelAllocations = supplyLevelAllocations,
+        consolidatedPegging = consolidatedPegging,
     )
+}
+
+/**
+ * For each multi-demand WO group from Phase E, emit a consolidatedPegging
+ * entry shaped like the leaf-engine's: `{demand_id: null, consolidated: true,
+ * consolidated_demand_ids: [...], per_demand_allocations: {...}, tree: ...}`.
+ *
+ * The tree is the per-demand pegging tree of the largest contributor — the
+ * frontend's findWoNode walks by (pid, lid, method) and doesn't care which
+ * contributor owns the tree, so any tree containing the WO works.
+ *
+ * Single-demand groups don't need consolidated entries; the frontend looks
+ * those up in planningPegging by their real demand_id.
+ */
+private fun buildConsolidatedPegging(
+    perDemandWOs: List<Map<String, Any?>>,
+    perDemandPegging: List<Map<String, Any?>>,
+    priorities: Map<Any?, Int>,
+): List<Map<String, Any?>> {
+    if (perDemandWOs.isEmpty()) return emptyList()
+
+    // Group per-demand WOs by the same key Phase E uses.
+    data class GroupKey(
+        val productId: String?,
+        val locationId: String?,
+        val startTime: String?,
+        val endTime: String?,
+        val method: String?,
+    )
+
+    fun keyOf(wo: Map<String, Any?>) = GroupKey(
+        productId = wo["product_id"] as? String,
+        locationId = wo["location_id"] as? String,
+        startTime = wo["start_time"] as? String,
+        endTime = wo["end_time"] as? String,
+        method = wo["method"] as? String,
+    )
+
+    val groups = perDemandWOs.groupBy(::keyOf)
+    val treeByDemand: Map<Any?, Map<String, Any?>> = perDemandPegging
+        .mapNotNull { entry ->
+            val did = entry["demand_id"]
+            @Suppress("UNCHECKED_CAST")
+            val tree = entry["tree"] as? Map<String, Any?>
+            if (did != null && tree != null) did to tree else null
+        }
+        .toMap()
+
+    val result = mutableListOf<Map<String, Any?>>()
+    for ((_, members) in groups) {
+        if (members.size < 2) continue  // single-demand passthroughs go through planningPegging by demand_id
+        val perDemandQty: Map<Any?, Double> = members
+            .filter { it["demand_id"] != null }
+            .groupingBy { it["demand_id"] }
+            .fold(0.0) { acc, wo -> acc + ((wo["quantity"] as? Number)?.toDouble() ?: 0.0) }
+        if (perDemandQty.isEmpty()) continue
+        // Largest contributor — guaranteed to have a per-demand tree containing this WO.
+        val largest = perDemandQty.maxByOrNull { it.value }?.key ?: continue
+        val tree = treeByDemand[largest] ?: continue
+        result.add(mapOf(
+            "demand_id" to null,
+            "consolidated" to true,
+            "consolidated_demand_ids" to perDemandQty.keys.map { it?.toString() ?: "" },
+            "per_demand_allocations" to perDemandQty.entries.associate { (k, v) -> (k?.toString() ?: "") to v },
+            "tree" to tree,
+            // Carry priority of the chosen tree's demand for downstream sorting (best-effort).
+            "_priority" to (priorities[largest] ?: 0),
+        ))
+    }
+    return result
 }
 
 /**

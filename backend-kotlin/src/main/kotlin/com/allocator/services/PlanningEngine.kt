@@ -2206,9 +2206,11 @@ fun runPlanning(
                     demands, inventory, data, config, consolidationConfig, overrideIndex, progressCallback,
                 )
                 // Supply engine puts ALL WOs (consolidated + passthrough) into one
-                // list. consolidatedPegging stays empty; per-demand pegging trees
-                // come through commitResult.planningPegging.
+                // list. consolidatedPegging carries one entry per multi-demand WO
+                // group so the WO-pegging endpoint can locate trees for merged WOs;
+                // per-demand pegging trees come through commitResult.planningPegging.
                 consolidatedWOs.addAll(supply.workOrders)
+                consolidatedPegging.addAll(supply.consolidatedPegging)
                 commitResult = supply.commitResult
                 supplyLevelAllocations = supply.supplyLevelAllocations
             }
