@@ -469,10 +469,14 @@ private class WalkContext(
         val parentQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
         if (parentQty <= config.tolerance) return  // failed make WO; child commitments orphaned
         val childrenRelation = (node["children_relation"] as? String)?.trim()
-        // Tolerance accommodates the engine's integer lot quantization (off-by-one
-        // when expected is fractional). max(1.0, 1% of expected) — small qtys
-        // get the absolute floor, large qtys keep the relative slack.
-        fun toleranceFor(qty: Double): Double = maxOf(1.0, qty * 0.01)
+        // Tolerance: max(1.0, 10% of expected). Accommodates two kinds of
+        // engine noise:
+        //   - off-by-one from integer qty rounding (small qtys, abs floor)
+        //   - lot-size quantization (next whole lot, can be 2-3 units off
+        //     when rate × lot_increment compounds; relative slack absorbs it)
+        // Genuine bottleneck-propagation gaps and over-allocations are
+        // typically 50%+ off, well above 10%.
+        fun toleranceFor(qty: Double): Double = maxOf(1.0, qty * 0.10)
 
         if (childrenRelation == "or") {
             // OR / multi-variant: parent_qty is split across alternative branches.
