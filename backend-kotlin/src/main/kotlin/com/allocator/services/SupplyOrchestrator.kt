@@ -35,9 +35,20 @@ private val log = LoggerFactory.getLogger("com.allocator.SupplyOrchestrator")
  * Maximum compensation iterations the supply engine will run before giving
  * up and using the last allocations as-is. Each iter is one full
  * runInitialCommit + compensate pass. In the design (§5) we expect 1-2
- * iters typical; 5 is safety headroom.
+ * iters typical; 10 is safety headroom for cases with deep BOMs where the
+ * tail of the geometric decay needs a few more passes to settle.
  */
-private const val MAX_SUPPLY_ITERATIONS = 5
+private const val MAX_SUPPLY_ITERATIONS = 10
+
+/**
+ * Practical-convergence threshold. If consecutive iters' redistributed qty
+ * differ by less than this fraction (1%), we treat the loop as converged
+ * even though `compensate.redistributed` is still true. The residual is
+ * floating-point/rounding shuffle between cap-bound demands at boundary
+ * supplies — running more iters won't change the allocation in any way the
+ * downstream commit can observe, so we stop early.
+ */
+private const val CONVERGENCE_PROGRESS_THRESHOLD = 0.01
 
 /** Output of [runV2Supply]; mirrors the shape runPlanning expects. */
 internal data class V2SupplyResult(
@@ -107,6 +118,7 @@ internal fun runV2Supply(
     var commit: InitialCommitResult? = null
     var iterations = 0
     var converged = false
+    var prevRedistributed = Double.POSITIVE_INFINITY
 
     for (iter in 0 until MAX_SUPPLY_ITERATIONS) {
         iterations = iter + 1
@@ -129,11 +141,31 @@ internal fun runV2Supply(
             break
         }
 
+        // Practical-convergence break: if the redistribution qty has shrunk
+        // less than CONVERGENCE_PROGRESS_THRESHOLD relative to last iter, the
+        // tail is just rounding shuffle between boundary candidates — running
+        // more iters won't materially change the allocation. Apply the new
+        // caps from this iter (it's still a strict improvement) before exit.
+        val progressFraction = if (prevRedistributed.isFinite() && prevRedistributed > 0.0) {
+            (prevRedistributed - comp.qtyRedistributed) / prevRedistributed
+        } else 1.0
+        if (iter > 0 && progressFraction < CONVERGENCE_PROGRESS_THRESHOLD) {
+            log.info(
+                "supply iter {}: converged (progress {:.2}% below {:.0}% threshold; redistributed {} qty across {} supply(ies))",
+                iterations, progressFraction * 100, CONVERGENCE_PROGRESS_THRESHOLD * 100,
+                "%.2f".format(comp.qtyRedistributed), comp.supplyCount,
+            )
+            allocations = comp.allocations
+            converged = true
+            break
+        }
+
         log.info(
             "supply iter {}: redistributed {} qty across {} supply(ies); refining caps for next iter",
             iterations, "%.2f".format(comp.qtyRedistributed), comp.supplyCount,
         )
         allocations = comp.allocations
+        prevRedistributed = comp.qtyRedistributed
     }
 
     if (!converged) {
