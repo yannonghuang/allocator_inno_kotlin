@@ -6,6 +6,7 @@ import java.nio.file.Paths
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 import kotlin.math.abs
+import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
 
@@ -154,6 +155,39 @@ private data class ChildPassResult(
     val pegging: Map<String, Any?>?,
     val cTimes: List<LocalDate>,
 )
+
+/**
+ * Compute parent achievable qty from per-child first-pass results, given the
+ * relation among children. AND (or unspecified): the worst-supplied child caps
+ * the parent (classic min-bottleneck). OR: each variant contributes additively
+ * — Σ (variant's fractional success × variant's share of demand). Returns
+ * (rawAchievable, isOrSplit) so callers can decide whether a uniform second
+ * pass is appropriate (AND) or whether to keep first-pass per-variant commits
+ * as-is (OR — each variant already represents an independent attempt).
+ */
+private fun computeRawAchievable(
+    childPassResults: List<ChildPassResult>,
+    demandNetQty: Double,
+    woChildrenRelation: String?,
+): Pair<Double, Boolean> {
+    val isOr = woChildrenRelation == "or" && childPassResults.size > 1
+    val raw = if (isOr) {
+        // Variants are equal-split shares of demand (see getPreferredVariants).
+        // Each variant's parent contribution = success_fraction × variant_share.
+        val perVariantShare = demandNetQty / childPassResults.size
+        childPassResults.sumOf { cr ->
+            if (cr.neededQty > 1e-9) {
+                val frac = (cr.effectiveQty / cr.neededQty).coerceAtMost(1.0)
+                frac * perVariantShare
+            } else perVariantShare
+        }
+    } else {
+        childPassResults.minOf { cr ->
+            if (cr.neededQty > 1e-9) cr.effectiveQty * demandNetQty / cr.neededQty else demandNetQty
+        }
+    }
+    return Pair(raw, isOr)
+}
 
 // ── BOM real-pair cache ────────────────────────────────────────────────────────
 
@@ -907,14 +941,20 @@ fun plan(
     if (taken > 0) {
         val commitForFulfilled = fulfillCommitTime ?: reqTimeStr
         demandFulfilledList.add(committedRow(taken, commitForFulfilled, "inventory"))
-        // One supply node per consumed bucket so each node carries its exact supply_id
+        // One supply node per consumed bucket so each node carries its exact supply_id.
+        // Keep `quantity` UNROUNDED — fair-split allocators distribute supply.qty across
+        // demands as fractional shares (e.g. 4 units / 6 demands = 0.667 each), and
+        // rounding each leaf to 1 makes Σ leaves overstate consumption (R7b violation
+        // on case 171's 500-6496_1000_4: 6 × roundQty(0.667)=6 against supply.qty=4).
+        // extractSupplyAllocations + R7b checker both sum these qtys, so accuracy
+        // matters more than display niceness.
         for (bucket in consumedBuckets) {
             peggingChildren.add(mapOf(
                 "type" to "supply",
                 "product_id" to productId,
                 "location_id" to locationId,
                 "supply_id" to bucket.supplyId,
-                "quantity" to roundQty(bucket.qty),
+                "quantity" to bucket.qty,
                 "commit_time" to (bucket.commitTime ?: reqTimeStr),
                 "children" to emptyList<Any>(),
             ))
@@ -956,20 +996,6 @@ fun plan(
     val useSingleVariant = variantCfg.multiple == false
     val scoreWeights = variantCfg.scoreWeights
     val topN = variantCfg.topN
-
-    // Shortage tolerance: tiny partial-fulfillment gaps are collapsed to "no bottleneck".
-    // Tolerance = max(absolute, relative * qty), capped at 50% of qty so the
-    // absolute floor never absorbs > 50% relative shortage on small demands
-    // (without the cap, demandNetQty=1 with rawAchievable=0.5 — a real 50%
-    // bottleneck — would be treated as noise because 0.5 < 1.0). Configurable
-    // via shortage_tolerance: { absolute: 1.0, relative: 0.01 }.
-    val shortageToleranceCfg = (config?.get("shortage_tolerance") as? Map<*, *>)?.let {
-        @Suppress("UNCHECKED_CAST") it as? Map<String, Any?>
-    }
-    val shortageAbs = (shortageToleranceCfg?.get("absolute") as? Number)?.toDouble() ?: 1.0
-    val shortageRel = (shortageToleranceCfg?.get("relative") as? Number)?.toDouble() ?: 0.01
-    fun shortageTolerance(qty: Double) =
-        maxOf(shortageRel * qty, minOf(shortageAbs, qty * 0.5))
 
     // ── Multiple methods: equal split (with per-method two-pass probe) ─────────
     //
@@ -1059,7 +1085,7 @@ fun plan(
             }
 
             val methodChildShort = methodChildResults.any { cr -> cr.effectiveQty < cr.neededQty - 1e-9 }
-            val methodAchievable: Double
+            var methodAchievable: Double
             val childWos = mutableListOf<Map<String, Any?>>()
             val commitTimes = mutableListOf<LocalDate>()
             val childPeggingNodes = mutableListOf<Map<String, Any?>>()
@@ -1072,16 +1098,15 @@ fun plan(
                     commitTimes.addAll(cr.cTimes)
                 }
             } else {
-                val rawAchievable = methodChildResults.minOf { cr ->
-                    if (cr.neededQty > 1e-9) cr.effectiveQty * methodQty / cr.neededQty else methodQty
-                }
-                // Close-enough collapse: tiny shortages are numerical noise, not real
-                // bottlenecks. Conservation guard: when rawAchievable is essentially
-                // zero, NEVER absorb (would commit a phantom WO under shortage). See
-                // single-method path for full rationale.
-                val capped = if (rawAchievable > 1e-9 &&
-                                 methodQty - rawAchievable < shortageTolerance(methodQty)) methodQty
-                             else rawAchievable.coerceIn(0.0, methodQty)
+                // AND-bottleneck (min over children) or OR-additive (Σ over variants).
+                // OR is detected per-method-slot via woChildrenRelation set above.
+                val (rawAchievable, isOrSplit) = computeRawAchievable(methodChildResults, methodQty, woChildrenRelation)
+                // Conservation: floor a fractional cap so Math.round can't round it
+                // UP (Math.round(0.5)=1) and emit a WO that over-claims its children.
+                // 1e-6 is FP-noise only; lot-quantization slop is absorbed by the R4
+                // checker's own tolerance.
+                val capped = if (rawAchievable >= methodQty - 1e-6) methodQty
+                             else floor(rawAchievable).coerceIn(0.0, methodQty)
                 if (capped <= 1e-9) {
                     // This method is completely blocked — deep raw material is exhausted.
                     // Contribute 0 to the split and preserve the first-pass pegging so the UI
@@ -1100,23 +1125,43 @@ fun plan(
                 methodAchievable = capped
                 anyMethodShort = true
 
-                // ── Second pass: restore inventory + budget and re-plan at scaled qty ──
-                inventory.clear()
-                inventory.addAll(methodInvSnap)
-                if (budget != null && methodBudgetSnap != null) {
-                    budget.clear()
-                    budget.putAll(methodBudgetSnap)
-                }
-                val scale = methodAchievable / methodQty
-                val scaledChildren = scaleChildMaterials(childMaterials, scale)
-                for (c in scaledChildren) {
-                    val cReqDt = dateAddDays(reqDt, -leadDays)
-                    val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
-                        "quantity" to c["quantity"], "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
-                    val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget)
-                    childWos.addAll(cWos)
-                    if (cPegging != null) childPeggingNodes.add(cPegging)
-                    solvedList.forEach { s -> parseDate(s["commit_time"] as? String)?.let { commitTimes.add(it) } }
+                if (isOrSplit) {
+                    // OR-relation: variants already represent independent partial attempts.
+                    // No uniform rescale; use first-pass results.
+                    methodChildResults.forEach { cr ->
+                        childWos.addAll(cr.wos)
+                        if (cr.pegging != null) childPeggingNodes.add(cr.pegging)
+                        commitTimes.addAll(cr.cTimes)
+                    }
+                } else {
+                    // ── Second pass: restore inventory + budget and re-plan at scaled qty ──
+                    inventory.clear()
+                    inventory.addAll(methodInvSnap)
+                    if (budget != null && methodBudgetSnap != null) {
+                        budget.clear()
+                        budget.putAll(methodBudgetSnap)
+                    }
+                    val scale = methodAchievable / methodQty
+                    val scaledChildren = scaleChildMaterials(childMaterials, scale)
+                    for (c in scaledChildren) {
+                        val cReqDt = dateAddDays(reqDt, -leadDays)
+                        val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
+                            "quantity" to c["quantity"], "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
+                        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget)
+                        childWos.addAll(cWos)
+                        if (cPegging != null) childPeggingNodes.add(cPegging)
+                        solvedList.forEach { s -> parseDate(s["commit_time"] as? String)?.let { commitTimes.add(it) } }
+                    }
+
+                    // Move conservation: see single-method path for rationale.
+                    if (m["type"] == "move") {
+                        val childCommit = childPeggingNodes.firstOrNull()?.let {
+                            (it["committed_qty"] as? Number)?.toDouble()
+                        }
+                        if (childCommit != null && childCommit < methodAchievable - 1e-6) {
+                            methodAchievable = floor(childCommit).coerceAtLeast(0.0)
+                        }
+                    }
                 }
             }
 
@@ -1291,7 +1336,7 @@ fun plan(
 
 
     // ── Determine achievable parent qty ────────────────────────────────────────
-    val achievableParentQty: Double
+    var achievableParentQty: Double
     if (!anyChildShort || childMaterials.isEmpty()) {
         // All children fully committed — first-pass results are final.
         achievableParentQty = demandNetQty
@@ -1301,22 +1346,20 @@ fun plan(
             commitTimes.addAll(cr.cTimes)
         }
     } else {
-        // Bottleneck: child with the worst committed/needed ratio limits the parent.
-        val rawAchievable = childPassResults.minOf { cr ->
-            if (cr.neededQty > 1e-9) cr.effectiveQty * demandNetQty / cr.neededQty else demandNetQty
-        }
-        // Close-enough collapse: tiny shortages are numerical noise, not real
-        // bottlenecks. Threshold sourced from config.shortage_tolerance.
-        //
-        // Conservation guard: when rawAchievable is essentially zero, NEVER
-        // absorb the shortage as noise — that path commits a phantom WO with
-        // children that delivered nothing (R4 conservation violation surfaced
-        // by case 171's soundness check). The shortage_tolerance default is
-        // 1.0 absolute, which means a 100%-short demand of qty=0.985 was
-        // being treated as noise simply because demandNetQty < 1.0.
-        val capped = if (rawAchievable > 1e-9 &&
-                         demandNetQty - rawAchievable < shortageTolerance(demandNetQty)) demandNetQty
-                     else rawAchievable.coerceIn(0.0, demandNetQty)
+        // Bottleneck for AND-relation children: the worst-supplied child caps the
+        // parent (min over children). For OR-relation (multi-variant equal-split),
+        // each variant contributes additively — Σ over variants instead of min.
+        val (rawAchievable, isOrSplit) = computeRawAchievable(childPassResults, demandNetQty, woChildrenRelation)
+        // Conservation: floor rawAchievable in the partial branch so Math.round
+        // can't round a fractional cap UP (e.g. 0.5→1, 1.5→2) and emit a WO that
+        // over-claims its children. Snap to demandNetQty only inside a tight FP-noise
+        // tolerance — the previous 1.0-absolute / 50%-relative tolerances were
+        // silently absorbing real 20–50% bottlenecks as "noise" when demandNetQty
+        // was small or fractional. Lot-quantization slop is absorbed by the R4
+        // checker's own tolerance, not by inflating WO qty here.
+        // See docs/planner-conservation-fixes.md (case 171, mechanisms A and B).
+        val capped = if (rawAchievable >= demandNetQty - 1e-6) demandNetQty
+                     else floor(rawAchievable).coerceIn(0.0, demandNetQty)
 
         if (capped <= 1e-9) {
             // Nothing achievable at all — no raw capacity after deeper chain depletion.
@@ -1348,35 +1391,65 @@ fun plan(
         }
         achievableParentQty = capped
 
-        // ── Second pass: restore inventory + budget and re-plan at achievable qty ──────
-        // Because scale = capped/demandNetQty, each child is asked for exactly
-        // what it committed in the first pass (minus epsilon), so this pass succeeds.
-        inventory.clear()
-        inventory.addAll(inventorySnap)
-        if (budget != null && budgetSnap != null) {
-            // Reset budget to pre-first-pass state. The second pass's draws will
-            // re-decrement it as it walks; final budget reflects actual final
-            // consumption, not exploratory + commit double-counting.
-            budget.clear()
-            budget.putAll(budgetSnap)
-        }
-        val scale = achievableParentQty / demandNetQty
-        val scaledChildren = scaleChildMaterials(childMaterials, scale)
-        for (c in scaledChildren) {
-            if (m["type"] == "make") {
-                val parentKey = productId.trim()
-                val childKey = (c["product_id"] as? String)?.trim() ?: ""
-                if (Pair(parentKey, childKey) in REAL_BOM_PAIRS) {
-                    log.info("planning: real BOM partial re-plan parent={} child={} demand={} achievable={}", parentKey, childKey, demandId, achievableParentQty)
+        if (isOrSplit) {
+            // OR-relation: variants are independent partial attempts; first-pass
+            // already represents real commits (each variant drew from inventory
+            // independently). A uniform second-pass rescale is incoherent for OR
+            // — it would shrink the succeeding variants to match the failing
+            // ones. Use first-pass results as-is.
+            childPassResults.forEach { cr ->
+                childWos.addAll(cr.wos)
+                if (cr.pegging != null) childPeggingNodes.add(cr.pegging)
+                commitTimes.addAll(cr.cTimes)
+            }
+        } else {
+            // ── Second pass: restore inventory + budget and re-plan at achievable qty ──────
+            // Because scale = capped/demandNetQty, each child is asked for exactly
+            // what it committed in the first pass (minus epsilon), so this pass succeeds.
+            inventory.clear()
+            inventory.addAll(inventorySnap)
+            if (budget != null && budgetSnap != null) {
+                // Reset budget to pre-first-pass state. The second pass's draws will
+                // re-decrement it as it walks; final budget reflects actual final
+                // consumption, not exploratory + commit double-counting.
+                budget.clear()
+                budget.putAll(budgetSnap)
+            }
+            val scale = achievableParentQty / demandNetQty
+            val scaledChildren = scaleChildMaterials(childMaterials, scale)
+            for (c in scaledChildren) {
+                if (m["type"] == "make") {
+                    val parentKey = productId.trim()
+                    val childKey = (c["product_id"] as? String)?.trim() ?: ""
+                    if (Pair(parentKey, childKey) in REAL_BOM_PAIRS) {
+                        log.info("planning: real BOM partial re-plan parent={} child={} demand={} achievable={}", parentKey, childKey, demandId, achievableParentQty)
+                    }
+                }
+                val cReqDt = dateAddDays(reqDt, -leadDays)
+                val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
+                    "quantity" to c["quantity"], "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
+                val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget)
+                childWos.addAll(cWos)
+                if (cPegging != null) childPeggingNodes.add(cPegging)
+                solvedList.forEach { s -> parseDate(s["commit_time"] as? String)?.let { commitTimes.add(it) } }
+            }
+
+            // Move conservation: a move WO has exactly one source-side child whose
+            // committed_qty must equal the parent qty. The first-pass effectiveQty
+            // can round UP (e.g. taken=17.6 → row.quantity=18) and over-state the
+            // achievable cap; the second pass then commits the actual fractional
+            // amount which rounds DOWN at the demand node (committed_qty=17). Clamp
+            // the WO qty to whatever the (single) source-side child actually
+            // committed in the second pass, so parent_qty ≤ child_committed_qty
+            // holds by construction.
+            if (m["type"] == "move") {
+                val childCommit = childPeggingNodes.firstOrNull()?.let {
+                    (it["committed_qty"] as? Number)?.toDouble()
+                }
+                if (childCommit != null && childCommit < achievableParentQty - 1e-6) {
+                    achievableParentQty = floor(childCommit).coerceAtLeast(0.0)
                 }
             }
-            val cReqDt = dateAddDays(reqDt, -leadDays)
-            val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
-                "quantity" to c["quantity"], "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
-            val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget)
-            childWos.addAll(cWos)
-            if (cPegging != null) childPeggingNodes.add(cPegging)
-            solvedList.forEach { s -> parseDate(s["commit_time"] as? String)?.let { commitTimes.add(it) } }
         }
     }
 
