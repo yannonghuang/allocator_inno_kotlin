@@ -60,7 +60,9 @@ class SupplyCompensationTest : FunSpec({
 
     test("redistributes when one demand left allocation unused") {
         // D1 drew 0 of its 30 (alt-divergence). D2 drew its full 30 but had unmet
-        // symbolic need 50. Redistribute D1's unused 30 to D2.
+        // symbolic need 50. Revoke D1's unused 30 (cap → 0) and redistribute
+        // 20 to D2 (its residual need); the remaining 10 has no candidate and
+        // is dropped — total allocation at S shrinks from 60 to 50.
         val matrix = NeedsMatrix(
             byRow = mapOf(
                 "D1" to mapOf(SupplyKey("X", "L1") to 30.0),
@@ -84,16 +86,22 @@ class SupplyCompensationTest : FunSpec({
 
         result.redistributed shouldBe true
         result.supplyCount shouldBe 1
-        result.qtyRedistributed shouldBe (20.0 plusOrMinus 1e-9)  // D2 needed 50, had 30 → +20
+        // qtyRedistributed counts the revoked qty (30 from D1). D2 absorbs 20 of
+        // it as a cap increment; the remaining 10 has no eligible demand and
+        // is dropped on the floor — that's the conservative shrink toward draws.
+        result.qtyRedistributed shouldBe (30.0 plusOrMinus 1e-9)
 
-        // D2's new cap: 30 + 20 = 50. D1's cap unchanged at 30.
+        // D1 revoked from 30 → 0 (drew nothing). D2 increased 30 → 50.
         result.allocations.byRow["D2"]!![SupplyKey("X", "L1")]!! shouldBe (50.0 plusOrMinus 1e-9)
-        result.allocations.byRow["D1"]!![SupplyKey("X", "L1")]!! shouldBe (30.0 plusOrMinus 1e-9)
+        result.allocations.byRow["D1"]!![SupplyKey("X", "L1")]!! shouldBe (0.0 plusOrMinus 1e-9)
     }
 
-    test("does not redistribute when no candidates have unmet need") {
-        // D1 left 20 unused, but D2 already has full need allocation.
-        // Nothing to redistribute to.
+    test("revokes unused even when no candidates need more") {
+        // D1 left 20 unused (drew 10 of 30). D2 cap-bound at full need (alloc=30,
+        // matrix=30, residual=0 → not a candidate). The 20 has nowhere to go —
+        // but D1's cap still shrinks 30 → 10 so total allocation no longer
+        // exceeds what was actually drawn at S. This is the conservative
+        // shrink that keeps total allocation bounded across iterations.
         val matrix = NeedsMatrix(
             byRow = mapOf(
                 "D1" to mapOf(SupplyKey("X", "L1") to 30.0),
@@ -110,11 +118,15 @@ class SupplyCompensationTest : FunSpec({
         )
         val draws = mapOf<Any?, Map<SupplyKey, Double>>(
             "D1" to mapOf(SupplyKey("X", "L1") to 10.0),  // only drew 10 of 30
-            "D2" to mapOf(SupplyKey("X", "L1") to 30.0),  // cap-bound, but matrix says need=30 = alloc → no headroom
+            "D2" to mapOf(SupplyKey("X", "L1") to 30.0),  // cap-bound, no headroom
         )
 
         val result = compensate(alloc, draws, matrix, mapOf<Any?, Int>("D1" to 0, "D2" to 0), mode = "fair")
-        result.redistributed shouldBe false
+        // Revocation IS a redistribution event (cap changed); reported as such.
+        result.redistributed shouldBe true
+        result.qtyRedistributed shouldBe (20.0 plusOrMinus 1e-9)
+        result.allocations.byRow["D1"]!![SupplyKey("X", "L1")]!! shouldBe (10.0 plusOrMinus 1e-9)
+        result.allocations.byRow["D2"]!![SupplyKey("X", "L1")]!! shouldBe (30.0 plusOrMinus 1e-9)
     }
 
     test("priority_first: highest priority gets compensation first") {
@@ -150,10 +162,11 @@ class SupplyCompensationTest : FunSpec({
 
         val result = compensate(alloc, draws, matrix, priorities, mode = "priority_first")
 
-        // Unused = 30. D2 (priority 1) gets 20 (its residual need); D3 gets the rest 10.
+        // D1 revoked from 30 → 0 (drew nothing). Unused 30 redistributed:
+        // D2 (priority 1) gets 20 (its residual need); D3 gets the rest 10.
         result.allocations.byRow["D2"]!![SupplyKey("X", "L1")]!! shouldBe (50.0 plusOrMinus 1e-9)
         result.allocations.byRow["D3"]!![SupplyKey("X", "L1")]!! shouldBe (40.0 plusOrMinus 1e-9)
-        result.allocations.byRow["D1"]!![SupplyKey("X", "L1")]!! shouldBe (30.0 plusOrMinus 1e-9)
+        result.allocations.byRow["D1"]!![SupplyKey("X", "L1")]!! shouldBe (0.0 plusOrMinus 1e-9)
     }
 
     test("proportional: split residual among candidates by share of remaining need") {
@@ -239,8 +252,15 @@ class SupplyCompensationTest : FunSpec({
     }
 
     test("multiple supplies independently compensated in one pass") {
-        // X: D1 unused 10, D2 cap-bound with residual 10. Redistribute 10 to D2.
-        // Y: D1 unused 5, D2 not cap-bound. No redistribution at Y.
+        // X: D1 alloc=10 drew=0 (revoke 10) → D2 cap-bound with residual 10
+        //    receives 10. Net at X: D1 0, D2 20.
+        // Y: D1 alloc=5 drew=0 (revoke 5), D2 alloc=5 drew=3 (revoke 2). No
+        //    candidates (D1's matrix=5 alloc=0 drew=0 cap-bound with residual=5
+        //    is a candidate — gets 5 of the 7 unused). D2 stays at drew=3.
+        //    Wait: D1's residual = matrix(5) - alloc(5) = 0 BEFORE revocation,
+        //    but the partition uses currentAlloc not the post-revoke value, so
+        //    D1 lands in the revoker bucket (drew < alloc) — not a candidate.
+        //    No candidates at Y, all 7 unused dropped. Net at Y: D1 0, D2 3.
         val matrix = NeedsMatrix(
             byRow = mapOf(
                 "D1" to mapOf(SupplyKey("X", "L1") to 10.0, SupplyKey("Y", "L1") to 5.0),
@@ -275,10 +295,12 @@ class SupplyCompensationTest : FunSpec({
             mode = "fair",
         )
 
-        result.supplyCount shouldBe 1  // only X had redistribution
-        result.qtyRedistributed shouldBe (10.0 plusOrMinus 1e-9)
+        result.supplyCount shouldBe 2  // both X and Y had revocations
+        result.qtyRedistributed shouldBe (17.0 plusOrMinus 1e-9)  // X: 10 revoked, Y: 7 revoked
         result.allocations.byRow["D2"]!![SupplyKey("X", "L1")]!! shouldBe (20.0 plusOrMinus 1e-9)  // 10 + 10
-        result.allocations.byRow["D2"]!![SupplyKey("Y", "L1")]!! shouldBe (5.0 plusOrMinus 1e-9)  // unchanged
+        result.allocations.byRow["D2"]!![SupplyKey("Y", "L1")]!! shouldBe (3.0 plusOrMinus 1e-9)   // revoked to drew
+        result.allocations.byRow["D1"]!![SupplyKey("X", "L1")]!! shouldBe (0.0 plusOrMinus 1e-9)   // revoked to 0
+        result.allocations.byRow["D1"]!![SupplyKey("Y", "L1")]!! shouldBe (0.0 plusOrMinus 1e-9)   // revoked to 0
     }
 
     // ── End-to-end: alt-divergence scenario ───────────────────────────────────

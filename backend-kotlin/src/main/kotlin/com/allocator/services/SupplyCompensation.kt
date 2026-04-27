@@ -93,46 +93,75 @@ fun compensate(
         val allocsAtS = allocations.byColumn[supplyKey] ?: continue
         if (allocsAtS.isEmpty()) continue
 
-        val totalAllocated = allocsAtS.values.sum()
-        val totalDrew = allocsAtS.keys.sumOf { d ->
-            actualDraws[d]?.get(supplyKey) ?: 0.0
-        }
-        val unused = totalAllocated - totalDrew
-        if (unused <= 1e-9) continue  // converged at this supply
-
-        // Identify candidates: cap-bound demands with unmet symbolic need.
-        // A demand is "cap-bound" if its actualDraw is at-or-near its allocation
-        // (within float tolerance). It has "unmet need" if its symbolic need
-        // exceeds its current allocation.
+        // Walk demands at this supply, partitioning into:
+        //   - candidates: cap-bound (drew == alloc) AND have residual symbolic need.
+        //                 They get allocation INCREMENTS in step 2.
+        //   - revokers:   under-utilized (drew < alloc). Their unused
+        //                 capacity is RECLAIMED (alloc reduced to actualDraw)
+        //                 and pooled for redistribution.
+        //   - stable:     cap-bound but already at full need, or had alloc=0
+        //                 with no need. Untouched.
+        //
+        // Crucial: revoking unused before redistributing keeps total allocation at
+        // S bounded by the original total (and therefore by supply.qty). Without
+        // revocation the algorithm just inflates allocations across iterations
+        // without ever fully redistributing, producing the bistable rebound we
+        // observed on case-162's first supply-engine run.
         val candidates = mutableListOf<AllocationCandidate>()
+        var unused = 0.0
+        var redistributedAtS = 0.0  // tracks per-iter change for telemetry
+
+        // ── Phase 1: revoke unused from under-utilizers (in-place mutation). ──
         for ((demandId, currentAlloc) in allocsAtS) {
             val drew = actualDraws[demandId]?.get(supplyKey) ?: 0.0
             val capBound = drew >= currentAlloc - 1e-9
-            if (!capBound) continue  // demand didn't fully use its allocation; not a candidate
-
             val symbolicNeed = demandNeedsAtS[demandId] ?: 0.0
             val residualNeed = symbolicNeed - currentAlloc
-            if (residualNeed <= 1e-9) continue  // demand has no headroom — already fully allocated
 
-            candidates.add(AllocationCandidate(
-                demandId = demandId,
-                neededQty = residualNeed,
-                priority = demandPriorities[demandId] ?: 0,
-            ))
+            when {
+                capBound && residualNeed > 1e-9 -> {
+                    // Candidate. Keep current alloc; will receive an increment.
+                    candidates.add(AllocationCandidate(
+                        demandId = demandId,
+                        neededQty = residualNeed,
+                        priority = demandPriorities[demandId] ?: 0,
+                    ))
+                }
+                drew < currentAlloc - 1e-9 -> {
+                    // Under-utilizer. Revoke unused down to actualDraw.
+                    val revoked = currentAlloc - drew
+                    unused += revoked
+                    redistributedAtS += revoked  // this revoked qty IS a redistribution event
+                    val byRow = newByRow.getOrPut(demandId) { mutableMapOf() }
+                    byRow[supplyKey] = drew
+                    val byCol = newByColumn.getOrPut(supplyKey) { mutableMapOf() }
+                    byCol[demandId] = drew
+                }
+                // else: stable — cap-bound with no headroom, or no over-allocation. Leave as-is.
+            }
         }
 
-        if (candidates.isEmpty()) continue  // unused capacity but nobody to give it to
+        if (candidates.isEmpty() || unused <= 1e-9) {
+            // Either no candidates to receive (unused gets dropped on the floor — by
+            // construction this is OK; allocation just shrinks toward actualDraws,
+            // which is conservative), or no unused capacity to redistribute.
+            if (redistributedAtS > 1e-9) {
+                supplyCount++
+                qtyRedistributed += redistributedAtS
+            }
+            continue
+        }
 
-        // Apply policy to the residual slice. Output: incremental qty per demand.
+        // ── Phase 2: redistribute revoked capacity to candidates by policy. ──
         val increment = allocate(candidates, unused, mode)
-        var redistributedAtS = 0.0
         for ((demandId, addQty) in increment) {
             if (addQty <= 1e-9) continue
             val byRow = newByRow.getOrPut(demandId) { mutableMapOf() }
             byRow[supplyKey] = (byRow[supplyKey] ?: 0.0) + addQty
             val byCol = newByColumn.getOrPut(supplyKey) { mutableMapOf() }
             byCol[demandId] = (byCol[demandId] ?: 0.0) + addQty
-            redistributedAtS += addQty
+            // Don't double-count for telemetry — the revoke step already added `revoked`
+            // to redistributedAtS, and `Σ addQty ≤ unused = Σ revoked`.
         }
         if (redistributedAtS > 1e-9) {
             supplyCount++
