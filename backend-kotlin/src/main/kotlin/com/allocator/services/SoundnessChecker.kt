@@ -439,10 +439,16 @@ private class WalkContext(
         }
 
         // R4: child qty must equal parent_qty / rate (within tolerance).
+        // Use the child's committed_qty (not quantity) because under shortage the
+        // engine emits placeholder WOs with quantity=0 and children that retain
+        // the originally-requested quantity for diagnostic purposes — but
+        // committed_qty correctly tracks what was actually delivered through
+        // this path. Both match parent.quantity / rate when the rule holds.
         val parentQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
         for (childNode in woChildren.filter { it["type"] == "demand" }) {
             val childPid = (childNode["product_id"] as? String)?.trim() ?: continue
-            val childQty = (childNode["quantity"] as? Number)?.toDouble() ?: 0.0
+            val childCommitted = (childNode["committed_qty"] as? Number)?.toDouble()
+                ?: (childNode["quantity"] as? Number)?.toDouble() ?: 0.0
             val bomRow = parentBomRows.firstOrNull { (it["child_id"] as? String)?.trim() == childPid }
             if (bomRow == null) {
                 violations.add(Violation(
@@ -455,13 +461,13 @@ private class WalkContext(
             val rate = (bomRow["rate"] as? Number)?.toDouble() ?: 1.0
             // Spec: consumption of component i is quantity / rate_i.
             val expectedChildQty = if (rate > 0) parentQty / rate else 0.0
-            if (abs(childQty - expectedChildQty) > config.tolerance && abs(childQty - expectedChildQty) > expectedChildQty * 0.01) {
+            if (abs(childCommitted - expectedChildQty) > config.tolerance && abs(childCommitted - expectedChildQty) > expectedChildQty * 0.01) {
                 violations.add(Violation(
                     rule = "R4_qty_propagation",
                     nodePath = path,
-                    message = "Make WO child pid=$childPid qty=$childQty doesn't match parent_qty/rate = $expectedChildQty (parent=$parentQty, rate=$rate).",
+                    message = "Make WO child pid=$childPid committed_qty=$childCommitted doesn't match parent_qty/rate = $expectedChildQty (parent=$parentQty, rate=$rate).",
                     expected = expectedChildQty,
-                    actual = childQty,
+                    actual = childCommitted,
                 ))
             }
         }
@@ -509,20 +515,24 @@ private class WalkContext(
             return
         }
 
-        // R4: qty conserved at move WOs (parent qty == single child qty).
+        // R4: qty conserved at move WOs (parent qty == single child committed_qty).
+        // Same rationale as the make case: child's committed_qty is the
+        // delivered amount through this edge; quantity is the requested amount
+        // (which under shortage may differ).
         val parentQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
         @Suppress("UNCHECKED_CAST")
         val children = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
         val demandChildren = children.filter { it["type"] == "demand" }
         for (childNode in demandChildren) {
-            val childQty = (childNode["quantity"] as? Number)?.toDouble() ?: 0.0
-            if (abs(childQty - parentQty) > config.tolerance) {
+            val childCommitted = (childNode["committed_qty"] as? Number)?.toDouble()
+                ?: (childNode["quantity"] as? Number)?.toDouble() ?: 0.0
+            if (abs(childCommitted - parentQty) > config.tolerance) {
                 violations.add(Violation(
                     rule = "R4_qty_conservation_move",
                     nodePath = path,
-                    message = "Move WO child qty=$childQty doesn't equal parent qty=$parentQty.",
+                    message = "Move WO child committed_qty=$childCommitted doesn't equal parent qty=$parentQty.",
                     expected = parentQty,
-                    actual = childQty,
+                    actual = childCommitted,
                 ))
             }
         }
