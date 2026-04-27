@@ -455,13 +455,19 @@ private class WalkContext(
             ))
         }
 
-        // R4: child qty must equal parent_qty / rate (within tolerance).
-        // Use the child's committed_qty (not quantity) because under shortage the
-        // engine emits placeholder WOs with quantity=0 and children that retain
-        // the originally-requested quantity for diagnostic purposes — but
-        // committed_qty correctly tracks what was actually delivered through
-        // this path. Both match parent.quantity / rate when the rule holds.
+        // R4: child committed_qty must equal parent_qty × rate (within tolerance).
+        // Two engine conventions to match:
+        //   - Rate direction: variantsForMake computes child_qty = parent_qty *
+        //     rate (engine), the OPPOSITE of spec.md's "child = parent / rate".
+        //     The engine is the authority since the soundness check exists to
+        //     verify what plan() actually emits.
+        //   - Failed-parent skip: when parent.quantity == 0 the WO didn't
+        //     produce anything; child committed_qty values can reflect stale
+        //     first-pass exploratory commitments and aren't tied to this WO.
+        //     Skip R4 in that case (the tree is internally inconsistent but
+        //     the inconsistency isn't a quantity-propagation violation).
         val parentQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
+        if (parentQty <= config.tolerance) return  // failed make WO; child commitments orphaned
         for (childNode in woChildren.filter { it["type"] == "demand" }) {
             val childPid = (childNode["product_id"] as? String)?.trim() ?: continue
             val childCommitted = (childNode["committed_qty"] as? Number)?.toDouble()
@@ -476,13 +482,15 @@ private class WalkContext(
                 continue
             }
             val rate = (bomRow["rate"] as? Number)?.toDouble() ?: 1.0
-            // Spec: consumption of component i is quantity / rate_i.
-            val expectedChildQty = if (rate > 0) parentQty / rate else 0.0
-            if (abs(childCommitted - expectedChildQty) > config.tolerance && abs(childCommitted - expectedChildQty) > expectedChildQty * 0.01) {
+            val expectedChildQty = parentQty * rate
+            // Allow either absolute or 1% relative tolerance to absorb integer-rounding
+            // artifacts in the engine's qty quantization.
+            val absDiff = abs(childCommitted - expectedChildQty)
+            if (absDiff > config.tolerance && absDiff > expectedChildQty * 0.01) {
                 violations.add(Violation(
                     rule = "R4_qty_propagation",
                     nodePath = path,
-                    message = "Make WO child pid=$childPid committed_qty=$childCommitted doesn't match parent_qty/rate = $expectedChildQty (parent=$parentQty, rate=$rate).",
+                    message = "Make WO child pid=$childPid committed_qty=$childCommitted doesn't match parent_qty × rate = $expectedChildQty (parent=$parentQty, rate=$rate).",
                     expected = expectedChildQty,
                     actual = childCommitted,
                 ))

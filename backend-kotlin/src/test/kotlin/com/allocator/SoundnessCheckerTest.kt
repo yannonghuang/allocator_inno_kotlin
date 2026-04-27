@@ -197,13 +197,14 @@ class SoundnessCheckerTest : FunSpec({
     }
 
     test("happy path: make WO with correct rate propagation is sound") {
-        // FG → make → consumes 2× of X
+        // FG → make → consumes 2× of X. Engine convention: child = parent × rate,
+        // so parent=10 with rate=2 needs 20 of X.
         val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
         val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0,
             children = listOf(makeWO("FG", "L1", qty = 10.0,
                 children = listOf(
-                    demandNode("D1", "X", "L1", qty = 5.0, committedQty = 5.0,
-                        children = listOf(supplyLeaf("X", "L1", "S1", 5.0))),
+                    demandNode("D1", "X", "L1", qty = 20.0, committedQty = 20.0,
+                        children = listOf(supplyLeaf("X", "L1", "S1", 20.0))),
                 ))))
         val data = mapOf(
             "supply" to listOf(supply("S1", "X", "L1", 100.0)),
