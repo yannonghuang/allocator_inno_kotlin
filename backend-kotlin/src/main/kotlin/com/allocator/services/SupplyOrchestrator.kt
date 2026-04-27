@@ -146,6 +146,25 @@ internal fun runV2Supply(
             demands, inventory, data, config, overrideIndex, allocations, iterCb,
         )
 
+        // Capture matrix misses. runInitialCommit now reports actualDraws via
+        // inventory delta, so any (D, S) pair where D drew from S without an
+        // allocation is visible. Patch those into `allocations` at the drawn
+        // qty, so subsequent iters' commits and Phase 3c run with proper caps
+        // and the demand participates in supply-level allocation instead of
+        // racing through plan() unconstrained.
+        //
+        // The patch is at-or-above the supply.qty bound: total per-S
+        // allocation post-patch ≤ total inventory drained from S in this iter
+        // ≤ supply.qty. compensate's revoke step still bounds the loop.
+        val (patchedAllocs, missCount, missQty) = patchMatrixMisses(allocations, commit.actualDraws)
+        if (missCount > 0) {
+            log.warn(
+                "supply iter {}: matrix-miss caught — {} (demand, supply) pair(s) totaling {} qty bypassed Phase 2; patching caps for next iter",
+                iterations, missCount, "%.2f".format(missQty),
+            )
+            allocations = patchedAllocs
+        }
+
         // 3b — compensation.
         val comp = compensate(allocations, commit.actualDraws, matrix, priorities, mode)
 
@@ -247,6 +266,51 @@ internal fun runV2Supply(
         converged = converged,
         supplyLevelAllocations = supplyLevelAllocations,
     )
+}
+
+/**
+ * Detect (demand, supply) pairs that drew from a supply without a Phase 2
+ * allocation — i.e., the matrix walker missed them, so plan() ran with no
+ * cap for that pair and FIFO-style competition resumed.
+ *
+ * Patches `allocations` with the discovered draw qty for each missed pair.
+ * Returns the patched allocations plus a (count, qty) summary for telemetry.
+ *
+ * After patching, every demand that physically drew from a supply has an
+ * explicit cap. The next iter's commit (and ultimately Phase 3c) will run
+ * plan() with that cap in budget — no more unconstrained draws.
+ */
+private fun patchMatrixMisses(
+    allocations: SupplyAllocations,
+    actualDraws: Map<Any?, Map<SupplyKey, Double>>,
+): Triple<SupplyAllocations, Int, Double> {
+    var missCount = 0
+    var missQty = 0.0
+    val newByRow = allocations.byRow.mapValues { (_, m) -> m.toMutableMap() }.toMutableMap()
+    val newByColumn = allocations.byColumn.mapValues { (_, m) -> m.toMutableMap() }.toMutableMap()
+
+    for ((demandId, draws) in actualDraws) {
+        val rowAllocs = newByRow[demandId]
+        for ((sk, drew) in draws) {
+            if (drew <= 1e-9) continue
+            val currentAlloc = rowAllocs?.get(sk) ?: 0.0
+            // Matrix miss = drew > current cap. Either the demand wasn't in
+            // the matrix (rowAllocs == null) or the matrix had no entry for
+            // this supply (currentAlloc == 0) but plan() drew via inventory
+            // anyway. Either way, the cap needs to rise to at least drew so
+            // the next iter recognizes the demand as a participant at S.
+            if (drew > currentAlloc + 1e-9) {
+                val byRow = newByRow.getOrPut(demandId) { mutableMapOf() }
+                byRow[sk] = drew
+                val byCol = newByColumn.getOrPut(sk) { mutableMapOf() }
+                byCol[demandId] = drew
+                missQty += drew - currentAlloc
+                missCount++
+            }
+        }
+    }
+
+    return Triple(SupplyAllocations(byRow = newByRow, byColumn = newByColumn), missCount, missQty)
 }
 
 /**

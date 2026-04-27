@@ -77,6 +77,17 @@ fun runInitialCommit(
     val actualDraws = mutableMapOf<Any?, Map<SupplyKey, Double>>()
     val total = demands.size
 
+    // Build the supply key set once. Used to filter inventory deltas down to
+    // supply-level keys (intermediate inventory consumption isn't tracked here).
+    val supplyKeys: Set<SupplyKey> = (data["supply"] ?: emptyList())
+        .filter { ((it["qty"] as? Number)?.toDouble() ?: 0.0) > 0 }
+        .mapNotNull { row ->
+            val pid = (row["product_id"] as? String)?.trim() ?: return@mapNotNull null
+            val lid = (row["location_id"] as? String)?.trim() ?: return@mapNotNull null
+            if (pid.isBlank() || lid.isBlank()) null else SupplyKey(pid, lid)
+        }
+        .toSet()
+
     demands.forEachIndexed { i, d ->
         val demandId = d["demand_id"]
         val reqStr = d["request_due_time"] as? String ?: d["request_time"] as? String
@@ -88,6 +99,16 @@ fun runInitialCommit(
         val budget: MutableMap<String, Double> = initialAllocation
             .mapKeys { (sk, _) -> sk.toString() }
             .toMutableMap()
+
+        // Snapshot inventory totals per supply key BEFORE plan() so we can
+        // compute this demand's actual consumption regardless of whether the
+        // matrix knew about each supply. Matrix misses (demand draws from S
+        // without an allocation) are caught here as inventory deltas, not as
+        // budget deltas — without this, plan() runs unconstrained for the
+        // missed (D, S) pair and the orchestrator never learns about it,
+        // re-instating the FIFO-style competition the supply engine is meant
+        // to eliminate.
+        val invBefore = computeInventoryByKey(inventory, supplyKeys)
 
         val (solvedList, wos, peggingNode) = plan(
             d, inventory, data, reqDt,
@@ -103,12 +124,14 @@ fun runInitialCommit(
             planningPegging.add(mapOf("demand_id" to demandId, "tree" to peggingNode))
         }
 
-        // Compute actual draws from before/after budget delta.
+        // Compute draws via inventory delta — captures both matrix-known
+        // supplies (where alloc - remaining matches) and matrix-miss supplies
+        // (where the budget map had no entry, so plan() drew unconstrained).
+        val invAfter = computeInventoryByKey(inventory, supplyKeys)
         val draws = mutableMapOf<SupplyKey, Double>()
-        for ((supplyKey, initial) in initialAllocation) {
-            val remaining = budget[supplyKey.toString()] ?: 0.0
-            val drew = (initial - remaining).coerceAtLeast(0.0)
-            if (drew > 1e-12) draws[supplyKey] = drew
+        for (sk in supplyKeys) {
+            val drew = ((invBefore[sk] ?: 0.0) - (invAfter[sk] ?: 0.0)).coerceAtLeast(0.0)
+            if (drew > 1e-12) draws[sk] = drew
         }
         if (draws.isNotEmpty()) actualDraws[demandId] = draws
 
@@ -116,4 +139,21 @@ fun runInitialCommit(
     }
 
     return InitialCommitResult(committedDemands, workOrders, planningPegging, actualDraws)
+}
+
+/** Sum inventory qty per (pid, lid), restricted to the given supply key set. */
+private fun computeInventoryByKey(
+    inventory: List<Map<String, Any?>>,
+    supplyKeys: Set<SupplyKey>,
+): Map<SupplyKey, Double> {
+    val result = mutableMapOf<SupplyKey, Double>()
+    for (b in inventory) {
+        val pid = (b["product_id"] as? String)?.trim() ?: continue
+        val lid = (b["location_id"] as? String)?.trim() ?: continue
+        val sk = SupplyKey(pid, lid)
+        if (sk !in supplyKeys) continue
+        val qty = (b["qty"] as? Number)?.toDouble() ?: continue
+        result.merge(sk, qty, Double::plus)
+    }
+    return result
 }
