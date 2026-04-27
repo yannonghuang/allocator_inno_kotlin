@@ -82,13 +82,46 @@ suspend fun llmChat(
     maxTokens: Int = 512,
     temperature: Double = 0.2,
     model: String? = null,
+    /**
+     * Per-call provider override. When null, uses [AppConfig.llmProvider] (the global default
+     * driven by `LLM_PROVIDER` env). Set to pin a specific call site to a fixed provider
+     * regardless of the global flag — used by /material-impact-assessment and /planning-copilot
+     * to stay on OpenAI even when the global provider is openclaw or anthropic.
+     */
+    provider: String? = null,
 ): String {
-    val resolvedModel = model ?: config.assessmentModel
-    return when (config.llmProvider) {
-        "openai" -> openAiChat(systemPrompt, messages, maxTokens, temperature, resolvedModel)
-        "anthropic" -> anthropicChat(systemPrompt, messages, maxTokens, temperature, resolvedModel)
-        else -> openClawChat(systemPrompt, messages, maxTokens, temperature, resolvedModel)
+    val effectiveProvider = (provider ?: config.llmProvider).lowercase()
+    val resolvedModel = model ?: defaultModelForProvider(effectiveProvider)
+    return try {
+        when (effectiveProvider) {
+            "openai" -> openAiChat(systemPrompt, messages, maxTokens, temperature, resolvedModel)
+            "anthropic" -> anthropicChat(systemPrompt, messages, maxTokens, temperature, resolvedModel)
+            else -> openClawChat(systemPrompt, messages, maxTokens, temperature, resolvedModel)
+        }
+    } catch (e: java.nio.channels.UnresolvedAddressException) {
+        // UnresolvedAddressException extends IllegalArgumentException (JDK quirk),
+        // which would otherwise surface as a misleading 400 Bad request via StatusPages.
+        throw IllegalStateException(
+            "LLM provider host unresolved (provider=$effectiveProvider). " +
+                "Check OPENCLAW_URL / network reachability.",
+            e,
+        )
+    } catch (e: java.net.ConnectException) {
+        throw IllegalStateException(
+            "LLM provider connection refused (provider=$effectiveProvider): ${e.message}",
+            e,
+        )
     }
+}
+
+private fun defaultModelForProvider(provider: String): String = when (provider) {
+    // When the caller pins a provider, prefer ASSESSMENT_MODEL only if it matches that
+    // provider's model id space. The global config.assessmentModel was resolved against
+    // config.llmProvider at startup, so it's only safe to reuse when the providers match.
+    config.llmProvider -> config.assessmentModel
+    "openai" -> "gpt-4o-mini"
+    "anthropic" -> "claude-haiku-4-5-20251001"
+    else -> "openclaw"
 }
 
 private suspend fun openClawChat(

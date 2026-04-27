@@ -161,6 +161,16 @@ data class ConsolidationConfig(
     val enabled: Boolean = false,
     val periodDays: Int = 365,
     val allocationMode: String = "fair",  // "proportional" | "priority_first" | "fair"
+    /**
+     * Which consolidation engine to use when [enabled].
+     *   "leaf-legacy" — the original v2 mergeGroups + per-group consolidation
+     *                   pipeline (today's default).
+     *   "supply"      — supply-level allocation: every inventory-bearing node
+     *                   gets a column, allocation policy fires once per supply,
+     *                   compensation redistributes unused. See
+     *                   docs/supply-level-consolidation.md.
+     */
+    val engine: String = "leaf-legacy",
 )
 
 /** Output of runConsolidation(). */
@@ -178,13 +188,17 @@ fun parseConsolidationConfig(config: Map<String, Any?>?): ConsolidationConfig {
     @Suppress("UNCHECKED_CAST")
     val m = sub as? Map<String, Any?> ?: return ConsolidationConfig()
     val enabled = m["enabled"] as? Boolean ?: false
-    val periodDays = ((m["period_days"] as? Number)?.toInt() ?: 365).coerceIn(1, 365)
+    val periodDays = ((m["period_days"] as? Number)?.toInt() ?: 365).coerceIn(0, 365)
     val allocationMode = when (m["allocation_mode"]?.toString()) {
         "proportional"   -> "proportional"
         "priority_first" -> "priority_first"
         else             -> "fair"
     }
-    return ConsolidationConfig(enabled, periodDays, allocationMode)
+    val engine = when (m["engine"]?.toString()) {
+        "supply" -> "supply"
+        else     -> "leaf-legacy"  // includes null and any unknown value
+    }
+    return ConsolidationConfig(enabled, periodDays, allocationMode, engine)
 }
 
 // ── Time bucketing ────────────────────────────────────────────────────────────
@@ -192,9 +206,15 @@ fun parseConsolidationConfig(config: Map<String, Any?>?): ConsolidationConfig {
 /**
  * Floor a date to the nearest epoch-anchored period boundary.
  * Buckets are deterministic and period-aligned regardless of calendar weeks.
+ *
+ * periodDays == 0 is a sentinel meaning "single bucket": all dates collapse to
+ * LocalDate.EPOCH so every demand lands in the same group regardless of its
+ * due date. Use this when you want consolidation to merge across the entire
+ * planning horizon without temporal fragmentation.
  */
 fun timeBucket(date: LocalDate?, periodDays: Int): LocalDate {
     if (date == null) return LocalDate.EPOCH
+    if (periodDays <= 0) return LocalDate.EPOCH
     val epochDay = date.toEpochDay()
     val bucketEpochDay = (epochDay / periodDays) * periodDays
     return LocalDate.ofEpochDay(bucketEpochDay)
@@ -571,7 +591,14 @@ fun runConsolidation(
                 )
             }.toMutableList()
             val (committed, wos, pegging) = planFn(syntheticDemand, invCopy, data, group.timeBucket, 500, emptySet(), planConfig, null)
-            val producedQty = committed.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
+            // Exclude hard-failure rows (no_methods / no_preferred_method / depth_limit /
+            // child_failed:*) from producedQty — those represent unmet demand, not real production.
+            // Counting them as produced would inject phantom synthetic supply for products that
+            // actually have nothing to offer (e.g. raw materials with no make method after their
+            // parent's consolidation drained the inventory).
+            val producedQty = committed
+                .filterNot { isHardPlanningFailure(it["commit_reason"] as? String) }
+                .sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
             // Mark WOs and add
             wos.forEach { wo ->
                 consolidatedWOs.add(wo + mapOf("consolidated" to false))
@@ -625,7 +652,10 @@ fun runConsolidation(
                 )
             }.toMutableList()
             val (committed, wos, pegging) = planFn(syntheticDemand, invCopy, data, group.timeBucket, 500, emptySet(), planConfig, null)
-            val producedQty = committed.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
+            // Exclude hard-failure rows from producedQty — see passthrough branch for rationale.
+            val producedQty = committed
+                .filterNot { isHardPlanningFailure(it["commit_reason"] as? String) }
+                .sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
 
             // Check for a component_split override before falling back to engine split policy
             val splitKey = "${group.productId}|${group.locationId}|${group.timeBucket}"

@@ -1446,7 +1446,13 @@ private suspend fun runPlanBackground(
         val progressCb: (Map<String, Any?>) -> Unit = { p ->
             planJobs[jobId]?.let { job ->
                 if (job["status"] == "running") {
-                    job["progress"] = mapOf("current" to (p["current"] ?: 0), "total" to total)
+                    val payload = mutableMapOf<String, Any?>(
+                        "current" to (p["current"] ?: 0),
+                        "total" to total,
+                    )
+                    p["iteration"]?.let { payload["iteration"] = it }
+                    p["iterations_max"]?.let { payload["iterations_max"] = it }
+                    job["progress"] = payload
                 }
             }
         }
@@ -1691,11 +1697,16 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
         }
         putJsonObject("consolidation") {
             put("enabled",         consolidation["enabled"]      as? Boolean ?: false)
-            put("period_days",     ((consolidation["period_days"] as? Number)?.toInt() ?: 7).coerceIn(1, 365))
+            // 0 = single-bucket sentinel (collapses every demand into LocalDate.EPOCH); legal value, do NOT clamp up to 1.
+            put("period_days",     ((consolidation["period_days"] as? Number)?.toInt() ?: 0).coerceIn(0, 365))
             put("allocation_mode", when (consolidation["allocation_mode"]?.toString()) {
                 "proportional"   -> "proportional"
                 "priority_first" -> "priority_first"
                 else             -> "fair"
+            })
+            put("engine", when (consolidation["engine"]?.toString()) {
+                "supply" -> "supply"
+                else     -> "leaf-legacy"
             })
         }
     }

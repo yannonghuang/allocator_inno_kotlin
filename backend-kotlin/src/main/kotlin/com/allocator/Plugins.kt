@@ -61,7 +61,14 @@ fun Application.configurePlugins() {
     // Global error handling
     install(StatusPages) {
         exception<IllegalArgumentException> { call, cause ->
-            call.respond(HttpStatusCode.BadRequest, mapOf("detail" to (cause.message ?: "Bad request")))
+            // Log the full stack trace so callers see the source even when the
+            // exception's message is null (bare "Bad request").
+            call.application.log.warn(
+                "400 ${call.request.local.method.value} ${call.request.local.uri} -> ${cause::class.simpleName}: ${cause.message}",
+                cause,
+            )
+            val detail = cause.message ?: "Bad request (${cause::class.simpleName})"
+            call.respond(HttpStatusCode.BadRequest, mapOf("detail" to detail))
         }
         exception<NoSuchElementException> { call, cause ->
             call.respond(HttpStatusCode.NotFound, mapOf("detail" to (cause.message ?: "Not found")))
