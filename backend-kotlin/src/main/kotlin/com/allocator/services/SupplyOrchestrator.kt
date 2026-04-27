@@ -152,7 +152,7 @@ internal fun runV2Supply(
         val dropped = comp.qtyRedistributed - comp.qtyAbsorbed
         if (iter > 0 && progressFraction < CONVERGENCE_PROGRESS_THRESHOLD) {
             log.info(
-                "supply iter {}: converged (progress {}% below {}% threshold; over-production {} qty across {} supply(ies); {} absorbed by candidates, {} dropped)",
+                "supply iter {}: converged (progress {}% below {}% threshold; over-allocation {} qty across {} supply(ies); {} absorbed by candidates, {} dropped)",
                 iterations,
                 "%.2f".format(progressFraction * 100),
                 "%.0f".format(CONVERGENCE_PROGRESS_THRESHOLD * 100),
@@ -167,7 +167,7 @@ internal fun runV2Supply(
         }
 
         log.info(
-            "supply iter {}: over-production {} qty across {} supply(ies) ({} absorbed by candidates, {} dropped); refining caps for next iter",
+            "supply iter {}: over-allocation {} qty across {} supply(ies) ({} absorbed by candidates, {} dropped); refining caps for next iter",
             iterations,
             "%.2f".format(comp.qtyRedistributed),
             comp.supplyCount,
@@ -185,8 +185,30 @@ internal fun runV2Supply(
         )
     }
 
+    // Phase 3c — final commit with converged caps.
+    //
+    // The in-loop `commit` reflects iter K's pre-compensation caps. When the
+    // loop exits via the relative-progress threshold, comp.allocations differs
+    // from the caps that produced `commit.workOrders` by up to qtyRedistributed
+    // (e.g. ~179k qty on case 169). Without this pass, WOs would encode iter
+    // K's input caps while supplyLevelAllocations encodes iter K's output caps.
+    //
+    // For the "no redistribution" exit path this is a no-op (allocations
+    // unchanged → identical commit). For the threshold-break path it
+    // re-resolves WOs against the converged caps so all downstream artifacts
+    // describe the same state.
+    inventory.clear()
+    for (b in initialInventory) inventory.add(b.toMutableMap())
+    commit = runInitialCommit(
+        demands, inventory, data, config, overrideIndex, allocations, progressCallback,
+    )
+    log.info(
+        "supply Phase 3c (final commit): produced {} WOs from {} demand(s) under converged caps",
+        commit.workOrders.size, demands.size,
+    )
+
     // Phase E — merge per-demand WOs into consolidated WOs.
-    val mergedWOs = synthesizeConsolidatedWOs(commit!!.workOrders, priorities, mode)
+    val mergedWOs = synthesizeConsolidatedWOs(commit.workOrders, priorities, mode)
     log.info(
         "supply Phase E (WO synthesis): {} per-demand WOs merged into {} (consolidated + passthrough) WO(s)",
         commit.workOrders.size, mergedWOs.size,

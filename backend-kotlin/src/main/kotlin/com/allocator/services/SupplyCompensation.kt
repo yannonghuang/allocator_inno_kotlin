@@ -43,9 +43,12 @@ data class CompensationResult(
     /** Number of (supply) columns where redistribution happened — for telemetry. */
     val supplyCount: Int,
     /**
-     * Total qty revoked from under-utilizers across all supplies — equivalent
-     * to the leaf engine's "over-production" metric (allocated minus actually
-     * drawn, summed). Always equal to `qtyAbsorbed + qtyDropped`.
+     * Total qty revoked from under-utilizers across all supplies — i.e., the
+     * total over-allocation discovered this pass (alloc minus actualDraw,
+     * summed where positive). The leaf engine reports the analogous quantity
+     * as "over-production"; in this regime caps are bounded by supply.qty so
+     * physical over-production cannot occur — only over-allocation, which
+     * compensation reclaims. Always equal to `qtyAbsorbed + qtyDropped`.
      */
     val qtyRedistributed: Double,
     /**
