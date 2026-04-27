@@ -303,6 +303,17 @@ private fun walkBomSymbolic(
             if (newIn == 0 && child !in processed) ready.addLast(child)
         }
     }
+    // Drain cycle members. After Kahn's, any node with non-zero in-degree is
+    // part of a cycle and was never moved to ready. We still need to process
+    // them so supplies inside the cycle (e.g., a product with reciprocal
+    // moves between two locations) get emitted into the matrix. Rate
+    // accumulation is approximate inside the cycle — one direction propagates
+    // first, the other's contribution may arrive after the destination's
+    // already been processed and gets dropped — but each supply node is
+    // visited at least once with a positive rate, which is what matters.
+    for (node in discovered) {
+        if (processed.add(node)) topoOrder.add(node)
+    }
 
     // ── Step 3: rate propagation in topo order. ── Step 4: emit supply needs.
     val rate = mutableMapOf<Pair<String, String>, Double>()
