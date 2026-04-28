@@ -100,12 +100,16 @@ data class SoundnessReport(
  * @param demands the case's input demand rows.
  * @param data full case data (bom, method_make, method_move, method_buy, supply).
  *        Needed to validate WOs against their declared BOM/method rows.
+ * @param workOrders the run's `work_orders` field. Used to validate consumption
+ *        of synthetic `consolidated_<pid>_<lid>` supply buckets against the
+ *        producing WOs at that (pid, lid). Pass an empty list to skip R7c.
  */
 fun checkRunSoundness(
     planningPegging: List<Map<String, Any?>>,
     demands: List<Map<String, Any?>>,
     data: Map<String, List<Map<String, Any?>>>,
     config: SoundnessConfig = SoundnessConfig(),
+    workOrders: List<Map<String, Any?>> = emptyList(),
 ): SoundnessReport {
     // Index demands by id and lookup tables for rule checks.
     val demandById: Map<String, Map<String, Any?>> = demands.associateBy { it["demand_id"]?.toString() ?: "" }
@@ -114,6 +118,20 @@ fun checkRunSoundness(
     val methodMoves = data["method_move"] ?: emptyList()
     val supplies = data["supply"] ?: emptyList()
     val supplyById: Map<String, Map<String, Any?>> = supplies.associateBy { it["supply_id"]?.toString() ?: "" }
+
+    // Total WO production at each (pid, lid). Used by R7c to bound consumption
+    // of the synthetic `consolidated_<pid>_<lid>` inventory bucket emitted by
+    // the leaf-legacy consolidator (Phase 2). One synthetic bucket aggregates
+    // all production at a component, so the cap is Σ over WOs at (pid, lid).
+    val woQtyByComponent = mutableMapOf<String, Double>()
+    for (wo in workOrders) {
+        val pid = (wo["product_id"] as? String)?.trim() ?: continue
+        val lid = (wo["location_id"] as? String)?.trim() ?: continue
+        val qty = (wo["quantity"] as? Number)?.toDouble() ?: 0.0
+        if (pid.isBlank() || lid.isBlank() || qty <= 0) continue
+        val key = "$pid|$lid"
+        woQtyByComponent[key] = (woQtyByComponent[key] ?: 0.0) + qty
+    }
 
     // For each demand_id, take the LAST matching pegging tree (matches the
     // frontend's lookup logic at _CaseSectionPage.tsx:7199 — main planning tree
@@ -134,6 +152,7 @@ fun checkRunSoundness(
     val demandReports = mutableListOf<DemandSoundness>()
     val perDemandSupplyConsumption = mutableMapOf<String, Double>()  // supply_id → total qty (across leaves of one demand)
     val crossDemandSupplyConsumption = mutableMapOf<String, Double>()  // supply_id → total qty (across all demands)
+    val crossDemandSyntheticConsumption = mutableMapOf<String, Double>()  // "$pid|$lid" → total qty drawn from synthetic consolidated buckets
 
     for ((demandId, demandRow) in demandById) {
         val tree = treeByDemand[demandId]
@@ -175,6 +194,9 @@ fun checkRunSoundness(
             crossDemandSupplyConsumption.merge(supplyId, qty, Double::plus)
         }
         perDemandSupplyConsumption.putAll(ctx.supplyConsumption)
+        for ((compKey, qty) in ctx.syntheticConsumption) {
+            crossDemandSyntheticConsumption.merge(compKey, qty, Double::plus)
+        }
 
         demandReports.add(DemandSoundness(
             demandId = demandId,
@@ -197,6 +219,29 @@ fun checkRunSoundness(
                 expected = available,
                 actual = totalConsumed,
             ))
+        }
+    }
+
+    // ── R7c synthetic-bucket bound ────────────────────────────────────────────
+    // Each `consolidated_<pid>_<lid>` synthetic inventory bucket aggregates the
+    // production of all WOs at (pid, lid). Cross-demand consumption from that
+    // bucket must not exceed total WO output at the same (pid, lid). Runtime's
+    // consumeFromInventory clamps takes to bucket.qty, so this bound holds by
+    // construction in normal operation; R7c catches bugs that bypass that path
+    // (e.g. pegging-tree edits, save-path corruption, wrong producer attribution).
+    // Skipped (no violation) when workOrders is empty — caller didn't pass them.
+    if (woQtyByComponent.isNotEmpty()) {
+        for ((componentKey, totalConsumed) in crossDemandSyntheticConsumption) {
+            val produced = woQtyByComponent[componentKey] ?: 0.0
+            if (totalConsumed > produced + config.tolerance) {
+                crossViolations.add(Violation(
+                    rule = "R7c_consolidated_overconsumption",
+                    nodePath = "synthetic:$componentKey",
+                    message = "Σ consumption from synthetic 'consolidated_$componentKey' bucket exceeds total WO production at $componentKey.",
+                    expected = produced,
+                    actual = totalConsumed,
+                ))
+            }
         }
     }
 
@@ -228,6 +273,8 @@ private class WalkContext(
     val violations = mutableListOf<Violation>()
     /** supply_id → qty consumed across all leaves of this demand's tree. */
     val supplyConsumption = mutableMapOf<String, Double>()
+    /** "$pid|$lid" → qty consumed via synthetic `consolidated_<pid>_<lid>` buckets. */
+    val syntheticConsumption = mutableMapOf<String, Double>()
 
     fun walkRoot(tree: Map<String, Any?>) {
         // R1 — root must be a demand node matching the demand row.
@@ -305,6 +352,21 @@ private class WalkContext(
                 nodePath = path,
                 message = "Supply leaf has no supply_id.",
             ))
+            return
+        }
+        // Synthetic bucket emitted by the leaf-legacy consolidator (Phase 2 emits
+        // one "consolidated_<pid>_<lid>" inventory bucket per produced component).
+        // These aren't physical supplies, so R7a's "exists in supplies table"
+        // check doesn't apply. But we still want a bound: total consumption of
+        // a synthetic bucket must not exceed total WO production at (pid, lid).
+        // Accumulate per (pid, lid) here; the R7c cross-demand check validates
+        // against woQtyByComponent at the end of the run.
+        if (supplyId.startsWith("consolidated_")) {
+            val pid = (node["product_id"] as? String)?.trim()
+            val lid = (node["location_id"] as? String)?.trim()
+            if (!pid.isNullOrBlank() && !lid.isNullOrBlank()) {
+                syntheticConsumption.merge("$pid|$lid", qty, Double::plus)
+            }
             return
         }
         val supply = supplyById[supplyId]

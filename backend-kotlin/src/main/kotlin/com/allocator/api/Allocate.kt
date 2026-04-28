@@ -826,6 +826,8 @@ fun Routing.allocateRoutes() {
                 ?: throw IllegalStateException("Plan run result is not a JSON object")
             @Suppress("UNCHECKED_CAST")
             val planningPegging = (resultMap["planning_pegging"] as? List<Map<String, Any?>>) ?: emptyList()
+            @Suppress("UNCHECKED_CAST")
+            val workOrders = (resultMap["work_orders"] as? List<Map<String, Any?>>) ?: emptyList()
             // Reload case data for BOM/method lookups; we don't trust whatever was at run time
             // since the soundness check is a freshly-evaluated property of the persisted plan.
             val data = transaction { CaseLoader.load(caseId) }
@@ -836,6 +838,7 @@ fun Routing.allocateRoutes() {
                 demands = demands,
                 data = data,
                 config = com.allocator.services.SoundnessConfig(deepCheck = deepCheck),
+                workOrders = workOrders,
             )
         } catch (e: Exception) {
             transaction {
