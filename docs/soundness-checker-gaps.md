@@ -1,83 +1,52 @@
 # Soundness checker — outstanding gaps
 
 Inventory of gaps in `SoundnessChecker.kt` after the case-171 conservation
-work landed (commits `ea07f53`, `7bd2eb7`). Surveyed by reading the
-checker source, not speculation.
+work landed. Surveyed by reading the checker source, not speculation.
 
-## In scope on this branch (`feat/soundness-checker-completeness`)
+## Status
 
-### (1) R8 deep conservation — declared but never implemented
+All seven gaps catalogued in the original survey are addressed. Listed
+in commit order; rule codes are what the checker emits today.
 
-The class doc and `SoundnessConfig.deepCheck` flag promise:
+| # | gap | rule | commit |
+|---|---|---|---|
+| 1 | R8 deep conservation never implemented | `R8_deep_conservation` | `c384ce2` |
+| 2 | `committed_demands` vs pegging silent divergence | `R0_committed_consistency` | `84f10eb` |
+| 4 | `walkPurchase` was a structural no-op | `R7d_purchase_{pid,lid,qty}_*` | `63ab38a` |
+| 3 | demand-root timing unchecked | `R3_demand_late` | `f3f35ee` |
+| 5 | R7b/R7c hard-coded `1e-6` tolerance | (tolerance hardened) | `508af46` |
+| 6 | tree-selection "last wins" silent fallback | `R0_pegging_duplicate` | `508af46` |
+| 7 | method override conformance unchecked | `R9_method_override_violated` | `20619f8` |
 
-> R8 conservation (deep check) — committed_qty at root = Σ over leaves
-> Skipped unless `SoundnessConfig.deepCheck = true`.
+UI: deep-check toggle hoisted to the run-history panel header (`86a5f97`)
+so the user can opt into R8 before clicking "check soundness."
 
-The flag is plumbed into `SoundnessReport.deepCheck` but **no R8 rule
-exists in the file**. Setting `deepCheck=true` does nothing today.
+## Notable findings surfaced
 
-What it should do: walk each demand's tree leaf-to-root accumulating
-`qty × rate` along BOM edges, and assert the root's `committed_qty`
-equals the resulting total at the demand's product unit. Catches
-planner bugs that break leaf-to-root conservation in a way the per-WO
-R4 check would miss (e.g. mid-tree rate-conversion drift, missing
-intermediate WOs).
+These are *real* issues that the new rules caught the moment they ran on
+case 171, separate from the conservation work:
 
-### (2) `committed_demands` ↔ `planning_pegging` cross-check
+- **R3** flagged 13 late deliveries on run 385 (supply engine) and 10 on
+  run 386 (leaf-legacy) — demands committed after their `request_due_time`.
+  No prior rule asserted the temporal contract.
+- **R0_pegging_duplicate** flagged 8 demands on run 386 with multiple
+  entries in `planning_pegging` — 6 synthetic `Negative_Inventory_*`
+  placeholders + 2 user demands. Indicates a leaf-engine emission bug;
+  the supply engine is clean. Tracked as planner work.
 
-The two are produced by separate code paths in `runPlanning`. For each
-demand, `committedRow.quantity` (in `committed_demands`) should match
-the pegging tree root's `committed_qty` (in `planning_pegging`).
-Today they could diverge silently — e.g. a demand reports
-`committed=5` in `committed_demands` but the pegging shows root
-`committed_qty=3`. Add a cross-demand rule (e.g.
-`R0_committed_consistency`) that compares them within `config.tolerance`.
+## Held as future work
 
-### (4) `walkPurchase` is a no-op
+### Variant-override conformance (sub-item of (7))
 
-```kotlin
-private fun walkPurchase(node: Map<String, Any?>, path: String) {
-    // Purchase leaves are terminal — no per-row validation needed beyond
-    // structural shape. Quantity is whatever plan() committed; pricing /
-    // vendor selection is out of scope for soundness.
-    @Suppress("UNUSED_VARIABLE")
-    val pid = node["product_id"]?.toString()
-}
-```
+R9 covers `method_selection` overrides. `variant_selection` overrides
+force a specific `alt_group`, but the WO doesn't directly carry alt_group
+— the check would need to look up each child's alt_group via BOM at
+walk time and assert that the children all come from the forced group.
+Not done.
 
-A purchase leaf with `qty=-5`, missing `product_id`, or no
-`location_id` would pass. At minimum: assert qty > 0 and pid/lid
-present, mirroring the structural part of `walkSupply`. (Pricing
-and vendor are out of scope, fine.)
+### Planner bug filed by R0_pegging_duplicate
 
-## Out of scope on this branch — preserve as future work
-
-### (3) R3 (timing) at the demand root isn't checked
-
-R5_lead_time / R5_transit_time validate make/move WO timing, but no
-rule asserts `commit_time ≤ request_due_time` at the demand root. A
-demand fulfilled after its due date currently passes soundness. Would
-be an `R3_demand_due_time` rule.
-
-### (5) R7c tolerance is `1e-6` (the global config tolerance)
-
-May be tight under FP drift. Σ 6 demands × 0.6667 fractional shares
-can land at 4.0000001 vs WO qty=4. Want a small relative slack like
-`max(1e-6, 1e-9 × produced)`. Not biting on case 171 yet but fragile.
-
-### (6) Tree-selection fragility in `treeByDemand`
-
-Does "last wins" on `planning_pegging` with the comment "matches the
-frontend's lookup logic." If `consolidatedPegging` ordering ever
-changes — e.g. a future engine emits per-demand trees first, then
-consolidated — the checker would silently switch which tree it walks.
-No explicit assertion that the picked tree is the canonical one.
-
-### (7) Override conformance is unchecked
-
-When `overrideIndex` configures `method_selection` or
-`variant_selection` for a demand, the resulting WO should reflect
-that choice. Today it's possible (in principle) for the planner to
-ignore the override and still pass soundness. Would need to thread
-override state into the checker and validate WO methods/variants
-against it.
+The leaf-engine duplicate-pegging emission is a planner-side fix, not a
+checker fix. The checker now surfaces it; the next planner-debug session
+should investigate the consolidator path that emits both per-demand and
+synthetic entries under the same demand_id.
