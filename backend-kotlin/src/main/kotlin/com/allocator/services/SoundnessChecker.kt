@@ -107,6 +107,10 @@ data class SoundnessReport(
  *        that each demand's reported committed quantity matches its pegging
  *        tree's root.committed_qty. Pass an empty list to skip the consistency
  *        check.
+ * @param overrideIndex the run's override index (built from the run's
+ *        override_snapshot via [buildOverrideIndex]). Used by R9 to check that
+ *        each WO honors the user's method_selection override. Pass an empty
+ *        map to skip override conformance.
  */
 fun checkRunSoundness(
     planningPegging: List<Map<String, Any?>>,
@@ -115,6 +119,7 @@ fun checkRunSoundness(
     config: SoundnessConfig = SoundnessConfig(),
     workOrders: List<Map<String, Any?>> = emptyList(),
     committedDemands: List<Map<String, Any?>> = emptyList(),
+    overrideIndex: Map<String, Map<String, Any?>> = emptyMap(),
 ): SoundnessReport {
     // Index demands by id and lookup tables for rule checks.
     val demandById: Map<String, Map<String, Any?>> = demands.associateBy { it["demand_id"]?.toString() ?: "" }
@@ -210,6 +215,7 @@ fun checkRunSoundness(
             methodMoves = methodMoves,
             supplyById = supplyById,
             config = config,
+            overrideIndex = overrideIndex,
         )
         ctx.walkRoot(tree)
 
@@ -338,6 +344,8 @@ private class WalkContext(
     val methodMoves: List<Map<String, Any?>>,
     val supplyById: Map<String, Map<String, Any?>>,
     val config: SoundnessConfig,
+    /** Override index keyed by "$entityType|$entityKey" — see buildOverrideIndex. */
+    val overrideIndex: Map<String, Map<String, Any?>>,
 ) {
     val violations = mutableListOf<Violation>()
     /** supply_id → qty consumed across all leaves of this demand's tree. */
@@ -620,6 +628,32 @@ private class WalkContext(
                 message = "Work order method '$method' is not one of make/move/purchase.",
                 actual = method,
             ))
+        }
+        // R9 — method-selection override conformance. If the user configured a
+        // method_selection override for this (pid, lid) — either demand-scoped
+        // or location-level — the WO's method must match. Mirrors plan()'s
+        // override lookup at PlanningEngine.kt:1146-1150 (demand-scoped key
+        // wins; falls back to location-level). Skipped when overrideIndex is
+        // empty (no overrides in the run).
+        if (overrideIndex.isNotEmpty() && method.isNotBlank()) {
+            val pid = (node["product_id"] as? String)?.trim() ?: ""
+            val lid = (node["location_id"] as? String)?.trim() ?: ""
+            if (pid.isNotBlank() && lid.isNotBlank()) {
+                val ovr = overrideIndex["method_selection|$pid|$lid|$demandId"]
+                    ?: overrideIndex["method_selection|$pid|$lid"]
+                if (ovr != null) {
+                    val forced = (ovr["method"] ?: ovr["method_type"])?.toString()?.trim()
+                    if (!forced.isNullOrBlank() && forced != method) {
+                        violations.add(Violation(
+                            rule = "R9_method_override_violated",
+                            nodePath = path,
+                            message = "WO at $pid@$lid uses method='$method' but a method_selection override forces '$forced'.",
+                            expected = forced,
+                            actual = method,
+                        ))
+                    }
+                }
+            }
         }
         // Recurse into children regardless of method (purchase has no children).
         @Suppress("UNCHECKED_CAST")

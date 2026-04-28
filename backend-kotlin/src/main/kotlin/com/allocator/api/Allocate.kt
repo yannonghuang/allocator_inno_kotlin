@@ -817,9 +817,11 @@ fun Routing.allocateRoutes() {
 
         // Run the check. Pure function — no IO, fast.
         val report = try {
-            val resultJson = transaction {
-                PlanRuns.selectAll().where { PlanRuns.id eq runId }.single()[PlanRuns.result]
-            } ?: throw IllegalStateException("Plan run has no result to check")
+            val (resultJson, overrideSnapshotJson) = transaction {
+                val row = PlanRuns.selectAll().where { PlanRuns.id eq runId }.single()
+                Pair(row[PlanRuns.result], row[PlanRuns.overrideSnapshot])
+            }
+            if (resultJson == null) throw IllegalStateException("Plan run has no result to check")
             val resultElement = Json.parseToJsonElement(resultJson)
             @Suppress("UNCHECKED_CAST")
             val resultMap = jsonElementToNative(resultElement) as? Map<String, Any?>
@@ -830,6 +832,17 @@ fun Routing.allocateRoutes() {
             val workOrders = (resultMap["work_orders"] as? List<Map<String, Any?>>) ?: emptyList()
             @Suppress("UNCHECKED_CAST")
             val committedDemandsForCheck = (resultMap["committed_demands"] as? List<Map<String, Any?>>) ?: emptyList()
+            // Build override index from the run's snapshot — what was active when
+            // the plan was committed. R9 in the checker uses this to validate
+            // that each WO honored the user's method_selection override.
+            @Suppress("UNCHECKED_CAST")
+            val overrideRows: List<Map<String, Any?>> = overrideSnapshotJson?.let {
+                runCatching {
+                    val parsed = Json.parseToJsonElement(it)
+                    (jsonElementToNative(parsed) as? List<Map<String, Any?>>) ?: emptyList()
+                }.getOrElse { emptyList() }
+            } ?: emptyList()
+            val overrideIndexForCheck = com.allocator.services.buildOverrideIndex(overrideRows)
             // Reload case data for BOM/method lookups; we don't trust whatever was at run time
             // since the soundness check is a freshly-evaluated property of the persisted plan.
             val data = transaction { CaseLoader.load(caseId) }
@@ -842,6 +855,7 @@ fun Routing.allocateRoutes() {
                 config = com.allocator.services.SoundnessConfig(deepCheck = deepCheck),
                 workOrders = workOrders,
                 committedDemands = committedDemandsForCheck,
+                overrideIndex = overrideIndexForCheck,
             )
         } catch (e: Exception) {
             transaction {
