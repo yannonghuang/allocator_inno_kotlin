@@ -80,6 +80,11 @@ private fun parseMethodDepth(raw: Any?): Int {
  * Default tracks the UI default; the two are intentionally kept in sync.
  */
 private const val DEFAULT_MAX_METHODS = 2
+
+/** Below this residual (in demand-qty units), waterfall stops invoking further
+ *  method slots. Prevents trivial 0.x-unit second WOs from lot-size or
+ *  bottleneck-rounding leftovers. */
+private const val MIN_WATERFALL_RESIDUAL = 0.5
 private fun parseMaxMethods(rawMax: Any?, multiple: Boolean, multiplePresent: Boolean): Int {
     if (rawMax != null) {
         val n = (rawMax as? Number)?.toInt()
@@ -1373,8 +1378,106 @@ fun plan(
         }
     } else methods
 
-    // ── Single method selection ────────────────────────────────────────────────
     val elaborateAtThisLevel = shouldElaborateAtDepth(depth, methodCfg.depth)
+
+    // ── Waterfall multi-method allocation ──────────────────────────────────
+    // When `max_methods > 1` and we're at a level where method-selection logic
+    // applies (root only by default, top-N levels via method_selection.depth),
+    // run sequential exhaustion across the top-`max_methods` ranked methods.
+    // Slot 1 plans the full demand; whatever can't be filled flows to slot 2
+    // as residual; etc. Each slot consumes inventory in place so slot N+1
+    // sees slot N's commitments. No re-ranking between iterations — order is
+    // fixed at the start of the demand.
+    //
+    // Gating: method override-narrowed effectiveMethods, methods.size > 1,
+    // and elaborateAtThisLevel together prevent waterfall from firing deep
+    // in the BOM (where it would compound exponentially) or when the user
+    // pinned a single method via override.
+    val useWaterfall = methodCfg.maxMethods > 1 && elaborateAtThisLevel && effectiveMethods.size > 1
+    if (useWaterfall) {
+        // Rank methods once. Preference mode → ascending preference int (cascade
+        // order). Elaborate mode → composite score descending. Failed elaborate
+        // candidates carry score=-1e9 and naturally sink to the bottom.
+        val ranked: List<Map<String, Any?>> = if (useElaborateMethod) {
+            scoreMethodsForElaborate(effectiveMethods, demand, inventory, data, requestTimeDt, config, depth, path)
+                .sortedByDescending { it.score }.map { it.method }
+        } else {
+            effectiveMethods.sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
+        }
+
+        // Override-active determination for waterfall: only "did override narrow
+        // the candidate set" applies, since waterfall doesn't pick a single
+        // method that could "differ from auto-selection".
+        val methodOverrideActiveW = methodOverride != null && effectiveMethods.size < methods.size
+        val overrideActiveW = methodOverrideActiveW || variantOverride != null
+
+        val cap = methodCfg.maxMethods.coerceAtMost(ranked.size)
+        var residual = demandNetQty
+        var latestCommit: LocalDate? = null
+        val allWos = mutableListOf<Map<String, Any?>>()
+        val slotPeggingNodes = mutableListOf<Map<String, Any?>>()
+        var slotsUsed = 0
+        var lastBlockedReason: String? = null
+
+        for (method in ranked) {
+            if (slotsUsed >= cap) break
+            // MIN_RESIDUAL: skip trivial leftovers from lot-size rounding so we
+            // don't burn a slot emitting a 0.x-unit second WO.
+            if (residual <= MIN_WATERFALL_RESIDUAL) break
+            val mLoc = (method["location_id"] ?: method["to_location_id"] ?: "").toString()
+            val slotLabel = "Waterfall slot ${slotsUsed + 1}/${cap}: ${method["type"]}@$mLoc " +
+                "(planning ${roundQty(residual).toLong()} of ${demandNetQty.toLong()} residual)"
+            val slot = planMethodSlot(
+                m = method, slotQty = residual,
+                productId = productId, locationId = locationId,
+                demand = demand, demandId = demandId,
+                requestTimeDt = requestTimeDt, reqTimeStr = reqTimeStr,
+                inventory = inventory, data = data,
+                depth = depth, path = path,
+                config = config, preferDemandId = preferDemandId,
+                overrideIndex = overrideIndex, budget = budget,
+                useSingleVariant = useSingleVariant,
+                scoreWeights = scoreWeights, topN = topN,
+                variantOverride = variantOverride,
+                methodChoiceExplanation = slotLabel,
+                overrideActive = overrideActiveW,
+            )
+            // Always record the slot's pegging node so the UI shows every attempt
+            // (including blocked ones with zero qty). Hard-failures still consume
+            // a slot — a method that committed 0 is informative for the user.
+            slotPeggingNodes.add(slot.methodPeggingNode)
+            slotsUsed += 1
+            if (slot.blockedReason != null) {
+                lastBlockedReason = slot.blockedReason
+                continue
+            }
+            residual -= slot.achievableQty
+            allWos.addAll(slot.wos)
+            slot.latestCommit?.let { c ->
+                if (latestCommit == null || c > latestCommit) latestCommit = c
+            }
+        }
+
+        val totalCommitted = demandNetQty - residual
+        val partialReason = when {
+            // Nothing committed at all — surface the last slot's hard-fail reason
+            // so downstream KPIs / soundness see a real failure (not "partial").
+            totalCommitted <= 1e-9 -> lastBlockedReason ?: "no_methods_succeeded"
+            // Some committed but residual above the noise floor → partial fulfillment.
+            residual > 1e-9 -> "partial"
+            else -> null
+        }
+        val commitTimeStr = formatDate(latestCommit)
+        demandFulfilledList.add(committedRow(totalCommitted, commitTimeStr ?: reqTimeStr, partialReason))
+        val finalPegging = slotPeggingNodes + peggingChildren
+        return Triple(
+            demandFulfilledList,
+            allWos,
+            demandNode(finalPegging, commitTimeStr ?: reqTimeStr, partialReason, committedQty = taken + totalCommitted),
+        )
+    }
+
+    // ── Single method selection ────────────────────────────────────────────────
     val (m, methodChoiceExplanation) = when {
         effectiveMethods.size == 1 -> {
             val m = effectiveMethods[0]; val loc = (m["location_id"] ?: m["to_location_id"] ?: "").toString()
