@@ -322,6 +322,89 @@ private class WalkContext(
         children.forEachIndexed { i, child ->
             walkChildOfDemand(child, "0-$i")
         }
+
+        // R8 — leaf-to-root conservation. Walks the tree bottom-up, propagating
+        // each leaf's qty through BOM rate conversions (make WOs) and AND/OR
+        // aggregation, then asserts the supportable root qty ≥ committed_qty.
+        // Catches chain-conservation gaps that per-WO R4 can miss (e.g.
+        // mid-tree rate-conversion drift, missing intermediate WOs).
+        if (config.deepCheck && committed > config.tolerance) {
+            val supportable = supportableQty(tree)
+            // Tolerance: max(1.0, 10% of committed) — same shape as R4
+            // (toleranceFor at line 503). Absorbs lot quantization and
+            // fractional fair-split rounding (e.g. 0.667 supplies vs
+            // committed_qty=1 after roundQty), but still catches the 50%+
+            // gaps that indicate a missing intermediate WO or a real
+            // chain-conservation break.
+            val r8Tol = maxOf(1.0, committed * 0.10)
+            if (supportable < committed - r8Tol) {
+                violations.add(Violation(
+                    rule = "R8_deep_conservation",
+                    nodePath = "0",
+                    message = "Root committed_qty=$committed exceeds leaf-supportable qty=$supportable (chain conservation broken).",
+                    expected = committed,
+                    actual = supportable,
+                ))
+            }
+        }
+    }
+
+    /**
+     * Recursive bottom-up qty propagation for R8. Returns the qty (in this
+     * node's product_id units) that the subtree's leaves can physically support.
+     *
+     * - supply / purchase leaves: their `quantity` is the source qty.
+     * - demand sub-nodes: sum across children (each child is a method that
+     *   fulfills this demand at this product).
+     * - work_order: aggregate children through BOM rate. AND uses min over
+     *   (child_supportable / rate); OR uses Σ. Capped at the WO's claimed
+     *   qty since a WO can't produce more than itself.
+     */
+    private fun supportableQty(node: Map<String, Any?>): Double {
+        val type = node["type"]?.toString() ?: return 0.0
+        @Suppress("UNCHECKED_CAST")
+        val children = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
+        return when (type) {
+            "supply", "purchase" -> (node["quantity"] as? Number)?.toDouble() ?: 0.0
+            "demand" -> children.sumOf { supportableQty(it) }
+            "work_order" -> {
+                val woQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
+                if (woQty <= config.tolerance) return 0.0
+                val method = node["method"]?.toString()
+                val raw = when (method) {
+                    "purchase", "move" -> children.sumOf { supportableQty(it) }
+                    "make" -> {
+                        val parentPid = (node["product_id"] as? String)?.trim() ?: ""
+                        val parentBomRows = bomRows.filter {
+                            (it["parent_id"] as? String)?.trim() == parentPid
+                        }
+                        val rel = node["children_relation"]?.toString()
+                        val demandKids = children.filter { it["type"] == "demand" }
+                        if (demandKids.isEmpty()) 0.0
+                        else if (rel == "or") {
+                            demandKids.sumOf { child -> childContribution(child, parentBomRows) }
+                        } else {
+                            demandKids.minOf { child -> childContribution(child, parentBomRows) }
+                        }
+                    }
+                    else -> 0.0
+                }
+                kotlin.math.min(raw, woQty)
+            }
+            else -> 0.0
+        }
+    }
+
+    /** A make-WO child's contribution to parent units = supportableQty / rate. */
+    private fun childContribution(
+        child: Map<String, Any?>,
+        parentBomRows: List<Map<String, Any?>>,
+    ): Double {
+        val cs = supportableQty(child)
+        val cPid = (child["product_id"] as? String)?.trim() ?: ""
+        val rate = (parentBomRows.firstOrNull { (it["child_id"] as? String)?.trim() == cPid }
+            ?.get("rate") as? Number)?.toDouble() ?: 1.0
+        return if (rate > 0) cs / rate else 0.0
     }
 
     private fun walkChildOfDemand(node: Map<String, Any?>, path: String) {
