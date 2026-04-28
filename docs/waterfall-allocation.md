@@ -181,6 +181,57 @@ unchanged in the run-history UI.
     = 0.5` threshold absorbs this; raise via `method_selection.min_residual`
     if 0.5 isn't tight enough.
 
+## Empirical findings (case-171, 2026-04-28)
+
+The first end-to-end sweep on case-171 (208 demands, deep BOMs sharing
+~120 SUB_PCBA components, supply-engine consolidation on, purchase
+disabled) revealed several non-obvious patterns. Documenting here so
+future tuning has a baseline.
+
+| run | max | mode | fill % | Gini | median | starv % | on-time | WOs | wall |
+|-----|-----|------|--------|------|--------|---------|---------|-----|------|
+| 419 | 1   | pref     | 13.37 | 0.4445 | 0.675  | 20.19 | 197/208 | —   | ~4 min |
+| 420 | 2   | pref     | **15.20** | **0.4165** | **0.7387** | **19.23** | 177 | 322 | ~2 min |
+| 421 | 4   | pref     | 14.99 | 0.4272 | 0.7321 | 20.67 | 176 | 300 | ~3 min |
+| 422 | 2   | elab     | 14.60 | 0.4931 | 0.467  | 22.60 | 181 | 340 | ~5.7 min |
+| 423 | 4   | elab     | 15.12 | 0.4228 | 0.7279 | 20.67 | 178 | 356 | ~5.9 min |
+
+Lessons:
+
+  1. **`max=2, mode=preference` is the sweet spot for this case.** Best
+     Gini and median, lowest starvation, fastest wall-time among
+     waterfall configs. +13.7% fill vs `max=1` baseline.
+  2. **Diminishing/inverted returns past `max=2` under preference.**
+     Every fairness metric is slightly *worse* at `max=4` than `max=2`.
+     Hypothesis: more methods per demand means slot 3/4 grabs lower-
+     preference supplies that another demand might have used more
+     efficiently. Per-demand local optimum, global pessimum.
+  3. **Elaborate ranking is per-demand-greedy and can hurt shared-supply
+     fairness.** At `max=2`, elab-ON has Gini **0.4931** vs preference's
+     **0.4165** — a noticeable regression. Why: elaborate's composite
+     score (commit_time / inventory / purchase) is local to each demand;
+     it picks fastest-commit methods that may use shared capacity another
+     demand desperately needed. Preference int is global (user-set
+     priorities common to all demands), so it incidentally coordinates
+     them.
+  4. **The elaborate-fairness regression evaporates as `max_methods`
+     approaches `methods.size`.** At `max=4`, elab-ON's Gini is 0.4228 —
+     comparable to preference's 0.4272. When the cap saturates the
+     candidate pool (most products have 2-3 candidates), ranking ceases
+     to matter because all methods are used anyway.
+  5. **Elaborate has a fixed wall-time tax** (~3-4 min for per-demand
+     subtree simulation), roughly independent of `max_methods`.
+     Preference is much cheaper because no scoring simulation runs.
+  6. **on-time drops by ~20 demands across every waterfall config.**
+     That's the lead-time penalty of fallback methods (slot N+1 typically
+     has longer transit/lead than slot N), not really tunable here. If
+     on-time is paramount, stay at `max=1`.
+
+**Default recommendation**: `mode=preference, max_methods=2`. Switch to
+elaborate only when delivery time matters more than fairness (e.g.,
+expedited orders), and consider `max_methods >= methods.size` if you
+do — the elab-ON Gini hit fades when the cap is broad.
+
 ## Migration
 
 Saved plan_run configs containing `split_mechanism` are not migrated. They
