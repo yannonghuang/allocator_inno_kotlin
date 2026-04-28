@@ -301,7 +301,28 @@ export type PlanningConfig = {
     mode?: 'preference' | 'elaborate';
     depth?: number;
     elaborate?: boolean;
+    /**
+     * @deprecated use `max_methods` instead. Kept for back-compat reading of
+     * legacy saved configs. The UI no longer writes this field — saving a
+     * legacy `multiple: true` config from the form re-emits `max_methods`.
+     */
     multiple?: boolean;
+    /**
+     * Cap on how many methods can be applied to a single demand. Integer >= 1.
+     * Default 2 (in sync with the backend default). 1 = single best method;
+     * 2-4 = blend the best few.
+     */
+    max_methods?: number;
+    /**
+     * How to divide a demand's quantity across the top-`max_methods` selected
+     * methods.
+     *   - "equal":      divide evenly (largest-remainder rounding for integer demand)
+     *   - "score":      proportional to elaborate composite score
+     *   - "preference": proportional to dense-rank-inverse of BOM `preference`
+     * Defaults to "equal". Falls back to equal when scores/preferences are
+     * uniform or zero.
+     */
+    split_mechanism?: 'equal' | 'score' | 'preference';
     /** Relative weights for elaborate scoring. Backend normalizes so absolute values don't matter. */
     score_weights?: { commit_time?: number; inventory_consumed?: number; purchase?: number };
     /** When true, backend iterates depth=1..N picking the first non-improving step (using score_weights). */

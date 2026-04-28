@@ -3471,16 +3471,64 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         <div style={{ marginBottom: '0.75rem' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap', marginBottom: '0.5rem' }}>
             <span style={{ color: '#a1a1aa', fontSize: '0.875rem' }}>{tP('config.methodSelection')}</span>
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
-              <input
-                type="checkbox"
-                checked={planningConfig.method_selection?.multiple === true}
-                onChange={(e) => setPlanningConfig((c) => ({
-                  ...c,
-                  method_selection: { ...c.method_selection, multiple: e.target.checked },
-                }))}
-              />
-              <span>{tP('config.equalSplitMethods')}</span>
+            {/* Max methods (replaces the legacy `multiple` boolean). Defaults to 2 in
+                sync with the backend; legacy `multiple: false` reads as 1, `multiple: true` as 2. */}
+            <label
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', cursor: 'pointer' }}
+              title={tP('config.methodMaxCountTooltip')}
+            >
+              <span style={{ color: '#a1a1aa' }}>{tP('config.methodMaxCount')}</span>
+              <select
+                value={(() => {
+                  const ms = planningConfig.method_selection;
+                  if (typeof ms?.max_methods === 'number') return Math.max(1, Math.min(4, Math.trunc(ms.max_methods)));
+                  if (ms?.multiple === false) return 1;
+                  return 2;
+                })()}
+                onChange={(e) => setPlanningConfig((c) => {
+                  const v = Math.max(1, Math.min(4, parseInt(e.target.value, 10) || 2));
+                  // Drop legacy `multiple` on save; backend resolution prefers max_methods anyway.
+                  const { multiple: _drop, ...rest } = c.method_selection ?? {};
+                  void _drop;
+                  return { ...c, method_selection: { ...rest, max_methods: v } };
+                })}
+                style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+              >
+                <option value={1}>1</option>
+                <option value={2}>2</option>
+                <option value={3}>3</option>
+                <option value={4}>4</option>
+              </select>
+            </label>
+            {/* Split mechanism. Disabled when max_methods=1 (single-method path; nothing to split). */}
+            <label
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', cursor: 'pointer', opacity: (() => {
+                const ms = planningConfig.method_selection;
+                const eff = (typeof ms?.max_methods === 'number') ? ms.max_methods : (ms?.multiple === false ? 1 : 2);
+                return eff > 1 ? 1 : 0.4;
+              })() }}
+              title={tP('config.methodSplitMechanismTooltip')}
+            >
+              <span style={{ color: '#a1a1aa' }}>{tP('config.methodSplitMechanism')}</span>
+              <select
+                value={planningConfig.method_selection?.split_mechanism ?? 'equal'}
+                disabled={(() => {
+                  const ms = planningConfig.method_selection;
+                  const eff = (typeof ms?.max_methods === 'number') ? ms.max_methods : (ms?.multiple === false ? 1 : 2);
+                  return eff <= 1;
+                })()}
+                onChange={(e) => setPlanningConfig((c) => {
+                  const v = e.target.value as 'equal' | 'score' | 'preference';
+                  const { multiple: _drop, ...rest } = c.method_selection ?? {};
+                  void _drop;
+                  return { ...c, method_selection: { ...rest, split_mechanism: v } };
+                })}
+                style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+              >
+                <option value="equal" title={tP('config.methodSplitEqualTooltip')}>{tP('config.methodSplitEqual')}</option>
+                <option value="score" title={tP('config.methodSplitScoreTooltip')}>{tP('config.methodSplitScore')}</option>
+                <option value="preference" title={tP('config.methodSplitPreferenceTooltip')}>{tP('config.methodSplitPreference')}</option>
+              </select>
             </label>
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
               <input
