@@ -701,6 +701,24 @@ internal fun scoreMethodsForElaborate(
     val methodCfg = resolveMethodSelection(config)
     val scoreWeights = methodCfg.scoreWeights
     val (wCommit, wInv, wPurchase) = normalizeScoreWeights(scoreWeights)
+
+    // The recursive plan() calls below are pure simulations — used to measure
+    // each candidate method's commit_time / inventory_consumed / purchase
+    // metrics, not to commit. To avoid exponential blow-up (`split_mechanism =
+    // score` with `max_methods >= 2` would otherwise re-enter scoring at every
+    // multi-method site in the simulated subtree), force the simulation to use
+    // single-method preference selection. Real planning behavior is unchanged
+    // — only the per-method probe runs cheaper.
+    val simConfig: Map<String, Any?> = (config ?: emptyMap()) + mapOf(
+        "method_selection" to (
+            ((config?.get("method_selection") as? Map<*, *>)
+                ?.let { @Suppress("UNCHECKED_CAST") (it as Map<String, Any?>) }
+                ?: emptyMap()) + mapOf(
+                "max_methods" to 1,
+                "split_mechanism" to "equal",
+            )
+        ),
+    )
     val productId = demand["product_id"] as? String ?: ""
     val locationId = demand["location_id"] as? String ?: ""
     val quantity = (demand["quantity"] as? Number)?.toDouble() ?: 0.0
@@ -747,7 +765,7 @@ internal fun scoreMethodsForElaborate(
                 "request_due_time" to formatDate(cReqDt),
                 "request_time" to formatDate(cReqDt),
             )
-            val (solvedList, cWos, _) = plan(cDemand, invCopy, data, cReqDt, depth = depth - 1, planningPath = planningPath, config = config)
+            val (solvedList, cWos, _) = plan(cDemand, invCopy, data, cReqDt, depth = depth - 1, planningPath = planningPath, config = simConfig)
             for (s in solvedList) {
                 if ((s["quantity"] as? Number)?.toDouble() ?: 0.0 <= 0) continue
                 val ct = s["commit_time"] as? String
