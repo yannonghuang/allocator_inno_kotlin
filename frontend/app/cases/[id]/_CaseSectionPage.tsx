@@ -5835,7 +5835,20 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             />
             <div style={{ padding: '1rem 1.25rem', borderBottom: '1px solid #3d3d40', flexShrink: 0, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <h3 style={{ margin: 0, fontSize: '1rem' }}>{tP('runHistory.panelTitle')}</h3>
-              <button type="button" onClick={() => setPlanRunHistoryOpen(false)} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tP('runHistory.close')}</button>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <label
+                  title="When checked, the soundness check also runs R8 — leaf-to-root chain conservation. Slower; off by default."
+                  style={{ fontSize: '0.78rem', color: '#a1a1aa', display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={soundnessDeepCheck}
+                    onChange={(e) => setSoundnessDeepCheck(e.target.checked)}
+                  />
+                  deep check
+                </label>
+                <button type="button" onClick={() => setPlanRunHistoryOpen(false)} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tP('runHistory.close')}</button>
+              </div>
             </div>
             <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
               {planRunHistoryLoading && <p style={{ color: '#71717a' }}>{tP('runHistory.loading')}</p>}
@@ -5948,7 +5961,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             onClick={async () => {
                               if (!clickable || !id) return;
                               try {
-                                const report = await checkPlanRunSoundness(id, run.id, { deep_check: false });
+                                const report = await checkPlanRunSoundness(id, run.id, { deep_check: soundnessDeepCheck });
                                 setSoundnessReportOpen({ runId: run.id, report });
                               } catch {/* noop */}
                             }}
@@ -6231,17 +6244,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   {soundnessReportOpen.report.cross_demand_violations.length > 0 && ` · ${soundnessReportOpen.report.cross_demand_violations.length} cross-demand violation(s)`}
                 </p>
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <label style={{ fontSize: '0.78rem', color: '#a1a1aa', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                  <input
-                    type="checkbox"
-                    checked={soundnessDeepCheck}
-                    onChange={(e) => setSoundnessDeepCheck(e.target.checked)}
-                  />
-                  deep check
-                </label>
-                <button type="button" onClick={() => setSoundnessReportOpen(null)} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
-              </div>
+              <button type="button" onClick={() => setSoundnessReportOpen(null)} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
             </div>
             <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
               {soundnessReportOpen.report.cross_demand_violations.length > 0 && (
