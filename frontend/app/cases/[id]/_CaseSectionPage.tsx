@@ -220,12 +220,12 @@ export function PlanKpiDashboard({
   const proc = kpis.procurement ?? {};
   const mfg = kpis.manufacturing ?? {};
   const log = kpis.logistics ?? {};
-  const card = (title: string, items: { label: string; value: string }[], accent?: string) => (
+  const card = (title: string, items: { label: string; value: string; tooltip?: string }[], accent?: string) => (
     <div key={title} style={{ flex: '1 1 160px', minWidth: 140, padding: '0.75rem 1rem', background: 'rgba(255,255,255,0.04)', borderRadius: 8, border: '1px solid #3d3d40' }}>
       <div style={{ fontSize: '0.7rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '0.5rem', fontWeight: 600 }}>{title}</div>
-      {items.map(({ label, value }) => (
-        <div key={label} style={{ marginTop: 4 }}>
-          <span style={{ fontSize: '0.75rem', color: '#71717a' }}>{label}</span>
+      {items.map(({ label, value, tooltip }) => (
+        <div key={label} style={{ marginTop: 4 }} title={tooltip}>
+          <span style={{ fontSize: '0.75rem', color: '#71717a', cursor: tooltip ? 'help' : undefined }}>{label}</span>
           <span style={{ display: 'block', fontSize: '1rem', fontWeight: 600, color: accent ?? '#e4e4e7' }}>{value}</span>
         </div>
       ))}
@@ -261,10 +261,10 @@ export function PlanKpiDashboard({
           })(),
         ], '#34d399')}
         {card(tK('fairness'), [
-          { label: tK('fairnessGini'), value: fair?.gini != null ? Number(fair.gini).toFixed(2) : '–' },
-          { label: tK('fairnessP10'), value: fair?.p10_fill_ratio != null ? Number(fair.p10_fill_ratio).toFixed(2) : '–' },
-          { label: tK('fairnessMedian'), value: fair?.median_fill_ratio != null ? Number(fair.median_fill_ratio).toFixed(2) : '–' },
-          { label: tK('fairnessStarvation'), value: fair?.starvation_pct != null ? `${Number(fair.starvation_pct).toFixed(1)}%` : '–' },
+          { label: tK('fairnessGini'), value: fair?.gini != null ? Number(fair.gini).toFixed(2) : '–', tooltip: tK('fairnessGiniTooltip') },
+          { label: tK('fairnessP10'), value: fair?.p10_fill_ratio != null ? Number(fair.p10_fill_ratio).toFixed(2) : '–', tooltip: tK('fairnessP10Tooltip') },
+          { label: tK('fairnessMedian'), value: fair?.median_fill_ratio != null ? Number(fair.median_fill_ratio).toFixed(2) : '–', tooltip: tK('fairnessMedianTooltip') },
+          { label: tK('fairnessStarvation'), value: fair?.starvation_pct != null ? `${Number(fair.starvation_pct).toFixed(1)}%` : '–', tooltip: tK('fairnessStarvationTooltip') },
         ], '#f472b6')}
         {card(tK('inventory'), [
           { label: tK('consumptionRate'), value: inv.consumption_rate != null ? `${(Number(inv.consumption_rate) * 100).toFixed(1)}%` : '–' },
