@@ -1,5 +1,6 @@
 package com.allocator
 
+import com.allocator.services.SplitMechanism
 import com.allocator.services.resolveMethodSelection
 import com.allocator.services.resolveVariantSelection
 import com.allocator.services.shouldElaborateAtDepth
@@ -95,6 +96,60 @@ class PlanningEngineSelectionConfigTest : FunSpec({
     test("method_selection multiple is read") {
         resolveMethodSelection(mapOf("method_selection" to mapOf("multiple" to true))).multiple shouldBe true
         resolveMethodSelection(mapOf("method_selection" to mapOf("multiple" to false))).multiple shouldBe false
+    }
+
+    // ── method_selection.max_methods + split_mechanism (NEW) ─────────────────
+
+    test("max_methods defaults to 2 when neither max_methods nor multiple is set") {
+        resolveMethodSelection(null).maxMethods shouldBe 2
+        resolveMethodSelection(emptyMap()).maxMethods shouldBe 2
+        resolveMethodSelection(mapOf("method_selection" to emptyMap<String, Any?>())).maxMethods shouldBe 2
+    }
+
+    test("max_methods explicit value wins over legacy multiple") {
+        // Explicit 3 even though multiple=false would otherwise give 1.
+        resolveMethodSelection(mapOf(
+            "method_selection" to mapOf("multiple" to false, "max_methods" to 3)
+        )).maxMethods shouldBe 3
+        // Explicit 1 even though multiple=true would otherwise give 2.
+        resolveMethodSelection(mapOf(
+            "method_selection" to mapOf("multiple" to true, "max_methods" to 1)
+        )).maxMethods shouldBe 1
+    }
+
+    test("max_methods legacy resolution: multiple=false → 1, multiple=true → 2") {
+        resolveMethodSelection(mapOf(
+            "method_selection" to mapOf("multiple" to false)
+        )).maxMethods shouldBe 1
+        resolveMethodSelection(mapOf(
+            "method_selection" to mapOf("multiple" to true)
+        )).maxMethods shouldBe 2
+    }
+
+    test("max_methods clamps non-numeric / out-of-range values to default 2") {
+        resolveMethodSelection(mapOf(
+            "method_selection" to mapOf("max_methods" to "abc")
+        )).maxMethods shouldBe 2
+        resolveMethodSelection(mapOf(
+            "method_selection" to mapOf("max_methods" to 0)
+        )).maxMethods shouldBe 2
+        resolveMethodSelection(mapOf(
+            "method_selection" to mapOf("max_methods" to -1)
+        )).maxMethods shouldBe 2
+    }
+
+    test("max_methods accepts Number subclasses") {
+        resolveMethodSelection(mapOf("method_selection" to mapOf("max_methods" to 5L))).maxMethods shouldBe 5
+        resolveMethodSelection(mapOf("method_selection" to mapOf("max_methods" to 1.7))).maxMethods shouldBe 1
+    }
+
+    test("split_mechanism parses case-insensitively, defaults to EQUAL") {
+        resolveMethodSelection(null).splitMechanism shouldBe SplitMechanism.EQUAL
+        resolveMethodSelection(mapOf("method_selection" to mapOf("split_mechanism" to "equal"))).splitMechanism shouldBe SplitMechanism.EQUAL
+        resolveMethodSelection(mapOf("method_selection" to mapOf("split_mechanism" to "EQUAL"))).splitMechanism shouldBe SplitMechanism.EQUAL
+        resolveMethodSelection(mapOf("method_selection" to mapOf("split_mechanism" to "score"))).splitMechanism shouldBe SplitMechanism.SCORE
+        resolveMethodSelection(mapOf("method_selection" to mapOf("split_mechanism" to "Preference"))).splitMechanism shouldBe SplitMechanism.PREFERENCE
+        resolveMethodSelection(mapOf("method_selection" to mapOf("split_mechanism" to "garbage"))).splitMechanism shouldBe SplitMechanism.EQUAL
     }
 
     // ── method_selection.score_weights (drives elaborate scoring) ────────────

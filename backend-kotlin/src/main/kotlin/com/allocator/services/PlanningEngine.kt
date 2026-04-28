@@ -37,11 +37,18 @@ private val LATE_DATE = LocalDate.of(9999, 12, 31)
 // concept. Variant config is just the equal-split / scoring knobs it has
 // always been (`multiple`, `score_weights`, `top_n`).
 
+/** How a demand's quantity is divided across the top-N selected methods. */
+internal enum class SplitMechanism { EQUAL, SCORE, PREFERENCE }
+
 /** Effective method_selection config. */
 internal data class MethodSelectionConfig(
     val mode: String,        // "preference" | "elaborate"
     val depth: Int,          // >= 1
     val multiple: Boolean,
+    /** Cap on how many methods can be applied to a single demand. >= 1; default 2. */
+    val maxMethods: Int,
+    /** How a demand's qty is divided across the selected top-`maxMethods` methods. */
+    val splitMechanism: SplitMechanism,
     val scoreWeights: Map<String, Any?>?,  // drives elaborate scoring (commit_time / inventory_consumed / purchase)
     val depthOptimal: Boolean = false,     // when true, caller iterates depth=1..N picking the first non-improving step
 ) {
@@ -67,6 +74,49 @@ private fun parseMethodDepth(raw: Any?): Int {
 }
 
 /**
+ * Resolve the effective `max_methods` cap.
+ *
+ * Priority:
+ *   1. explicit `max_methods` (clamped to ≥ 1; non-numeric warns and falls back to default)
+ *   2. legacy `multiple: false` (no `max_methods`)         → 1
+ *   3. legacy `multiple: true`  (no `max_methods`)         → 2 (behavior change documented)
+ *   4. neither set                                          → 2
+ *
+ * Default tracks the UI default; the two are intentionally kept in sync.
+ */
+private const val DEFAULT_MAX_METHODS = 2
+private fun parseMaxMethods(rawMax: Any?, multiple: Boolean, multiplePresent: Boolean): Int {
+    if (rawMax != null) {
+        val n = (rawMax as? Number)?.toInt()
+        if (n == null) {
+            log.warn("Invalid method_selection.max_methods={}; falling back to default {}", rawMax, DEFAULT_MAX_METHODS)
+            return DEFAULT_MAX_METHODS
+        }
+        if (n < 1) {
+            log.warn("method_selection.max_methods={} < 1; clamping to default {}", n, DEFAULT_MAX_METHODS)
+            return DEFAULT_MAX_METHODS
+        }
+        return n
+    }
+    if (multiplePresent) return if (multiple) DEFAULT_MAX_METHODS else 1
+    return DEFAULT_MAX_METHODS
+}
+
+/** Parse split_mechanism case-insensitively; warn on unknown values and default to EQUAL. */
+private fun parseSplitMechanism(raw: Any?): SplitMechanism {
+    if (raw == null) return SplitMechanism.EQUAL
+    return when ((raw as? String)?.trim()?.lowercase()) {
+        "equal", "" -> SplitMechanism.EQUAL
+        "score" -> SplitMechanism.SCORE
+        "preference" -> SplitMechanism.PREFERENCE
+        else -> {
+            log.warn("Invalid method_selection.split_mechanism={}; defaulting to equal", raw)
+            SplitMechanism.EQUAL
+        }
+    }
+}
+
+/**
  * Resolve the effective method_selection config.
  *
  * Accepts both the new shape (`mode`, `depth`, `score_weights`) and the legacy shape
@@ -89,6 +139,9 @@ internal fun resolveMethodSelection(config: Map<String, Any?>?): MethodSelection
     }
     val depth = parseMethodDepth(raw["depth"])
     val multiple = raw["multiple"] == true
+    val multiplePresent = raw.containsKey("multiple") && raw["multiple"] is Boolean
+    val maxMethods = parseMaxMethods(raw["max_methods"], multiple, multiplePresent)
+    val splitMechanism = parseSplitMechanism(raw["split_mechanism"])
     @Suppress("UNCHECKED_CAST")
     val methodWeights = raw["score_weights"] as? Map<String, Any?>
     val weights = methodWeights ?: run {
@@ -99,7 +152,15 @@ internal fun resolveMethodSelection(config: Map<String, Any?>?): MethodSelection
         vs?.get("score_weights") as? Map<String, Any?>
     }
     val depthOptimal = raw["depth_optimal"] == true
-    return MethodSelectionConfig(mode = mode, depth = depth, multiple = multiple, scoreWeights = weights, depthOptimal = depthOptimal)
+    return MethodSelectionConfig(
+        mode = mode,
+        depth = depth,
+        multiple = multiple,
+        maxMethods = maxMethods,
+        splitMechanism = splitMechanism,
+        scoreWeights = weights,
+        depthOptimal = depthOptimal,
+    )
 }
 
 /** Soft cap on how many depths the optimal-depth search will try. Each iteration costs a full plan. */
@@ -600,7 +661,34 @@ internal fun getPreferredMethodCascade(
  * Falls back to preference-only when we're past method_selection.depth levels from the
  * root, or when only one method exists.
  */
-internal fun getPreferredMethodElaborate(
+/**
+ * Per-method elaborate score, used both by the single-method picker
+ * (`getPreferredMethodElaborate`) and by the multi-method splitter
+ * (`selectAndSplitMethods` for `split_mechanism = score`).
+ *
+ * `score` is in `[0, 1]` for non-failed methods (composite of
+ * commit_time / inventory_consumed / purchase normalized by their
+ * cross-method spans, weighted by `score_weights`). Failed methods get
+ * `-1e9` so callers can sort/filter cleanly.
+ */
+internal data class MethodScore(
+    val method: Map<String, Any?>,
+    val score: Double,
+    val failed: Boolean,
+    val ts: Double,
+    val consumed: Double,
+    val purchase: Double,
+)
+
+/**
+ * Score every method by simulating each one's BOM children and measuring
+ * commit_time / inventory_consumed / purchase. Returns one `MethodScore`
+ * per input in the same order. Caller sorts.
+ *
+ * Extracted from the original inlined scoring inside `getPreferredMethodElaborate`
+ * so the multi-method splitter can reuse it without code duplication.
+ */
+internal fun scoreMethodsForElaborate(
     methods: List<Map<String, Any?>>,
     demand: Map<String, Any?>,
     inventory: List<Map<String, Any?>>,
@@ -609,11 +697,8 @@ internal fun getPreferredMethodElaborate(
     config: Map<String, Any?>?,
     depth: Int,
     planningPath: Set<Pair<String, String>>,
-): Pair<Map<String, Any?>?, String> {
-    if (methods.isEmpty()) return Pair(null, "No methods available.")
+): List<MethodScore> {
     val methodCfg = resolveMethodSelection(config)
-    if (!shouldElaborateAtDepth(depth, methodCfg.depth) || methods.size <= 1) return getPreferredMethod(methods)
-
     val scoreWeights = methodCfg.scoreWeights
     val (wCommit, wInv, wPurchase) = normalizeScoreWeights(scoreWeights)
     val productId = demand["product_id"] as? String ?: ""
@@ -621,9 +706,9 @@ internal fun getPreferredMethodElaborate(
     val quantity = (demand["quantity"] as? Number)?.toDouble() ?: 0.0
     val reqTimeStr = demand["request_due_time"] as? String ?: demand["request_time"] as? String
 
-    data class Scored(val score: Double, val method: Map<String, Any?>, val ts: Double, val consumed: Double, val purchase: Double, val failed: Boolean)
+    data class Raw(val method: Map<String, Any?>, val ts: Double, val consumed: Double, val purchase: Double, val failed: Boolean)
 
-    val scored = methods.map { m ->
+    val raw = methods.map { m ->
         val invCopy = copyInventory(inventory)
         val productionLocation = (m["location_id"] ?: m["to_location_id"] ?: locationId) as? String ?: locationId
         val reqDt = parseDate(reqTimeStr) ?: requestTimeDt
@@ -641,7 +726,7 @@ internal fun getPreferredMethodElaborate(
         val childMaterials = when (m["type"]) {
             "make" -> {
                 val variants = variantsForMake(productId, productionLocation, quantity, m, data)
-                if (variants.isEmpty()) return@map Scored(-1e9, m, LATE_DATE.toEpochDay().toDouble(), 0.0, 0.0, true)
+                if (variants.isEmpty()) return@map Raw(m, LATE_DATE.toEpochDay().toDouble(), 0.0, 0.0, true)
                 val (variantList, _) = getPreferredVariants(
                     variants, invCopy, data, reqDt, leadDays, planningPath, depth - 1, quantity,
                     multiple = false, scoreWeights = scoreWeights, topN = null
@@ -678,13 +763,12 @@ internal fun getPreferredMethodElaborate(
         val consumed = beforeQty - afterQty
         if (anyFailed) maxCommit = null
         val ts = maxCommit?.toEpochDay()?.toDouble() ?: LATE_DATE.toEpochDay().toDouble()
-        Scored(0.0, m, ts, consumed, purchaseQty, anyFailed)
-    }.toMutableList()
+        Raw(m, ts, consumed, purchaseQty, anyFailed)
+    }
 
-    // Normalize scores
-    val validTs = scored.filter { !it.failed }.map { it.ts }
-    val consList = scored.map { it.consumed }
-    val purchList = scored.map { it.purchase }
+    val validTs = raw.filter { !it.failed }.map { it.ts }
+    val consList = raw.map { it.consumed }
+    val purchList = raw.map { it.purchase }
     var spanTs = if (validTs.size >= 2) validTs.max() - validTs.min() else 1.0
     var spanC = if (consList.isNotEmpty()) consList.max() - consList.min() else 1.0
     var spanP = if (purchList.isNotEmpty()) purchList.max() - purchList.min() else 1.0
@@ -693,21 +777,187 @@ internal fun getPreferredMethodElaborate(
     if (spanP <= 0) spanP = 1.0
     val tsMax = validTs.maxOrNull() ?: 0.0
 
-    val finalScored = scored.map { s ->
-        if (s.failed) s.copy(score = -1e9)
+    return raw.map { r ->
+        if (r.failed) MethodScore(r.method, -1e9, true, r.ts, r.consumed, r.purchase)
         else {
-            val normCommit = max(0.0, min(1.0, (tsMax - s.ts) / spanTs))
-            val normInv = max(0.0, min(1.0, (s.consumed - consList.min()) / spanC))
-            val normP = max(0.0, min(1.0, (purchList.max() - s.purchase) / spanP))
-            s.copy(score = wCommit * normCommit + wInv * normInv + wPurchase * normP)
+            val normCommit = max(0.0, min(1.0, (tsMax - r.ts) / spanTs))
+            val normInv = max(0.0, min(1.0, (r.consumed - consList.min()) / spanC))
+            val normP = max(0.0, min(1.0, (purchList.max() - r.purchase) / spanP))
+            val s = wCommit * normCommit + wInv * normInv + wPurchase * normP
+            MethodScore(r.method, s, false, r.ts, r.consumed, r.purchase)
         }
-    }.sortedByDescending { it.score }
+    }
+}
 
-    val best = finalScored.first()
+internal fun getPreferredMethodElaborate(
+    methods: List<Map<String, Any?>>,
+    demand: Map<String, Any?>,
+    inventory: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+    requestTimeDt: LocalDate?,
+    config: Map<String, Any?>?,
+    depth: Int,
+    planningPath: Set<Pair<String, String>>,
+): Pair<Map<String, Any?>?, String> {
+    if (methods.isEmpty()) return Pair(null, "No methods available.")
+    val methodCfg = resolveMethodSelection(config)
+    if (!shouldElaborateAtDepth(depth, methodCfg.depth) || methods.size <= 1) return getPreferredMethod(methods)
+
+    val scored = scoreMethodsForElaborate(
+        methods, demand, inventory, data, requestTimeDt, config, depth, planningPath,
+    ).sortedByDescending { it.score }
+
+    val best = scored.first()
     if (best.failed) return getPreferredMethod(methods)
     val loc = (best.method["location_id"] ?: best.method["to_location_id"] ?: "").toString()
     return Pair(best.method, "Chosen (elaborate score): ${best.method["type"]} @ $loc " +
         "(inventory_consumed=${best.consumed.toLong()}, purchase=${best.purchase.toLong()}).")
+}
+
+// ── Multi-method split mechanics ──────────────────────────────────────────────
+
+/**
+ * Assign dense ranks to methods by their raw `preference` int (lower is better,
+ * matching the cascade ranking convention).
+ *
+ * Equal raw values share the same rank, and the next distinct value advances by 1
+ * (e.g. raw `[0, 0, 5, 100]` → ranks `[1, 1, 2, 3]`). Returns the same number of
+ * elements as the input, in input order, paired with the assigned rank. Methods
+ * with a missing or non-numeric `preference` get the largest possible rank
+ * (last-resort tier) so they never out-weight a method with a real preference.
+ */
+internal fun denseRankByPreference(
+    methods: List<Map<String, Any?>>,
+): List<Pair<Map<String, Any?>, Int>> {
+    if (methods.isEmpty()) return emptyList()
+    fun pref(m: Map<String, Any?>): Long? = (m["preference"] as? Number)?.toLong()
+    val distinctSorted = methods.mapNotNull { pref(it) }.toSortedSet().toList()
+    val rankOf: Map<Long, Int> = distinctSorted.withIndex().associate { (i, v) -> v to (i + 1) }
+    val missingRank = distinctSorted.size + 1
+    return methods.map { m ->
+        val r = pref(m)?.let { rankOf[it] } ?: missingRank
+        m to r
+    }
+}
+
+/**
+ * Equal split of a quantity across `n` slots. Integer-aware: when `qty` is a
+ * whole integer, distributes the remainder to the first slots (largest-remainder
+ * with integer demand). Fractional `qty` divides evenly.
+ *
+ * Mirrors the existing block at the multi-method site so we get one
+ * authoritative implementation.
+ */
+internal fun equalSplitQty(qty: Double, n: Int): List<Double> {
+    if (n <= 0) return emptyList()
+    if (n == 1) return listOf(qty)
+    val asLong = qty.toLong()
+    val isInteger = abs(qty - asLong.toDouble()) < 1e-9
+    return if (isInteger) {
+        val base = asLong / n
+        val rem = (asLong % n).toInt()
+        List(rem) { (base + 1).toDouble() } + List(n - rem) { base.toDouble() }
+    } else {
+        List(n) { qty / n }
+    }
+}
+
+/**
+ * Proportional split of a quantity by per-slot weights.
+ *
+ * For integer `qty`, uses largest-remainder rounding so the slots sum exactly to
+ * `qty`. For fractional `qty`, returns `qty * (w_i / Σw_i)` directly.
+ *
+ * Falls back to [equalSplitQty] when weights are degenerate:
+ * sum ≤ ε, all weights equal, or the list is empty.
+ */
+internal fun proportionalSplitQty(qty: Double, weights: List<Double>): List<Double> {
+    if (weights.isEmpty()) return emptyList()
+    val n = weights.size
+    val nonNeg = weights.map { it.coerceAtLeast(0.0) }
+    val total = nonNeg.sum()
+    val span = (nonNeg.maxOrNull() ?: 0.0) - (nonNeg.minOrNull() ?: 0.0)
+    if (total <= 1e-12 || span <= 1e-12) return equalSplitQty(qty, n)
+
+    val asLong = qty.toLong()
+    val isInteger = abs(qty - asLong.toDouble()) < 1e-9
+    if (!isInteger) {
+        return nonNeg.map { qty * (it / total) }
+    }
+    // Largest-remainder rounding: floor each share, then distribute the leftover
+    // units one by one to the slots with the largest fractional remainders.
+    val exact = nonNeg.map { qty * (it / total) }
+    val floored = exact.map { kotlin.math.floor(it).toLong() }.toMutableList()
+    var leftover = (asLong - floored.sum()).toInt()
+    if (leftover > 0) {
+        val remainderOrder = exact.withIndex()
+            .map { (i, e) -> i to (e - kotlin.math.floor(e)) }
+            .sortedByDescending { it.second }
+            .map { it.first }
+        var k = 0
+        while (leftover > 0 && k < remainderOrder.size) {
+            floored[remainderOrder[k]] = floored[remainderOrder[k]] + 1
+            leftover -= 1
+            k += 1
+        }
+    }
+    return floored.map { it.toDouble() }
+}
+
+/**
+ * Pick the top-`max_methods` methods for a demand and split its qty across
+ * them, per `method_selection.split_mechanism`. Only invoked when
+ * `min(cfg.maxMethods, methods.size) > 1`; the single-method path handles
+ * `cap == 1` via the existing `getPreferredMethod*` flow.
+ *
+ * Returns `(method, allocated qty)` pairs in selection order. Conservation
+ * holds by construction: Σ allocated qty == demandNetQty (within FP epsilon
+ * for fractional demands, exactly for integer demands via largest-remainder).
+ */
+internal fun selectAndSplitMethods(
+    methods: List<Map<String, Any?>>,
+    demandNetQty: Double,
+    cfg: MethodSelectionConfig,
+    demand: Map<String, Any?>,
+    inventory: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+    requestTimeDt: LocalDate?,
+    config: Map<String, Any?>?,
+    depth: Int,
+    planningPath: Set<Pair<String, String>>,
+): List<Pair<Map<String, Any?>, Double>> {
+    if (methods.isEmpty()) return emptyList()
+    val cap = cfg.maxMethods.coerceAtMost(methods.size)
+    if (cap < 1) return emptyList()
+
+    // Score each method by the metric appropriate to the chosen mechanism.
+    // EQUAL falls back to the cfg.mode-appropriate metric so the top-cap
+    // ranking still picks "best" when methods.size > cap.
+    val metric: SplitMechanism = when (cfg.splitMechanism) {
+        SplitMechanism.SCORE, SplitMechanism.PREFERENCE -> cfg.splitMechanism
+        SplitMechanism.EQUAL -> if (cfg.elaborate) SplitMechanism.SCORE else SplitMechanism.PREFERENCE
+    }
+    val weighted: List<Pair<Map<String, Any?>, Double>> = when (metric) {
+        SplitMechanism.SCORE -> {
+            val msList = scoreMethodsForElaborate(methods, demand, inventory, data, requestTimeDt, config, depth, planningPath)
+            // coerceAtLeast(0): failed methods carry score=-1e9, which we don't
+            // want bleeding into proportional weights.
+            msList.map { it.method to it.score.coerceAtLeast(0.0) }
+        }
+        SplitMechanism.PREFERENCE -> {
+            denseRankByPreference(methods).map { (m, rank) -> m to (1.0 / rank) }
+        }
+        SplitMechanism.EQUAL -> error("unreachable: EQUAL was rewritten above")
+    }
+
+    val top = weighted.sortedByDescending { it.second }.take(cap)
+    val topMethods = top.map { it.first }
+    val topWeights = top.map { it.second }
+    val qtys: List<Double> = when (cfg.splitMechanism) {
+        SplitMechanism.EQUAL -> equalSplitQty(demandNetQty, top.size)
+        SplitMechanism.SCORE, SplitMechanism.PREFERENCE -> proportionalSplitQty(demandNetQty, topWeights)
+    }
+    return topMethods.zip(qtys)
 }
 
 // ── Variant selection ──────────────────────────────────────────────────────────
@@ -992,32 +1242,22 @@ fun plan(
     val methodCfg = resolveMethodSelection(config)
     val variantCfg = resolveVariantSelection(config)
     val useElaborateMethod = methodCfg.elaborate
-    val useMultipleMethods = methodCfg.multiple && methods.size > 1
+    val effectiveMaxMethods = methodCfg.maxMethods.coerceAtMost(methods.size)
+    val useMultipleMethods = effectiveMaxMethods > 1
     val useSingleVariant = variantCfg.multiple == false
     val scoreWeights = variantCfg.scoreWeights
     val topN = variantCfg.topN
 
-    // ── Multiple methods: equal split (with per-method two-pass probe) ─────────
+    // ── Multiple methods: pick top-`max_methods` and split per `split_mechanism` ──
     //
-    // For each method slot:
-    //   a) Compute child materials at the slot's methodQty.
-    //   b) Snapshot inventory; first pass → plan each child at its full needed qty.
-    //   c) If any child is short, cap the slot at the bottleneck ratio
-    //      (min effective/needed × methodQty), restore inventory, rescale children,
-    //      and re-plan (second pass).
-    //   d) Build the WO at methodAchievable (not methodQty).
-    //   e) Aggregate: totalAchievable = Σ methodAchievable across slots.
-    //      Emit ONE committed row with commit_reason="partial" if any slot shorted.
+    // selectAndSplitMethods returns (method, allocated qty) pairs in selection order.
+    // For each pair we run the existing per-method first-pass / second-pass /
+    // bottleneck logic — that part is untouched, only the upstream picker changed.
     if (useMultipleMethods) {
-        val n = methods.size
-        val demandInt = demandNetQty.toLong()
-        val useIntSplit = n > 0 && abs(demandNetQty - demandInt.toDouble()) < 1e-9
-        val qtyPerMethod = if (useIntSplit) {
-            val base = demandInt / n; val rem = (demandInt % n).toInt()
-            List(rem) { (base + 1).toDouble() } + List(n - rem) { base.toDouble() }
-        } else {
-            val ea = if (n > 0) demandNetQty / n else demandNetQty; List(n) { ea }
-        }
+        val selected = selectAndSplitMethods(
+            methods, demandNetQty, methodCfg,
+            demand, inventory, data, requestTimeDt, config, depth, path,
+        )
 
         val allWos = mutableListOf<Map<String, Any?>>()
         val allPeggingWoNodes = mutableListOf<Map<String, Any?>>()
@@ -1026,8 +1266,8 @@ fun plan(
         var totalMethodAchievable = 0.0
         var anyMethodShort = false
 
-        for ((idx, m) in methods.withIndex()) {
-            val methodQty = qtyPerMethod.getOrElse(idx) { 0.0 }
+        for ((idx, slot) in selected.withIndex()) {
+            val (m, methodQty) = slot
             if (methodQty <= 1e-9) continue
             val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
             val leadDays = leadDaysForMethod(m)
