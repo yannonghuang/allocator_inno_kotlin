@@ -152,11 +152,14 @@ fun checkRunSoundness(
         woQtyByComponent[key] = (woQtyByComponent[key] ?: 0.0) + qty
     }
 
-    // For each demand_id, take the LAST matching pegging tree (matches the
-    // frontend's lookup logic at _CaseSectionPage.tsx:7199 — main planning tree
-    // is the last entry under leaf-engine where consolidatedPegging precedes
-    // planningPegging).
-    val treeByDemand: Map<String, Map<String, Any?>> = planningPegging
+    // For each demand_id, locate its canonical pegging tree. Both engines
+    // produce exactly one entry per demand in planningPegging; consolidated /
+    // synthetic entries in the same list have demand_id=null and are filtered
+    // out below. If a future engine ever emits multiple entries per demand_id,
+    // we'd silently use the last and the soundness check would walk the wrong
+    // tree — make that case explicit by flagging duplicates and tracking them
+    // as cross-demand violations.
+    val peggingByDemand = planningPegging
         .mapNotNull { entry ->
             val did = entry["demand_id"]?.toString() ?: return@mapNotNull null
             if (did.isBlank()) return@mapNotNull null
@@ -164,8 +167,10 @@ fun checkRunSoundness(
             val tree = entry["tree"] as? Map<String, Any?> ?: return@mapNotNull null
             did to tree
         }
-        // Last wins: the canonical main tree under both engines.
-        .toMap()
+        .groupBy({ it.first }, { it.second })
+    val peggingDuplicateDemands = peggingByDemand.filter { it.value.size > 1 }.keys
+    // Last wins (preserves prior behavior when no duplicates exist).
+    val treeByDemand: Map<String, Map<String, Any?>> = peggingByDemand.mapValues { it.value.last() }
 
     // ── Per-demand walk ───────────────────────────────────────────────────────
     val demandReports = mutableListOf<DemandSoundness>()
@@ -244,13 +249,35 @@ fun checkRunSoundness(
         ))
     }
 
-    // ── R7b cross-demand supply.qty bound ─────────────────────────────────────
     val crossViolations = mutableListOf<Violation>()
+
+    // ── R0 pegging-tree uniqueness ────────────────────────────────────────────
+    // If a demand_id appears in planning_pegging more than once, the per-demand
+    // walk silently uses the last entry. Surface the duplicates so a regression
+    // in either engine's pegging emission can't hide behind "last wins."
+    for (did in peggingDuplicateDemands) {
+        val n = peggingByDemand[did]?.size ?: 0
+        crossViolations.add(Violation(
+            rule = "R0_pegging_duplicate",
+            nodePath = "demand:$did",
+            message = "demand_id=$did has $n entries in planning_pegging; expected exactly one canonical tree.",
+            expected = 1,
+            actual = n,
+        ))
+    }
+
+    // ── R7b cross-demand supply.qty bound ─────────────────────────────────────
+    // Tolerance: max(config.tolerance, 1e-9 × available) — the absolute floor
+    // covers small-supply cases (e.g. supply.qty=4 with 6 demands at 0.667
+    // each), the relative term scales for large supplies where summing many
+    // unrounded fair-split takes can drift by more than 1e-6 (FP error grows
+    // with the number of summands; bound by ~N × eps × magnitude).
     for ((supplyId, totalConsumed) in crossDemandSupplyConsumption) {
         val supply = supplyById[supplyId]
         if (supply == null) continue  // R7a already flagged this per-demand
         val available = (supply["qty"] as? Number)?.toDouble() ?: 0.0
-        if (totalConsumed > available + config.tolerance) {
+        val tol = maxOf(config.tolerance, 1e-9 * available)
+        if (totalConsumed > available + tol) {
             crossViolations.add(Violation(
                 rule = "R7b_supply_overconsumption",
                 nodePath = "supply:$supplyId",
@@ -269,10 +296,13 @@ fun checkRunSoundness(
     // construction in normal operation; R7c catches bugs that bypass that path
     // (e.g. pegging-tree edits, save-path corruption, wrong producer attribution).
     // Skipped (no violation) when workOrders is empty — caller didn't pass them.
+    // Tolerance: same shape as R7b — absolute floor for small components,
+    // relative term for large-volume components where Σ over demands drifts.
     if (woQtyByComponent.isNotEmpty()) {
         for ((componentKey, totalConsumed) in crossDemandSyntheticConsumption) {
             val produced = woQtyByComponent[componentKey] ?: 0.0
-            if (totalConsumed > produced + config.tolerance) {
+            val tol = maxOf(config.tolerance, 1e-9 * produced)
+            if (totalConsumed > produced + tol) {
                 crossViolations.add(Violation(
                     rule = "R7c_consolidated_overconsumption",
                     nodePath = "synthetic:$componentKey",
