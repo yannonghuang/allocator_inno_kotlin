@@ -308,21 +308,14 @@ export type PlanningConfig = {
      */
     multiple?: boolean;
     /**
-     * Cap on how many methods can be applied to a single demand. Integer >= 1.
-     * Default 2 (in sync with the backend default). 1 = single best method;
-     * 2-4 = blend the best few.
+     * Waterfall cap: how many ranked methods may be tried before giving up.
+     * Integer >= 1. Default 2 (in sync with the backend default).
+     *   1 = single best method (no fallback)
+     *   2-4 = exhaust best, then resort to lesser only if demand isn't met
+     * Methods are ranked once at the call site (preference int asc, or
+     * elaborate score desc). Inventory carries forward across slots.
      */
     max_methods?: number;
-    /**
-     * How to divide a demand's quantity across the top-`max_methods` selected
-     * methods.
-     *   - "equal":      divide evenly (largest-remainder rounding for integer demand)
-     *   - "score":      proportional to elaborate composite score
-     *   - "preference": proportional to dense-rank-inverse of BOM `preference`
-     * Defaults to "equal". Falls back to equal when scores/preferences are
-     * uniform or zero.
-     */
-    split_mechanism?: 'equal' | 'score' | 'preference';
     /** Relative weights for elaborate scoring. Backend normalizes so absolute values don't matter. */
     score_weights?: { commit_time?: number; inventory_consumed?: number; purchase?: number };
     /** When true, backend iterates depth=1..N picking the first non-improving step (using score_weights). */
@@ -430,17 +423,19 @@ export async function getWorkOrderPegging(
  * Normalize method_selection so the backend always receives canonical
  * `max_methods` instead of the legacy `multiple` boolean. Mirrors the form
  * defaults: `multiple: false` (no max_methods) → 1; `multiple: true` (no
- * max_methods) → 2; nothing set → 2. Drops legacy `multiple` from the
- * outgoing config so saved runs migrate forward.
+ * max_methods) → 2; nothing set → 2. Strips legacy `multiple` and the
+ * obsolete `split_mechanism` (proportional split removed in favor of
+ * waterfall) from the outgoing config so saved runs migrate forward.
  */
 function normalizeMethodSelection(config: PlanningConfig | null | undefined): PlanningConfig | null | undefined {
   if (!config) return config;
   const ms = config.method_selection;
   if (!ms) {
-    return { ...config, method_selection: { max_methods: 2, split_mechanism: 'equal' } };
+    return { ...config, method_selection: { max_methods: 2 } };
   }
-  // Drop legacy `multiple`, derive `max_methods` if absent.
-  const { multiple: legacyMultiple, ...rest } = ms;
+  // Drop legacy `multiple` + obsolete `split_mechanism`. Derive `max_methods` if absent.
+  const { multiple: legacyMultiple, split_mechanism: _drop, ...rest } = ms as typeof ms & { split_mechanism?: unknown };
+  void _drop;
   let max = rest.max_methods;
   if (typeof max !== 'number' || !Number.isFinite(max) || max < 1) {
     max = legacyMultiple === false ? 1 : 2;

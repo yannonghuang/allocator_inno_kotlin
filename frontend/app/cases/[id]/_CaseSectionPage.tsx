@@ -3500,36 +3500,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <option value={4}>4</option>
               </select>
             </label>
-            {/* Split mechanism. Disabled when max_methods=1 (single-method path; nothing to split). */}
-            <label
-              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', cursor: 'pointer', opacity: (() => {
-                const ms = planningConfig.method_selection;
-                const eff = (typeof ms?.max_methods === 'number') ? ms.max_methods : (ms?.multiple === false ? 1 : 2);
-                return eff > 1 ? 1 : 0.4;
-              })() }}
-              title={tP('config.methodSplitMechanismTooltip')}
-            >
-              <span style={{ color: '#a1a1aa' }}>{tP('config.methodSplitMechanism')}</span>
-              <select
-                value={planningConfig.method_selection?.split_mechanism ?? 'equal'}
-                disabled={(() => {
-                  const ms = planningConfig.method_selection;
-                  const eff = (typeof ms?.max_methods === 'number') ? ms.max_methods : (ms?.multiple === false ? 1 : 2);
-                  return eff <= 1;
-                })()}
-                onChange={(e) => setPlanningConfig((c) => {
-                  const v = e.target.value as 'equal' | 'score' | 'preference';
-                  const { multiple: _drop, ...rest } = c.method_selection ?? {};
-                  void _drop;
-                  return { ...c, method_selection: { ...rest, split_mechanism: v } };
-                })}
-                style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
-              >
-                <option value="equal" title={tP('config.methodSplitEqualTooltip')}>{tP('config.methodSplitEqual')}</option>
-                <option value="score" title={tP('config.methodSplitScoreTooltip')}>{tP('config.methodSplitScore')}</option>
-                <option value="preference" title={tP('config.methodSplitPreferenceTooltip')}>{tP('config.methodSplitPreference')}</option>
-              </select>
-            </label>
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
               <input
                 type="checkbox"
