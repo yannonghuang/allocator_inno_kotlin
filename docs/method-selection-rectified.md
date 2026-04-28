@@ -16,11 +16,17 @@ This work generalizes both axes:
    Default **2** (both backend and UI seed the same value, kept in sync).
 2. **Split mechanism** — three options:
    - `equal` — divide demand qty evenly (current behavior).
-   - `score` — weight by the elaborate scorer's composite score
-     (uses the existing `commit_time / inventory_consumed / purchase`
-     weights). Requires the scorer to run regardless of `mode`.
-   - `preference` — weight inversely by the BOM `preference` int
-     (lower preference = higher weight, matching cascade ranking).
+   - `score` — weight by the elaborate scorer's composite score.
+     The scorer already normalizes its three components (commit_time
+     / inventory_consumed / purchase) to `[0, 1]`, so raw scores
+     are directly usable as proportional weights.
+   - `preference` — weight by **rank**, not raw `preference` int.
+     Raw preference values are arbitrary (we've seen negatives like
+     `-7304` and wildly scattered ranges in real data); only the
+     relative ordering matters. The mechanism normalizes to dense
+     ranks `1, 2, 3, …`, then uses `weight_i = 1 / rank_i`. Ties
+     in raw preference share the same rank (and therefore the same
+     weight). See the algorithm details below.
 
 The pattern partly mirrors variants
 ([`variant_selection.topN`](backend-kotlin/src/main/kotlin/com/allocator/services/PlanningEngine.kt#L51-L55)
@@ -92,24 +98,27 @@ Pseudocode:
        Use the existing single-method branch (preserves preference vs. elaborate
        behavior end-to-end). Return [(chosen, demandQty)].
 
-3. Score every method (used for BOTH ranking and weighting; the scoring
-   metric depends on split_mechanism):
+3. Rank + score the methods (semantics differ by split_mechanism):
 
        split_mechanism == "score":
            score_i = composite from scoreMethod(...) using
-           commit_time / inventory_consumed / purchase weights.
-           Higher = better. (Always computed, even when mode == "preference",
+           commit_time / inventory_consumed / purchase weights, in [0, 1].
+           Higher = better. (Always computed, even under mode=preference,
            because the user explicitly asked for score-weighted split.)
 
        split_mechanism == "preference":
-           score_i = 1.0 / (preference_i + 1)
-           Lower preference int → higher score. Stable monotone transform;
-           preserves cascade ranking but yields positive weights.
+           Sort by raw preference int ascending (lower = better).
+           Assign DENSE ranks 1, 2, 3, ... — equal raw values share the
+           same rank, next distinct value advances by 1 (e.g.
+           raw [0, 0, 5, 100] → ranks [1, 1, 2, 3]).
+           score_i = 1.0 / rank_i.
+           Raw values can be negative or arbitrary; only relative position
+           matters. Ties in raw preference get equal share by design.
 
        split_mechanism == "equal":
-           For ranking, fall back to the cfg.mode-appropriate ranking
-           (elaborate → composite score; preference → 1/(pref+1)).
-           Weights are not used for split (see step 6).
+           For ranking only (when |methods| > cap): use the cfg.mode-
+           appropriate score (elaborate → composite; preference → dense
+           rank). Weights are not consumed for the split (step 6).
 
 4. Filter to feasible (drop hard-failed candidates per the existing scorer).
    If filtering leaves 0 methods, fall back to the original list (matches
@@ -120,9 +129,9 @@ Pseudocode:
 6. Allocate qtyPerMethod across the top-`cap` methods:
 
        "equal":
-           Existing logic — base = qty/n, rem = qty%n; first `rem`
+           Existing logic — base = qty/cap, rem = qty%cap; first `rem`
            slots get base+1 for integer demand. Fractional demand:
-           qty/n each.
+           qty/cap each.
 
        "score" or "preference":
            Σ scores → weight_i = score_i / Σ.
@@ -132,7 +141,10 @@ Pseudocode:
 
            Degenerate cases — fall back to equal split:
              - Σ scores ≤ ε
-             - max(score) - min(score) < ε  (all equal)
+             - max(score) - min(score) < ε  (all equal — this is also
+               how the preference path handles all-equal raw values:
+               every method ends up at dense rank 1, so all weights
+               equal 1, and the equal-split fallback fires)
              - score_weights map empty AND mechanism == "score"
                (no signal to weight on)
 
