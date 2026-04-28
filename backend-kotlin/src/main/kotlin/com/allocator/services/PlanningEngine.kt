@@ -502,7 +502,14 @@ private fun normalizeScoreWeights(weights: Map<String, Any?>?): Triple<Double, D
     return Triple(wC / total, wI / total, wP / total)
 }
 
-/** Score a variant by simulating planning its child components. Returns (maxCommit, consumed, purchaseQty, anyFailed). */
+/** Score a variant by simulating planning its child components. Returns (maxCommit, consumed, purchaseQty, anyFailed).
+ *
+ *  `config` MUST be forwarded to the recursive `plan()` call. Defaulting it to
+ *  null is unsafe in this branch: with `parseMaxMethods` defaulting to 2, a
+ *  null config flips the deeper plan into multi-method splitting at every
+ *  multi-candidate site, which is exponential in BOM depth (case-171 hangs).
+ *  Callers pass either the real planner config or a narrowed simConfig
+ *  (max_methods=1, split=equal) when this is invoked from the elaborate scorer. */
 private fun scoreVariant(
     altKey: String,
     childList: List<Map<String, Any?>>,
@@ -512,6 +519,7 @@ private fun scoreVariant(
     leadDays: Double,
     planningPath: Set<Pair<String, String>>,
     depth: Int,
+    config: Map<String, Any?>?,
 ): Quadruple<LocalDate?, Double, Double, Boolean> {
     val invCopy = copyInventory(inventory)
     val beforeQty = invCopy.sumOf { (it["qty"] as? Number)?.toDouble() ?: 0.0 }
@@ -528,7 +536,7 @@ private fun scoreVariant(
             "request_due_time" to formatDate(cReqDt),
             "request_time" to formatDate(cReqDt),
         )
-        val (solvedList, cWos, _) = plan(cDemand, invCopy, data, cReqDt, depth = depth - 1, planningPath = planningPath)
+        val (solvedList, cWos, _) = plan(cDemand, invCopy, data, cReqDt, depth = depth - 1, planningPath = planningPath, config = config)
         for (s in solvedList) {
             val qty = (s["quantity"] as? Number)?.toDouble() ?: 0.0
             val ct = s["commit_time"] as? String
@@ -568,6 +576,7 @@ internal fun firstFeasibleMethod(
     requestTimeDt: LocalDate?,
     depth: Int,
     planningPath: Set<Pair<String, String>>,
+    config: Map<String, Any?>? = null,
 ): Map<String, Any?>? {
     if (methods.isEmpty()) return null
     val productId = demand["product_id"] as? String ?: ""
@@ -583,12 +592,12 @@ internal fun firstFeasibleMethod(
             "purchase" -> false
             "move" -> {
                 val children = childMaterialsForMove(m, quantity)
-                scoreVariant("feasibility", children, inventory, data, reqDt, leadDays, planningPath, depth - 1).fourth
+                scoreVariant("feasibility", children, inventory, data, reqDt, leadDays, planningPath, depth - 1, config).fourth
             }
             "make" -> {
                 val variants = variantsForMake(productId, productionLocation, quantity, m, data)
                 variants.isEmpty() || variants.all { (altKey, childList) ->
-                    scoreVariant(altKey, childList, inventory, data, reqDt, leadDays, planningPath, depth - 1).fourth
+                    scoreVariant(altKey, childList, inventory, data, reqDt, leadDays, planningPath, depth - 1, config).fourth
                 }
             }
             else -> false
@@ -634,12 +643,12 @@ internal fun getPreferredMethodCascade(
             "purchase" -> false
             "move" -> {
                 val children = childMaterialsForMove(m, quantity)
-                scoreVariant("cascade", children, inventory, data, reqDt, leadDays, planningPath, depth - 1).fourth
+                scoreVariant("cascade", children, inventory, data, reqDt, leadDays, planningPath, depth - 1, config).fourth
             }
             "make" -> {
                 val variants = variantsForMake(productId, productionLocation, quantity, m, data)
                 variants.isEmpty() || variants.all { (altKey, childList) ->
-                    scoreVariant(altKey, childList, inventory, data, reqDt, leadDays, planningPath, depth - 1).fourth
+                    scoreVariant(altKey, childList, inventory, data, reqDt, leadDays, planningPath, depth - 1, config).fourth
                 }
             }
             else -> false
@@ -747,7 +756,8 @@ internal fun scoreMethodsForElaborate(
                 if (variants.isEmpty()) return@map Raw(m, LATE_DATE.toEpochDay().toDouble(), 0.0, 0.0, true)
                 val (variantList, _) = getPreferredVariants(
                     variants, invCopy, data, reqDt, leadDays, planningPath, depth - 1, quantity,
-                    multiple = false, scoreWeights = scoreWeights, topN = null
+                    multiple = false, scoreWeights = scoreWeights, topN = null,
+                    config = simConfig,
                 )
                 variantList.flatMap { (cm, _, _) -> cm }
             }
@@ -999,6 +1009,7 @@ fun getPreferredVariants(
     multiple: Boolean? = null,
     scoreWeights: Map<String, Any?>? = null,
     topN: Int? = null,
+    config: Map<String, Any?>? = null,
 ): Pair<List<VariantResultItem>, String> {
     if (variants.isEmpty()) return Pair(emptyList(), "No variants.")
     if (variants.size == 1) {
@@ -1019,7 +1030,7 @@ fun getPreferredVariants(
 
     val needRanking = multiple == false || (topN != null && topN >= 1)
     val scored = variants.map { (altKey, childList) ->
-        val sc = scoreVariant(altKey, childList, inventory, data, reqDt, leadDays, planningPath, depth)
+        val sc = scoreVariant(altKey, childList, inventory, data, reqDt, leadDays, planningPath, depth, config)
         ScoredVariant(sc, altKey, childList, sc.fourth)
     }
 
@@ -1295,7 +1306,7 @@ fun plan(
                 "make" -> {
                     val variants = variantsForMake(productId, productionLocation, methodQty, m, data)
                     val (variantList, ve) = getPreferredVariants(variants, inventory, data, reqDt, leadDays, path, depth, methodQty,
-                        multiple = if (useSingleVariant) false else null, scoreWeights = scoreWeights, topN = topN)
+                        multiple = if (useSingleVariant) false else null, scoreWeights = scoreWeights, topN = topN, config = config)
                     val cm = variantList.flatMap { (childList, _, _) -> childList }
                     if (variantList.size > 1) {
                         woChildrenRelation = if (variantList.all { (childList, _, _) -> childList.size == 1 }) "or" else "and"
@@ -1513,7 +1524,7 @@ fun plan(
                     }
             } else rawVariants
             val (variantList, ve) = getPreferredVariants(variants, inventory, data, reqDt, leadDays, path, depth, demandNetQty,
-                multiple = if (useSingleVariant) false else null, scoreWeights = scoreWeights, topN = topN)
+                multiple = if (useSingleVariant) false else null, scoreWeights = scoreWeights, topN = topN, config = config)
             val cm = variantList.flatMap { (childList, _, _) -> childList }
             if (variantList.size > 1) {
                 woChildrenRelation = if (variantList.all { (childList, _, _) -> childList.size == 1 }) "or" else "and"

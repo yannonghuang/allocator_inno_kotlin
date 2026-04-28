@@ -405,7 +405,7 @@ private fun collectDeepNeeds(
     // always passes a populated inventory; older unit tests that call collectComponentNeeds
     // without inventory rely on the supplyIndex-based structural reachability only.
     if (isRoot && demand != null && methods.isNotEmpty() && inventory.isNotEmpty()) {
-        if (firstFeasibleMethod(methods, demand, inventory, data, dueDate, 500, emptySet()) == null) {
+        if (firstFeasibleMethod(methods, demand, inventory, data, dueDate, 500, emptySet(), planConfig) == null) {
             return
         }
     }
