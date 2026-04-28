@@ -515,11 +515,38 @@ private class WalkContext(
     }
 
     private fun walkPurchase(node: Map<String, Any?>, path: String) {
-        // Purchase leaves are terminal — no per-row validation needed beyond
-        // structural shape. Quantity is whatever plan() committed; pricing /
-        // vendor selection is out of scope for soundness.
-        @Suppress("UNUSED_VARIABLE")
-        val pid = node["product_id"]?.toString()
+        // Purchase leaves are terminal. Pricing / vendor selection is out of
+        // scope for soundness, but the structural fields that downstream
+        // consumers rely on (UI, supply allocation extraction) must be
+        // present and well-formed: pid + lid + non-negative qty. A qty=0
+        // purchase leaf is legitimate (placeholder under a blocked-WO at
+        // line 1381 of PlanningEngine.kt), so only flag qty<0 and missing
+        // identifiers.
+        val pid = (node["product_id"] as? String)?.trim()
+        val lid = (node["location_id"] as? String)?.trim()
+        val qty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
+        if (pid.isNullOrBlank()) {
+            violations.add(Violation(
+                rule = "R7d_purchase_pid_missing",
+                nodePath = path,
+                message = "Purchase leaf has no product_id.",
+            ))
+        }
+        if (lid.isNullOrBlank()) {
+            violations.add(Violation(
+                rule = "R7d_purchase_lid_missing",
+                nodePath = path,
+                message = "Purchase leaf has no location_id.",
+            ))
+        }
+        if (qty < -config.tolerance) {
+            violations.add(Violation(
+                rule = "R7d_purchase_qty_negative",
+                nodePath = path,
+                message = "Purchase leaf has negative quantity: $qty.",
+                actual = qty,
+            ))
+        }
     }
 
     private fun walkWorkOrder(node: Map<String, Any?>, path: String) {
