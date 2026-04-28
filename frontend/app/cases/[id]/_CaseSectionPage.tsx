@@ -3533,10 +3533,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
               <input
                 type="checkbox"
-                checked={planningConfig.method_selection?.elaborate === true}
+                checked={(() => {
+                  const ms = planningConfig.method_selection;
+                  if (ms?.mode === 'elaborate') return true;
+                  if (ms?.mode === 'preference') return false;
+                  return ms?.elaborate === true;
+                })()}
                 onChange={(e) => setPlanningConfig((c) => ({
                   ...c,
-                  method_selection: { ...c.method_selection, elaborate: e.target.checked },
+                  method_selection: {
+                    ...c.method_selection,
+                    elaborate: e.target.checked,
+                    mode: e.target.checked ? 'elaborate' : 'preference',
+                  },
                 }))}
               />
               <span>{tP('config.elaborateMethod')}</span>
