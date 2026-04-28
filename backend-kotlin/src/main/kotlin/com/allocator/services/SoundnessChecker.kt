@@ -157,17 +157,26 @@ fun checkRunSoundness(
         woQtyByComponent[key] = (woQtyByComponent[key] ?: 0.0) + qty
     }
 
-    // For each demand_id, locate its canonical pegging tree. Both engines
-    // produce exactly one entry per demand in planningPegging; consolidated /
-    // synthetic entries in the same list have demand_id=null and are filtered
-    // out below. If a future engine ever emits multiple entries per demand_id,
-    // we'd silently use the last and the soundness check would walk the wrong
-    // tree — make that case explicit by flagging duplicates and tracking them
-    // as cross-demand violations.
+    // For each demand_id, locate its canonical pegging tree.
+    //
+    // Under the leaf-legacy engine, the consolidator (ConsolidationEngine.kt:606-620)
+    // legitimately emits a second entry tagged with the same demand_id but
+    // marked `passthrough: true` — these represent supply-allocation pegging
+    // at deeper (pid, lid) levels needed by the WO-pegging endpoint. They are
+    // NOT alternate views of the demand tree. Filter them out so they don't
+    // count as duplicates of the canonical tree.
+    //
+    // R0_pegging_duplicate then fires only on TRUE duplicates: two or more
+    // canonical-tagged entries for the same demand_id (which would indicate
+    // a real engine emission bug).
     val peggingByDemand = planningPegging
         .mapNotNull { entry ->
             val did = entry["demand_id"]?.toString() ?: return@mapNotNull null
             if (did.isBlank()) return@mapNotNull null
+            // Skip passthrough/consolidated tags — supply-allocation pegging
+            // fragments, not the demand's canonical tree.
+            if (entry["passthrough"] == true) return@mapNotNull null
+            if (entry["consolidated"] == true) return@mapNotNull null
             @Suppress("UNCHECKED_CAST")
             val tree = entry["tree"] as? Map<String, Any?> ?: return@mapNotNull null
             did to tree
