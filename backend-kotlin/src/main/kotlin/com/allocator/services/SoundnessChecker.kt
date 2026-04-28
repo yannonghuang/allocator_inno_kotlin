@@ -355,6 +355,35 @@ private class WalkContext(
             ))
         }
 
+        // R3 — demand-root timing. The plan's commit_time at the root must not
+        // exceed the demand's request_due_time (with request_time as fallback,
+        // matching plan()'s `reqTimeStr` resolution at line 881). Skipped for
+        // committed_qty ≤ 0: a zero-commit demand carries the failure reason in
+        // commit_reason and its commit_time is irrelevant.
+        //
+        // Per-WO R5/R5_lead/R5_transit only catch impossible cases (duration <
+        // lead/transit). Late delivery against the demand's contract is
+        // independent — a fully successful commit_qty can still land after
+        // request_due_time, and nothing else in the checker flags that.
+        if (committed > config.tolerance) {
+            val commitTime = parseDateLocal(tree["commit_time"]?.toString())
+            val dueTimeStr = (demandRow["request_due_time"] as? String)
+                ?: (demandRow["request_time"] as? String)
+            val dueTime = parseDateLocal(dueTimeStr)
+            if (commitTime != null && dueTime != null) {
+                val daysLate = java.time.temporal.ChronoUnit.DAYS.between(dueTime, commitTime)
+                if (daysLate > config.timeToleranceDays) {
+                    violations.add(Violation(
+                        rule = "R3_demand_late",
+                        nodePath = "0",
+                        message = "commit_time=${tree["commit_time"]} is ${daysLate}d after request_due_time=$dueTimeStr.",
+                        expected = dueTimeStr,
+                        actual = tree["commit_time"],
+                    ))
+                }
+            }
+        }
+
         // Recurse into children.
         @Suppress("UNCHECKED_CAST")
         val children = (tree["children"] as? List<Map<String, Any?>>) ?: emptyList()
