@@ -1,6 +1,5 @@
 package com.allocator
 
-import com.allocator.services.SplitMechanism
 import com.allocator.services.resolveMethodSelection
 import com.allocator.services.resolveVariantSelection
 import com.allocator.services.shouldElaborateAtDepth
@@ -143,13 +142,11 @@ class PlanningEngineSelectionConfigTest : FunSpec({
         resolveMethodSelection(mapOf("method_selection" to mapOf("max_methods" to 1.7))).maxMethods shouldBe 1
     }
 
-    test("split_mechanism parses case-insensitively, defaults to EQUAL") {
-        resolveMethodSelection(null).splitMechanism shouldBe SplitMechanism.EQUAL
-        resolveMethodSelection(mapOf("method_selection" to mapOf("split_mechanism" to "equal"))).splitMechanism shouldBe SplitMechanism.EQUAL
-        resolveMethodSelection(mapOf("method_selection" to mapOf("split_mechanism" to "EQUAL"))).splitMechanism shouldBe SplitMechanism.EQUAL
-        resolveMethodSelection(mapOf("method_selection" to mapOf("split_mechanism" to "score"))).splitMechanism shouldBe SplitMechanism.SCORE
-        resolveMethodSelection(mapOf("method_selection" to mapOf("split_mechanism" to "Preference"))).splitMechanism shouldBe SplitMechanism.PREFERENCE
-        resolveMethodSelection(mapOf("method_selection" to mapOf("split_mechanism" to "garbage"))).splitMechanism shouldBe SplitMechanism.EQUAL
+    test("split_mechanism is silently ignored on input (legacy field)") {
+        // Old plan_run configs may still carry split_mechanism; backend must not trip on it.
+        val cfg = resolveMethodSelection(mapOf("method_selection" to mapOf("split_mechanism" to "score")))
+        cfg.maxMethods shouldBe 2  // unaffected
+        cfg.mode shouldBe "preference"
     }
 
     // ── method_selection.score_weights (drives elaborate scoring) ────────────

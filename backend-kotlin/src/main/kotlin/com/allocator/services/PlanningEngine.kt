@@ -37,18 +37,13 @@ private val LATE_DATE = LocalDate.of(9999, 12, 31)
 // concept. Variant config is just the equal-split / scoring knobs it has
 // always been (`multiple`, `score_weights`, `top_n`).
 
-/** How a demand's quantity is divided across the top-N selected methods. */
-internal enum class SplitMechanism { EQUAL, SCORE, PREFERENCE }
-
 /** Effective method_selection config. */
 internal data class MethodSelectionConfig(
-    val mode: String,        // "preference" | "elaborate"
-    val depth: Int,          // >= 1
-    val multiple: Boolean,
-    /** Cap on how many methods can be applied to a single demand. >= 1; default 2. */
+    val mode: String,        // "preference" | "elaborate"  — ranking source for waterfall
+    val depth: Int,          // >= 1                        — gate for both elaborate and waterfall
+    val multiple: Boolean,                                 //   legacy back-compat parse only
+    /** Cap on how many methods waterfall may invoke per demand. >= 1; default 2. */
     val maxMethods: Int,
-    /** How a demand's qty is divided across the selected top-`maxMethods` methods. */
-    val splitMechanism: SplitMechanism,
     val scoreWeights: Map<String, Any?>?,  // drives elaborate scoring (commit_time / inventory_consumed / purchase)
     val depthOptimal: Boolean = false,     // when true, caller iterates depth=1..N picking the first non-improving step
 ) {
@@ -102,20 +97,6 @@ private fun parseMaxMethods(rawMax: Any?, multiple: Boolean, multiplePresent: Bo
     return DEFAULT_MAX_METHODS
 }
 
-/** Parse split_mechanism case-insensitively; warn on unknown values and default to EQUAL. */
-private fun parseSplitMechanism(raw: Any?): SplitMechanism {
-    if (raw == null) return SplitMechanism.EQUAL
-    return when ((raw as? String)?.trim()?.lowercase()) {
-        "equal", "" -> SplitMechanism.EQUAL
-        "score" -> SplitMechanism.SCORE
-        "preference" -> SplitMechanism.PREFERENCE
-        else -> {
-            log.warn("Invalid method_selection.split_mechanism={}; defaulting to equal", raw)
-            SplitMechanism.EQUAL
-        }
-    }
-}
-
 /**
  * Resolve the effective method_selection config.
  *
@@ -141,7 +122,6 @@ internal fun resolveMethodSelection(config: Map<String, Any?>?): MethodSelection
     val multiple = raw["multiple"] == true
     val multiplePresent = raw.containsKey("multiple") && raw["multiple"] is Boolean
     val maxMethods = parseMaxMethods(raw["max_methods"], multiple, multiplePresent)
-    val splitMechanism = parseSplitMechanism(raw["split_mechanism"])
     @Suppress("UNCHECKED_CAST")
     val methodWeights = raw["score_weights"] as? Map<String, Any?>
     val weights = methodWeights ?: run {
@@ -157,7 +137,6 @@ internal fun resolveMethodSelection(config: Map<String, Any?>?): MethodSelection
         depth = depth,
         multiple = multiple,
         maxMethods = maxMethods,
-        splitMechanism = splitMechanism,
         scoreWeights = weights,
         depthOptimal = depthOptimal,
     )
@@ -671,9 +650,9 @@ internal fun getPreferredMethodCascade(
  * root, or when only one method exists.
  */
 /**
- * Per-method elaborate score, used both by the single-method picker
- * (`getPreferredMethodElaborate`) and by the multi-method splitter
- * (`selectAndSplitMethods` for `split_mechanism = score`).
+ * Per-method elaborate score, used by the single-method picker
+ * (`getPreferredMethodElaborate`) and as the rank source for waterfall
+ * allocation when `mode = elaborate`.
  *
  * `score` is in `[0, 1]` for non-failed methods (composite of
  * commit_time / inventory_consumed / purchase normalized by their
@@ -713,18 +692,15 @@ internal fun scoreMethodsForElaborate(
 
     // The recursive plan() calls below are pure simulations — used to measure
     // each candidate method's commit_time / inventory_consumed / purchase
-    // metrics, not to commit. To avoid exponential blow-up (`split_mechanism =
-    // score` with `max_methods >= 2` would otherwise re-enter scoring at every
-    // multi-method site in the simulated subtree), force the simulation to use
-    // single-method preference selection. Real planning behavior is unchanged
-    // — only the per-method probe runs cheaper.
+    // metrics, not to commit. Force the simulation to single-method preference
+    // selection so a deep multi-method site doesn't re-enter scoring (the
+    // simulation is cost-only, multi-method semantics aren't useful here).
     val simConfig: Map<String, Any?> = (config ?: emptyMap()) + mapOf(
         "method_selection" to (
             ((config?.get("method_selection") as? Map<*, *>)
                 ?.let { @Suppress("UNCHECKED_CAST") (it as Map<String, Any?>) }
                 ?: emptyMap()) + mapOf(
                 "max_methods" to 1,
-                "split_mechanism" to "equal",
             )
         ),
     )
@@ -840,152 +816,6 @@ internal fun getPreferredMethodElaborate(
     val loc = (best.method["location_id"] ?: best.method["to_location_id"] ?: "").toString()
     return Pair(best.method, "Chosen (elaborate score): ${best.method["type"]} @ $loc " +
         "(inventory_consumed=${best.consumed.toLong()}, purchase=${best.purchase.toLong()}).")
-}
-
-// ── Multi-method split mechanics ──────────────────────────────────────────────
-
-/**
- * Assign dense ranks to methods by their raw `preference` int (lower is better,
- * matching the cascade ranking convention).
- *
- * Equal raw values share the same rank, and the next distinct value advances by 1
- * (e.g. raw `[0, 0, 5, 100]` → ranks `[1, 1, 2, 3]`). Returns the same number of
- * elements as the input, in input order, paired with the assigned rank. Methods
- * with a missing or non-numeric `preference` get the largest possible rank
- * (last-resort tier) so they never out-weight a method with a real preference.
- */
-internal fun denseRankByPreference(
-    methods: List<Map<String, Any?>>,
-): List<Pair<Map<String, Any?>, Int>> {
-    if (methods.isEmpty()) return emptyList()
-    fun pref(m: Map<String, Any?>): Long? = (m["preference"] as? Number)?.toLong()
-    val distinctSorted = methods.mapNotNull { pref(it) }.toSortedSet().toList()
-    val rankOf: Map<Long, Int> = distinctSorted.withIndex().associate { (i, v) -> v to (i + 1) }
-    val missingRank = distinctSorted.size + 1
-    return methods.map { m ->
-        val r = pref(m)?.let { rankOf[it] } ?: missingRank
-        m to r
-    }
-}
-
-/**
- * Equal split of a quantity across `n` slots. Integer-aware: when `qty` is a
- * whole integer, distributes the remainder to the first slots (largest-remainder
- * with integer demand). Fractional `qty` divides evenly.
- *
- * Mirrors the existing block at the multi-method site so we get one
- * authoritative implementation.
- */
-internal fun equalSplitQty(qty: Double, n: Int): List<Double> {
-    if (n <= 0) return emptyList()
-    if (n == 1) return listOf(qty)
-    val asLong = qty.toLong()
-    val isInteger = abs(qty - asLong.toDouble()) < 1e-9
-    return if (isInteger) {
-        val base = asLong / n
-        val rem = (asLong % n).toInt()
-        List(rem) { (base + 1).toDouble() } + List(n - rem) { base.toDouble() }
-    } else {
-        List(n) { qty / n }
-    }
-}
-
-/**
- * Proportional split of a quantity by per-slot weights.
- *
- * For integer `qty`, uses largest-remainder rounding so the slots sum exactly to
- * `qty`. For fractional `qty`, returns `qty * (w_i / Σw_i)` directly.
- *
- * Falls back to [equalSplitQty] when weights are degenerate:
- * sum ≤ ε, all weights equal, or the list is empty.
- */
-internal fun proportionalSplitQty(qty: Double, weights: List<Double>): List<Double> {
-    if (weights.isEmpty()) return emptyList()
-    val n = weights.size
-    val nonNeg = weights.map { it.coerceAtLeast(0.0) }
-    val total = nonNeg.sum()
-    val span = (nonNeg.maxOrNull() ?: 0.0) - (nonNeg.minOrNull() ?: 0.0)
-    if (total <= 1e-12 || span <= 1e-12) return equalSplitQty(qty, n)
-
-    val asLong = qty.toLong()
-    val isInteger = abs(qty - asLong.toDouble()) < 1e-9
-    if (!isInteger) {
-        return nonNeg.map { qty * (it / total) }
-    }
-    // Largest-remainder rounding: floor each share, then distribute the leftover
-    // units one by one to the slots with the largest fractional remainders.
-    val exact = nonNeg.map { qty * (it / total) }
-    val floored = exact.map { kotlin.math.floor(it).toLong() }.toMutableList()
-    var leftover = (asLong - floored.sum()).toInt()
-    if (leftover > 0) {
-        val remainderOrder = exact.withIndex()
-            .map { (i, e) -> i to (e - kotlin.math.floor(e)) }
-            .sortedByDescending { it.second }
-            .map { it.first }
-        var k = 0
-        while (leftover > 0 && k < remainderOrder.size) {
-            floored[remainderOrder[k]] = floored[remainderOrder[k]] + 1
-            leftover -= 1
-            k += 1
-        }
-    }
-    return floored.map { it.toDouble() }
-}
-
-/**
- * Pick the top-`max_methods` methods for a demand and split its qty across
- * them, per `method_selection.split_mechanism`. Only invoked when
- * `min(cfg.maxMethods, methods.size) > 1`; the single-method path handles
- * `cap == 1` via the existing `getPreferredMethod*` flow.
- *
- * Returns `(method, allocated qty)` pairs in selection order. Conservation
- * holds by construction: Σ allocated qty == demandNetQty (within FP epsilon
- * for fractional demands, exactly for integer demands via largest-remainder).
- */
-internal fun selectAndSplitMethods(
-    methods: List<Map<String, Any?>>,
-    demandNetQty: Double,
-    cfg: MethodSelectionConfig,
-    demand: Map<String, Any?>,
-    inventory: List<Map<String, Any?>>,
-    data: Map<String, List<Map<String, Any?>>>,
-    requestTimeDt: LocalDate?,
-    config: Map<String, Any?>?,
-    depth: Int,
-    planningPath: Set<Pair<String, String>>,
-): List<Pair<Map<String, Any?>, Double>> {
-    if (methods.isEmpty()) return emptyList()
-    val cap = cfg.maxMethods.coerceAtMost(methods.size)
-    if (cap < 1) return emptyList()
-
-    // Score each method by the metric appropriate to the chosen mechanism.
-    // EQUAL falls back to the cfg.mode-appropriate metric so the top-cap
-    // ranking still picks "best" when methods.size > cap.
-    val metric: SplitMechanism = when (cfg.splitMechanism) {
-        SplitMechanism.SCORE, SplitMechanism.PREFERENCE -> cfg.splitMechanism
-        SplitMechanism.EQUAL -> if (cfg.elaborate) SplitMechanism.SCORE else SplitMechanism.PREFERENCE
-    }
-    val weighted: List<Pair<Map<String, Any?>, Double>> = when (metric) {
-        SplitMechanism.SCORE -> {
-            val msList = scoreMethodsForElaborate(methods, demand, inventory, data, requestTimeDt, config, depth, planningPath)
-            // coerceAtLeast(0): failed methods carry score=-1e9, which we don't
-            // want bleeding into proportional weights.
-            msList.map { it.method to it.score.coerceAtLeast(0.0) }
-        }
-        SplitMechanism.PREFERENCE -> {
-            denseRankByPreference(methods).map { (m, rank) -> m to (1.0 / rank) }
-        }
-        SplitMechanism.EQUAL -> error("unreachable: EQUAL was rewritten above")
-    }
-
-    val top = weighted.sortedByDescending { it.second }.take(cap)
-    val topMethods = top.map { it.first }
-    val topWeights = top.map { it.second }
-    val qtys: List<Double> = when (cfg.splitMechanism) {
-        SplitMechanism.EQUAL -> equalSplitQty(demandNetQty, top.size)
-        SplitMechanism.SCORE, SplitMechanism.PREFERENCE -> proportionalSplitQty(demandNetQty, topWeights)
-    }
-    return topMethods.zip(qtys)
 }
 
 // ── Variant selection ──────────────────────────────────────────────────────────
@@ -1271,187 +1101,9 @@ fun plan(
     val methodCfg = resolveMethodSelection(config)
     val variantCfg = resolveVariantSelection(config)
     val useElaborateMethod = methodCfg.elaborate
-    val effectiveMaxMethods = methodCfg.maxMethods.coerceAtMost(methods.size)
-    val useMultipleMethods = effectiveMaxMethods > 1
     val useSingleVariant = variantCfg.multiple == false
     val scoreWeights = variantCfg.scoreWeights
     val topN = variantCfg.topN
-
-    // ── Multiple methods: pick top-`max_methods` and split per `split_mechanism` ──
-    //
-    // selectAndSplitMethods returns (method, allocated qty) pairs in selection order.
-    // For each pair we run the existing per-method first-pass / second-pass /
-    // bottleneck logic — that part is untouched, only the upstream picker changed.
-    if (useMultipleMethods) {
-        val selected = selectAndSplitMethods(
-            methods, demandNetQty, methodCfg,
-            demand, inventory, data, requestTimeDt, config, depth, path,
-        )
-
-        val allWos = mutableListOf<Map<String, Any?>>()
-        val allPeggingWoNodes = mutableListOf<Map<String, Any?>>()
-        var latestCommit: LocalDate? = null
-        val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
-        var totalMethodAchievable = 0.0
-        var anyMethodShort = false
-
-        for ((idx, slot) in selected.withIndex()) {
-            val (m, methodQty) = slot
-            if (methodQty <= 1e-9) continue
-            val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
-            val leadDays = leadDaysForMethod(m)
-
-            var woChildrenRelation: String? = null
-            val (childMaterials, variantExplanation) = when (m["type"]) {
-                "make" -> {
-                    val variants = variantsForMake(productId, productionLocation, methodQty, m, data)
-                    val (variantList, ve) = getPreferredVariants(variants, inventory, data, reqDt, leadDays, path, depth, methodQty,
-                        multiple = if (useSingleVariant) false else null, scoreWeights = scoreWeights, topN = topN, config = config)
-                    val cm = variantList.flatMap { (childList, _, _) -> childList }
-                    if (variantList.size > 1) {
-                        woChildrenRelation = if (variantList.all { (childList, _, _) -> childList.size == 1 }) "or" else "and"
-                    } else if (variantList.size == 1 && (variantList[0].first.size) > 1) {
-                        woChildrenRelation = "and"
-                    }
-                    Pair(cm, ve)
-                }
-                "move" -> Pair(childMaterialsForMove(m, methodQty), "")
-                else -> Pair(emptyList(), "")
-            }
-
-            // Snapshot inventory so we can restore before the second pass if a deeper cap is found.
-            val methodInvSnap = copyInventory(inventory)
-            // Snapshot budget — same reason as the single-method path: the first
-            // pass's exploratory consumeFromInventory calls decrement budget;
-            // the second pass needs the original cap to draw at the rescaled qty.
-            val methodBudgetSnap: Map<String, Double>? = budget?.toMap()
-
-            // ── First pass: plan each child at its full needed qty ───────────
-            val methodChildResults = mutableListOf<ChildPassResult>()
-            for (c in childMaterials) {
-                if (m["type"] == "make") {
-                    val parentKey = productId.trim()
-                    val childKey = (c["product_id"] as? String)?.trim() ?: ""
-                    if (Pair(parentKey, childKey) in REAL_BOM_PAIRS) {
-                        log.info("planning: real BOM (VIRTUAL<>Y) parent={} child={} demand={} qty={} (equal-split)", parentKey, childKey, demandId, c["quantity"])
-                    }
-                }
-                val cReqDt = dateAddDays(reqDt, -leadDays)
-                val neededQty = (c["quantity"] as? Number)?.toDouble() ?: 0.0
-                val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
-                    "quantity" to neededQty, "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
-                val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget)
-                // effectiveQty: sum of qty committed by non-hard-failure rows, excluding cycle
-                // terminators (which return no physical supply). Matches L991-996 in single-method path.
-                val effectiveQty = solvedList.sumOf { s ->
-                    val r = s["commit_reason"] as? String
-                    if (r == "cycle_stopped" || r == "cycle_detected") 0.0
-                    else if (!isHardPlanningFailure(r)) (s["quantity"] as? Number)?.toDouble() ?: 0.0
-                    else 0.0
-                }
-                val cTimes = solvedList.mapNotNull { s -> parseDate(s["commit_time"] as? String) }
-                methodChildResults.add(ChildPassResult(c, neededQty, effectiveQty, cWos, cPegging, cTimes))
-            }
-
-            val methodChildShort = methodChildResults.any { cr -> cr.effectiveQty < cr.neededQty - 1e-9 }
-            var methodAchievable: Double
-            val childWos = mutableListOf<Map<String, Any?>>()
-            val commitTimes = mutableListOf<LocalDate>()
-            val childPeggingNodes = mutableListOf<Map<String, Any?>>()
-
-            if (!methodChildShort || childMaterials.isEmpty()) {
-                methodAchievable = methodQty
-                methodChildResults.forEach { cr ->
-                    childWos.addAll(cr.wos)
-                    if (cr.pegging != null) childPeggingNodes.add(cr.pegging)
-                    commitTimes.addAll(cr.cTimes)
-                }
-            } else {
-                // AND-bottleneck (min over children) or OR-additive (Σ over variants).
-                // OR is detected per-method-slot via woChildrenRelation set above.
-                val (rawAchievable, isOrSplit) = computeRawAchievable(methodChildResults, methodQty, woChildrenRelation)
-                // Conservation: floor a fractional cap so Math.round can't round it
-                // UP (Math.round(0.5)=1) and emit a WO that over-claims its children.
-                // 1e-6 is FP-noise only; lot-quantization slop is absorbed by the R4
-                // checker's own tolerance.
-                val capped = if (rawAchievable >= methodQty - 1e-6) methodQty
-                             else floor(rawAchievable).coerceIn(0.0, methodQty)
-                if (capped <= 1e-9) {
-                    // This method is completely blocked — deep raw material is exhausted.
-                    // Contribute 0 to the split and preserve the first-pass pegging so the UI
-                    // still shows WHICH child hit zero. No WO is emitted for this slot.
-                    methodChildResults.forEach { cr ->
-                        if (cr.pegging != null) childPeggingNodes.add(cr.pegging)
-                    }
-                    val methodType = m["type"] as? String ?: ""
-                    allPeggingWoNodes.add(buildWoNode(productId, productionLocation, 0.0, methodType, m,
-                        reqDt, null, 0, 0.0,
-                        "Equal split: ${methodType}@${productionLocation} blocked (deep child exhausted; 0 of ${roundQty(methodQty).toLong()})",
-                        variantExplanation, woChildrenRelation, childPeggingNodes))
-                    anyMethodShort = true
-                    continue
-                }
-                methodAchievable = capped
-                anyMethodShort = true
-
-                if (isOrSplit) {
-                    // OR-relation: variants already represent independent partial attempts.
-                    // No uniform rescale; use first-pass results.
-                    methodChildResults.forEach { cr ->
-                        childWos.addAll(cr.wos)
-                        if (cr.pegging != null) childPeggingNodes.add(cr.pegging)
-                        commitTimes.addAll(cr.cTimes)
-                    }
-                } else {
-                    // ── Second pass: restore inventory + budget and re-plan at scaled qty ──
-                    inventory.clear()
-                    inventory.addAll(methodInvSnap)
-                    if (budget != null && methodBudgetSnap != null) {
-                        budget.clear()
-                        budget.putAll(methodBudgetSnap)
-                    }
-                    val scale = methodAchievable / methodQty
-                    val scaledChildren = scaleChildMaterials(childMaterials, scale)
-                    for (c in scaledChildren) {
-                        val cReqDt = dateAddDays(reqDt, -leadDays)
-                        val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
-                            "quantity" to c["quantity"], "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
-                        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget)
-                        childWos.addAll(cWos)
-                        if (cPegging != null) childPeggingNodes.add(cPegging)
-                        solvedList.forEach { s -> parseDate(s["commit_time"] as? String)?.let { commitTimes.add(it) } }
-                    }
-
-                    // Move conservation: see single-method path for rationale.
-                    if (m["type"] == "move") {
-                        val childCommit = childPeggingNodes.firstOrNull()?.let {
-                            (it["committed_qty"] as? Number)?.toDouble()
-                        }
-                        if (childCommit != null && childCommit < methodAchievable - 1e-6) {
-                            methodAchievable = floor(childCommit).coerceAtLeast(0.0)
-                        }
-                    }
-                }
-            }
-
-            val startDt = computeStartDt(reqDt, leadDays, commitTimes)
-            val (wos, lotCount, lastEnd, lotSizeVal) = buildWorkOrders(productId, productionLocation, methodAchievable, leadDays, startDt, m, demandId, data)
-            allWos.addAll(wos); allWos.addAll(childWos)
-            if (lastEnd != null && (latestCommit == null || lastEnd > latestCommit)) latestCommit = lastEnd
-
-            val methodType = m["type"] as? String ?: ""
-            val methodLabel = "$methodType@$productionLocation"
-            val woChildren = if (methodType == "purchase") listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to roundQty(methodAchievable), "children" to emptyList<Any>()))
-                             else childPeggingNodes
-            val methodLabelExpl = "Equal split: $methodLabel (qty ${roundQty(methodAchievable).toLong()} of ${roundQty(methodQty).toLong()})"
-            allPeggingWoNodes.add(buildWoNode(productId, productionLocation, methodAchievable, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodLabelExpl, variantExplanation, woChildrenRelation, woChildren))
-            totalMethodAchievable += methodAchievable
-        }
-
-        val partialReason = if (anyMethodShort && totalMethodAchievable < demandNetQty - 1e-9) "partial" else null
-        demandFulfilledList.add(committedRow(totalMethodAchievable, formatDate(latestCommit), partialReason))
-        return Triple(demandFulfilledList, allWos, demandNode(allPeggingWoNodes, formatDate(latestCommit), partialReason, committedQty = taken + totalMethodAchievable))
-    }
 
     // ── Override lookup for this (product, location, demand) ──────────────────
     // Exact match only: demand-specific WOs match demand-scoped keys; null-demand WOs match
