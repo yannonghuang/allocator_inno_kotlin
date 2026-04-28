@@ -426,11 +426,34 @@ export async function getWorkOrderPegging(
 }
 
 /** Start async plan; returns job_id. Poll getPlanStatus(caseId, job_id) for progress and result. */
+/**
+ * Normalize method_selection so the backend always receives canonical
+ * `max_methods` instead of the legacy `multiple` boolean. Mirrors the form
+ * defaults: `multiple: false` (no max_methods) → 1; `multiple: true` (no
+ * max_methods) → 2; nothing set → 2. Drops legacy `multiple` from the
+ * outgoing config so saved runs migrate forward.
+ */
+function normalizeMethodSelection(config: PlanningConfig | null | undefined): PlanningConfig | null | undefined {
+  if (!config) return config;
+  const ms = config.method_selection;
+  if (!ms) {
+    return { ...config, method_selection: { max_methods: 2, split_mechanism: 'equal' } };
+  }
+  // Drop legacy `multiple`, derive `max_methods` if absent.
+  const { multiple: legacyMultiple, ...rest } = ms;
+  let max = rest.max_methods;
+  if (typeof max !== 'number' || !Number.isFinite(max) || max < 1) {
+    max = legacyMultiple === false ? 1 : 2;
+  }
+  return { ...config, method_selection: { ...rest, max_methods: max } };
+}
+
 export async function runPlanAsync(caseId: number, config?: PlanningConfig | null): Promise<{ job_id: string }> {
+  const normalized = normalizeMethodSelection(config);
   const r = await fetch(`${API}/cases/${caseId}/plan`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ config: config ?? undefined, async: true }),
+    body: JSON.stringify({ config: normalized ?? undefined, async: true }),
   });
   if (r.status !== 202) {
     const text = await r.text();

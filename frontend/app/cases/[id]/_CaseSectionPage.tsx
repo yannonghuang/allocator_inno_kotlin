@@ -3724,25 +3724,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               // Contingent runs are blocked from re-plan by the disabled guard, so currentPlanRunId
               // here is always either null or a success run.
               setOverrideCandidateRunId(currentPlanRunId);
-              // Normalize method_selection at submit time:
-              //   1. If `max_methods` isn't set, derive it from legacy `multiple` (false→1, true→2)
-              //      or fall back to the default (2). This matches the form's display semantics
-              //      so what the user sees in the Max dropdown is what the backend receives.
-              //   2. Drop legacy `multiple`. New flows write `max_methods` only.
-              const ms = planningConfig.method_selection;
-              const normalized: PlanningConfig = (() => {
-                if (!ms) {
-                  return { ...planningConfig, method_selection: { max_methods: 2, split_mechanism: 'equal' as const } };
-                }
-                const { multiple: _drop, ...rest } = ms;
-                void _drop;
-                let max = rest.max_methods;
-                if (typeof max !== 'number' || !Number.isFinite(max) || max < 1) {
-                  max = ms.multiple === false ? 1 : 2;
-                }
-                return { ...planningConfig, method_selection: { ...rest, max_methods: max } };
-              })();
-              const config = Object.keys(normalized).length ? normalized : undefined;
+              // runPlanAsync normalizes method_selection (drops legacy `multiple`,
+              // derives `max_methods` if absent) so we don't duplicate that here.
+              const config = Object.keys(planningConfig).length ? planningConfig : undefined;
               try {
                 const { job_id } = await runPlanAsync(id, config);
                 setPlanJobId(job_id);
