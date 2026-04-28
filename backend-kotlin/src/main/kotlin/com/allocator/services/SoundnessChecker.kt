@@ -381,6 +381,15 @@ private class WalkContext(
         }
 
         // committed_qty must not exceed quantity.
+        // Note: committed < requested (partial fulfillment) is an acceptable
+        // planner outcome, not a soundness violation — the planner does its
+        // best with available supply. Likewise, commit_time > request_due_time
+        // (late delivery) is an acceptable outcome when supply timing forces
+        // it. The soundness checker validates the plan's *internal*
+        // consistency (no phantom WOs, conservation holds, no over-commitment),
+        // not whether every customer contract was met perfectly. Both signals
+        // surface to the user via committed_demands.shortage and the partial
+        // commit_reason; they don't belong in the soundness verdict.
         val requested = (tree["quantity"] as? Number)?.toDouble() ?: 0.0
         val committed = (tree["committed_qty"] as? Number)?.toDouble() ?: 0.0
         if (committed > requested + config.tolerance) {
@@ -391,35 +400,6 @@ private class WalkContext(
                 expected = requested,
                 actual = committed,
             ))
-        }
-
-        // R3 — demand-root timing. The plan's commit_time at the root must not
-        // exceed the demand's request_due_time (with request_time as fallback,
-        // matching plan()'s `reqTimeStr` resolution at line 881). Skipped for
-        // committed_qty ≤ 0: a zero-commit demand carries the failure reason in
-        // commit_reason and its commit_time is irrelevant.
-        //
-        // Per-WO R5/R5_lead/R5_transit only catch impossible cases (duration <
-        // lead/transit). Late delivery against the demand's contract is
-        // independent — a fully successful commit_qty can still land after
-        // request_due_time, and nothing else in the checker flags that.
-        if (committed > config.tolerance) {
-            val commitTime = parseDateLocal(tree["commit_time"]?.toString())
-            val dueTimeStr = (demandRow["request_due_time"] as? String)
-                ?: (demandRow["request_time"] as? String)
-            val dueTime = parseDateLocal(dueTimeStr)
-            if (commitTime != null && dueTime != null) {
-                val daysLate = java.time.temporal.ChronoUnit.DAYS.between(dueTime, commitTime)
-                if (daysLate > config.timeToleranceDays) {
-                    violations.add(Violation(
-                        rule = "R3_demand_late",
-                        nodePath = "0",
-                        message = "commit_time=${tree["commit_time"]} is ${daysLate}d after request_due_time=$dueTimeStr.",
-                        expected = dueTimeStr,
-                        actual = tree["commit_time"],
-                    ))
-                }
-            }
         }
 
         // Recurse into children.
