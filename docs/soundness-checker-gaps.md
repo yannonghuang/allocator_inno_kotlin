@@ -45,9 +45,13 @@ so the user can opt into R8 before clicking "check soundness."
 ## Notable findings surfaced
 
 **R0_pegging_duplicate** flagged 8 demands on run 386 with multiple
-entries in `planning_pegging` — 6 synthetic `Negative_Inventory_*`
-placeholders + 2 user demands. Indicates a leaf-engine emission bug;
-the supply engine is clean. Tracked as planner work.
+entries in `planning_pegging`. Investigation showed this was a checker
+false positive — the leaf-legacy consolidator legitimately emits a
+second `passthrough: true` entry per consuming demand for the WO-pegging
+endpoint. Resolved on `fix/planner-soundness-followups` (`758ac52`):
+filter passthrough/consolidated entries before grouping. R0 still fires
+on TRUE duplicates (two canonical-tagged trees per demand_id), which
+would indicate a real engine bug.
 
 ## Held as future work
 
@@ -57,11 +61,7 @@ R9 covers `method_selection` overrides. `variant_selection` overrides
 force a specific `alt_group`, but the WO doesn't directly carry alt_group
 — the check would need to look up each child's alt_group via BOM at
 walk time and assert that the children all come from the forced group.
-Not done.
 
-### Planner bug filed by R0_pegging_duplicate
-
-The leaf-engine duplicate-pegging emission is a planner-side fix, not a
-checker fix. The checker now surfaces it; the next planner-debug session
-should investigate the consolidator path that emits both per-demand and
-synthetic entries under the same demand_id.
+**Lower priority**: variant-override is currently disabled on the UI,
+so the planner doesn't receive these from users in normal operation.
+Worth implementing if and when that toggle is re-enabled.
