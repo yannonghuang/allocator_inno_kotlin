@@ -103,6 +103,10 @@ data class SoundnessReport(
  * @param workOrders the run's `work_orders` field. Used to validate consumption
  *        of synthetic `consolidated_<pid>_<lid>` supply buckets against the
  *        producing WOs at that (pid, lid). Pass an empty list to skip R7c.
+ * @param committedDemands the run's `committed_demands` field. Used to check
+ *        that each demand's reported committed quantity matches its pegging
+ *        tree's root.committed_qty. Pass an empty list to skip the consistency
+ *        check.
  */
 fun checkRunSoundness(
     planningPegging: List<Map<String, Any?>>,
@@ -110,6 +114,7 @@ fun checkRunSoundness(
     data: Map<String, List<Map<String, Any?>>>,
     config: SoundnessConfig = SoundnessConfig(),
     workOrders: List<Map<String, Any?>> = emptyList(),
+    committedDemands: List<Map<String, Any?>> = emptyList(),
 ): SoundnessReport {
     // Index demands by id and lookup tables for rule checks.
     val demandById: Map<String, Map<String, Any?>> = demands.associateBy { it["demand_id"]?.toString() ?: "" }
@@ -118,6 +123,20 @@ fun checkRunSoundness(
     val methodMoves = data["method_move"] ?: emptyList()
     val supplies = data["supply"] ?: emptyList()
     val supplyById: Map<String, Map<String, Any?>> = supplies.associateBy { it["supply_id"]?.toString() ?: "" }
+
+    // committed_demands is the per-demand fulfillment summary that flows to
+    // KPIs / UI / shortage reporting; planning_pegging is the parallel pegging
+    // tree. Both are derived from the same plan() invocation but via separate
+    // accumulator paths in runPlanning, so a divergence indicates a bookkeeping
+    // bug in one of them. Index by demand_id; if a demand has multiple rows
+    // (legacy paths sometimes append per-iteration), sum their `quantity`.
+    val committedQtyById = mutableMapOf<String, Double>()
+    for (row in committedDemands) {
+        val did = row["demand_id"]?.toString() ?: continue
+        if (did.isBlank()) continue
+        val q = (row["quantity"] as? Number)?.toDouble() ?: 0.0
+        committedQtyById[did] = (committedQtyById[did] ?: 0.0) + q
+    }
 
     // Total WO production at each (pid, lid). Used by R7c to bound consumption
     // of the synthetic `consolidated_<pid>_<lid>` inventory bucket emitted by
@@ -196,6 +215,26 @@ fun checkRunSoundness(
         perDemandSupplyConsumption.putAll(ctx.supplyConsumption)
         for ((compKey, qty) in ctx.syntheticConsumption) {
             crossDemandSyntheticConsumption.merge(compKey, qty, Double::plus)
+        }
+
+        // R0_committed_consistency — committed_demands.quantity must match the
+        // pegging tree root's committed_qty for the same demand. Both are
+        // derived from the same plan() output but populated via separate
+        // accumulators; a divergence means one of them is wrong (typically
+        // the save / enrichment path that populates committed_demands). Skip
+        // when committedDemands wasn't passed to the checker.
+        if (committedQtyById.isNotEmpty()) {
+            val tableQty = committedQtyById[demandId]
+            val treeQty = (tree["committed_qty"] as? Number)?.toDouble() ?: 0.0
+            if (tableQty != null && abs(tableQty - treeQty) > config.tolerance) {
+                ctx.violations.add(Violation(
+                    rule = "R0_committed_consistency",
+                    nodePath = "0",
+                    message = "committed_demands.quantity=$tableQty doesn't match pegging root.committed_qty=$treeQty for demand $demandId.",
+                    expected = treeQty,
+                    actual = tableQty,
+                ))
+            }
         }
 
         demandReports.add(DemandSoundness(
