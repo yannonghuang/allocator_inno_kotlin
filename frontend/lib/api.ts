@@ -250,7 +250,7 @@ export type PlanningPeggingEntry = {
   per_demand_allocations?: Record<string, number> | null;
 };
 
-/** Plan KPI dashboard: delivery, inventory, procurement, manufacturing, logistics. */
+/** Plan KPI dashboard: delivery, fairness, inventory, procurement, manufacturing, logistics. */
 export type PlanKpis = {
   delivery: {
     total_requested: number;
@@ -261,6 +261,23 @@ export type PlanKpis = {
     fulfilled_with_tree_count?: number;
     fulfilled_by_real_make_count?: number;
     fulfilled_by_inventory_only_count?: number;
+  };
+  /**
+   * Distribution of fill ratios across demands. Aggregate fill_rate_pct hides
+   * whether shortage was spread evenly or concentrated on a few demands; these
+   * four numbers describe the shape of the distribution.
+   *
+   * All fields are null when there are no demands with requested_qty > 0.
+   */
+  fairness?: {
+    /** 0 = perfectly equal, 1 = max inequality. */
+    gini: number | null;
+    /** Bottom-decile demand's fill ratio; reflects worst-served experience. */
+    p10_fill_ratio: number | null;
+    /** Median fill ratio; robust complement to the existing mean fill_rate_pct. */
+    median_fill_ratio: number | null;
+    /** % of demands with 0% fill (committed_qty ≤ ε). */
+    starvation_pct: number | null;
   };
   inventory: {
     initial_total: number;

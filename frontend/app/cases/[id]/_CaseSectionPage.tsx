@@ -133,6 +133,44 @@ function peggingTreeContainsRealMove(node: PlanningPeggingNode, realMoveKeys: Se
 }
 
 /** Renders Plan KPIs when plan result exists; builds kpis from backend plan_kpis or derives from committed_demands/work_orders. */
+/**
+ * Mirror of the backend's computeFairness (Allocate.kt). Used by the fallback
+ * path when plan_kpis is missing — keeps the Fairness card populated for
+ * legacy runs. Same formulas, same null semantics.
+ */
+function computeFairnessFromCommitted(committed: CommittedDemand[]): NonNullable<PlanKpis['fairness']> {
+  const fills: number[] = [];
+  for (const row of committed) {
+    const req = Number(row.requested_qty);
+    if (!Number.isFinite(req) || req <= 0) continue;
+    const cmt = Number(row.quantity) || 0;
+    fills.push(Math.max(0, Math.min(1, cmt / req)));
+  }
+  const n = fills.length;
+  if (n === 0) {
+    return { gini: null, p10_fill_ratio: null, median_fill_ratio: null, starvation_pct: null };
+  }
+  fills.sort((a, b) => a - b);
+  const sum = fills.reduce((a, b) => a + b, 0);
+  let gini = 0;
+  if (n > 1 && sum >= 1e-12) {
+    let weighted = 0;
+    for (let i = 0; i < n; i += 1) weighted += (i + 1) * fills[i];
+    gini = (2 * weighted) / (n * sum) - (n + 1) / n;
+  }
+  const p10Idx = Math.min(n - 1, Math.max(0, Math.ceil(0.1 * n) - 1));
+  const median = n % 2 === 1 ? fills[(n - 1) / 2] : (fills[n / 2 - 1] + fills[n / 2]) / 2;
+  const starved = fills.filter((x) => x <= 1e-9).length;
+  const r4 = (x: number) => Math.round(x * 10000) / 10000;
+  const r2 = (x: number) => Math.round(x * 100) / 100;
+  return {
+    gini: r4(gini),
+    p10_fill_ratio: r4(fills[p10Idx]),
+    median_fill_ratio: r4(median),
+    starvation_pct: r2((starved / n) * 100),
+  };
+}
+
 export function PlanKpiDashboard({
   planResult,
 }: {
@@ -169,6 +207,7 @@ export function PlanKpiDashboard({
         demand_count: committed.length,
         on_time_count: 0,
       },
+      fairness: computeFairnessFromCommitted(committed),
       inventory: inv,
       procurement: byMethod('purchase'),
       manufacturing: byMethod('make'),
@@ -176,6 +215,7 @@ export function PlanKpiDashboard({
     };
   }
   const d = kpis.delivery ?? {};
+  const fair = kpis.fairness;
   const inv = kpis.inventory ?? {};
   const proc = kpis.procurement ?? {};
   const mfg = kpis.manufacturing ?? {};
@@ -220,6 +260,12 @@ export function PlanKpiDashboard({
             };
           })(),
         ], '#34d399')}
+        {card(tK('fairness'), [
+          { label: tK('fairnessGini'), value: fair?.gini != null ? Number(fair.gini).toFixed(2) : '–' },
+          { label: tK('fairnessP10'), value: fair?.p10_fill_ratio != null ? Number(fair.p10_fill_ratio).toFixed(2) : '–' },
+          { label: tK('fairnessMedian'), value: fair?.median_fill_ratio != null ? Number(fair.median_fill_ratio).toFixed(2) : '–' },
+          { label: tK('fairnessStarvation'), value: fair?.starvation_pct != null ? `${Number(fair.starvation_pct).toFixed(1)}%` : '–' },
+        ], '#f472b6')}
         {card(tK('inventory'), [
           { label: tK('consumptionRate'), value: inv.consumption_rate != null ? `${(Number(inv.consumption_rate) * 100).toFixed(1)}%` : '–' },
           { label: tK('consumed'), value: qtyFmt(Number(inv.consumed_total ?? 0)) },

@@ -1353,6 +1353,18 @@ private fun planKpis(
         return mapOf("order_count" to seen.size, "total_quantity" to roundQty(seen.values.sum()))
     }
 
+    // Fairness — distribution of fill ratios across demands. Aggregate fill_rate_pct
+    // hides whether the shortage was spread evenly or concentrated on a few demands.
+    // Skip rows with non-positive requested_qty (synthetic placeholders); cap each
+    // ratio at 1.0 defensively against any over-commit slip-throughs.
+    val fillRatios = committed
+        .mapNotNull { row ->
+            val req = (row["requested_qty"] as? Number)?.toDouble() ?: return@mapNotNull null
+            if (req <= 0) return@mapNotNull null
+            val cmt = (row["quantity"] as? Number)?.toDouble() ?: 0.0
+            (cmt / req).coerceIn(0.0, 1.0)
+        }
+
     return mapOf(
         "delivery" to mapOf(
             "total_requested" to roundQty(totalRequested),
@@ -1364,6 +1376,7 @@ private fun planKpis(
             "fulfilled_by_real_make_count" to fulfilledByRealMake,
             "fulfilled_by_inventory_only_count" to fulfilledByInventoryOnly,
         ),
+        "fairness" to computeFairness(fillRatios),
         "inventory" to mapOf(
             "initial_total" to roundQty(initialTotal),
             "consumed_total" to roundQty(consumedTotal),
@@ -1372,6 +1385,56 @@ private fun planKpis(
         "procurement" to methodStats("purchase"),
         "manufacturing" to methodStats("make"),
         "logistics" to methodStats("move"),
+    )
+}
+
+/**
+ * Compute fairness metrics from a list of per-demand fill ratios in [0, 1].
+ * Returns null for each metric when the list is empty (no demands to measure);
+ * with a single demand, Gini is 0 by definition (no inequality possible).
+ *
+ * Public/internal so unit tests can exercise it directly without going through
+ * the full `planKpis` pipeline.
+ */
+internal fun computeFairness(fills: List<Double>): Map<String, Any?> {
+    val n = fills.size
+    if (n == 0) {
+        return mapOf(
+            "gini" to null,
+            "p10_fill_ratio" to null,
+            "median_fill_ratio" to null,
+            "starvation_pct" to null,
+        )
+    }
+    val sorted = fills.sorted()
+    val sum = sorted.sum()
+    // Gini: G = (2·Σᵢ i·xᵢ) / (n·Σxᵢ) − (n+1)/n  with xᵢ ascending, i in 1..n.
+    // Defined as 0 when sum is 0 (all-zero distribution: maximally equal at 0)
+    // and trivially 0 when n == 1.
+    val gini = if (n == 1 || sum < 1e-12) 0.0
+    else {
+        var weighted = 0.0
+        for ((idx, x) in sorted.withIndex()) weighted += (idx + 1) * x
+        (2.0 * weighted) / (n * sum) - (n + 1.0) / n
+    }
+    // p10: bottom-decile demand via nearest-rank — the smallest value at or
+    // below the 10% mark. ceil(0.1·n) gives a 1-based rank; subtract 1 for
+    // 0-based index. Clamped for safety. (For n=10, this returns sorted[0],
+    // matching "10th percentile = smallest 10% of values are at-or-below this".)
+    val p10Idx = (kotlin.math.ceil(0.10 * n).toInt() - 1).coerceIn(0, n - 1)
+    val p10 = sorted[p10Idx]
+    // Median: middle value (avg of two middle for even n).
+    val median = if (n % 2 == 1) sorted[n / 2]
+                 else (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    val starved = sorted.count { it <= 1e-9 }
+    val starvationPct = starved.toDouble() / n * 100.0
+    fun r4(x: Double) = Math.round(x * 10000.0) / 10000.0
+    fun r2(x: Double) = Math.round(x * 100.0) / 100.0
+    return mapOf(
+        "gini" to r4(gini),
+        "p10_fill_ratio" to r4(p10),
+        "median_fill_ratio" to r4(median),
+        "starvation_pct" to r2(starvationPct),
     )
 }
 
