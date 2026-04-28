@@ -12,15 +12,20 @@ method with **equal-split** of the demand. Two limitations:
 
 This work generalizes both axes:
 
-1. **Cap (`top_n`)** — max methods to use, integer ≥ 1, or `null` =
-   all available. UI default proposed to user: 2.
-2. **Split mechanism** — `equal` (current) or `proportional` (new;
-   weights by score from the existing elaborate scorer).
+1. **Cap (`max_methods`)** — max methods to use, integer ≥ 1.
+   Default **2** (both backend and UI seed the same value, kept in sync).
+2. **Split mechanism** — three options:
+   - `equal` — divide demand qty evenly (current behavior).
+   - `score` — weight by the elaborate scorer's composite score
+     (uses the existing `commit_time / inventory_consumed / purchase`
+     weights). Requires the scorer to run regardless of `mode`.
+   - `preference` — weight inversely by the BOM `preference` int
+     (lower preference = higher weight, matching cascade ranking).
 
-The pattern already exists for variants
+The pattern partly mirrors variants
 ([`variant_selection.topN`](backend-kotlin/src/main/kotlin/com/allocator/services/PlanningEngine.kt#L51-L55)
-+ equal-split inside `getPreferredVariants`). We mirror it for methods,
-adding a proportional path the variants don't have today.
++ equal-split inside `getPreferredVariants`), but methods get richer
+split semantics that variants don't have today.
 
 ## Architecture
 
@@ -30,32 +35,40 @@ adding a proportional path the variants don't have today.
 "method_selection": {
   // existing fields, unchanged
   "mode":         "preference" | "elaborate",
-  "depth":        Int >= 1,                    // default 1
-  "elaborate":    Bool,                        // legacy alias for mode=elaborate
+  "depth":        Int >= 1,                                     // default 1
+  "elaborate":    Bool,                                         // legacy alias for mode=elaborate
   "score_weights": { commit_time, inventory_consumed, purchase },
   "depth_optimal": Bool,
 
   // NEW
-  "multiple":         Bool,                    // existing; semantics relaxed (see below)
-  "top_n":            Int? >= 1,               // null = all methods
-  "split_mechanism":  "equal" | "proportional" // default "equal"
+  "multiple":         Bool,                                     // @deprecated — see migration
+  "max_methods":      Int >= 1,                                 // default 2
+  "split_mechanism":  "equal" | "score" | "preference"          // default "equal"
 }
 ```
 
-**Backwards compat for `multiple` and `top_n`** (resolution order in
-`resolveMethodSelection`):
+**Backwards compat / migration for `multiple` and `max_methods`**
+(resolution order in `resolveMethodSelection`):
 
-| stored config | effective `top_n` | rationale |
+| stored config | effective `max_methods` | rationale |
 |---|---|---|
-| `multiple: false`, `top_n: any` | `1` | back-compat: explicit single |
-| `multiple: true`, `top_n: null` | `null` (all) | preserves old "use everything" |
-| `multiple: true`, `top_n: 2` | `2` | new |
-| `multiple: omitted`, `top_n: 2` | `2` | new runs from updated UI |
-| nothing set | `1` (single method) | safest default |
+| `max_methods` set explicitly | use it (clamped to ≥ 1) | UI-driven new runs |
+| `multiple: false`, no `max_methods` | `1` | back-compat: explicit single |
+| `multiple: true`, no `max_methods` | `2` | **behavior change** for legacy "all" configs; documented |
+| nothing set | `2` | new default; in sync with the UI |
 
-`multiple` becomes a soft alias: `multiple = (top_n != 1)`. We keep
-the field for now to avoid breaking saved configs and the existing
-i18n surface; it can be deprecated in a follow-up.
+The "behavior change" row is intentional and was the user's explicit
+choice when defaults were aligned to 2. Saved plan runs in the DB are
+immutable (their pegging trees and KPIs are persisted as-is), so this
+only affects re-running an old config or starting a new plan from a
+case whose stored config has `multiple: true` without `max_methods`.
+
+`multiple` is **soft-deprecated**:
+- TypeScript: tag with JSDoc `@deprecated use max_methods instead`.
+- Backend: continue reading it for back-compat resolution above.
+- New UI flows: write `max_methods` only; do not write `multiple`.
+- A follow-up branch can remove `multiple` entirely once no live
+  configs reference it.
 
 ### Scoring + selection algorithm
 
@@ -74,31 +87,55 @@ internal fun selectAndSplitMethods(
 Pseudocode:
 
 ```
-1. cap = cfg.topN ?: methods.size; cap = min(cap, methods.size).
+1. cap = min(cfg.maxMethods, methods.size).
 2. If cap == 1:
        Use the existing single-method branch (preserves preference vs. elaborate
-       behavior end-to-end). Return [(chosen, demandQty)] OR fall through to a
-       no-method blocked path the same way today's plan() does.
-3. Score every method:
-       - When mode == "elaborate":
-             score_i = composite from scoreMethod(...) using current
-             commit_time / inventory_consumed / purchase weights.
-             Higher = better.
-       - When mode == "preference":
-             score_i = 1.0 / (preference_i + 1)   // lower preference int → higher score
-             Stable monotone transform; preserves cascade ranking but yields
-             positive weights for proportional.
+       behavior end-to-end). Return [(chosen, demandQty)].
+
+3. Score every method (used for BOTH ranking and weighting; the scoring
+   metric depends on split_mechanism):
+
+       split_mechanism == "score":
+           score_i = composite from scoreMethod(...) using
+           commit_time / inventory_consumed / purchase weights.
+           Higher = better. (Always computed, even when mode == "preference",
+           because the user explicitly asked for score-weighted split.)
+
+       split_mechanism == "preference":
+           score_i = 1.0 / (preference_i + 1)
+           Lower preference int → higher score. Stable monotone transform;
+           preserves cascade ranking but yields positive weights.
+
+       split_mechanism == "equal":
+           For ranking, fall back to the cfg.mode-appropriate ranking
+           (elaborate → composite score; preference → 1/(pref+1)).
+           Weights are not used for split (see step 6).
+
 4. Filter to feasible (drop hard-failed candidates per the existing scorer).
+   If filtering leaves 0 methods, fall back to the original list (matches
+   the current variant-selection fallback at getPreferredVariants line 768).
+
 5. Sort by score desc; take top `cap`.
-6. Allocate qtyPerMethod:
-       - "equal":         existing logic (integer-aware: base = qty/n,
-                          rem = qty%n; first `rem` slots get base+1).
-       - "proportional":  Σ scores → weight_i = score_i / Σ.
-                          For integer demands: largest-remainder rounding so
-                          Σ qtyPerMethod = demandNetQty exactly.
-                          For fractional: qty * weight_i.
-       - Degenerate cases (Σ scores ≤ ε, or all scores equal):
-                          fall back to equal split.
+
+6. Allocate qtyPerMethod across the top-`cap` methods:
+
+       "equal":
+           Existing logic — base = qty/n, rem = qty%n; first `rem`
+           slots get base+1 for integer demand. Fractional demand:
+           qty/n each.
+
+       "score" or "preference":
+           Σ scores → weight_i = score_i / Σ.
+           Integer demand: largest-remainder rounding so
+           Σ qtyPerMethod == demandNetQty exactly.
+           Fractional demand: qty * weight_i.
+
+           Degenerate cases — fall back to equal split:
+             - Σ scores ≤ ε
+             - max(score) - min(score) < ε  (all equal)
+             - score_weights map empty AND mechanism == "score"
+               (no signal to weight on)
+
 7. Return zipped list.
 ```
 
@@ -123,11 +160,11 @@ bottleneck logic (which the conservation work just stabilized).
 
 | file | change |
 |---|---|
-| [services/PlanningEngine.kt:41-48](backend-kotlin/src/main/kotlin/com/allocator/services/PlanningEngine.kt#L41-L48) | `MethodSelectionConfig` — add `topN: Int?`, `splitMechanism: SplitMechanism` enum (`EQUAL` / `PROPORTIONAL`). |
-| `services/PlanningEngine.kt:77-102` | `resolveMethodSelection` — parse `top_n` (clamp ≥ 1; null when 0/negative/missing/non-numeric) and `split_mechanism` (case-insensitive; default `EQUAL`; unknown → `EQUAL` with a warn log). |
+| [services/PlanningEngine.kt:41-48](backend-kotlin/src/main/kotlin/com/allocator/services/PlanningEngine.kt#L41-L48) | `MethodSelectionConfig` — add `maxMethods: Int` (default 2) and `splitMechanism: SplitMechanism` enum (`EQUAL` / `SCORE` / `PREFERENCE`). |
+| `services/PlanningEngine.kt:77-102` | `resolveMethodSelection` — parse `max_methods` (clamp ≥ 1; default 2; non-numeric → 2). Parse `split_mechanism` case-insensitive; default `EQUAL`; unknown → `EQUAL` with a warn log. Apply legacy resolution: when `max_methods` absent, derive from `multiple` (false→1, true→2 for new default sync, missing→2). |
 | `services/PlanningEngine.kt` (new top-level) | `selectAndSplitMethods` helper as above. Reuse the existing `scoreMethod` / `normalizeScoreWeights` plumbing. |
 | `services/PlanningEngine.kt:992-1016` | Replace the inlined equal-split block with a call to `selectAndSplitMethods`. The `for ((idx, m) in methods.withIndex())` loop becomes `for ((idx, slot) in selected.withIndex()) { val (m, methodQty) = slot; ... }`. |
-| `services/PlanningEngine.kt:~985` | `useMultipleMethods` becomes `methodCfg.effectiveTopN(methods.size) > 1`. |
+| `services/PlanningEngine.kt:~985` | `useMultipleMethods` becomes `min(methodCfg.maxMethods, methods.size) > 1`. |
 
 ### Frontend types
 
@@ -139,9 +176,10 @@ method_selection?: {
   mode?: 'preference' | 'elaborate';
   depth?: number;
   elaborate?: boolean;
-  multiple?: boolean;                            // kept for back-compat
-  top_n?: number | null;                         // NEW
-  split_mechanism?: 'equal' | 'proportional';    // NEW
+  /** @deprecated use max_methods instead */
+  multiple?: boolean;
+  max_methods?: number;                                  // NEW; default 2
+  split_mechanism?: 'equal' | 'score' | 'preference';    // NEW; default 'equal'
   score_weights?: { commit_time?: number; inventory_consumed?: number; purchase?: number };
   depth_optimal?: boolean;
 }
@@ -155,40 +193,49 @@ include presets like "equal split methods". Plan:
 
 1. **Two new controls** in the planning-config drawer (find the
    existing form section that owns `multiple`):
-   - **Max methods** — a small number picker (1, 2, 3, 4, All). Use
-     the same select-style component as other planning-config fields.
-     Sends `top_n: 1|2|3|4|null`. Default in the UI: `2`.
-   - **Split mechanism** — radio with two options:
+   - **Max methods** — a small number picker (1, 2, 3, 4). Use the
+     same select-style component as other planning-config fields.
+     Sends `max_methods: 1|2|3|4`. UI default `2` (in sync with the
+     backend default).
+   - **Split mechanism** — radio with three options:
      - `Equal` (current behavior; recommended when methods are
        roughly comparable).
-     - `Proportional` (weights by elaborate score; only meaningful
-       when score weights are non-trivial, so the UI nudges users
-       toward elaborate mode if they pick proportional with
-       preference mode).
-2. **Back-compat for old saved configs**: when loading a config with
-   `multiple: false`, render `Max methods = 1`. With `multiple: true`
-   and no `top_n`, render `Max methods = All`.
-3. **Copilot shortcuts** — add two more presets:
-   - "Top 2 methods, equal split" (likely the new default suggestion)
-   - "Top N methods, proportional"
-   And update the natural-language detection in the existing copilot
-   block to recognize phrases like "top 2 methods" and "proportional
-   split".
+     - `By score` (uses elaborate scorer's composite weights;
+       requires non-trivial `score_weights` to differentiate).
+     - `By preference` (uses BOM `preference` int directly).
+2. **Back-compat for old saved configs**: when loading a config that
+   has `multiple` but not `max_methods`:
+   - `multiple: false` → render `Max methods = 1`.
+   - `multiple: true`  → render `Max methods = 2` (the new default).
+   On save, write `max_methods` and **drop `multiple`** so the config
+   migrates forward as users edit it.
+3. **Copilot shortcuts** — replace the single "equal split methods"
+   preset with three:
+   - "Top 2 methods, equal split" (the new baseline suggestion)
+   - "Top N methods, score-weighted"
+   - "Top N methods, preference-weighted"
+   Update natural-language detection to recognize "top 2 methods",
+   "score-weighted split", "preference-weighted split".
 4. **i18n**: new keys under `planning.copilot` and the planning-config
    form's namespace, en + zh:
-   - `methodMaxCount`, `methodSplitMechanism`, `methodSplitEqual`,
-     `methodSplitProportional`, plus tooltips explaining each.
+   - `methodMaxCount`, `methodMaxCountTooltip`,
+     `methodSplitMechanism`, `methodSplitMechanismTooltip`,
+     `methodSplitEqual`, `methodSplitScore`, `methodSplitPreference`,
+     plus tooltip strings explaining each.
 
 ### i18n keys to add (en + zh)
 
 ```
-"methodMaxCount":             "Max methods"
-"methodMaxCountTooltip":      "Cap on how many methods can be used per demand. 1 = single best; 2-4 = blend the best few; All = unbounded."
-"methodSplitMechanism":       "Split"
-"methodSplitMechanismTooltip":"How to divide a demand's quantity across the selected methods."
-"methodSplitEqual":           "Equal"
-"methodSplitProportional":    "Proportional to score"
-"methodSplitProportionalNote":"Uses the elaborate scorer's weights; falls back to equal when all scores are zero or the score weights are not configured."
+"methodMaxCount":              "Max methods"
+"methodMaxCountTooltip":       "Cap on how many methods can be used per demand. 1 = single best; 2-4 = blend the best few."
+"methodSplitMechanism":        "Split"
+"methodSplitMechanismTooltip": "How to divide a demand's quantity across the selected methods."
+"methodSplitEqual":            "Equal"
+"methodSplitEqualTooltip":     "Demand divided evenly across the selected methods."
+"methodSplitScore":            "By score"
+"methodSplitScoreTooltip":     "Demand weighted by the elaborate scorer (commit_time / inventory / purchase). Falls back to equal when all scores are equal or score weights are not set."
+"methodSplitPreference":       "By preference"
+"methodSplitPreferenceTooltip":"Demand weighted by BOM preference (lower preference int → larger share). Falls back to equal when all preferences are equal."
 ```
 
 ## Tests
@@ -198,102 +245,117 @@ include presets like "equal split methods". Plan:
 Add to
 [`backend-kotlin/src/test/kotlin/com/allocator/PlanningEngineSelectionConfigTest.kt`](backend-kotlin/src/test/kotlin/com/allocator/PlanningEngineSelectionConfigTest.kt):
 
-1. `top_n` parsing: `null` (default) → null; `0`/`-1`/`abc` → null;
-   `1.7` → 1; `3` → 3.
+1. `max_methods` parsing: missing → 2; `0`/`-1`/`abc` → 2 (clamped to
+   default); `1.7` → 1; `3` → 3.
 2. `split_mechanism` parsing: missing → `EQUAL`; `"equal"` /
-   `"EQUAL"` / `"proportional"` → respective enums; `"foo"` → `EQUAL`
-   (with warn log; assert via captured logger).
-3. Legacy resolution: `multiple: false` always wins (effective
-   `top_n` = 1, even if `top_n: 5` is also set).
-4. `multiple: true, top_n: null` → effective `top_n` = methods.size.
+   `"EQUAL"` / `"score"` / `"preference"` → respective enums;
+   `"foo"` → `EQUAL` (with warn log).
+3. Legacy resolution priority: `max_methods` set explicitly always
+   wins over `multiple` (so `multiple: false, max_methods: 3` →
+   effective 3).
+4. Legacy `multiple: false` (no `max_methods`) → effective 1.
+5. Legacy `multiple: true` (no `max_methods`) → effective 2.
+6. Both fields absent → effective 2.
 
 New file
 `backend-kotlin/src/test/kotlin/com/allocator/SelectAndSplitMethodsTest.kt`:
 
-1. **topN cap**: 4 methods, topN=2 → returns 2 highest-scored.
-2. **topN exceeds count**: topN=10, 3 methods → returns all 3.
-3. **topN=1**: returns the single best, full demand.
+1. **max_methods cap**: 4 methods, cap=2 → returns 2 highest-scored.
+2. **max_methods exceeds count**: cap=10, 3 methods → returns all 3.
+3. **max_methods=1**: returns the single best, full demand.
 4. **Equal split, integer demand=10, n=3** → `[4, 3, 3]`
    (largest-remainder; matches existing variants logic).
 5. **Equal split, fractional demand=10.5, n=3** → `[3.5, 3.5, 3.5]`.
-6. **Proportional, scores [3, 1], integer demand=8** → `[6, 2]`.
-7. **Proportional, scores [3, 1], fractional demand=10.0** →
+6. **Score-weighted, scores [3, 1], integer demand=8** → `[6, 2]`.
+7. **Score-weighted, scores [3, 1], fractional demand=10.0** →
    `[7.5, 2.5]`.
-8. **Proportional fallback (equal scores)** → equal split.
-9. **Proportional fallback (all-zero scores)** → equal split.
-10. **Preference-mode scoring with topN=2**: methods with preferences
-    `[1, 2, 3]` → top 2 are pref=1 and pref=2.
+8. **Preference-weighted, prefs [1, 2, 3], integer demand=11** —
+   weights 1/2, 1/3, 1/4 normalized → roughly `[6, 3, 2]` after
+   largest-remainder.
+9. **Score fallback (all-zero scores)** → equal split.
+10. **Score fallback (all equal scores)** → equal split.
+11. **Score fallback (empty score_weights map)** → equal split.
+12. **Preference fallback (all equal preferences)** → equal split.
+13. **Top-K with score sort**: scores [5, 1, 3, 2], cap=2 →
+    selected indices match the top-2 scores `[5, 3]` and qty
+    weights derive from those.
 
 ### Backend integration tests
 
 On case 171 (curl harness, like the prior conservation work):
 
-1. **Baseline**: `top_n=1`, equal — soundness should match the
-   existing run-385 baseline.
-2. **Top-2 equal**: `top_n=2, split=equal` — soundness still
-   `overall_sound=true`; KPI `manufacturing.order_count` should
-   change (more or fewer make WOs depending on demand structure).
-3. **Top-2 proportional**: `top_n=2, split=proportional, mode=elaborate,
-   weights={commit_time:1.0, inventory:0, purchase:0}` — soundness
-   still `overall_sound=true`; verify the per-method qtys differ from
-   equal-split when scoring is non-uniform (inspect a sample WO via
-   `result.work_orders`).
+1. **Baseline**: `max_methods=1` — soundness should match the existing
+   run-385 baseline.
+2. **Top-2 equal**: `max_methods=2, split_mechanism=equal` — soundness
+   still `overall_sound=true`; KPI `manufacturing.order_count`
+   should change relative to baseline.
+3. **Top-2 by score**: `max_methods=2, split_mechanism=score,
+   mode=elaborate, weights={commit_time:1.0, inventory:0, purchase:0}` —
+   soundness still `overall_sound=true`; per-method qtys should differ
+   from equal-split (inspect via `result.work_orders`).
+4. **Top-2 by preference**: `max_methods=2, split_mechanism=preference` —
+   soundness still `overall_sound=true`; per-method qtys should reflect
+   `1/(pref+1)` weighting.
+
+A small bonus: when running 2-4 above, the new **Fairness KPI** card
+provides a quick distributional check — score-weighted vs preference-
+weighted vs equal split should produce visibly different Gini /
+starvation values.
 
 ### Frontend tests
 
 - TypeScript compile clean.
-- Manual smoke: open case 171, set Max=2 + Proportional, run plan,
-  verify the request body contains `top_n: 2,
-  split_mechanism: "proportional"`. Verify the saved config round-trips
-  through the run-history panel.
+- Manual smoke: open case 171, set Max=2 + Score, run plan, verify
+  the request body contains `max_methods: 2, split_mechanism:
+  "score"`. Verify the saved config round-trips through the
+  run-history panel and that loading a legacy `multiple: true` run
+  renders Max=2 (and re-saves as `max_methods: 2` only).
 
-## Open design questions
+## Design decisions (resolved)
 
-These are the points worth confirming before implementation:
+User-confirmed answers to the open questions in the original draft:
 
-1. **Default for new runs (UI)**: The user said "default to 2 for example".
-   Confirm: the *backend* default stays `null` (= preserves old
-   behavior for legacy configs), but the *UI* seeds `top_n = 2` for
-   newly-created configs. Is that the right split?
-
-2. **Proportional in preference mode**: Should `split_mechanism =
-   proportional` work when `mode = preference` (using
-   `score = 1/(preference+1)`), or should the UI gate it to
-   `mode = elaborate` only?
-
-3. **Field name**: `top_n` (parallels variants) vs `max_methods`
-   (more self-documenting). Plan uses `top_n` for parity.
-
-4. **Soft-deprecate `multiple`** in TS as `@deprecated use top_n
-   instead`, or keep it active? The plan keeps it active for
-   back-compat round-tripping.
+1. **Default**: backend and UI both default to `max_methods = 2`.
+   Documented as a deliberate behavior change for legacy configs that
+   had `multiple: true` without an explicit cap (previously "all
+   methods"; now top 2).
+2. **Split mechanism options**: three values — `equal`, `score`,
+   `preference`. Independent of `mode` (proportional split is allowed
+   in preference mode).
+3. **Field name**: `max_methods` (self-documenting) instead of
+   `top_n`.
+4. **`multiple`**: soft-deprecated. TS gets `@deprecated`. Backend
+   continues to read it for back-compat. New UI flows write
+   `max_methods` only and stop emitting `multiple`.
 
 ## Verification (post-implementation)
 
 Run the full backend test suite:
 
 ```bash
-cd backend-kotlin && ./gradlew test    # expect 249 + N new tests, 0 failures
+cd backend-kotlin && ./gradlew test    # expect 249 + ~13 new tests, 0 failures
 ```
 
 End-to-end on case 171:
 
 ```bash
-# Top-2 proportional under elaborate mode
+# Top-2, score-weighted, under elaborate mode
 JOB=$(curl -s -X POST http://localhost:8000/cases/171/plan \
   -H 'Content-Type: application/json' \
   -d '{"async": true, "config": {
         "method_selection": {
-          "mode": "elaborate", "depth": 2, "top_n": 2,
-          "split_mechanism": "proportional",
+          "mode": "elaborate", "depth": 2,
+          "max_methods": 2,
+          "split_mechanism": "score",
           "score_weights": {"commit_time": 1.0}
         },
         "consolidation": {"enabled": true, "engine": "supply", "allocation_mode": "fair"}
       }}' | jq -r .job_id)
-# poll, save, check soundness, inspect work_orders.
+# poll, save, check soundness, inspect work_orders + plan_kpis.fairness.
 ```
 
 Manual UI test: pick the new controls, run a plan, verify the
 Fairness card and the existing soundness check still report sensible
-values (top-N selection should generally improve fairness Gini when
-proportional weights spread demand wider).
+values. The three split mechanisms should produce visibly different
+Gini / starvation values on the same case, which gives the user an
+immediate sanity check that the new mechanism is wired correctly.
