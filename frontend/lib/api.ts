@@ -338,6 +338,16 @@ export type PlanningConfig = {
      */
     engine?: 'leaf-legacy' | 'supply';
   };
+  /**
+   * Post-plan UI behavior toggles. These do not affect planner output — they
+   * control what the UI does *after* a successful plan run. Lifted into
+   * PlanningConfig so the planning-copilot can read/set them in the same
+   * round-trip as the real planner config.
+   */
+  /** When true, automatically save + analyze criticality after each successful plan. Default: false. */
+  analyze_criticality?: boolean;
+  /** When true, automatically run the soundness check (always deep) after each successful plan. Default: true. */
+  check_soundness?: boolean;
 };
 
 export type PlanSupplyAllocation = {
