@@ -442,40 +442,62 @@ private suspend fun toolWaitForPlan(args: JsonObject): ToolResult {
     return toolError("plan did not complete within 10 minutes")
 }
 
+private data class PlanRunSummary(
+    val id: Int,
+    val status: String,
+    val name: String,
+    val createdAt: String,
+    val soundnessStatus: String,
+    val fillPct: Double?,
+)
+
 private fun toolListPlanRuns(caseId: Int, args: JsonObject): ToolResult {
     val limit = (args["limit"]?.jsonPrimitive?.intOrNull ?: 10).coerceIn(1, 50)
-    val rows = transaction {
+    // Materialize all row data INSIDE the transaction. Exposed lazy-evaluates
+    // some column reads (especially nullable text + timestamp), so accessing
+    // ResultRow columns outside the transaction throws "No transaction in
+    // context".
+    val items: List<PlanRunSummary> = transaction {
         PlanRuns.selectAll()
             .where { PlanRuns.caseId eq caseId }
             .orderBy(PlanRuns.createdAt to SortOrder.DESC)
             .limit(limit)
-            .toList()
+            .map { r ->
+                val resultJson = r[PlanRuns.result]
+                val fillPct: Double? = if (resultJson.isNullOrBlank()) null else runCatching {
+                    val root = jsonParser.parseToJsonElement(resultJson).jsonObject
+                    ((root["plan_kpis"] as? JsonObject)
+                        ?.get("delivery") as? JsonObject)
+                        ?.get("fill_rate_pct")?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
+                }.getOrNull()
+                PlanRunSummary(
+                    id = r[PlanRuns.id],
+                    status = r[PlanRuns.status],
+                    name = r[PlanRuns.name] ?: "",
+                    createdAt = r[PlanRuns.createdAt].toString(),
+                    soundnessStatus = r[PlanRuns.soundnessStatus],
+                    fillPct = fillPct,
+                )
+            }
     }
-    val items = rows.map { r ->
-        // Pull headline fill rate from result JSON if present (cheap parse).
-        val resultJson = r[PlanRuns.result]
-        val fillPct: Double? = if (resultJson.isNullOrBlank()) null else runCatching {
-            val root = jsonParser.parseToJsonElement(resultJson).jsonObject
-            ((root["plan_kpis"] as? JsonObject)
-                ?.get("delivery") as? JsonObject)
-                ?.get("fill_rate_pct")?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
-        }.getOrNull()
-        buildJsonObject {
-            put("id", r[PlanRuns.id])
-            put("status", r[PlanRuns.status])
-            put("name", r[PlanRuns.name] ?: "")
-            put("created_at", r[PlanRuns.createdAt].toString())
-            put("soundness_status", r[PlanRuns.soundnessStatus])
-            if (fillPct != null) put("fill_rate_pct", fillPct)
-        }
-    }
-    val summary = if (items.isEmpty()) "no plan runs for case $caseId" else
-        "${items.size} runs, latest=${(items.first() as JsonObject)["id"]}"
+    val summary = if (items.isEmpty()) "no plan runs for case $caseId"
+        else "${items.size} runs, latest=${items.first().id}"
     return ToolResult(
         summary = summary,
         payload = buildJsonObject {
             put("count", items.size)
-            put("runs", buildJsonArray { items.forEach { add(it) } })
+            put("runs", buildJsonArray {
+                items.forEach { s ->
+                    add(buildJsonObject {
+                        put("id", s.id)
+                        put("status", s.status)
+                        put("name", s.name)
+                        put("created_at", s.createdAt)
+                        put("soundness_status", s.soundnessStatus)
+                        if (s.fillPct != null) put("fill_rate_pct", s.fillPct)
+                    })
+                }
+            })
         },
     )
 }
