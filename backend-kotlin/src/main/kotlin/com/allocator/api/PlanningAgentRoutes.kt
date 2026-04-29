@@ -197,15 +197,23 @@ private val TOOLS: List<LlmTool> = listOf(
     tool(
         "list_plan_runs",
         "List recent plan runs for this case, newest first. Returns up to `limit` " +
-            "rows with id, status, name, created_at, soundness_status, and a one-line " +
-            "KPI snapshot (fill_rate_pct + total_committed). Use this to discover run_ids " +
-            "before calling get_kpis or get_demand_pegging.",
+            "rows with id, status, name, created_at, soundness_status, and (when " +
+            "available) fill_rate_pct. Use to discover run_ids before calling " +
+            "get_kpis or get_demand_pegging. Pass status='success' to skip " +
+            "contingent / failed / running runs (contingent runs have no plan_kpis " +
+            "stored — they're what-if simulations).",
         buildJsonObject {
             put("type", "object")
             putJsonObject("properties") {
                 putJsonObject("limit") {
                     put("type", "integer")
                     put("description", "Max rows to return; defaults to 10, hard-capped at 50.")
+                }
+                putJsonObject("status") {
+                    put("type", "string")
+                    put("description",
+                        "Optional status filter: 'success' | 'contingent' | 'failed' | 'running'. " +
+                            "Omit to include all statuses.")
                 }
             }
             put("required", buildJsonArray { })
@@ -453,13 +461,19 @@ private data class PlanRunSummary(
 
 private fun toolListPlanRuns(caseId: Int, args: JsonObject): ToolResult {
     val limit = (args["limit"]?.jsonPrimitive?.intOrNull ?: 10).coerceIn(1, 50)
+    val statusFilter = args["status"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotBlank() }
     // Materialize all row data INSIDE the transaction. Exposed lazy-evaluates
     // some column reads (especially nullable text + timestamp), so accessing
     // ResultRow columns outside the transaction throws "No transaction in
     // context".
     val items: List<PlanRunSummary> = transaction {
         PlanRuns.selectAll()
-            .where { PlanRuns.caseId eq caseId }
+            .where {
+                if (statusFilter != null)
+                    (PlanRuns.caseId eq caseId) and (PlanRuns.status eq statusFilter)
+                else
+                    PlanRuns.caseId eq caseId
+            }
             .orderBy(PlanRuns.createdAt to SortOrder.DESC)
             .limit(limit)
             .map { r ->
@@ -508,7 +522,27 @@ private fun toolGetKpis(caseId: Int, args: JsonObject): ToolResult {
     val result = loadPlanResultFromDb(caseId, runId)
         ?: return toolError("plan run $runId not found for case $caseId")
     @Suppress("UNCHECKED_CAST")
-    val kpis = (result["plan_kpis"] as? Map<String, Any?>) ?: emptyMap()
+    val kpis = (result["plan_kpis"] as? Map<String, Any?>)
+    if (kpis.isNullOrEmpty()) {
+        // Contingent / what-if runs skip the KPI compute step — they store
+        // committed_demands + pegging but not plan_kpis. Tell the model
+        // explicitly so it doesn't say "KPIs not available" without context.
+        return ToolResult(
+            summary = "Run $runId has no plan_kpis (likely a contingent run)",
+            payload = buildJsonObject {
+                put("error", "no_plan_kpis")
+                put("run_id", runId)
+                put(
+                    "note",
+                    "This run has no precomputed KPIs. Common cause: status=contingent " +
+                        "(what-if simulation from /material-impact). To see fairness/delivery " +
+                        "KPIs, look at the baseline run this contingent was forked from " +
+                        "(see plan_run.metadata.baselinePlanRunId), or use list_plan_runs " +
+                        "with status=success to find a real run.",
+                )
+            },
+        )
+    }
     val delivery = kpis["delivery"] as? Map<String, Any?>
     val fillPct = (delivery?.get("fill_rate_pct") as? Number)?.toDouble()
     return ToolResult(
