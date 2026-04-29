@@ -87,9 +87,26 @@ private data class AgentResponse(
     @SerialName("fresh_run_id") val freshRunId: Int? = null,
 )
 
+// ── Knowledge primer (curated value props + design + ops + glossary) ────────
+//
+// Loaded once at JVM startup from src/main/resources/agent-knowledge.md
+// and prepended to the system prompt on every conversation turn. The file
+// is the single source of truth for what the agent "knows" about the
+// system at a high level — when a major design decision or new feature
+// ships, that file gets updated in the same PR. See its header for the
+// maintenance contract.
+
+private val AGENT_KNOWLEDGE: String by lazy {
+    val res = ::AGENT_KNOWLEDGE.javaClass.classLoader.getResource("agent-knowledge.md")
+    res?.readText() ?: run {
+        log.warn("agent-knowledge.md not found on classpath; agent will run with system prompt only.")
+        ""
+    }
+}
+
 // ── System prompt ────────────────────────────────────────────────────────────
 
-private const val SYSTEM_PROMPT = """You are the Planning Agent — a domain expert for this supply-chain planning system.
+private const val SYSTEM_PROMPT_INTRO = """You are the Planning Agent — a domain expert for this supply-chain planning system.
 
 Your jobs:
   1. Configure planning parameters from the user's natural-language goals.
@@ -661,9 +678,23 @@ private suspend fun runAgentLoop(
 
     // Bootstrap memory into the system prompt so the model sees prior context
     // without needing to call read_memory first (saves a round-trip).
+    // Sequence:
+    //   1. SYSTEM_PROMPT_INTRO — persona / intent classification / tactics
+    //   2. AGENT_KNOWLEDGE     — curated digest of value props + design
+    //                            decisions + tool ops + glossary, loaded
+    //                            from src/main/resources/agent-knowledge.md.
+    //                            Update that file when shipping major
+    //                            features so the agent's knowledge stays
+    //                            current.
+    //   3. <memory>            — per-case agent_memory entries
+    //   4. <current_config>    — the working PlanningConfig
     val memory = loadMemory(caseId)
     val systemWithMemory = buildString {
-        append(SYSTEM_PROMPT)
+        append(SYSTEM_PROMPT_INTRO)
+        if (AGENT_KNOWLEDGE.isNotBlank()) {
+            append("\n\n────── KNOWLEDGE PRIMER ──────\n\n")
+            append(AGENT_KNOWLEDGE)
+        }
         append("\n\n<memory>\n")
         if (memory.isEmpty()) append("(empty)") else append(memory.toString())
         append("\n</memory>")

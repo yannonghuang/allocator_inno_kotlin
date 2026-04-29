@@ -24,6 +24,42 @@ expert that:
 4. **Maintains memory** across sessions per case (preferences, recurring
    goals, decisions worth remembering).
 
+## Knowledge primer (and maintenance contract)
+
+The agent's domain expertise lives in
+[`backend-kotlin/src/main/resources/agent-knowledge.md`](../backend-kotlin/src/main/resources/agent-knowledge.md).
+That file is loaded once at JVM startup and prepended to the system prompt
+on every conversation turn. It carries:
+
+- the **value propositions** of the system (what makes it different from MRP)
+- the load-bearing **design decisions** (waterfall vs proportional, mode
+  semantics, consolidation engine choices, soundness, memory)
+- the **tool catalog** with usage guidance per tool
+- a **plan-run-status** table (success / contingent / failed / running) so the
+  agent knows what each status implies for available data
+- a **KPI glossary** (fill_rate, Gini, p10, median, starvation, on_time)
+- known **failure modes** and recommended diagnostic steps
+
+**Maintenance contract** (the central reason this file exists): when you
+ship a major design decision or a new agent tool, update `agent-knowledge.md`
+in the same PR. Otherwise the agent will give stale advice. Detailed
+design notes still live in `docs/`; the knowledge primer is the curated
+digest.
+
+Pattern for a doc update PR:
+
+1. Land the feature change as usual (code + tests).
+2. Update `agent-knowledge.md`:
+   - If new tool: add a row to "Operational knowledge — tool catalog".
+   - If design decision: add to "Design principles" + a one-line
+     description of the trade-off.
+   - If new failure mode: add to "Failure modes to recognize".
+3. Optional: deeper exposition in `docs/<feature>.md`; reference it from
+   the knowledge primer.
+
+The primer is small on purpose — it's the agent's mental model, not the
+specification.
+
 ## Architecture
 
 New endpoint:
