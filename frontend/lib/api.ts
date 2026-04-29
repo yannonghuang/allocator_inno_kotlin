@@ -301,7 +301,21 @@ export type PlanningConfig = {
     mode?: 'preference' | 'elaborate';
     depth?: number;
     elaborate?: boolean;
+    /**
+     * @deprecated use `max_methods` instead. Kept for back-compat reading of
+     * legacy saved configs. The UI no longer writes this field — saving a
+     * legacy `multiple: true` config from the form re-emits `max_methods`.
+     */
     multiple?: boolean;
+    /**
+     * Waterfall cap: how many ranked methods may be tried before giving up.
+     * Integer >= 1. Default 2 (in sync with the backend default).
+     *   1 = single best method (no fallback)
+     *   2-4 = exhaust best, then resort to lesser only if demand isn't met
+     * Methods are ranked once at the call site (preference int asc, or
+     * elaborate score desc). Inventory carries forward across slots.
+     */
+    max_methods?: number;
     /** Relative weights for elaborate scoring. Backend normalizes so absolute values don't matter. */
     score_weights?: { commit_time?: number; inventory_consumed?: number; purchase?: number };
     /** When true, backend iterates depth=1..N picking the first non-improving step (using score_weights). */
@@ -324,6 +338,16 @@ export type PlanningConfig = {
      */
     engine?: 'leaf-legacy' | 'supply';
   };
+  /**
+   * Post-plan UI behavior toggles. These do not affect planner output — they
+   * control what the UI does *after* a successful plan run. Lifted into
+   * PlanningConfig so the planning-copilot can read/set them in the same
+   * round-trip as the real planner config.
+   */
+  /** When true, automatically save + analyze criticality after each successful plan. Default: false. */
+  analyze_criticality?: boolean;
+  /** When true, automatically run the soundness check (always deep) after each successful plan. Default: true. */
+  check_soundness?: boolean;
 };
 
 export type PlanSupplyAllocation = {
@@ -405,11 +429,36 @@ export async function getWorkOrderPegging(
 }
 
 /** Start async plan; returns job_id. Poll getPlanStatus(caseId, job_id) for progress and result. */
+/**
+ * Normalize method_selection so the backend always receives canonical
+ * `max_methods` instead of the legacy `multiple` boolean. Mirrors the form
+ * defaults: `multiple: false` (no max_methods) → 1; `multiple: true` (no
+ * max_methods) → 2; nothing set → 2. Strips legacy `multiple` and the
+ * obsolete `split_mechanism` (proportional split removed in favor of
+ * waterfall) from the outgoing config so saved runs migrate forward.
+ */
+function normalizeMethodSelection(config: PlanningConfig | null | undefined): PlanningConfig | null | undefined {
+  if (!config) return config;
+  const ms = config.method_selection;
+  if (!ms) {
+    return { ...config, method_selection: { max_methods: 2 } };
+  }
+  // Drop legacy `multiple` + obsolete `split_mechanism`. Derive `max_methods` if absent.
+  const { multiple: legacyMultiple, split_mechanism: _drop, ...rest } = ms as typeof ms & { split_mechanism?: unknown };
+  void _drop;
+  let max = rest.max_methods;
+  if (typeof max !== 'number' || !Number.isFinite(max) || max < 1) {
+    max = legacyMultiple === false ? 1 : 2;
+  }
+  return { ...config, method_selection: { ...rest, max_methods: max } };
+}
+
 export async function runPlanAsync(caseId: number, config?: PlanningConfig | null): Promise<{ job_id: string }> {
+  const normalized = normalizeMethodSelection(config);
   const r = await fetch(`${API}/cases/${caseId}/plan`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ config: config ?? undefined, async: true }),
+    body: JSON.stringify({ config: normalized ?? undefined, async: true }),
   });
   if (r.status !== 202) {
     const text = await r.text();

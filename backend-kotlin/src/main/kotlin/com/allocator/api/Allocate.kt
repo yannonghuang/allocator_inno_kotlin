@@ -1892,7 +1892,8 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
             put("mode",      methodCfg.mode)
             put("depth",     methodCfg.depth)
             put("elaborate", methodCfg.elaborate)  // legacy mirror — consumers still read this
-            put("multiple",  methodCfg.multiple)
+            put("multiple",  methodCfg.multiple)   // legacy mirror — soft-deprecated, see max_methods
+            put("max_methods",   methodCfg.maxMethods)
             put("depth_optimal", methodCfg.depthOptimal)
             // Always materialize score_weights (with engine defaults) so the persisted
             // snapshot is self-describing — viewing config later shows the exact weights

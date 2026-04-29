@@ -97,6 +97,58 @@ class PlanningEngineSelectionConfigTest : FunSpec({
         resolveMethodSelection(mapOf("method_selection" to mapOf("multiple" to false))).multiple shouldBe false
     }
 
+    // ── method_selection.max_methods + split_mechanism (NEW) ─────────────────
+
+    test("max_methods defaults to 2 when neither max_methods nor multiple is set") {
+        resolveMethodSelection(null).maxMethods shouldBe 2
+        resolveMethodSelection(emptyMap()).maxMethods shouldBe 2
+        resolveMethodSelection(mapOf("method_selection" to emptyMap<String, Any?>())).maxMethods shouldBe 2
+    }
+
+    test("max_methods explicit value wins over legacy multiple") {
+        // Explicit 3 even though multiple=false would otherwise give 1.
+        resolveMethodSelection(mapOf(
+            "method_selection" to mapOf("multiple" to false, "max_methods" to 3)
+        )).maxMethods shouldBe 3
+        // Explicit 1 even though multiple=true would otherwise give 2.
+        resolveMethodSelection(mapOf(
+            "method_selection" to mapOf("multiple" to true, "max_methods" to 1)
+        )).maxMethods shouldBe 1
+    }
+
+    test("max_methods legacy resolution: multiple=false → 1, multiple=true → 2") {
+        resolveMethodSelection(mapOf(
+            "method_selection" to mapOf("multiple" to false)
+        )).maxMethods shouldBe 1
+        resolveMethodSelection(mapOf(
+            "method_selection" to mapOf("multiple" to true)
+        )).maxMethods shouldBe 2
+    }
+
+    test("max_methods clamps non-numeric / out-of-range values to default 2") {
+        resolveMethodSelection(mapOf(
+            "method_selection" to mapOf("max_methods" to "abc")
+        )).maxMethods shouldBe 2
+        resolveMethodSelection(mapOf(
+            "method_selection" to mapOf("max_methods" to 0)
+        )).maxMethods shouldBe 2
+        resolveMethodSelection(mapOf(
+            "method_selection" to mapOf("max_methods" to -1)
+        )).maxMethods shouldBe 2
+    }
+
+    test("max_methods accepts Number subclasses") {
+        resolveMethodSelection(mapOf("method_selection" to mapOf("max_methods" to 5L))).maxMethods shouldBe 5
+        resolveMethodSelection(mapOf("method_selection" to mapOf("max_methods" to 1.7))).maxMethods shouldBe 1
+    }
+
+    test("split_mechanism is silently ignored on input (legacy field)") {
+        // Old plan_run configs may still carry split_mechanism; backend must not trip on it.
+        val cfg = resolveMethodSelection(mapOf("method_selection" to mapOf("split_mechanism" to "score")))
+        cfg.maxMethods shouldBe 2  // unaffected
+        cfg.mode shouldBe "preference"
+    }
+
     // ── method_selection.score_weights (drives elaborate scoring) ────────────
 
     test("method_selection.score_weights is passed through") {

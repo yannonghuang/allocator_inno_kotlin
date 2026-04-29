@@ -118,6 +118,29 @@ function peggingTreeContainsPurchase(node: PlanningPeggingNode): boolean {
   return false;
 }
 
+/** True if the actual pegging tree has at least one site where the planner had to
+ *  pick between alternatives (and used >1 of them). Two such sites:
+ *    1. demand → multiple work_order children — the waterfall actually fired and
+ *       used multiple methods to fulfill the demand (max_methods >= 2 realized).
+ *    2. work_order → multiple children with relation = 'or' — the planner used
+ *       multiple BOM alt_group variants (OR-relation, not AND-relation).
+ *  Rules out static-BOM-only alternatives where the planner picked a single
+ *  candidate; this filter shows demands whose pegging actually exercises the
+ *  alternatives. */
+function peggingTreeHasAlternatives(node: PlanningPeggingNode): boolean {
+  if (node.type === 'demand') {
+    const woChildren = (node.children ?? []).filter((c) => c.type === 'work_order');
+    if (woChildren.length > 1) return true;
+  }
+  if (node.type === 'work_order' && node.children_relation === 'or' && (node.children ?? []).length > 1) {
+    return true;
+  }
+  for (const child of node.children ?? []) {
+    if (peggingTreeHasAlternatives(child)) return true;
+  }
+  return false;
+}
+
 /** True if the pegging tree has any move WO whose (product_id, from_location, to_location) is in realMoveKeys (TRANSIT_TIME > 0). */
 function peggingTreeContainsRealMove(node: PlanningPeggingNode, realMoveKeys: Set<string>): boolean {
   if (node.type === 'work_order' && (node.method ?? '').toLowerCase() === 'move') {
@@ -647,10 +670,34 @@ function buildWoMaps(pegging: PlanningPeggingEntry[]): {
       }
       const isMake = (node.method ?? '').toLowerCase() === 'make';
       if (isMake) {
-        // Component demands (what's consumed to produce this WO's committed qty).
-        const demandChildren = (node.children ?? []).filter((c) => c.type === 'demand');
+        // Component demands actually consumed to produce this WO's committed qty.
+        // Drop rows that failed (commit_reason starts with "child_failed:" or
+        // similar hard-failure markers) — those represent attempts that consumed
+        // nothing; including them would over-count consumption and clutter the
+        // panel. Then dedupe by (product, location, qty, reason): a WO can be
+        // referenced from multiple pegging entries (consolidation / waterfall),
+        // and the walker visits each independently. Without dedupe, the same
+        // component would appear N times for N entry references.
+        const HARD_FAIL = /^(child_failed:|no_methods$|no_preferred_method$|depth_limit$)/;
+        const isConsumedRow = (c: PlanningPeggingNode): boolean => {
+          const r = (c.commit_reason ?? '').trim();
+          if (!r) return true;
+          if (HARD_FAIL.test(r)) return false;
+          return true;
+        };
+        const demandChildren = (node.children ?? []).filter((c) => c.type === 'demand' && isConsumedRow(c));
         if (demandChildren.length > 0) {
-          suppliesMap.set(key, [...(suppliesMap.get(key) ?? []), ...demandChildren]);
+          const existing = suppliesMap.get(key) ?? [];
+          const seen = new Set(existing.map((c) =>
+            `${c.demand_id ?? ''}|${c.product_id ?? ''}|${c.location_id ?? ''}|${c.quantity ?? ''}|${c.commit_reason ?? ''}`,
+          ));
+          const fresh = demandChildren.filter((c) => {
+            const k2 = `${c.demand_id ?? ''}|${c.product_id ?? ''}|${c.location_id ?? ''}|${c.quantity ?? ''}|${c.commit_reason ?? ''}`;
+            if (seen.has(k2)) return false;
+            seen.add(k2);
+            return true;
+          });
+          if (fresh.length > 0) suppliesMap.set(key, [...existing, ...fresh]);
         }
       } else {
         // Move/purchase WOs: show same-product supply/purchase leaf nodes.
@@ -839,6 +886,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planDemandShortOnly, setPlanDemandShortOnly] = useState(false);
   const [planDemandBuyOnly, setPlanDemandBuyOnly] = useState(false);
   const [planDemandRealMoveOnly, setPlanDemandRealMoveOnly] = useState(false);
+  const [planDemandAlternativesOnly, setPlanDemandAlternativesOnly] = useState(false);
   const [planDemandSupplyFilter, setPlanDemandSupplyFilter] = useState('');
   const [supplyFilterInput, setSupplyFilterInput] = useState('');
   const [supplyFilterSuggestions, setSupplyFilterSuggestions] = useState<SupplySuggestion[]>([]);
@@ -864,7 +912,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [woPeggingRowKey, setWoPeggingRowKey] = useState<string | null>(null);
   const [bomRealPairs, setBomRealPairs] = useState<[string, string][] | null>(null);
   const [realMoveTriples, setRealMoveTriples] = useState<[string, string, string][] | null>(null);
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' }, purchase_allowed: false });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -882,7 +930,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [criticalityRunning, setCriticalityRunning] = useState(false);
   const [criticalityProgress, setCriticalityProgress] = useState<{ done: number; total: number } | null>(null);
   // Whether to auto-run criticality scan after planning (config option, default: off)
-  const [analyzeCriticalityEnabled, setAnalyzeCriticalityEnabled] = useState(false);
+  // analyzeCriticalityEnabled + checkSoundnessEnabled are derived from planningConfig so the
+  // planning-copilot's config_update can flip them via natural language ("turn off
+  // soundness", "也要做关键度分析"). Setting back through setPlanningConfig keeps the form
+  // and the copilot in sync via a single source of truth.
+  const analyzeCriticalityEnabled = planningConfig.analyze_criticality === true;
+  const setAnalyzeCriticalityEnabled = (v: boolean) => setPlanningConfig((c) => ({ ...c, analyze_criticality: v }));
   // Set to true after plan completes with analyzeCriticalityEnabled; cleared once caseSupplies loads and analysis starts
   const [autoCriticalityPending, setAutoCriticalityPending] = useState(false);
 
@@ -901,7 +954,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // Soundness check state: per-run busy flag + currently-displayed report (when slide-in open).
   const [soundnessChecking, setSoundnessChecking] = useState<Record<number, boolean>>({});
   const [soundnessReportOpen, setSoundnessReportOpen] = useState<{ runId: number; report: SoundnessReport } | null>(null);
-  const [soundnessDeepCheck, setSoundnessDeepCheck] = useState(false);
+  // When true, every successful plan auto-runs the soundness check (always deep — R8 chain
+  // conservation is cheap relative to a full re-plan, no reason to expose the speed knob).
+  // Same source-of-truth pattern as analyzeCriticalityEnabled — derives from planningConfig.
+  const checkSoundnessEnabled = planningConfig.check_soundness !== false;
+  const setCheckSoundnessEnabled = (v: boolean) => setPlanningConfig((c) => ({ ...c, check_soundness: v }));
 
   // ── Override dialog state ───────────────────────────────────────────────────
   const [overrideDialogOpen, setOverrideDialogOpen] = useState(false);
@@ -965,10 +1022,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       return { reply: tP('copilot.replies.showConfig', { methodLine, purchaseMode, consolidationMode }) };
     }
 
+    // Explicit "max methods N" / "最多方法 N" → set the waterfall cap.
+    const maxMethodsMatch = t.match(/max\s*methods?\s*(?:=|:|to)?\s*(\d+)|最多方法\s*[:=]?\s*(\d+)|方法上限\s*[:=]?\s*(\d+)/);
+    if (maxMethodsMatch) {
+      const n = Math.max(1, Math.min(4, parseInt(maxMethodsMatch[1] ?? maxMethodsMatch[2] ?? maxMethodsMatch[3] ?? '2', 10)));
+      return {
+        reply: tP('copilot.replies.methodMaxMethods', { n }),
+        configUpdate: { method_selection: { ...ms, max_methods: n } },
+      };
+    }
+    // Legacy "equal split" / "split across methods" intent — under waterfall the
+    // closest behavior is max_methods=2 (use the best, fall back to the next when short).
     if (/equal.?split.?method|split.?method.?equal|split across method|multiple method|use all method|方法等量拆分|等量拆分方法|跨方法拆分/.test(t)) {
       return {
-        reply: tP('copilot.replies.methodEqual'),
-        configUpdate: { method_selection: { ...ms, multiple: true, elaborate: false } },
+        reply: tP('copilot.replies.methodMaxMethods', { n: 2 }),
+        configUpdate: { method_selection: { ...ms, max_methods: 2 } },
       };
     }
 
@@ -1095,10 +1163,36 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       };
     }
 
+    // Post-plan UI toggles.
+    if (/(?:analyz|analys)e?\s*criticality|criticality\s*(?:on|enable|analysis)|enable\s*criticality|启用关键度|做关键度|开启关键度|开启临界|做临界/.test(t)) {
+      return {
+        reply: tP('copilot.replies.criticalityOn'),
+        configUpdate: { analyze_criticality: true },
+      };
+    }
+    if (/(?:no|skip|disable|turn off)\s*criticality|criticality\s*off|关闭关键度|不做关键度|停用关键度|不分析关键度|关闭临界/.test(t)) {
+      return {
+        reply: tP('copilot.replies.criticalityOff'),
+        configUpdate: { analyze_criticality: false },
+      };
+    }
+    if (/(?:check|validate|verify|run)\s*soundness|soundness\s*(?:check\s*)?(?:on|enable)|enable\s*soundness|开启完整性|校验完整性|做合理性|检查合理性|开启校验/.test(t)) {
+      return {
+        reply: tP('copilot.replies.soundnessOn'),
+        configUpdate: { check_soundness: true },
+      };
+    }
+    if (/(?:no|skip|disable|turn off)\s*soundness|soundness\s*off|关闭完整性|不做合理性|跳过校验|不校验/.test(t)) {
+      return {
+        reply: tP('copilot.replies.soundnessOff'),
+        configUpdate: { check_soundness: false },
+      };
+    }
+
     if (/reset|default|clear|重置|默认|清除/.test(t)) {
       return {
         reply: tP('copilot.replies.reset'),
-        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, depth_optimal: false, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' } },
+        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, depth_optimal: false, max_methods: 2, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' }, analyze_criticality: false, check_soundness: true },
       };
     }
 
@@ -1124,19 +1218,40 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           setPlanWorkOrderPeggingCache({});
           setSupplyCriticalityMap({});
           try { sessionStorage.removeItem(`criticality-case-${id}`); } catch { /* ignore */ }
-          if (analyzeCriticalityEnabled && freshId && id != null) {
-            // Auto-persist so impact/criticality analysis can use the persisted run.
+          // Soundness needs a persisted run_id; criticality also requires save. If either
+          // toggle is on, save first, then trigger their respective async work.
+          const needsSave = (analyzeCriticalityEnabled || checkSoundnessEnabled) && freshId != null;
+          if (needsSave && freshId && id != null) {
+            // Auto-persist so impact/criticality and soundness can use the persisted run.
+            let saved = false;
             try {
               await savePlanRun(Number(id), freshId);
               setCurrentPlanRunId(freshId);
               setFreshPlanRunId(null);
               setOverrideCandidateRunId(null);
+              saved = true;
             } catch {
               // Auto-save failed — leave as unsaved; user can save manually.
               setCurrentPlanRunId(null);
               setFreshPlanRunId(freshId);
             }
-            setAutoCriticalityPending(true);
+            if (analyzeCriticalityEnabled) setAutoCriticalityPending(true);
+            // Fire-and-forget the soundness check — UI updates the per-row badge from
+            // listPlanRuns polling, and the user can click the badge to open the report.
+            if (saved && checkSoundnessEnabled) {
+              setSoundnessChecking((prev) => ({ ...prev, [freshId]: true }));
+              checkPlanRunSoundness(Number(id), freshId, { deep_check: true })
+                .then(async () => {
+                  try {
+                    const updated = await listPlanRuns(Number(id));
+                    setPlanRunHistory(updated);
+                  } catch { /* ignore — badge will refresh on next history open */ }
+                })
+                .catch(() => { /* error surfaces via plan_run.soundness_status='error' */ })
+                .finally(() => {
+                  setSoundnessChecking((prev) => { const n = { ...prev }; delete n[freshId]; return n; });
+                });
+            }
           } else {
             setCurrentPlanRunId(null);
             setFreshPlanRunId(freshId);
@@ -3471,24 +3586,51 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         <div style={{ marginBottom: '0.75rem' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap', marginBottom: '0.5rem' }}>
             <span style={{ color: '#a1a1aa', fontSize: '0.875rem' }}>{tP('config.methodSelection')}</span>
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
-              <input
-                type="checkbox"
-                checked={planningConfig.method_selection?.multiple === true}
-                onChange={(e) => setPlanningConfig((c) => ({
-                  ...c,
-                  method_selection: { ...c.method_selection, multiple: e.target.checked },
-                }))}
-              />
-              <span>{tP('config.equalSplitMethods')}</span>
+            {/* Max methods (replaces the legacy `multiple` boolean). Defaults to 2 in
+                sync with the backend; legacy `multiple: false` reads as 1, `multiple: true` as 2. */}
+            <label
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', cursor: 'pointer' }}
+              title={tP('config.methodMaxCountTooltip')}
+            >
+              <span style={{ color: '#a1a1aa' }}>{tP('config.methodMaxCount')}</span>
+              <select
+                value={(() => {
+                  const ms = planningConfig.method_selection;
+                  if (typeof ms?.max_methods === 'number') return Math.max(1, Math.min(4, Math.trunc(ms.max_methods)));
+                  if (ms?.multiple === false) return 1;
+                  return 2;
+                })()}
+                onChange={(e) => setPlanningConfig((c) => {
+                  const v = Math.max(1, Math.min(4, parseInt(e.target.value, 10) || 2));
+                  // Drop legacy `multiple` on save; backend resolution prefers max_methods anyway.
+                  const { multiple: _drop, ...rest } = c.method_selection ?? {};
+                  void _drop;
+                  return { ...c, method_selection: { ...rest, max_methods: v } };
+                })}
+                style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+              >
+                <option value={1}>1</option>
+                <option value={2}>2</option>
+                <option value={3}>3</option>
+                <option value={4}>4</option>
+              </select>
             </label>
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
               <input
                 type="checkbox"
-                checked={planningConfig.method_selection?.elaborate === true}
+                checked={(() => {
+                  const ms = planningConfig.method_selection;
+                  if (ms?.mode === 'elaborate') return true;
+                  if (ms?.mode === 'preference') return false;
+                  return ms?.elaborate === true;
+                })()}
                 onChange={(e) => setPlanningConfig((c) => ({
                   ...c,
-                  method_selection: { ...c.method_selection, elaborate: e.target.checked },
+                  method_selection: {
+                    ...c.method_selection,
+                    elaborate: e.target.checked,
+                    mode: e.target.checked ? 'elaborate' : 'preference',
+                  },
                 }))}
               />
               <span>{tP('config.elaborateMethod')}</span>
@@ -3655,6 +3797,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               />
               <span style={{ fontSize: '0.875rem' }}>Analyze Criticality</span>
             </label>
+            <label
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}
+              title={tP('config.checkSoundnessTooltip')}
+            >
+              <input
+                type="checkbox"
+                checked={checkSoundnessEnabled}
+                onChange={(e) => setCheckSoundnessEnabled(e.target.checked)}
+              />
+              <span style={{ fontSize: '0.875rem' }}>{tP('config.checkSoundness')}</span>
+            </label>
           </div>
           <br style={{ marginTop: '0.25rem' }} />
           <button
@@ -3676,6 +3829,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               // Contingent runs are blocked from re-plan by the disabled guard, so currentPlanRunId
               // here is always either null or a success run.
               setOverrideCandidateRunId(currentPlanRunId);
+              // runPlanAsync normalizes method_selection (drops legacy `multiple`,
+              // derives `max_methods` if absent) so we don't duplicate that here.
               const config = Object.keys(planningConfig).length ? planningConfig : undefined;
               try {
                 const { job_id } = await runPlanAsync(id, config);
@@ -3947,6 +4102,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       />
                       <span>{tP('committedDemands.filterShortOnly')}</span>
                     </label>
+                    <label
+                      style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}
+                      title={tP('committedDemands.filterAlternativesOnlyTooltip')}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={planDemandAlternativesOnly}
+                        onChange={(e) => setPlanDemandAlternativesOnly(e.target.checked)}
+                      />
+                      <span>{tP('committedDemands.filterAlternativesOnly')}</span>
+                    </label>
                     {planDemandRealMakeOnly && (
                       <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>
                         {bomRealPairs === null
@@ -4082,6 +4248,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     }
                     if (planDemandShortOnly) {
                       list = list.filter((r) => (r.shortage ?? 0) > 0.01);
+                    }
+                    if (planDemandAlternativesOnly) {
+                      list = list.filter((r) => {
+                        const demandId = r.demand_id ?? (r as unknown as { demand_id?: string }).demand_id;
+                        const entry = demandId ? peggingByDemandId[demandId] : null;
+                        if (!entry?.tree) return false;
+                        return peggingTreeHasAlternatives(entry.tree);
+                      });
                     }
                     if (planDemandSupplyFilter.trim()) {
                       // Use the same criterion as the Supply View's "Pegged Demands" column:
@@ -5881,20 +6055,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             />
             <div style={{ padding: '1rem 1.25rem', borderBottom: '1px solid #3d3d40', flexShrink: 0, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <h3 style={{ margin: 0, fontSize: '1rem' }}>{tP('runHistory.panelTitle')}</h3>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                <label
-                  title="When checked, the soundness check also runs R8 — leaf-to-root chain conservation. Slower; off by default."
-                  style={{ fontSize: '0.78rem', color: '#a1a1aa', display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}
-                >
-                  <input
-                    type="checkbox"
-                    checked={soundnessDeepCheck}
-                    onChange={(e) => setSoundnessDeepCheck(e.target.checked)}
-                  />
-                  deep check
-                </label>
-                <button type="button" onClick={() => setPlanRunHistoryOpen(false)} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tP('runHistory.close')}</button>
-              </div>
+              <button type="button" onClick={() => setPlanRunHistoryOpen(false)} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tP('runHistory.close')}</button>
             </div>
             <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
               {planRunHistoryLoading && <p style={{ color: '#71717a' }}>{tP('runHistory.loading')}</p>}
@@ -6007,7 +6168,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             onClick={async () => {
                               if (!clickable || !id) return;
                               try {
-                                const report = await checkPlanRunSoundness(id, run.id, { deep_check: soundnessDeepCheck });
+                                const report = await checkPlanRunSoundness(id, run.id, { deep_check: true });
                                 setSoundnessReportOpen({ runId: run.id, report });
                               } catch {/* noop */}
                             }}
@@ -6041,13 +6202,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             if (!id) return;
                             setSoundnessChecking((prev) => ({ ...prev, [run.id]: true }));
                             try {
-                              const report = await checkPlanRunSoundness(id, run.id, { deep_check: soundnessDeepCheck });
+                              const report = await checkPlanRunSoundness(id, run.id, { deep_check: true });
                               setSoundnessReportOpen({ runId: run.id, report });
                               // Refresh history list so the badge reflects the new state.
                               const updated = await listPlanRuns(id);
                               setPlanRunHistory(updated);
                             } catch (e) {
-                              setSoundnessReportOpen({ runId: run.id, report: { overall_sound: false, demand_count: 0, sound_count: 0, deep_check: soundnessDeepCheck, demands: [], cross_demand_violations: [{ rule: 'check_failed', node_path: '', message: e instanceof Error ? e.message : 'Soundness check failed.' }] } });
+                              setSoundnessReportOpen({ runId: run.id, report: { overall_sound: false, demand_count: 0, sound_count: 0, deep_check: true, demands: [], cross_demand_violations: [{ rule: 'check_failed', node_path: '', message: e instanceof Error ? e.message : 'Soundness check failed.' }] } });
                             } finally {
                               setSoundnessChecking((prev) => { const n = { ...prev }; delete n[run.id]; return n; });
                             }
@@ -7453,7 +7614,31 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               };
 
               function renderNode(node: PlanningPeggingNode, path: string, depth: number, xlink = false) {
-                const childrenList = node.children ?? [];
+                const rawChildren = node.children ?? [];
+                // A child "contributed" if it has any committed_qty (demand) or quantity (other).
+                const childContrib = (c: PlanningPeggingNode): number => {
+                  const cc = (c as { committed_qty?: number | null }).committed_qty;
+                  return Number((cc != null ? cc : c.quantity) ?? 0);
+                };
+                let childrenList = rawChildren;
+                // Fix: blocked work_order — collapse the failed subtree. The slot's
+                // method_choice_explanation already says "blocked: deep child X has no
+                // supply", so the tree below adds noise without information.
+                const isBlockedWo = node.type === 'work_order'
+                  && Number(node.quantity ?? 0) <= 1e-9
+                  && rawChildren.length > 0;
+                if (isBlockedWo) {
+                  childrenList = [];
+                }
+                // Fix: under OR-relation, hide siblings that contributed nothing when at
+                // least one DID contribute. OR semantics is "any one path supplies the
+                // parent" — failed alternatives are dead weight.
+                if (!isBlockedWo && node.children_relation === 'or' && childrenList.length > 1) {
+                  const contribCount = childrenList.reduce((n, c) => n + (childContrib(c) > 1e-9 ? 1 : 0), 0);
+                  if (contribCount > 0 && contribCount < childrenList.length) {
+                    childrenList = childrenList.filter((c) => childContrib(c) > 1e-9);
+                  }
+                }
 
                 // Consolidated supply nodes: find the original supply trees from non-last
                 // planning_pegging entries for the embedded demand_id.
@@ -7535,21 +7720,25 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 } else if (relation === 'and' && hasChildren && childrenList.length > 1) {
                   childGroupKind = 'and';
                   childGroupLabel = 'ALL of the inventories / work orders below are required together (AND).';
-                } else if (!relation && hasChildren && childrenList.length > 1 && node.type !== 'work_order') {
-                  // Children under a demand node are additive. When the children are all
-                  // supply/purchase buckets of the SAME product, they're FIFO bucket splits —
-                  // neither AND (different components) nor OR (alternatives). Omit the label.
-                  // Otherwise (distinct components summed under the demand, e.g. a make WO's
-                  // BOM children bubbled up), AND is the honest reading.
-                  const sameProductBucketsOnly =
-                    node.type === 'demand' &&
-                    childrenList.every((c: typeof node) =>
+                } else if (!relation && hasChildren && childrenList.length > 1) {
+                  // No explicit relation set. Default by parent type:
+                  //   - work_order children are BOM components → AND (all required).
+                  //   - demand children are independent supply paths (waterfall slots,
+                  //     inventory buckets, alternative methods) → OR. Exception:
+                  //     same-product FIFO buckets — neither AND nor OR, no label.
+                  //   - supply/purchase nodes shouldn't normally have multiple children.
+                  if (node.type === 'work_order') {
+                    childGroupKind = 'and';
+                    childGroupLabel = 'ALL of the inventories / work orders below are required together (AND).';
+                  } else if (node.type === 'demand') {
+                    const sameProductBucketsOnly = childrenList.every((c: typeof node) =>
                       (c.type === 'supply' || c.type === 'purchase') &&
                       c.product_id === node.product_id,
                     );
-                  if (!sameProductBucketsOnly) {
-                    childGroupKind = 'and';
-                    childGroupLabel = 'ALL of the inventories / work orders below are required together (AND).';
+                    if (!sameProductBucketsOnly) {
+                      childGroupKind = 'or';
+                      childGroupLabel = 'ANY of the inventories / work orders below can supply this node (OR).';
+                    }
                   }
                 }
                 const isActiveMatch = planPeggingMatchPath === path;
