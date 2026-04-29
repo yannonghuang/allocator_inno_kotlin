@@ -303,7 +303,9 @@ private val jsonParser = kotlinx.serialization.json.Json { ignoreUnknownKeys = t
 
 // ── Config merge (deep merge of JsonObject) ──────────────────────────────────
 
-private fun mergeJsonObject(base: JsonObject?, patch: JsonObject): JsonObject {
+/** Recursive deep-merge: scalar / array values in `patch` replace those in `base`;
+ *  nested JsonObject keys are merged key-by-key. Exposed as `internal` for tests. */
+internal fun mergeJsonObject(base: JsonObject?, patch: JsonObject): JsonObject {
     val merged = (base?.toMutableMap() ?: mutableMapOf())
     for ((k, v) in patch) {
         val existing = merged[k]
