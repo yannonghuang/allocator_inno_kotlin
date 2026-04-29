@@ -3,6 +3,8 @@ package com.allocator.api
 import com.allocator.AgentMemory
 import com.allocator.Cases
 import com.allocator.PlanRuns
+import org.jetbrains.exposed.sql.SortOrder
+import org.jetbrains.exposed.sql.max
 import com.allocator.services.CaseLoader
 import com.allocator.services.LlmAgentMessage
 import com.allocator.services.LlmNotConfiguredException
@@ -190,6 +192,23 @@ private val TOOLS: List<LlmTool> = listOf(
                 putJsonObject("job_id") { put("type", "string") }
             }
             put("required", buildJsonArray { add("job_id") })
+        },
+    ),
+    tool(
+        "list_plan_runs",
+        "List recent plan runs for this case, newest first. Returns up to `limit` " +
+            "rows with id, status, name, created_at, soundness_status, and a one-line " +
+            "KPI snapshot (fill_rate_pct + total_committed). Use this to discover run_ids " +
+            "before calling get_kpis or get_demand_pegging.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("limit") {
+                    put("type", "integer")
+                    put("description", "Max rows to return; defaults to 10, hard-capped at 50.")
+                }
+            }
+            put("required", buildJsonArray { })
         },
     ),
     tool(
@@ -423,6 +442,44 @@ private suspend fun toolWaitForPlan(args: JsonObject): ToolResult {
     return toolError("plan did not complete within 10 minutes")
 }
 
+private fun toolListPlanRuns(caseId: Int, args: JsonObject): ToolResult {
+    val limit = (args["limit"]?.jsonPrimitive?.intOrNull ?: 10).coerceIn(1, 50)
+    val rows = transaction {
+        PlanRuns.selectAll()
+            .where { PlanRuns.caseId eq caseId }
+            .orderBy(PlanRuns.createdAt to SortOrder.DESC)
+            .limit(limit)
+            .toList()
+    }
+    val items = rows.map { r ->
+        // Pull headline fill rate from result JSON if present (cheap parse).
+        val resultJson = r[PlanRuns.result]
+        val fillPct: Double? = if (resultJson.isNullOrBlank()) null else runCatching {
+            val root = jsonParser.parseToJsonElement(resultJson).jsonObject
+            ((root["plan_kpis"] as? JsonObject)
+                ?.get("delivery") as? JsonObject)
+                ?.get("fill_rate_pct")?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
+        }.getOrNull()
+        buildJsonObject {
+            put("id", r[PlanRuns.id])
+            put("status", r[PlanRuns.status])
+            put("name", r[PlanRuns.name] ?: "")
+            put("created_at", r[PlanRuns.createdAt].toString())
+            put("soundness_status", r[PlanRuns.soundnessStatus])
+            if (fillPct != null) put("fill_rate_pct", fillPct)
+        }
+    }
+    val summary = if (items.isEmpty()) "no plan runs for case $caseId" else
+        "${items.size} runs, latest=${(items.first() as JsonObject)["id"]}"
+    return ToolResult(
+        summary = summary,
+        payload = buildJsonObject {
+            put("count", items.size)
+            put("runs", buildJsonArray { items.forEach { add(it) } })
+        },
+    )
+}
+
 private fun toolGetKpis(caseId: Int, args: JsonObject): ToolResult {
     val runId = args["run_id"]?.jsonPrimitive?.intOrNull
         ?: return toolError("`run_id` is required")
@@ -631,6 +688,7 @@ private suspend fun dispatchTool(
         "update_config" -> toolUpdateConfig(workingConfig, args)
         "run_plan_async" -> Pair(toolRunPlanAsync(caseId, workingConfig), workingConfig)
         "wait_for_plan" -> Pair(toolWaitForPlan(args), workingConfig)
+        "list_plan_runs" -> Pair(toolListPlanRuns(caseId, args), workingConfig)
         "get_kpis" -> Pair(toolGetKpis(caseId, args), workingConfig)
         "get_demand_pegging" -> Pair(toolGetDemandPegging(caseId, args), workingConfig)
         "get_supply_split_explanation" -> Pair(toolGetSupplySplitExplanation(caseId, args), workingConfig)
