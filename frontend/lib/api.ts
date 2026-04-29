@@ -490,7 +490,14 @@ export async function getPlanStatus(caseId: number, jobId: string): Promise<Plan
   return r.json();
 }
 
-export type PlanningCopilotMessage = { role: 'user' | 'assistant'; text: string };
+export type PlanningCopilotMessage = {
+  role: 'user' | 'assistant';
+  text: string;
+  /** Tool-call steps the agent ran while producing this assistant turn (planning-agent only). */
+  steps?: PlanningAgentStep[];
+  /** plan_run_id if this assistant turn ran a fresh plan (planning-agent only). */
+  fresh_run_id?: number | null;
+};
 
 export type PlanningCopilotResponse = { reply: string; config_update: PlanningConfig | null };
 
@@ -504,6 +511,46 @@ export async function planningCopilot(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ message, current_config: currentConfig, history }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+/** One tool invocation the agent ran, surfaced in the chat as a gray "step" row. */
+export type PlanningAgentStep = {
+  tool: string;
+  args: Record<string, unknown>;
+  result_summary: string;
+};
+
+/**
+ * Full agent response. Unlike copilot, the agent may have run a plan
+ * (`fresh_run_id`), updated config (`config_update`), and recorded multiple
+ * tool steps. The chat panel should render every step inline so the user
+ * can see what the agent did.
+ */
+export type PlanningAgentResponse = {
+  reply: string;
+  steps: PlanningAgentStep[];
+  config_update: PlanningConfig | null;
+  fresh_run_id: number | null;
+};
+
+export async function planningAgent(
+  caseId: number,
+  message: string,
+  currentConfig: PlanningConfig,
+  history: PlanningCopilotMessage[]
+): Promise<PlanningAgentResponse> {
+  const r = await fetch(`${API}/cases/${caseId}/planning-agent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      message,
+      current_config: currentConfig,
+      // The agent's history shape mirrors the copilot's: role + content.
+      history: history.map((m) => ({ role: m.role, content: m.text })),
+    }),
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
