@@ -99,7 +99,7 @@ private fun createTables() {
         Demands, MethodBuys, MethodMakes, ProductLocations,
         Supplies, MethodMoves, AllocationRuns, AllocationActions,
         ManualOverrides, PlanRuns, MaterialEvents, MaterialImpactAssessments,
-        PlanSupplyAllocations, NegotiationWaits, PlanRunEvents
+        PlanSupplyAllocations, NegotiationWaits, PlanRunEvents, AgentMemory
     )
 }
 
