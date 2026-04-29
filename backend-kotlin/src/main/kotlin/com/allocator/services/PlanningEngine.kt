@@ -608,8 +608,21 @@ internal fun getPreferredMethodCascade(
     planningPath: Set<Pair<String, String>>,
 ): Pair<Map<String, Any?>?, String> {
     if (methods.isEmpty()) return Pair(null, "No methods available.")
-    val levels = resolveMethodSelection(config).depth
-    if (!shouldElaborateAtDepth(depth, levels) || methods.size <= 1) return getPreferredMethod(methods)
+    val cfg = resolveMethodSelection(config)
+    val levels = cfg.depth
+    val pastScope = !shouldElaborateAtDepth(depth, levels)
+    if (pastScope || methods.size <= 1) {
+        val (m, msg) = getPreferredMethod(methods)
+        // When elaborate mode is configured but we've recursed past the
+        // method_selection.depth scope, the message would otherwise just say
+        // "Chosen: <type> @ <loc> (preference X)" with no hint that elaborate
+        // was bypassed. Annotate so the UI's Why panel makes it obvious why
+        // a preference-shaped explanation appears in an elaborate-mode run.
+        if (pastScope && cfg.elaborate && methods.size > 1) {
+            return Pair(m, "$msg [past elaborate scope (method_selection.depth=$levels): preference fallback]")
+        }
+        return Pair(m, msg)
+    }
 
     val productId = demand["product_id"] as? String ?: ""
     val locationId = demand["location_id"] as? String ?: ""
@@ -646,7 +659,8 @@ internal fun getPreferredMethodCascade(
     }
 
     log.debug("cascade: all methods failed for {}@{}, falling back to lowest-preference", productId, locationId)
-    return getPreferredMethod(methods)
+    val (m, msg) = getPreferredMethod(methods)
+    return Pair(m, "$msg [cascade probe exhausted: every method reported child failures, took lowest preference]")
 }
 
 /**
@@ -1424,6 +1438,14 @@ fun plan(
             // MIN_RESIDUAL: skip trivial leftovers from lot-size rounding so we
             // don't burn a slot emitting a 0.x-unit second WO.
             if (residual <= MIN_WATERFALL_RESIDUAL) break
+            // (Note: a stricter preflight using `firstFeasibleMethod` was tried
+            // and rejected — that probe fails on any partial child commit, which
+            // would skip slots that could legitimately commit some qty under
+            // partial-fulfillment. planMethodSlot itself short-circuits on
+            // capped<=0, and the UI suppresses zero-qty pegging subtrees, so the
+            // remaining cost of a doomed slot is bounded and the noise is
+            // already hidden at render time.)
+
             val mLoc = (method["location_id"] ?: method["to_location_id"] ?: "").toString()
             val slotLabel = "Waterfall slot ${slotsUsed + 1}/${cap}: ${method["type"]}@$mLoc " +
                 "(planning ${roundQty(residual).toLong()} of ${demandNetQty.toLong()} residual)"
@@ -1470,10 +1492,14 @@ fun plan(
         val commitTimeStr = formatDate(latestCommit)
         demandFulfilledList.add(committedRow(totalCommitted, commitTimeStr ?: reqTimeStr, partialReason))
         val finalPegging = slotPeggingNodes + peggingChildren
+        // Multi-slot waterfall: siblings under the demand are additive supply
+        // paths (slot 1 + slot 2 each cover part of the demand). Mark OR so the
+        // UI labels them as alternatives, matching the legend.
+        val demandRelation = if (finalPegging.size > 1) "or" else null
         return Triple(
             demandFulfilledList,
             allWos,
-            demandNode(finalPegging, commitTimeStr ?: reqTimeStr, partialReason, committedQty = taken + totalCommitted),
+            demandNode(finalPegging, commitTimeStr ?: reqTimeStr, partialReason, committedQty = taken + totalCommitted, childrenRelation = demandRelation),
         )
     }
 
