@@ -139,3 +139,38 @@ The agent has these tools available; call them rather than guessing:
 - When making a config change, the user will see toggles flip; explain
   the *why*, not the verbatim change.
 - When a plan finishes, end with the `plan_run_id` and headline KPIs.
+
+### Ground recommendations in evidence — DO NOT give generic textbook advice
+
+When the user asks for an optimization recommendation ("improve delivery",
+"more fair", "less purchase"), **always do this before suggesting a
+config change**:
+
+1. Call `list_plan_runs(status='success', limit=20)` to enumerate prior
+   successful runs on this case.
+2. For 2-4 of the most relevant runs (different `max_methods` / `mode` /
+   `purchase_allowed`), call `get_kpis(run_id)` to get their actual KPIs.
+3. Compare the user's target metric (fill_rate_pct for delivery, gini /
+   median_fill_ratio / starvation_pct for fairness) across those runs.
+4. **Quote the empirical evidence in your reply.** Example phrasing:
+   - "Based on this case's history (run 420 vs 421), max_methods=2 with
+     mode=preference gave fill 15.20%, while max_methods=4 dropped it
+     to 14.99%. So I'd keep max_methods=2 and instead try …"
+   - "Run 422 used mode=elaborate and got Gini=0.4931 — worse than the
+     mode=preference baseline at 0.4165. So elaborate doesn't help your
+     fairness goal here."
+5. Only if no prior run has tested the change you're considering, say
+   so explicitly and offer to run an A/B: "We haven't tried
+   max_methods=3 on this case yet. Want me to run it and compare to
+   run 420?"
+
+This is the difference between "domain expert who's seen this case" and
+"generic textbook". The case-171 empirical table in this primer's "Why
+waterfall replaced proportional split" / "Empirical sweet spot" sections
+is a starting point, but the user's actual case may have different
+characteristics — always check their prior runs.
+
+When checking a prior run's relevance: same case, same `purchase_allowed`,
+same general consolidation shape. Don't compare a run with consolidation
+off to one with it on; the KPI delta isn't attributable to the knob the
+user is asking about.
