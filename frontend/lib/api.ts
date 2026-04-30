@@ -486,7 +486,11 @@ export type PlanStatusResponse = {
 
 export async function getPlanStatus(caseId: number, jobId: string): Promise<PlanStatusResponse> {
   const r = await fetch(`${API}/cases/${caseId}/plan/status/${jobId}`);
-  if (!r.ok) throw new Error(await r.text());
+  if (!r.ok) {
+    const err = new Error(await r.text()) as Error & { status?: number };
+    err.status = r.status;
+    throw err;
+  }
   return r.json();
 }
 

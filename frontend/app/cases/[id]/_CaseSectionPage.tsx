@@ -1285,8 +1285,24 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             planPollRef.current = null;
           }
         }
-      } catch {
-        // keep polling on transient errors
+      } catch (e) {
+        // 404 ⇒ the backend has no record of this job. Almost always means the
+        // backend was rebuilt/restarted while a tab held a stale planJobId in
+        // React state — the in-memory planJobs map is wiped on restart. Stop
+        // polling instead of churning forever (the original code's bare
+        // `catch {}` was the source of the "ghost curl" log spam).
+        if ((e as { status?: number } | null)?.status === 404) {
+          setPlanJobId(null);
+          setPlanLoading(false);
+          setPlanProgress(null);
+          setPlanError(
+            'Plan job no longer exists on the server (likely a backend restart). ' +
+            'Page is out of sync — refresh to re-sync.'
+          );
+          if (planPollRef.current) { clearInterval(planPollRef.current); planPollRef.current = null; }
+          return;
+        }
+        // Other (transient network, 5xx) — keep polling.
       }
     };
     poll();
