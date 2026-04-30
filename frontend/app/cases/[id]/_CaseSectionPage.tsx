@@ -1381,16 +1381,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     setWoPeggingActiveDemandId(null);
   }, [planPeggingContext]);
 
-  // Reset assessment result/history when a different supply is opened in the pegging panel
-  const currentPeggingSupplyId = planPeggingContext?.type === 'supply' ? planPeggingContext.supplyId : null;
+  // Reset assessment result/history when a different supply is opened in the
+  // breakdown slide-in (where the assessment UI now lives).
+  const currentExplainSupplyId = supExplainRow?.supplyId ?? null;
   useEffect(() => {
-    if (currentPeggingSupplyId) {
+    if (currentExplainSupplyId) {
       setAssessmentResult(null);
       setAssessmentHistory([]);
       setAssessmentHistoryOpen(false);
       setAssessError(null);
     }
-  }, [currentPeggingSupplyId]);
+  }, [currentExplainSupplyId]);
 
   // Load assessment criteria lazily when the editor is opened for the first time
   useEffect(() => {
@@ -2881,13 +2882,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // ── Assessment handlers ─────────────────────────────────────────────────────
 
   const handleAssess = async () => {
-    if (!planPeggingContext || planPeggingContext.type !== 'supply') return;
+    const supplyId = supExplainRow?.supplyId;
+    if (!supplyId) return;
     setAssessmentRunning(true);
     setAssessError(null);
     try {
       const result = await runAssessment(
         id,
-        planPeggingContext.supplyId,
+        supplyId,
         assessDelayDays,
         assessQtyDecreaseMode === 'pct' ? assessQtyDecreasePct : 0,
         currentPlanRunId,
@@ -2896,7 +2898,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         locale,
       );
       setAssessmentResult(result);
-      const hist = await listAssessments(id, planPeggingContext.supplyId);
+      const hist = await listAssessments(id, supplyId);
       setAssessmentHistory(hist);
       setAssessmentHistoryOpen(true);
     } catch (e) {
@@ -2907,10 +2909,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   };
 
   const handleLoadHistory = async () => {
-    if (!planPeggingContext || planPeggingContext.type !== 'supply') return;
+    const supplyId = supExplainRow?.supplyId;
+    if (!supplyId) return;
     if (!assessmentHistoryOpen) {
       try {
-        const hist = await listAssessments(id, planPeggingContext.supplyId);
+        const hist = await listAssessments(id, supplyId);
         setAssessmentHistory(hist);
       } catch (_) { /* best-effort */ }
     }
@@ -5465,31 +5468,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                 </span>
                               );
                             }},
-                            { key: '_sup_pegging' as keyof (PlanSupplyViewRow & { _key: string }), label: tP('supplyView.columns.impact'), sortable: false, render: (r) => {
-                              if (r.peggedDemandCount === 0) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
-                              const k = `supply|${r.supplyId}`;
-                              const isSelected = woPeggingRowKey === k;
-                              return (
-                                <button
-                                  type="button"
-                                  className="secondary"
-                                  style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
-                                  onClick={() => {
-                                    if (isSelected) {
-                                      setPlanPeggingOpen(false);
-                                      setPlanPeggingContext(null);
-                                      setWoPeggingRowKey(null);
-                                      setPreviousPeggingContext(null);
-                                    } else {
-                                      setPlanPeggingContext({ type: 'supply', supplyId: r.supplyId, peggedDemands: r.peggedDemands, initialQty: r.qty, consumedQty: r.consumedQty });
-                                      setPlanPeggingOpen(true);
-                                      setWoPeggingRowKey(k);
-                                      setPreviousPeggingContext(null);
-                                    }
-                                  }}
-                                >{tc('show')}</button>
-                              );
-                            }},
                             { key: '_sup_explain' as keyof (PlanSupplyViewRow & { _key: string }), label: tP('supplyView.columns.breakdown'), sortable: false, render: (r) => {
                               const cs = supplyCriticalityMap[r.supplyId];
                               const hasCriticality = cs === 'critical' || cs === 'not_critical';
@@ -7011,6 +6989,98 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     <> {' · '}<strong>{(supExplainRow.utilizationRate * 100).toFixed(1)}%</strong></>
                   )}
                 </p>
+              </section>
+              {/* ── Assessment UI (impact what-if) ────────────────────────── */}
+              <section style={{ marginBottom: '1.25rem' }}>
+                <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('supplyView.assessment.heading')}</h4>
+                <div style={{ padding: '0.6rem 0.75rem', background: '#1c1c1e', borderRadius: 6, border: '1px solid #3d3d40' }}>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
+                    <label style={{ fontSize: '0.78rem', color: '#a1a1aa', display: 'flex', alignItems: 'center', gap: 4 }}>
+                      {tP('supplyView.assessment.delayDays')}
+                      <input
+                        type="number" min={0}
+                        value={assessDelayDays}
+                        onChange={(e) => setAssessDelayDays(Math.max(0, Number(e.target.value)))}
+                        style={{ width: 60, fontSize: '0.78rem', padding: '2px 4px', background: '#27272a', color: '#e4e4e7', border: '1px solid #52525b', borderRadius: 3 }}
+                      />
+                    </label>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <span style={{ fontSize: '0.78rem', color: '#a1a1aa' }}>{tP('supplyView.assessment.qtyDecreasePct')}</span>
+                      <div style={{ display: 'flex', border: '1px solid #4c1d95', borderRadius: 4, overflow: 'hidden' }}>
+                        <button type="button"
+                          onClick={() => setAssessQtyDecreaseMode('pct')}
+                          style={{ fontSize: '0.72rem', padding: '1px 8px', background: assessQtyDecreaseMode === 'pct' ? '#4c1d95' : '#27272a', color: '#e4e4e7', border: 'none', cursor: 'pointer' }}>
+                          %
+                        </button>
+                        <button type="button"
+                          onClick={() => setAssessQtyDecreaseMode('abs')}
+                          style={{ fontSize: '0.72rem', padding: '1px 8px', background: assessQtyDecreaseMode === 'abs' ? '#4c1d95' : '#27272a', color: '#e4e4e7', border: 'none', borderLeft: '1px solid #4c1d95', cursor: 'pointer' }}>
+                          qty
+                        </button>
+                      </div>
+                      {assessQtyDecreaseMode === 'pct' ? (
+                        <input
+                          type="number" min={0} max={100}
+                          value={assessQtyDecreasePct}
+                          onChange={(e) => setAssessQtyDecreasePct(Math.max(0, Math.min(100, Number(e.target.value))))}
+                          style={{ width: 60, fontSize: '0.78rem', padding: '2px 4px', background: '#27272a', color: '#e4e4e7', border: '1px solid #52525b', borderRadius: 3 }}
+                        />
+                      ) : (
+                        <input
+                          type="number" min={0} step={1}
+                          placeholder={tP('supplyView.assessment.qtyDecreaseUnits')}
+                          value={assessQtyDecreaseAbs}
+                          onChange={(e) => setAssessQtyDecreaseAbs(Math.max(0, Number(e.target.value)))}
+                          style={{ width: 80, fontSize: '0.78rem', padding: '2px 4px', background: '#27272a', color: '#e4e4e7', border: '1px solid #52525b', borderRadius: 3 }}
+                        />
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleAssess}
+                      disabled={assessmentRunning}
+                      style={{ fontSize: '0.8rem' }}
+                    >
+                      {assessmentRunning ? tP('supplyView.assessment.assessing') : tP('supplyView.assessment.assess')}
+                    </button>
+                  </div>
+                  {assessError && (
+                    <p style={{ color: '#f87171', fontSize: '0.75rem', margin: '0 0 0.4rem' }}>{assessError}</p>
+                  )}
+                  {assessmentResult && (
+                    <div style={{ marginBottom: '0.4rem' }}>
+                      <span style={{ fontSize: '0.82rem', color: '#a1a1aa' }}>{tP('supplyView.assessment.ratingLabel')} </span>
+                      <span style={{
+                        display: 'inline-block',
+                        padding: '1px 10px',
+                        borderRadius: 12,
+                        fontSize: '0.8rem',
+                        fontWeight: 600,
+                        letterSpacing: '0.05em',
+                        background: assessmentResult.rating === 'LOW' ? 'rgba(52,211,153,0.15)' : assessmentResult.rating === 'HIGH' ? 'rgba(248,113,113,0.15)' : 'rgba(251,191,36,0.15)',
+                        color: assessmentResult.rating === 'LOW' ? '#34d399' : assessmentResult.rating === 'HIGH' ? '#f87171' : '#fbbf24',
+                        border: `1px solid ${assessmentResult.rating === 'LOW' ? '#34d399' : assessmentResult.rating === 'HIGH' ? '#f87171' : '#fbbf24'}`,
+                      }}>{assessmentResult.rating}</span>
+                      <p style={{ fontSize: '0.78rem', color: '#d4d4d8', margin: '0.35rem 0 0' }}>{assessmentResult.explanation}</p>
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={handleLoadHistory}
+                    style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '0.75rem', padding: 0 }}
+                  >
+                    {assessmentHistoryOpen ? '▾' : '▸'} {tP('supplyView.assessment.history')}
+                  </button>
+                  {assessmentHistoryOpen && (
+                    <div style={{ marginTop: '0.5rem' }}>
+                      {assessmentHistory.length === 0 ? (
+                        <p style={{ fontSize: '0.75rem', color: '#71717a', margin: 0 }}>{tP('supplyView.assessment.noHistory')}</p>
+                      ) : (
+                        <AssessmentHistoryTable rows={assessmentHistory} storageKey="supExplain" />
+                      )}
+                    </div>
+                  )}
+                </div>
               </section>
               <section style={{ marginBottom: '1.25rem' }}>
                 <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('supExplain.peggedHeading')}</h4>

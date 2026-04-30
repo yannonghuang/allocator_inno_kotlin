@@ -763,7 +763,6 @@
         "splitInfo": "Split Info",
         "override": "Override",
         "pegging": "Pegging",
-        "impact": "Impact",
         "breakdown": "Breakdown"
       },
       "peggingPanel": {
@@ -779,6 +778,8 @@
         }
       },
       "assessment": {
+        "heading": "Assess impact",
+        "qtyDecreaseUnits": "units",
         "criteria": "Assessment criteria",
         "criteriaPlaceholder": "Describe how to evaluate impact severity (LOW / MEDIUM / HIGH). Can be in English or Chinese.",
         "criteriaHint": "Saved per case. Used by the LLM when rating supply-change impact. Leave blank to use the built-in default.",

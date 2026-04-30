@@ -763,7 +763,6 @@
         "splitInfo": "拆分信息",
         "override": "覆盖",
         "pegging": "追溯",
-        "impact": "影响",
         "breakdown": "详情"
       },
       "peggingPanel": {
@@ -779,6 +778,8 @@
         }
       },
       "assessment": {
+        "heading": "评估影响",
+        "qtyDecreaseUnits": "数量",
         "criteria": "评估标准",
         "criteriaPlaceholder": "描述如何评定影响严重程度（低 / 中 / 高），支持中文或英文。",
         "criteriaHint": "按方案保存。LLM 评估供应变更影响时使用此标准。留空则使用默认标准。",
