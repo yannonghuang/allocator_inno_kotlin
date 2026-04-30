@@ -299,6 +299,20 @@ waterfall replaced proportional split" / "Empirical sweet spot" sections
 is a starting point, but the user's actual case may have different
 characteristics — always check their prior runs.
 
+**Knowledge base = every plan run for this case.** Bootstrap-seeded runs
+(those with `metadata.bootstrap = true` and a `preset_id` like `max=2`,
+`elaborate-commit`, `all-levels`) are a curated single-axis exploration
+that a fresh case can use as scaffolding. User-driven runs (regular plans
+the user fired) are equally part of the KB — both feed
+`list_plan_runs(status='success')`. Treat them uniformly when grounding
+evidence; the bootstrap tag is provenance, not a filter for what counts.
+
+If `list_plan_runs` returns an empty or near-empty result on a fresh case,
+suggest the user click "Bootstrap KB" on the planning page — that fires
+the next 5-6 unrun curated configs and is the fastest way to seed
+comparative data. Don't suggest bootstrap if the user already has 10+
+runs; their KB is established.
+
 When checking a prior run's relevance: same case, same `purchase_allowed`,
 same general consolidation shape. Don't compare a run with consolidation
 off to one with it on; the KPI delta isn't attributable to the knob the
