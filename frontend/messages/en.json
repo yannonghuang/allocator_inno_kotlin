@@ -747,9 +747,10 @@
       "overrideWarnBanner": "The last plan run could not fully commit one or more demands under this override. Affected demands below show their shortfall.",
       "edit": "Edit",
       "clear": "Clear",
-      "scarcityRatioTooltip": "Total demand {demand} / total supply {supply} for this product (all locations).",
+      "scarcityRatioTooltip": "Direct user demand {demand} / total supply {supply} for this product (all locations).",
+      "scarcityBomTooltip": "BOM-derived consumption {demand} / total supply {supply}: this is an intermediate material; {demand} is what upstream user demands consumed via BOM explosion. Committed-based — capped at supply availability, so true requested pressure could be higher.",
       "scarcityShortageTooltip": "Demand {demand} / no supply available — total shortage.",
-      "scarcityNoneTooltip": "No user demand for this product — material is unconstrained.",
+      "scarcityNoneTooltip": "No user demand for this product, and no BOM-derived consumption — material is unused.",
       "columns": {
         "supplyId": "Supply ID",
         "product": "Product",

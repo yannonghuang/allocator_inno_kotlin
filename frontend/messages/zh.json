@@ -747,9 +747,10 @@
       "overrideWarnBanner": "在此覆盖下，上次计划运行未能完全满足一个或多个需求。受影响的需求及其短缺量见下方。",
       "edit": "编辑",
       "clear": "清除",
-      "scarcityRatioTooltip": "该产品总需求 {demand} / 总供应 {supply}（含所有地点）。",
+      "scarcityRatioTooltip": "直接用户需求 {demand} / 该产品总供应 {supply}（含所有地点）。",
+      "scarcityBomTooltip": "BOM 派生消耗 {demand} / 总供应 {supply}：此为中间物料，{demand} 为上游用户需求经 BOM 展开消耗的数量。基于已承诺数据，受供应上限约束，真实请求压力可能更高。",
       "scarcityShortageTooltip": "需求 {demand} / 无可用供应 — 完全缺货。",
-      "scarcityNoneTooltip": "该产品无用户需求 — 物料不受约束。",
+      "scarcityNoneTooltip": "该产品无用户需求，亦无 BOM 派生消耗 — 物料未被使用。",
       "columns": {
         "supplyId": "供应 ID",
         "product": "产品",

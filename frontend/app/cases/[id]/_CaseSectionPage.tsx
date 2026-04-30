@@ -2433,8 +2433,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
    *  demand records that drove the plan), excluding BOM-exploded intermediates.
    *  committed_demands holds exactly the user-facing demand rows; planner-internal
    *  intermediate consumption lives in planning_pegging, not here, so summing
-   *  requested_qty here is double-count safe. Used to compute the Scarcity column
-   *  in the Plan Supply View. */
+   *  requested_qty here is double-count safe. Used as the *direct* component of
+   *  the Scarcity column in the Plan Supply View. */
   const productDemandTotalMap = useMemo((): Record<string, number> => {
     const m: Record<string, number> = {};
     if (!planResult?.committed_demands) return m;
@@ -2444,6 +2444,26 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     }
     return m;
   }, [planResult]);
+
+  /** Sum of totalPeggedQty per productId across all plan supply view rows.
+   *  Used as the *BOM-derived* component of Scarcity for intermediate
+   *  materials (which have zero direct user demand but are consumed via
+   *  upstream demands' BOM explosion). The pegging tree captures
+   *  user-demand→supply traversal in supply units, so summing across all
+   *  supplies of a given productId gives the total committed consumption
+   *  of that material from end-product demands.
+   *  Caveat: this is committed-based. If a material is the bottleneck and
+   *  the planner could not fully satisfy upstream demand, this number is
+   *  capped at supply availability — true requested pressure could be
+   *  higher. Documented in the column tooltip. */
+  const productConsumedTotalMap = useMemo((): Record<string, number> => {
+    const m: Record<string, number> = {};
+    for (const r of planSupplyViewRows) {
+      const pid = r.productId ?? '';
+      if (pid) m[pid] = (m[pid] ?? 0) + (Number(r.totalPeggedQty) || 0);
+    }
+    return m;
+  }, [planSupplyViewRows]);
 
   const handleAnalyzeCriticalityForSupply = async (supplyId: string) => {
     setSupplyCriticalityMap(prev => ({ ...prev, [supplyId]: 'running' }));
@@ -5329,22 +5349,34 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             <span> {tP('supplyView.overallUtilization', { pct: overallUtil, consumed: qtyFmt(Number(totalConsumed)), initial: qtyFmt(Number(totalInitial)) })}</span>
                           )}
                         </p>
-                        <SortFilterTable<PlanSupplyViewRow & { _key: string; productTotal: number; criticalityOrder: number; demandTotal: number; scarcityRatio: number }>
+                        <SortFilterTable<PlanSupplyViewRow & { _key: string; productTotal: number; criticalityOrder: number; demandTotal: number; scarcityRatio: number; scarcityKind: 'direct' | 'bom' | 'none' }>
                           idKey="_key"
                           rows={rows.map((r, i) => {
                             const cs = supplyCriticalityMap[r.supplyId];
                             const autoSafe = !cs && r.consumedQty === 0;
                             const criticalityOrder = cs === 'critical' ? 0 : (cs === 'not_critical' || autoSafe) ? 1 : cs === 'error' ? 2 : cs === 'running' ? 3 : 4;
                             const productTotal = planSupplyProductTotalMap[r.productId] ?? 0;
-                            const demandTotal = productDemandTotalMap[r.productId] ?? 0;
-                            // Material-level scarcity = total user demand / total supply for the same
-                            // productId (across all locations / supply records). Demand=0 → no demand
-                            // pressure (rendered as "–"). Supply=0 with demand>0 → infinite scarcity
-                            // (rendered as "∞"). Otherwise a ratio that we render as a percentage.
+                            // Hybrid material-level demand:
+                            //   • End products with direct user demand → sum of requested_qty (can
+                            //     exceed 100%, captures true requested pressure).
+                            //   • Intermediates with no direct user demand → pegging-derived
+                            //     consumption (BOM-explosion of upstream user demands, in this
+                            //     material's units; capped at supply availability by physics).
+                            // Mutually exclusive paths to avoid double-counting on products that are
+                            // both directly demanded AND used as a BOM intermediate (rare but real).
+                            const directDemand = productDemandTotalMap[r.productId] ?? 0;
+                            const bomDerivedDemand = productConsumedTotalMap[r.productId] ?? 0;
+                            const demandTotal = directDemand > 0 ? directDemand : bomDerivedDemand;
+                            const scarcityKind: 'direct' | 'bom' | 'none' = directDemand > 0
+                              ? 'direct'
+                              : bomDerivedDemand > 0 ? 'bom' : 'none';
+                            // Demand=0 → no demand pressure (rendered as "–"). Supply=0 with
+                            // demand>0 → infinite scarcity (rendered as "∞"). Otherwise a ratio
+                            // rendered as a percentage.
                             const scarcityRatio = productTotal > 0
                               ? demandTotal / productTotal
                               : (demandTotal > 0 ? Infinity : 0);
-                            return { ...r, _key: `psv-${i}-${r.supplyId}`, productTotal, criticalityOrder, demandTotal, scarcityRatio };
+                            return { ...r, _key: `psv-${i}-${r.supplyId}`, productTotal, criticalityOrder, demandTotal, scarcityRatio, scarcityKind };
                           })}
                           filterKeys={[]}
                           defaultSortKey="supplyDate"
@@ -5382,7 +5414,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               }
                               const pct = r.scarcityRatio * 100;
                               const color = r.scarcityRatio > 1.0 ? '#f87171' : r.scarcityRatio >= 0.9 ? '#fbbf24' : '#34d399';
-                              return <span style={{ color, fontWeight: 600 }} title={tP('supplyView.scarcityRatioTooltip', { demand: qtyFmt(r.demandTotal), supply: qtyFmt(r.productTotal) })}>{pct.toFixed(0)}%</span>;
+                              const tooltipKey = r.scarcityKind === 'bom'
+                                ? 'supplyView.scarcityBomTooltip'
+                                : 'supplyView.scarcityRatioTooltip';
+                              // Subtle visual cue: dotted underline for BOM-derived rows so a user
+                              // can see at a glance that the number isn't from direct user demand
+                              // (and is committed-based, capped at 100%).
+                              const decoration = r.scarcityKind === 'bom' ? 'underline dotted' : undefined;
+                              return <span style={{ color, fontWeight: 600, textDecoration: decoration, textUnderlineOffset: '3px' }} title={tP(tooltipKey, { demand: qtyFmt(r.demandTotal), supply: qtyFmt(r.productTotal) })}>{pct.toFixed(0)}%</span>;
                             } },
                             { key: 'consumedQty', label: tP('supplyView.columns.consumed'), sortable: true, render: (r) => r.consumedQty > 0 ? <span style={{ color: '#a78bfa' }}>{qtyFmt(Number(r.consumedQty))}</span> : <span style={{ color: '#52525b' }}>0</span> },
                             { key: 'residualQty', label: tP('supplyView.columns.residual'), sortable: true, render: (r) => r.residualQty > 0 ? <span style={{ color: '#34d399' }}>{qtyFmt(Number(r.residualQty))}</span> : <span style={{ color: '#52525b' }}>0</span> },
