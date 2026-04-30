@@ -61,13 +61,30 @@ regression evaporates when `max_methods` saturates available methods (~max=4).
 
 ### Consolidation — `consolidation`
 
-- Two engines: `supply` (recommended; per-supply allocation policy with
-  compensation passes) and `leaf-legacy` (original cap loop).
-- `allocation_mode = "fair"` (priority-first when supply ample, proportional
-  under shortage — no demand fully starved) | `"proportional"` (qty-weighted
-  share) | `"priority_first"` (highest priority filled first, may starve
-  others). Note: `fair` and `proportional` produce identical splits when
-  supply is short, which is most case-171 demands.
+Two engines, fundamentally different competition shapes:
+
+- **`supply` engine** ("flat") — decides each supply's split *upfront*
+  across all competing demands. Under `fair`/`proportional` shortage,
+  this fragments shared inputs into slivers per demand. AND-bottlenecks
+  compute MIN(child shares), so slivers × MIN = tiny make output. Newer;
+  supports `get_supply_split_explanation`.
+- **`leaf-legacy` engine** ("layered") — sequential cap loop where each
+  demand takes a whole claim in turn. Preserves integer-quantity
+  atomicity that AND-relations need to drive real make output.
+- **Trade-off** (case-171 evidence: Run 433 leaf-legacy vs Run 434
+  supply, identical config otherwise): leaf-legacy committed 80,752 /
+  fill 25% / Gini 0.39 / starvation 28%; supply committed 35,098 / fill
+  11% / Gini 0.46 / starvation 19%. The `manufacturing.total_quantity`
+  gap (104k vs 28k from same supplies) is the engine-fragmentation
+  smoking gun. Pick **`leaf-legacy`** for throughput + complete orders;
+  pick **`supply`** for minimum-service-level fairness (more demands
+  touched, fewer fully starved).
+- `allocation_mode = "fair"` (priority-first when supply ample,
+  proportional under shortage — no demand fully starved) |
+  `"proportional"` (qty-weighted share) | `"priority_first"` (highest
+  priority filled first, may starve others). `fair` and `proportional`
+  produce identical splits when supply is short, which is most case-171
+  demands.
 - `period_days` controls bucket width (0 = single bucket regardless of due date).
 
 ### Soundness check
@@ -97,6 +114,9 @@ The agent has these tools available; call them rather than guessing:
 | `get_kpis(run_id)` | KPI questions. Returns `no_plan_kpis` for contingent runs — fall through to the baseline run via `metadata.baselinePlanRunId`. |
 | `get_demand_pegging(run_id, demand_id)` | "Why is demand X partial?" / "what fulfilled demand X?". |
 | `get_supply_split_explanation(run_id, supply_id)` | "Why did demand A get more than demand B from supply X?" — only works when consolidation engine = `supply`. |
+| `get_run_config(run_id)` | "What config did run X use?". MUST-HAVE before any A/B comparison — confirms the single knob that differs, so KPI deltas are actually attributable. Returns config + override snapshot. |
+| `recheck_soundness(run_id, deep_check?)` | A soundness rule has shipped *since* run X — apply the current ruleset retroactively. Updates the run's badge. |
+| `get_soundness_summary(run_id)` | "How sound is run X — what rules failed, by how much?". Server-side rollup (rule, demand_count, violation_count, total_actual). Use INSTEAD of walking each demand's pegging. |
 | `read_memory` / `write_memory` | Memory is auto-bootstrapped into the prompt; explicit reads are rarely needed. Write durable preferences. |
 
 ## Plan run statuses
@@ -117,6 +137,12 @@ The agent has these tools available; call them rather than guessing:
 - **`median_fill_ratio`**: 50th-percentile fill ratio.
 - **`starvation_pct`**: % of demands with 0 fill (committed_qty ≤ ε).
 - **`on_time_count`**: # demands committed by their due date.
+- **`inventory.consumed_total`** / **`manufacturing.total_quantity`**:
+  total raw input consumed and total make output. **A multi-x gap on
+  these between two runs with the same supplies almost always means
+  engine fragmentation, not a method-selection difference.** (Case-171:
+  Run 433 mfg=104,014 vs Run 434 mfg=28,036 — 3.7× gap = the
+  `supply` engine fragmenting shared inputs below the make threshold.)
 
 ## Failure modes to recognize
 
@@ -206,3 +232,25 @@ When checking a prior run's relevance: same case, same `purchase_allowed`,
 same general consolidation shape. Don't compare a run with consolidation
 off to one with it on; the KPI delta isn't attributable to the knob the
 user is asking about.
+
+### Comparative diagnosis — when the user asks "why did A beat B?"
+
+Common forms: "why is run X better than Y?", "fill rate dropped — why?",
+"the new engine is worse, what gives?". Don't speculate from KPIs alone;
+follow this pattern:
+
+1. `get_run_config(A)` and `get_run_config(B)` → diff. Report the
+   single load-bearing knob that differs. If multiple differ, say so
+   and ask the user which delta to attribute to.
+2. `get_kpis(A)` and `get_kpis(B)`.
+3. Cross-check `manufacturing.total_quantity` and
+   `inventory.consumed_total`. A multi-x gap on these from the same
+   supplies is the engine-fragmentation smoking gun.
+4. **If a soundness rule has shipped *between* the runs** (e.g. R7d
+   landed after the orphan-fix), call `recheck_soundness(older_run)`
+   then `get_soundness_summary(older_run)` to confirm/rule out a
+   "phantom KPI" explanation — pre-fix runs may have inflated commits
+   via orphan inventory consumption, so the older run's "better" fill
+   rate may simply be dishonest accounting.
+5. Explain via the relevant Mechanism section in this primer (e.g. the
+   Consolidation engines block), not by listing KPIs.
