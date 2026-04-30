@@ -838,6 +838,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [previousPeggingContext, setPreviousPeggingContext] = useState<{
     type: 'supply'; supplyId: string; peggedDemands: PeggedDemandEntry[]; initialQty: number; consumedQty: number;
   } | null>(null);
+  // When drilling from the Breakdown slide-in (supExplain) into a demand's pegging tree,
+  // remembers the supExplain row for the back link in the planPegging slide-in. Cleared
+  // whenever the planPegging slide-in is closed via any path (Close button or new context).
+  const [previousSupExplainRow, setPreviousSupExplainRow] = useState<PlanSupplyViewRow | null>(null);
   const [planWorkOrderPeggingLoading, setPlanWorkOrderPeggingLoading] = useState<string | null>(null);
   const [planWorkOrderPeggingError, setPlanWorkOrderPeggingError] = useState<string | null>(null);
   const planPeggingResizeRef = useRef<{ startX: number; startW: number } | null>(null);
@@ -1381,16 +1385,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     setWoPeggingActiveDemandId(null);
   }, [planPeggingContext]);
 
-  // Reset assessment result/history when a different supply is opened in the pegging panel
-  const currentPeggingSupplyId = planPeggingContext?.type === 'supply' ? planPeggingContext.supplyId : null;
+  // Reset assessment result/history when a different supply is opened in the
+  // breakdown slide-in (where the assessment UI now lives).
+  const currentExplainSupplyId = supExplainRow?.supplyId ?? null;
   useEffect(() => {
-    if (currentPeggingSupplyId) {
+    if (currentExplainSupplyId) {
       setAssessmentResult(null);
       setAssessmentHistory([]);
       setAssessmentHistoryOpen(false);
       setAssessError(null);
     }
-  }, [currentPeggingSupplyId]);
+  }, [currentExplainSupplyId]);
 
   // Load assessment criteria lazily when the editor is opened for the first time
   useEffect(() => {
@@ -2428,6 +2433,42 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return m;
   }, [planSupplyViewRows]);
 
+  /** Sum of requested qty per productId across all USER demands (i.e. the
+   *  demand records that drove the plan), excluding BOM-exploded intermediates.
+   *  committed_demands holds exactly the user-facing demand rows; planner-internal
+   *  intermediate consumption lives in planning_pegging, not here, so summing
+   *  requested_qty here is double-count safe. Used as the *direct* component of
+   *  the Scarcity column in the Plan Supply View. */
+  const productDemandTotalMap = useMemo((): Record<string, number> => {
+    const m: Record<string, number> = {};
+    if (!planResult?.committed_demands) return m;
+    for (const d of planResult.committed_demands) {
+      const pid = d.product_id ?? '';
+      if (pid) m[pid] = (m[pid] ?? 0) + (Number(d.requested_qty) || 0);
+    }
+    return m;
+  }, [planResult]);
+
+  /** Sum of totalPeggedQty per productId across all plan supply view rows.
+   *  Used as the *BOM-derived* component of Scarcity for intermediate
+   *  materials (which have zero direct user demand but are consumed via
+   *  upstream demands' BOM explosion). The pegging tree captures
+   *  user-demand→supply traversal in supply units, so summing across all
+   *  supplies of a given productId gives the total committed consumption
+   *  of that material from end-product demands.
+   *  Caveat: this is committed-based. If a material is the bottleneck and
+   *  the planner could not fully satisfy upstream demand, this number is
+   *  capped at supply availability — true requested pressure could be
+   *  higher. Documented in the column tooltip. */
+  const productConsumedTotalMap = useMemo((): Record<string, number> => {
+    const m: Record<string, number> = {};
+    for (const r of planSupplyViewRows) {
+      const pid = r.productId ?? '';
+      if (pid) m[pid] = (m[pid] ?? 0) + (Number(r.totalPeggedQty) || 0);
+    }
+    return m;
+  }, [planSupplyViewRows]);
+
   const handleAnalyzeCriticalityForSupply = async (supplyId: string) => {
     setSupplyCriticalityMap(prev => ({ ...prev, [supplyId]: 'running' }));
     try {
@@ -2596,7 +2637,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (!selectedRunId) return;
     setPeggingOpen(true);
     setPeggingLoading(true);
-    setPeggingTitle(`Pegging: Supply ${row.component_key.replace('|', '@')}`);
+    setPeggingTitle(tP('peggingPanel.titleWorkOrder', { product: row.component_key.split('|')[0] ?? row.component_key, location: row.component_key.split('|')[1] ?? '' }));
     setPeggingData(null);
     setPeggingTreeReady(false);
     setPeggingExpanded(new Set());
@@ -2633,7 +2674,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (!selectedRunId) return;
     setPeggingOpen(true);
     setPeggingLoading(true);
-    setPeggingTitle(`Pegging: Demand ${row.demand_id}`);
+    setPeggingTitle(tP('peggingPanel.titleDemand', { label: String(row.demand_id) }));
     setPeggingData(null);
     setPeggingTreeReady(false);
     setPeggingExpanded(new Set());
@@ -2881,13 +2922,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // ── Assessment handlers ─────────────────────────────────────────────────────
 
   const handleAssess = async () => {
-    if (!planPeggingContext || planPeggingContext.type !== 'supply') return;
+    const supplyId = supExplainRow?.supplyId;
+    if (!supplyId) return;
     setAssessmentRunning(true);
     setAssessError(null);
     try {
       const result = await runAssessment(
         id,
-        planPeggingContext.supplyId,
+        supplyId,
         assessDelayDays,
         assessQtyDecreaseMode === 'pct' ? assessQtyDecreasePct : 0,
         currentPlanRunId,
@@ -2896,7 +2938,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         locale,
       );
       setAssessmentResult(result);
-      const hist = await listAssessments(id, planPeggingContext.supplyId);
+      const hist = await listAssessments(id, supplyId);
       setAssessmentHistory(hist);
       setAssessmentHistoryOpen(true);
     } catch (e) {
@@ -2907,10 +2949,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   };
 
   const handleLoadHistory = async () => {
-    if (!planPeggingContext || planPeggingContext.type !== 'supply') return;
+    const supplyId = supExplainRow?.supplyId;
+    if (!supplyId) return;
     if (!assessmentHistoryOpen) {
       try {
-        const hist = await listAssessments(id, planPeggingContext.supplyId);
+        const hist = await listAssessments(id, supplyId);
         setAssessmentHistory(hist);
       } catch (_) { /* best-effort */ }
     }
@@ -3029,7 +3072,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 )}
                 {!supplyViewLoading && supplyView.length <= 1 && supplyView.length > 0 && (
                   <p style={{ fontSize: '0.875rem', color: '#71717a', marginBottom: '0.5rem' }}>
-                    One row per supply record. If you expect more rows, re-import supply CSV for this case.
+                    {tA('supplyView.hint')}
                   </p>
                 )}
                 {!supplyViewLoading && (
@@ -3040,17 +3083,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   const overallUtil = totalInitial > 0 ? (totalConsumed / totalInitial) * 100 : 0;
                   return (
                     <p style={{ fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
-                      Overall utilization: <strong>{qtyFmt(totalConsumed)}</strong> / <strong>{qtyFmt(totalInitial)}</strong> initial = <strong>{overallUtil.toFixed(1)}%</strong>
+                      {tA('supplyView.overallUtilization')} <strong>{qtyFmt(totalConsumed)}</strong> / <strong>{qtyFmt(totalInitial)}</strong> {tA('supplyView.initial')} = <strong>{overallUtil.toFixed(1)}%</strong>
                     </p>
                   );
                 })()}
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, marginBottom: '0.5rem' }} title="Uncheck to see all supplies, including those with 0 consumed">
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, marginBottom: '0.5rem' }}>
                   <input
                     type="checkbox"
                     checked={supplyFilterConsumedOnly}
                     onChange={(e) => setSupplyFilterConsumedOnly(e.target.checked)}
                   />
-                  Only consumed (consumed qty &gt; 0) — uncheck to see all supplies
+                  {tA('supplyView.onlyConsumed')}
                 </label>
                 <SortFilterTable<SupplyViewRow & { _rowKey?: string; product_total: number }>
                 idKey="_rowKey"
@@ -3062,16 +3105,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 filterKeys={['supply_id', 'product_id', 'location_id', 'component_key', 'supply_date', 'consumed_qty', 'utilization_rate']}
                 defaultSortKey="utilization_rate"
                 columns={[
-                  { key: 'supply_id', label: 'Supply ID', sortable: true },
-                  { key: 'supply_date', label: 'Time', sortable: true, render: (r) => r.supply_date ?? '–' },
-                  { key: 'product_id', label: 'Product', sortable: true },
-                  { key: 'location_id', label: 'Location', sortable: true },
-                  { key: 'initial_qty', label: 'Initial qty', sortable: true },
-                  { key: 'product_total', label: 'Total per product', sortable: true, render: (r) => r.product_total > 0 ? qtyFmt(r.product_total) : '–' },
-                  { key: 'consumed_qty', label: 'Consumed qty', sortable: true },
-                  { key: 'residual_qty', label: 'Residual qty', sortable: true },
-                  { key: 'utilization_rate', label: 'Utilization', sortable: true, render: (r) => r.utilization_rate != null ? `${(Number(r.utilization_rate) * 100).toFixed(1)}%` : '–' },
-                  { key: '_pegging', label: 'Pegging', sortable: false, render: (r) => <button type="button" className="secondary" onClick={() => handleSupplyPeggingClick(r)}>Show</button> },
+                  { key: 'supply_id', label: tA('supplyView.columns.supplyId'), sortable: true },
+                  { key: 'supply_date', label: tA('supplyView.columns.time'), sortable: true, render: (r) => r.supply_date ?? '–' },
+                  { key: 'product_id', label: tA('supplyView.columns.product'), sortable: true },
+                  { key: 'location_id', label: tA('supplyView.columns.location'), sortable: true },
+                  { key: 'initial_qty', label: tA('supplyView.columns.initialQty'), sortable: true },
+                  { key: 'product_total', label: tA('supplyView.columns.productTotal'), sortable: true, render: (r) => r.product_total > 0 ? qtyFmt(r.product_total) : '–' },
+                  { key: 'consumed_qty', label: tA('supplyView.columns.consumedQty'), sortable: true },
+                  { key: 'residual_qty', label: tA('supplyView.columns.residualQty'), sortable: true },
+                  { key: 'utilization_rate', label: tA('supplyView.columns.utilization'), sortable: true, render: (r) => r.utilization_rate != null ? `${(Number(r.utilization_rate) * 100).toFixed(1)}%` : '–' },
+                  { key: '_pegging', label: tA('supplyView.columns.pegging'), sortable: false, render: (r) => <button type="button" className="secondary" onClick={() => handleSupplyPeggingClick(r)}>{tc('show')}</button> },
                 ]}
               />
                 </>
@@ -3507,24 +3550,28 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 idKey="demand_id"
                 rows={feasibleDemands.map((f) => ({
                   ...f,
-                  suggested_revision: f.suggested_revision ?? (f.status === 'fulfilled' ? 'Fulfilled' : f.allocated_qty > 0 ? `Reduce to ${f.allocated_qty}` : 'Unfulfilled (0 allocated)'),
+                  suggested_revision: f.suggested_revision ?? (f.status === 'fulfilled'
+                    ? tA('demandView.fulfilled')
+                    : f.allocated_qty > 0
+                      ? `${tA('demandView.reduceTo')} ${f.allocated_qty}`
+                      : tA('demandView.unfulfilled')),
                 }))}
                 rowId={(r) => `demand-${r.demand_id}`}
                 onRowClick={handleDemandPeggingClick}
                 filterKeys={['demand_id', 'customer', 'customer_id', 'product_id', 'status', 'suggested_revision', 'request_due_time', 'revised_time', 'fulfillment_rate']}
                 defaultSortKey="fulfillment_rate"
                 columns={[
-                  { key: 'demand_id', label: 'Demand ID', sortable: true },
-                  { key: 'customer', label: 'Customer', sortable: true, render: (r) => r.customer ?? r.customer_id ?? '–' },
-                  { key: 'request_due_time', label: 'Time', sortable: true, render: (r) => r.request_due_time ?? '–' },
-                  { key: 'revised_time', label: 'Revised time', sortable: true, render: (r) => r.revised_time ?? '–' },
-                  { key: 'product_id', label: 'Product', sortable: true },
-                  { key: 'requested_qty', label: 'Requested', sortable: true },
-                  { key: 'allocated_qty', label: 'Allocated', sortable: true },
-                  { key: 'fulfillment_rate', label: 'Fulfillment', sortable: true, render: (r) => r.fulfillment_rate != null ? `${(Number(r.fulfillment_rate) * 100).toFixed(1)}%` : '–' },
-                  { key: 'status', label: 'Status', sortable: true },
-                  { key: 'suggested_revision', label: 'Suggested revision', sortable: true },
-                  { key: '_pegging', label: 'Pegging', sortable: false, render: (r) => <button type="button" className="secondary" onClick={() => handleDemandPeggingClick(r)}>Show</button> },
+                  { key: 'demand_id', label: tA('demandView.columns.demandId'), sortable: true },
+                  { key: 'customer', label: tA('demandView.columns.customer'), sortable: true, render: (r) => r.customer ?? r.customer_id ?? '–' },
+                  { key: 'request_due_time', label: tA('demandView.columns.time'), sortable: true, render: (r) => r.request_due_time ?? '–' },
+                  { key: 'revised_time', label: tA('demandView.columns.revisedTime'), sortable: true, render: (r) => r.revised_time ?? '–' },
+                  { key: 'product_id', label: tA('demandView.columns.product'), sortable: true },
+                  { key: 'requested_qty', label: tA('demandView.columns.requested'), sortable: true },
+                  { key: 'allocated_qty', label: tA('demandView.columns.allocated'), sortable: true },
+                  { key: 'fulfillment_rate', label: tA('demandView.columns.fulfillment'), sortable: true, render: (r) => r.fulfillment_rate != null ? `${(Number(r.fulfillment_rate) * 100).toFixed(1)}%` : '–' },
+                  { key: 'status', label: tA('demandView.columns.status'), sortable: true },
+                  { key: 'suggested_revision', label: tA('demandView.columns.suggestedRevision'), sortable: true },
+                  { key: '_pegging', label: tA('demandView.columns.pegging'), sortable: false, render: (r) => <button type="button" className="secondary" onClick={() => handleDemandPeggingClick(r)}>{tc('show')}</button> },
                 ]}
               />
               </>
@@ -4315,20 +4362,20 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         )}
                         {planDemandBuyOnly && list.length === 0 && (
                           <p style={{ fontSize: '0.8rem', color: '#71717a', marginBottom: '0.5rem' }}>
-                            No demands in this plan have a work order with method &quot;purchase&quot; in their pegging tree.
+                            {tP('committedDemands.noBuyInPlan')}
                           </p>
                         )}
                         {planDemandRealMoveOnly && list.length === 0 && realMoveTriples !== null && realMoveTriples.length > 0 && (
                           <p style={{ fontSize: '0.8rem', color: '#71717a', marginBottom: '0.5rem' }}>
-                            No demands in this plan have a move work order with TRANSIT_TIME &gt; 0 in their pegging tree.
+                            {tP('committedDemands.noMoveInPlan')}
                           </p>
                         )}
                         {hasMultipleCustomers && (
                           <details style={{ fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
-                            <summary style={{ cursor: 'pointer' }}>Rollup by customer (filtered set)</summary>
+                            <summary style={{ cursor: 'pointer' }}>{tP('committedDemands.rollupFiltered')}</summary>
                             <ul style={{ marginTop: '0.25rem', paddingLeft: '1.25rem' }}>
                               {Object.entries(byCustomer).map(([cust, qty]) => (
-                                <li key={cust}><strong>{cust}</strong>: {qtyFmt(Number(qty))} committed</li>
+                                <li key={cust}><strong>{cust}</strong>: {qtyFmt(Number(qty))} {tP('committedDemands.committed')}</li>
                               ))}
                             </ul>
                           </details>
@@ -4341,7 +4388,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             _customer: String(r.customer ?? r.customer_id ?? ''),
                           }))}
                           filterKeys={['demand_id', '_customer', 'product_id', 'location_id', 'commit_time', 'commit_reason']}
-                          filterPlaceholder="Filter by demand ID, customer, product, location…"
+                          filterPlaceholder={tP('committedDemands.filterPlaceholder')}
                           defaultSortKey="commit_time"
                           stickyHeader
                           rowStyle={(r) => {
@@ -4351,23 +4398,23 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             return undefined;
                           }}
                           columns={[
-                            { key: 'demand_id', label: 'Demand ID', sortable: true, render: (r) => r.demand_id ?? '–' },
-                            { key: '_customer', label: 'Customer', sortable: true, render: (r) => (r as { _customer?: string })._customer || (r.customer ?? r.customer_id ?? '–') },
-                            { key: 'product_id', label: 'Product', sortable: true },
-                            { key: 'location_id', label: 'Location', sortable: true },
-                            { key: 'requested_qty', label: 'Requested', sortable: true, render: (r) => r.requested_qty != null ? qtyFmt(Number(r.requested_qty)) : '–' },
-                            { key: 'quantity', label: 'Committed', sortable: true, render: (r) => r.is_failed
-                              ? <span style={{ color: '#f87171', fontWeight: 600, fontSize: '0.78rem', background: 'rgba(248,113,113,0.15)', padding: '1px 6px', borderRadius: 4 }}>FAILED</span>
+                            { key: 'demand_id', label: tP('committedDemands.columns.demandId'), sortable: true, render: (r) => r.demand_id ?? '–' },
+                            { key: '_customer', label: tP('committedDemands.columns.customer'), sortable: true, render: (r) => (r as { _customer?: string })._customer || (r.customer ?? r.customer_id ?? '–') },
+                            { key: 'product_id', label: tP('committedDemands.columns.product'), sortable: true },
+                            { key: 'location_id', label: tP('committedDemands.columns.location'), sortable: true },
+                            { key: 'requested_qty', label: tP('committedDemands.columns.requested'), sortable: true, render: (r) => r.requested_qty != null ? qtyFmt(Number(r.requested_qty)) : '–' },
+                            { key: 'quantity', label: tP('committedDemands.columns.committed'), sortable: true, render: (r) => r.is_failed
+                              ? <span style={{ color: '#f87171', fontWeight: 600, fontSize: '0.78rem', background: 'rgba(248,113,113,0.15)', padding: '1px 6px', borderRadius: 4 }}>{tP('committedDemands.failed')}</span>
                               : qtyFmt(Number(r.quantity)) },
-                            { key: 'shortage', label: 'Shortage', sortable: true, render: (r) => {
+                            { key: 'shortage', label: tP('committedDemands.columns.shortage'), sortable: true, render: (r) => {
                               const s = r.shortage ?? 0;
                               return s > 0.01
                                 ? <span style={{ color: '#f87171', fontWeight: 600 }}>{qtyFmt(Number(s))}</span>
                                 : <span style={{ color: '#4ade80' }}>0</span>;
                             }},
-                            { key: 'request_time', label: 'Request time', sortable: true, render: (r) => r.request_time ?? '–' },
-                            { key: 'commit_time', label: 'Commit time', sortable: true, render: (r) => r.commit_time ?? '–' },
-                            { key: 'commit_reason', label: 'Commit reason', sortable: true, render: (r) => {
+                            { key: 'request_time', label: tP('committedDemands.columns.requestTime'), sortable: true, render: (r) => r.request_time ?? '–' },
+                            { key: 'commit_time', label: tP('committedDemands.columns.commitTime'), sortable: true, render: (r) => r.commit_time ?? '–' },
+                            { key: 'commit_reason', label: tP('committedDemands.columns.commitReason'), sortable: true, render: (r) => {
                               if (!r.commit_reason) return <span style={{ color: '#52525b' }}>–</span>;
                               const { label, tooltip } = formatCommitReason(r.commit_reason, planningConfig.purchase_allowed !== false);
                               if (!r.is_failed) {
@@ -4385,7 +4432,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                 </span>
                               );
                             } },
-                            { key: '_pegging', label: 'Pegging', sortable: false, render: (r) => {
+                            { key: '_pegging', label: tP('committedDemands.columns.pegging'), sortable: false, render: (r) => {
                               const k = `demand|${r.demand_id ?? ''}|${r.product_id}|${r.location_id}`;
                               const isSelected = woPeggingRowKey === k;
                               return (
@@ -4394,10 +4441,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                   className="secondary"
                                   style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
                                   onClick={() => {
-                                    if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); }
-                                    else { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); }
+                                    if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); }
+                                    else { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); }
                                   }}
-                                >Show</button>
+                                >{tc('show')}</button>
                               );
                             } },
                           ]}
@@ -4690,17 +4737,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       ? woRowsAll.filter((r) => (r._shortage ?? 0) > 0.01)
                       : woRowsAll;
                     const woColumns: { key: string; label: string; sortable?: boolean; render?: (r: WoEnrichedRow) => React.ReactNode }[] = [
-                      { key: 'product_id', label: 'Product', sortable: true },
-                      { key: 'location_id', label: 'Location', sortable: true },
-                      { key: '_prod_area', label: 'PROD_AREA', sortable: true, render: (r) => r._prod_area || r.prod_area || '–' },
-                      { key: '_requested_qty', label: 'Requested', sortable: true, render: (r) =>
+                      { key: 'product_id', label: tP('workOrders.columns.product'), sortable: true },
+                      { key: 'location_id', label: tP('workOrders.columns.location'), sortable: true },
+                      { key: '_prod_area', label: tP('workOrders.columns.prodArea'), sortable: true, render: (r) => r._prod_area || r.prod_area || '–' },
+                      { key: '_requested_qty', label: tP('workOrders.columns.requested'), sortable: true, render: (r) =>
                         r._requested_qty != null ? qtyFmt(Number(r._requested_qty)) : '–'
                       },
-                      { key: 'quantity', label: 'Committed', sortable: true, render: (r) => qtyFmt(Number(r.quantity)) },
-                      { key: 'start_time', label: 'Start time', sortable: true, render: (r) => r.start_time ?? '–' },
-                      { key: 'end_time', label: 'End time', sortable: true, render: (r) => r.end_time ?? '–' },
-                      { key: 'method', label: 'Method', sortable: true, render: (r) => r.method ?? '–' },
-                      { key: '_demand_label', label: 'Demand', sortable: true, render: (r) => {
+                      { key: 'quantity', label: tP('workOrders.columns.committed'), sortable: true, render: (r) => qtyFmt(Number(r.quantity)) },
+                      { key: 'start_time', label: tP('workOrders.columns.startTime'), sortable: true, render: (r) => r.start_time ?? '–' },
+                      { key: 'end_time', label: tP('workOrders.columns.endTime'), sortable: true, render: (r) => r.end_time ?? '–' },
+                      { key: 'method', label: tP('workOrders.columns.method'), sortable: true, render: (r) => r.method ?? '–' },
+                      { key: '_demand_label', label: tP('workOrders.columns.demand'), sortable: true, render: (r) => {
                         const ids = r._demand_ids ?? [];
                         const label = r._demand_label;
                         if (!label) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
@@ -4710,18 +4757,18 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           <span title={label} style={{ cursor: 'default' }}>
                             {preview}
                             <span style={{ marginLeft: 5, background: '#0891b2', color: '#fff', borderRadius: 8, padding: '1px 6px', fontSize: '0.7rem', verticalAlign: 'middle' }}>
-                              shared
+                              {tP('workOrders.shared')}
                             </span>
                           </span>
                         );
                       } },
-                      { key: '_shortage', label: 'Shortage', sortable: true, render: (r) => {
+                      { key: '_shortage', label: tP('workOrders.columns.shortage'), sortable: true, render: (r) => {
                         const s = r._shortage;
                         if (!s) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
                         return <span style={{ color: '#f87171' }}>{qtyFmt(Number(s))}</span>;
                       } },
-                      { key: 'location_source', label: 'Location source', sortable: true, render: (r) => r.location_source ?? '–' },
-                      { key: '_peg_order', label: 'Pegging', sortable: true, render: (r) => {
+                      { key: 'location_source', label: tP('workOrders.columns.locationSource'), sortable: true, render: (r) => r.location_source ?? '–' },
+                      { key: '_peg_order', label: tP('workOrders.columns.pegging'), sortable: true, render: (r) => {
                         const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
                         const isSelected = woPeggingRowKey === k;
                         return (
@@ -4731,13 +4778,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
                             onClick={(e) => {
                               e.stopPropagation();
-                              if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); }
-                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); }
+                              if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); }
+                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); }
                             }}
-                          >Show</button>
+                          >{tc('show')}</button>
                         );
                       } },
-                      { key: '_explain', label: 'Explain', sortable: false, render: (r) => {
+                      { key: '_explain', label: tP('workOrders.columns.explain'), sortable: false, render: (r) => {
                         const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
                         const isSelected = woExplainKey === k;
                         if (!(r.wo_explanation_method || (r.wo_competing_demands?.length ?? 0) > 0 || (r.wo_consolidation_split_details?.length ?? 0) > 1))
@@ -4751,10 +4798,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               if (isSelected) { setWoExplainOpen(false); setWoExplainKey(null); setWoExplainRow(null); }
                               else { setWoExplainRow(r); setWoExplainKey(k); setWoExplainOpen(true); }
                             }}
-                          >Why</button>
+                          >{tc('show')}</button>
                         );
                       }},
-                      { key: '_override', label: 'Override', sortable: false, render: (r) => {
+                      { key: '_override', label: tP('workOrders.columns.override'), sortable: false, render: (r) => {
                         const methodOptions = r.wo_explanation_method
                           ? new Set(Array.from(r.wo_explanation_method.matchAll(/\b(make|move|buy)\b/gi), (m) => m[1].toLowerCase()))
                           : new Set<string>();
@@ -4763,8 +4810,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         if (!hasMethod && !hasSplit) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
                         return (
                           <div style={{ display: 'flex', gap: 4 }}>
-                            {hasMethod && <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 6px' }} onClick={() => openOverrideDialog('method_selection', r)}>Method</button>}
-                            {hasSplit && <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 6px' }} onClick={() => openOverrideDialog('component_split', r)}>Split</button>}
+                            {hasMethod && <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 6px' }} onClick={() => openOverrideDialog('method_selection', r)}>{tP('workOrders.overrideMethod')}</button>}
+                            {hasSplit && <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 6px' }} onClick={() => openOverrideDialog('component_split', r)}>{tP('workOrders.overrideSplit')}</button>}
                           </div>
                         );
                       }},
@@ -5306,13 +5353,34 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             <span> {tP('supplyView.overallUtilization', { pct: overallUtil, consumed: qtyFmt(Number(totalConsumed)), initial: qtyFmt(Number(totalInitial)) })}</span>
                           )}
                         </p>
-                        <SortFilterTable<PlanSupplyViewRow & { _key: string; productTotal: number; criticalityOrder: number }>
+                        <SortFilterTable<PlanSupplyViewRow & { _key: string; productTotal: number; criticalityOrder: number; demandTotal: number; scarcityRatio: number; scarcityKind: 'direct' | 'bom' | 'none' }>
                           idKey="_key"
                           rows={rows.map((r, i) => {
                             const cs = supplyCriticalityMap[r.supplyId];
                             const autoSafe = !cs && r.consumedQty === 0;
                             const criticalityOrder = cs === 'critical' ? 0 : (cs === 'not_critical' || autoSafe) ? 1 : cs === 'error' ? 2 : cs === 'running' ? 3 : 4;
-                            return { ...r, _key: `psv-${i}-${r.supplyId}`, productTotal: planSupplyProductTotalMap[r.productId] ?? 0, criticalityOrder };
+                            const productTotal = planSupplyProductTotalMap[r.productId] ?? 0;
+                            // Hybrid material-level demand:
+                            //   • End products with direct user demand → sum of requested_qty (can
+                            //     exceed 100%, captures true requested pressure).
+                            //   • Intermediates with no direct user demand → pegging-derived
+                            //     consumption (BOM-explosion of upstream user demands, in this
+                            //     material's units; capped at supply availability by physics).
+                            // Mutually exclusive paths to avoid double-counting on products that are
+                            // both directly demanded AND used as a BOM intermediate (rare but real).
+                            const directDemand = productDemandTotalMap[r.productId] ?? 0;
+                            const bomDerivedDemand = productConsumedTotalMap[r.productId] ?? 0;
+                            const demandTotal = directDemand > 0 ? directDemand : bomDerivedDemand;
+                            const scarcityKind: 'direct' | 'bom' | 'none' = directDemand > 0
+                              ? 'direct'
+                              : bomDerivedDemand > 0 ? 'bom' : 'none';
+                            // Demand=0 → no demand pressure (rendered as "–"). Supply=0 with
+                            // demand>0 → infinite scarcity (rendered as "∞"). Otherwise a ratio
+                            // rendered as a percentage.
+                            const scarcityRatio = productTotal > 0
+                              ? demandTotal / productTotal
+                              : (demandTotal > 0 ? Infinity : 0);
+                            return { ...r, _key: `psv-${i}-${r.supplyId}`, productTotal, criticalityOrder, demandTotal, scarcityRatio, scarcityKind };
                           })}
                           filterKeys={[]}
                           defaultSortKey="supplyDate"
@@ -5343,6 +5411,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             { key: 'supplyDate', label: tP('supplyView.columns.supplyDate'), sortable: true, render: (r) => r.supplyDate ?? '–' },
                             { key: 'qty', label: tP('supplyView.columns.initialQty'), sortable: true, render: (r) => qtyFmt(Number(r.qty)) },
                             { key: 'productTotal', label: tP('supplyView.columns.productTotal'), sortable: true, render: (r) => r.productTotal > 0 ? qtyFmt(Number(r.productTotal)) : '–' },
+                            { key: 'scarcityRatio', label: tP('supplyView.columns.scarcity'), sortable: true, render: (r) => {
+                              if (r.demandTotal === 0) return <span style={{ color: '#52525b' }} title={tP('supplyView.scarcityNoneTooltip')}>–</span>;
+                              if (!isFinite(r.scarcityRatio)) {
+                                return <span style={{ color: '#f87171', fontWeight: 600 }} title={tP('supplyView.scarcityShortageTooltip', { demand: qtyFmt(r.demandTotal) })}>∞</span>;
+                              }
+                              const pct = r.scarcityRatio * 100;
+                              const color = r.scarcityRatio > 1.0 ? '#f87171' : r.scarcityRatio >= 0.9 ? '#fbbf24' : '#34d399';
+                              const tooltipKey = r.scarcityKind === 'bom'
+                                ? 'supplyView.scarcityBomTooltip'
+                                : 'supplyView.scarcityRatioTooltip';
+                              // Subtle visual cue: dotted underline for BOM-derived rows so a user
+                              // can see at a glance that the number isn't from direct user demand
+                              // (and is committed-based, capped at 100%).
+                              const decoration = r.scarcityKind === 'bom' ? 'underline dotted' : undefined;
+                              return <span style={{ color, fontWeight: 600, textDecoration: decoration, textUnderlineOffset: '3px' }} title={tP(tooltipKey, { demand: qtyFmt(r.demandTotal), supply: qtyFmt(r.productTotal) })}>{pct.toFixed(0)}%</span>;
+                            } },
                             { key: 'consumedQty', label: tP('supplyView.columns.consumed'), sortable: true, render: (r) => r.consumedQty > 0 ? <span style={{ color: '#a78bfa' }}>{qtyFmt(Number(r.consumedQty))}</span> : <span style={{ color: '#52525b' }}>0</span> },
                             { key: 'residualQty', label: tP('supplyView.columns.residual'), sortable: true, render: (r) => r.residualQty > 0 ? <span style={{ color: '#34d399' }}>{qtyFmt(Number(r.residualQty))}</span> : <span style={{ color: '#52525b' }}>0</span> },
                             { key: 'utilizationRate', label: tP('supplyView.columns.utilPct'), sortable: true, render: (r) => {
@@ -5461,32 +5545,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                 </span>
                               );
                             }},
-                            { key: '_sup_pegging' as keyof (PlanSupplyViewRow & { _key: string }), label: tP('supplyView.columns.pegging'), sortable: false, render: (r) => {
-                              if (r.peggedDemandCount === 0) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
-                              const k = `supply|${r.supplyId}`;
-                              const isSelected = woPeggingRowKey === k;
-                              return (
-                                <button
-                                  type="button"
-                                  className="secondary"
-                                  style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
-                                  onClick={() => {
-                                    if (isSelected) {
-                                      setPlanPeggingOpen(false);
-                                      setPlanPeggingContext(null);
-                                      setWoPeggingRowKey(null);
-                                      setPreviousPeggingContext(null);
-                                    } else {
-                                      setPlanPeggingContext({ type: 'supply', supplyId: r.supplyId, peggedDemands: r.peggedDemands, initialQty: r.qty, consumedQty: r.consumedQty });
-                                      setPlanPeggingOpen(true);
-                                      setWoPeggingRowKey(k);
-                                      setPreviousPeggingContext(null);
-                                    }
-                                  }}
-                                >Show</button>
-                              );
-                            }},
-                            { key: '_sup_explain' as keyof (PlanSupplyViewRow & { _key: string }), label: 'Explain', sortable: false, render: (r) => {
+                            { key: '_sup_explain' as keyof (PlanSupplyViewRow & { _key: string }), label: tP('supplyView.columns.breakdown'), sortable: false, render: (r) => {
                               const cs = supplyCriticalityMap[r.supplyId];
                               const hasCriticality = cs === 'critical' || cs === 'not_critical';
                               const eligible = r.peggedDemandCount > 0 || r.splitInfos.length > 0 || !!r.override || hasCriticality;
@@ -5502,7 +5561,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                     if (isSelected) { setSupExplainOpen(false); setSupExplainKey(null); setSupExplainRow(null); }
                                     else { setSupExplainRow(r); setSupExplainKey(k); setSupExplainOpen(true); }
                                   }}
-                                >Why</button>
+                                >{tc('show')}</button>
                               );
                             }},
                           ]}
@@ -7008,6 +7067,98 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   )}
                 </p>
               </section>
+              {/* ── Assessment UI (impact what-if) ────────────────────────── */}
+              <section style={{ marginBottom: '1.25rem' }}>
+                <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('supplyView.assessment.heading')}</h4>
+                <div style={{ padding: '0.6rem 0.75rem', background: '#1c1c1e', borderRadius: 6, border: '1px solid #3d3d40' }}>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
+                    <label style={{ fontSize: '0.78rem', color: '#a1a1aa', display: 'flex', alignItems: 'center', gap: 4 }}>
+                      {tP('supplyView.assessment.delayDays')}
+                      <input
+                        type="number" min={0}
+                        value={assessDelayDays}
+                        onChange={(e) => setAssessDelayDays(Math.max(0, Number(e.target.value)))}
+                        style={{ width: 60, fontSize: '0.78rem', padding: '2px 4px', background: '#27272a', color: '#e4e4e7', border: '1px solid #52525b', borderRadius: 3 }}
+                      />
+                    </label>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <span style={{ fontSize: '0.78rem', color: '#a1a1aa' }}>{tP('supplyView.assessment.qtyDecreasePct')}</span>
+                      <div style={{ display: 'flex', border: '1px solid #4c1d95', borderRadius: 4, overflow: 'hidden' }}>
+                        <button type="button"
+                          onClick={() => setAssessQtyDecreaseMode('pct')}
+                          style={{ fontSize: '0.72rem', padding: '1px 8px', background: assessQtyDecreaseMode === 'pct' ? '#4c1d95' : '#27272a', color: '#e4e4e7', border: 'none', cursor: 'pointer' }}>
+                          %
+                        </button>
+                        <button type="button"
+                          onClick={() => setAssessQtyDecreaseMode('abs')}
+                          style={{ fontSize: '0.72rem', padding: '1px 8px', background: assessQtyDecreaseMode === 'abs' ? '#4c1d95' : '#27272a', color: '#e4e4e7', border: 'none', borderLeft: '1px solid #4c1d95', cursor: 'pointer' }}>
+                          qty
+                        </button>
+                      </div>
+                      {assessQtyDecreaseMode === 'pct' ? (
+                        <input
+                          type="number" min={0} max={100}
+                          value={assessQtyDecreasePct}
+                          onChange={(e) => setAssessQtyDecreasePct(Math.max(0, Math.min(100, Number(e.target.value))))}
+                          style={{ width: 60, fontSize: '0.78rem', padding: '2px 4px', background: '#27272a', color: '#e4e4e7', border: '1px solid #52525b', borderRadius: 3 }}
+                        />
+                      ) : (
+                        <input
+                          type="number" min={0} step={1}
+                          placeholder={tP('supplyView.assessment.qtyDecreaseUnits')}
+                          value={assessQtyDecreaseAbs}
+                          onChange={(e) => setAssessQtyDecreaseAbs(Math.max(0, Number(e.target.value)))}
+                          style={{ width: 80, fontSize: '0.78rem', padding: '2px 4px', background: '#27272a', color: '#e4e4e7', border: '1px solid #52525b', borderRadius: 3 }}
+                        />
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleAssess}
+                      disabled={assessmentRunning}
+                      style={{ fontSize: '0.8rem' }}
+                    >
+                      {assessmentRunning ? tP('supplyView.assessment.assessing') : tP('supplyView.assessment.assess')}
+                    </button>
+                  </div>
+                  {assessError && (
+                    <p style={{ color: '#f87171', fontSize: '0.75rem', margin: '0 0 0.4rem' }}>{assessError}</p>
+                  )}
+                  {assessmentResult && (
+                    <div style={{ marginBottom: '0.4rem' }}>
+                      <span style={{ fontSize: '0.82rem', color: '#a1a1aa' }}>{tP('supplyView.assessment.ratingLabel')} </span>
+                      <span style={{
+                        display: 'inline-block',
+                        padding: '1px 10px',
+                        borderRadius: 12,
+                        fontSize: '0.8rem',
+                        fontWeight: 600,
+                        letterSpacing: '0.05em',
+                        background: assessmentResult.rating === 'LOW' ? 'rgba(52,211,153,0.15)' : assessmentResult.rating === 'HIGH' ? 'rgba(248,113,113,0.15)' : 'rgba(251,191,36,0.15)',
+                        color: assessmentResult.rating === 'LOW' ? '#34d399' : assessmentResult.rating === 'HIGH' ? '#f87171' : '#fbbf24',
+                        border: `1px solid ${assessmentResult.rating === 'LOW' ? '#34d399' : assessmentResult.rating === 'HIGH' ? '#f87171' : '#fbbf24'}`,
+                      }}>{assessmentResult.rating}</span>
+                      <p style={{ fontSize: '0.78rem', color: '#d4d4d8', margin: '0.35rem 0 0' }}>{assessmentResult.explanation}</p>
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={handleLoadHistory}
+                    style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '0.75rem', padding: 0 }}
+                  >
+                    {assessmentHistoryOpen ? '▾' : '▸'} {tP('supplyView.assessment.history')}
+                  </button>
+                  {assessmentHistoryOpen && (
+                    <div style={{ marginTop: '0.5rem' }}>
+                      {assessmentHistory.length === 0 ? (
+                        <p style={{ fontSize: '0.75rem', color: '#71717a', margin: 0 }}>{tP('supplyView.assessment.noHistory')}</p>
+                      ) : (
+                        <AssessmentHistoryTable rows={assessmentHistory} storageKey="supExplain" />
+                      )}
+                    </div>
+                  )}
+                </div>
+              </section>
               <section style={{ marginBottom: '1.25rem' }}>
                 <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('supExplain.peggedHeading')}</h4>
                 {supExplainRow.peggedDemands.length === 0 ? (
@@ -7047,9 +7198,40 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           // Path label covers BOTH multi-demand consolidation groups AND
                           // passthrough singletons; absent = main-loop direct consumption.
                           const groupLabel = supExplainRow.demandPath[d.demandId] ?? null;
+                          // Make the demand id clickable so the user can jump straight to that
+                          // demand's pegging tree. Only active when the corresponding
+                          // committed_demand row exists (i.e. it's a real user-level demand we
+                          // can render a tree for). This restores the demand-hyperlink behavior
+                          // that the deleted Impact column used to provide.
+                          const demandRow = planResult?.committed_demands.find((cd) => cd.demand_id === d.demandId);
+                          const demandKey = demandRow ? `demand|${demandRow.demand_id ?? ''}|${demandRow.product_id}|${demandRow.location_id}` : null;
                           return (
                             <tr key={`${d.demandId}-${i}`} style={{ borderTop: '1px solid #3d3d40' }}>
-                              <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.demandId}</td>
+                              <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {demandRow && demandKey ? (
+                                  <button
+                                    type="button"
+                                    className="secondary"
+                                    style={{ fontSize: '0.74rem', padding: '1px 6px', fontFamily: 'monospace' }}
+                                    title={tP('supExplain.openDemandPegging')}
+                                    onClick={() => {
+                                      // Switch to the planPegging slide-in for this demand.
+                                      // Capture the current supExplain row so the planPegging
+                                      // slide-in can render a "← back to <supplyId>" link that
+                                      // restores the Breakdown view.
+                                      setPreviousSupExplainRow(supExplainRow);
+                                      setPlanPeggingContext({ type: 'demand', row: demandRow });
+                                      setPlanPeggingOpen(true);
+                                      setWoPeggingRowKey(demandKey);
+                                      setSupExplainOpen(false);
+                                      setSupExplainKey(null);
+                                      setSupExplainRow(null);
+                                    }}
+                                  >{d.demandId}</button>
+                                ) : (
+                                  <span>{d.demandId}</span>
+                                )}
+                              </td>
                               <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', color: '#a1a1aa', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.customer ?? '–'}</td>
                               <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '0.74rem' }}>
                                 {groupLabel ? (
@@ -7330,7 +7512,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         >
           <div
             style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 0, pointerEvents: 'auto' }}
-            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); }}
+            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); }}
             aria-hidden
           />
           <div
@@ -7387,24 +7569,46 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 </button>
               </div>
             )}
+            {previousSupExplainRow && (
+              <div style={{ marginBottom: '0.5rem' }}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    // Restore the Breakdown slide-in for the supply we came from,
+                    // close the planPegging slide-in. This is the inverse of the
+                    // demand-id click in supExplain.
+                    setSupExplainRow(previousSupExplainRow);
+                    setSupExplainKey(`supply|${previousSupExplainRow.supplyId}`);
+                    setSupExplainOpen(true);
+                    setPlanPeggingOpen(false);
+                    setPlanPeggingContext(null);
+                    setWoPeggingRowKey(null);
+                    setPreviousSupExplainRow(null);
+                  }}
+                  style={{ background: 'none', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '0.78rem', padding: 0, display: 'flex', alignItems: 'center', gap: '0.3rem' }}
+                >
+                  ← {previousSupExplainRow.supplyId}
+                </button>
+              </div>
+            )}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
               <h3 style={{ margin: 0, color: '#fafafa' }}>
                 {planPeggingContext.type === 'supply'
                   ? tP('supplyView.peggingPanel.title', { supplyId: planPeggingContext.supplyId })
                   : planPeggingContext.type === 'demand'
-                    ? `Pegging: ${planPeggingContext.row.demand_id ?? planPeggingContext.row.product_id}`
-                    : `Pegging: ${planPeggingContext.row.product_id} @ ${planPeggingContext.row.location_id}`}
+                    ? tP('peggingPanel.titleDemand', { label: planPeggingContext.row.demand_id ?? planPeggingContext.row.product_id ?? '' })
+                    : tP('peggingPanel.titleWorkOrder', { product: planPeggingContext.row.product_id ?? '', location: planPeggingContext.row.location_id ?? '' })}
               </h3>
-              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setPreviousPeggingContext(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
+              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tc('close')}</button>
             </div>
             <p style={{ margin: 0, marginBottom: '0.5rem', fontSize: '0.8rem', color: '#71717a' }}>
               {planPeggingContext.type === 'supply'
                 ? tP('supplyView.peggingPanel.description')
                 : planPeggingContext.type === 'work_order'
-                  ? 'Root = this work order; below it are the supplies that fulfill it (inventory, child work orders, purchase) at all levels.'
-                  : '▢ blue = demand target, ▢ purple = supply / purchase inventory, ⚙ green = work order (transformation). Root = target demand; leaves = supply or purchase inventory.'}
+                  ? tP('peggingPanel.descriptionWorkOrder')
+                  : tP('peggingPanel.descriptionDemand')}
               {planPeggingContext.type !== 'supply' && (
-                <>{' '}When multiple inventories or work orders appear as siblings under the same parent, they are alternative paths <strong>OR</strong> that can each supply flow to that parent.</>
+                <>{' '}{tP('peggingPanel.descriptionOrSiblings')}</>
               )}
             </p>
             {planPeggingContext.type === 'supply' && (() => {
@@ -8227,26 +8431,26 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             />
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
               <h3 style={{ margin: 0, color: '#fafafa' }}>{peggingTitle}</h3>
-              <button type="button" onClick={() => setPeggingOpen(false)} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
+              <button type="button" onClick={() => setPeggingOpen(false)} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tc('close')}</button>
             </div>
             {peggingData?.direction === 'demand-to-supply' && (peggingData.demand_allocated_qty != null || peggingData.demand_requested_qty != null) && (
               <>
                 <p style={{ margin: 0, marginBottom: '0.25rem', color: '#a1a1aa', fontSize: '0.9rem' }}>
-                  Allocated: <strong style={{ color: '#fafafa' }}>{qtyFmt(Number(peggingData.demand_allocated_qty ?? 0))}</strong>
+                  {tP('peggingPanel.allocated')} <strong style={{ color: '#fafafa' }}>{qtyFmt(Number(peggingData.demand_allocated_qty ?? 0))}</strong>
                   {peggingData.demand_requested_qty != null && (
-                    <> (requested: {qtyFmt(Number(peggingData.demand_requested_qty))})</>
+                    <> {tP('peggingPanel.requested')}{qtyFmt(Number(peggingData.demand_requested_qty))})</>
                   )}
                 </p>
                 <p style={{ margin: 0, marginBottom: '1rem', color: '#71717a', fontSize: '0.8rem' }}>
-                  First level below = direct contributors; their edge qtys sum to Allocated above. Deeper levels: qty = flow along that edge (· = leaf, no further expansion).
+                  {tP('peggingPanel.info')}
                 </p>
               </>
             )}
-            {peggingLoading && <p style={{ color: '#a1a1aa' }}>Loading…</p>}
+            {peggingLoading && <p style={{ color: '#a1a1aa' }}>{tc('loading')}</p>}
             {!peggingLoading && peggingData && !peggingTreeReady && (
               <div style={{ fontSize: '0.9rem' }}>
-                <p><strong>Nodes:</strong> {(Array.isArray(peggingData.nodes) ? peggingData.nodes : []).length} &nbsp; <strong>Edges:</strong> {(Array.isArray(peggingData.edges) ? peggingData.edges : []).length}</p>
-                <p style={{ color: '#a1a1aa' }}>Building tree…</p>
+                <p><strong>{tP('peggingPanel.nodes')}:</strong> {(Array.isArray(peggingData.nodes) ? peggingData.nodes : []).length} &nbsp; <strong>{tP('peggingPanel.edges')}:</strong> {(Array.isArray(peggingData.edges) ? peggingData.edges : []).length}</p>
+                <p style={{ color: '#a1a1aa' }}>{tP('peggingPanel.buildingTree')}</p>
               </div>
             )}
             {!peggingLoading && peggingData && peggingTreeReady && peggingGraph && (

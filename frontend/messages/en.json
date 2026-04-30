@@ -100,6 +100,7 @@
         "product": "Product",
         "location": "Location",
         "initialQty": "Initial qty",
+        "productTotal": "Total per product",
         "consumedQty": "Consumed qty",
         "residualQty": "Residual qty",
         "utilization": "Utilization",
@@ -202,11 +203,18 @@
     },
     "peggingPanel": {
       "title": "Pegging:",
+      "titleDemand": "Pegging: {label}",
+      "titleWorkOrder": "Pegging: {product} @ {location}",
+      "descriptionDemand": "▢ blue = demand target, ▢ purple = supply / purchase inventory, ⚙ green = work order (transformation). Root = target demand; leaves = supply or purchase inventory.",
+      "descriptionWorkOrder": "Root = this work order; below it are the supplies that fulfill it (inventory, child work orders, purchase) at all levels.",
+      "descriptionOrSiblings": "When multiple inventories or work orders appear as siblings under the same parent, they are alternative paths OR that can each supply flow to that parent.",
       "allocated": "Allocated:",
       "requested": "(requested:",
       "info": "First level below = direct contributors; their edge qtys sum to Allocated above. Deeper levels: qty = flow along that edge (· = leaf, no further expansion).",
       "buildingTree": "Building tree…",
-      "loadError": "Could not load pegging."
+      "loadError": "Could not load pegging.",
+      "nodes": "Nodes",
+      "edges": "Edges"
     },
     "basketPanel": {
       "titleFinal": "Basket at end of loaded view",
@@ -362,7 +370,27 @@
       "filterMultiSupply": "Only work orders with multiple supply methods available (BOM graph)",
       "filterPurchaseOnly": "Purchase orders only (method = buy/purchase)",
       "filterMoveOnly": "Move orders only (method = move)",
-      "filterHasOverride": "Only work orders with a saved override"
+      "filterHasOverride": "Only work orders with a saved override",
+      "filterPlaceholder": "Filter by product, location, method…",
+      "shared": "shared",
+      "columns": {
+        "product": "Product",
+        "location": "Location",
+        "prodArea": "PROD_AREA",
+        "requested": "Requested",
+        "committed": "Committed",
+        "startTime": "Start time",
+        "endTime": "End time",
+        "method": "Method",
+        "demand": "Demand",
+        "shortage": "Shortage",
+        "locationSource": "Location source",
+        "pegging": "Pegging",
+        "explain": "Explain",
+        "override": "Override"
+      },
+      "overrideMethod": "Method",
+      "overrideSplit": "Split"
     },
     "planKpis": {
       "title": "Plan KPIs",
@@ -458,6 +486,7 @@
       "peggedHeading": "Pegged demands",
       "peggedEmpty": "This supply was not consumed by any demand.",
       "peggedConsumedSuffix": "demand(s) consumed this supply",
+      "openDemandPegging": "Open this demand's pegging tree",
       "peggedTotal": "total",
       "peggedColDemand": "Demand",
       "peggedColCustomer": "Customer",
@@ -489,6 +518,17 @@
     },
     "peggingPanel": {
       "title": "Pegging:",
+      "titleDemand": "Pegging: {label}",
+      "titleWorkOrder": "Pegging: {product} @ {location}",
+      "descriptionDemand": "▢ blue = demand target, ▢ purple = supply / purchase inventory, ⚙ green = work order (transformation). Root = target demand; leaves = supply or purchase inventory.",
+      "descriptionWorkOrder": "Root = this work order; below it are the supplies that fulfill it (inventory, child work orders, purchase) at all levels.",
+      "descriptionOrSiblings": "When multiple inventories or work orders appear as siblings under the same parent, they are alternative paths OR that can each supply flow to that parent.",
+      "allocated": "Allocated:",
+      "requested": "(requested:",
+      "info": "First level below = direct contributors; their edge qtys sum to Allocated above. Deeper levels: qty = flow along that edge (· = leaf, no further expansion).",
+      "buildingTree": "Building tree…",
+      "nodes": "Nodes",
+      "edges": "Edges",
       "rootInfo": "Root = this work order; below it are the supplies that fulfill it (inventory, child work orders, purchase) at all levels.",
       "legendInfo": "▢ Inventory (static state) and ⚙ Work order (transformation). Root = target inventory; work orders transform between states; leaves = supply or purchase inventory.",
       "orInfo": "When multiple inventories or work orders appear as siblings under the same parent, they are alternative paths",
@@ -719,6 +759,10 @@
       "overrideWarnBanner": "The last plan run could not fully commit one or more demands under this override. Affected demands below show their shortfall.",
       "edit": "Edit",
       "clear": "Clear",
+      "scarcityRatioTooltip": "Direct user demand {demand} / total supply {supply} for this product (all locations).",
+      "scarcityBomTooltip": "BOM-derived consumption {demand} / total supply {supply}: this is an intermediate material; {demand} is what upstream user demands consumed via BOM explosion. Committed-based — capped at supply availability, so true requested pressure could be higher.",
+      "scarcityShortageTooltip": "Demand {demand} / no supply available — total shortage.",
+      "scarcityNoneTooltip": "No user demand for this product, and no BOM-derived consumption — material is unused.",
       "columns": {
         "supplyId": "Supply ID",
         "product": "Product",
@@ -727,6 +771,7 @@
         "supplyDate": "Supply Date",
         "initialQty": "Initial Qty",
         "productTotal": "Total per product",
+        "scarcity": "Scarcity",
         "consumed": "Consumed",
         "residual": "Residual",
         "utilPct": "Util %",
@@ -734,7 +779,8 @@
         "totalPeggedQty": "Total Pegged Qty",
         "splitInfo": "Split Info",
         "override": "Override",
-        "pegging": "Pegging"
+        "pegging": "Pegging",
+        "breakdown": "Breakdown"
       },
       "peggingPanel": {
         "title": "Supply pegging: {supplyId}",
@@ -749,6 +795,8 @@
         }
       },
       "assessment": {
+        "heading": "Assess impact",
+        "qtyDecreaseUnits": "units",
         "criteria": "Assessment criteria",
         "criteriaPlaceholder": "Describe how to evaluate impact severity (LOW / MEDIUM / HIGH). Can be in English or Chinese.",
         "criteriaHint": "Saved per case. Used by the LLM when rating supply-change impact. Leave blank to use the built-in default.",
