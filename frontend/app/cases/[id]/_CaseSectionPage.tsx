@@ -913,7 +913,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [woPeggingRowKey, setWoPeggingRowKey] = useState<string | null>(null);
   const [bomRealPairs, setBomRealPairs] = useState<[string, string][] | null>(null);
   const [realMoveTriples, setRealMoveTriples] = useState<[string, string, string][] | null>(null);
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', engine: 'leaf-legacy' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1193,7 +1193,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (/reset|default|clear|重置|默认|清除/.test(t)) {
       return {
         reply: tP('copilot.replies.reset'),
-        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, depth_optimal: false, max_methods: 2, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' }, analyze_criticality: false, check_soundness: true },
+        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, depth_optimal: false, max_methods: 2, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', engine: 'leaf-legacy' }, analyze_criticality: false, check_soundness: true },
       };
     }
 
@@ -3820,7 +3820,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 checked={analyzeCriticalityEnabled}
                 onChange={(e) => setAnalyzeCriticalityEnabled(e.target.checked)}
               />
-              <span style={{ fontSize: '0.875rem' }}>Analyze Criticality</span>
+              <span style={{ fontSize: '0.875rem' }}>{tP('config.analyzeCriticality')}</span>
             </label>
             <label
               style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}
@@ -3883,7 +3883,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 },
               },
               purchase_allowed: false,
-              consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' },
+              consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', engine: 'leaf-legacy' },
             })}
             title={tP('config.resetDefaultsTitle')}
             style={{ padding: '6px 12px' }}
@@ -5202,8 +5202,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       style={{ fontSize: '0.8rem' }}
                     >
                       {criticalityRunning
-                        ? `Analyzing… (${criticalityProgress?.done ?? 0}/${criticalityProgress?.total ?? 0})`
-                        : 'Analyze Criticality'}
+                        ? tP('config.analyzingCriticality', { done: criticalityProgress?.done ?? 0, total: criticalityProgress?.total ?? 0 })
+                        : tP('config.analyzeCriticality')}
                     </button>
                     {!criticalityRunning && Object.keys(supplyCriticalityMap).length > 0 && (
                       <button
@@ -5211,7 +5211,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         className="secondary"
                         onClick={() => setSupplyCriticalityMap({})}
                         style={{ fontSize: '0.8rem' }}
-                      >Clear</button>
+                      >{tP('config.criticalityClear')}</button>
                     )}
                     {!criticalityRunning && Object.keys(supplyCriticalityMap).length > 0 && (() => {
                       const critical = Object.values(supplyCriticalityMap).filter(s => s === 'critical').length;

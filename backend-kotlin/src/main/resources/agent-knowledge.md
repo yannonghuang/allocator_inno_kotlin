@@ -139,14 +139,15 @@ regression evaporates when `max_methods` saturates available methods (~max=4).
 Operational exposure of **regulation scope** from Algorithmic ideas §1.
 Two orthogonal knobs:
 
-- `engine` (UI: "Regulation scope") = `"leaf-legacy"` ("Leaves only") |
-  `"supply"` ("All levels"). Decides *where* `allocation_mode` is applied.
-  Default is case-dependent; on case-171 *Leaves only* dominates on
-  throughput at the cost of higher starvation. Run 433 (Leaves only) vs
-  Run 434 (All levels), identical config otherwise: 80,752 vs 35,098
+- `engine` (UI: "Regulation scope") = `"leaf-legacy"` ("Leaves only",
+  the default) | `"supply"` ("All levels"). Decides *where*
+  `allocation_mode` is applied. Run 433 (Leaves only) vs Run 434 (All
+  levels) on case-171, identical config otherwise: 80,752 vs 35,098
   committed; fill 25% vs 11%; Gini 0.39 vs 0.46; starvation 28% vs 19%;
   mfg total_quantity 104k vs 28k. The mfg gap is the fragmentation
-  smoking gun.
+  smoking gun. *Leaves only* is the default because it dominates on
+  throughput; switch to *All levels* when minimum-service-level fairness
+  matters more than aggregate output.
 - `allocation_mode` = `"fair"` (priority-first when ample, proportional
   under shortage) | `"proportional"` (qty-weighted share) |
   `"priority_first"` (highest priority filled first, may starve others).
