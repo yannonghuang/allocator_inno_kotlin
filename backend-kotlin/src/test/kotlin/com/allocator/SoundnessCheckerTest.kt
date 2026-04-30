@@ -438,6 +438,39 @@ class SoundnessCheckerTest : FunSpec({
         report.overallSound shouldBe false
     }
 
+    test("R7d_orphan_leaf_under_blocked_wo: zero-qty WO with non-zero leaves under it") {
+        // Synthetic legacy run: demand committed 0 of FG (R0_committed_consistency
+        // skipped here — we don't pass committed_demands), but the placeholder WO
+        // beneath it has a real supply leaf claiming consumption. R7d catches
+        // this orphan pattern by name.
+        val demands = listOf(demand("D1", "FG", "L1", qty = 100.0))
+        val tree = demandNode(
+            "D1", "FG", "L1", qty = 100.0, committedQty = 0.0,
+            children = listOf(
+                makeWO(
+                    "FG", "L1", qty = 0.0,                 // zero-qty placeholder WO
+                    children = listOf(
+                        // demand-child for component A (orphan path)
+                        mapOf(
+                            "type" to "demand",
+                            "demand_id" to "D1",
+                            "product_id" to "A",
+                            "location_id" to "L1",
+                            "quantity" to 100.0,
+                            "committed_qty" to 100.0,
+                            "children" to listOf(supplyLeaf("A", "L1", "SUP_A", 100.0)),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        val data = mapOf("supply" to listOf(supply("SUP_A", "A", "L1", 100.0)))
+        val report = checkRunSoundness(planningPegging = listOf(pegEntry("D1", tree)), demands = demands, data = data)
+        // Among the violations on D1 there must be R7d. (R4 may also fire — that's
+        // fine; R7d is the named-pattern surface alongside the structural R4.)
+        report.demands[0].violations.map { it.rule } shouldContain "R7d_orphan_leaf_under_blocked_wo"
+    }
+
     // ── Aggregation report semantics ──────────────────────────────────────────
 
     test("report aggregation: mixed sound/unsound demands") {
