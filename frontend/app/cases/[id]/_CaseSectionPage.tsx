@@ -1224,12 +1224,20 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           const needsSave = (analyzeCriticalityEnabled || checkSoundnessEnabled) && freshId != null;
           if (needsSave && freshId && id != null) {
             // Auto-persist so impact/criticality and soundness can use the persisted run.
+            // Carry the unsaved-banner's name/notes through — otherwise anything the user
+            // typed (when soundness/criticality were off on a prior plan and the inputs
+            // retained their value) is dropped silently when auto-save fires.
             let saved = false;
             try {
-              await savePlanRun(Number(id), freshId);
+              await savePlanRun(Number(id), freshId, {
+                name: freshRunName.trim() || undefined,
+                notes: freshRunNotes.trim() || undefined,
+              });
               setCurrentPlanRunId(freshId);
               setFreshPlanRunId(null);
               setOverrideCandidateRunId(null);
+              setFreshRunName('');
+              setFreshRunNotes('');
               saved = true;
             } catch {
               // Auto-save failed — leave as unsaved; user can save manually.
