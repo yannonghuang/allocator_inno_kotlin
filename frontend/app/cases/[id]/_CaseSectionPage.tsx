@@ -838,6 +838,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [previousPeggingContext, setPreviousPeggingContext] = useState<{
     type: 'supply'; supplyId: string; peggedDemands: PeggedDemandEntry[]; initialQty: number; consumedQty: number;
   } | null>(null);
+  // When drilling from the Breakdown slide-in (supExplain) into a demand's pegging tree,
+  // remembers the supExplain row for the back link in the planPegging slide-in. Cleared
+  // whenever the planPegging slide-in is closed via any path (Close button or new context).
+  const [previousSupExplainRow, setPreviousSupExplainRow] = useState<PlanSupplyViewRow | null>(null);
   const [planWorkOrderPeggingLoading, setPlanWorkOrderPeggingLoading] = useState<string | null>(null);
   const [planWorkOrderPeggingError, setPlanWorkOrderPeggingError] = useState<string | null>(null);
   const planPeggingResizeRef = useRef<{ startX: number; startW: number } | null>(null);
@@ -4437,8 +4441,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                   className="secondary"
                                   style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
                                   onClick={() => {
-                                    if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); }
-                                    else { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); }
+                                    if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); }
+                                    else { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); }
                                   }}
                                 >{tc('show')}</button>
                               );
@@ -4774,8 +4778,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
                             onClick={(e) => {
                               e.stopPropagation();
-                              if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); }
-                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); }
+                              if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); }
+                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); }
                             }}
                           >{tc('show')}</button>
                         );
@@ -7212,8 +7216,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                     title={tP('supExplain.openDemandPegging')}
                                     onClick={() => {
                                       // Switch to the planPegging slide-in for this demand.
-                                      // Close supExplain so the two slide-ins don't overlap;
-                                      // user can re-open Breakdown later if needed.
+                                      // Capture the current supExplain row so the planPegging
+                                      // slide-in can render a "← back to <supplyId>" link that
+                                      // restores the Breakdown view.
+                                      setPreviousSupExplainRow(supExplainRow);
                                       setPlanPeggingContext({ type: 'demand', row: demandRow });
                                       setPlanPeggingOpen(true);
                                       setWoPeggingRowKey(demandKey);
@@ -7506,7 +7512,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         >
           <div
             style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 0, pointerEvents: 'auto' }}
-            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); }}
+            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); }}
             aria-hidden
           />
           <div
@@ -7563,6 +7569,28 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 </button>
               </div>
             )}
+            {previousSupExplainRow && (
+              <div style={{ marginBottom: '0.5rem' }}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    // Restore the Breakdown slide-in for the supply we came from,
+                    // close the planPegging slide-in. This is the inverse of the
+                    // demand-id click in supExplain.
+                    setSupExplainRow(previousSupExplainRow);
+                    setSupExplainKey(`supply|${previousSupExplainRow.supplyId}`);
+                    setSupExplainOpen(true);
+                    setPlanPeggingOpen(false);
+                    setPlanPeggingContext(null);
+                    setWoPeggingRowKey(null);
+                    setPreviousSupExplainRow(null);
+                  }}
+                  style={{ background: 'none', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '0.78rem', padding: 0, display: 'flex', alignItems: 'center', gap: '0.3rem' }}
+                >
+                  ← {previousSupExplainRow.supplyId}
+                </button>
+              </div>
+            )}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
               <h3 style={{ margin: 0, color: '#fafafa' }}>
                 {planPeggingContext.type === 'supply'
@@ -7571,7 +7599,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     ? tP('peggingPanel.titleDemand', { label: planPeggingContext.row.demand_id ?? planPeggingContext.row.product_id ?? '' })
                     : tP('peggingPanel.titleWorkOrder', { product: planPeggingContext.row.product_id ?? '', location: planPeggingContext.row.location_id ?? '' })}
               </h3>
-              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setPreviousPeggingContext(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tc('close')}</button>
+              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tc('close')}</button>
             </div>
             <p style={{ margin: 0, marginBottom: '0.5rem', fontSize: '0.8rem', color: '#71717a' }}>
               {planPeggingContext.type === 'supply'
