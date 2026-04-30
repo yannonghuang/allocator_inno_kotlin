@@ -26,6 +26,69 @@ Three things differentiate it from a stock MRP:
    late, which demands break and by how much?" Used by the upstream
    negotiation flow.
 
+## Algorithmic ideas (the conceptual lenses)
+
+These are the load-bearing design decisions to reason **from** when
+answering "why" questions. The config sections below are mechanical
+exposure of these ideas — the user usually wants the *idea*, not the knob.
+
+### 1. Competition shape — flat vs layered
+
+When a shared resource has multiple claimants, two divisions are possible:
+
+- **Flat** (upfront proportional split): every claimant gets a slice of
+  every resource at once. Predictable, fair on paper. *Failure mode*:
+  fragments shared inputs into slivers, which collapse to tiny output at
+  AND-bottlenecks via MIN(child shares).
+- **Layered** (sequential cap loop): claimants take turns; each gets a
+  whole claim before the next. *Failure mode*: order-dependent; late
+  claimants may find shelves bare.
+
+Surfaced as `consolidation.engine = "supply"` (flat) vs `"leaf-legacy"`
+(layered). On case-171 layered beat flat ~3× on throughput because make
+operations need atomic shares.
+
+### 2. AND-bottleneck atomicity
+
+A make operation requires *all* BOM children at once. Achievable qty =
+`MIN(child shares)`. This is the constraint that distinguishes
+supply-chain planning from generic resource allocation. Anything that
+fragments inputs (flat splits, fine-grained proportional allocation)
+interacts catastrophically with AND-relations — slivers × MIN collapses
+to ~0 make output even when raw material exists in aggregate.
+
+### 3. Waterfall vs proportional method selection
+
+When multiple methods can satisfy one demand:
+
+- *Proportional*: split across top-N methods, simulate each at every
+  depth. Cost: `max_methods^depth`. Abandoned (hung indefinitely on
+  case-171).
+- *Waterfall* (best-supply-win): exhaust the best method first, fall
+  back only on capacity hit. Cost: `max_methods × cost(one demand)` —
+  linear in the cap.
+
+The system uses waterfall. `max_methods` is the cap; `mode` decides
+"best". The same flat-vs-layered intuition applies one level up: a
+demand's *methods* compete for capacity in layered fashion, not flat.
+
+### 4. Conservation by validation, not by construction
+
+The planner is heuristic — it doesn't enforce conservation laws while
+allocating. Correctness is checked **post-hoc** via R0–R8 rules and
+badged on the run. A run with `soundness_status="unsound"` is suspect
+even if its KPIs look great. Pre-fix orphan-inventory runs (R7d violations)
+inflated fill rates with phantom commits — the lesson: **trust soundness
+over headline KPIs**, especially when comparing across planner versions.
+
+### 5. Pegging as the audit trail
+
+Every commit traces back to specific supplies via `planning_pegging`
+(demand → work order → child materials → supplies → leaf). This is the
+substrate for every "why" question. "Why did demand X commit only 50?"
+→ walk its pegging. "Where did supply Y go?" → query
+`supply_level_allocations` (supply engine only).
+
 ## Design principles (the load-bearing decisions)
 
 ### Method selection — `method_selection`
@@ -61,31 +124,23 @@ regression evaporates when `max_methods` saturates available methods (~max=4).
 
 ### Consolidation — `consolidation`
 
-Two engines, fundamentally different competition shapes:
+Operational exposure of the **flat vs layered** competition shape from
+Algorithmic ideas §1.
 
-- **`supply` engine** ("flat") — decides each supply's split *upfront*
-  across all competing demands. Under `fair`/`proportional` shortage,
-  this fragments shared inputs into slivers per demand. AND-bottlenecks
-  compute MIN(child shares), so slivers × MIN = tiny make output. Newer;
-  supports `get_supply_split_explanation`.
-- **`leaf-legacy` engine** ("layered") — sequential cap loop where each
-  demand takes a whole claim in turn. Preserves integer-quantity
-  atomicity that AND-relations need to drive real make output.
-- **Trade-off** (case-171 evidence: Run 433 leaf-legacy vs Run 434
-  supply, identical config otherwise): leaf-legacy committed 80,752 /
-  fill 25% / Gini 0.39 / starvation 28%; supply committed 35,098 / fill
-  11% / Gini 0.46 / starvation 19%. The `manufacturing.total_quantity`
-  gap (104k vs 28k from same supplies) is the engine-fragmentation
-  smoking gun. Pick **`leaf-legacy`** for throughput + complete orders;
-  pick **`supply`** for minimum-service-level fairness (more demands
-  touched, fewer fully starved).
-- `allocation_mode = "fair"` (priority-first when supply ample,
-  proportional under shortage — no demand fully starved) |
-  `"proportional"` (qty-weighted share) | `"priority_first"` (highest
-  priority filled first, may starve others). `fair` and `proportional`
-  produce identical splits when supply is short, which is most case-171
-  demands.
-- `period_days` controls bucket width (0 = single bucket regardless of due date).
+- `engine = "supply"` (flat) | `"leaf-legacy"` (layered). Default is
+  case-dependent; on case-171 layered dominates on throughput at the
+  cost of higher starvation. Run 433 (leaf-legacy) vs Run 434 (supply,
+  identical config otherwise): 80,752 vs 35,098 committed; fill 25% vs
+  11%; Gini 0.39 vs 0.46; starvation 28% vs 19%; mfg total_quantity
+  104k vs 28k. The mfg gap is the fragmentation smoking gun.
+- `allocation_mode = "fair"` (priority-first when ample, proportional
+  under shortage) | `"proportional"` (qty-weighted share) |
+  `"priority_first"` (highest priority filled first, may starve others).
+  `fair` and `proportional` produce identical splits when supply is
+  short, which is most case-171 demands.
+- `period_days` — bucket width; 0 = single bucket regardless of due date.
+- `get_supply_split_explanation(supply_id)` works only with the supply
+  engine.
 
 ### Soundness check
 
