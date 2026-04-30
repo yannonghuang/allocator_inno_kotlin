@@ -1362,3 +1362,58 @@ export async function runAssessment(
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
+
+// ── Case bootstrap (KB seeding) ─────────────────────────────────────────────
+
+export type BootstrapPreset = {
+  preset_id: string;
+  preset_label: string;
+  preset_index: number;
+  primary_axis: string;
+  config: Record<string, unknown>;
+};
+
+export type BootstrapPreview = {
+  library_size: number;
+  already_run_count: number;
+  remaining_count: number;
+  batch_size: number;
+  already_run: BootstrapPreset[];
+  next_batch: BootstrapPreset[];
+};
+
+export type BootstrapStartResponse =
+  | { status: 'library_exhausted'; library_size: number; message: string }
+  | { bootstrap_job_id: string; total: number; presets: BootstrapPreset[] };
+
+export type BootstrapJobStatus = {
+  status: 'running' | 'completed' | 'unknown';
+  total: number;
+  completed: number;
+  current_preset_id: string;
+  current_preset_label: string;
+  plan_run_ids: number[];
+  errors: string[];
+};
+
+export async function getBootstrapPreview(caseId: number, batchSize = 5): Promise<BootstrapPreview> {
+  const r = await fetch(`${API}/cases/${caseId}/bootstrap?batch_size=${batchSize}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function startBootstrap(caseId: number, batchSize = 5): Promise<BootstrapStartResponse> {
+  const r = await fetch(`${API}/cases/${caseId}/bootstrap`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ batch_size: batchSize }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function getBootstrapJobStatus(caseId: number, jobId: string): Promise<BootstrapJobStatus> {
+  const r = await fetch(`${API}/cases/${caseId}/bootstrap/status/${jobId}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
