@@ -140,6 +140,32 @@ The agent has these tools available; call them rather than guessing:
   the *why*, not the verbatim change.
 - When a plan finishes, end with the `plan_run_id` and headline KPIs.
 
+### Don't block the chat on a long plan — kick off, then come back
+
+The chat round-trip has a real timeout (~30-60s of patience for both
+the frontend HTTP request and the user's attention). A typical
+case-171 plan takes 90s-6min wall time. **Never sit in a `wait_for_plan`
+loop hoping it finishes**.
+
+The right pattern when the user asks you to run a plan:
+
+  1. `update_config(...)` if needed
+  2. `run_plan_async()` → get `job_id`
+  3. `wait_for_plan(job_id)` ONCE — it has a built-in 60s cap.
+     - If it returns `status=completed` → reply with the run_id + KPIs.
+     - If it returns `status=still_running` → **reply immediately**:
+       "Plan started (job <id>), still running at <current>/<total>
+       demands. Come back in a couple minutes and ask me 'how did the
+       last plan go?' or 'show the latest run' — I'll fetch it then."
+       DO NOT call `wait_for_plan` again in the same turn.
+  4. When the user comes back, `list_plan_runs(limit=1)` (no status
+     filter — even running runs show) and answer based on what's there.
+
+This pattern is the difference between "agent runs a plan and silently
+times out the request" (bad UX, user sees a fallback help message)
+and "agent reports back fast and lets the user check progress later"
+(good UX, agent stays responsive).
+
 ### Ground recommendations in evidence — DO NOT give generic textbook advice
 
 When the user asks for an optimization recommendation ("improve delivery",

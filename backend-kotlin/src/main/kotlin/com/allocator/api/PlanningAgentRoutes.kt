@@ -427,7 +427,13 @@ private suspend fun toolRunPlanAsync(
 private suspend fun toolWaitForPlan(args: JsonObject): ToolResult {
     val jobId = args["job_id"]?.jsonPrimitive?.contentOrNull
         ?: return toolError("`job_id` is required")
-    val deadline = System.currentTimeMillis() + 10 * 60 * 1000  // 10 min
+    // 60s chat-friendly cap. The frontend's HTTP request would otherwise sit
+    // open for the full plan wall-time (case-171 ranges 90s–6min); intermediate
+    // proxies and the user's patience both run out long before that. When this
+    // expires we return a structured "still_running" payload + the job_id so
+    // the agent can reply "plan started, check back in a couple minutes" and
+    // the user can poll later by asking again.
+    val deadline = System.currentTimeMillis() + 60 * 1000
     while (System.currentTimeMillis() < deadline) {
         val job = planJobs[jobId] ?: return toolError("job $jobId not found (server restart?)")
         when (job["status"]) {
@@ -464,7 +470,30 @@ private suspend fun toolWaitForPlan(args: JsonObject): ToolResult {
             else -> delay(2_000)  // poll every 2s
         }
     }
-    return toolError("plan did not complete within 10 minutes")
+    // 60s elapsed and plan still running. Return a "still_running" tool result
+    // (NOT an error) so the agent can craft a useful reply with the job_id +
+    // current progress instead of treating this as a failure.
+    val job = planJobs[jobId]
+    @Suppress("UNCHECKED_CAST")
+    val progress = job?.get("progress") as? Map<String, Any?>
+    val current = (progress?.get("current") as? Number)?.toInt() ?: 0
+    val total = (progress?.get("total") as? Number)?.toInt() ?: 0
+    return ToolResult(
+        summary = "Plan still running ($current/$total demands after 60s) — agent should reply early",
+        payload = buildJsonObject {
+            put("status", "still_running")
+            put("job_id", jobId)
+            put("progress_current", current)
+            put("progress_total", total)
+            put(
+                "note",
+                "60-second wait window expired but plan is still in flight. " +
+                    "Reply to the user immediately with the job_id and total progress; " +
+                    "tell them to come back in a couple minutes and ask for the result. " +
+                    "Don't loop on wait_for_plan — the chat timeout will kick in.",
+            )
+        },
+    )
 }
 
 private data class PlanRunSummary(
