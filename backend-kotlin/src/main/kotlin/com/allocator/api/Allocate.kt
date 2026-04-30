@@ -806,117 +806,7 @@ fun Routing.allocateRoutes() {
                       else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrElse { JsonObject(emptyMap()) }
         val deepCheck = payload["deep_check"]?.jsonPrimitive?.booleanOrNull ?: false
 
-        // Mark as "checking" early so the UI's polling shows progress.
-        transaction {
-            val exists = PlanRuns.selectAll().where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }.singleOrNull()
-                ?: throw NoSuchElementException("Plan run $runId not found for case $caseId")
-            if (exists[PlanRuns.status] !in setOf("success", "contingent")) {
-                throw IllegalStateException("Soundness check requires a completed plan run (status=success or contingent); current status is '${exists[PlanRuns.status]}'.")
-            }
-            PlanRuns.update({ (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }) {
-                it[PlanRuns.soundnessStatus] = "checking"
-            }
-        }
-
-        // Run the check. Pure function — no IO, fast.
-        val report = try {
-            val (resultJson, overrideSnapshotJson) = transaction {
-                val row = PlanRuns.selectAll().where { PlanRuns.id eq runId }.single()
-                Pair(row[PlanRuns.result], row[PlanRuns.overrideSnapshot])
-            }
-            if (resultJson == null) throw IllegalStateException("Plan run has no result to check")
-            val resultElement = Json.parseToJsonElement(resultJson)
-            @Suppress("UNCHECKED_CAST")
-            val resultMap = jsonElementToNative(resultElement) as? Map<String, Any?>
-                ?: throw IllegalStateException("Plan run result is not a JSON object")
-            @Suppress("UNCHECKED_CAST")
-            val planningPegging = (resultMap["planning_pegging"] as? List<Map<String, Any?>>) ?: emptyList()
-            @Suppress("UNCHECKED_CAST")
-            val workOrders = (resultMap["work_orders"] as? List<Map<String, Any?>>) ?: emptyList()
-            @Suppress("UNCHECKED_CAST")
-            val committedDemandsForCheck = (resultMap["committed_demands"] as? List<Map<String, Any?>>) ?: emptyList()
-            // Build override index from the run's snapshot — what was active when
-            // the plan was committed. R9 in the checker uses this to validate
-            // that each WO honored the user's method_selection override.
-            @Suppress("UNCHECKED_CAST")
-            val overrideRows: List<Map<String, Any?>> = overrideSnapshotJson?.let {
-                runCatching {
-                    val parsed = Json.parseToJsonElement(it)
-                    (jsonElementToNative(parsed) as? List<Map<String, Any?>>) ?: emptyList()
-                }.getOrElse { emptyList() }
-            } ?: emptyList()
-            val overrideIndexForCheck = com.allocator.services.buildOverrideIndex(overrideRows)
-            // Reload case data for BOM/method lookups; we don't trust whatever was at run time
-            // since the soundness check is a freshly-evaluated property of the persisted plan.
-            val data = transaction { CaseLoader.load(caseId) }
-            @Suppress("UNCHECKED_CAST")
-            val demands = (data["demand"] as? List<Map<String, Any?>>) ?: emptyList()
-            com.allocator.services.checkRunSoundness(
-                planningPegging = planningPegging,
-                demands = demands,
-                data = data,
-                config = com.allocator.services.SoundnessConfig(deepCheck = deepCheck),
-                workOrders = workOrders,
-                committedDemands = committedDemandsForCheck,
-                overrideIndex = overrideIndexForCheck,
-            )
-        } catch (e: Exception) {
-            transaction {
-                PlanRuns.update({ (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }) {
-                    it[PlanRuns.soundnessStatus] = "error"
-                    it[PlanRuns.soundnessReport] = buildJsonObject {
-                        put("error", e.message ?: e::class.simpleName ?: "unknown")
-                    }.toString()
-                    it[PlanRuns.soundnessCheckedAt] = kotlinx.datetime.Clock.System.now()
-                }
-            }
-            throw e
-        }
-
-        // Persist the report.
-        val reportJson = buildJsonObject {
-            put("overall_sound", report.overallSound)
-            put("demand_count", report.demandCount)
-            put("sound_count", report.soundCount)
-            put("deep_check", report.deepCheck)
-            putJsonArray("demands") {
-                for (d in report.demands) {
-                    addJsonObject {
-                        put("demand_id", d.demandId)
-                        put("sound", d.sound)
-                        putJsonArray("violations") {
-                            for (v in d.violations) {
-                                addJsonObject {
-                                    put("rule", v.rule)
-                                    put("node_path", v.nodePath)
-                                    put("message", v.message)
-                                    put("expected", anyToJson(v.expected))
-                                    put("actual", anyToJson(v.actual))
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            putJsonArray("cross_demand_violations") {
-                for (v in report.crossDemandViolations) {
-                    addJsonObject {
-                        put("rule", v.rule)
-                        put("node_path", v.nodePath)
-                        put("message", v.message)
-                        put("expected", anyToJson(v.expected))
-                        put("actual", anyToJson(v.actual))
-                    }
-                }
-            }
-        }
-        transaction {
-            PlanRuns.update({ (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }) {
-                it[PlanRuns.soundnessStatus] = if (report.overallSound) "sound" else "unsound"
-                it[PlanRuns.soundnessReport] = reportJson.toString()
-                it[PlanRuns.soundnessCheckedAt] = kotlinx.datetime.Clock.System.now()
-            }
-        }
+        val reportJson = runSoundnessCheckForRun(caseId, runId, deepCheck)
         call.respond(reportJson)
     }
 
@@ -981,6 +871,126 @@ fun Routing.allocateRoutes() {
 }
 
 // ── Plan helper functions ──────────────────────────────────────────────────────
+
+/**
+ * Run the soundness checker against a persisted plan run and overwrite its
+ * stored soundness_status / soundness_report / soundness_checked_at.
+ *
+ * Shared between the public `POST .../check-soundness` route and the
+ * planning-agent's `recheck_soundness` tool — the agent needs this to apply
+ * newly-shipped rules (e.g. R7d) to legacy runs whose stored status predates
+ * the rule.
+ *
+ * Throws on missing run / unsupported status / parse failure / checker
+ * exception. On checker exception the run's soundness_status is set to
+ * "error" with the message persisted in soundness_report before re-raising.
+ */
+internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean): JsonObject {
+    transaction {
+        val exists = PlanRuns.selectAll().where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }.singleOrNull()
+            ?: throw NoSuchElementException("Plan run $runId not found for case $caseId")
+        if (exists[PlanRuns.status] !in setOf("success", "contingent")) {
+            throw IllegalStateException("Soundness check requires a completed plan run (status=success or contingent); current status is '${exists[PlanRuns.status]}'.")
+        }
+        PlanRuns.update({ (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }) {
+            it[PlanRuns.soundnessStatus] = "checking"
+        }
+    }
+
+    val report = try {
+        val (resultJson, overrideSnapshotJson) = transaction {
+            val row = PlanRuns.selectAll().where { PlanRuns.id eq runId }.single()
+            Pair(row[PlanRuns.result], row[PlanRuns.overrideSnapshot])
+        }
+        if (resultJson == null) throw IllegalStateException("Plan run has no result to check")
+        val resultElement = Json.parseToJsonElement(resultJson)
+        @Suppress("UNCHECKED_CAST")
+        val resultMap = jsonElementToNative(resultElement) as? Map<String, Any?>
+            ?: throw IllegalStateException("Plan run result is not a JSON object")
+        @Suppress("UNCHECKED_CAST")
+        val planningPegging = (resultMap["planning_pegging"] as? List<Map<String, Any?>>) ?: emptyList()
+        @Suppress("UNCHECKED_CAST")
+        val workOrders = (resultMap["work_orders"] as? List<Map<String, Any?>>) ?: emptyList()
+        @Suppress("UNCHECKED_CAST")
+        val committedDemandsForCheck = (resultMap["committed_demands"] as? List<Map<String, Any?>>) ?: emptyList()
+        @Suppress("UNCHECKED_CAST")
+        val overrideRows: List<Map<String, Any?>> = overrideSnapshotJson?.let {
+            runCatching {
+                val parsed = Json.parseToJsonElement(it)
+                (jsonElementToNative(parsed) as? List<Map<String, Any?>>) ?: emptyList()
+            }.getOrElse { emptyList() }
+        } ?: emptyList()
+        val overrideIndexForCheck = com.allocator.services.buildOverrideIndex(overrideRows)
+        val data = transaction { CaseLoader.load(caseId) }
+        @Suppress("UNCHECKED_CAST")
+        val demands = (data["demand"] as? List<Map<String, Any?>>) ?: emptyList()
+        com.allocator.services.checkRunSoundness(
+            planningPegging = planningPegging,
+            demands = demands,
+            data = data,
+            config = com.allocator.services.SoundnessConfig(deepCheck = deepCheck),
+            workOrders = workOrders,
+            committedDemands = committedDemandsForCheck,
+            overrideIndex = overrideIndexForCheck,
+        )
+    } catch (e: Exception) {
+        transaction {
+            PlanRuns.update({ (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }) {
+                it[PlanRuns.soundnessStatus] = "error"
+                it[PlanRuns.soundnessReport] = buildJsonObject {
+                    put("error", e.message ?: e::class.simpleName ?: "unknown")
+                }.toString()
+                it[PlanRuns.soundnessCheckedAt] = kotlinx.datetime.Clock.System.now()
+            }
+        }
+        throw e
+    }
+
+    val reportJson = buildJsonObject {
+        put("overall_sound", report.overallSound)
+        put("demand_count", report.demandCount)
+        put("sound_count", report.soundCount)
+        put("deep_check", report.deepCheck)
+        putJsonArray("demands") {
+            for (d in report.demands) {
+                addJsonObject {
+                    put("demand_id", d.demandId)
+                    put("sound", d.sound)
+                    putJsonArray("violations") {
+                        for (v in d.violations) {
+                            addJsonObject {
+                                put("rule", v.rule)
+                                put("node_path", v.nodePath)
+                                put("message", v.message)
+                                put("expected", anyToJson(v.expected))
+                                put("actual", anyToJson(v.actual))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        putJsonArray("cross_demand_violations") {
+            for (v in report.crossDemandViolations) {
+                addJsonObject {
+                    put("rule", v.rule)
+                    put("node_path", v.nodePath)
+                    put("message", v.message)
+                    put("expected", anyToJson(v.expected))
+                    put("actual", anyToJson(v.actual))
+                }
+            }
+        }
+    }
+    transaction {
+        PlanRuns.update({ (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }) {
+            it[PlanRuns.soundnessStatus] = if (report.overallSound) "sound" else "unsound"
+            it[PlanRuns.soundnessReport] = reportJson.toString()
+            it[PlanRuns.soundnessCheckedAt] = kotlinx.datetime.Clock.System.now()
+        }
+    }
+    return reportJson
+}
 
 /** Convert Any? to JsonElement for response serialization. */
 private fun anyToJson(v: Any?): JsonElement = when (v) {
