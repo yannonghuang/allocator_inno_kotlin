@@ -379,10 +379,38 @@ private fun toolUpdateConfig(
     workingConfig: JsonObject,
     args: JsonObject,
 ): Pair<ToolResult, JsonObject> {
-    val partial = args["partial"] as? JsonObject ?: return Pair(
-        toolError("`partial` must be a JSON object"),
-        workingConfig,
-    )
+    // OpenAI's function-calling sometimes sends the partial as a stringified
+    // JSON, sometimes flattens the keys directly into args. Accept any of:
+    //   1. {"partial": { ... }}                  ← schema-correct form
+    //   2. {"partial": "{...}" }                 ← stringified
+    //   3. {"max_methods": 2, "consolidation": ... }  ← flattened (no wrapper)
+    // Step 1: pull the candidate from `partial` if present.
+    val rawPartial: JsonElement? = args["partial"]
+    val partial: JsonObject? = when (rawPartial) {
+        is JsonObject -> rawPartial
+        is JsonPrimitive -> if (rawPartial.isString) {
+            runCatching { jsonParser.parseToJsonElement(rawPartial.content).jsonObject }.getOrNull()
+        } else null
+        else -> null
+    } ?: run {
+        // Step 2: no `partial` wrapper — treat the whole args as the partial,
+        // but only if it has at least one recognized config top-level key.
+        val configKeys = setOf(
+            "method_selection", "consolidation", "purchase_allowed",
+            "analyze_criticality", "check_soundness",
+        )
+        if (args.keys.any { it in configKeys }) args else null
+    }
+    if (partial == null || partial.isEmpty()) {
+        return Pair(
+            toolError(
+                "Could not extract a config patch from your tool call. " +
+                    "Pass `partial` as a JSON object, e.g. " +
+                    """{"partial": {"method_selection": {"max_methods": 3}}}""",
+            ),
+            workingConfig,
+        )
+    }
     val merged = mergeJsonObject(workingConfig, partial)
     val changedKeys = partial.keys.joinToString(", ")
     return Pair(
