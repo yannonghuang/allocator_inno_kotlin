@@ -331,10 +331,14 @@ export type PlanningConfig = {
     /** How to split consolidated output among competing demands. Default: fair. */
     allocation_mode?: 'priority_first' | 'proportional' | 'fair';
     /**
-     * Which consolidation engine to use.
-     *   'leaf-legacy' (default) — original leaf-level cap loop.
-     *   'supply'                — supply-level allocation policy + compensation
-     *                             (see docs/supply-level-consolidation.md).
+     * Regulation scope: where the allocation_mode split policy is applied.
+     * UI labels: "Leaves only" / "All levels".
+     *   'leaf-legacy' — at supply-bearing nodes only (raw inventory, leftover
+     *                   stock, prior-round WOs). Make/move WOs generated this
+     *                   round run unconstrained.
+     *   'supply'      — at supply-bearing nodes AND every make/move WO
+     *                   generated this round. Buy WOs are unbounded either
+     *                   way. See docs/supply-level-consolidation.md.
      */
     engine?: 'leaf-legacy' | 'supply';
   };

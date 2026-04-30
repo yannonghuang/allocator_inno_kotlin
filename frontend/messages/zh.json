@@ -288,6 +288,10 @@
       "priorityFirst": "优先级优先",
       "proportional": "按比例",
       "fair": "公平",
+      "regulationScope": "调控范围：",
+      "scopeLeavesOnly": "仅末端",
+      "scopeAllLevels": "全链路",
+      "scopeTooltip": "拆分策略应用的范围。仅末端 — 仅在已持有供应的节点上（原料库存、剩余库存、上一轮规划遗留的 WO）；本轮新生成的生产/调拨订单不受调控。全链路 — 已持有供应的节点 加上 本轮新生成的每一个生产/调拨订单。采购订单视为无限来源，两种模式下均不受调控。",
       "resetDefaults": "重置配置",
       "resetDefaultsTitle": "重置计划配置：按偏好方法选择（深度 1）、禁用采购、合并开启（365 天桶，公平拆分）"
     },

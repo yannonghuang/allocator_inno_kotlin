@@ -3799,7 +3799,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               </select>
             </label>
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}>
-              <span style={{ color: '#a1a1aa' }}>engine</span>
+              <span style={{ color: '#a1a1aa' }}>{tP('config.regulationScope')}</span>
               <select
                 disabled={planningConfig.consolidation?.enabled !== true}
                 value={planningConfig.consolidation?.engine ?? 'leaf-legacy'}
@@ -3808,10 +3808,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   consolidation: { ...c.consolidation, engine: e.target.value as 'leaf-legacy' | 'supply' },
                 }))}
                 style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
-                title="leaf-legacy = original cap loop; supply = supply-level allocation + compensation (experimental)"
+                title={tP('config.scopeTooltip')}
               >
-                <option value="leaf-legacy">leaf-legacy</option>
-                <option value="supply">supply (experimental)</option>
+                <option value="leaf-legacy">{tP('config.scopeLeavesOnly')}</option>
+                <option value="supply">{tP('config.scopeAllLevels')}</option>
               </select>
             </label>
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>

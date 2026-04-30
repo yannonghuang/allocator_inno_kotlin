@@ -288,6 +288,10 @@
       "priorityFirst": "Priority first",
       "proportional": "Proportional",
       "fair": "Fair",
+      "regulationScope": "Regulation scope:",
+      "scopeLeavesOnly": "Leaves only",
+      "scopeAllLevels": "All levels",
+      "scopeTooltip": "Where the split policy applies. Leaves only — at supply-bearing nodes (raw inventory, leftover stock, WOs carried over from a prior planning round); make/move orders generated this round run unconstrained. All levels — at supply-bearing nodes AND every make/move order generated this round. Buy orders are unbounded either way and never regulated.",
       "resetDefaults": "Reset config",
       "resetDefaultsTitle": "Reset planning config: method by preference (depth 1), purchase disallowed, consolidation on (365-day bucket, fair split)"
     },

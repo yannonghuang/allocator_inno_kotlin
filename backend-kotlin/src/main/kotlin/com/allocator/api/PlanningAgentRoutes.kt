@@ -141,7 +141,16 @@ Planner knowledge (from docs/waterfall-allocation.md):
   - mode = "preference" (lowest preference int wins) | "elaborate" (composite scoring
     of commit_time / inventory_consumed / purchase; ~3-4× slower wall-time).
   - method_selection.depth gates elaborate to top N BOM levels (default 1 = root only).
-  - consolidation.engine = "supply" (experimental, recommended) | "leaf-legacy".
+  - consolidation.engine ("regulation scope" in the UI):
+      • "leaf-legacy" → UI label "Leaves only". Split policy applies only at
+        nodes that already hold supply (raw inventory, leftover stock, WOs
+        carried over from a prior planning round). Make/move WOs generated
+        this round run unconstrained.
+      • "supply" → UI label "All levels". Split policy applies at supply-
+        bearing nodes AND every make/move WO generated this round. Buy WOs
+        are unbounded either way.
+    Use the friendly labels when talking to users; use the keys when calling
+    tools (the config field is still `engine`).
   - consolidation.allocation_mode = "fair" (priority-first when ample, proportional
     under shortage) | "proportional" | "priority_first".
   - On case-171 the empirical sweet spot is mode=preference + max_methods=2.
@@ -747,7 +756,8 @@ private fun toolGetSupplySplitExplanation(caseId: Int, args: JsonObject, locale:
     val match = sla.firstOrNull { it["supply_id"]?.toString() == supplyId }
         ?: return toolError(
             "supply $supplyId not in supply_level_allocations for run $runId — " +
-                "either run was leaf-legacy engine or supply wasn't consolidated",
+                "either run used 'Leaves only' regulation scope (engine=leaf-legacy) " +
+                "or supply wasn't consolidated",
             locale,
         )
     @Suppress("UNCHECKED_CAST")

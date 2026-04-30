@@ -32,30 +32,41 @@ These are the load-bearing design decisions to reason **from** when
 answering "why" questions. The config sections below are mechanical
 exposure of these ideas — the user usually wants the *idea*, not the knob.
 
-### 1. Competition shape — flat vs layered
+### 1. Regulation scope — leaves only vs all levels
 
-When a shared resource has multiple claimants, two divisions are possible:
+`consolidation.engine` chooses **where** the split policy
+(`allocation_mode`) is applied. The policy itself is the *how* (fair /
+proportional / priority_first); the engine is the *where*.
 
-- **Flat** (upfront proportional split): every claimant gets a slice of
-  every resource at once. Predictable, fair on paper. *Failure mode*:
-  fragments shared inputs into slivers, which collapse to tiny output at
-  AND-bottlenecks via MIN(child shares).
-- **Layered** (sequential cap loop): claimants take turns; each gets a
-  whole claim before the next. *Failure mode*: order-dependent; late
-  claimants may find shelves bare.
+- **Leaves only** (`engine = "leaf-legacy"`, UI label *"Leaves only"*):
+  Apply the split policy only at nodes that already hold supply — raw
+  inventory, leftover stock, WOs carried over from a prior planning
+  round. Make/move WOs generated this round run unconstrained. *Failure
+  mode*: order-dependent at the leaf level; late claimants find empty
+  shelves.
+- **All levels** (`engine = "supply"`, UI label *"All levels"*): Apply
+  the split policy at supply-bearing nodes AND every make/move WO
+  generated this round. Buy WOs are unbounded either way and never
+  regulated. *Failure mode*: regulating at every WO output fragments
+  shared inputs into slivers, which collapse to tiny output at
+  AND-bottlenecks via `MIN(child shares)`.
 
-Surfaced as `consolidation.engine = "supply"` (flat) vs `"leaf-legacy"`
-(layered). On case-171 layered beat flat ~3× on throughput because make
-operations need atomic shares.
+In the UI the control is labeled "Regulation scope". Use the friendly
+labels ("Leaves only", "All levels") when talking to users; use the
+config keys (`leaf-legacy`, `supply`) when calling tools.
+
+On case-171, *Leaves only* beat *All levels* ~3× on throughput
+because make operations need atomic shares; pervasive regulation
+fragments them.
 
 ### 2. AND-bottleneck atomicity
 
 A make operation requires *all* BOM children at once. Achievable qty =
 `MIN(child shares)`. This is the constraint that distinguishes
 supply-chain planning from generic resource allocation. Anything that
-fragments inputs (flat splits, fine-grained proportional allocation)
-interacts catastrophically with AND-relations — slivers × MIN collapses
-to ~0 make output even when raw material exists in aggregate.
+fragments inputs (regulating at every level, fine-grained proportional
+allocation) interacts catastrophically with AND-relations — slivers × MIN
+collapses to ~0 make output even when raw material exists in aggregate.
 
 ### 3. Waterfall vs proportional method selection
 
@@ -69,8 +80,9 @@ When multiple methods can satisfy one demand:
   linear in the cap.
 
 The system uses waterfall. `max_methods` is the cap; `mode` decides
-"best". The same flat-vs-layered intuition applies one level up: a
-demand's *methods* compete for capacity in layered fashion, not flat.
+"best". The same scope intuition applies one level up: a demand's
+*methods* are tried in sequence (one fully, then the next), not split
+proportionally across all candidates.
 
 ### 4. Conservation by validation, not by construction
 
@@ -124,23 +136,26 @@ regression evaporates when `max_methods` saturates available methods (~max=4).
 
 ### Consolidation — `consolidation`
 
-Operational exposure of the **flat vs layered** competition shape from
-Algorithmic ideas §1.
+Operational exposure of **regulation scope** from Algorithmic ideas §1.
+Two orthogonal knobs:
 
-- `engine = "supply"` (flat) | `"leaf-legacy"` (layered). Default is
-  case-dependent; on case-171 layered dominates on throughput at the
-  cost of higher starvation. Run 433 (leaf-legacy) vs Run 434 (supply,
-  identical config otherwise): 80,752 vs 35,098 committed; fill 25% vs
-  11%; Gini 0.39 vs 0.46; starvation 28% vs 19%; mfg total_quantity
-  104k vs 28k. The mfg gap is the fragmentation smoking gun.
-- `allocation_mode = "fair"` (priority-first when ample, proportional
+- `engine` (UI: "Regulation scope") = `"leaf-legacy"` ("Leaves only") |
+  `"supply"` ("All levels"). Decides *where* `allocation_mode` is applied.
+  Default is case-dependent; on case-171 *Leaves only* dominates on
+  throughput at the cost of higher starvation. Run 433 (Leaves only) vs
+  Run 434 (All levels), identical config otherwise: 80,752 vs 35,098
+  committed; fill 25% vs 11%; Gini 0.39 vs 0.46; starvation 28% vs 19%;
+  mfg total_quantity 104k vs 28k. The mfg gap is the fragmentation
+  smoking gun.
+- `allocation_mode` = `"fair"` (priority-first when ample, proportional
   under shortage) | `"proportional"` (qty-weighted share) |
   `"priority_first"` (highest priority filled first, may starve others).
-  `fair` and `proportional` produce identical splits when supply is
-  short, which is most case-171 demands.
+  Decides *how* a contested supply is split. `fair` and `proportional`
+  produce identical splits when supply is short, which is most case-171
+  demands.
 - `period_days` — bucket width; 0 = single bucket regardless of due date.
-- `get_supply_split_explanation(supply_id)` works only with the supply
-  engine.
+- `get_supply_split_explanation(supply_id)` works only with the "All
+  levels" scope (engine=supply).
 
 ### Soundness check
 
@@ -317,22 +332,23 @@ Pattern:
 Example — bad reply (data dump, no insight):
 
 > "Run 433 had higher fill rate (25%) and more manufacturing output
-> (104k) than 434 (11%, 28k), so leaf-legacy was more effective at
+> (104k) than 434 (11%, 28k), so 'Leaves only' was more effective at
 > using inventory."
 
 Example — good reply (mechanism-grounded):
 
-> "The only differing knob is `consolidation.engine`. Run 434's
-> `supply` engine pre-splits each supply across all demanders upfront;
-> under shortage that fragments shared inputs into slivers, and
-> AND-bottleneck levels compute MIN(child shares) — so slivers × MIN
-> collapses to tiny make output. Run 433's `leaf-legacy` cap loop
-> gives each demand a whole claim in turn, preserving the
-> integer-quantity atomicity AND-relations need. The 3.7× mfg gap
-> (104k vs 28k from the same supplies) is that fragmentation, not a
-> fairness/method-selection difference. Trade-off: leaf-legacy wins
-> throughput + complete orders (median fill 1.0); supply wins
-> minimum-service-level fairness (starvation 19% vs 28%)."
+> "The only differing knob is the regulation scope. Run 434's *All
+> levels* (engine=supply) applies the split policy at every make/move
+> WO output too, not just at supply-bearing nodes. Under shortage that
+> fragments shared inputs into slivers, and AND-bottlenecks compute
+> MIN(child shares) — so slivers × MIN collapses to tiny make output.
+> Run 433's *Leaves only* (engine=leaf-legacy) regulates only at
+> nodes that already hold supply; the new make/move WOs run unconstrained,
+> preserving the integer-quantity atomicity AND-relations need. The
+> 3.7× mfg gap (104k vs 28k from the same supplies) is that
+> fragmentation, not a fairness/method-selection difference. Trade-off:
+> Leaves only wins throughput + complete orders (median fill 1.0); All
+> levels wins minimum-service-level fairness (starvation 19% vs 28%)."
 
 The bad reply describes *what* happened; the good reply explains *why*
 mechanically. This is the difference between a dashboard summarizer and
