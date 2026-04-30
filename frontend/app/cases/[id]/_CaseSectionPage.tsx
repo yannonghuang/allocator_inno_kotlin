@@ -7194,9 +7194,38 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           // Path label covers BOTH multi-demand consolidation groups AND
                           // passthrough singletons; absent = main-loop direct consumption.
                           const groupLabel = supExplainRow.demandPath[d.demandId] ?? null;
+                          // Make the demand id clickable so the user can jump straight to that
+                          // demand's pegging tree. Only active when the corresponding
+                          // committed_demand row exists (i.e. it's a real user-level demand we
+                          // can render a tree for). This restores the demand-hyperlink behavior
+                          // that the deleted Impact column used to provide.
+                          const demandRow = planResult?.committed_demands.find((cd) => cd.demand_id === d.demandId);
+                          const demandKey = demandRow ? `demand|${demandRow.demand_id ?? ''}|${demandRow.product_id}|${demandRow.location_id}` : null;
                           return (
                             <tr key={`${d.demandId}-${i}`} style={{ borderTop: '1px solid #3d3d40' }}>
-                              <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.demandId}</td>
+                              <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {demandRow && demandKey ? (
+                                  <button
+                                    type="button"
+                                    className="secondary"
+                                    style={{ fontSize: '0.74rem', padding: '1px 6px', fontFamily: 'monospace' }}
+                                    title={tP('supExplain.openDemandPegging')}
+                                    onClick={() => {
+                                      // Switch to the planPegging slide-in for this demand.
+                                      // Close supExplain so the two slide-ins don't overlap;
+                                      // user can re-open Breakdown later if needed.
+                                      setPlanPeggingContext({ type: 'demand', row: demandRow });
+                                      setPlanPeggingOpen(true);
+                                      setWoPeggingRowKey(demandKey);
+                                      setSupExplainOpen(false);
+                                      setSupExplainKey(null);
+                                      setSupExplainRow(null);
+                                    }}
+                                  >{d.demandId}</button>
+                                ) : (
+                                  <span>{d.demandId}</span>
+                                )}
+                              </td>
                               <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', color: '#a1a1aa', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.customer ?? '–'}</td>
                               <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '0.74rem' }}>
                                 {groupLabel ? (

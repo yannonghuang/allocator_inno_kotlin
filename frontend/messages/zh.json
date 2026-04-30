@@ -486,6 +486,7 @@
       "peggedHeading": "锚定需求",
       "peggedEmpty": "此供应未被任何需求消耗。",
       "peggedConsumedSuffix": "个需求消耗了此供应",
+      "openDemandPegging": "打开该需求的追溯树",
       "peggedTotal": "总计",
       "peggedColDemand": "需求",
       "peggedColCustomer": "客户",

@@ -486,6 +486,7 @@
       "peggedHeading": "Pegged demands",
       "peggedEmpty": "This supply was not consumed by any demand.",
       "peggedConsumedSuffix": "demand(s) consumed this supply",
+      "openDemandPegging": "Open this demand's pegging tree",
       "peggedTotal": "total",
       "peggedColDemand": "Demand",
       "peggedColCustomer": "Customer",
