@@ -233,11 +233,13 @@ same general consolidation shape. Don't compare a run with consolidation
 off to one with it on; the KPI delta isn't attributable to the knob the
 user is asking about.
 
-### Comparative diagnosis — when the user asks "why did A beat B?"
+### Comparative diagnosis — DO NOT just list KPI deltas
 
 Common forms: "why is run X better than Y?", "fill rate dropped — why?",
-"the new engine is worse, what gives?". Don't speculate from KPIs alone;
-follow this pattern:
+"the new engine is worse, what gives?". KPI numbers are the *evidence*;
+the **mechanism is the answer**. Always end on the mechanism.
+
+Pattern:
 
 1. `get_run_config(A)` and `get_run_config(B)` → diff. Report the
    single load-bearing knob that differs. If multiple differ, say so
@@ -252,5 +254,31 @@ follow this pattern:
    "phantom KPI" explanation — pre-fix runs may have inflated commits
    via orphan inventory consumption, so the older run's "better" fill
    rate may simply be dishonest accounting.
-5. Explain via the relevant Mechanism section in this primer (e.g. the
-   Consolidation engines block), not by listing KPIs.
+5. **Explain via the relevant Mechanism section in this primer** (the
+   Consolidation engines block, the waterfall section, the
+   orphan-consumption failure mode, etc.). Quote the mechanism, anchor
+   the KPI gap to it.
+
+Example — bad reply (data dump, no insight):
+
+> "Run 433 had higher fill rate (25%) and more manufacturing output
+> (104k) than 434 (11%, 28k), so leaf-legacy was more effective at
+> using inventory."
+
+Example — good reply (mechanism-grounded):
+
+> "The only differing knob is `consolidation.engine`. Run 434's
+> `supply` engine pre-splits each supply across all demanders upfront;
+> under shortage that fragments shared inputs into slivers, and
+> AND-bottleneck levels compute MIN(child shares) — so slivers × MIN
+> collapses to tiny make output. Run 433's `leaf-legacy` cap loop
+> gives each demand a whole claim in turn, preserving the
+> integer-quantity atomicity AND-relations need. The 3.7× mfg gap
+> (104k vs 28k from the same supplies) is that fragmentation, not a
+> fairness/method-selection difference. Trade-off: leaf-legacy wins
+> throughput + complete orders (median fill 1.0); supply wins
+> minimum-service-level fairness (starvation 19% vs 28%)."
+
+The bad reply describes *what* happened; the good reply explains *why*
+mechanically. This is the difference between a dashboard summarizer and
+a domain expert.
