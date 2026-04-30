@@ -27,6 +27,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -140,7 +141,16 @@ Planner knowledge (from docs/waterfall-allocation.md):
   - mode = "preference" (lowest preference int wins) | "elaborate" (composite scoring
     of commit_time / inventory_consumed / purchase; ~3-4× slower wall-time).
   - method_selection.depth gates elaborate to top N BOM levels (default 1 = root only).
-  - consolidation.engine = "supply" (experimental, recommended) | "leaf-legacy".
+  - consolidation.engine ("regulation scope" in the UI):
+      • "leaf-legacy" → UI label "Leaves only". Split policy applies only at
+        nodes that already hold supply (raw inventory, leftover stock, WOs
+        carried over from a prior planning round). Make/move WOs generated
+        this round run unconstrained.
+      • "supply" → UI label "All levels". Split policy applies at supply-
+        bearing nodes AND every make/move WO generated this round. Buy WOs
+        are unbounded either way.
+    Use the friendly labels when talking to users; use the keys when calling
+    tools (the config field is still `engine`).
   - consolidation.allocation_mode = "fair" (priority-first when ample, proportional
     under shortage) | "proportional" | "priority_first".
   - On case-171 the empirical sweet spot is mode=preference + max_methods=2.
@@ -275,6 +285,52 @@ private val TOOLS: List<LlmTool> = listOf(
         },
     ),
     tool(
+        "get_run_config",
+        "Return the planning config and override snapshot that produced a specific plan run. " +
+            "Use this BEFORE comparing two runs' KPIs — to confirm they share the same config (so " +
+            "any KPI delta is attributable to a single load-bearing knob, not a confound). Returns " +
+            "{config, override_snapshot}.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("run_id") { put("type", "integer") }
+            }
+            put("required", buildJsonArray { add("run_id") })
+        },
+    ),
+    tool(
+        "recheck_soundness",
+        "Re-run the soundness checker against a persisted plan run with the *current* rule set. " +
+            "Use this when a new soundness rule has shipped (e.g. R7d) and you need to retroactively " +
+            "apply it to an older run whose stored soundness_status predates the rule. Updates the " +
+            "run's soundness_status / soundness_report and returns the full report.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("run_id") { put("type", "integer") }
+                putJsonObject("deep_check") {
+                    put("type", "boolean")
+                    put("description", "Whether to run the deep R8 conservation walk. Default true.")
+                }
+            }
+            put("required", buildJsonArray { add("run_id") })
+        },
+    ),
+    tool(
+        "get_soundness_summary",
+        "Aggregate a plan run's soundness_report into rule-level rollups. Returns " +
+            "{overall_sound, demand_count, sound_count, violations_by_rule: [{rule, demand_count, " +
+            "violation_count, total_actual}]}. Use INSTEAD of walking 200+ demands one at a time when " +
+            "you just need the headline (\"how many demands violate which rules, by how much\").",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("run_id") { put("type", "integer") }
+            }
+            put("required", buildJsonArray { add("run_id") })
+        },
+    ),
+    tool(
         "read_memory",
         "Read all per-case memory entries (key/value JSON) the agent has stored for this case. " +
             "Use to recall durable user preferences from prior sessions.",
@@ -345,6 +401,24 @@ private fun upsertMemory(caseId: Int, key: String, value: JsonElement) {
 
 private val jsonParser = kotlinx.serialization.json.Json { ignoreUnknownKeys = true; isLenient = true }
 
+// ── Locale detection for tool result summaries ──────────────────────────────
+//
+// The reply itself is rendered by the LLM in whatever language the user's
+// message is in (driven by the system-prompt tactic "Mirror the user's
+// language"). Tool result summaries are different — they're built by Kotlin
+// code and shown in the UI's step trace right under the reply. If the user
+// is talking Chinese and the trace is English, the UX has a visible seam.
+//
+// Detect from the latest user message: any CJK-Unified-Ideograph code point
+// → locale="zh", otherwise "en". Cheap, no API change, no frontend work.
+
+private fun detectLocale(s: String): String =
+    if (s.any { it in '一'..'鿿' || it in '㐀'..'䶿' }) "zh" else "en"
+
+/** Pick a localized string. Defaults to English when the locale isn't recognized. */
+private fun loc(en: String, zh: String, locale: String): String =
+    if (locale == "zh") zh else en
+
 // ── Config merge (deep merge of JsonObject) ──────────────────────────────────
 
 /** Recursive deep-merge: scalar / array values in `patch` replace those in `base`;
@@ -367,17 +441,24 @@ internal fun mergeJsonObject(base: JsonObject?, patch: JsonObject): JsonObject {
 
 private data class ToolResult(val summary: String, val payload: JsonElement)
 
-private fun toolError(message: String): ToolResult =
-    ToolResult(summary = "error: $message", payload = buildJsonObject { put("error", message) })
+private fun toolError(message: String, locale: String = "en"): ToolResult =
+    ToolResult(
+        summary = loc("error: $message", "出错：$message", locale),
+        payload = buildJsonObject { put("error", message) },
+    )
 
-private fun toolReadCurrentConfig(workingConfig: JsonObject): ToolResult {
-    val keys = workingConfig.keys.joinToString(", ").ifBlank { "(empty)" }
-    return ToolResult(summary = "Read working config ($keys)", payload = workingConfig)
+private fun toolReadCurrentConfig(workingConfig: JsonObject, locale: String): ToolResult {
+    val keys = workingConfig.keys.joinToString(", ").ifBlank { loc("(empty)", "(空)", locale) }
+    return ToolResult(
+        summary = loc("Read working config ($keys)", "已读取当前配置（$keys）", locale),
+        payload = workingConfig,
+    )
 }
 
 private fun toolUpdateConfig(
     workingConfig: JsonObject,
     args: JsonObject,
+    locale: String,
 ): Pair<ToolResult, JsonObject> {
     // OpenAI's function-calling sometimes sends the partial as a stringified
     // JSON, sometimes flattens the keys directly into args. Accept any of:
@@ -407,6 +488,7 @@ private fun toolUpdateConfig(
                 "Could not extract a config patch from your tool call. " +
                     "Pass `partial` as a JSON object, e.g. " +
                     """{"partial": {"method_selection": {"max_methods": 3}}}""",
+                locale,
             ),
             workingConfig,
         )
@@ -414,7 +496,10 @@ private fun toolUpdateConfig(
     val merged = mergeJsonObject(workingConfig, partial)
     val changedKeys = partial.keys.joinToString(", ")
     return Pair(
-        ToolResult(summary = "Updated config: $changedKeys", payload = merged),
+        ToolResult(
+            summary = loc("Updated config: $changedKeys", "已更新配置：$changedKeys", locale),
+            payload = merged,
+        ),
         merged,
     )
 }
@@ -422,15 +507,16 @@ private fun toolUpdateConfig(
 private suspend fun toolRunPlanAsync(
     caseId: Int,
     workingConfig: JsonObject,
+    locale: String,
 ): ToolResult {
     val configMap = jsonObjectToMap(workingConfig)
     val data = transaction {
         Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
             ?: return@transaction null
         CaseLoader.load(caseId)
-    } ?: return toolError("case $caseId not found")
+    } ?: return toolError("case $caseId not found", locale)
     if (data["demand"].isNullOrEmpty() || data["supply"].isNullOrEmpty()) {
-        return toolError("case $caseId has no demand or supply rows; import CSV first")
+        return toolError("case $caseId has no demand or supply rows; import CSV first", locale)
     }
     val jobId = UUID.randomUUID().toString()
     val total = data["demand"]?.size ?: 0
@@ -443,7 +529,11 @@ private suspend fun toolRunPlanAsync(
     )
     engineScope.launch { runPlanBackground(jobId, caseId, data, configMap) }
     return ToolResult(
-        summary = "Started plan job $jobId ($total demands)",
+        summary = loc(
+            "Started plan job $jobId ($total demands)",
+            "已启动计划任务 $jobId（$total 个需求）",
+            locale,
+        ),
         payload = buildJsonObject {
             put("job_id", jobId)
             put("status", "running")
@@ -452,18 +542,12 @@ private suspend fun toolRunPlanAsync(
     )
 }
 
-private suspend fun toolWaitForPlan(args: JsonObject): ToolResult {
+private suspend fun toolWaitForPlan(args: JsonObject, locale: String): ToolResult {
     val jobId = args["job_id"]?.jsonPrimitive?.contentOrNull
-        ?: return toolError("`job_id` is required")
-    // 60s chat-friendly cap. The frontend's HTTP request would otherwise sit
-    // open for the full plan wall-time (case-171 ranges 90s–6min); intermediate
-    // proxies and the user's patience both run out long before that. When this
-    // expires we return a structured "still_running" payload + the job_id so
-    // the agent can reply "plan started, check back in a couple minutes" and
-    // the user can poll later by asking again.
+        ?: return toolError("`job_id` is required", locale)
     val deadline = System.currentTimeMillis() + 60 * 1000
     while (System.currentTimeMillis() < deadline) {
-        val job = planJobs[jobId] ?: return toolError("job $jobId not found (server restart?)")
+        val job = planJobs[jobId] ?: return toolError("job $jobId not found (server restart?)", locale)
         when (job["status"]) {
             "completed" -> {
                 val runId = planJobRunIds[jobId]
@@ -475,8 +559,13 @@ private suspend fun toolWaitForPlan(args: JsonObject): ToolResult {
                 val totalCommitted = (delivery?.get("total_committed") as? Number)?.toDouble()
                 val totalRequested = (delivery?.get("total_requested") as? Number)?.toDouble()
                 return ToolResult(
-                    summary = "Plan run $runId completed: fill ${fillPct ?: "?"}% " +
-                        "(${totalCommitted ?: "?"} / ${totalRequested ?: "?"})",
+                    summary = loc(
+                        "Plan run $runId completed: fill ${fillPct ?: "?"}% " +
+                            "(${totalCommitted ?: "?"} / ${totalRequested ?: "?"})",
+                        "计划运行 $runId 已完成：填充率 ${fillPct ?: "?"}% " +
+                            "（${totalCommitted ?: "?"} / ${totalRequested ?: "?"}）",
+                        locale,
+                    ),
                     payload = buildJsonObject {
                         put("plan_run_id", runId)
                         put("status", "completed")
@@ -489,7 +578,7 @@ private suspend fun toolWaitForPlan(args: JsonObject): ToolResult {
             "failed" -> {
                 val err = job["error"]?.toString() ?: "(unknown)"
                 return ToolResult(
-                    summary = "Plan failed: $err",
+                    summary = loc("Plan failed: $err", "计划失败：$err", locale),
                     payload = buildJsonObject {
                         put("status", "failed"); put("error", err)
                     },
@@ -498,16 +587,17 @@ private suspend fun toolWaitForPlan(args: JsonObject): ToolResult {
             else -> delay(2_000)  // poll every 2s
         }
     }
-    // 60s elapsed and plan still running. Return a "still_running" tool result
-    // (NOT an error) so the agent can craft a useful reply with the job_id +
-    // current progress instead of treating this as a failure.
     val job = planJobs[jobId]
     @Suppress("UNCHECKED_CAST")
     val progress = job?.get("progress") as? Map<String, Any?>
     val current = (progress?.get("current") as? Number)?.toInt() ?: 0
     val total = (progress?.get("total") as? Number)?.toInt() ?: 0
     return ToolResult(
-        summary = "Plan still running ($current/$total demands after 60s) — agent should reply early",
+        summary = loc(
+            "Plan still running ($current/$total demands after 60s) — agent should reply early",
+            "计划仍在运行中（60 秒后 $current/$total 个需求）— 应尽快回复用户",
+            locale,
+        ),
         payload = buildJsonObject {
             put("status", "still_running")
             put("job_id", jobId)
@@ -533,7 +623,7 @@ private data class PlanRunSummary(
     val fillPct: Double?,
 )
 
-private fun toolListPlanRuns(caseId: Int, args: JsonObject): ToolResult {
+private fun toolListPlanRuns(caseId: Int, args: JsonObject, locale: String): ToolResult {
     val limit = (args["limit"]?.jsonPrimitive?.intOrNull ?: 10).coerceIn(1, 50)
     val statusFilter = args["status"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotBlank() }
     // Materialize all row data INSIDE the transaction. Exposed lazy-evaluates
@@ -568,8 +658,11 @@ private fun toolListPlanRuns(caseId: Int, args: JsonObject): ToolResult {
                 )
             }
     }
-    val summary = if (items.isEmpty()) "no plan runs for case $caseId"
-        else "${items.size} runs, latest=${items.first().id}"
+    val summary = if (items.isEmpty())
+        loc("no plan runs for case $caseId", "案例 $caseId 没有计划运行记录", locale)
+    else
+        loc("${items.size} runs, latest=${items.first().id}",
+            "${items.size} 条记录，最新=${items.first().id}", locale)
     return ToolResult(
         summary = summary,
         payload = buildJsonObject {
@@ -590,19 +683,20 @@ private fun toolListPlanRuns(caseId: Int, args: JsonObject): ToolResult {
     )
 }
 
-private fun toolGetKpis(caseId: Int, args: JsonObject): ToolResult {
+private fun toolGetKpis(caseId: Int, args: JsonObject, locale: String): ToolResult {
     val runId = args["run_id"]?.jsonPrimitive?.intOrNull
-        ?: return toolError("`run_id` is required")
+        ?: return toolError("`run_id` is required", locale)
     val result = loadPlanResultFromDb(caseId, runId)
-        ?: return toolError("plan run $runId not found for case $caseId")
+        ?: return toolError("plan run $runId not found for case $caseId", locale)
     @Suppress("UNCHECKED_CAST")
     val kpis = (result["plan_kpis"] as? Map<String, Any?>)
     if (kpis.isNullOrEmpty()) {
-        // Contingent / what-if runs skip the KPI compute step — they store
-        // committed_demands + pegging but not plan_kpis. Tell the model
-        // explicitly so it doesn't say "KPIs not available" without context.
         return ToolResult(
-            summary = "Run $runId has no plan_kpis (likely a contingent run)",
+            summary = loc(
+                "Run $runId has no plan_kpis (likely a contingent run)",
+                "运行 $runId 没有 plan_kpis（可能是 contingent 模拟运行）",
+                locale,
+            ),
             payload = buildJsonObject {
                 put("error", "no_plan_kpis")
                 put("run_id", runId)
@@ -620,66 +714,225 @@ private fun toolGetKpis(caseId: Int, args: JsonObject): ToolResult {
     val delivery = kpis["delivery"] as? Map<String, Any?>
     val fillPct = (delivery?.get("fill_rate_pct") as? Number)?.toDouble()
     return ToolResult(
-        summary = "Run $runId KPIs (fill ${fillPct ?: "?"}%)",
+        summary = loc(
+            "Run $runId KPIs (fill ${fillPct ?: "?"}%)",
+            "运行 $runId 的 KPI（填充率 ${fillPct ?: "?"}%）",
+            locale,
+        ),
         payload = anyToJson(kpis),
     )
 }
 
-private fun toolGetDemandPegging(caseId: Int, args: JsonObject): ToolResult {
+private fun toolGetDemandPegging(caseId: Int, args: JsonObject, locale: String): ToolResult {
     val runId = args["run_id"]?.jsonPrimitive?.intOrNull
-        ?: return toolError("`run_id` is required")
+        ?: return toolError("`run_id` is required", locale)
     val demandId = args["demand_id"]?.jsonPrimitive?.contentOrNull
-        ?: return toolError("`demand_id` is required")
+        ?: return toolError("`demand_id` is required", locale)
     val result = loadPlanResultFromDb(caseId, runId)
-        ?: return toolError("plan run $runId not found for case $caseId")
+        ?: return toolError("plan run $runId not found for case $caseId", locale)
     @Suppress("UNCHECKED_CAST")
     val pegging = result["planning_pegging"] as? List<Map<String, Any?>> ?: emptyList()
     val entry = pegging.firstOrNull { it["demand_id"]?.toString()?.trim() == demandId.trim() }
-        ?: return toolError("demand $demandId not in run $runId pegging")
+        ?: return toolError("demand $demandId not in run $runId pegging", locale)
     return ToolResult(
-        summary = "Pegging tree for demand $demandId",
+        summary = loc(
+            "Pegging tree for demand $demandId",
+            "需求 $demandId 的支撑链",
+            locale,
+        ),
         payload = anyToJson(entry),
     )
 }
 
-private fun toolGetSupplySplitExplanation(caseId: Int, args: JsonObject): ToolResult {
+private fun toolGetSupplySplitExplanation(caseId: Int, args: JsonObject, locale: String): ToolResult {
     val runId = args["run_id"]?.jsonPrimitive?.intOrNull
-        ?: return toolError("`run_id` is required")
+        ?: return toolError("`run_id` is required", locale)
     val supplyId = args["supply_id"]?.jsonPrimitive?.contentOrNull
-        ?: return toolError("`supply_id` is required")
+        ?: return toolError("`supply_id` is required", locale)
     val result = loadPlanResultFromDb(caseId, runId)
-        ?: return toolError("plan run $runId not found for case $caseId")
+        ?: return toolError("plan run $runId not found for case $caseId", locale)
     @Suppress("UNCHECKED_CAST")
     val sla = result["supply_level_allocations"] as? List<Map<String, Any?>> ?: emptyList()
     val match = sla.firstOrNull { it["supply_id"]?.toString() == supplyId }
         ?: return toolError(
             "supply $supplyId not in supply_level_allocations for run $runId — " +
-                "either run was leaf-legacy engine or supply wasn't consolidated",
+                "either run used 'Leaves only' regulation scope (engine=leaf-legacy) " +
+                "or supply wasn't consolidated",
+            locale,
         )
     @Suppress("UNCHECKED_CAST")
     val perDemand = match["per_demand_allocations"] as? Map<String, Any?> ?: emptyMap()
     return ToolResult(
-        summary = "Supply $supplyId split across ${perDemand.size} demands",
+        summary = loc(
+            "Supply $supplyId split across ${perDemand.size} demands",
+            "供应 $supplyId 在 ${perDemand.size} 个需求间分配",
+            locale,
+        ),
         payload = anyToJson(match),
     )
 }
 
-private fun toolReadMemory(caseId: Int): ToolResult {
+private fun toolGetRunConfig(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val runId = args["run_id"]?.jsonPrimitive?.intOrNull
+        ?: return toolError("`run_id` is required", locale)
+    val (config, override) = transaction {
+        val row = PlanRuns.selectAll()
+            .where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }
+            .singleOrNull() ?: return@transaction null
+        Pair(row[PlanRuns.config], row[PlanRuns.overrideSnapshot])
+    } ?: return toolError("plan run $runId not found for case $caseId", locale)
+    val configJson: JsonElement = config?.let { raw ->
+        runCatching { jsonParser.parseToJsonElement(raw) }.getOrElse { JsonPrimitive(raw) }
+    } ?: JsonObject(emptyMap())
+    val overrideJson: JsonElement = override?.let { raw ->
+        runCatching { jsonParser.parseToJsonElement(raw) }.getOrElse { JsonPrimitive(raw) }
+    } ?: JsonObject(emptyMap())
+    val configKeys = (configJson as? JsonObject)?.keys?.joinToString(", ").orEmpty()
+    val keysDisplay = configKeys.ifBlank { loc("no top-level keys", "无顶层键", locale) }
+    return ToolResult(
+        summary = loc(
+            "Run $runId config ($keysDisplay)",
+            "运行 $runId 的配置（$keysDisplay）",
+            locale,
+        ),
+        payload = buildJsonObject {
+            put("run_id", runId)
+            put("config", configJson)
+            put("override_snapshot", overrideJson)
+        },
+    )
+}
+
+private fun toolRecheckSoundness(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val runId = args["run_id"]?.jsonPrimitive?.intOrNull
+        ?: return toolError("`run_id` is required", locale)
+    val deepCheck = args["deep_check"]?.jsonPrimitive?.booleanOrNull ?: true
+    return try {
+        val report = runSoundnessCheckForRun(caseId, runId, deepCheck)
+        val overall = report["overall_sound"]?.jsonPrimitive?.booleanOrNull
+        val sound = report["sound_count"]?.jsonPrimitive?.intOrNull
+        val total = report["demand_count"]?.jsonPrimitive?.intOrNull
+        val verdictEn = if (overall == true) "sound" else "unsound"
+        val verdictZh = if (overall == true) "通过" else "未通过"
+        ToolResult(
+            summary = loc(
+                "Re-checked run $runId: $verdictEn ($sound/$total demands)",
+                "已重新校验运行 $runId：$verdictZh（$sound/$total 个需求）",
+                locale,
+            ),
+            payload = report,
+        )
+    } catch (e: NoSuchElementException) {
+        toolError(e.message ?: "plan run $runId not found", locale)
+    } catch (e: IllegalStateException) {
+        toolError(e.message ?: "soundness check failed", locale)
+    } catch (e: Exception) {
+        toolError("soundness check raised: ${e.message ?: e::class.simpleName ?: "unknown"}", locale)
+    }
+}
+
+private fun toolGetSoundnessSummary(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val runId = args["run_id"]?.jsonPrimitive?.intOrNull
+        ?: return toolError("`run_id` is required", locale)
+    val reportRaw = transaction {
+        PlanRuns.selectAll()
+            .where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }
+            .singleOrNull()?.get(PlanRuns.soundnessReport)
+    } ?: return toolError(
+        "plan run $runId has no soundness_report — call recheck_soundness first to generate one",
+        locale,
+    )
+    val report = runCatching { jsonParser.parseToJsonElement(reportRaw).jsonObject }
+        .getOrElse { return toolError("plan run $runId soundness_report is not parseable JSON", locale) }
+
+    // Aggregate per-demand violations by rule.
+    data class Bucket(val demandIds: MutableSet<String> = mutableSetOf(), var count: Int = 0, var totalActual: Double = 0.0)
+    val buckets = mutableMapOf<String, Bucket>()
+    val demands = report["demands"]?.jsonArray ?: JsonArray(emptyList())
+    for (d in demands) {
+        val obj = d.jsonObject
+        val demandId = obj["demand_id"]?.jsonPrimitive?.contentOrNull ?: continue
+        val violations = obj["violations"]?.jsonArray ?: continue
+        for (v in violations) {
+            val vObj = v.jsonObject
+            val rule = vObj["rule"]?.jsonPrimitive?.contentOrNull ?: continue
+            val actualNum = vObj["actual"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull() ?: 0.0
+            val b = buckets.getOrPut(rule) { Bucket() }
+            b.demandIds.add(demandId)
+            b.count++
+            b.totalActual += actualNum
+        }
+    }
+    // Cross-demand violations (separate from per-demand) — emit under their own rule key
+    // with the demand_count meaningless (set to null in the output for those rows).
+    val crossViolations = report["cross_demand_violations"]?.jsonArray ?: JsonArray(emptyList())
+    val crossBuckets = mutableMapOf<String, Bucket>()
+    for (v in crossViolations) {
+        val vObj = v.jsonObject
+        val rule = vObj["rule"]?.jsonPrimitive?.contentOrNull ?: continue
+        val actualNum = vObj["actual"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull() ?: 0.0
+        val b = crossBuckets.getOrPut(rule) { Bucket() }
+        b.count++
+        b.totalActual += actualNum
+    }
+
+    val nRules = buckets.size + crossBuckets.size
+    return ToolResult(
+        summary = if (nRules == 0)
+            loc("Soundness summary for run $runId: no violations",
+                "运行 $runId 的合理性汇总：无违规", locale)
+        else
+            loc("Soundness summary for run $runId: $nRules rules",
+                "运行 $runId 的合理性汇总：$nRules 条规则违规", locale),
+        payload = buildJsonObject {
+            put("run_id", runId)
+            put("overall_sound", report["overall_sound"] ?: JsonPrimitive(true))
+            put("demand_count", report["demand_count"] ?: JsonPrimitive(0))
+            put("sound_count", report["sound_count"] ?: JsonPrimitive(0))
+            put("deep_check", report["deep_check"] ?: JsonPrimitive(false))
+            put("violations_by_rule", buildJsonArray {
+                buckets.entries.sortedByDescending { it.value.totalActual }.forEach { (rule, b) ->
+                    add(buildJsonObject {
+                        put("rule", rule)
+                        put("demand_count", b.demandIds.size)
+                        put("violation_count", b.count)
+                        put("total_actual", b.totalActual)
+                    })
+                }
+            })
+            put("cross_demand_violations_by_rule", buildJsonArray {
+                crossBuckets.entries.sortedByDescending { it.value.totalActual }.forEach { (rule, b) ->
+                    add(buildJsonObject {
+                        put("rule", rule)
+                        put("violation_count", b.count)
+                        put("total_actual", b.totalActual)
+                    })
+                }
+            })
+        },
+    )
+}
+
+private fun toolReadMemory(caseId: Int, locale: String): ToolResult {
     val mem = loadMemory(caseId)
     return ToolResult(
-        summary = "Read ${mem.size} memory entries",
+        summary = loc(
+            "Read ${mem.size} memory entries",
+            "已读取 ${mem.size} 条记忆",
+            locale,
+        ),
         payload = mem,
     )
 }
 
-private fun toolWriteMemory(caseId: Int, args: JsonObject): ToolResult {
+private fun toolWriteMemory(caseId: Int, args: JsonObject, locale: String): ToolResult {
     val key = args["key"]?.jsonPrimitive?.contentOrNull
-        ?: return toolError("`key` is required")
-    if (key.length > 128) return toolError("`key` must be ≤ 128 characters")
-    val value = args["value"] ?: return toolError("`value` is required")
+        ?: return toolError("`key` is required", locale)
+    if (key.length > 128) return toolError("`key` must be ≤ 128 characters", locale)
+    val value = args["value"] ?: return toolError("`value` is required", locale)
     upsertMemory(caseId, key, value)
     return ToolResult(
-        summary = "Wrote memory[$key]",
+        summary = loc("Wrote memory[$key]", "已写入记忆[$key]", locale),
         payload = buildJsonObject { put("ok", true); put("key", key) },
     )
 }
@@ -732,6 +985,11 @@ private suspend fun runAgentLoop(
     var workingConfig = initialConfig
     var freshRunId: Int? = null
     val steps = mutableListOf<AgentStep>()
+    // Locale drives only the tool result summaries shown in the chat-step trace
+    // — the LLM-rendered reply already mirrors the user's language via the
+    // system prompt's "Mirror the user's language" tactic. We detect from the
+    // current user message; conversation-mid switches are handled per-turn.
+    val locale = detectLocale(userMessage)
 
     // Bootstrap memory into the system prompt so the model sees prior context
     // without needing to call read_memory first (saves a round-trip).
@@ -797,7 +1055,7 @@ private suspend fun runAgentLoop(
         for (call in resp.toolCalls) {
             val args = runCatching { jsonParser.parseToJsonElement(call.arguments).jsonObject }
                 .getOrElse { JsonObject(emptyMap()) }
-            val (result, configAfter) = dispatchTool(caseId, call, args, workingConfig)
+            val (result, configAfter) = dispatchTool(caseId, call, args, workingConfig, locale)
             workingConfig = configAfter
             // wait_for_plan succeeded → capture run id for the response envelope.
             if (call.name == "wait_for_plan") {
@@ -826,19 +1084,23 @@ private suspend fun dispatchTool(
     call: LlmToolCall,
     args: JsonObject,
     workingConfig: JsonObject,
+    locale: String,
 ): Pair<ToolResult, JsonObject> {
     return when (call.name) {
-        "read_current_config" -> Pair(toolReadCurrentConfig(workingConfig), workingConfig)
-        "update_config" -> toolUpdateConfig(workingConfig, args)
-        "run_plan_async" -> Pair(toolRunPlanAsync(caseId, workingConfig), workingConfig)
-        "wait_for_plan" -> Pair(toolWaitForPlan(args), workingConfig)
-        "list_plan_runs" -> Pair(toolListPlanRuns(caseId, args), workingConfig)
-        "get_kpis" -> Pair(toolGetKpis(caseId, args), workingConfig)
-        "get_demand_pegging" -> Pair(toolGetDemandPegging(caseId, args), workingConfig)
-        "get_supply_split_explanation" -> Pair(toolGetSupplySplitExplanation(caseId, args), workingConfig)
-        "read_memory" -> Pair(toolReadMemory(caseId), workingConfig)
-        "write_memory" -> Pair(toolWriteMemory(caseId, args), workingConfig)
-        else -> Pair(toolError("unknown tool: ${call.name}"), workingConfig)
+        "read_current_config" -> Pair(toolReadCurrentConfig(workingConfig, locale), workingConfig)
+        "update_config" -> toolUpdateConfig(workingConfig, args, locale)
+        "run_plan_async" -> Pair(toolRunPlanAsync(caseId, workingConfig, locale), workingConfig)
+        "wait_for_plan" -> Pair(toolWaitForPlan(args, locale), workingConfig)
+        "list_plan_runs" -> Pair(toolListPlanRuns(caseId, args, locale), workingConfig)
+        "get_kpis" -> Pair(toolGetKpis(caseId, args, locale), workingConfig)
+        "get_demand_pegging" -> Pair(toolGetDemandPegging(caseId, args, locale), workingConfig)
+        "get_supply_split_explanation" -> Pair(toolGetSupplySplitExplanation(caseId, args, locale), workingConfig)
+        "get_run_config" -> Pair(toolGetRunConfig(caseId, args, locale), workingConfig)
+        "recheck_soundness" -> Pair(toolRecheckSoundness(caseId, args, locale), workingConfig)
+        "get_soundness_summary" -> Pair(toolGetSoundnessSummary(caseId, args, locale), workingConfig)
+        "read_memory" -> Pair(toolReadMemory(caseId, locale), workingConfig)
+        "write_memory" -> Pair(toolWriteMemory(caseId, args, locale), workingConfig)
+        else -> Pair(toolError("unknown tool: ${call.name}", locale), workingConfig)
     }
 }
 

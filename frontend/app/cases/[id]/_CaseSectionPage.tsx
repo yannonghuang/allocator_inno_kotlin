@@ -913,7 +913,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [woPeggingRowKey, setWoPeggingRowKey] = useState<string | null>(null);
   const [bomRealPairs, setBomRealPairs] = useState<[string, string][] | null>(null);
   const [realMoveTriples, setRealMoveTriples] = useState<[string, string, string][] | null>(null);
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', engine: 'leaf-legacy' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1193,7 +1193,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (/reset|default|clear|重置|默认|清除/.test(t)) {
       return {
         reply: tP('copilot.replies.reset'),
-        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, depth_optimal: false, max_methods: 2, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' }, analyze_criticality: false, check_soundness: true },
+        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, depth_optimal: false, max_methods: 2, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', engine: 'leaf-legacy' }, analyze_criticality: false, check_soundness: true },
       };
     }
 
@@ -1224,12 +1224,20 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           const needsSave = (analyzeCriticalityEnabled || checkSoundnessEnabled) && freshId != null;
           if (needsSave && freshId && id != null) {
             // Auto-persist so impact/criticality and soundness can use the persisted run.
+            // Carry the unsaved-banner's name/notes through — otherwise anything the user
+            // typed (when soundness/criticality were off on a prior plan and the inputs
+            // retained their value) is dropped silently when auto-save fires.
             let saved = false;
             try {
-              await savePlanRun(Number(id), freshId);
+              await savePlanRun(Number(id), freshId, {
+                name: freshRunName.trim() || undefined,
+                notes: freshRunNotes.trim() || undefined,
+              });
               setCurrentPlanRunId(freshId);
               setFreshPlanRunId(null);
               setOverrideCandidateRunId(null);
+              setFreshRunName('');
+              setFreshRunNotes('');
               saved = true;
             } catch {
               // Auto-save failed — leave as unsaved; user can save manually.
@@ -1277,8 +1285,24 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             planPollRef.current = null;
           }
         }
-      } catch {
-        // keep polling on transient errors
+      } catch (e) {
+        // 404 ⇒ the backend has no record of this job. Almost always means the
+        // backend was rebuilt/restarted while a tab held a stale planJobId in
+        // React state — the in-memory planJobs map is wiped on restart. Stop
+        // polling instead of churning forever (the original code's bare
+        // `catch {}` was the source of the "ghost curl" log spam).
+        if ((e as { status?: number } | null)?.status === 404) {
+          setPlanJobId(null);
+          setPlanLoading(false);
+          setPlanProgress(null);
+          setPlanError(
+            'Plan job no longer exists on the server (likely a backend restart). ' +
+            'Page is out of sync — refresh to re-sync.'
+          );
+          if (planPollRef.current) { clearInterval(planPollRef.current); planPollRef.current = null; }
+          return;
+        }
+        // Other (transient network, 5xx) — keep polling.
       }
     };
     poll();
@@ -3775,7 +3799,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               </select>
             </label>
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}>
-              <span style={{ color: '#a1a1aa' }}>engine</span>
+              <span style={{ color: '#a1a1aa' }}>{tP('config.regulationScope')}</span>
               <select
                 disabled={planningConfig.consolidation?.enabled !== true}
                 value={planningConfig.consolidation?.engine ?? 'leaf-legacy'}
@@ -3784,10 +3808,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   consolidation: { ...c.consolidation, engine: e.target.value as 'leaf-legacy' | 'supply' },
                 }))}
                 style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
-                title="leaf-legacy = original cap loop; supply = supply-level allocation + compensation (experimental)"
+                title={tP('config.scopeTooltip')}
               >
-                <option value="leaf-legacy">leaf-legacy</option>
-                <option value="supply">supply (experimental)</option>
+                <option value="leaf-legacy">{tP('config.scopeLeavesOnly')}</option>
+                <option value="supply">{tP('config.scopeAllLevels')}</option>
               </select>
             </label>
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
@@ -3796,7 +3820,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 checked={analyzeCriticalityEnabled}
                 onChange={(e) => setAnalyzeCriticalityEnabled(e.target.checked)}
               />
-              <span style={{ fontSize: '0.875rem' }}>Analyze Criticality</span>
+              <span style={{ fontSize: '0.875rem' }}>{tP('config.analyzeCriticality')}</span>
             </label>
             <label
               style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}
@@ -3859,7 +3883,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 },
               },
               purchase_allowed: false,
-              consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' },
+              consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', engine: 'leaf-legacy' },
             })}
             title={tP('config.resetDefaultsTitle')}
             style={{ padding: '6px 12px' }}
@@ -5178,8 +5202,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       style={{ fontSize: '0.8rem' }}
                     >
                       {criticalityRunning
-                        ? `Analyzing… (${criticalityProgress?.done ?? 0}/${criticalityProgress?.total ?? 0})`
-                        : 'Analyze Criticality'}
+                        ? tP('config.analyzingCriticality', { done: criticalityProgress?.done ?? 0, total: criticalityProgress?.total ?? 0 })
+                        : tP('config.analyzeCriticality')}
                     </button>
                     {!criticalityRunning && Object.keys(supplyCriticalityMap).length > 0 && (
                       <button
@@ -5187,7 +5211,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         className="secondary"
                         onClick={() => setSupplyCriticalityMap({})}
                         style={{ fontSize: '0.8rem' }}
-                      >Clear</button>
+                      >{tP('config.criticalityClear')}</button>
                     )}
                     {!criticalityRunning && Object.keys(supplyCriticalityMap).length > 0 && (() => {
                       const critical = Object.values(supplyCriticalityMap).filter(s => s === 'critical').length;
@@ -7098,7 +7122,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             pointerEvents: 'auto',
           }}
           role="dialog"
-          aria-label="Planning copilot"
+          aria-label={tP('copilot.title')}
         >
           <div
             style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 0, pointerEvents: 'auto' }}
@@ -7125,7 +7149,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           >
             <div
               role="separator"
-              aria-label="Resize copilot panel"
+              aria-label="Resize agent panel"
               onMouseDown={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -7258,6 +7282,37 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             </form>
           </div>
         </div>,
+        document.body
+      )}
+      {!copilotOpen && typeof document !== 'undefined' && createPortal(
+        <button
+          type="button"
+          onClick={() => setCopilotOpen(true)}
+          aria-label={tP('copilot.title')}
+          title={tP('copilot.title')}
+          style={{
+            position: 'fixed',
+            right: 0,
+            top: '50%',
+            transform: 'translateY(-50%)',
+            zIndex: 9990,
+            padding: '14px 8px',
+            background: '#3b82f6',
+            color: '#fff',
+            border: 'none',
+            borderTopLeftRadius: 8,
+            borderBottomLeftRadius: 8,
+            boxShadow: '-2px 0 10px rgba(0,0,0,0.35)',
+            cursor: 'pointer',
+            writingMode: 'vertical-rl',
+            textOrientation: 'mixed',
+            fontSize: '0.85rem',
+            fontWeight: 600,
+            letterSpacing: '0.04em',
+          }}
+        >
+          {tP('agentLauncher')}
+        </button>,
         document.body
       )}
       {planPeggingOpen && planPeggingContext && typeof document !== 'undefined' && (planPeggingContext.type === 'demand' ? !!planResult : true) && createPortal(

@@ -26,6 +26,81 @@ Three things differentiate it from a stock MRP:
    late, which demands break and by how much?" Used by the upstream
    negotiation flow.
 
+## Algorithmic ideas (the conceptual lenses)
+
+These are the load-bearing design decisions to reason **from** when
+answering "why" questions. The config sections below are mechanical
+exposure of these ideas — the user usually wants the *idea*, not the knob.
+
+### 1. Regulation scope — leaves only vs all levels
+
+`consolidation.engine` chooses **where** the split policy
+(`allocation_mode`) is applied. The policy itself is the *how* (fair /
+proportional / priority_first); the engine is the *where*.
+
+- **Leaves only** (`engine = "leaf-legacy"`, UI label *"Leaves only"*):
+  Apply the split policy only at nodes that already hold supply — raw
+  inventory, leftover stock, WOs carried over from a prior planning
+  round. Make/move WOs generated this round run unconstrained. *Failure
+  mode*: order-dependent at the leaf level; late claimants find empty
+  shelves.
+- **All levels** (`engine = "supply"`, UI label *"All levels"*): Apply
+  the split policy at supply-bearing nodes AND every make/move WO
+  generated this round. Buy WOs are unbounded either way and never
+  regulated. *Failure mode*: regulating at every WO output fragments
+  shared inputs into slivers, which collapse to tiny output at
+  AND-bottlenecks via `MIN(child shares)`.
+
+In the UI the control is labeled "Regulation scope". Use the friendly
+labels ("Leaves only", "All levels") when talking to users; use the
+config keys (`leaf-legacy`, `supply`) when calling tools.
+
+On case-171, *Leaves only* beat *All levels* ~3× on throughput
+because make operations need atomic shares; pervasive regulation
+fragments them.
+
+### 2. AND-bottleneck atomicity
+
+A make operation requires *all* BOM children at once. Achievable qty =
+`MIN(child shares)`. This is the constraint that distinguishes
+supply-chain planning from generic resource allocation. Anything that
+fragments inputs (regulating at every level, fine-grained proportional
+allocation) interacts catastrophically with AND-relations — slivers × MIN
+collapses to ~0 make output even when raw material exists in aggregate.
+
+### 3. Waterfall vs proportional method selection
+
+When multiple methods can satisfy one demand:
+
+- *Proportional*: split across top-N methods, simulate each at every
+  depth. Cost: `max_methods^depth`. Abandoned (hung indefinitely on
+  case-171).
+- *Waterfall* (best-supply-win): exhaust the best method first, fall
+  back only on capacity hit. Cost: `max_methods × cost(one demand)` —
+  linear in the cap.
+
+The system uses waterfall. `max_methods` is the cap; `mode` decides
+"best". The same scope intuition applies one level up: a demand's
+*methods* are tried in sequence (one fully, then the next), not split
+proportionally across all candidates.
+
+### 4. Conservation by validation, not by construction
+
+The planner is heuristic — it doesn't enforce conservation laws while
+allocating. Correctness is checked **post-hoc** via R0–R8 rules and
+badged on the run. A run with `soundness_status="unsound"` is suspect
+even if its KPIs look great. Pre-fix orphan-inventory runs (R7d violations)
+inflated fill rates with phantom commits — the lesson: **trust soundness
+over headline KPIs**, especially when comparing across planner versions.
+
+### 5. Pegging as the audit trail
+
+Every commit traces back to specific supplies via `planning_pegging`
+(demand → work order → child materials → supplies → leaf). This is the
+substrate for every "why" question. "Why did demand X commit only 50?"
+→ walk its pegging. "Where did supply Y go?" → query
+`supply_level_allocations` (supply engine only).
+
 ## Design principles (the load-bearing decisions)
 
 ### Method selection — `method_selection`
@@ -61,14 +136,27 @@ regression evaporates when `max_methods` saturates available methods (~max=4).
 
 ### Consolidation — `consolidation`
 
-- Two engines: `supply` (recommended; per-supply allocation policy with
-  compensation passes) and `leaf-legacy` (original cap loop).
-- `allocation_mode = "fair"` (priority-first when supply ample, proportional
-  under shortage — no demand fully starved) | `"proportional"` (qty-weighted
-  share) | `"priority_first"` (highest priority filled first, may starve
-  others). Note: `fair` and `proportional` produce identical splits when
-  supply is short, which is most case-171 demands.
-- `period_days` controls bucket width (0 = single bucket regardless of due date).
+Operational exposure of **regulation scope** from Algorithmic ideas §1.
+Two orthogonal knobs:
+
+- `engine` (UI: "Regulation scope") = `"leaf-legacy"` ("Leaves only",
+  the default) | `"supply"` ("All levels"). Decides *where*
+  `allocation_mode` is applied. Run 433 (Leaves only) vs Run 434 (All
+  levels) on case-171, identical config otherwise: 80,752 vs 35,098
+  committed; fill 25% vs 11%; Gini 0.39 vs 0.46; starvation 28% vs 19%;
+  mfg total_quantity 104k vs 28k. The mfg gap is the fragmentation
+  smoking gun. *Leaves only* is the default because it dominates on
+  throughput; switch to *All levels* when minimum-service-level fairness
+  matters more than aggregate output.
+- `allocation_mode` = `"fair"` (priority-first when ample, proportional
+  under shortage) | `"proportional"` (qty-weighted share) |
+  `"priority_first"` (highest priority filled first, may starve others).
+  Decides *how* a contested supply is split. `fair` and `proportional`
+  produce identical splits when supply is short, which is most case-171
+  demands.
+- `period_days` — bucket width; 0 = single bucket regardless of due date.
+- `get_supply_split_explanation(supply_id)` works only with the "All
+  levels" scope (engine=supply).
 
 ### Soundness check
 
@@ -97,6 +185,9 @@ The agent has these tools available; call them rather than guessing:
 | `get_kpis(run_id)` | KPI questions. Returns `no_plan_kpis` for contingent runs — fall through to the baseline run via `metadata.baselinePlanRunId`. |
 | `get_demand_pegging(run_id, demand_id)` | "Why is demand X partial?" / "what fulfilled demand X?". |
 | `get_supply_split_explanation(run_id, supply_id)` | "Why did demand A get more than demand B from supply X?" — only works when consolidation engine = `supply`. |
+| `get_run_config(run_id)` | "What config did run X use?". MUST-HAVE before any A/B comparison — confirms the single knob that differs, so KPI deltas are actually attributable. Returns config + override snapshot. |
+| `recheck_soundness(run_id, deep_check?)` | A soundness rule has shipped *since* run X — apply the current ruleset retroactively. Updates the run's badge. |
+| `get_soundness_summary(run_id)` | "How sound is run X — what rules failed, by how much?". Server-side rollup (rule, demand_count, violation_count, total_actual). Use INSTEAD of walking each demand's pegging. |
 | `read_memory` / `write_memory` | Memory is auto-bootstrapped into the prompt; explicit reads are rarely needed. Write durable preferences. |
 
 ## Plan run statuses
@@ -117,6 +208,12 @@ The agent has these tools available; call them rather than guessing:
 - **`median_fill_ratio`**: 50th-percentile fill ratio.
 - **`starvation_pct`**: % of demands with 0 fill (committed_qty ≤ ε).
 - **`on_time_count`**: # demands committed by their due date.
+- **`inventory.consumed_total`** / **`manufacturing.total_quantity`**:
+  total raw input consumed and total make output. **A multi-x gap on
+  these between two runs with the same supplies almost always means
+  engine fragmentation, not a method-selection difference.** (Case-171:
+  Run 433 mfg=104,014 vs Run 434 mfg=28,036 — 3.7× gap = the
+  `supply` engine fragmenting shared inputs below the make threshold.)
 
 ## Failure modes to recognize
 
@@ -206,3 +303,54 @@ When checking a prior run's relevance: same case, same `purchase_allowed`,
 same general consolidation shape. Don't compare a run with consolidation
 off to one with it on; the KPI delta isn't attributable to the knob the
 user is asking about.
+
+### Comparative diagnosis — DO NOT just list KPI deltas
+
+Common forms: "why is run X better than Y?", "fill rate dropped — why?",
+"the new engine is worse, what gives?". KPI numbers are the *evidence*;
+the **mechanism is the answer**. Always end on the mechanism.
+
+Pattern:
+
+1. `get_run_config(A)` and `get_run_config(B)` → diff. Report the
+   single load-bearing knob that differs. If multiple differ, say so
+   and ask the user which delta to attribute to.
+2. `get_kpis(A)` and `get_kpis(B)`.
+3. Cross-check `manufacturing.total_quantity` and
+   `inventory.consumed_total`. A multi-x gap on these from the same
+   supplies is the engine-fragmentation smoking gun.
+4. **If a soundness rule has shipped *between* the runs** (e.g. R7d
+   landed after the orphan-fix), call `recheck_soundness(older_run)`
+   then `get_soundness_summary(older_run)` to confirm/rule out a
+   "phantom KPI" explanation — pre-fix runs may have inflated commits
+   via orphan inventory consumption, so the older run's "better" fill
+   rate may simply be dishonest accounting.
+5. **Explain via the relevant Mechanism section in this primer** (the
+   Consolidation engines block, the waterfall section, the
+   orphan-consumption failure mode, etc.). Quote the mechanism, anchor
+   the KPI gap to it.
+
+Example — bad reply (data dump, no insight):
+
+> "Run 433 had higher fill rate (25%) and more manufacturing output
+> (104k) than 434 (11%, 28k), so 'Leaves only' was more effective at
+> using inventory."
+
+Example — good reply (mechanism-grounded):
+
+> "The only differing knob is the regulation scope. Run 434's *All
+> levels* (engine=supply) applies the split policy at every make/move
+> WO output too, not just at supply-bearing nodes. Under shortage that
+> fragments shared inputs into slivers, and AND-bottlenecks compute
+> MIN(child shares) — so slivers × MIN collapses to tiny make output.
+> Run 433's *Leaves only* (engine=leaf-legacy) regulates only at
+> nodes that already hold supply; the new make/move WOs run unconstrained,
+> preserving the integer-quantity atomicity AND-relations need. The
+> 3.7× mfg gap (104k vs 28k from the same supplies) is that
+> fragmentation, not a fairness/method-selection difference. Trade-off:
+> Leaves only wins throughput + complete orders (median fill 1.0); All
+> levels wins minimum-service-level fairness (starvation 19% vs 28%)."
+
+The bad reply describes *what* happened; the good reply explains *why*
+mechanically. This is the difference between a dashboard summarizer and
+a domain expert.
