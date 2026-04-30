@@ -29,13 +29,16 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 private val log = LoggerFactory.getLogger("com.allocator.AllocateRoute")
-private val engineScope = CoroutineScope(Dispatchers.IO)
+// `internal` so the planning agent (PlanningAgentRoutes.kt) can reuse the
+// same coroutine scope, in-memory job state, and result loaders without
+// duplicating the planner orchestration logic.
+internal val engineScope = CoroutineScope(Dispatchers.IO)
 
 // ── In-memory plan job state ───────────────────────────────────────────────────
-private val planJobs = ConcurrentHashMap<String, MutableMap<String, Any?>>()
+internal val planJobs = ConcurrentHashMap<String, MutableMap<String, Any?>>()
 internal val casePlanResults = ConcurrentHashMap<Int, Map<String, Any>>()
 // jobId → plan_run.id for associating async jobs with persisted runs
-private val planJobRunIds = ConcurrentHashMap<String, Int>()
+internal val planJobRunIds = ConcurrentHashMap<String, Int>()
 
 /**
  * Allocation run routes — port of api/allocate.py.
@@ -1016,7 +1019,7 @@ private fun jsonToAny(v: JsonElement): Any? = when (v) {
  * Returns null if not found or the stored result cannot be parsed.
  */
 @Suppress("UNCHECKED_CAST")
-private fun loadPlanResultFromDb(caseId: Int, runId: Int? = null): Map<String, Any>? {
+internal fun loadPlanResultFromDb(caseId: Int, runId: Int? = null): Map<String, Any>? {
     val resultJson = transaction {
         if (runId != null) {
             PlanRuns.selectAll()
@@ -1620,7 +1623,7 @@ private suspend fun runOptimalDepthPlanning(
     return Triple(bestEnriched!!, bestDepth, attempts.toList())
 }
 
-private suspend fun runPlanBackground(
+internal suspend fun runPlanBackground(
     jobId: String,
     caseId: Int,
     data: Map<String, List<Map<String, Any?>>>,

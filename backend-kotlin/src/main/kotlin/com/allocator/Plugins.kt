@@ -11,6 +11,7 @@ import com.allocator.api.materialImpactRoutes
 import com.allocator.api.materialEventRoutes
 import com.allocator.api.negotiationRoutes
 import com.allocator.api.planRunRoutes
+import com.allocator.api.planningAgentRoutes
 import com.allocator.api.planningCopilotRoutes
 import com.allocator.api.productRoutes
 import com.allocator.api.supplyRoutes
@@ -101,6 +102,7 @@ fun Application.configureRouting() {
         planRunRoutes()
         negotiationRoutes()
         planningCopilotRoutes()
+        planningAgentRoutes()
         productRoutes()
         supplyRoutes()
     }

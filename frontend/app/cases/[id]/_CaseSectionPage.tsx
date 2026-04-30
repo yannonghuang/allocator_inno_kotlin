@@ -25,6 +25,7 @@ import {
   runPlanAsync,
   getPlanStatus,
   planningCopilot,
+  planningAgent,
   listPlanRuns,
   getPlanRun,
   deletePlanRun,
@@ -7175,6 +7176,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <div key={i} style={{ marginBottom: '0.75rem' }}>
                   <span style={{ fontWeight: 600, color: m.role === 'user' ? '#a78bfa' : '#67e8f9', fontSize: '0.8rem' }}>{m.role === 'user' ? tP('copilot.roleUser') : tP('copilot.roleCopilot')}: </span>
                   <span style={{ whiteSpace: 'pre-wrap', fontSize: '0.875rem' }}>{m.text.replace(/\*\*(.*?)\*\*/g, '$1')}</span>
+                  {m.role === 'assistant' && m.steps && m.steps.length > 0 && (
+                    <div style={{ marginTop: '0.4rem', marginLeft: '0.75rem', borderLeft: '2px solid #3d3d40', paddingLeft: '0.75rem' }}>
+                      {m.steps.map((s, si) => (
+                        <div key={si} style={{ fontSize: '0.75rem', color: '#a1a1aa', fontStyle: 'italic', marginBottom: '0.15rem' }}>
+                          <span style={{ color: '#71717a', fontFamily: 'monospace' }}>{s.tool}</span>
+                          {' · '}
+                          {s.result_summary}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               ))}
               {copilotLoading && <p style={{ margin: 0, fontSize: '0.875rem', color: '#a1a1aa' }}>{tP('copilot.thinking')}</p>}
@@ -7189,25 +7201,45 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 setCopilotMessages((prev) => [...prev, { role: 'user', text }]);
                 setCopilotInput('');
                 setCopilotLoading(true);
+                // Apply config_update + reply to chat in a shared shape.
+                const applyConfig = (cu: PlanningConfig | null) => {
+                  if (!cu) return;
+                  setPlanningConfig((prev) => ({
+                    ...prev,
+                    ...cu,
+                    method_selection: cu.method_selection ? { ...prev.method_selection, ...cu.method_selection } : prev.method_selection,
+                    purchase_allowed: 'purchase_allowed' in cu ? cu.purchase_allowed : prev.purchase_allowed,
+                    consolidation: cu.consolidation ? { ...prev.consolidation, ...cu.consolidation } : prev.consolidation,
+                  }));
+                };
                 try {
-                  const res = await planningCopilot(id, text, planningConfig, copilotMessages);
-                  if (res.config_update) setPlanningConfig((prev) => ({
+                  // Try the full agent first; fall back to copilot if it 5xxs (e.g. OPENAI key missing).
+                  const res = await planningAgent(id, text, planningConfig, copilotMessages);
+                  applyConfig(res.config_update);
+                  setCopilotMessages((prev) => [
                     ...prev,
-                    ...res.config_update!,
-                    method_selection: res.config_update!.method_selection ? { ...prev.method_selection, ...res.config_update!.method_selection } : prev.method_selection,
-                    purchase_allowed: 'purchase_allowed' in res.config_update! ? res.config_update!.purchase_allowed : prev.purchase_allowed,
-                    consolidation: res.config_update!.consolidation ? { ...prev.consolidation, ...res.config_update!.consolidation } : prev.consolidation,
-                  }));
-                  setCopilotMessages((prev) => [...prev, { role: 'assistant', text: res.reply }]);
+                    { role: 'assistant', text: res.reply, steps: res.steps, fresh_run_id: res.fresh_run_id },
+                  ]);
+                  // If the agent ran a plan, refresh the run-history list so the user sees it.
+                  if (res.fresh_run_id != null && id != null) {
+                    listPlanRuns(id).then(setPlanRunHistory).catch(() => { /* ignore */ });
+                  }
                 } catch {
-                  const { reply, configUpdate } = parseCopilotIntent(text, planningConfig);
-                  if (configUpdate) setPlanningConfig((prev) => ({
-                    ...prev,
-                    ...configUpdate,
-                    method_selection: configUpdate.method_selection ? { ...prev.method_selection, ...configUpdate.method_selection } : prev.method_selection,
-                    consolidation: configUpdate.consolidation ? { ...prev.consolidation, ...configUpdate.consolidation } : prev.consolidation,
-                  }));
-                  setCopilotMessages((prev) => [...prev, { role: 'assistant', text: reply }]);
+                  // Agent unavailable — fall back to the copilot route, then to local rule-based parser.
+                  try {
+                    const res = await planningCopilot(id, text, planningConfig, copilotMessages);
+                    applyConfig(res.config_update);
+                    setCopilotMessages((prev) => [...prev, { role: 'assistant', text: res.reply }]);
+                  } catch {
+                    const { reply, configUpdate } = parseCopilotIntent(text, planningConfig);
+                    if (configUpdate) setPlanningConfig((prev) => ({
+                      ...prev,
+                      ...configUpdate,
+                      method_selection: configUpdate.method_selection ? { ...prev.method_selection, ...configUpdate.method_selection } : prev.method_selection,
+                      consolidation: configUpdate.consolidation ? { ...prev.consolidation, ...configUpdate.consolidation } : prev.consolidation,
+                    }));
+                    setCopilotMessages((prev) => [...prev, { role: 'assistant', text: reply }]);
+                  }
                 } finally {
                   setCopilotLoading(false);
                 }

@@ -13,6 +13,13 @@ import io.ktor.serialization.kotlinx.json.*
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
 
 /**
  * Provider-agnostic chat wrapper. Provider is selected by LLM_PROVIDER env:
@@ -216,3 +223,166 @@ private suspend fun anthropicChat(
     return resp.body<AnthropicResp>().content.firstOrNull { it.type == "text" }?.text
         ?: throw IllegalStateException("Anthropic response contained no text content")
 }
+
+// ── Tool-use API (OpenAI function-calling) ──────────────────────────────────
+//
+// Phase 1 of the planning agent: OpenAI Chat Completions with `tools` + the
+// `tool_calls` round-trip. Anthropic and OpenClaw stubs throw — agents pin
+// to "openai" provider just like /material-impact-assessment and
+// /planning-copilot do.
+
+/** A function-callable tool advertised to the model. `parameters` is JSON Schema. */
+data class LlmTool(
+    val name: String,
+    val description: String,
+    val parameters: JsonObject,
+)
+
+/** One tool invocation requested by the model. `arguments` is a JSON string per OpenAI spec. */
+data class LlmToolCall(
+    val id: String,
+    val name: String,
+    val arguments: String,
+)
+
+/**
+ * Conversation message for the tool-use loop. Shape matches OpenAI's wire format:
+ *   - role=user/system: `content` set, others null
+ *   - role=assistant with text reply: `content` set, `toolCalls` null
+ *   - role=assistant requesting tools: `content` may be null, `toolCalls` non-empty
+ *   - role=tool (result of a prior tool call): `content` + `toolCallId` set
+ */
+data class LlmAgentMessage(
+    val role: String,
+    val content: String? = null,
+    val toolCallId: String? = null,
+    val toolCalls: List<LlmToolCall>? = null,
+)
+
+data class LlmToolResponse(
+    /** Final assistant text when the model is done calling tools; null when only tool_calls. */
+    val text: String?,
+    /** Tools the model wants the caller to execute next; empty when the model produced text. */
+    val toolCalls: List<LlmToolCall>,
+)
+
+/**
+ * Single tool-use round-trip: send messages + tools to the model, return its
+ * response (either final text or a list of tool calls to execute). The caller
+ * runs the agent loop: append tool results as `role=tool` messages and call
+ * again until `toolCalls.isEmpty()`.
+ *
+ * Phase 1 supports OpenAI only (the planning agent pins `provider="openai"`).
+ */
+suspend fun llmChatWithTools(
+    systemPrompt: String? = null,
+    messages: List<LlmAgentMessage>,
+    tools: List<LlmTool>,
+    maxTokens: Int = 1024,
+    temperature: Double = 0.2,
+    model: String? = null,
+    provider: String? = null,
+): LlmToolResponse {
+    val effectiveProvider = (provider ?: config.llmProvider).lowercase()
+    if (effectiveProvider != "openai") {
+        throw LlmNotConfiguredException(
+            "llmChatWithTools is OpenAI-only in Phase 1 (got provider=$effectiveProvider). " +
+                "Pin the call site with provider=\"openai\".",
+        )
+    }
+    val resolvedModel = model ?: defaultModelForProvider("openai")
+    val apiKey = config.openAiApiKey
+        ?: throw LlmNotConfiguredException("OPENAI_API_KEY is not configured")
+
+    val body = buildJsonObject {
+        put("model", resolvedModel)
+        put("max_tokens", maxTokens)
+        put("temperature", temperature)
+        // Build messages array with optional tool_calls / tool_call_id fields.
+        put("messages", buildJsonArray {
+            if (!systemPrompt.isNullOrBlank()) {
+                add(buildJsonObject {
+                    put("role", "system")
+                    put("content", systemPrompt)
+                })
+            }
+            messages.forEach { m ->
+                add(buildJsonObject {
+                    put("role", m.role)
+                    // OpenAI requires `content` field even when null for tool-call assistant messages.
+                    put("content", m.content?.let { JsonPrimitive(it) } ?: JsonPrimitive(null as String?))
+                    m.toolCallId?.let { put("tool_call_id", it) }
+                    m.toolCalls?.takeIf { it.isNotEmpty() }?.let { calls ->
+                        put("tool_calls", buildJsonArray {
+                            calls.forEach { c ->
+                                add(buildJsonObject {
+                                    put("id", c.id)
+                                    put("type", "function")
+                                    putJsonObject("function") {
+                                        put("name", c.name)
+                                        put("arguments", c.arguments)
+                                    }
+                                })
+                            }
+                        })
+                    }
+                })
+            }
+        })
+        // Advertise tools.
+        put("tools", buildJsonArray {
+            tools.forEach { t ->
+                add(buildJsonObject {
+                    put("type", "function")
+                    putJsonObject("function") {
+                        put("name", t.name)
+                        put("description", t.description)
+                        put("parameters", t.parameters)
+                    }
+                })
+            }
+        })
+        put("tool_choice", "auto")
+    }
+
+    val resp = try {
+        llmHttpClient.post("https://api.openai.com/v1/chat/completions") {
+            header("Authorization", "Bearer $apiKey")
+            contentType(ContentType.Application.Json)
+            setBody(body)
+        }
+    } catch (e: java.nio.channels.UnresolvedAddressException) {
+        throw IllegalStateException("OpenAI host unresolved", e)
+    } catch (e: java.net.ConnectException) {
+        throw IllegalStateException("OpenAI connection refused: ${e.message}", e)
+    }
+
+    if (!resp.status.isSuccess()) {
+        throw IllegalStateException("OpenAI API error ${resp.status.value}: ${resp.bodyAsText()}")
+    }
+
+    val json = resp.body<JsonElement>().jsonObjectOrNull()
+        ?: throw IllegalStateException("OpenAI response was not a JSON object")
+    val choices = (json["choices"] as? kotlinx.serialization.json.JsonArray)
+        ?: throw IllegalStateException("OpenAI response missing 'choices' array")
+    val message = (choices.firstOrNull() as? JsonObject)?.get("message") as? JsonObject
+        ?: throw IllegalStateException("OpenAI response missing message in first choice")
+
+    val text = (message["content"] as? JsonPrimitive)?.let {
+        if (it.isString) it.content else null
+    }
+
+    val toolCalls = ((message["tool_calls"] as? kotlinx.serialization.json.JsonArray) ?: emptyList<JsonElement>())
+        .mapNotNull { tc ->
+            val obj = tc as? JsonObject ?: return@mapNotNull null
+            val id = (obj["id"] as? JsonPrimitive)?.content ?: return@mapNotNull null
+            val fn = obj["function"] as? JsonObject ?: return@mapNotNull null
+            val name = (fn["name"] as? JsonPrimitive)?.content ?: return@mapNotNull null
+            val args = (fn["arguments"] as? JsonPrimitive)?.content ?: "{}"
+            LlmToolCall(id = id, name = name, arguments = args)
+        }
+
+    return LlmToolResponse(text = text, toolCalls = toolCalls)
+}
+
+private fun JsonElement.jsonObjectOrNull(): JsonObject? = this as? JsonObject

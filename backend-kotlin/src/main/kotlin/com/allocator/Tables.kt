@@ -265,6 +265,27 @@ object NegotiationWaits : Table("negotiation_wait") {
 }
 
 /**
+ * Per-case key-value memory for the planning agent. The agent reads this at
+ * the start of every conversation and writes via its `write_memory` tool when
+ * it learns durable facts (user preferences, recurring goals, recent decisions
+ * worth remembering across sessions). Value is a JSON-encoded string —
+ * arbitrary shape, opaque to the backend; the agent owns the schema.
+ *
+ * `scope` is reserved for future expansion (per-user / global) — Phase 1
+ * always writes "case" and the unique index keys on (case_id, scope, key).
+ */
+object AgentMemory : Table("agent_memory") {
+    val id          = long("id").autoIncrement()
+    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val scope       = varchar("scope", 32).default("case")
+    val key         = varchar("key", 128)
+    val value       = text("value")
+    val updatedAt   = timestamp("updated_at").defaultExpression(CurrentTimestamp)
+    override val primaryKey = PrimaryKey(id)
+    init { uniqueIndex("uq_agent_memory_case_scope_key", caseId, scope, key) }
+}
+
+/**
  * Append-only lifecycle log for a plan run. Each mutation emits a row.
  * Event kinds: "created" | "saved" | "renamed" | "promoted" | "designated_active" | "undesignated".
  * payload is a kind-specific JSON blob (e.g., {"old_name": "...", "new_name": "..."}).
