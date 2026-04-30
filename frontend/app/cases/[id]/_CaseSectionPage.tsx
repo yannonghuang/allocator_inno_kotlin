@@ -7122,7 +7122,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             pointerEvents: 'auto',
           }}
           role="dialog"
-          aria-label="Planning copilot"
+          aria-label={tP('copilot.title')}
         >
           <div
             style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 0, pointerEvents: 'auto' }}
@@ -7149,7 +7149,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           >
             <div
               role="separator"
-              aria-label="Resize copilot panel"
+              aria-label="Resize agent panel"
               onMouseDown={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -7282,6 +7282,37 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             </form>
           </div>
         </div>,
+        document.body
+      )}
+      {!copilotOpen && typeof document !== 'undefined' && createPortal(
+        <button
+          type="button"
+          onClick={() => setCopilotOpen(true)}
+          aria-label={tP('copilot.title')}
+          title={tP('copilot.title')}
+          style={{
+            position: 'fixed',
+            right: 0,
+            top: '50%',
+            transform: 'translateY(-50%)',
+            zIndex: 9990,
+            padding: '14px 8px',
+            background: '#3b82f6',
+            color: '#fff',
+            border: 'none',
+            borderTopLeftRadius: 8,
+            borderBottomLeftRadius: 8,
+            boxShadow: '-2px 0 10px rgba(0,0,0,0.35)',
+            cursor: 'pointer',
+            writingMode: 'vertical-rl',
+            textOrientation: 'mixed',
+            fontSize: '0.85rem',
+            fontWeight: 600,
+            letterSpacing: '0.04em',
+          }}
+        >
+          {tP('agentLauncher')}
+        </button>,
         document.body
       )}
       {planPeggingOpen && planPeggingContext && typeof document !== 'undefined' && (planPeggingContext.type === 'demand' ? !!planResult : true) && createPortal(
