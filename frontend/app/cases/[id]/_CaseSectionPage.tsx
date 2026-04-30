@@ -3029,7 +3029,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 )}
                 {!supplyViewLoading && supplyView.length <= 1 && supplyView.length > 0 && (
                   <p style={{ fontSize: '0.875rem', color: '#71717a', marginBottom: '0.5rem' }}>
-                    One row per supply record. If you expect more rows, re-import supply CSV for this case.
+                    {tA('supplyView.hint')}
                   </p>
                 )}
                 {!supplyViewLoading && (
@@ -3040,17 +3040,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   const overallUtil = totalInitial > 0 ? (totalConsumed / totalInitial) * 100 : 0;
                   return (
                     <p style={{ fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
-                      Overall utilization: <strong>{qtyFmt(totalConsumed)}</strong> / <strong>{qtyFmt(totalInitial)}</strong> initial = <strong>{overallUtil.toFixed(1)}%</strong>
+                      {tA('supplyView.overallUtilization')} <strong>{qtyFmt(totalConsumed)}</strong> / <strong>{qtyFmt(totalInitial)}</strong> {tA('supplyView.initial')} = <strong>{overallUtil.toFixed(1)}%</strong>
                     </p>
                   );
                 })()}
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, marginBottom: '0.5rem' }} title="Uncheck to see all supplies, including those with 0 consumed">
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, marginBottom: '0.5rem' }}>
                   <input
                     type="checkbox"
                     checked={supplyFilterConsumedOnly}
                     onChange={(e) => setSupplyFilterConsumedOnly(e.target.checked)}
                   />
-                  Only consumed (consumed qty &gt; 0) — uncheck to see all supplies
+                  {tA('supplyView.onlyConsumed')}
                 </label>
                 <SortFilterTable<SupplyViewRow & { _rowKey?: string; product_total: number }>
                 idKey="_rowKey"
@@ -3062,16 +3062,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 filterKeys={['supply_id', 'product_id', 'location_id', 'component_key', 'supply_date', 'consumed_qty', 'utilization_rate']}
                 defaultSortKey="utilization_rate"
                 columns={[
-                  { key: 'supply_id', label: 'Supply ID', sortable: true },
-                  { key: 'supply_date', label: 'Time', sortable: true, render: (r) => r.supply_date ?? '–' },
-                  { key: 'product_id', label: 'Product', sortable: true },
-                  { key: 'location_id', label: 'Location', sortable: true },
-                  { key: 'initial_qty', label: 'Initial qty', sortable: true },
-                  { key: 'product_total', label: 'Total per product', sortable: true, render: (r) => r.product_total > 0 ? qtyFmt(r.product_total) : '–' },
-                  { key: 'consumed_qty', label: 'Consumed qty', sortable: true },
-                  { key: 'residual_qty', label: 'Residual qty', sortable: true },
-                  { key: 'utilization_rate', label: 'Utilization', sortable: true, render: (r) => r.utilization_rate != null ? `${(Number(r.utilization_rate) * 100).toFixed(1)}%` : '–' },
-                  { key: '_pegging', label: 'Pegging', sortable: false, render: (r) => <button type="button" className="secondary" onClick={() => handleSupplyPeggingClick(r)}>Show</button> },
+                  { key: 'supply_id', label: tA('supplyView.columns.supplyId'), sortable: true },
+                  { key: 'supply_date', label: tA('supplyView.columns.time'), sortable: true, render: (r) => r.supply_date ?? '–' },
+                  { key: 'product_id', label: tA('supplyView.columns.product'), sortable: true },
+                  { key: 'location_id', label: tA('supplyView.columns.location'), sortable: true },
+                  { key: 'initial_qty', label: tA('supplyView.columns.initialQty'), sortable: true },
+                  { key: 'product_total', label: tA('supplyView.columns.productTotal'), sortable: true, render: (r) => r.product_total > 0 ? qtyFmt(r.product_total) : '–' },
+                  { key: 'consumed_qty', label: tA('supplyView.columns.consumedQty'), sortable: true },
+                  { key: 'residual_qty', label: tA('supplyView.columns.residualQty'), sortable: true },
+                  { key: 'utilization_rate', label: tA('supplyView.columns.utilization'), sortable: true, render: (r) => r.utilization_rate != null ? `${(Number(r.utilization_rate) * 100).toFixed(1)}%` : '–' },
+                  { key: '_pegging', label: tA('supplyView.columns.pegging'), sortable: false, render: (r) => <button type="button" className="secondary" onClick={() => handleSupplyPeggingClick(r)}>{tc('show')}</button> },
                 ]}
               />
                 </>
@@ -3507,24 +3507,28 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 idKey="demand_id"
                 rows={feasibleDemands.map((f) => ({
                   ...f,
-                  suggested_revision: f.suggested_revision ?? (f.status === 'fulfilled' ? 'Fulfilled' : f.allocated_qty > 0 ? `Reduce to ${f.allocated_qty}` : 'Unfulfilled (0 allocated)'),
+                  suggested_revision: f.suggested_revision ?? (f.status === 'fulfilled'
+                    ? tA('demandView.fulfilled')
+                    : f.allocated_qty > 0
+                      ? `${tA('demandView.reduceTo')} ${f.allocated_qty}`
+                      : tA('demandView.unfulfilled')),
                 }))}
                 rowId={(r) => `demand-${r.demand_id}`}
                 onRowClick={handleDemandPeggingClick}
                 filterKeys={['demand_id', 'customer', 'customer_id', 'product_id', 'status', 'suggested_revision', 'request_due_time', 'revised_time', 'fulfillment_rate']}
                 defaultSortKey="fulfillment_rate"
                 columns={[
-                  { key: 'demand_id', label: 'Demand ID', sortable: true },
-                  { key: 'customer', label: 'Customer', sortable: true, render: (r) => r.customer ?? r.customer_id ?? '–' },
-                  { key: 'request_due_time', label: 'Time', sortable: true, render: (r) => r.request_due_time ?? '–' },
-                  { key: 'revised_time', label: 'Revised time', sortable: true, render: (r) => r.revised_time ?? '–' },
-                  { key: 'product_id', label: 'Product', sortable: true },
-                  { key: 'requested_qty', label: 'Requested', sortable: true },
-                  { key: 'allocated_qty', label: 'Allocated', sortable: true },
-                  { key: 'fulfillment_rate', label: 'Fulfillment', sortable: true, render: (r) => r.fulfillment_rate != null ? `${(Number(r.fulfillment_rate) * 100).toFixed(1)}%` : '–' },
-                  { key: 'status', label: 'Status', sortable: true },
-                  { key: 'suggested_revision', label: 'Suggested revision', sortable: true },
-                  { key: '_pegging', label: 'Pegging', sortable: false, render: (r) => <button type="button" className="secondary" onClick={() => handleDemandPeggingClick(r)}>Show</button> },
+                  { key: 'demand_id', label: tA('demandView.columns.demandId'), sortable: true },
+                  { key: 'customer', label: tA('demandView.columns.customer'), sortable: true, render: (r) => r.customer ?? r.customer_id ?? '–' },
+                  { key: 'request_due_time', label: tA('demandView.columns.time'), sortable: true, render: (r) => r.request_due_time ?? '–' },
+                  { key: 'revised_time', label: tA('demandView.columns.revisedTime'), sortable: true, render: (r) => r.revised_time ?? '–' },
+                  { key: 'product_id', label: tA('demandView.columns.product'), sortable: true },
+                  { key: 'requested_qty', label: tA('demandView.columns.requested'), sortable: true },
+                  { key: 'allocated_qty', label: tA('demandView.columns.allocated'), sortable: true },
+                  { key: 'fulfillment_rate', label: tA('demandView.columns.fulfillment'), sortable: true, render: (r) => r.fulfillment_rate != null ? `${(Number(r.fulfillment_rate) * 100).toFixed(1)}%` : '–' },
+                  { key: 'status', label: tA('demandView.columns.status'), sortable: true },
+                  { key: 'suggested_revision', label: tA('demandView.columns.suggestedRevision'), sortable: true },
+                  { key: '_pegging', label: tA('demandView.columns.pegging'), sortable: false, render: (r) => <button type="button" className="secondary" onClick={() => handleDemandPeggingClick(r)}>{tc('show')}</button> },
                 ]}
               />
               </>
@@ -5461,7 +5465,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                 </span>
                               );
                             }},
-                            { key: '_sup_pegging' as keyof (PlanSupplyViewRow & { _key: string }), label: tP('supplyView.columns.pegging'), sortable: false, render: (r) => {
+                            { key: '_sup_pegging' as keyof (PlanSupplyViewRow & { _key: string }), label: tP('supplyView.columns.impact'), sortable: false, render: (r) => {
                               if (r.peggedDemandCount === 0) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
                               const k = `supply|${r.supplyId}`;
                               const isSelected = woPeggingRowKey === k;
@@ -5483,10 +5487,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                       setPreviousPeggingContext(null);
                                     }
                                   }}
-                                >Show</button>
+                                >{tc('show')}</button>
                               );
                             }},
-                            { key: '_sup_explain' as keyof (PlanSupplyViewRow & { _key: string }), label: 'Explain', sortable: false, render: (r) => {
+                            { key: '_sup_explain' as keyof (PlanSupplyViewRow & { _key: string }), label: tP('supplyView.columns.breakdown'), sortable: false, render: (r) => {
                               const cs = supplyCriticalityMap[r.supplyId];
                               const hasCriticality = cs === 'critical' || cs === 'not_critical';
                               const eligible = r.peggedDemandCount > 0 || r.splitInfos.length > 0 || !!r.override || hasCriticality;
@@ -5502,7 +5506,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                     if (isSelected) { setSupExplainOpen(false); setSupExplainKey(null); setSupExplainRow(null); }
                                     else { setSupExplainRow(r); setSupExplainKey(k); setSupExplainOpen(true); }
                                   }}
-                                >Why</button>
+                                >{tc('show')}</button>
                               );
                             }},
                           ]}

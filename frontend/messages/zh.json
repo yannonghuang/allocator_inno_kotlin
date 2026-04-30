@@ -100,6 +100,7 @@
         "product": "产品",
         "location": "地点",
         "initialQty": "初始数量",
+        "productTotal": "产品总量",
         "consumedQty": "已消耗数量",
         "residualQty": "剩余数量",
         "utilization": "利用率",
@@ -734,7 +735,9 @@
         "totalPeggedQty": "关联需求总量",
         "splitInfo": "拆分信息",
         "override": "覆盖",
-        "pegging": "追溯"
+        "pegging": "追溯",
+        "impact": "影响",
+        "breakdown": "详情"
       },
       "peggingPanel": {
         "title": "供应追溯：{supplyId}",

@@ -100,6 +100,7 @@
         "product": "Product",
         "location": "Location",
         "initialQty": "Initial qty",
+        "productTotal": "Total per product",
         "consumedQty": "Consumed qty",
         "residualQty": "Residual qty",
         "utilization": "Utilization",
@@ -734,7 +735,9 @@
         "totalPeggedQty": "Total Pegged Qty",
         "splitInfo": "Split Info",
         "override": "Override",
-        "pegging": "Pegging"
+        "pegging": "Pegging",
+        "impact": "Impact",
+        "breakdown": "Breakdown"
       },
       "peggingPanel": {
         "title": "Supply pegging: {supplyId}",
