@@ -747,6 +747,9 @@
       "overrideWarnBanner": "在此覆盖下，上次计划运行未能完全满足一个或多个需求。受影响的需求及其短缺量见下方。",
       "edit": "编辑",
       "clear": "清除",
+      "scarcityRatioTooltip": "该产品总需求 {demand} / 总供应 {supply}（含所有地点）。",
+      "scarcityShortageTooltip": "需求 {demand} / 无可用供应 — 完全缺货。",
+      "scarcityNoneTooltip": "该产品无用户需求 — 物料不受约束。",
       "columns": {
         "supplyId": "供应 ID",
         "product": "产品",
@@ -755,6 +758,7 @@
         "supplyDate": "供应日期",
         "initialQty": "初始数量",
         "productTotal": "产品总量",
+        "scarcity": "紧缺度",
         "consumed": "已消耗",
         "residual": "剩余",
         "utilPct": "利用率 %",

@@ -747,6 +747,9 @@
       "overrideWarnBanner": "The last plan run could not fully commit one or more demands under this override. Affected demands below show their shortfall.",
       "edit": "Edit",
       "clear": "Clear",
+      "scarcityRatioTooltip": "Total demand {demand} / total supply {supply} for this product (all locations).",
+      "scarcityShortageTooltip": "Demand {demand} / no supply available — total shortage.",
+      "scarcityNoneTooltip": "No user demand for this product — material is unconstrained.",
       "columns": {
         "supplyId": "Supply ID",
         "product": "Product",
@@ -755,6 +758,7 @@
         "supplyDate": "Supply Date",
         "initialQty": "Initial Qty",
         "productTotal": "Total per product",
+        "scarcity": "Scarcity",
         "consumed": "Consumed",
         "residual": "Residual",
         "utilPct": "Util %",

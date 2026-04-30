@@ -2429,6 +2429,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return m;
   }, [planSupplyViewRows]);
 
+  /** Sum of requested qty per productId across all USER demands (i.e. the
+   *  demand records that drove the plan), excluding BOM-exploded intermediates.
+   *  committed_demands holds exactly the user-facing demand rows; planner-internal
+   *  intermediate consumption lives in planning_pegging, not here, so summing
+   *  requested_qty here is double-count safe. Used to compute the Scarcity column
+   *  in the Plan Supply View. */
+  const productDemandTotalMap = useMemo((): Record<string, number> => {
+    const m: Record<string, number> = {};
+    if (!planResult?.committed_demands) return m;
+    for (const d of planResult.committed_demands) {
+      const pid = d.product_id ?? '';
+      if (pid) m[pid] = (m[pid] ?? 0) + (Number(d.requested_qty) || 0);
+    }
+    return m;
+  }, [planResult]);
+
   const handleAnalyzeCriticalityForSupply = async (supplyId: string) => {
     setSupplyCriticalityMap(prev => ({ ...prev, [supplyId]: 'running' }));
     try {
@@ -5313,13 +5329,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             <span> {tP('supplyView.overallUtilization', { pct: overallUtil, consumed: qtyFmt(Number(totalConsumed)), initial: qtyFmt(Number(totalInitial)) })}</span>
                           )}
                         </p>
-                        <SortFilterTable<PlanSupplyViewRow & { _key: string; productTotal: number; criticalityOrder: number }>
+                        <SortFilterTable<PlanSupplyViewRow & { _key: string; productTotal: number; criticalityOrder: number; demandTotal: number; scarcityRatio: number }>
                           idKey="_key"
                           rows={rows.map((r, i) => {
                             const cs = supplyCriticalityMap[r.supplyId];
                             const autoSafe = !cs && r.consumedQty === 0;
                             const criticalityOrder = cs === 'critical' ? 0 : (cs === 'not_critical' || autoSafe) ? 1 : cs === 'error' ? 2 : cs === 'running' ? 3 : 4;
-                            return { ...r, _key: `psv-${i}-${r.supplyId}`, productTotal: planSupplyProductTotalMap[r.productId] ?? 0, criticalityOrder };
+                            const productTotal = planSupplyProductTotalMap[r.productId] ?? 0;
+                            const demandTotal = productDemandTotalMap[r.productId] ?? 0;
+                            // Material-level scarcity = total user demand / total supply for the same
+                            // productId (across all locations / supply records). Demand=0 → no demand
+                            // pressure (rendered as "–"). Supply=0 with demand>0 → infinite scarcity
+                            // (rendered as "∞"). Otherwise a ratio that we render as a percentage.
+                            const scarcityRatio = productTotal > 0
+                              ? demandTotal / productTotal
+                              : (demandTotal > 0 ? Infinity : 0);
+                            return { ...r, _key: `psv-${i}-${r.supplyId}`, productTotal, criticalityOrder, demandTotal, scarcityRatio };
                           })}
                           filterKeys={[]}
                           defaultSortKey="supplyDate"
@@ -5350,6 +5375,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             { key: 'supplyDate', label: tP('supplyView.columns.supplyDate'), sortable: true, render: (r) => r.supplyDate ?? '–' },
                             { key: 'qty', label: tP('supplyView.columns.initialQty'), sortable: true, render: (r) => qtyFmt(Number(r.qty)) },
                             { key: 'productTotal', label: tP('supplyView.columns.productTotal'), sortable: true, render: (r) => r.productTotal > 0 ? qtyFmt(Number(r.productTotal)) : '–' },
+                            { key: 'scarcityRatio', label: tP('supplyView.columns.scarcity'), sortable: true, render: (r) => {
+                              if (r.demandTotal === 0) return <span style={{ color: '#52525b' }} title={tP('supplyView.scarcityNoneTooltip')}>–</span>;
+                              if (!isFinite(r.scarcityRatio)) {
+                                return <span style={{ color: '#f87171', fontWeight: 600 }} title={tP('supplyView.scarcityShortageTooltip', { demand: qtyFmt(r.demandTotal) })}>∞</span>;
+                              }
+                              const pct = r.scarcityRatio * 100;
+                              const color = r.scarcityRatio > 1.0 ? '#f87171' : r.scarcityRatio >= 0.9 ? '#fbbf24' : '#34d399';
+                              return <span style={{ color, fontWeight: 600 }} title={tP('supplyView.scarcityRatioTooltip', { demand: qtyFmt(r.demandTotal), supply: qtyFmt(r.productTotal) })}>{pct.toFixed(0)}%</span>;
+                            } },
                             { key: 'consumedQty', label: tP('supplyView.columns.consumed'), sortable: true, render: (r) => r.consumedQty > 0 ? <span style={{ color: '#a78bfa' }}>{qtyFmt(Number(r.consumedQty))}</span> : <span style={{ color: '#52525b' }}>0</span> },
                             { key: 'residualQty', label: tP('supplyView.columns.residual'), sortable: true, render: (r) => r.residualQty > 0 ? <span style={{ color: '#34d399' }}>{qtyFmt(Number(r.residualQty))}</span> : <span style={{ color: '#52525b' }}>0</span> },
                             { key: 'utilizationRate', label: tP('supplyView.columns.utilPct'), sortable: true, render: (r) => {
