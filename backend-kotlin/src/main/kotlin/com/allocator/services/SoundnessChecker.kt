@@ -29,6 +29,11 @@ import kotlin.math.abs
  *      supply.supply_id; per-demand consumed qty ≤ available supply.qty.
  *   R7b cross-demand supply conservation — Σ leaf.qty across all demands ≤
  *      supply.qty for each supply_id.
+ *   R7d orphan-leaf check — for any work_order with `quantity ≤ ε`, the sum
+ *      of supply/purchase leaf qty in its subtree must also be ≤ ε. Catches
+ *      "stock claimed but no output" patterns the planner historically
+ *      created in the AND-bottleneck blocked path before that path was
+ *      taught to restore inventory.
  *   R8 conservation (deep check) — committed_qty at root = Σ over leaves
  *      of (leaf.qty × ∏ rates along leaf→root path), within tolerance.
  *      Skipped unless [SoundnessConfig.deepCheck] = true.
@@ -618,6 +623,30 @@ private class WalkContext(
                 actual = method,
             ))
         }
+
+        // R7d — orphan-leaf check: if this WO emitted zero qty, no supply or
+        // purchase leaf below it should claim consumption. Catches the
+        // pre-fix planMethodSlot bug where a blocked-AND-bottleneck branch
+        // returned without restoring inventory, leaving first-pass leaf
+        // takes attached to a zero-qty placeholder WO. Structurally implied
+        // by R4 (qty propagation), but R4's message is generic — R7d names
+        // the pattern so operators see "orphan inventory consumption" rather
+        // than a vague "child qty mismatch."
+        val woQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
+        if (woQty <= config.tolerance) {
+            val leafSum = sumSupplyAndPurchaseLeavesIn(node)
+            if (leafSum > config.tolerance) {
+                violations.add(Violation(
+                    rule = "R7d_orphan_leaf_under_blocked_wo",
+                    nodePath = path,
+                    message = "WO emitted ~0 qty but supply/purchase leaves under its subtree consume " +
+                        "$leafSum total. Likely a planner under-consumption bug — inventory was claimed " +
+                        "but no output was produced.",
+                    expected = 0.0,
+                    actual = leafSum,
+                ))
+            }
+        }
         // R9 — method-selection override conformance. If the user configured a
         // method_selection override for this (pid, lid) — either demand-scoped
         // or location-level — the WO's method must match. Mirrors plan()'s
@@ -650,6 +679,30 @@ private class WalkContext(
         children.forEachIndexed { i, child ->
             walkChildOfWorkOrder(child, "$path-$i", parentNode = node)
         }
+    }
+
+    /**
+     * R7d helper — sum the qty of every supply / purchase leaf reachable from
+     * this node's subtree. Used to detect orphan inventory consumption (leaves
+     * claiming qty under a zero-qty parent WO). Stops descending into nested
+     * `work_order` nodes whose `quantity` is non-zero — those have their own
+     * R7d frame and own R4 propagation check, so we shouldn't double-count.
+     */
+    private fun sumSupplyAndPurchaseLeavesIn(node: Map<String, Any?>): Double {
+        val type = node["type"]?.toString()
+        if (type == "supply" || type == "purchase") {
+            return (node["quantity"] as? Number)?.toDouble() ?: 0.0
+        }
+        // Don't descend into nested non-zero WOs — they're independent R7d
+        // frames. Zero-qty nested WOs ARE descended into (their leaves count
+        // toward the outer WO's orphan tally too — orphan can chain).
+        if (type == "work_order") {
+            val q = (node["quantity"] as? Number)?.toDouble() ?: 0.0
+            if (q > config.tolerance) return 0.0
+        }
+        @Suppress("UNCHECKED_CAST")
+        val children = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
+        return children.sumOf { sumSupplyAndPurchaseLeavesIn(it) }
     }
 
     private fun walkChildOfWorkOrder(child: Map<String, Any?>, path: String, parentNode: Map<String, Any?>) {

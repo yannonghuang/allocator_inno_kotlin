@@ -989,20 +989,43 @@ internal fun planMethodSlot(
             // Nothing achievable — emit a zero-qty placeholder pegging node so the UI
             // still shows WHICH method was attempted, and return blockedReason so the
             // caller can decide whether to keep trying (waterfall) or fail the demand.
+            //
+            // BEFORE returning, restore inventory + budget to the pre-first-pass
+            // snapshot. The first pass recursively descended this method's BOM
+            // and called consumeFromInventory at every supply leaf — mutating the
+            // single global `inventory` list at every depth (raw materials,
+            // intermediates, deeper sub-makes' second-pass commits). Without this
+            // restore those takes persist into the live state even though the
+            // parent committed 0, stranding raw materials and starving subsequent
+            // demands. Symmetrical to the second-pass restore at lines 1024-1031
+            // — same snapshots, same mechanism.
+            //
+            // Subtree-wide by construction: `inventory` is one global list passed
+            // by reference through all recursive plan() calls; restoring at the
+            // outer level reverts mutations at every depth below.
+            inventory.clear()
+            inventory.addAll(inventorySnap)
+            if (budget != null && budgetSnap != null) {
+                budget.clear()
+                budget.putAll(budgetSnap)
+            }
+            // Drop the failed-child pegging — those trees show first-pass takes
+            // that no longer exist post-restore. Keeping them would re-create the
+            // per-demand R4 violation we just spent the restore eliminating. The
+            // bottleneck product@location is preserved in method_choice_explanation,
+            // so debug context isn't lost.
             val bottleneck = childPassResults.first { cr -> cr.effectiveQty < cr.neededQty - 1e-9 }
             val childProduct = bottleneck.child["product_id"]?.toString() ?: "?"
             val childLoc     = bottleneck.child["location_id"]?.toString() ?: "?"
             val reason = "child_failed:${childProduct}@${childLoc}(no_inventory)"
-            val failedChildPegging = childPassResults.mapNotNull { it.pegging }
             val methodType = m["type"] as? String ?: ""
-            val blockedWoChildren = if (methodType == "purchase")
-                listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to 0.0, "children" to emptyList<Any>()))
-            else failedChildPegging
             val blockedWoNode = buildWoNode(
                 productId, productionLocation, 0.0, methodType, m,
                 reqDt, null, 0, 0.0,
                 "$methodChoiceExplanation — blocked: deep child $childProduct@$childLoc has no supply",
-                variantExplanation, woChildrenRelation, blockedWoChildren, overrideActive
+                variantExplanation, woChildrenRelation,
+                emptyList<Map<String, Any?>>(),  // no failed-child pegging — see comment above
+                overrideActive,
             )
             return MethodSlotResult(
                 achievableQty = 0.0,

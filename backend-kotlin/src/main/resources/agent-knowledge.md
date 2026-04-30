@@ -129,6 +129,12 @@ The agent has these tools available; call them rather than guessing:
 - **`no_methods_succeeded`** → no candidate method had a feasible BOM path.
   Often means inventory was fully depleted earlier in the waterfall, OR a
   sibling demand consumed shared supply first.
+- **`R7d_orphan_leaf_under_blocked_wo`** in soundness report → a legacy
+  bug (now fixed) where the planner's AND-bottleneck blocked branch
+  failed to restore inventory after first-pass takes. Stock was claimed
+  but no output produced; subsequent demands silently saw depleted
+  supplies. New runs shouldn't produce R7d; if they do, it's a regression
+  worth investigating. See `docs/planner-orphan-consumption.md`.
 
 ## Conversational tactics
 
