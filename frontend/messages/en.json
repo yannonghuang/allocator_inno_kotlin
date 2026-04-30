@@ -203,11 +203,18 @@
     },
     "peggingPanel": {
       "title": "Pegging:",
+      "titleDemand": "Pegging: {label}",
+      "titleWorkOrder": "Pegging: {product} @ {location}",
+      "descriptionDemand": "▢ blue = demand target, ▢ purple = supply / purchase inventory, ⚙ green = work order (transformation). Root = target demand; leaves = supply or purchase inventory.",
+      "descriptionWorkOrder": "Root = this work order; below it are the supplies that fulfill it (inventory, child work orders, purchase) at all levels.",
+      "descriptionOrSiblings": "When multiple inventories or work orders appear as siblings under the same parent, they are alternative paths OR that can each supply flow to that parent.",
       "allocated": "Allocated:",
       "requested": "(requested:",
       "info": "First level below = direct contributors; their edge qtys sum to Allocated above. Deeper levels: qty = flow along that edge (· = leaf, no further expansion).",
       "buildingTree": "Building tree…",
-      "loadError": "Could not load pegging."
+      "loadError": "Could not load pegging.",
+      "nodes": "Nodes",
+      "edges": "Edges"
     },
     "basketPanel": {
       "titleFinal": "Basket at end of loaded view",
@@ -363,7 +370,27 @@
       "filterMultiSupply": "Only work orders with multiple supply methods available (BOM graph)",
       "filterPurchaseOnly": "Purchase orders only (method = buy/purchase)",
       "filterMoveOnly": "Move orders only (method = move)",
-      "filterHasOverride": "Only work orders with a saved override"
+      "filterHasOverride": "Only work orders with a saved override",
+      "filterPlaceholder": "Filter by product, location, method…",
+      "shared": "shared",
+      "columns": {
+        "product": "Product",
+        "location": "Location",
+        "prodArea": "PROD_AREA",
+        "requested": "Requested",
+        "committed": "Committed",
+        "startTime": "Start time",
+        "endTime": "End time",
+        "method": "Method",
+        "demand": "Demand",
+        "shortage": "Shortage",
+        "locationSource": "Location source",
+        "pegging": "Pegging",
+        "explain": "Explain",
+        "override": "Override"
+      },
+      "overrideMethod": "Method",
+      "overrideSplit": "Split"
     },
     "planKpis": {
       "title": "Plan KPIs",

@@ -2596,7 +2596,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (!selectedRunId) return;
     setPeggingOpen(true);
     setPeggingLoading(true);
-    setPeggingTitle(`Pegging: Supply ${row.component_key.replace('|', '@')}`);
+    setPeggingTitle(tP('peggingPanel.titleWorkOrder', { product: row.component_key.split('|')[0] ?? row.component_key, location: row.component_key.split('|')[1] ?? '' }));
     setPeggingData(null);
     setPeggingTreeReady(false);
     setPeggingExpanded(new Set());
@@ -2633,7 +2633,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (!selectedRunId) return;
     setPeggingOpen(true);
     setPeggingLoading(true);
-    setPeggingTitle(`Pegging: Demand ${row.demand_id}`);
+    setPeggingTitle(tP('peggingPanel.titleDemand', { label: String(row.demand_id) }));
     setPeggingData(null);
     setPeggingTreeReady(false);
     setPeggingExpanded(new Set());
@@ -4319,20 +4319,20 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         )}
                         {planDemandBuyOnly && list.length === 0 && (
                           <p style={{ fontSize: '0.8rem', color: '#71717a', marginBottom: '0.5rem' }}>
-                            No demands in this plan have a work order with method &quot;purchase&quot; in their pegging tree.
+                            {tP('committedDemands.noBuyInPlan')}
                           </p>
                         )}
                         {planDemandRealMoveOnly && list.length === 0 && realMoveTriples !== null && realMoveTriples.length > 0 && (
                           <p style={{ fontSize: '0.8rem', color: '#71717a', marginBottom: '0.5rem' }}>
-                            No demands in this plan have a move work order with TRANSIT_TIME &gt; 0 in their pegging tree.
+                            {tP('committedDemands.noMoveInPlan')}
                           </p>
                         )}
                         {hasMultipleCustomers && (
                           <details style={{ fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
-                            <summary style={{ cursor: 'pointer' }}>Rollup by customer (filtered set)</summary>
+                            <summary style={{ cursor: 'pointer' }}>{tP('committedDemands.rollupFiltered')}</summary>
                             <ul style={{ marginTop: '0.25rem', paddingLeft: '1.25rem' }}>
                               {Object.entries(byCustomer).map(([cust, qty]) => (
-                                <li key={cust}><strong>{cust}</strong>: {qtyFmt(Number(qty))} committed</li>
+                                <li key={cust}><strong>{cust}</strong>: {qtyFmt(Number(qty))} {tP('committedDemands.committed')}</li>
                               ))}
                             </ul>
                           </details>
@@ -4345,7 +4345,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             _customer: String(r.customer ?? r.customer_id ?? ''),
                           }))}
                           filterKeys={['demand_id', '_customer', 'product_id', 'location_id', 'commit_time', 'commit_reason']}
-                          filterPlaceholder="Filter by demand ID, customer, product, location…"
+                          filterPlaceholder={tP('committedDemands.filterPlaceholder')}
                           defaultSortKey="commit_time"
                           stickyHeader
                           rowStyle={(r) => {
@@ -4355,23 +4355,23 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             return undefined;
                           }}
                           columns={[
-                            { key: 'demand_id', label: 'Demand ID', sortable: true, render: (r) => r.demand_id ?? '–' },
-                            { key: '_customer', label: 'Customer', sortable: true, render: (r) => (r as { _customer?: string })._customer || (r.customer ?? r.customer_id ?? '–') },
-                            { key: 'product_id', label: 'Product', sortable: true },
-                            { key: 'location_id', label: 'Location', sortable: true },
-                            { key: 'requested_qty', label: 'Requested', sortable: true, render: (r) => r.requested_qty != null ? qtyFmt(Number(r.requested_qty)) : '–' },
-                            { key: 'quantity', label: 'Committed', sortable: true, render: (r) => r.is_failed
-                              ? <span style={{ color: '#f87171', fontWeight: 600, fontSize: '0.78rem', background: 'rgba(248,113,113,0.15)', padding: '1px 6px', borderRadius: 4 }}>FAILED</span>
+                            { key: 'demand_id', label: tP('committedDemands.columns.demandId'), sortable: true, render: (r) => r.demand_id ?? '–' },
+                            { key: '_customer', label: tP('committedDemands.columns.customer'), sortable: true, render: (r) => (r as { _customer?: string })._customer || (r.customer ?? r.customer_id ?? '–') },
+                            { key: 'product_id', label: tP('committedDemands.columns.product'), sortable: true },
+                            { key: 'location_id', label: tP('committedDemands.columns.location'), sortable: true },
+                            { key: 'requested_qty', label: tP('committedDemands.columns.requested'), sortable: true, render: (r) => r.requested_qty != null ? qtyFmt(Number(r.requested_qty)) : '–' },
+                            { key: 'quantity', label: tP('committedDemands.columns.committed'), sortable: true, render: (r) => r.is_failed
+                              ? <span style={{ color: '#f87171', fontWeight: 600, fontSize: '0.78rem', background: 'rgba(248,113,113,0.15)', padding: '1px 6px', borderRadius: 4 }}>{tP('committedDemands.failed')}</span>
                               : qtyFmt(Number(r.quantity)) },
-                            { key: 'shortage', label: 'Shortage', sortable: true, render: (r) => {
+                            { key: 'shortage', label: tP('committedDemands.columns.shortage'), sortable: true, render: (r) => {
                               const s = r.shortage ?? 0;
                               return s > 0.01
                                 ? <span style={{ color: '#f87171', fontWeight: 600 }}>{qtyFmt(Number(s))}</span>
                                 : <span style={{ color: '#4ade80' }}>0</span>;
                             }},
-                            { key: 'request_time', label: 'Request time', sortable: true, render: (r) => r.request_time ?? '–' },
-                            { key: 'commit_time', label: 'Commit time', sortable: true, render: (r) => r.commit_time ?? '–' },
-                            { key: 'commit_reason', label: 'Commit reason', sortable: true, render: (r) => {
+                            { key: 'request_time', label: tP('committedDemands.columns.requestTime'), sortable: true, render: (r) => r.request_time ?? '–' },
+                            { key: 'commit_time', label: tP('committedDemands.columns.commitTime'), sortable: true, render: (r) => r.commit_time ?? '–' },
+                            { key: 'commit_reason', label: tP('committedDemands.columns.commitReason'), sortable: true, render: (r) => {
                               if (!r.commit_reason) return <span style={{ color: '#52525b' }}>–</span>;
                               const { label, tooltip } = formatCommitReason(r.commit_reason, planningConfig.purchase_allowed !== false);
                               if (!r.is_failed) {
@@ -4389,7 +4389,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                 </span>
                               );
                             } },
-                            { key: '_pegging', label: 'Pegging', sortable: false, render: (r) => {
+                            { key: '_pegging', label: tP('committedDemands.columns.pegging'), sortable: false, render: (r) => {
                               const k = `demand|${r.demand_id ?? ''}|${r.product_id}|${r.location_id}`;
                               const isSelected = woPeggingRowKey === k;
                               return (
@@ -4401,7 +4401,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                     if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); }
                                     else { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); }
                                   }}
-                                >Show</button>
+                                >{tc('show')}</button>
                               );
                             } },
                           ]}
@@ -4694,17 +4694,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       ? woRowsAll.filter((r) => (r._shortage ?? 0) > 0.01)
                       : woRowsAll;
                     const woColumns: { key: string; label: string; sortable?: boolean; render?: (r: WoEnrichedRow) => React.ReactNode }[] = [
-                      { key: 'product_id', label: 'Product', sortable: true },
-                      { key: 'location_id', label: 'Location', sortable: true },
-                      { key: '_prod_area', label: 'PROD_AREA', sortable: true, render: (r) => r._prod_area || r.prod_area || '–' },
-                      { key: '_requested_qty', label: 'Requested', sortable: true, render: (r) =>
+                      { key: 'product_id', label: tP('workOrders.columns.product'), sortable: true },
+                      { key: 'location_id', label: tP('workOrders.columns.location'), sortable: true },
+                      { key: '_prod_area', label: tP('workOrders.columns.prodArea'), sortable: true, render: (r) => r._prod_area || r.prod_area || '–' },
+                      { key: '_requested_qty', label: tP('workOrders.columns.requested'), sortable: true, render: (r) =>
                         r._requested_qty != null ? qtyFmt(Number(r._requested_qty)) : '–'
                       },
-                      { key: 'quantity', label: 'Committed', sortable: true, render: (r) => qtyFmt(Number(r.quantity)) },
-                      { key: 'start_time', label: 'Start time', sortable: true, render: (r) => r.start_time ?? '–' },
-                      { key: 'end_time', label: 'End time', sortable: true, render: (r) => r.end_time ?? '–' },
-                      { key: 'method', label: 'Method', sortable: true, render: (r) => r.method ?? '–' },
-                      { key: '_demand_label', label: 'Demand', sortable: true, render: (r) => {
+                      { key: 'quantity', label: tP('workOrders.columns.committed'), sortable: true, render: (r) => qtyFmt(Number(r.quantity)) },
+                      { key: 'start_time', label: tP('workOrders.columns.startTime'), sortable: true, render: (r) => r.start_time ?? '–' },
+                      { key: 'end_time', label: tP('workOrders.columns.endTime'), sortable: true, render: (r) => r.end_time ?? '–' },
+                      { key: 'method', label: tP('workOrders.columns.method'), sortable: true, render: (r) => r.method ?? '–' },
+                      { key: '_demand_label', label: tP('workOrders.columns.demand'), sortable: true, render: (r) => {
                         const ids = r._demand_ids ?? [];
                         const label = r._demand_label;
                         if (!label) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
@@ -4714,18 +4714,18 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           <span title={label} style={{ cursor: 'default' }}>
                             {preview}
                             <span style={{ marginLeft: 5, background: '#0891b2', color: '#fff', borderRadius: 8, padding: '1px 6px', fontSize: '0.7rem', verticalAlign: 'middle' }}>
-                              shared
+                              {tP('workOrders.shared')}
                             </span>
                           </span>
                         );
                       } },
-                      { key: '_shortage', label: 'Shortage', sortable: true, render: (r) => {
+                      { key: '_shortage', label: tP('workOrders.columns.shortage'), sortable: true, render: (r) => {
                         const s = r._shortage;
                         if (!s) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
                         return <span style={{ color: '#f87171' }}>{qtyFmt(Number(s))}</span>;
                       } },
-                      { key: 'location_source', label: 'Location source', sortable: true, render: (r) => r.location_source ?? '–' },
-                      { key: '_peg_order', label: 'Pegging', sortable: true, render: (r) => {
+                      { key: 'location_source', label: tP('workOrders.columns.locationSource'), sortable: true, render: (r) => r.location_source ?? '–' },
+                      { key: '_peg_order', label: tP('workOrders.columns.pegging'), sortable: true, render: (r) => {
                         const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
                         const isSelected = woPeggingRowKey === k;
                         return (
@@ -4738,10 +4738,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); }
                               else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); }
                             }}
-                          >Show</button>
+                          >{tc('show')}</button>
                         );
                       } },
-                      { key: '_explain', label: 'Explain', sortable: false, render: (r) => {
+                      { key: '_explain', label: tP('workOrders.columns.explain'), sortable: false, render: (r) => {
                         const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
                         const isSelected = woExplainKey === k;
                         if (!(r.wo_explanation_method || (r.wo_competing_demands?.length ?? 0) > 0 || (r.wo_consolidation_split_details?.length ?? 0) > 1))
@@ -4755,10 +4755,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               if (isSelected) { setWoExplainOpen(false); setWoExplainKey(null); setWoExplainRow(null); }
                               else { setWoExplainRow(r); setWoExplainKey(k); setWoExplainOpen(true); }
                             }}
-                          >Why</button>
+                          >{tc('show')}</button>
                         );
                       }},
-                      { key: '_override', label: 'Override', sortable: false, render: (r) => {
+                      { key: '_override', label: tP('workOrders.columns.override'), sortable: false, render: (r) => {
                         const methodOptions = r.wo_explanation_method
                           ? new Set(Array.from(r.wo_explanation_method.matchAll(/\b(make|move|buy)\b/gi), (m) => m[1].toLowerCase()))
                           : new Set<string>();
@@ -4767,8 +4767,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         if (!hasMethod && !hasSplit) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
                         return (
                           <div style={{ display: 'flex', gap: 4 }}>
-                            {hasMethod && <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 6px' }} onClick={() => openOverrideDialog('method_selection', r)}>Method</button>}
-                            {hasSplit && <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 6px' }} onClick={() => openOverrideDialog('component_split', r)}>Split</button>}
+                            {hasMethod && <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 6px' }} onClick={() => openOverrideDialog('method_selection', r)}>{tP('workOrders.overrideMethod')}</button>}
+                            {hasSplit && <button type="button" className="secondary" style={{ fontSize: '0.72rem', padding: '2px 6px' }} onClick={() => openOverrideDialog('component_split', r)}>{tP('workOrders.overrideSplit')}</button>}
                           </div>
                         );
                       }},
@@ -7396,19 +7396,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 {planPeggingContext.type === 'supply'
                   ? tP('supplyView.peggingPanel.title', { supplyId: planPeggingContext.supplyId })
                   : planPeggingContext.type === 'demand'
-                    ? `Pegging: ${planPeggingContext.row.demand_id ?? planPeggingContext.row.product_id}`
-                    : `Pegging: ${planPeggingContext.row.product_id} @ ${planPeggingContext.row.location_id}`}
+                    ? tP('peggingPanel.titleDemand', { label: planPeggingContext.row.demand_id ?? planPeggingContext.row.product_id ?? '' })
+                    : tP('peggingPanel.titleWorkOrder', { product: planPeggingContext.row.product_id ?? '', location: planPeggingContext.row.location_id ?? '' })}
               </h3>
-              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setPreviousPeggingContext(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
+              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setPreviousPeggingContext(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tc('close')}</button>
             </div>
             <p style={{ margin: 0, marginBottom: '0.5rem', fontSize: '0.8rem', color: '#71717a' }}>
               {planPeggingContext.type === 'supply'
                 ? tP('supplyView.peggingPanel.description')
                 : planPeggingContext.type === 'work_order'
-                  ? 'Root = this work order; below it are the supplies that fulfill it (inventory, child work orders, purchase) at all levels.'
-                  : '▢ blue = demand target, ▢ purple = supply / purchase inventory, ⚙ green = work order (transformation). Root = target demand; leaves = supply or purchase inventory.'}
+                  ? tP('peggingPanel.descriptionWorkOrder')
+                  : tP('peggingPanel.descriptionDemand')}
               {planPeggingContext.type !== 'supply' && (
-                <>{' '}When multiple inventories or work orders appear as siblings under the same parent, they are alternative paths <strong>OR</strong> that can each supply flow to that parent.</>
+                <>{' '}{tP('peggingPanel.descriptionOrSiblings')}</>
               )}
             </p>
             {planPeggingContext.type === 'supply' && (() => {
@@ -8231,26 +8231,26 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             />
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
               <h3 style={{ margin: 0, color: '#fafafa' }}>{peggingTitle}</h3>
-              <button type="button" onClick={() => setPeggingOpen(false)} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
+              <button type="button" onClick={() => setPeggingOpen(false)} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tc('close')}</button>
             </div>
             {peggingData?.direction === 'demand-to-supply' && (peggingData.demand_allocated_qty != null || peggingData.demand_requested_qty != null) && (
               <>
                 <p style={{ margin: 0, marginBottom: '0.25rem', color: '#a1a1aa', fontSize: '0.9rem' }}>
-                  Allocated: <strong style={{ color: '#fafafa' }}>{qtyFmt(Number(peggingData.demand_allocated_qty ?? 0))}</strong>
+                  {tP('peggingPanel.allocated')} <strong style={{ color: '#fafafa' }}>{qtyFmt(Number(peggingData.demand_allocated_qty ?? 0))}</strong>
                   {peggingData.demand_requested_qty != null && (
-                    <> (requested: {qtyFmt(Number(peggingData.demand_requested_qty))})</>
+                    <> {tP('peggingPanel.requested')}{qtyFmt(Number(peggingData.demand_requested_qty))})</>
                   )}
                 </p>
                 <p style={{ margin: 0, marginBottom: '1rem', color: '#71717a', fontSize: '0.8rem' }}>
-                  First level below = direct contributors; their edge qtys sum to Allocated above. Deeper levels: qty = flow along that edge (· = leaf, no further expansion).
+                  {tP('peggingPanel.info')}
                 </p>
               </>
             )}
-            {peggingLoading && <p style={{ color: '#a1a1aa' }}>Loading…</p>}
+            {peggingLoading && <p style={{ color: '#a1a1aa' }}>{tc('loading')}</p>}
             {!peggingLoading && peggingData && !peggingTreeReady && (
               <div style={{ fontSize: '0.9rem' }}>
-                <p><strong>Nodes:</strong> {(Array.isArray(peggingData.nodes) ? peggingData.nodes : []).length} &nbsp; <strong>Edges:</strong> {(Array.isArray(peggingData.edges) ? peggingData.edges : []).length}</p>
-                <p style={{ color: '#a1a1aa' }}>Building tree…</p>
+                <p><strong>{tP('peggingPanel.nodes')}:</strong> {(Array.isArray(peggingData.nodes) ? peggingData.nodes : []).length} &nbsp; <strong>{tP('peggingPanel.edges')}:</strong> {(Array.isArray(peggingData.edges) ? peggingData.edges : []).length}</p>
+                <p style={{ color: '#a1a1aa' }}>{tP('peggingPanel.buildingTree')}</p>
               </div>
             )}
             {!peggingLoading && peggingData && peggingTreeReady && peggingGraph && (

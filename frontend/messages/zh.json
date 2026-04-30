@@ -203,11 +203,18 @@
     },
     "peggingPanel": {
       "title": "供需追溯：",
+      "titleDemand": "追溯：{label}",
+      "titleWorkOrder": "追溯：{product} @ {location}",
+      "descriptionDemand": "▢ 蓝色 = 需求目标，▢ 紫色 = 供应/采购库存，⚙ 绿色 = 生产订单（转换）。根节点 = 目标需求；叶节点 = 供应或采购库存。",
+      "descriptionWorkOrder": "根节点 = 此生产订单；其下为满足它的供应（库存、子生产订单、采购），涵盖所有层级。",
+      "descriptionOrSiblings": "当多个库存或生产订单作为同一父节点下的兄弟节点出现时，它们是可替代路径（OR 关系），任意一个均可向该父节点供给。",
       "allocated": "已配置：",
       "requested": "（请求：",
       "info": "第一层 = 直接贡献者；其边数量之和等于上方已配置量。更深层：数量 = 沿该边的流量（· = 叶子，不再展开）。",
       "buildingTree": "构建树中…",
-      "loadError": "无法加载追溯数据。"
+      "loadError": "无法加载追溯数据。",
+      "nodes": "节点",
+      "edges": "边"
     },
     "basketPanel": {
       "titleFinal": "已加载视图末尾的篮子",
@@ -363,7 +370,27 @@
       "filterMultiSupply": "仅显示有多种可用供应方法的生产订单（BOM 图）",
       "filterPurchaseOnly": "仅采购订单（方法 = 采购）",
       "filterMoveOnly": "仅调拨订单（方法 = 调拨）",
-      "filterHasOverride": "仅显示有手工覆盖的生产订单"
+      "filterHasOverride": "仅显示有手工覆盖的生产订单",
+      "filterPlaceholder": "按产品、地点、方法筛选…",
+      "shared": "共享",
+      "columns": {
+        "product": "产品",
+        "location": "地点",
+        "prodArea": "PROD_AREA",
+        "requested": "请求数量",
+        "committed": "已承诺",
+        "startTime": "开始时间",
+        "endTime": "结束时间",
+        "method": "方法",
+        "demand": "需求",
+        "shortage": "缺口",
+        "locationSource": "地点来源",
+        "pegging": "追溯",
+        "explain": "解释",
+        "override": "覆盖"
+      },
+      "overrideMethod": "方法",
+      "overrideSplit": "拆分"
     },
     "planKpis": {
       "title": "计划关键指标",
