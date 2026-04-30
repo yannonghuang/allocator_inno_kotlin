@@ -27,6 +27,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -272,6 +273,52 @@ private val TOOLS: List<LlmTool> = listOf(
                 putJsonObject("supply_id") { put("type", "string") }
             }
             put("required", buildJsonArray { add("run_id"); add("supply_id") })
+        },
+    ),
+    tool(
+        "get_run_config",
+        "Return the planning config and override snapshot that produced a specific plan run. " +
+            "Use this BEFORE comparing two runs' KPIs — to confirm they share the same config (so " +
+            "any KPI delta is attributable to a single load-bearing knob, not a confound). Returns " +
+            "{config, override_snapshot}.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("run_id") { put("type", "integer") }
+            }
+            put("required", buildJsonArray { add("run_id") })
+        },
+    ),
+    tool(
+        "recheck_soundness",
+        "Re-run the soundness checker against a persisted plan run with the *current* rule set. " +
+            "Use this when a new soundness rule has shipped (e.g. R7d) and you need to retroactively " +
+            "apply it to an older run whose stored soundness_status predates the rule. Updates the " +
+            "run's soundness_status / soundness_report and returns the full report.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("run_id") { put("type", "integer") }
+                putJsonObject("deep_check") {
+                    put("type", "boolean")
+                    put("description", "Whether to run the deep R8 conservation walk. Default true.")
+                }
+            }
+            put("required", buildJsonArray { add("run_id") })
+        },
+    ),
+    tool(
+        "get_soundness_summary",
+        "Aggregate a plan run's soundness_report into rule-level rollups. Returns " +
+            "{overall_sound, demand_count, sound_count, violations_by_rule: [{rule, demand_count, " +
+            "violation_count, total_actual}]}. Use INSTEAD of walking 200+ demands one at a time when " +
+            "you just need the headline (\"how many demands violate which rules, by how much\").",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("run_id") { put("type", "integer") }
+            }
+            put("required", buildJsonArray { add("run_id") })
         },
     ),
     tool(
@@ -664,6 +711,130 @@ private fun toolGetSupplySplitExplanation(caseId: Int, args: JsonObject): ToolRe
     )
 }
 
+private fun toolGetRunConfig(caseId: Int, args: JsonObject): ToolResult {
+    val runId = args["run_id"]?.jsonPrimitive?.intOrNull
+        ?: return toolError("`run_id` is required")
+    val (config, override) = transaction {
+        val row = PlanRuns.selectAll()
+            .where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }
+            .singleOrNull() ?: return@transaction null
+        Pair(row[PlanRuns.config], row[PlanRuns.overrideSnapshot])
+    } ?: return toolError("plan run $runId not found for case $caseId")
+    val configJson: JsonElement = config?.let { raw ->
+        runCatching { jsonParser.parseToJsonElement(raw) }.getOrElse { JsonPrimitive(raw) }
+    } ?: JsonObject(emptyMap())
+    val overrideJson: JsonElement = override?.let { raw ->
+        runCatching { jsonParser.parseToJsonElement(raw) }.getOrElse { JsonPrimitive(raw) }
+    } ?: JsonObject(emptyMap())
+    val configKeys = (configJson as? JsonObject)?.keys?.joinToString(", ").orEmpty()
+    return ToolResult(
+        summary = "Run $runId config (${configKeys.ifBlank { "no top-level keys" }})",
+        payload = buildJsonObject {
+            put("run_id", runId)
+            put("config", configJson)
+            put("override_snapshot", overrideJson)
+        },
+    )
+}
+
+private fun toolRecheckSoundness(caseId: Int, args: JsonObject): ToolResult {
+    val runId = args["run_id"]?.jsonPrimitive?.intOrNull
+        ?: return toolError("`run_id` is required")
+    val deepCheck = args["deep_check"]?.jsonPrimitive?.booleanOrNull ?: true
+    return try {
+        val report = runSoundnessCheckForRun(caseId, runId, deepCheck)
+        val overall = report["overall_sound"]?.jsonPrimitive?.booleanOrNull
+        val sound = report["sound_count"]?.jsonPrimitive?.intOrNull
+        val total = report["demand_count"]?.jsonPrimitive?.intOrNull
+        ToolResult(
+            summary = "Re-checked run $runId: ${if (overall == true) "sound" else "unsound"} ($sound/$total demands)",
+            payload = report,
+        )
+    } catch (e: NoSuchElementException) {
+        toolError(e.message ?: "plan run $runId not found")
+    } catch (e: IllegalStateException) {
+        toolError(e.message ?: "soundness check failed")
+    } catch (e: Exception) {
+        toolError("soundness check raised: ${e.message ?: e::class.simpleName ?: "unknown"}")
+    }
+}
+
+private fun toolGetSoundnessSummary(caseId: Int, args: JsonObject): ToolResult {
+    val runId = args["run_id"]?.jsonPrimitive?.intOrNull
+        ?: return toolError("`run_id` is required")
+    val reportRaw = transaction {
+        PlanRuns.selectAll()
+            .where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }
+            .singleOrNull()?.get(PlanRuns.soundnessReport)
+    } ?: return toolError(
+        "plan run $runId has no soundness_report — call recheck_soundness first to generate one"
+    )
+    val report = runCatching { jsonParser.parseToJsonElement(reportRaw).jsonObject }
+        .getOrElse { return toolError("plan run $runId soundness_report is not parseable JSON") }
+
+    // Aggregate per-demand violations by rule.
+    data class Bucket(val demandIds: MutableSet<String> = mutableSetOf(), var count: Int = 0, var totalActual: Double = 0.0)
+    val buckets = mutableMapOf<String, Bucket>()
+    val demands = report["demands"]?.jsonArray ?: JsonArray(emptyList())
+    for (d in demands) {
+        val obj = d.jsonObject
+        val demandId = obj["demand_id"]?.jsonPrimitive?.contentOrNull ?: continue
+        val violations = obj["violations"]?.jsonArray ?: continue
+        for (v in violations) {
+            val vObj = v.jsonObject
+            val rule = vObj["rule"]?.jsonPrimitive?.contentOrNull ?: continue
+            val actualNum = vObj["actual"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull() ?: 0.0
+            val b = buckets.getOrPut(rule) { Bucket() }
+            b.demandIds.add(demandId)
+            b.count++
+            b.totalActual += actualNum
+        }
+    }
+    // Cross-demand violations (separate from per-demand) — emit under their own rule key
+    // with the demand_count meaningless (set to null in the output for those rows).
+    val crossViolations = report["cross_demand_violations"]?.jsonArray ?: JsonArray(emptyList())
+    val crossBuckets = mutableMapOf<String, Bucket>()
+    for (v in crossViolations) {
+        val vObj = v.jsonObject
+        val rule = vObj["rule"]?.jsonPrimitive?.contentOrNull ?: continue
+        val actualNum = vObj["actual"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull() ?: 0.0
+        val b = crossBuckets.getOrPut(rule) { Bucket() }
+        b.count++
+        b.totalActual += actualNum
+    }
+
+    return ToolResult(
+        summary = "Soundness summary for run $runId: " +
+            (if (buckets.isEmpty() && crossBuckets.isEmpty()) "no violations" else "${buckets.size + crossBuckets.size} rules"),
+        payload = buildJsonObject {
+            put("run_id", runId)
+            put("overall_sound", report["overall_sound"] ?: JsonPrimitive(true))
+            put("demand_count", report["demand_count"] ?: JsonPrimitive(0))
+            put("sound_count", report["sound_count"] ?: JsonPrimitive(0))
+            put("deep_check", report["deep_check"] ?: JsonPrimitive(false))
+            put("violations_by_rule", buildJsonArray {
+                buckets.entries.sortedByDescending { it.value.totalActual }.forEach { (rule, b) ->
+                    add(buildJsonObject {
+                        put("rule", rule)
+                        put("demand_count", b.demandIds.size)
+                        put("violation_count", b.count)
+                        put("total_actual", b.totalActual)
+                    })
+                }
+            })
+            put("cross_demand_violations_by_rule", buildJsonArray {
+                crossBuckets.entries.sortedByDescending { it.value.totalActual }.forEach { (rule, b) ->
+                    add(buildJsonObject {
+                        put("rule", rule)
+                        put("violation_count", b.count)
+                        put("total_actual", b.totalActual)
+                    })
+                }
+            })
+        },
+    )
+}
+
 private fun toolReadMemory(caseId: Int): ToolResult {
     val mem = loadMemory(caseId)
     return ToolResult(
@@ -836,6 +1007,9 @@ private suspend fun dispatchTool(
         "get_kpis" -> Pair(toolGetKpis(caseId, args), workingConfig)
         "get_demand_pegging" -> Pair(toolGetDemandPegging(caseId, args), workingConfig)
         "get_supply_split_explanation" -> Pair(toolGetSupplySplitExplanation(caseId, args), workingConfig)
+        "get_run_config" -> Pair(toolGetRunConfig(caseId, args), workingConfig)
+        "recheck_soundness" -> Pair(toolRecheckSoundness(caseId, args), workingConfig)
+        "get_soundness_summary" -> Pair(toolGetSoundnessSummary(caseId, args), workingConfig)
         "read_memory" -> Pair(toolReadMemory(caseId), workingConfig)
         "write_memory" -> Pair(toolWriteMemory(caseId, args), workingConfig)
         else -> Pair(toolError("unknown tool: ${call.name}"), workingConfig)
