@@ -108,6 +108,10 @@ data class PlanRunResponse(
     val attempts: JsonElement? = null,  // [{depth, duration_ms}, ...] for optimal-depth runs
     @SerialName("soundness_status") val soundnessStatus: String = "unchecked",
     @SerialName("soundness_checked_at") val soundnessCheckedAt: String? = null,
+    /** Free-form provenance (parsed plan_run.metadata). Currently includes
+     *  `bootstrap: true` + `preset_id` + `preset_label` + `primary_axis` +
+     *  `signature` for KB-seeded runs; null for ordinary user-driven runs. */
+    val metadata: JsonElement? = null,
 )
 
 @Serializable

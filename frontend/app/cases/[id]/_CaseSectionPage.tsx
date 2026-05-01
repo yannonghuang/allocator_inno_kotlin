@@ -963,6 +963,27 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [bootstrapJobId, setBootstrapJobId] = useState<string | null>(null);
   const [bootstrapJobStatus, setBootstrapJobStatus] = useState<BootstrapJobStatus | null>(null);
   const bootstrapPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [bootstrapExpandedPresets, setBootstrapExpandedPresets] = useState<Set<string>>(new Set());
+  const toggleBootstrapPresetExpanded = (presetId: string) => {
+    setBootstrapExpandedPresets((prev) => {
+      const next = new Set(prev);
+      if (next.has(presetId)) next.delete(presetId); else next.add(presetId);
+      return next;
+    });
+  };
+  const handleDeleteCoveredRun = async (planRunId: number) => {
+    if (!id) return;
+    try {
+      await deletePlanRun(id, planRunId);
+      // Refresh preview so the deleted run drops out of "already covered".
+      const preview = await getBootstrapPreview(id, bootstrapBatchSize);
+      setBootstrapPreview(preview);
+      // Run history may also be open; refresh it too.
+      loadPlanRunHistory();
+    } catch (e) {
+      console.error('Failed to delete covered run', e);
+    }
+  };
   const [planRunHistoryLoading, setPlanRunHistoryLoading] = useState(false);
   const [planRunLoadingId, setPlanRunLoadingId] = useState<number | null>(null);
   // Per-run expansion: which tab, plus lazy-loaded full detail (for overrides + events)
@@ -6339,14 +6360,39 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 </div>
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.78rem', marginBottom: '0.75rem' }}>
                   <tbody>
-                    {bootstrapPreview.next_batch.map((p) => (
-                      <tr key={p.preset_id} style={{ borderBottom: '1px solid #27272a' }}>
-                        <td style={{ padding: '4px 6px', fontFamily: 'monospace', color: '#67e8f9' }}>{p.preset_label}</td>
-                        <td style={{ padding: '4px 6px', color: '#71717a' }}>
-                          <span style={{ fontSize: '0.7rem', background: '#3f3f46', borderRadius: 4, padding: '1px 6px' }}>{p.primary_axis}</span>
-                        </td>
-                      </tr>
-                    ))}
+                    {bootstrapPreview.next_batch.map((p) => {
+                      const expanded = bootstrapExpandedPresets.has(p.preset_id);
+                      return (
+                        <React.Fragment key={p.preset_id}>
+                          <tr style={{ borderBottom: expanded ? 'none' : '1px solid #27272a' }}>
+                            <td style={{ padding: '4px 6px', width: 18, cursor: 'pointer', color: '#71717a' }}
+                                onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
+                              {expanded ? '▾' : '▸'}
+                            </td>
+                            <td style={{ padding: '4px 6px', fontFamily: 'monospace', color: '#67e8f9', cursor: 'pointer' }}
+                                onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
+                              {p.preset_label}
+                            </td>
+                            <td style={{ padding: '4px 6px', color: '#71717a' }}>
+                              <span style={{ fontSize: '0.7rem', background: '#3f3f46', borderRadius: 4, padding: '1px 6px' }}>{p.primary_axis}</span>
+                            </td>
+                          </tr>
+                          {expanded && (
+                            <tr style={{ borderBottom: '1px solid #27272a' }}>
+                              <td colSpan={3} style={{ padding: '0 6px 6px 26px' }}>
+                                <pre style={{
+                                  margin: 0, fontSize: '0.68rem', color: '#a1a1aa',
+                                  background: '#0a0a0a', padding: '6px 8px', borderRadius: 4,
+                                  overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                }}>
+                                  {JSON.stringify(p.config, null, 2)}
+                                </pre>
+                              </td>
+                            </tr>
+                          )}
+                        </React.Fragment>
+                      );
+                    })}
                   </tbody>
                 </table>
 
@@ -6373,13 +6419,66 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     <summary style={{ cursor: 'pointer' }}>
                       {tP('bootstrap.alreadyRunHeading', { n: bootstrapPreview.already_run.length })}
                     </summary>
-                    <ul style={{ margin: '0.5rem 0 0 1rem', padding: 0 }}>
-                      {bootstrapPreview.already_run.map((p) => (
-                        <li key={p.preset_id} style={{ fontFamily: 'monospace' }}>
-                          {p.preset_label} <span style={{ color: '#52525b' }}>({p.primary_axis})</span>
-                        </li>
-                      ))}
-                    </ul>
+                    <table style={{ width: '100%', marginTop: '0.5rem', borderCollapse: 'collapse', fontSize: '0.74rem' }}>
+                      <tbody>
+                        {bootstrapPreview.already_run.map((p) => {
+                          const expanded = bootstrapExpandedPresets.has(p.preset_id);
+                          return (
+                            <React.Fragment key={p.preset_id}>
+                              <tr style={{ borderBottom: expanded ? 'none' : '1px solid #27272a' }}>
+                                <td style={{ padding: '4px 6px', width: 18, cursor: 'pointer', color: '#71717a' }}
+                                    onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
+                                  {expanded ? '▾' : '▸'}
+                                </td>
+                                <td style={{ padding: '4px 6px', fontFamily: 'monospace', color: '#a1a1aa', cursor: 'pointer' }}
+                                    onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
+                                  {p.preset_label}
+                                </td>
+                                <td style={{ padding: '4px 6px' }}>
+                                  <span style={{ fontSize: '0.66rem', background: '#3f3f46', borderRadius: 4, padding: '1px 6px', color: '#a1a1aa' }}>{p.primary_axis}</span>
+                                </td>
+                                <td style={{ padding: '4px 6px', color: '#a78bfa', textAlign: 'right' }}>
+                                  {p.fill_rate_pct != null ? `${p.fill_rate_pct.toFixed(1)}%` : '–'}
+                                </td>
+                                <td style={{ padding: '4px 6px' }}>
+                                  {p.soundness_status === 'sound' && <span style={{ color: '#34d399', fontSize: '0.7rem' }}>✓ sound</span>}
+                                  {p.soundness_status === 'unsound' && <span style={{ color: '#f87171', fontSize: '0.7rem' }}>✗ unsound</span>}
+                                  {p.soundness_status === 'unchecked' && <span style={{ color: '#71717a', fontSize: '0.7rem' }}>—</span>}
+                                  {p.soundness_status === 'error' && <span style={{ color: '#fbbf24', fontSize: '0.7rem' }}>err</span>}
+                                </td>
+                                <td style={{ padding: '4px 6px', textAlign: 'right' }}>
+                                  {p.plan_run_id != null && (
+                                    <button type="button"
+                                      onClick={() => handleDeleteCoveredRun(p.plan_run_id!)}
+                                      style={{
+                                        fontSize: '0.7rem', padding: '1px 6px',
+                                        background: 'transparent', color: '#f87171',
+                                        border: '1px solid rgba(248,113,113,0.4)', borderRadius: 4,
+                                        cursor: 'pointer',
+                                      }}>
+                                      {tc('delete')}
+                                    </button>
+                                  )}
+                                </td>
+                              </tr>
+                              {expanded && (
+                                <tr style={{ borderBottom: '1px solid #27272a' }}>
+                                  <td colSpan={6} style={{ padding: '0 6px 6px 26px' }}>
+                                    <pre style={{
+                                      margin: 0, fontSize: '0.66rem', color: '#a1a1aa',
+                                      background: '#0a0a0a', padding: '6px 8px', borderRadius: 4,
+                                      overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                    }}>
+                                      {JSON.stringify(p.config, null, 2)}
+                                    </pre>
+                                  </td>
+                                </tr>
+                              )}
+                            </React.Fragment>
+                          );
+                        })}
+                      </tbody>
+                    </table>
                   </details>
                 )}
               </>
@@ -6443,6 +6542,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       {isInitial && (
                         <span title={tP('runHistory.chips.initialTitle')} style={{ background: '#1e3a8a', color: '#bfdbfe', borderRadius: 8, padding: '1px 7px', fontSize: '0.7rem', fontWeight: 600 }}>
                           {tP('runHistory.chips.initial')}
+                        </span>
+                      )}
+                      {run.metadata && (run.metadata as { bootstrap?: unknown }).bootstrap === true && (
+                        <span
+                          title={(run.metadata as { preset_label?: string; primary_axis?: string }).preset_label
+                            ? `bootstrap · ${(run.metadata as { preset_label?: string; primary_axis?: string }).preset_label} (${(run.metadata as { preset_label?: string; primary_axis?: string }).primary_axis ?? '—'})`
+                            : 'bootstrap'}
+                          style={{ background: '#3b0764', color: '#e9d5ff', borderRadius: 8, padding: '1px 7px', fontSize: '0.7rem', fontWeight: 600 }}
+                        >
+                          📚 {tP('bootstrap.badge')}
                         </span>
                       )}
                       {isActive && (

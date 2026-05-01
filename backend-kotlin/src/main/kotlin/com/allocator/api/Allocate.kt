@@ -530,6 +530,9 @@ fun Routing.allocateRoutes() {
                     attempts = attempts,
                     soundnessStatus = row[PlanRuns.soundnessStatus],
                     soundnessCheckedAt = row[PlanRuns.soundnessCheckedAt]?.let { formatTs(it) },
+                    metadata = row[PlanRuns.metadata]?.let {
+                        runCatching { Json.parseToJsonElement(it) }.getOrNull()
+                    },
                 )
             }
         }

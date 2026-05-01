@@ -266,13 +266,83 @@ object CaseBootstrap {
         put("config", preset.config)
     }
 
+    /** Same as [toJson] but enriched with the matching plan_run's id and a
+     *  few headline KPIs — used in the dialog's "Already covered" section so
+     *  the user can see fill_rate / soundness at a glance and delete the
+     *  underlying plan_run if they want to retry the preset. */
+    fun toJsonWithRun(preset: BootstrapPreset, run: CoveredRun?): JsonObject = buildJsonObject {
+        put("preset_id", preset.presetId)
+        put("preset_label", preset.label)
+        put("preset_index", preset.index)
+        put("primary_axis", preset.primaryAxis)
+        put("config", preset.config)
+        if (run != null) {
+            put("plan_run_id", run.id)
+            put("plan_run_status", run.status)
+            put("soundness_status", run.soundnessStatus)
+            if (run.fillRatePct != null) put("fill_rate_pct", run.fillRatePct)
+        }
+    }
+
+    /** Snapshot of a plan_run that covers a library signature. */
+    data class CoveredRun(
+        val id: Int,
+        val status: String,
+        val soundnessStatus: String,
+        val fillRatePct: Double?,
+        val signature: String,
+    )
+
+    /** Per-signature lookup of the *best* covering plan_run. "Best" =
+     *  status=success first; otherwise any non-failed run, latest by id. */
+    private fun listCoveredRuns(caseId: Int): Map<String, CoveredRun> = transaction {
+        val rows = PlanRuns.selectAll()
+            .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status neq "failed") }
+            .toList()
+        val perSig = mutableMapOf<String, CoveredRun>()
+        for (row in rows) {
+            val configRaw = row[PlanRuns.config] ?: continue
+            val cfg = runCatching { kotlinx.serialization.json.Json.parseToJsonElement(configRaw).jsonObject }
+                .getOrNull() ?: continue
+            val sig = signatureFor(cfg)
+            val resultRaw = row[PlanRuns.result]
+            val fillPct: Double? = if (resultRaw.isNullOrBlank()) null else runCatching {
+                val rj = kotlinx.serialization.json.Json.parseToJsonElement(resultRaw).jsonObject
+                ((rj["plan_kpis"] as? JsonObject)
+                    ?.get("delivery") as? JsonObject)
+                    ?.get("fill_rate_pct")
+                    ?.toString()
+                    ?.trim('"')
+                    ?.toDoubleOrNull()
+            }.getOrNull()
+            val newRun = CoveredRun(
+                id = row[PlanRuns.id],
+                status = row[PlanRuns.status],
+                soundnessStatus = row[PlanRuns.soundnessStatus],
+                fillRatePct = fillPct,
+                signature = sig,
+            )
+            // Prefer success status, then latest id among same-status runs.
+            val existing = perSig[sig]
+            if (existing == null
+                || (newRun.status == "success" && existing.status != "success")
+                || (newRun.status == existing.status && newRun.id > existing.id)
+            ) {
+                perSig[sig] = newRun
+            }
+        }
+        perSig
+    }
+
     /** Whole-library status snapshot for a case: which presets are already
      *  covered (by any plan_run, bootstrap-tagged or user-driven), and which
      *  would run in the next batch. Frontend uses this to render the confirm
-     *  dialog. */
+     *  dialog. The `already_run` items carry the underlying plan_run_id and
+     *  KPIs so the dialog can show fill rate / soundness inline and offer
+     *  delete. */
     fun statusFor(caseId: Int, batchSize: Int = 5): JsonObject {
-        val coveredSignatures = listCoveredSignatures(caseId)
-        val coveredPresets = LIBRARY.filter { signatureFor(it.config) in coveredSignatures }
+        val coveredRuns = listCoveredRuns(caseId)
+        val coveredPresets = LIBRARY.filter { signatureFor(it.config) in coveredRuns.keys }
         val nextBatch = selectNextBatch(caseId, batchSize)
         return buildJsonObject {
             put("library_size", LIBRARY.size)
@@ -280,7 +350,10 @@ object CaseBootstrap {
             put("remaining_count", LIBRARY.size - coveredPresets.size)
             put("batch_size", batchSize)
             putJsonArray("already_run") {
-                coveredPresets.forEach { add(toJson(it)) }
+                coveredPresets.forEach { preset ->
+                    val sig = signatureFor(preset.config)
+                    add(toJsonWithRun(preset, coveredRuns[sig]))
+                }
             }
             putJsonArray("next_batch") {
                 nextBatch.forEach { add(toJson(it)) }

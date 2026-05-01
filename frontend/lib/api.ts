@@ -615,6 +615,9 @@ export type PlanRun = {
   attempts?: Array<{ depth: number; duration_ms: number }> | null;
   soundness_status?: 'unchecked' | 'checking' | 'sound' | 'unsound' | 'error';
   soundness_checked_at?: string | null;
+  /** Free-form provenance — `{ bootstrap: true, preset_id, preset_label, ... }`
+   *  for KB-seeded runs, undefined/null for user-driven. */
+  metadata?: Record<string, unknown> | null;
 };
 
 export type SoundnessViolation = {
@@ -1371,6 +1374,13 @@ export type BootstrapPreset = {
   preset_index: number;
   primary_axis: string;
   config: Record<string, unknown>;
+  // Present only on items in `already_run[]` — carries the matching
+  // plan_run's id + headline KPIs so the dialog can show coverage + offer
+  // delete inline.
+  plan_run_id?: number;
+  plan_run_status?: string;
+  soundness_status?: string;
+  fill_rate_pct?: number;
 };
 
 export type BootstrapPreview = {
