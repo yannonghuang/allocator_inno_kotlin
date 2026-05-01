@@ -39,6 +39,11 @@ internal val planJobs = ConcurrentHashMap<String, MutableMap<String, Any?>>()
 internal val casePlanResults = ConcurrentHashMap<Int, Map<String, Any>>()
 // jobId → plan_run.id for associating async jobs with persisted runs
 internal val planJobRunIds = ConcurrentHashMap<String, Int>()
+// Bootstrap (KB-seeding) job state. Each entry tracks an end-to-end multi-preset
+// sweep: the planner runs each preset sequentially, persists each as a new
+// plan_run with metadata.bootstrap=true, then triggers the soundness check.
+// Frontend polls /bootstrap/status/{job_id} for progress.
+internal val bootstrapJobs = ConcurrentHashMap<String, MutableMap<String, Any?>>()
 
 /**
  * Allocation run routes — port of api/allocate.py.
@@ -287,6 +292,100 @@ fun Routing.allocateRoutes() {
         call.respond(anyToJson(enriched))
     }
 
+    // ── GET /cases/{case_id}/bootstrap — preview of the next batch ────────────
+    // Read-only: returns which presets are already covered for this case and
+    // which would run next. Used by the confirm dialog before the user clicks
+    // "Bootstrap KB". Does NOT trigger any planning.
+    get("/cases/{case_id}/bootstrap") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        transaction {
+            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
+                ?: throw NoSuchElementException("Case not found")
+        }
+        val batchSize = (call.request.queryParameters["batch_size"]?.toIntOrNull() ?: 5).coerceIn(1, com.allocator.services.CaseBootstrap.LIBRARY.size)
+        call.respond(com.allocator.services.CaseBootstrap.statusFor(caseId, batchSize))
+    }
+
+    // ── POST /cases/{case_id}/bootstrap — fire next batch of preset runs ──────
+    // Body: { "batch_size": int (default 5, capped 1..15) }
+    // Picks the next un-run presets from the bootstrap library, fires each as
+    // an end-to-end planning + persist + soundness sequence (sequential —
+    // planner is single-threaded per JVM anyway), and returns immediately with
+    // a bootstrap_job_id for progress polling.
+    post("/cases/{case_id}/bootstrap") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        transaction {
+            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
+                ?: throw NoSuchElementException("Case not found")
+        }
+        val data = transaction { CaseLoader.load(caseId) }
+        if (data["demand"].isNullOrEmpty()) throw IllegalArgumentException("No demand data")
+        if (data["supply"].isNullOrEmpty()) throw IllegalArgumentException("No supply data")
+
+        val body = runCatching { call.receiveText() }.getOrElse { "" }
+        val payload = if (body.isBlank()) JsonObject(emptyMap())
+                      else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrElse { JsonObject(emptyMap()) }
+        val batchSize = (payload["batch_size"]?.jsonPrimitive?.intOrNull ?: 5).coerceIn(1, com.allocator.services.CaseBootstrap.LIBRARY.size)
+
+        val presets = com.allocator.services.CaseBootstrap.selectNextBatch(caseId, batchSize)
+        if (presets.isEmpty()) {
+            call.respond(buildJsonObject {
+                put("status", "library_exhausted")
+                put("library_size", com.allocator.services.CaseBootstrap.LIBRARY.size)
+                put("message", "All bootstrap presets have been run for this case. " +
+                    "The case's knowledge base now spans the curated library — use the planning agent " +
+                    "for ad-hoc explorations, or run plans manually for case-specific tuning.")
+            })
+            return@post
+        }
+
+        val bootstrapJobId = UUID.randomUUID().toString()
+        bootstrapJobs[bootstrapJobId] = mutableMapOf(
+            "case_id" to caseId,
+            "status" to "running",
+            "total" to presets.size,
+            "completed" to 0,
+            "current_preset_id" to presets.first().presetId,
+            "current_preset_label" to presets.first().label,
+            "plan_run_ids" to mutableListOf<Int>(),
+            "errors" to mutableListOf<String>(),
+        )
+
+        engineScope.launch { runBootstrapBatchBackground(bootstrapJobId, caseId, presets, data) }
+
+        call.respond(buildJsonObject {
+            put("bootstrap_job_id", bootstrapJobId)
+            put("total", presets.size)
+            putJsonArray("presets") {
+                presets.forEach { add(com.allocator.services.CaseBootstrap.toJson(it)) }
+            }
+        })
+    }
+
+    // ── GET /cases/{case_id}/bootstrap/status/{job_id} — poll bootstrap ───────
+    get("/cases/{case_id}/bootstrap/status/{job_id}") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val jobId = call.parameters["job_id"] ?: throw IllegalArgumentException("Invalid job_id")
+        val state = bootstrapJobs[jobId] ?: throw NoSuchElementException("Bootstrap job not found")
+        if (state["case_id"] != caseId) throw NoSuchElementException("Bootstrap job not found for this case")
+        @Suppress("UNCHECKED_CAST")
+        val planRunIds = (state["plan_run_ids"] as? List<Int>) ?: emptyList()
+        @Suppress("UNCHECKED_CAST")
+        val errors = (state["errors"] as? List<String>) ?: emptyList()
+        call.respond(buildJsonObject {
+            put("status", state["status"]?.toString() ?: "unknown")
+            put("total", JsonPrimitive(state["total"] as? Int ?: 0))
+            put("completed", JsonPrimitive(state["completed"] as? Int ?: 0))
+            put("current_preset_id", state["current_preset_id"]?.toString() ?: "")
+            put("current_preset_label", state["current_preset_label"]?.toString() ?: "")
+            putJsonArray("plan_run_ids") { planRunIds.forEach { add(JsonPrimitive(it)) } }
+            putJsonArray("errors") { errors.forEach { add(JsonPrimitive(it)) } }
+        })
+    }
+
     // ── GET /cases/{case_id}/plan/status/{job_id} ─────────────────────────────
     get("/cases/{case_id}/plan/status/{job_id}") {
         val caseId = call.parameters["case_id"]?.toIntOrNull()
@@ -431,6 +530,9 @@ fun Routing.allocateRoutes() {
                     attempts = attempts,
                     soundnessStatus = row[PlanRuns.soundnessStatus],
                     soundnessCheckedAt = row[PlanRuns.soundnessCheckedAt]?.let { formatTs(it) },
+                    metadata = row[PlanRuns.metadata]?.let {
+                        runCatching { Json.parseToJsonElement(it) }.getOrNull()
+                    },
                 )
             }
         }
@@ -1741,6 +1843,139 @@ internal suspend fun runPlanBackground(
             job["status"] = "failed"
             job["error"] = e.message ?: "Unknown error"
         }
+    }
+}
+
+// ── Bootstrap runner ──────────────────────────────────────────────────────────
+//
+// Sequential end-to-end runner for a batch of curated configs. Each preset:
+//   1. Inserts a plan_run row (status=running, name=preset.label,
+//      metadata=bootstrap+preset_id+...)
+//   2. Runs the planner (synchronously inside the bootstrap coroutine — the
+//      whole batch is in one coroutine, so plans naturally serialize).
+//   3. Persists the enriched result (status=success).
+//   4. Runs deep soundness check.
+//
+// A failure in one preset doesn't stop the batch — error is recorded and the
+// next preset runs. The user can re-trigger bootstrap to retry; the
+// already-failed preset still appears as "tried" and won't reappear in the
+// next batch unless the failed plan_run row is deleted.
+
+internal suspend fun runBootstrapBatchBackground(
+    bootstrapJobId: String,
+    caseId: Int,
+    presets: List<com.allocator.services.BootstrapPreset>,
+    data: Map<String, List<Map<String, Any?>>>,
+) {
+    for (preset in presets) {
+        bootstrapJobs[bootstrapJobId]?.let {
+            it["current_preset_id"] = preset.presetId
+            it["current_preset_label"] = preset.label
+        }
+        try {
+            val planRunId = runOneBootstrapPreset(caseId, preset, data)
+            @Suppress("UNCHECKED_CAST")
+            (bootstrapJobs[bootstrapJobId]?.get("plan_run_ids") as? MutableList<Int>)?.add(planRunId)
+        } catch (e: Exception) {
+            log.error("Bootstrap preset ${preset.presetId} failed for case $caseId: ${e.message}", e)
+            @Suppress("UNCHECKED_CAST")
+            (bootstrapJobs[bootstrapJobId]?.get("errors") as? MutableList<String>)
+                ?.add("${preset.presetId}: ${e.message ?: e::class.simpleName ?: "unknown"}")
+        }
+        bootstrapJobs[bootstrapJobId]?.let {
+            it["completed"] = (it["completed"] as Int) + 1
+        }
+    }
+    bootstrapJobs[bootstrapJobId]?.let { it["status"] = "completed" }
+}
+
+/** Run one preset end-to-end: insert plan_run, run planner, persist, soundness. */
+private suspend fun runOneBootstrapPreset(
+    caseId: Int,
+    preset: com.allocator.services.BootstrapPreset,
+    data: Map<String, List<Map<String, Any?>>>,
+): Int {
+    @Suppress("UNCHECKED_CAST")
+    val configMap = jsonElementToNative(preset.config) as? Map<String, Any?>
+        ?: throw IllegalStateException("Failed to convert bootstrap preset config to Map")
+
+    val planRunId = transaction {
+        val overrides = ManualOverrides.selectAll().where { ManualOverrides.caseId eq caseId }
+            .map { row ->
+                buildJsonObject {
+                    put("id", row[ManualOverrides.id])
+                    put("case_id", row[ManualOverrides.caseId])
+                    put("entity_type", row[ManualOverrides.entityType])
+                    put("entity_key", row[ManualOverrides.entityKey])
+                    put("payload", runCatching { Json.parseToJsonElement(row[ManualOverrides.payload]) }.getOrElse { JsonNull })
+                }
+            }
+        val overrideSnapshotJson = JsonArray(overrides).toString()
+        val configJson = resolveEffectiveConfig(configMap).toString()
+        val metadataJson = com.allocator.services.CaseBootstrap.metadataFor(preset).toString()
+        val insertedId = PlanRuns.insert {
+            it[PlanRuns.caseId] = caseId
+            it[PlanRuns.status] = "running"
+            it[PlanRuns.config] = configJson
+            it[PlanRuns.overrideSnapshot] = overrideSnapshotJson
+            it[PlanRuns.metadata] = metadataJson
+            it[PlanRuns.name] = preset.label
+        }[PlanRuns.id]
+        com.allocator.services.emitPlanRunEvent(caseId, insertedId, "created", buildJsonObject {
+            put("source", "bootstrap")
+            put("preset_id", preset.presetId)
+            put("override_count", JsonPrimitive(overrides.size))
+        })
+        insertedId
+    }
+
+    try {
+        val raw = runPlanning(data, config = configMap)
+        val enriched = enrichPlanResultWithData(caseId, raw, data)
+        val resultJson = runCatching { anyToJson(enriched).toString() }.getOrElse { null }
+
+        transaction {
+            PlanRuns.update({ PlanRuns.id eq planRunId }) {
+                it[PlanRuns.status] = "success"
+                it[PlanRuns.result] = resultJson
+                it[PlanRuns.finishedAt] = kotlinx.datetime.Clock.System.now()
+            }
+            @Suppress("UNCHECKED_CAST")
+            val supplyAllocs = (enriched["supply_allocations"] as? List<Map<String, Any?>>).orEmpty()
+            if (supplyAllocs.isNotEmpty()) {
+                PlanSupplyAllocations.deleteWhere { PlanSupplyAllocations.planRunId eq planRunId }
+                PlanSupplyAllocations.batchInsert(supplyAllocs) { alloc ->
+                    this[PlanSupplyAllocations.caseId] = caseId
+                    this[PlanSupplyAllocations.planRunId] = planRunId
+                    this[PlanSupplyAllocations.supplyId] = alloc["supply_id"] as String
+                    this[PlanSupplyAllocations.demandId] = alloc["demand_id"] as? String
+                    this[PlanSupplyAllocations.qtyConsumed] = (alloc["qty_consumed"] as? Number)?.toDouble() ?: 0.0
+                }
+            }
+            com.allocator.services.emitPlanRunEvent(caseId, planRunId, "saved", buildJsonObject {
+                put("source", "bootstrap")
+            })
+        }
+
+        // Soundness check (deep). Failures here don't fail the bootstrap run —
+        // the run is already saved as "success", soundness_status defaults to
+        // "unchecked", and the user (or a re-check) can retry.
+        try {
+            runSoundnessCheckForRun(caseId, planRunId, deepCheck = true)
+        } catch (e: Exception) {
+            log.warn("Bootstrap soundness check failed for run $planRunId: ${e.message}")
+        }
+
+        return planRunId
+    } catch (e: Exception) {
+        transaction {
+            PlanRuns.update({ PlanRuns.id eq planRunId }) {
+                it[PlanRuns.status] = "failed"
+                it[PlanRuns.error] = e.message ?: "Unknown error"
+                it[PlanRuns.finishedAt] = kotlinx.datetime.Clock.System.now()
+            }
+        }
+        throw e
     }
 }
 

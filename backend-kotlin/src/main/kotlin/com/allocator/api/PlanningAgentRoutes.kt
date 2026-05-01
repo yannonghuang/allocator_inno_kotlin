@@ -224,11 +224,15 @@ private val TOOLS: List<LlmTool> = listOf(
     tool(
         "list_plan_runs",
         "List recent plan runs for this case, newest first. Returns up to `limit` " +
-            "rows with id, status, name, created_at, soundness_status, and (when " +
-            "available) fill_rate_pct. Use to discover run_ids before calling " +
-            "get_kpis or get_demand_pegging. Pass status='success' to skip " +
-            "contingent / failed / running runs (contingent runs have no plan_kpis " +
-            "stored — they're what-if simulations).",
+            "rows. Each row includes id, status, name, created_at, soundness_status " +
+            "PLUS the headline KPIs INLINE (fill_rate_pct, gini, p10_fill_ratio, " +
+            "median_fill_ratio, starvation_pct, on_time_count, total_committed, " +
+            "total_requested, manufacturing_total_quantity, inventory_consumed_total). " +
+            "This is the bulk-query channel — for any 'compare across runs' / " +
+            "'find the best on metric X' / multi-objective question, prefer ONE " +
+            "list_plan_runs call (with limit 50) over N get_kpis calls. KPI fields " +
+            "are omitted when null (contingent runs / older rows without computed " +
+            "KPIs). Pass status='success' to skip contingent / failed / running.",
         buildJsonObject {
             put("type", "object")
             putJsonObject("properties") {
@@ -620,16 +624,26 @@ private data class PlanRunSummary(
     val name: String,
     val createdAt: String,
     val soundnessStatus: String,
+    // Inline KPI snapshot (Phase A of agent KB scaling) — all the
+    // headline metrics the comparative-diagnosis / multi-objective tactics
+    // need, returned in one round-trip so the agent can reason across many
+    // runs without N+1 get_kpis calls. Each is null when the run isn't
+    // success-status or KPIs weren't computed (contingent runs).
     val fillPct: Double?,
+    val gini: Double?,
+    val p10FillRatio: Double?,
+    val medianFillRatio: Double?,
+    val starvationPct: Double?,
+    val onTimeCount: Int?,
+    val totalCommitted: Double?,
+    val totalRequested: Double?,
+    val mfgTotalQty: Double?,
+    val invConsumedTotal: Double?,
 )
 
 private fun toolListPlanRuns(caseId: Int, args: JsonObject, locale: String): ToolResult {
     val limit = (args["limit"]?.jsonPrimitive?.intOrNull ?: 10).coerceIn(1, 50)
     val statusFilter = args["status"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotBlank() }
-    // Materialize all row data INSIDE the transaction. Exposed lazy-evaluates
-    // some column reads (especially nullable text + timestamp), so accessing
-    // ResultRow columns outside the transaction throws "No transaction in
-    // context".
     val items: List<PlanRunSummary> = transaction {
         PlanRuns.selectAll()
             .where {
@@ -642,19 +656,36 @@ private fun toolListPlanRuns(caseId: Int, args: JsonObject, locale: String): Too
             .limit(limit)
             .map { r ->
                 val resultJson = r[PlanRuns.result]
-                val fillPct: Double? = if (resultJson.isNullOrBlank()) null else runCatching {
-                    val root = jsonParser.parseToJsonElement(resultJson).jsonObject
-                    ((root["plan_kpis"] as? JsonObject)
-                        ?.get("delivery") as? JsonObject)
-                        ?.get("fill_rate_pct")?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
-                }.getOrNull()
+                // Parse the plan_kpis subtree once and extract all headline
+                // metrics; nullable lookups so older / contingent runs that
+                // are missing fields just produce nulls rather than blow up.
+                val parsedRoot: JsonObject? = if (resultJson.isNullOrBlank()) null
+                    else runCatching { jsonParser.parseToJsonElement(resultJson).jsonObject }.getOrNull()
+                val kpis: JsonObject? = parsedRoot?.get("plan_kpis") as? JsonObject
+                val delivery: JsonObject? = kpis?.get("delivery") as? JsonObject
+                val fairness: JsonObject? = kpis?.get("fairness") as? JsonObject
+                val mfg: JsonObject? = kpis?.get("manufacturing") as? JsonObject
+                val inv: JsonObject? = kpis?.get("inventory") as? JsonObject
+                fun JsonObject?.numberAt(key: String): Double? = this?.get(key)
+                    ?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
+                fun JsonObject?.intAt(key: String): Int? = this?.get(key)
+                    ?.jsonPrimitive?.contentOrNull?.toIntOrNull()
                 PlanRunSummary(
                     id = r[PlanRuns.id],
                     status = r[PlanRuns.status],
                     name = r[PlanRuns.name] ?: "",
                     createdAt = r[PlanRuns.createdAt].toString(),
                     soundnessStatus = r[PlanRuns.soundnessStatus],
-                    fillPct = fillPct,
+                    fillPct = delivery.numberAt("fill_rate_pct"),
+                    gini = fairness.numberAt("gini"),
+                    p10FillRatio = fairness.numberAt("p10_fill_ratio"),
+                    medianFillRatio = fairness.numberAt("median_fill_ratio"),
+                    starvationPct = fairness.numberAt("starvation_pct"),
+                    onTimeCount = delivery.intAt("on_time_count"),
+                    totalCommitted = delivery.numberAt("total_committed"),
+                    totalRequested = delivery.numberAt("total_requested"),
+                    mfgTotalQty = mfg.numberAt("total_quantity"),
+                    invConsumedTotal = inv.numberAt("consumed_total"),
                 )
             }
     }
@@ -676,6 +707,15 @@ private fun toolListPlanRuns(caseId: Int, args: JsonObject, locale: String): Too
                         put("created_at", s.createdAt)
                         put("soundness_status", s.soundnessStatus)
                         if (s.fillPct != null) put("fill_rate_pct", s.fillPct)
+                        if (s.gini != null) put("gini", s.gini)
+                        if (s.p10FillRatio != null) put("p10_fill_ratio", s.p10FillRatio)
+                        if (s.medianFillRatio != null) put("median_fill_ratio", s.medianFillRatio)
+                        if (s.starvationPct != null) put("starvation_pct", s.starvationPct)
+                        if (s.onTimeCount != null) put("on_time_count", s.onTimeCount)
+                        if (s.totalCommitted != null) put("total_committed", s.totalCommitted)
+                        if (s.totalRequested != null) put("total_requested", s.totalRequested)
+                        if (s.mfgTotalQty != null) put("manufacturing_total_quantity", s.mfgTotalQty)
+                        if (s.invConsumedTotal != null) put("inventory_consumed_total", s.invConsumedTotal)
                     })
                 }
             })

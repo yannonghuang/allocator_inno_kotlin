@@ -80,6 +80,11 @@ import {
   type SoundnessReport,
   type PlanRunEvent,
   type PlanSupplyAllocation,
+  getBootstrapPreview,
+  startBootstrap,
+  getBootstrapJobStatus,
+  type BootstrapPreview,
+  type BootstrapJobStatus,
 } from '@/lib/api';
 
 type SupplySuggestion = {
@@ -949,6 +954,59 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const currentRunIsContingent = currentPlanRunId != null &&
     planRunHistory.find(r => r.id === currentPlanRunId)?.status === 'contingent';
   const [planRunHistoryOpen, setPlanRunHistoryOpen] = useState(false);
+  // ── Bootstrap (KB seeding) state ────────────────────────────────────────
+  const [bootstrapDialogOpen, setBootstrapDialogOpen] = useState(false);
+  const [bootstrapPreview, setBootstrapPreview] = useState<BootstrapPreview | null>(null);
+  const [bootstrapPreviewLoading, setBootstrapPreviewLoading] = useState(false);
+  const [bootstrapBatchSize, setBootstrapBatchSize] = useState(5);
+  const [bootstrapStarting, setBootstrapStarting] = useState(false);
+  const [bootstrapJobId, setBootstrapJobId] = useState<string | null>(null);
+  const [bootstrapJobStatus, setBootstrapJobStatus] = useState<BootstrapJobStatus | null>(null);
+  const bootstrapPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [bootstrapExpandedPresets, setBootstrapExpandedPresets] = useState<Set<string>>(new Set());
+  const toggleBootstrapPresetExpanded = (presetId: string) => {
+    setBootstrapExpandedPresets((prev) => {
+      const next = new Set(prev);
+      if (next.has(presetId)) next.delete(presetId); else next.add(presetId);
+      return next;
+    });
+  };
+
+  // Library baseline: the canonical config every bootstrap preset is varying
+  // from. Showing this once at the top of the dialog + a per-preset DIFF line
+  // is far less misleading than stacking 5 full JSONs that are 95% identical.
+  // Matches the cfg() defaults in CaseBootstrap.kt.
+  const presetDiffSummary = (config: Record<string, unknown>): string => {
+    const ms = (config.method_selection ?? {}) as Record<string, unknown>;
+    const cs = (config.consolidation ?? {}) as Record<string, unknown>;
+    const sw = (ms.score_weights ?? {}) as Record<string, number>;
+    const diffs: string[] = [];
+    if (ms.mode !== 'preference') diffs.push(`mode: preference → ${ms.mode}`);
+    if (Number(ms.max_methods) !== 2) diffs.push(`max_methods: 2 → ${ms.max_methods}`);
+    if (Number(ms.depth) !== 1) diffs.push(`depth: 1 → ${ms.depth}`);
+    if (Number(sw.commit_time) !== 0.4 || Number(sw.inventory_consumed) !== 0.35 || Number(sw.purchase) !== 0.25) {
+      diffs.push(`weights: (${sw.commit_time}, ${sw.inventory_consumed}, ${sw.purchase})`);
+    }
+    if (cs.engine !== 'leaf-legacy') diffs.push(`engine: leaf-legacy → ${cs.engine}`);
+    if (cs.allocation_mode !== 'fair') diffs.push(`allocation_mode: fair → ${cs.allocation_mode}`);
+    if (cs.enabled === false) diffs.push(`consolidation: on → off`);
+    if (Number(cs.period_days) !== 0) diffs.push(`period_days: 0 → ${cs.period_days}`);
+    if (config.purchase_allowed === true) diffs.push(`purchase: off → on`);
+    return diffs.join(' · ');
+  };
+  const handleDeleteCoveredRun = async (planRunId: number) => {
+    if (!id) return;
+    try {
+      await deletePlanRun(id, planRunId);
+      // Refresh preview so the deleted run drops out of "already covered".
+      const preview = await getBootstrapPreview(id, bootstrapBatchSize);
+      setBootstrapPreview(preview);
+      // Run history may also be open; refresh it too.
+      loadPlanRunHistory();
+    } catch (e) {
+      console.error('Failed to delete covered run', e);
+    }
+  };
   const [planRunHistoryLoading, setPlanRunHistoryLoading] = useState(false);
   const [planRunLoadingId, setPlanRunLoadingId] = useState<number | null>(null);
   // Per-run expansion: which tab, plus lazy-loaded full detail (for overrides + events)
@@ -2726,6 +2784,95 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     }
   };
 
+  // ── Bootstrap handlers ──────────────────────────────────────────────────
+  const openBootstrapDialog = async () => {
+    if (!id) return;
+    setBootstrapDialogOpen(true);
+    setBootstrapPreviewLoading(true);
+    try {
+      const preview = await getBootstrapPreview(id, bootstrapBatchSize);
+      setBootstrapPreview(preview);
+    } catch {
+      setBootstrapPreview(null);
+    } finally {
+      setBootstrapPreviewLoading(false);
+    }
+  };
+
+  // Re-fetch the preview whenever batch size changes while the dialog is open
+  // — the next-batch list shifts as the user dials the size up/down.
+  useEffect(() => {
+    if (!bootstrapDialogOpen || !id) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const preview = await getBootstrapPreview(id, bootstrapBatchSize);
+        if (!cancelled) setBootstrapPreview(preview);
+      } catch { /* keep prior preview */ }
+    })();
+    return () => { cancelled = true; };
+  }, [bootstrapBatchSize, bootstrapDialogOpen, id]);
+
+  const handleStartBootstrap = async () => {
+    if (!id) return;
+    setBootstrapStarting(true);
+    try {
+      const r = await startBootstrap(id, bootstrapBatchSize);
+      if ('status' in r) {
+        // library_exhausted; refresh the preview so the dialog shows the
+        // exhausted message until the user dismisses.
+        const preview = await getBootstrapPreview(id, bootstrapBatchSize);
+        setBootstrapPreview(preview);
+        return;
+      }
+      setBootstrapJobId(r.bootstrap_job_id);
+      // Seed status immediately so the progress block can render before the
+      // first poll lands.
+      setBootstrapJobStatus({
+        status: 'running',
+        total: r.total,
+        completed: 0,
+        current_preset_id: r.presets[0]?.preset_id ?? '',
+        current_preset_label: r.presets[0]?.preset_label ?? '',
+        plan_run_ids: [],
+        errors: [],
+      });
+    } catch (e) {
+      console.error('Bootstrap start failed', e);
+    } finally {
+      setBootstrapStarting(false);
+    }
+  };
+
+  // Poll bootstrap progress every 3s while a job is running. Stop on
+  // completion or when the user dismisses the dialog.
+  useEffect(() => {
+    if (!bootstrapJobId || !id) return;
+    const tick = async () => {
+      try {
+        const status = await getBootstrapJobStatus(id, bootstrapJobId);
+        setBootstrapJobStatus(status);
+        if (status.status === 'completed') {
+          if (bootstrapPollRef.current) { clearInterval(bootstrapPollRef.current); bootstrapPollRef.current = null; }
+          // Refresh the preview + run history now that new runs exist.
+          getBootstrapPreview(id, bootstrapBatchSize).then(setBootstrapPreview).catch(() => {});
+          loadPlanRunHistory();
+        }
+      } catch { /* keep polling on transient errors */ }
+    };
+    tick();
+    bootstrapPollRef.current = setInterval(tick, 3000);
+    return () => {
+      if (bootstrapPollRef.current) { clearInterval(bootstrapPollRef.current); bootstrapPollRef.current = null; }
+    };
+  }, [bootstrapJobId, id, bootstrapBatchSize]);
+
+  const closeBootstrapDialog = () => {
+    setBootstrapDialogOpen(false);
+    // Don't clear job id — the run may still be in flight in the background;
+    // the next time the user opens the dialog they'll see live progress.
+  };
+
   const handleRestorePlanRun = async (runId: number) => {
     setPlanRunLoadingId(runId);
     try {
@@ -3945,6 +4092,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             style={{ padding: '6px 12px' }}
           >
             {tP('planRunHistory')}
+          </button>
+          <span style={{ marginLeft: '0.5rem' }} />
+          <button
+            type="button"
+            className="secondary"
+            onClick={openBootstrapDialog}
+            title={tP('bootstrap.buttonTooltip')}
+            style={{ padding: '6px 12px' }}
+          >
+            {tP('bootstrap.button')}
           </button>
           <span style={{ marginLeft: '0.5rem' }} />
           <button
@@ -6126,6 +6283,249 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       </section>
       )}
       {/* ── Plan run history slide-in ──────────────────────────────────────────── */}
+      {bootstrapDialogOpen && typeof document !== 'undefined' && createPortal(
+        <div
+          style={{
+            position: 'fixed', inset: 0, zIndex: 9997, display: 'flex',
+            alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.55)',
+          }}
+          role="dialog"
+          aria-label={tP('bootstrap.title')}
+          onClick={closeBootstrapDialog}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: '#1c1c1e', color: '#e4e4e7', borderRadius: 8,
+              padding: '1.25rem 1.5rem', width: 560, maxWidth: '92vw',
+              maxHeight: '90vh', overflowY: 'auto',
+              boxShadow: '0 20px 60px rgba(0,0,0,0.6)',
+              border: '1px solid #3d3d40',
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
+              <h3 style={{ margin: 0, color: '#fafafa' }}>{tP('bootstrap.title')}</h3>
+              <button type="button" onClick={closeBootstrapDialog}
+                style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>
+                {tP('bootstrap.close')}
+              </button>
+            </div>
+            <p style={{ margin: '0 0 0.75rem', fontSize: '0.85rem', color: '#a1a1aa' }}>
+              {tP('bootstrap.intro')}
+            </p>
+
+            {/* Progress block (visible while a bootstrap job is running) */}
+            {bootstrapJobStatus && (
+              <div style={{ marginBottom: '0.75rem', padding: '0.6rem 0.75rem', background: '#0c1f3a', border: '1px solid #1d4ed8', borderRadius: 6 }}>
+                <div style={{ fontWeight: 600, color: '#93c5fd', fontSize: '0.85rem', marginBottom: '0.25rem' }}>
+                  {tP('bootstrap.progressTitle')}
+                </div>
+                <div style={{ fontSize: '0.82rem', color: '#e4e4e7' }}>
+                  {bootstrapJobStatus.status === 'completed'
+                    ? tP('bootstrap.progressDone', { completed: bootstrapJobStatus.completed })
+                    : tP('bootstrap.progressLine', {
+                        completed: bootstrapJobStatus.completed,
+                        total: bootstrapJobStatus.total,
+                        current: bootstrapJobStatus.current_preset_label,
+                      })}
+                </div>
+                <div style={{ marginTop: '0.4rem', height: 6, background: '#1e3a8a', borderRadius: 3, overflow: 'hidden' }}>
+                  <div style={{
+                    height: '100%', background: '#3b82f6',
+                    width: `${bootstrapJobStatus.total > 0 ? (bootstrapJobStatus.completed / bootstrapJobStatus.total) * 100 : 0}%`,
+                    transition: 'width 0.3s',
+                  }} />
+                </div>
+                {bootstrapJobStatus.errors.length > 0 && (
+                  <div style={{ marginTop: '0.4rem', fontSize: '0.75rem', color: '#f87171' }}>
+                    <div style={{ fontWeight: 600 }}>{tP('bootstrap.progressErrors', { n: bootstrapJobStatus.errors.length })}</div>
+                    <ul style={{ margin: '0.2rem 0 0 1rem', padding: 0 }}>
+                      {bootstrapJobStatus.errors.map((e, i) => (<li key={i}>{e}</li>))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Coverage + library-exhausted state */}
+            {bootstrapPreview && (
+              <p style={{ fontSize: '0.82rem', color: '#a1a1aa', margin: '0 0 0.75rem' }}>
+                {bootstrapPreview.remaining_count === 0
+                  ? tP('bootstrap.exhausted', { total: bootstrapPreview.library_size })
+                  : tP('bootstrap.coverage', {
+                      covered: bootstrapPreview.already_run_count,
+                      total: bootstrapPreview.library_size,
+                    })}
+              </p>
+            )}
+
+            {/* Batch size + Start (hidden while exhausted) */}
+            {bootstrapPreview && bootstrapPreview.remaining_count > 0 && (
+              <>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginBottom: '0.5rem' }}>
+                  <label style={{ fontSize: '0.82rem', color: '#e4e4e7' }}>
+                    {tP('bootstrap.batchSizeLabel')}:
+                    <input
+                      type="number" min={1} max={bootstrapPreview.library_size} value={bootstrapBatchSize}
+                      onChange={(e) => setBootstrapBatchSize(Math.max(1, Math.min(bootstrapPreview.library_size, Number(e.target.value) || 5)))}
+                      style={{
+                        marginLeft: '0.5rem', width: 60, padding: '3px 6px',
+                        background: '#27272a', color: '#e4e4e7',
+                        border: '1px solid #52525b', borderRadius: 4, fontSize: '0.82rem',
+                      }}
+                    />
+                  </label>
+                  <span style={{ fontSize: '0.75rem', color: '#71717a' }}>{tP('bootstrap.batchSizeHint', { max: bootstrapPreview.library_size })}</span>
+                </div>
+
+                <details style={{ marginBottom: '0.5rem', fontSize: '0.75rem', color: '#71717a' }}>
+                  <summary style={{ cursor: 'pointer' }}>
+                    {tP('bootstrap.baselineHeading')}
+                  </summary>
+                  <div style={{ marginTop: '0.25rem', padding: '4px 8px', background: '#0a0a0a', borderRadius: 4, fontFamily: 'monospace', fontSize: '0.7rem', color: '#a1a1aa' }}>
+                    {tP('bootstrap.baselineSummary')}
+                  </div>
+                </details>
+                <div style={{ marginBottom: '0.5rem', fontSize: '0.82rem', color: '#a1a1aa', fontWeight: 600 }}>
+                  {tP('bootstrap.nextBatchHeading')}
+                </div>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.78rem', marginBottom: '0.75rem' }}>
+                  <tbody>
+                    {bootstrapPreview.next_batch.map((p) => {
+                      const expanded = bootstrapExpandedPresets.has(p.preset_id);
+                      const diff = presetDiffSummary(p.config);
+                      return (
+                        <React.Fragment key={p.preset_id}>
+                          <tr style={{ borderBottom: expanded ? 'none' : '1px solid #27272a' }}>
+                            <td style={{ padding: '4px 6px', width: 18, cursor: 'pointer', color: '#71717a', verticalAlign: 'top' }}
+                                onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
+                              {expanded ? '▾' : '▸'}
+                            </td>
+                            <td style={{ padding: '4px 6px', fontFamily: 'monospace', color: '#67e8f9', cursor: 'pointer', verticalAlign: 'top', whiteSpace: 'nowrap' }}
+                                onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
+                              {p.preset_label}
+                            </td>
+                            <td style={{ padding: '4px 6px', verticalAlign: 'top', whiteSpace: 'nowrap' }}>
+                              <span style={{ fontSize: '0.7rem', background: '#3f3f46', borderRadius: 4, padding: '1px 6px', color: '#a1a1aa' }}>{p.primary_axis}</span>
+                            </td>
+                            <td style={{ padding: '4px 6px', fontFamily: 'monospace', fontSize: '0.72rem', color: diff ? '#fbbf24' : '#52525b', verticalAlign: 'top' }}>
+                              {diff || tP('bootstrap.noDiff')}
+                            </td>
+                          </tr>
+                          {expanded && (
+                            <tr style={{ borderBottom: '1px solid #27272a' }}>
+                              <td colSpan={4} style={{ padding: '0 6px 6px 26px' }}>
+                                <pre style={{
+                                  margin: 0, fontSize: '0.68rem', color: '#a1a1aa',
+                                  background: '#0a0a0a', padding: '6px 8px', borderRadius: 4,
+                                  overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                }}>
+                                  {JSON.stringify(p.config, null, 2)}
+                                </pre>
+                              </td>
+                            </tr>
+                          )}
+                        </React.Fragment>
+                      );
+                    })}
+                  </tbody>
+                </table>
+
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
+                  <button type="button" onClick={closeBootstrapDialog}
+                    style={{ padding: '5px 12px', background: 'transparent', color: '#a1a1aa', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>
+                    {tP('bootstrap.cancel')}
+                  </button>
+                  <button type="button" onClick={handleStartBootstrap}
+                    disabled={bootstrapStarting || bootstrapJobStatus?.status === 'running' || bootstrapPreviewLoading}
+                    style={{
+                      padding: '5px 14px', background: '#16a34a', color: '#fff',
+                      border: 'none', borderRadius: 6, cursor: 'pointer',
+                      fontWeight: 600, opacity: bootstrapStarting || bootstrapJobStatus?.status === 'running' ? 0.6 : 1,
+                    }}>
+                    {bootstrapStarting
+                      ? tP('bootstrap.starting')
+                      : tP('bootstrap.start', { n: bootstrapPreview.next_batch.length })}
+                  </button>
+                </div>
+
+                {bootstrapPreview.already_run.length > 0 && (
+                  <details style={{ marginTop: '1rem', fontSize: '0.78rem', color: '#71717a' }}>
+                    <summary style={{ cursor: 'pointer' }}>
+                      {tP('bootstrap.alreadyRunHeading', { n: bootstrapPreview.already_run.length })}
+                    </summary>
+                    <table style={{ width: '100%', marginTop: '0.5rem', borderCollapse: 'collapse', fontSize: '0.74rem' }}>
+                      <tbody>
+                        {bootstrapPreview.already_run.map((p) => {
+                          const expanded = bootstrapExpandedPresets.has(p.preset_id);
+                          const diff = presetDiffSummary(p.config);
+                          return (
+                            <React.Fragment key={p.preset_id}>
+                              <tr style={{ borderBottom: expanded ? 'none' : '1px solid #27272a' }}>
+                                <td style={{ padding: '4px 6px', width: 18, cursor: 'pointer', color: '#71717a', verticalAlign: 'top' }}
+                                    onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
+                                  {expanded ? '▾' : '▸'}
+                                </td>
+                                <td style={{ padding: '4px 6px', fontFamily: 'monospace', color: '#a1a1aa', cursor: 'pointer', verticalAlign: 'top', whiteSpace: 'nowrap' }}
+                                    onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
+                                  {p.preset_label}
+                                </td>
+                                <td style={{ padding: '4px 6px', verticalAlign: 'top', whiteSpace: 'nowrap' }}>
+                                  <span style={{ fontSize: '0.66rem', background: '#3f3f46', borderRadius: 4, padding: '1px 6px', color: '#a1a1aa' }}>{p.primary_axis}</span>
+                                </td>
+                                <td style={{ padding: '4px 6px', fontFamily: 'monospace', fontSize: '0.68rem', color: diff ? '#fbbf24' : '#52525b', verticalAlign: 'top' }}>
+                                  {diff || tP('bootstrap.noDiff')}
+                                </td>
+                                <td style={{ padding: '4px 6px', color: '#a78bfa', textAlign: 'right', verticalAlign: 'top' }}>
+                                  {p.fill_rate_pct != null ? `${p.fill_rate_pct.toFixed(1)}%` : '–'}
+                                </td>
+                                <td style={{ padding: '4px 6px', verticalAlign: 'top' }}>
+                                  {p.soundness_status === 'sound' && <span style={{ color: '#34d399', fontSize: '0.7rem' }}>✓</span>}
+                                  {p.soundness_status === 'unsound' && <span style={{ color: '#f87171', fontSize: '0.7rem' }}>✗</span>}
+                                  {p.soundness_status === 'unchecked' && <span style={{ color: '#71717a', fontSize: '0.7rem' }}>—</span>}
+                                  {p.soundness_status === 'error' && <span style={{ color: '#fbbf24', fontSize: '0.7rem' }}>err</span>}
+                                </td>
+                                <td style={{ padding: '4px 6px', textAlign: 'right', verticalAlign: 'top' }}>
+                                  {p.plan_run_id != null && (
+                                    <button type="button"
+                                      onClick={() => handleDeleteCoveredRun(p.plan_run_id!)}
+                                      style={{
+                                        fontSize: '0.7rem', padding: '1px 6px',
+                                        background: 'transparent', color: '#f87171',
+                                        border: '1px solid rgba(248,113,113,0.4)', borderRadius: 4,
+                                        cursor: 'pointer',
+                                      }}>
+                                      {tc('delete')}
+                                    </button>
+                                  )}
+                                </td>
+                              </tr>
+                              {expanded && (
+                                <tr style={{ borderBottom: '1px solid #27272a' }}>
+                                  <td colSpan={7} style={{ padding: '0 6px 6px 26px' }}>
+                                    <pre style={{
+                                      margin: 0, fontSize: '0.66rem', color: '#a1a1aa',
+                                      background: '#0a0a0a', padding: '6px 8px', borderRadius: 4,
+                                      overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                    }}>
+                                      {JSON.stringify(p.config, null, 2)}
+                                    </pre>
+                                  </td>
+                                </tr>
+                              )}
+                            </React.Fragment>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </details>
+                )}
+              </>
+            )}
+          </div>
+        </div>,
+        document.body
+      )}
       {planRunHistoryOpen && typeof document !== 'undefined' && createPortal(
         <div style={{ position: 'fixed', inset: 0, zIndex: 9996, display: 'flex', justifyContent: 'flex-end' }} role="dialog" aria-label="Plan run history">
           <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)' }} onClick={() => setPlanRunHistoryOpen(false)} aria-hidden />
@@ -6181,6 +6581,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       {isInitial && (
                         <span title={tP('runHistory.chips.initialTitle')} style={{ background: '#1e3a8a', color: '#bfdbfe', borderRadius: 8, padding: '1px 7px', fontSize: '0.7rem', fontWeight: 600 }}>
                           {tP('runHistory.chips.initial')}
+                        </span>
+                      )}
+                      {run.metadata && (run.metadata as { bootstrap?: unknown }).bootstrap === true && (
+                        <span
+                          title={(run.metadata as { preset_label?: string; primary_axis?: string }).preset_label
+                            ? `bootstrap · ${(run.metadata as { preset_label?: string; primary_axis?: string }).preset_label} (${(run.metadata as { preset_label?: string; primary_axis?: string }).primary_axis ?? '—'})`
+                            : 'bootstrap'}
+                          style={{ background: '#3b0764', color: '#e9d5ff', borderRadius: 8, padding: '1px 7px', fontSize: '0.7rem', fontWeight: 600 }}
+                        >
+                          📚 {tP('bootstrap.badge')}
                         </span>
                       )}
                       {isActive && (
