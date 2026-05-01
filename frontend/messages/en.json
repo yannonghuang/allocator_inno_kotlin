@@ -322,7 +322,7 @@
       "coverage": "Curated library: {covered} presets covered for this case so far.",
       "exhausted": "All {total} curated library presets are already covered for this case. Use the planning agent for ad-hoc explorations.",
       "batchSizeLabel": "Batch size",
-      "batchSizeHint": "Number of presets to run in this batch (1–15).",
+      "batchSizeHint": "Number of presets to run in this batch (1–{max}).",
       "nextBatchHeading": "Next batch:",
       "axisLabel": "axis",
       "baselineHeading": "Library baseline (each preset varies one knob from this):",

@@ -6366,8 +6366,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   <label style={{ fontSize: '0.82rem', color: '#e4e4e7' }}>
                     {tP('bootstrap.batchSizeLabel')}:
                     <input
-                      type="number" min={1} max={15} value={bootstrapBatchSize}
-                      onChange={(e) => setBootstrapBatchSize(Math.max(1, Math.min(15, Number(e.target.value) || 5)))}
+                      type="number" min={1} max={bootstrapPreview.library_size} value={bootstrapBatchSize}
+                      onChange={(e) => setBootstrapBatchSize(Math.max(1, Math.min(bootstrapPreview.library_size, Number(e.target.value) || 5)))}
                       style={{
                         marginLeft: '0.5rem', width: 60, padding: '3px 6px',
                         background: '#27272a', color: '#e4e4e7',
@@ -6375,7 +6375,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       }}
                     />
                   </label>
-                  <span style={{ fontSize: '0.75rem', color: '#71717a' }}>{tP('bootstrap.batchSizeHint')}</span>
+                  <span style={{ fontSize: '0.75rem', color: '#71717a' }}>{tP('bootstrap.batchSizeHint', { max: bootstrapPreview.library_size })}</span>
                 </div>
 
                 <details style={{ marginBottom: '0.5rem', fontSize: '0.75rem', color: '#71717a' }}>

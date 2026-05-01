@@ -303,7 +303,7 @@ fun Routing.allocateRoutes() {
             Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
                 ?: throw NoSuchElementException("Case not found")
         }
-        val batchSize = (call.request.queryParameters["batch_size"]?.toIntOrNull() ?: 5).coerceIn(1, 15)
+        val batchSize = (call.request.queryParameters["batch_size"]?.toIntOrNull() ?: 5).coerceIn(1, com.allocator.services.CaseBootstrap.LIBRARY.size)
         call.respond(com.allocator.services.CaseBootstrap.statusFor(caseId, batchSize))
     }
 
@@ -327,7 +327,7 @@ fun Routing.allocateRoutes() {
         val body = runCatching { call.receiveText() }.getOrElse { "" }
         val payload = if (body.isBlank()) JsonObject(emptyMap())
                       else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrElse { JsonObject(emptyMap()) }
-        val batchSize = (payload["batch_size"]?.jsonPrimitive?.intOrNull ?: 5).coerceIn(1, 15)
+        val batchSize = (payload["batch_size"]?.jsonPrimitive?.intOrNull ?: 5).coerceIn(1, com.allocator.services.CaseBootstrap.LIBRARY.size)
 
         val presets = com.allocator.services.CaseBootstrap.selectNextBatch(caseId, batchSize)
         if (presets.isEmpty()) {

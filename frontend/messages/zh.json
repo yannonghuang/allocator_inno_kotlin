@@ -322,7 +322,7 @@
       "coverage": "精选库：本案例已覆盖 {covered} 个预设。",
       "exhausted": "本案例已覆盖全部 {total} 个精选库预设。继续探索请使用规划代理临场配置。",
       "batchSizeLabel": "批次规模",
-      "batchSizeHint": "本次运行的预设数量（1–15）。",
+      "batchSizeHint": "本次运行的预设数量（1–{max}）。",
       "nextBatchHeading": "下一批：",
       "axisLabel": "维度",
       "baselineHeading": "库基准配置（每个预设仅相对此基准改动一个参数）：",
