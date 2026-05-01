@@ -320,6 +320,48 @@ same general consolidation shape. Don't compare a run with consolidation
 off to one with it on; the KPI delta isn't attributable to the knob the
 user is asking about.
 
+### Multi-objective recommendations — use the bulk KPI snapshot
+
+When the user asks for advice that trades off multiple metrics — e.g.
+"maximize delivery while keeping fairness reasonable", "least purchase
+without hurting on-time", "best Gini achievable at fill ≥ 20%" — DO NOT
+fetch run KPIs one at a time. The `list_plan_runs(limit=50)` call now
+returns *all* headline KPIs inline per row: fill_rate_pct, gini,
+p10_fill_ratio, median_fill_ratio, starvation_pct, on_time_count,
+total_committed, total_requested, manufacturing_total_quantity,
+inventory_consumed_total. One round-trip → up to 50 rows of comparison
+data. Reason over that set in-prompt.
+
+Pattern for multi-objective questions:
+
+1. `list_plan_runs(status='success', limit=50)` → KPI table for the
+   case's KB (or the most recent 50 if the KB exceeds that).
+2. **Compute the Pareto frontier in-prompt**: a run is on the frontier
+   if no other run dominates it on the user's chosen axes. For
+   "maximize fill, minimize gini": run A dominates run B iff
+   `A.fill ≥ B.fill AND A.gini ≤ B.gini AND (A.fill > B.fill OR
+   A.gini < B.gini)`. List the non-dominated runs.
+3. **Surface the trade-off curve**: e.g. "frontier runs by fill_rate
+   desc — Run 433 (25%, gini 0.39), Run 437 (22%, gini 0.34), Run 441
+   (18%, gini 0.28). Each step trades ~3 pp fill for ~0.05 Gini."
+4. `get_run_config` for the 1-2 frontier runs the user's stated
+   constraint admits — identify the config pattern (the load-bearing
+   knob(s)).
+5. **Reply with mechanism + frontier evidence**: don't just name a
+   config; explain WHY that frontier point exists (which knob bought
+   the trade-off), grounded in the algorithmic-ideas section.
+
+When KB is small (<10 runs) and the frontier is sparse, suggest
+`/expand-kb` (the "Expand KB" button on the planning page) to add the
+next library batch and re-run the analysis.
+
+> *Future tools (not yet implemented)* — once the KB grows past ~100
+> runs, `list_plan_runs(limit=50)` won't capture the full picture. We
+> plan to add `query_kb_runs(filters, sort, limit)` for parametric
+> filtering across all runs and `pareto_kb_runs(maximize, minimize)`
+> for server-side Pareto computation. Defer these until the user's
+> typical KB size exceeds the inline-bulk envelope.
+
 ### Comparative diagnosis — DO NOT just list KPI deltas
 
 Common forms: "why is run X better than Y?", "fill rate dropped — why?",
