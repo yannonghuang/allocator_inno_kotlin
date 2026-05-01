@@ -971,6 +971,29 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       return next;
     });
   };
+
+  // Library baseline: the canonical config every bootstrap preset is varying
+  // from. Showing this once at the top of the dialog + a per-preset DIFF line
+  // is far less misleading than stacking 5 full JSONs that are 95% identical.
+  // Matches the cfg() defaults in CaseBootstrap.kt.
+  const presetDiffSummary = (config: Record<string, unknown>): string => {
+    const ms = (config.method_selection ?? {}) as Record<string, unknown>;
+    const cs = (config.consolidation ?? {}) as Record<string, unknown>;
+    const sw = (ms.score_weights ?? {}) as Record<string, number>;
+    const diffs: string[] = [];
+    if (ms.mode !== 'preference') diffs.push(`mode: preference → ${ms.mode}`);
+    if (Number(ms.max_methods) !== 2) diffs.push(`max_methods: 2 → ${ms.max_methods}`);
+    if (Number(ms.depth) !== 1) diffs.push(`depth: 1 → ${ms.depth}`);
+    if (Number(sw.commit_time) !== 0.4 || Number(sw.inventory_consumed) !== 0.35 || Number(sw.purchase) !== 0.25) {
+      diffs.push(`weights: (${sw.commit_time}, ${sw.inventory_consumed}, ${sw.purchase})`);
+    }
+    if (cs.engine !== 'leaf-legacy') diffs.push(`engine: leaf-legacy → ${cs.engine}`);
+    if (cs.allocation_mode !== 'fair') diffs.push(`allocation_mode: fair → ${cs.allocation_mode}`);
+    if (cs.enabled === false) diffs.push(`consolidation: on → off`);
+    if (Number(cs.period_days) !== 0) diffs.push(`period_days: 0 → ${cs.period_days}`);
+    if (config.purchase_allowed === true) diffs.push(`purchase: off → on`);
+    return diffs.join(' · ');
+  };
   const handleDeleteCoveredRun = async (planRunId: number) => {
     if (!id) return;
     try {
@@ -6355,6 +6378,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   <span style={{ fontSize: '0.75rem', color: '#71717a' }}>{tP('bootstrap.batchSizeHint')}</span>
                 </div>
 
+                <details style={{ marginBottom: '0.5rem', fontSize: '0.75rem', color: '#71717a' }}>
+                  <summary style={{ cursor: 'pointer' }}>
+                    {tP('bootstrap.baselineHeading')}
+                  </summary>
+                  <div style={{ marginTop: '0.25rem', padding: '4px 8px', background: '#0a0a0a', borderRadius: 4, fontFamily: 'monospace', fontSize: '0.7rem', color: '#a1a1aa' }}>
+                    {tP('bootstrap.baselineSummary')}
+                  </div>
+                </details>
                 <div style={{ marginBottom: '0.5rem', fontSize: '0.82rem', color: '#a1a1aa', fontWeight: 600 }}>
                   {tP('bootstrap.nextBatchHeading')}
                 </div>
@@ -6362,24 +6393,28 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   <tbody>
                     {bootstrapPreview.next_batch.map((p) => {
                       const expanded = bootstrapExpandedPresets.has(p.preset_id);
+                      const diff = presetDiffSummary(p.config);
                       return (
                         <React.Fragment key={p.preset_id}>
                           <tr style={{ borderBottom: expanded ? 'none' : '1px solid #27272a' }}>
-                            <td style={{ padding: '4px 6px', width: 18, cursor: 'pointer', color: '#71717a' }}
+                            <td style={{ padding: '4px 6px', width: 18, cursor: 'pointer', color: '#71717a', verticalAlign: 'top' }}
                                 onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
                               {expanded ? '▾' : '▸'}
                             </td>
-                            <td style={{ padding: '4px 6px', fontFamily: 'monospace', color: '#67e8f9', cursor: 'pointer' }}
+                            <td style={{ padding: '4px 6px', fontFamily: 'monospace', color: '#67e8f9', cursor: 'pointer', verticalAlign: 'top', whiteSpace: 'nowrap' }}
                                 onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
                               {p.preset_label}
                             </td>
-                            <td style={{ padding: '4px 6px', color: '#71717a' }}>
-                              <span style={{ fontSize: '0.7rem', background: '#3f3f46', borderRadius: 4, padding: '1px 6px' }}>{p.primary_axis}</span>
+                            <td style={{ padding: '4px 6px', verticalAlign: 'top', whiteSpace: 'nowrap' }}>
+                              <span style={{ fontSize: '0.7rem', background: '#3f3f46', borderRadius: 4, padding: '1px 6px', color: '#a1a1aa' }}>{p.primary_axis}</span>
+                            </td>
+                            <td style={{ padding: '4px 6px', fontFamily: 'monospace', fontSize: '0.72rem', color: diff ? '#fbbf24' : '#52525b', verticalAlign: 'top' }}>
+                              {diff || tP('bootstrap.noDiff')}
                             </td>
                           </tr>
                           {expanded && (
                             <tr style={{ borderBottom: '1px solid #27272a' }}>
-                              <td colSpan={3} style={{ padding: '0 6px 6px 26px' }}>
+                              <td colSpan={4} style={{ padding: '0 6px 6px 26px' }}>
                                 <pre style={{
                                   margin: 0, fontSize: '0.68rem', color: '#a1a1aa',
                                   background: '#0a0a0a', padding: '6px 8px', borderRadius: 4,
@@ -6423,30 +6458,34 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <tbody>
                         {bootstrapPreview.already_run.map((p) => {
                           const expanded = bootstrapExpandedPresets.has(p.preset_id);
+                          const diff = presetDiffSummary(p.config);
                           return (
                             <React.Fragment key={p.preset_id}>
                               <tr style={{ borderBottom: expanded ? 'none' : '1px solid #27272a' }}>
-                                <td style={{ padding: '4px 6px', width: 18, cursor: 'pointer', color: '#71717a' }}
+                                <td style={{ padding: '4px 6px', width: 18, cursor: 'pointer', color: '#71717a', verticalAlign: 'top' }}
                                     onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
                                   {expanded ? '▾' : '▸'}
                                 </td>
-                                <td style={{ padding: '4px 6px', fontFamily: 'monospace', color: '#a1a1aa', cursor: 'pointer' }}
+                                <td style={{ padding: '4px 6px', fontFamily: 'monospace', color: '#a1a1aa', cursor: 'pointer', verticalAlign: 'top', whiteSpace: 'nowrap' }}
                                     onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
                                   {p.preset_label}
                                 </td>
-                                <td style={{ padding: '4px 6px' }}>
+                                <td style={{ padding: '4px 6px', verticalAlign: 'top', whiteSpace: 'nowrap' }}>
                                   <span style={{ fontSize: '0.66rem', background: '#3f3f46', borderRadius: 4, padding: '1px 6px', color: '#a1a1aa' }}>{p.primary_axis}</span>
                                 </td>
-                                <td style={{ padding: '4px 6px', color: '#a78bfa', textAlign: 'right' }}>
+                                <td style={{ padding: '4px 6px', fontFamily: 'monospace', fontSize: '0.68rem', color: diff ? '#fbbf24' : '#52525b', verticalAlign: 'top' }}>
+                                  {diff || tP('bootstrap.noDiff')}
+                                </td>
+                                <td style={{ padding: '4px 6px', color: '#a78bfa', textAlign: 'right', verticalAlign: 'top' }}>
                                   {p.fill_rate_pct != null ? `${p.fill_rate_pct.toFixed(1)}%` : '–'}
                                 </td>
-                                <td style={{ padding: '4px 6px' }}>
-                                  {p.soundness_status === 'sound' && <span style={{ color: '#34d399', fontSize: '0.7rem' }}>✓ sound</span>}
-                                  {p.soundness_status === 'unsound' && <span style={{ color: '#f87171', fontSize: '0.7rem' }}>✗ unsound</span>}
+                                <td style={{ padding: '4px 6px', verticalAlign: 'top' }}>
+                                  {p.soundness_status === 'sound' && <span style={{ color: '#34d399', fontSize: '0.7rem' }}>✓</span>}
+                                  {p.soundness_status === 'unsound' && <span style={{ color: '#f87171', fontSize: '0.7rem' }}>✗</span>}
                                   {p.soundness_status === 'unchecked' && <span style={{ color: '#71717a', fontSize: '0.7rem' }}>—</span>}
                                   {p.soundness_status === 'error' && <span style={{ color: '#fbbf24', fontSize: '0.7rem' }}>err</span>}
                                 </td>
-                                <td style={{ padding: '4px 6px', textAlign: 'right' }}>
+                                <td style={{ padding: '4px 6px', textAlign: 'right', verticalAlign: 'top' }}>
                                   {p.plan_run_id != null && (
                                     <button type="button"
                                       onClick={() => handleDeleteCoveredRun(p.plan_run_id!)}
@@ -6463,7 +6502,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               </tr>
                               {expanded && (
                                 <tr style={{ borderBottom: '1px solid #27272a' }}>
-                                  <td colSpan={6} style={{ padding: '0 6px 6px 26px' }}>
+                                  <td colSpan={7} style={{ padding: '0 6px 6px 26px' }}>
                                     <pre style={{
                                       margin: 0, fontSize: '0.66rem', color: '#a1a1aa',
                                       background: '#0a0a0a', padding: '6px 8px', borderRadius: 4,
