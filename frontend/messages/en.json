@@ -319,7 +319,7 @@
       "buttonTooltip": "Run a curated batch of plan-config experiments to expand this case's knowledge base (~2 min/run, default 5 runs/batch). Each batch picks configs the case hasn't tried yet, spread across method-selection, regulation scope, allocation mode, consolidation, purchase, and elaborate axes — so the planning agent has comparative evidence on every load-bearing knob. Repeatable: each click adds another batch.",
       "title": "Expand knowledge base",
       "intro": "Run a curated batch of plan configs to expand this case's KB with comparative data for the planning agent. Each run takes ~2 min on case-171.",
-      "coverage": "Curated library: {covered} / {total} presets covered. (The KB itself is open-ended — every plan run for this case counts.)",
+      "coverage": "Curated library: {covered} presets covered for this case so far.",
       "exhausted": "All {total} curated library presets are already covered for this case. Use the planning agent for ad-hoc explorations.",
       "batchSizeLabel": "Batch size",
       "batchSizeHint": "Number of presets to run in this batch (1–15).",
