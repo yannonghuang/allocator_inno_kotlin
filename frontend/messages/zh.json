@@ -9,6 +9,7 @@
     "remove": "移除",
     "send": "发送",
     "show": "查看",
+    "clear": "清除",
     "refresh": "刷新",
     "error": "错误",
     "notFound": "未找到",
@@ -396,6 +397,8 @@
       "filterPurchaseOnly": "仅采购订单（方法 = 采购）",
       "filterMoveOnly": "仅调拨订单（方法 = 调拨）",
       "filterHasOverride": "仅显示有手工覆盖的生产订单",
+      "filterPeggedOnly": "仅相关订单",
+      "filterPeggedOnlyTooltip": "仅显示选中的生产订单及其上下游相关订单",
       "filterPlaceholder": "按产品、地点、方法筛选…",
       "shared": "共享",
       "columns": {
@@ -404,6 +407,7 @@
         "prodArea": "PROD_AREA",
         "requested": "请求数量",
         "committed": "已承诺",
+        "schedule": "排程",
         "startTime": "开始时间",
         "endTime": "结束时间",
         "method": "方法",
@@ -413,6 +417,20 @@
         "pegging": "追溯",
         "explain": "解释",
         "override": "覆盖"
+      },
+      "scheduleHorizon": {
+        "weekly": "周",
+        "monthly": "月",
+        "quarterly": "季度"
+      },
+      "layout": {
+        "label": "布局：",
+        "data": "数据",
+        "split": "并列",
+        "timeline": "时间轴",
+        "dataTooltip": "隐藏排程列；数据列占满全宽",
+        "splitTooltip": "数据列和排程并列显示",
+        "timelineTooltip": "隐藏数据列；排程占满全宽"
       },
       "overrideMethod": "方法",
       "overrideSplit": "拆分"

@@ -86,6 +86,7 @@ import {
   type BootstrapPreview,
   type BootstrapJobStatus,
 } from '@/lib/api';
+import { computeHorizon, ScheduleBar, ScheduleHorizonRuler } from './_workOrderSchedule';
 
 type SupplySuggestion = {
   id: string;
@@ -303,7 +304,7 @@ export function PlanKpiDashboard({
         {card(tK('procurement'), [
           { label: tK('orders'), value: String(proc.order_count ?? 0) },
           { label: tK('totalQuantity'), value: qtyFmt(Number(proc.total_quantity ?? 0)) },
-        ], '#f59e0b')}
+        ], '#22c55e')}
         {card(tK('manufacturing'), [
           { label: tK('orders'), value: String(mfg.order_count ?? 0) },
           { label: tK('totalQuantity'), value: qtyFmt(Number(mfg.total_quantity ?? 0)) },
@@ -311,7 +312,7 @@ export function PlanKpiDashboard({
         {card(tK('logistics'), [
           { label: tK('orders'), value: String(log.order_count ?? 0) },
           { label: tK('totalQuantity'), value: qtyFmt(Number(log.total_quantity ?? 0)) },
-        ], '#06b6d4')}
+        ], '#f59e0b')}
       </div>
     </div>
   );
@@ -910,6 +911,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planWoMoveOnly, setPlanWoMoveOnly] = useState(false);
   const [planWoHasOverride, setPlanWoHasOverride] = useState(false);
   const [planWoPivot, setPlanWoPivot] = useState<'none' | 'prod_area' | 'location' | 'nested' | 'demand'>('none');
+  const [planWoLayoutMode, setPlanWoLayoutMode] = useState<'data' | 'split' | 'timeline'>('split');
+  const [woPegHighlightRow, setWoPegHighlightRow] = useState<WoEnrichedRow | null>(null);
+  const [woPegFilterPeggedOnly, setWoPegFilterPeggedOnly] = useState(true);
   const [planWoPivotExpanded, setPlanWoPivotExpanded] = useState<Set<string>>(new Set());
   const [planWoPivotSubExpanded, setPlanWoPivotSubExpanded] = useState<Set<string>>(new Set());
   const [woExpandedKeys, setWoExpandedKeys] = useState<Set<string>>(new Set());
@@ -2090,6 +2094,75 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     order.forEach((k, i) => { if (!map.has(k)) map.set(k, i); });
     return map;
   }, [planResult]);
+
+  // Direct-edge graph of WO → tree-parent WOs (downstream consumers) and tree-child WOs (upstream suppliers).
+  // Key format matches pegOrderMap: "demandId|productId|locationId|method".
+  const woPegRelations = useMemo(() => {
+    const parentMap = new Map<string, Set<string>>(); // childKey → set of parent (downstream) keys
+    const childMap = new Map<string, Set<string>>();  // parentKey → set of child (upstream) keys
+    function visit(node: PlanningPeggingNode, ancestorWoKey: string | null, demandId: string) {
+      const nodeDemand = node.demand_id ?? demandId;
+      let myKey: string | null = null;
+      if (node.type === 'work_order') {
+        myKey = `${nodeDemand}|${node.product_id ?? ''}|${node.location_id ?? ''}|${node.method ?? ''}`;
+        if (ancestorWoKey) {
+          if (!parentMap.has(myKey)) parentMap.set(myKey, new Set());
+          parentMap.get(myKey)!.add(ancestorWoKey);
+          if (!childMap.has(ancestorWoKey)) childMap.set(ancestorWoKey, new Set());
+          childMap.get(ancestorWoKey)!.add(myKey);
+        }
+      }
+      const nextAncestor = myKey ?? ancestorWoKey;
+      for (const child of node.children ?? []) visit(child, nextAncestor, nodeDemand);
+    }
+    for (const entry of planResult?.planning_pegging ?? []) {
+      visit(entry.tree, null, entry.demand_id ?? '');
+    }
+    return { parentMap, childMap };
+  }, [planResult]);
+
+  // 4-part WO keys for a row, considering multi-demand consolidation.
+  const woRowPegKeys = useCallback((r: WoEnrichedRow): string[] => {
+    const ids = (r._demand_ids?.length ? r._demand_ids : [r.demand_id ?? ''])
+      .filter((d): d is string => d != null);
+    return ids.map((d) => `${d}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`);
+  }, []);
+
+  // Transitive ancestor / descendant sets for the highlighted WO row.
+  // ancestors = downstream (consumers, closer to demand), descendants = upstream (suppliers).
+  const woPegHighlightSets = useMemo(() => {
+    const ancestors = new Set<string>();
+    const descendants = new Set<string>();
+    if (!woPegHighlightRow) return { ancestors, descendants };
+    const seedKeys = woRowPegKeys(woPegHighlightRow);
+    const bfs = (start: string, edges: Map<string, Set<string>>, out: Set<string>) => {
+      const queue = [start];
+      while (queue.length) {
+        const k = queue.shift()!;
+        const next = edges.get(k);
+        if (!next) continue;
+        next.forEach((n) => { if (!out.has(n)) { out.add(n); queue.push(n); } });
+      }
+    };
+    for (const sk of seedKeys) {
+      bfs(sk, woPegRelations.parentMap, ancestors);
+      bfs(sk, woPegRelations.childMap, descendants);
+    }
+    return { ancestors, descendants };
+  }, [woPegHighlightRow, woPegRelations, woRowPegKeys]);
+
+  // Clear highlight if the highlighted row no longer exists in the new plan run.
+  useEffect(() => {
+    if (woPegHighlightRow && planResult) {
+      const stillExists = planResult.work_orders?.some((w) =>
+        w.product_id === woPegHighlightRow.product_id
+          && w.location_id === woPegHighlightRow.location_id
+          && (w.method ?? '') === (woPegHighlightRow.method ?? '')
+          && (w.demand_id ?? '') === (woPegHighlightRow.demand_id ?? ''),
+      );
+      if (!stillExists) setWoPegHighlightRow(null);
+    }
+  }, [planResult, woPegHighlightRow]);
 
   /**
    * Invert demand-centric planning_pegging trees into a supply-centric map.
@@ -3731,77 +3804,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       {caseSection === 'planning' && (
       <section>
         <h2>{tSec('planning')}</h2>
-        <p style={{ fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
-          {tP('info')} <strong>{tP('infoConfigureLink')}</strong> {tP('infoSuffix')}
-        </p>
-
-        {/* ── Overrides management panel ─────────────────────────────────────── */}
-        <details style={{ marginBottom: '1rem', border: '1px solid #3d3d40', borderRadius: 6, padding: '0.5rem 0.75rem' }}>
-          <summary style={{ cursor: 'pointer', fontSize: '0.9rem', fontWeight: 600, color: '#e4e4e7', userSelect: 'none' }}>
-            {tP('overridesPanel.title')} {overrides.length > 0 && <span style={{ marginLeft: 6, background: '#3b82f6', color: '#fff', borderRadius: 10, padding: '1px 7px', fontSize: '0.75rem' }}>{overrides.length}</span>}
-          </summary>
-          <div style={{ marginTop: '0.75rem' }}>
-            <p style={{ fontSize: '0.8rem', color: '#a1a1aa', marginBottom: '0.75rem' }}>
-              {tP('overridesPanel.info')}
-            </p>
-            {overrides.length === 0 && (
-              <p style={{ fontSize: '0.85rem', color: '#52525b', marginBottom: '0.5rem' }}>{tP('overridesPanel.noOverrides')}</p>
-            )}
-            {overrides.length > 0 && (
-              <table style={{ width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse', marginBottom: '0.75rem' }}>
-                <thead>
-                  <tr style={{ color: '#a1a1aa', textAlign: 'left', borderBottom: '1px solid #3d3d40' }}>
-                    <th style={{ paddingBottom: '0.3rem', paddingRight: '0.75rem' }}>{tP('overridesPanel.columns.type')}</th>
-                    <th style={{ paddingBottom: '0.3rem', paddingRight: '0.75rem' }}>{tP('overridesPanel.columns.entityKey')}</th>
-                    <th style={{ paddingBottom: '0.3rem', paddingRight: '0.75rem' }}>{tP('overridesPanel.columns.payload')}</th>
-                    <th style={{ paddingBottom: '0.3rem' }}></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {overrides.map((ov) => (
-                    <tr key={ov.id} style={{ borderTop: '1px solid #27272a' }}>
-                      <td style={{ padding: '0.3rem 0.75rem 0.3rem 0', color: '#67e8f9' }}>{ov.entity_type}</td>
-                      <td style={{ padding: '0.3rem 0.75rem 0.3rem 0', color: '#d4d4d8' }}>{ov.entity_key}</td>
-                      <td style={{ padding: '0.3rem 0.75rem 0.3rem 0', color: '#a1a1aa', maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {JSON.stringify(ov.payload)}
-                      </td>
-                      <td style={{ padding: '0.3rem 0', whiteSpace: 'nowrap' }}>
-                        <button type="button" className="secondary" style={{ fontSize: '0.75rem', padding: '2px 8px' }} onClick={() => handleDeleteOverride(ov.id)}>{tc('remove')}</button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-            {/* Manual JSON override form */}
-            <details style={{ fontSize: '0.8rem' }}>
-              <summary style={{ cursor: 'pointer', color: '#71717a' }}>{tP('overridesPanel.addManually')}</summary>
-              <div style={{ marginTop: '0.5rem', display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'flex-end' }}>
-                <select
-                  value={overrideForm.entity_type}
-                  onChange={(e) => setOverrideForm({ ...overrideForm, entity_type: e.target.value })}
-                  style={{ padding: '4px 8px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem' }}
-                >
-                  <option value="method_selection">method_selection</option>
-                  <option value="component_split">component_split</option>
-                </select>
-                <input
-                  placeholder={tP('overridesPanel.entityKeyPlaceholder')}
-                  value={overrideForm.entity_key}
-                  onChange={(e) => setOverrideForm({ ...overrideForm, entity_key: e.target.value })}
-                  style={{ padding: '4px 8px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem', minWidth: 240 }}
-                />
-                <input
-                  placeholder={tP('overridesPanel.payloadPlaceholder')}
-                  value={overrideForm.payload}
-                  onChange={(e) => setOverrideForm({ ...overrideForm, payload: e.target.value })}
-                  style={{ padding: '4px 8px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem', minWidth: 200 }}
-                />
-                <button type="button" className="secondary" style={{ fontSize: '0.8rem' }} onClick={handleAddOverride}>{tc('add')}</button>
-              </div>
-            </details>
-          </div>
-        </details>
         <div style={{ marginBottom: '0.75rem' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap', marginBottom: '0.5rem' }}>
             <span style={{ color: '#a1a1aa', fontSize: '0.875rem' }}>{tP('config.methodSelection')}</span>
@@ -4722,6 +4724,56 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       Demand
                     </button>
                   </div>
+                  {/* ── Layout selector (Data / Split / Timeline) ── */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
+                    <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>{tP('workOrders.layout.label')}</span>
+                    {(['data', 'split', 'timeline'] as const).map((mode) => {
+                      const label = mode === 'data' ? tP('workOrders.layout.data')
+                        : mode === 'split' ? tP('workOrders.layout.split')
+                          : tP('workOrders.layout.timeline');
+                      const tooltip = mode === 'data' ? tP('workOrders.layout.dataTooltip')
+                        : mode === 'split' ? tP('workOrders.layout.splitTooltip')
+                          : tP('workOrders.layout.timelineTooltip');
+                      return (
+                        <button
+                          key={mode}
+                          type="button"
+                          className={planWoLayoutMode === mode ? '' : 'secondary'}
+                          style={{ fontSize: '0.75rem', padding: '2px 10px' }}
+                          onClick={() => setPlanWoLayoutMode(mode)}
+                          title={tooltip}
+                        >
+                          {label}
+                        </button>
+                      );
+                    })}
+                    {woPegHighlightRow && (
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.75rem', color: '#a1a1aa', marginLeft: '0.5rem' }}>
+                        <span>
+                          <span style={{ color: '#e4e4e7' }}>{woPegHighlightRow.product_id}</span>
+                          {' @ '}
+                          <span style={{ color: '#e4e4e7' }}>{woPegHighlightRow.location_id}</span>
+                          {' · '}
+                          <span style={{ color: '#ec4899' }}>↓ {woPegHighlightSets.ancestors.size}</span>
+                          {' · '}
+                          <span style={{ color: '#6366f1' }}>↑ {woPegHighlightSets.descendants.size}</span>
+                        </span>
+                        <button
+                          type="button"
+                          className={woPegFilterPeggedOnly ? '' : 'secondary'}
+                          style={{ fontSize: '0.7rem', padding: '1px 8px' }}
+                          onClick={() => setWoPegFilterPeggedOnly((v) => !v)}
+                          title={tP('workOrders.filterPeggedOnlyTooltip')}
+                        >{tP('workOrders.filterPeggedOnly')}</button>
+                        <button
+                          type="button"
+                          className="secondary"
+                          style={{ fontSize: '0.7rem', padding: '1px 8px' }}
+                          onClick={() => { setWoPegHighlightRow(null); setWoPegFilterPeggedOnly(false); }}
+                        >{tc('clear')}</button>
+                      </span>
+                    )}
+                  </div>
                   {planResult.work_orders.length > 0 && (() => {
                     const workOrdersFiltered = planWorkOrderHideDummyProdArea
                       ? planResult.work_orders.filter((r) => (r.prod_area ?? '').trim().toLowerCase() !== 'dummy')
@@ -4890,10 +4942,26 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         _shortage: shortage > 0 ? shortage : undefined,
                       };
                     });
-                    const woRows: WoEnrichedRow[] = planDemandShortOnly
+                    let woRows: WoEnrichedRow[] = planDemandShortOnly
                       ? woRowsAll.filter((r) => (r._shortage ?? 0) > 0.01)
                       : woRowsAll;
-                    const woColumns: { key: string; label: string; sortable?: boolean; render?: (r: WoEnrichedRow) => React.ReactNode }[] = [
+                    if (woPegHighlightRow && woPegFilterPeggedOnly) {
+                      const allowed = new Set<string>();
+                      woRowPegKeys(woPegHighlightRow).forEach((k) => allowed.add(k));
+                      woPegHighlightSets.ancestors.forEach((k) => allowed.add(k));
+                      woPegHighlightSets.descendants.forEach((k) => allowed.add(k));
+                      woRows = woRows.filter((r) => woRowPegKeys(r).some((k) => allowed.has(k)));
+                    }
+                    const horizon = computeHorizon(woRows);
+                    const woColumns: {
+                      key: string;
+                      label: string;
+                      sortable?: boolean;
+                      render?: (r: WoEnrichedRow) => React.ReactNode;
+                      width?: string;
+                      headerRender?: () => React.ReactNode;
+                      sortValue?: (r: WoEnrichedRow, dir: 'asc' | 'desc') => unknown;
+                    }[] = [
                       { key: 'product_id', label: tP('workOrders.columns.product'), sortable: true },
                       { key: 'location_id', label: tP('workOrders.columns.location'), sortable: true },
                       { key: '_prod_area', label: tP('workOrders.columns.prodArea'), sortable: true, render: (r) => r._prod_area || r.prod_area || '–' },
@@ -4901,8 +4969,63 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         r._requested_qty != null ? qtyFmt(Number(r._requested_qty)) : '–'
                       },
                       { key: 'quantity', label: tP('workOrders.columns.committed'), sortable: true, render: (r) => qtyFmt(Number(r.quantity)) },
-                      { key: 'start_time', label: tP('workOrders.columns.startTime'), sortable: true, render: (r) => r.start_time ?? '–' },
-                      { key: 'end_time', label: tP('workOrders.columns.endTime'), sortable: true, render: (r) => r.end_time ?? '–' },
+                      {
+                        key: '_schedule',
+                        label: tP('workOrders.columns.schedule'),
+                        sortable: true,
+                        width: '34%',
+                        sortValue: (r: WoEnrichedRow, dir) => {
+                          // Multi-level lexicographic sort encoded into one string. SortFilterTable
+                          // uses asc-then-negate, so character-by-character compare gives the
+                          // multi-level effect. PROD_AREA = "dummy" is the dummy classifier.
+                          //
+                          // UP   (asc): start asc → dummy-first at start tie → end asc → others-first at end tie.
+                          // DOWN (desc): end desc → dummy-first at end tie → start desc → others-first at start tie.
+                          //
+                          // Tie-indicator encoding flips with direction because negate inverts ordering:
+                          //   asc dummy-first  → dummy='0', non='1' (smaller = first in asc)
+                          //   asc others-first → non='0',   dummy='1'
+                          //   desc dummy-first → dummy='1', non='0' (larger = first in desc)
+                          //   desc others-first→ non='1',   dummy='0'
+                          const isDummy = (r._prod_area || r.prod_area || '').toString().trim().toLowerCase() === 'dummy';
+                          const start = r.start_time ?? '';
+                          const end = r.end_time ?? '';
+                          if (dir === 'asc') {
+                            return `${start}|${isDummy ? '0' : '1'}|${end}|${isDummy ? '1' : '0'}`;
+                          }
+                          return `${end}|${isDummy ? '1' : '0'}|${start}|${isDummy ? '0' : '1'}`;
+                        },
+                        headerRender: horizon
+                          ? () => <ScheduleHorizonRuler horizon={horizon} locale={locale} />
+                          : undefined,
+                        render: (r) => {
+                          if (!horizon) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                          const isSelf = !!woPegHighlightRow
+                            && r.product_id === woPegHighlightRow.product_id
+                            && r.location_id === woPegHighlightRow.location_id
+                            && (r.method ?? '') === (woPegHighlightRow.method ?? '')
+                            && (r.demand_id ?? '') === (woPegHighlightRow.demand_id ?? '')
+                            && (r.start_time ?? '') === (woPegHighlightRow.start_time ?? '');
+                          let colorOverride: string | undefined;
+                          if (woPegHighlightRow && !isSelf) {
+                            const rKeys = woRowPegKeys(r);
+                            if (rKeys.some((rk) => woPegHighlightSets.ancestors.has(rk))) colorOverride = '#ec4899';
+                            else if (rKeys.some((rk) => woPegHighlightSets.descendants.has(rk))) colorOverride = '#6366f1';
+                          }
+                          return (
+                            <ScheduleBar
+                              start={r.start_time}
+                              end={r.end_time}
+                              horizon={horizon}
+                              method={r.method}
+                              locale={locale}
+                              selected={isSelf}
+                              colorOverride={colorOverride}
+                              onClick={() => setWoPegHighlightRow(isSelf ? null : r)}
+                            />
+                          );
+                        },
+                      },
                       { key: 'method', label: tP('workOrders.columns.method'), sortable: true, render: (r) => r.method ?? '–' },
                       { key: '_demand_label', label: tP('workOrders.columns.demand'), sortable: true, render: (r) => {
                         const ids = r._demand_ids ?? [];
@@ -4935,8 +5058,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
                             onClick={(e) => {
                               e.stopPropagation();
-                              if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); }
-                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); }
+                              if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setWoPegHighlightRow(null); }
+                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setWoPegHighlightRow(r); }
                             }}
                           >{tc('show')}</button>
                         );
@@ -4973,6 +5096,26 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         );
                       }},
                     ];
+                    // ── Apply layout mode (data / split / timeline) ──
+                    // 'data':     replace Schedule with start_time + end_time text columns; data spans full width.
+                    // 'split':    keep all columns (default).
+                    // 'timeline': keep only identity (product/location), Schedule, and Actions; Schedule fills the row.
+                    if (planWoLayoutMode === 'data') {
+                      const idx = woColumns.findIndex((c) => c.key === '_schedule');
+                      if (idx >= 0) {
+                        woColumns.splice(idx, 1,
+                          { key: 'start_time', label: tP('workOrders.columns.startTime'), sortable: true, render: (r) => r.start_time ?? '–' },
+                          { key: 'end_time', label: tP('workOrders.columns.endTime'), sortable: true, render: (r) => r.end_time ?? '–' },
+                        );
+                      }
+                    } else if (planWoLayoutMode === 'timeline') {
+                      const keep = new Set(['product_id', 'location_id', '_schedule', '_peg_order', '_explain', '_override']);
+                      for (let i = woColumns.length - 1; i >= 0; i--) {
+                        if (!keep.has(woColumns[i].key)) woColumns.splice(i, 1);
+                      }
+                      const sched = woColumns.find((c) => c.key === '_schedule');
+                      if (sched) sched.width = '100%';
+                    }
                     // ── Demand-pivot column set ──
                     // • Drop _requested_qty, _shortage, _demand_label: the group header already
                     //   shows demand-level totals, and per-WO Requested/Shortage (WO-scoped) would
@@ -5020,6 +5163,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
                       if (woExplainKey === k) return { background: 'rgba(167,139,250,0.15)', outline: '1px solid rgba(167,139,250,0.4)' };
                       if (woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
+                      // Pegging-graph highlight (driven by woPegHighlightRow / bar click or Show button).
+                      if (woPegHighlightRow) {
+                        const isSelf = r === woPegHighlightRow
+                          || (r.product_id === woPegHighlightRow.product_id
+                            && r.location_id === woPegHighlightRow.location_id
+                            && (r.method ?? '') === (woPegHighlightRow.method ?? '')
+                            && (r.demand_id ?? '') === (woPegHighlightRow.demand_id ?? '')
+                            && (r.start_time ?? '') === (woPegHighlightRow.start_time ?? ''));
+                        if (isSelf) return { background: 'rgba(56,189,248,0.18)', outline: '1px solid rgba(56,189,248,0.5)' };
+                        const rKeys = woRowPegKeys(r);
+                        const isAncestor = rKeys.some((rk) => woPegHighlightSets.ancestors.has(rk));
+                        const isDescendant = rKeys.some((rk) => woPegHighlightSets.descendants.has(rk));
+                        if (isAncestor) return { background: 'rgba(236,72,153,0.10)', borderLeft: '3px solid #ec4899' };
+                        if (isDescendant) return { background: 'rgba(99,102,241,0.10)', borderLeft: '3px solid #6366f1' };
+                      }
                       if (!r.override_active && !r.consolidation_override_active && woHasSavedOverride(r)) return { borderLeft: '3px solid #b45309' };
                       return undefined;
                     };

@@ -9,6 +9,7 @@
     "remove": "Remove",
     "send": "Send",
     "show": "Show",
+    "clear": "Clear",
     "refresh": "Refresh",
     "error": "Error",
     "notFound": "Not found",
@@ -396,6 +397,8 @@
       "filterPurchaseOnly": "Purchase orders only (method = buy/purchase)",
       "filterMoveOnly": "Move orders only (method = move)",
       "filterHasOverride": "Only work orders with a saved override",
+      "filterPeggedOnly": "Pegged only",
+      "filterPeggedOnlyTooltip": "Show only the selected work order and its upstream/downstream pegged work orders",
       "filterPlaceholder": "Filter by product, location, method…",
       "shared": "shared",
       "columns": {
@@ -404,6 +407,7 @@
         "prodArea": "PROD_AREA",
         "requested": "Requested",
         "committed": "Committed",
+        "schedule": "Schedule",
         "startTime": "Start time",
         "endTime": "End time",
         "method": "Method",
@@ -413,6 +417,20 @@
         "pegging": "Pegging",
         "explain": "Explain",
         "override": "Override"
+      },
+      "scheduleHorizon": {
+        "weekly": "Weekly",
+        "monthly": "Monthly",
+        "quarterly": "Quarterly"
+      },
+      "layout": {
+        "label": "Layout:",
+        "data": "Data",
+        "split": "Split",
+        "timeline": "Timeline",
+        "dataTooltip": "Hide the Schedule column; show data columns full width",
+        "splitTooltip": "Show data columns and Schedule side-by-side",
+        "timelineTooltip": "Hide data columns; show Schedule full width"
       },
       "overrideMethod": "Method",
       "overrideSplit": "Split"

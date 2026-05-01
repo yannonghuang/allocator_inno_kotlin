@@ -7,6 +7,16 @@ export type Column<T> = {
   label: string;
   render?: (row: T) => React.ReactNode;
   sortable?: boolean;
+  /** Optional explicit column width (CSS), e.g. "36%" or "120px". */
+  width?: string;
+  /** Optional custom header content (overrides plain label rendering). The sort button still wraps it when sortable. */
+  headerRender?: () => React.ReactNode;
+  /**
+   * Optional custom sort value. When provided, this is used instead of `row[key]`
+   * for comparison. The sort direction is passed so a column can sort by a different
+   * field for asc vs desc (e.g. asc by start_time, desc by end_time).
+   */
+  sortValue?: (row: T, dir: 'asc' | 'desc') => unknown;
 };
 
 type Props<T> = {
@@ -68,9 +78,10 @@ export function SortFilterTable<T extends Record<string, unknown>>({
 
   const sorted = useMemo(() => {
     if (!sortKey) return filtered;
+    const sortCol = columns.find((c) => c.key === sortKey);
     return [...filtered].sort((a, b) => {
-      const va = a[sortKey];
-      const vb = b[sortKey];
+      const va = sortCol?.sortValue ? sortCol.sortValue(a, sortDir) : a[sortKey];
+      const vb = sortCol?.sortValue ? sortCol.sortValue(b, sortDir) : b[sortKey];
       const aNum = typeof va === 'number' ? va : Number(va);
       const bNum = typeof vb === 'number' ? vb : Number(vb);
       if (!Number.isNaN(aNum) && !Number.isNaN(bNum)) {
@@ -81,7 +92,7 @@ export function SortFilterTable<T extends Record<string, unknown>>({
       const cmp = aStr.localeCompare(bStr);
       return sortDir === 'asc' ? cmp : -cmp;
     });
-  }, [filtered, sortKey, sortDir]);
+  }, [filtered, sortKey, sortDir, columns]);
 
   const handleSort = (key: keyof T | string) => {
     if (sortKey === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
@@ -123,41 +134,56 @@ export function SortFilterTable<T extends Record<string, unknown>>({
                   }}
                 />
               )}
-              {columns.map((col) => (
-                <th
-                  key={String(col.key)}
-                  style={
-                    stickyHeader
-                      ? {
-                          position: 'sticky',
-                          top: 0,
-                          zIndex: 1,
-                          background: '#1c1c1e',
-                          boxShadow: '0 1px 0 0 #3d3d40',
-                        }
-                      : undefined
-                  }
-                >
-                  {col.sortable !== false ? (
-                    <button
-                      type="button"
-                      onClick={() => handleSort(col.key)}
-                      style={{
-                        background: 'none',
-                        border: 'none',
-                        color: 'inherit',
-                        cursor: 'pointer',
-                        padding: 0,
-                        fontWeight: sortKey === col.key ? 'bold' : 'normal',
-                      }}
-                    >
-                      {col.label} {sortKey === col.key ? (sortDir === 'asc' ? '↑' : '↓') : ''}
-                    </button>
-                  ) : (
-                    col.label
-                  )}
-                </th>
-              ))}
+              {columns.map((col) => {
+                const baseStyle: React.CSSProperties = stickyHeader
+                  ? { position: 'sticky', top: 0, zIndex: 1, background: '#1c1c1e', boxShadow: '0 1px 0 0 #3d3d40' }
+                  : {};
+                if (col.width) baseStyle.width = col.width;
+                const headerContent = col.headerRender ? col.headerRender() : col.label;
+                const isSortable = col.sortable !== false;
+                const sortIndicator = sortKey === col.key ? (sortDir === 'asc' ? '↑' : '↓') : '';
+                if (col.headerRender) {
+                  // Custom header (e.g. schedule ruler): render at full th width via a
+                  // block-level wrapper div (avoids `position: relative` on the table-cell
+                  // itself, which has quirky width behavior) and overlay a corner sort
+                  // indicator so the headerRender content keeps the column's exact extent.
+                  return (
+                    <th key={String(col.key)} style={baseStyle}>
+                      <div
+                        style={{ position: 'relative', display: 'block', width: '100%', cursor: isSortable ? 'pointer' : undefined }}
+                        onClick={isSortable ? () => handleSort(col.key) : undefined}
+                      >
+                        {headerContent}
+                        {isSortable && sortIndicator && (
+                          <span style={{ position: 'absolute', top: 0, right: 4, fontSize: 11, fontWeight: 'bold' }}>{sortIndicator}</span>
+                        )}
+                      </div>
+                    </th>
+                  );
+                }
+                return (
+                  <th key={String(col.key)} style={baseStyle}>
+                    {isSortable ? (
+                      <button
+                        type="button"
+                        onClick={() => handleSort(col.key)}
+                        style={{
+                          background: 'none',
+                          border: 'none',
+                          color: 'inherit',
+                          cursor: 'pointer',
+                          padding: 0,
+                          fontWeight: sortKey === col.key ? 'bold' : 'normal',
+                        }}
+                      >
+                        {headerContent} {sortIndicator}
+                      </button>
+                    ) : (
+                      headerContent
+                    )}
+                  </th>
+                );
+              })}
             </tr>
           </thead>
           <tbody>
