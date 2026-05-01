@@ -299,19 +299,21 @@ waterfall replaced proportional split" / "Empirical sweet spot" sections
 is a starting point, but the user's actual case may have different
 characteristics — always check their prior runs.
 
-**Knowledge base = every plan run for this case.** Bootstrap-seeded runs
+**Knowledge base = every plan run for this case.** Library-seeded runs
 (those with `metadata.bootstrap = true` and a `preset_id` like `max=2`,
-`elaborate-commit`, `all-levels`) are a curated single-axis exploration
-that a fresh case can use as scaffolding. User-driven runs (regular plans
-the user fired) are equally part of the KB — both feed
-`list_plan_runs(status='success')`. Treat them uniformly when grounding
-evidence; the bootstrap tag is provenance, not a filter for what counts.
+`elaborate-commit`, `all-levels`) come from the curated single-axis
+library and are useful as scaffolding for comparative evidence.
+User-driven runs (regular plans the user fired) are equally part of the
+KB — both feed `list_plan_runs(status='success')`. Treat them uniformly
+when grounding evidence; the `metadata.bootstrap` tag is provenance, not
+a filter for what counts.
 
-If `list_plan_runs` returns an empty or near-empty result on a fresh case,
-suggest the user click "Bootstrap KB" on the planning page — that fires
-the next 5-6 unrun curated configs and is the fastest way to seed
-comparative data. Don't suggest bootstrap if the user already has 10+
-runs; their KB is established.
+If `list_plan_runs` returns an empty or sparse result on a case,
+suggest the user click "Expand KB" on the planning page — that fires
+the next 5–6 unrun curated configs and is the fastest way to add
+comparative coverage. Each click adds another batch (the library has
+~15 single-axis presets total); the KB itself has no cap and grows
+with every plan run.
 
 When checking a prior run's relevance: same case, same `purchase_allowed`,
 same general consolidation shape. Don't compare a run with consolidation
