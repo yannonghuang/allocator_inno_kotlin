@@ -188,34 +188,30 @@ object CaseBootstrap {
         return picked
     }
 
-    /** Signatures of every plan_run for this case. Bootstrap-tagged runs are
-     *  matched directly via metadata.preset_id; user-driven runs are matched
-     *  by computing a config signature from the stored plan_run.config and
-     *  comparing against each preset's signature.
+    /** Signatures considered "covered" for next-batch dedup. Two sources:
      *
-     *  This way, if a user already ran a config that happens to match a
-     *  preset (e.g. they manually set max=2 + leaves-only + fair before
-     *  ever clicking bootstrap), bootstrap won't queue a redundant run. */
+     *   1. kb_records — the dissociated KB store. A row here means we have a
+     *      KPI snapshot regardless of whether the source plan_run still exists.
+     *   2. Non-failed plan_runs — user-driven runs that match a preset
+     *      signature should also dedup (don't re-queue what the user already
+     *      tried manually) even if they haven't been promoted to a kb_record.
+     *
+     *  Failed plan_runs do NOT count: bootstrap should retry them next click.
+     */
     private fun listCoveredSignatures(caseId: Int): Set<String> = transaction {
-        // What counts as "covered" for dedup purposes:
-        //   • success / ready / contingent — config produced a real result; the
-        //     KB has data for it. Don't re-queue.
-        //   • running — already in flight; queuing a duplicate would just
-        //     compete with itself.
-        //   • failed — open question. The failure may be transient (planner
-        //     crash, resource issue) or fundamental, but either way the
-        //     attempted config has no KPI data in the KB. Bootstrap should
-        //     give it another shot, so we DO NOT count failed runs as covered.
-        // Deleted runs naturally drop out of this table (intentional).
-        val rows = PlanRuns.selectAll()
+        val planRunSigs = PlanRuns.selectAll()
             .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status neq "failed") }
             .toList()
-        rows.mapNotNull { row ->
-            val configRaw = row[PlanRuns.config] ?: return@mapNotNull null
-            val cfg = runCatching { kotlinx.serialization.json.Json.parseToJsonElement(configRaw).jsonObject }
-                .getOrNull() ?: return@mapNotNull null
-            signatureFor(cfg)
-        }.toSet()
+            .mapNotNull { row ->
+                val configRaw = row[PlanRuns.config] ?: return@mapNotNull null
+                val cfg = runCatching { kotlinx.serialization.json.Json.parseToJsonElement(configRaw).jsonObject }
+                    .getOrNull() ?: return@mapNotNull null
+                signatureFor(cfg)
+            }
+        val kbSigs = com.allocator.KbRecords.selectAll()
+            .where { com.allocator.KbRecords.caseId eq caseId }
+            .map { it[com.allocator.KbRecords.signature] }
+        (planRunSigs + kbSigs).toSet()
     }
 
     /** Canonical config signature: a stable string of the load-bearing axes.
@@ -266,94 +262,89 @@ object CaseBootstrap {
         put("config", preset.config)
     }
 
-    /** Same as [toJson] but enriched with the matching plan_run's id and a
-     *  few headline KPIs — used in the dialog's "Already covered" section so
-     *  the user can see fill_rate / soundness at a glance and delete the
-     *  underlying plan_run if they want to retry the preset. */
-    fun toJsonWithRun(preset: BootstrapPreset, run: CoveredRun?): JsonObject = buildJsonObject {
+    /** Same as [toJson] but enriched with the matching KB record — id (for
+     *  the KB delete endpoint), full KPI snapshot, soundness, and the source
+     *  plan_run_id (or its tombstone). Reads from `kb_records` rather than
+     *  `plan_runs`, so coverage survives plan_run deletion. */
+    fun toJsonWithRun(preset: BootstrapPreset, kb: KbStore.KbRecord?): JsonObject = buildJsonObject {
         put("preset_id", preset.presetId)
         put("preset_label", preset.label)
         put("preset_index", preset.index)
         put("primary_axis", preset.primaryAxis)
         put("config", preset.config)
-        if (run != null) {
-            put("plan_run_id", run.id)
-            put("plan_run_status", run.status)
-            put("soundness_status", run.soundnessStatus)
-            if (run.fillRatePct != null) put("fill_rate_pct", run.fillRatePct)
+        put("library", true)
+        if (kb != null) {
+            put("kb_record_id", kb.id)
+            put("soundness_status", kb.soundnessStatus)
+            // Source plan_run pointer (may be null if the run was deleted —
+            // sourcePlanRunDeleted=true distinguishes "never had one" from
+            // "had one, gone now"). Frontend uses this for an optional
+            // "go to plan run" affordance.
+            kb.sourcePlanRunId?.let { put("plan_run_id", it) }
+            put("source_plan_run_deleted", kb.sourcePlanRunDeleted)
+            // Inline the KPI snapshot so the dialog doesn't need a second fetch.
+            val kpis = runCatching { kotlinx.serialization.json.Json.parseToJsonElement(kb.kpisSnapshotJson).jsonObject }
+                .getOrNull() ?: buildJsonObject { }
+            kpis.entries.forEach { (k, v) -> put(k, v) }
         }
     }
 
-    /** Snapshot of a plan_run that covers a library signature. */
-    data class CoveredRun(
-        val id: Int,
-        val status: String,
-        val soundnessStatus: String,
-        val fillRatePct: Double?,
-        val signature: String,
-    )
-
-    /** Per-signature lookup of the *best* covering plan_run. "Best" =
-     *  status=success first; otherwise any non-failed run, latest by id. */
-    private fun listCoveredRuns(caseId: Int): Map<String, CoveredRun> = transaction {
-        val rows = PlanRuns.selectAll()
-            .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status neq "failed") }
-            .toList()
-        val perSig = mutableMapOf<String, CoveredRun>()
-        for (row in rows) {
-            val configRaw = row[PlanRuns.config] ?: continue
-            val cfg = runCatching { kotlinx.serialization.json.Json.parseToJsonElement(configRaw).jsonObject }
-                .getOrNull() ?: continue
-            val sig = signatureFor(cfg)
-            val resultRaw = row[PlanRuns.result]
-            val fillPct: Double? = if (resultRaw.isNullOrBlank()) null else runCatching {
-                val rj = kotlinx.serialization.json.Json.parseToJsonElement(resultRaw).jsonObject
-                ((rj["plan_kpis"] as? JsonObject)
-                    ?.get("delivery") as? JsonObject)
-                    ?.get("fill_rate_pct")
-                    ?.toString()
-                    ?.trim('"')
-                    ?.toDoubleOrNull()
-            }.getOrNull()
-            val newRun = CoveredRun(
-                id = row[PlanRuns.id],
-                status = row[PlanRuns.status],
-                soundnessStatus = row[PlanRuns.soundnessStatus],
-                fillRatePct = fillPct,
-                signature = sig,
-            )
-            // Prefer success status, then latest id among same-status runs.
-            val existing = perSig[sig]
-            if (existing == null
-                || (newRun.status == "success" && existing.status != "success")
-                || (newRun.status == existing.status && newRun.id > existing.id)
-            ) {
-                perSig[sig] = newRun
-            }
-        }
-        perSig
+    /** JSON shape for an off-library KB record (config doesn't match any
+     *  LIBRARY preset). Synthesizes preset-shaped fields from the kb_record
+     *  itself so the frontend can render it in the same table. The `library`
+     *  flag tells the UI to badge it differently. */
+    private fun toJsonOffLibrary(kb: KbStore.KbRecord): JsonObject = buildJsonObject {
+        // No library preset to anchor to; use the source plan_run's name
+        // (carried in kb.presetLabel for bootstrap-tagged rows, null otherwise)
+        // or a truncated signature suffix as a deterministic fallback.
+        val displayLabel = kb.presetLabel
+            ?: ("custom-" + kb.signature.takeLast(6))
+        put("preset_id", kb.presetId ?: kb.signature)
+        put("preset_label", displayLabel)
+        put("preset_index", -1)
+        put("primary_axis", kb.primaryAxis ?: "user-driven")
+        runCatching { kotlinx.serialization.json.Json.parseToJsonElement(kb.configJson).jsonObject }
+            .getOrNull()?.let { put("config", it) }
+        put("library", false)
+        put("kb_record_id", kb.id)
+        put("soundness_status", kb.soundnessStatus)
+        kb.sourcePlanRunId?.let { put("plan_run_id", it) }
+        put("source_plan_run_deleted", kb.sourcePlanRunDeleted)
+        val kpis = runCatching { kotlinx.serialization.json.Json.parseToJsonElement(kb.kpisSnapshotJson).jsonObject }
+            .getOrNull() ?: buildJsonObject { }
+        kpis.entries.forEach { (k, v) -> put(k, v) }
     }
 
-    /** Whole-library status snapshot for a case: which presets are already
-     *  covered (by any plan_run, bootstrap-tagged or user-driven), and which
-     *  would run in the next batch. Frontend uses this to render the confirm
-     *  dialog. The `already_run` items carry the underlying plan_run_id and
-     *  KPIs so the dialog can show fill rate / soundness inline and offer
-     *  delete. */
+    /** Whole-KB status snapshot for a case: every KB record (library + off-
+     *  library) plus the next batch of uncovered library presets. Calls
+     *  KbStore.backfillForCase first so historical successful + sound runs
+     *  surface even if they predate the kb_records table.
+     *
+     *  - already_run         : ALL KB records (library and user-driven configs).
+     *  - already_run_count   : library-aligned subset (preserved for the
+     *                          "expand library coverage" hint).
+     *  - kb_record_count     : total KB rows on this case.
+     *  - next_batch          : library presets not yet covered.
+     */
     fun statusFor(caseId: Int, batchSize: Int = 5): JsonObject {
-        val coveredRuns = listCoveredRuns(caseId)
-        val coveredPresets = LIBRARY.filter { signatureFor(it.config) in coveredRuns.keys }
+        KbStore.backfillForCase(caseId)
+        val kbRecordsBySig = KbStore.listForCase(caseId)
+        val librarySigs = LIBRARY.associateBy { signatureFor(it.config) }
+        val coveredPresets = LIBRARY.filter { signatureFor(it.config) in kbRecordsBySig.keys }
+        val offLibraryRecords = kbRecordsBySig.filterKeys { sig -> sig !in librarySigs.keys }.values
         val nextBatch = selectNextBatch(caseId, batchSize)
         return buildJsonObject {
             put("library_size", LIBRARY.size)
             put("already_run_count", coveredPresets.size)
             put("remaining_count", LIBRARY.size - coveredPresets.size)
+            put("kb_record_count", kbRecordsBySig.size)
             put("batch_size", batchSize)
             putJsonArray("already_run") {
                 coveredPresets.forEach { preset ->
                     val sig = signatureFor(preset.config)
-                    add(toJsonWithRun(preset, coveredRuns[sig]))
+                    add(toJsonWithRun(preset, kbRecordsBySig[sig]))
                 }
+                offLibraryRecords.forEach { add(toJsonOffLibrary(it)) }
             }
             putJsonArray("next_batch") {
                 nextBatch.forEach { add(toJson(it)) }

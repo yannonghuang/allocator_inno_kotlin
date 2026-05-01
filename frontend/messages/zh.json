@@ -316,9 +316,9 @@
     "hideCopilot": "隐藏代理",
     "agentLauncher": "规划代理",
     "bootstrap": {
-      "button": "扩充知识库",
-      "buttonTooltip": "运行一批精选的规划配置实验，扩充本案例的知识库（每个运行约 2 分钟，默认 5 个/批次）。每次点击选取本案例尚未尝试过的配置，覆盖方法选择、调控范围、分配策略、合并、采购、精细化等维度。可重复执行：每次点击新增一批。",
-      "title": "扩充知识库",
+      "button": "知识库",
+      "buttonTooltip": "打开本案例的知识库 — 一组精选的规划配置 KPI 快照，供规划代理作为对比基准。可按 KPI 排序浏览已覆盖的配置、运行新批次扩充覆盖、以及管理记录。",
+      "title": "知识库",
       "intro": "运行一批精选的规划配置，为规划代理积累对比证据，持续扩充本案例的 KB。每个运行约 2 分钟（以 case-171 为参照）。",
       "coverage": "精选库：本案例已覆盖 {covered} 个预设。",
       "exhausted": "本案例已覆盖全部 {total} 个精选库预设。继续探索请使用规划代理临场配置。",
@@ -338,7 +338,30 @@
       "progressDone": "完成 — 已向知识库新增 {completed} 个运行。",
       "progressErrors": "{n} 个预设失败：",
       "close": "关闭",
-      "badge": "库"
+      "badge": "库",
+      "kbSoundOnly": "仅显示稳健",
+      "kbClearSort": "清除排序",
+      "kbHint": "点击 KPI 列头进行排序。删除计划运行不会删除知识库记录。",
+      "kbSourceDeleted": "源计划运行已删除；知识库快照仍保留以供比较。",
+      "kbDeleteTooltip": "删除此知识库记录；不会影响源计划运行（若仍存在）。",
+      "kbOffLibraryCount": "（{n} 条来自用户运行，库外）",
+      "kbOffLibraryBadge": "自定义",
+      "kbOffLibraryTooltip": "用户运行配置 — 不属于精选库的 15 条预设。运行时被自动记录到知识库。",
+      "kbCol": {
+        "preset": "预设",
+        "axis": "维度",
+        "diff": "配置"
+      },
+      "kpi": {
+        "fill": "填充率",
+        "gini": "Gini",
+        "p10": "p10",
+        "onTime": "准时",
+        "mfg": "制造量",
+        "invConsumed": "库存消耗",
+        "higherBetter": "数值越大越好",
+        "lowerBetter": "数值越小越好"
+      }
     },
     "tabs": {
       "committedDemands": "已承诺需求",
@@ -664,6 +687,7 @@
       "title": "运行历史",
       "panelTitle": "计划运行历史",
       "close": "关闭",
+      "sortBy": "排序：",
       "load": "加载",
       "loading": "加载中…",
       "delete": "删除",

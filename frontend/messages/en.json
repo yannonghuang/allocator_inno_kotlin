@@ -316,9 +316,9 @@
     "hideCopilot": "Hide Agent",
     "agentLauncher": "Planning Agent",
     "bootstrap": {
-      "button": "Expand KB",
-      "buttonTooltip": "Run a curated batch of plan-config experiments to expand this case's knowledge base (~2 min/run, default 5 runs/batch). Each batch picks configs the case hasn't tried yet, spread across method-selection, regulation scope, allocation mode, consolidation, purchase, and elaborate axes — so the planning agent has comparative evidence on every load-bearing knob. Repeatable: each click adds another batch.",
-      "title": "Expand knowledge base",
+      "button": "Knowledge Base",
+      "buttonTooltip": "Open the case's Knowledge Base — a curated set of plan-config snapshots used as comparative baselines by the planning agent. From here you can browse covered configurations sorted by KPI, run new batches to expand coverage, and manage the records.",
+      "title": "Knowledge Base",
       "intro": "Run a curated batch of plan configs to expand this case's KB with comparative data for the planning agent. Each run takes ~2 min on case-171.",
       "coverage": "Curated library: {covered} presets covered for this case so far.",
       "exhausted": "All {total} curated library presets are already covered for this case. Use the planning agent for ad-hoc explorations.",
@@ -338,7 +338,30 @@
       "progressDone": "Done — {completed} runs added to KB.",
       "progressErrors": "{n} preset(s) failed:",
       "close": "Close",
-      "badge": "library"
+      "badge": "library",
+      "kbSoundOnly": "Sound only",
+      "kbClearSort": "Clear sort",
+      "kbHint": "Click a KPI header to sort. KB rows survive plan-run deletion.",
+      "kbSourceDeleted": "The source plan run was deleted. The KB snapshot remains for comparison.",
+      "kbDeleteTooltip": "Delete this KB record. The source plan run (if any) is not affected.",
+      "kbOffLibraryCount": "({n} outside the curated library)",
+      "kbOffLibraryBadge": "custom",
+      "kbOffLibraryTooltip": "User-driven config — outside the curated library matrix. Captured into KB at run time.",
+      "kbCol": {
+        "preset": "Preset",
+        "axis": "Axis",
+        "diff": "Config"
+      },
+      "kpi": {
+        "fill": "Fill",
+        "gini": "Gini",
+        "p10": "p10",
+        "onTime": "On-time",
+        "mfg": "Mfg qty",
+        "invConsumed": "Inv used",
+        "higherBetter": "Higher is better",
+        "lowerBetter": "Lower is better"
+      }
     },
     "tabs": {
       "committedDemands": "Committed demands",
@@ -664,6 +687,7 @@
       "title": "Run history",
       "panelTitle": "Plan run history",
       "close": "Close",
+      "sortBy": "Sort by:",
       "load": "Load",
       "loading": "Loading…",
       "delete": "Delete",

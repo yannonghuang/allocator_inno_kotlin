@@ -618,6 +618,19 @@ export type PlanRun = {
   /** Free-form provenance — `{ bootstrap: true, preset_id, preset_label, ... }`
    *  for KB-seeded runs, undefined/null for user-driven. */
   metadata?: Record<string, unknown> | null;
+  // Inline KPI snapshot (from kb_records when present, else parsed from
+  // plan_run.result on the fly). Each is undefined when the run isn't
+  // success-status or KPIs weren't computed.
+  fill_rate_pct?: number;
+  gini?: number;
+  p10_fill_ratio?: number;
+  median_fill_ratio?: number;
+  starvation_pct?: number;
+  on_time_count?: number;
+  total_committed?: number;
+  total_requested?: number;
+  manufacturing_total_quantity?: number;
+  inventory_consumed_total?: number;
 };
 
 export type SoundnessViolation = {
@@ -1374,19 +1387,36 @@ export type BootstrapPreset = {
   preset_index: number;
   primary_axis: string;
   config: Record<string, unknown>;
-  // Present only on items in `already_run[]` — carries the matching
-  // plan_run's id + headline KPIs so the dialog can show coverage + offer
-  // delete inline.
+  /** True when this entry corresponds to a row in the curated LIBRARY; false
+   *  for user-driven configs that landed in KB outside the library matrix. */
+  library?: boolean;
+  // Present only on items in `already_run[]` — carries the KB record id (for
+  // delete) + the source plan_run pointer (may be deleted) + headline KPIs.
+  // KB rows are dissociated from plan_runs; the source link can be severed
+  // without losing this row.
+  kb_record_id?: number;
   plan_run_id?: number;
-  plan_run_status?: string;
+  source_plan_run_deleted?: boolean;
   soundness_status?: string;
   fill_rate_pct?: number;
+  gini?: number;
+  p10_fill_ratio?: number;
+  median_fill_ratio?: number;
+  starvation_pct?: number;
+  on_time_count?: number;
+  total_committed?: number;
+  total_requested?: number;
+  manufacturing_total_quantity?: number;
+  inventory_consumed_total?: number;
 };
 
 export type BootstrapPreview = {
   library_size: number;
   already_run_count: number;
   remaining_count: number;
+  /** Total KB rows on this case (library + user-driven). Backend addition;
+   *  may be undefined when talking to an older backend. */
+  kb_record_count?: number;
   batch_size: number;
   already_run: BootstrapPreset[];
   next_batch: BootstrapPreset[];
@@ -1426,4 +1456,10 @@ export async function getBootstrapJobStatus(caseId: number, jobId: string): Prom
   const r = await fetch(`${API}/cases/${caseId}/bootstrap/status/${jobId}`);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
+}
+
+/** Delete a KB record. Does NOT touch the source plan_run (KB is dissociated). */
+export async function deleteKbRecord(caseId: number, recordId: number): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/kb-records/${recordId}`, { method: 'DELETE' });
+  if (!r.ok) throw new Error(await r.text());
 }

@@ -364,6 +364,19 @@ fun Routing.allocateRoutes() {
         })
     }
 
+    // ── DELETE /cases/{case_id}/kb-records/{record_id} — drop a KB row ────────
+    // Removes the KB snapshot but does NOT touch the source plan_run. Use the
+    // plan-run delete endpoint separately if you also want to drop the run.
+    delete("/cases/{case_id}/kb-records/{record_id}") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val recordId = call.parameters["record_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid record_id")
+        val removed = com.allocator.services.KbStore.deleteRecord(caseId, recordId)
+        if (!removed) throw NoSuchElementException("KB record not found")
+        call.respond(HttpStatusCode.NoContent)
+    }
+
     // ── GET /cases/{case_id}/bootstrap/status/{job_id} — poll bootstrap ───────
     get("/cases/{case_id}/bootstrap/status/{job_id}") {
         val caseId = call.parameters["case_id"]?.toIntOrNull()
@@ -500,6 +513,12 @@ fun Routing.allocateRoutes() {
             val activeRunId = com.allocator.services.resolveActiveRunId(designatedId, successIds)
             val idStatusPairs = rows.map { it[PlanRuns.id] to it[PlanRuns.status] }
             val initialRunId = com.allocator.services.resolveInitialRunId(idStatusPairs)
+            // Pre-load KB snapshots for this case so each row can pick up its
+            // KPIs in O(1). KB rows are keyed by config signature; fall back
+            // to parsing plan_run.result directly when no KB row exists yet
+            // (e.g. unsound or in-flight runs that didn't backfill).
+            val kbBySig: Map<String, com.allocator.services.KbStore.KbRecord> =
+                com.allocator.services.KbStore.listForCase(caseId)
             rows.map { row ->
                 val snapshot = row[PlanRuns.overrideSnapshot]
                 val parsedSnapshot = snapshot?.let { runCatching { Json.parseToJsonElement(it) as? JsonArray }.getOrNull() }
@@ -510,12 +529,26 @@ fun Routing.allocateRoutes() {
                 val finishedInstant = row[PlanRuns.finishedAt]
                 val chosenDepth = row[PlanRuns.chosenDepth]
                 val attempts = parseAttempts(row[PlanRuns.attempts])
+                // KPI snapshot lookup: prefer the KB row (already extracted +
+                // cached) when present; otherwise compute on-the-fly from the
+                // run's stored result so unsound / in-flight runs still get
+                // KPI columns in the run-history view.
+                val configRaw = row[PlanRuns.config]
+                val configSig = configRaw?.let { raw ->
+                    runCatching { Json.parseToJsonElement(raw).jsonObject }.getOrNull()
+                        ?.let { com.allocator.services.CaseBootstrap.signatureFor(it) }
+                }
+                val kpis: JsonObject = configSig?.let { sig -> kbBySig[sig] }?.let { kb ->
+                    runCatching { Json.parseToJsonElement(kb.kpisSnapshotJson).jsonObject }.getOrNull()
+                } ?: com.allocator.services.KbStore.extractKpisFromResult(row[PlanRuns.result])
+                fun n(k: String): Double? = kpis[k]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
+                fun i(k: String): Int? = kpis[k]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
                 PlanRunResponse(
                     id = runId,
                     caseId = row[PlanRuns.caseId],
                     jobId = row[PlanRuns.jobId],
                     status = row[PlanRuns.status],
-                    config = row[PlanRuns.config]?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
+                    config = configRaw?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
                     overrideCount = overrideCount,
                     overrideSnapshotPreview = preview,
                     name = row[PlanRuns.name],
@@ -533,6 +566,16 @@ fun Routing.allocateRoutes() {
                     metadata = row[PlanRuns.metadata]?.let {
                         runCatching { Json.parseToJsonElement(it) }.getOrNull()
                     },
+                    fillRatePct = n("fill_rate_pct"),
+                    gini = n("gini"),
+                    p10FillRatio = n("p10_fill_ratio"),
+                    medianFillRatio = n("median_fill_ratio"),
+                    starvationPct = n("starvation_pct"),
+                    onTimeCount = i("on_time_count"),
+                    totalCommitted = n("total_committed"),
+                    totalRequested = n("total_requested"),
+                    mfgTotalQty = n("manufacturing_total_quantity"),
+                    invConsumedTotal = n("inventory_consumed_total"),
                 )
             }
         }
@@ -717,6 +760,12 @@ fun Routing.allocateRoutes() {
             ?: throw IllegalArgumentException("Invalid case_id")
         val runId = call.parameters["run_id"]?.toIntOrNull()
             ?: throw IllegalArgumentException("Invalid run_id")
+        // Detach KB rows so they survive the plan_run deletion — the KB is
+        // a design surface dissociated from plan_run lifecycle. The KB row
+        // keeps its KPI snapshot and config; only the source link is severed.
+        // (KbRecords.sourcePlanRunId has no FK by design so this is a manual
+        // book-keeping step rather than a DB cascade.)
+        com.allocator.services.KbStore.markPlanRunDeleted(runId)
         transaction {
             val deleted = PlanRuns.deleteWhere {
                 (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId)
@@ -788,13 +837,22 @@ fun Routing.allocateRoutes() {
                         this[PlanSupplyAllocations.qtyConsumed] = (alloc["qty_consumed"] as? Number)?.toDouble() ?: 0.0
                     }
                 }
-                // Delete the ready row (cascade wipes its plan_run_event rows)
+                // The ready row is about to be deleted (with KB rows detached
+                // first so the snapshot survives), and the target row gets the
+                // refreshed result.
+                com.allocator.services.KbStore.markPlanRunDeleted(runId)
                 PlanRuns.deleteWhere { PlanRuns.id eq runId }
                 com.allocator.services.emitPlanRunEvent(caseId, targetRunId, "overridden", buildJsonObject {
                     put("replaced_ready_run_id", JsonPrimitive(runId))
                     nameArg?.ifBlank { null }?.let { put("name", JsonPrimitive(it)) }
                     notesArg?.ifBlank { null }?.let { put("notes", JsonPrimitive(it)) }
                 })
+            }
+            // Refresh the KB snapshot for the target run with its new result.
+            try {
+                com.allocator.services.KbStore.upsertFromPlanRun(targetRunId)
+            } catch (e: Exception) {
+                log.warn("KB upsert failed for overridden run $targetRunId: ${e.message}")
             }
             call.respond(buildJsonObject { put("id", targetRunId); put("status", "success") })
             return@post
@@ -856,6 +914,14 @@ fun Routing.allocateRoutes() {
                 nameArg?.ifBlank { null }?.let { put("name", JsonPrimitive(it)) }
                 notesArg?.ifBlank { null }?.let { put("notes", JsonPrimitive(it)) }
             })
+        }
+        // Snapshot into the dissociated KB store. Every successful run flows
+        // into the KB regardless of origin (user-initiated or KB expansion).
+        // The plan_run can later be deleted without losing this row.
+        try {
+            com.allocator.services.KbStore.upsertFromPlanRun(runId)
+        } catch (e: Exception) {
+            log.warn("KB upsert failed for saved run $runId: ${e.message}")
         }
         call.respond(buildJsonObject { put("id", runId); put("status", "success") })
     }
@@ -1090,6 +1156,14 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
             it[PlanRuns.soundnessReport] = reportJson.toString()
             it[PlanRuns.soundnessCheckedAt] = kotlinx.datetime.Clock.System.now()
         }
+    }
+    // Refresh the dissociated KB snapshot so the new soundness status flows
+    // through to the Knowledge Base view (and the agent's soundness-aware
+    // queries). Best-effort — soundness is the source of truth either way.
+    try {
+        com.allocator.services.KbStore.upsertFromPlanRun(runId)
+    } catch (e: Exception) {
+        log.warn("KB upsert failed after soundness recheck of run $runId: ${e.message}")
     }
     return reportJson
 }
@@ -1964,6 +2038,17 @@ private suspend fun runOneBootstrapPreset(
             runSoundnessCheckForRun(caseId, planRunId, deepCheck = true)
         } catch (e: Exception) {
             log.warn("Bootstrap soundness check failed for run $planRunId: ${e.message}")
+        }
+
+        // Snapshot into the dissociated KB store. The plan_run can later be
+        // deleted (housekeeping, errors, etc.) without losing this KB row —
+        // see KbStore.markPlanRunDeleted, called from the plan_run DELETE
+        // handler. This call is idempotent so re-running the same preset
+        // refreshes the snapshot in place.
+        try {
+            com.allocator.services.KbStore.upsertFromPlanRun(planRunId)
+        } catch (e: Exception) {
+            log.warn("KB upsert failed for bootstrap run $planRunId: ${e.message}")
         }
 
         return planRunId

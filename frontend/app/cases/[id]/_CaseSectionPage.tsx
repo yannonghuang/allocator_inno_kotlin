@@ -83,6 +83,8 @@ import {
   getBootstrapPreview,
   startBootstrap,
   getBootstrapJobStatus,
+  deleteKbRecord,
+  type BootstrapPreset,
   type BootstrapPreview,
   type BootstrapJobStatus,
 } from '@/lib/api';
@@ -955,6 +957,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
 
   // ── Plan run history state ──────────────────────────────────────────────────
   const [planRunHistory, setPlanRunHistory] = useState<PlanRun[]>([]);
+  // Sort + filter for the run-history slide-in. Mirrors the KB workspace:
+  // null sort = default (created_at desc, as returned by the backend).
+  const [planRunHistorySort, setPlanRunHistorySort] = useState<{ key: string; dir: 'asc' | 'desc' } | null>(null);
+  const [planRunHistorySoundOnly, setPlanRunHistorySoundOnly] = useState(false);
   const currentRunIsContingent = currentPlanRunId != null &&
     planRunHistory.find(r => r.id === currentPlanRunId)?.status === 'contingent';
   const [planRunHistoryOpen, setPlanRunHistoryOpen] = useState(false);
@@ -968,6 +974,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [bootstrapJobStatus, setBootstrapJobStatus] = useState<BootstrapJobStatus | null>(null);
   const bootstrapPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [bootstrapExpandedPresets, setBootstrapExpandedPresets] = useState<Set<string>>(new Set());
+  // KB-inspector sort state. `key` matches a BootstrapPreset KPI field name;
+  // null = no sort (preserve backend / library order).
+  const [bootstrapKbSort, setBootstrapKbSort] = useState<{ key: string; dir: 'asc' | 'desc' } | null>(null);
+  const [bootstrapKbSoundOnly, setBootstrapKbSoundOnly] = useState(false);
   const toggleBootstrapPresetExpanded = (presetId: string) => {
     setBootstrapExpandedPresets((prev) => {
       const next = new Set(prev);
@@ -998,17 +1008,41 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (config.purchase_allowed === true) diffs.push(`purchase: off → on`);
     return diffs.join(' · ');
   };
-  const handleDeleteCoveredRun = async (planRunId: number) => {
+  /**
+   * Self-describing summary of a config — always emits the same set of axes,
+   * regardless of any baseline. Used in the KB / Already-covered list, where
+   * rows are heterogeneous (library + user-driven) and a baseline-relative
+   * diff would be misleading. Storage in kb_records is the full JSON; this
+   * function is purely presentation.
+   */
+  const presetConfigSummary = (config: Record<string, unknown>): string => {
+    const ms = (config.method_selection ?? {}) as Record<string, unknown>;
+    const cs = (config.consolidation ?? {}) as Record<string, unknown>;
+    const sw = (ms.score_weights ?? {}) as Record<string, number>;
+    const parts: string[] = [];
+    parts.push(`m=${ms.mode ?? 'preference'}`);
+    parts.push(`max=${ms.max_methods ?? 2}`);
+    parts.push(`d=${ms.depth ?? 1}`);
+    if (sw && (sw.commit_time != null || sw.inventory_consumed != null || sw.purchase != null)) {
+      parts.push(`w=(${Number(sw.commit_time ?? 0)}, ${Number(sw.inventory_consumed ?? 0)}, ${Number(sw.purchase ?? 0)})`);
+    }
+    parts.push(`eng=${cs.engine ?? 'leaf-legacy'}`);
+    parts.push(`alloc=${cs.allocation_mode ?? 'fair'}`);
+    parts.push(`cons=${cs.enabled === false ? 'off' : 'on'}`);
+    if (Number(cs.period_days ?? 0) !== 0) parts.push(`p=${cs.period_days}`);
+    parts.push(`purch=${config.purchase_allowed === true ? 'on' : 'off'}`);
+    return parts.join(' · ');
+  };
+  const handleDeleteKbRecord = async (recordId: number) => {
     if (!id) return;
     try {
-      await deletePlanRun(id, planRunId);
-      // Refresh preview so the deleted run drops out of "already covered".
+      await deleteKbRecord(id, recordId);
+      // Refresh preview so the deleted KB row drops out of "already covered".
+      // The underlying plan_run (if any) is untouched — KB is dissociated.
       const preview = await getBootstrapPreview(id, bootstrapBatchSize);
       setBootstrapPreview(preview);
-      // Run history may also be open; refresh it too.
-      loadPlanRunHistory();
     } catch (e) {
-      console.error('Failed to delete covered run', e);
+      console.error('Failed to delete KB record', e);
     }
   };
   const [planRunHistoryLoading, setPlanRunHistoryLoading] = useState(false);
@@ -1061,6 +1095,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planRunHistoryPanelWidth, setPlanRunHistoryPanelWidth] = useState(520);
   const planRunHistoryResizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [planRunHistoryResizing, setPlanRunHistoryResizing] = useState(false);
+  // KB slide-in panel resize state (mirrors planRunHistory).
+  const [bootstrapPanelWidth, setBootstrapPanelWidth] = useState(720);
+  const bootstrapResizeRef = useRef<{ startX: number; startW: number } | null>(null);
+  const [bootstrapResizing, setBootstrapResizing] = useState(false);
 
   /** Rule-based intent: map user message to config updates and a reply for method selection and consolidation. */
   function parseCopilotIntent(message: string, currentConfig: PlanningConfig): { reply: string; configUpdate?: PlanningConfig } {
@@ -1967,6 +2005,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     window.addEventListener('mouseup', onUp);
     return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
   }, [planRunHistoryResizing]);
+
+  useEffect(() => {
+    if (!bootstrapResizing) return;
+    const onMove = (e: MouseEvent) => {
+      const r = bootstrapResizeRef.current;
+      if (!r) return;
+      setBootstrapPanelWidth(Math.min(window.innerWidth * 0.95, Math.max(420, r.startW + (r.startX - e.clientX))));
+    };
+    const onUp = () => { bootstrapResizeRef.current = null; setBootstrapResizing(false); window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+  }, [bootstrapResizing]);
 
   // Defer tree building so first paint shows counts and "Building tree…" instead of blocking on huge graph
   useEffect(() => {
@@ -6440,27 +6491,36 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         })}
       </section>
       )}
-      {/* ── Plan run history slide-in ──────────────────────────────────────────── */}
+      {/* ── Knowledge Base slide-in ────────────────────────────────────────────── */}
       {bootstrapDialogOpen && typeof document !== 'undefined' && createPortal(
         <div
-          style={{
-            position: 'fixed', inset: 0, zIndex: 9997, display: 'flex',
-            alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.55)',
-          }}
+          style={{ position: 'fixed', inset: 0, zIndex: 9997, display: 'flex', justifyContent: 'flex-end' }}
           role="dialog"
           aria-label={tP('bootstrap.title')}
-          onClick={closeBootstrapDialog}
         >
           <div
-            onClick={(e) => e.stopPropagation()}
+            style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)' }}
+            onClick={closeBootstrapDialog}
+            aria-hidden
+          />
+          <div
             style={{
-              background: '#1c1c1e', color: '#e4e4e7', borderRadius: 8,
-              padding: '1.25rem 1.5rem', width: 560, maxWidth: '92vw',
-              maxHeight: '90vh', overflowY: 'auto',
-              boxShadow: '0 20px 60px rgba(0,0,0,0.6)',
-              border: '1px solid #3d3d40',
+              position: 'relative', zIndex: 10,
+              width: bootstrapPanelWidth, maxWidth: '95vw', height: '100vh',
+              display: 'flex', flexDirection: 'column',
+              background: '#1c1c1e', color: '#e4e4e7',
+              boxShadow: '-4px 0 24px rgba(0,0,0,0.4)',
+              padding: '1.25rem 1.5rem',
+              overflowY: 'auto',
             }}
           >
+            {/* Resize handle */}
+            <div
+              role="separator"
+              aria-label="Resize panel"
+              onMouseDown={(e) => { e.preventDefault(); bootstrapResizeRef.current = { startX: e.clientX, startW: bootstrapPanelWidth }; setBootstrapResizing(true); }}
+              style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: 6, cursor: 'col-resize', zIndex: 11 }}
+            />
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
               <h3 style={{ margin: 0, color: '#fafafa' }}>{tP('bootstrap.title')}</h3>
               <button type="button" onClick={closeBootstrapDialog}
@@ -6607,77 +6667,182 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   </button>
                 </div>
 
-                {bootstrapPreview.already_run.length > 0 && (
-                  <details style={{ marginTop: '1rem', fontSize: '0.78rem', color: '#71717a' }}>
-                    <summary style={{ cursor: 'pointer' }}>
-                      {tP('bootstrap.alreadyRunHeading', { n: bootstrapPreview.already_run.length })}
-                    </summary>
-                    <table style={{ width: '100%', marginTop: '0.5rem', borderCollapse: 'collapse', fontSize: '0.74rem' }}>
-                      <tbody>
-                        {bootstrapPreview.already_run.map((p) => {
-                          const expanded = bootstrapExpandedPresets.has(p.preset_id);
-                          const diff = presetDiffSummary(p.config);
-                          return (
-                            <React.Fragment key={p.preset_id}>
-                              <tr style={{ borderBottom: expanded ? 'none' : '1px solid #27272a' }}>
-                                <td style={{ padding: '4px 6px', width: 18, cursor: 'pointer', color: '#71717a', verticalAlign: 'top' }}
-                                    onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
-                                  {expanded ? '▾' : '▸'}
-                                </td>
-                                <td style={{ padding: '4px 6px', fontFamily: 'monospace', color: '#a1a1aa', cursor: 'pointer', verticalAlign: 'top', whiteSpace: 'nowrap' }}
-                                    onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
-                                  {p.preset_label}
-                                </td>
-                                <td style={{ padding: '4px 6px', verticalAlign: 'top', whiteSpace: 'nowrap' }}>
-                                  <span style={{ fontSize: '0.66rem', background: '#3f3f46', borderRadius: 4, padding: '1px 6px', color: '#a1a1aa' }}>{p.primary_axis}</span>
-                                </td>
-                                <td style={{ padding: '4px 6px', fontFamily: 'monospace', fontSize: '0.68rem', color: diff ? '#fbbf24' : '#52525b', verticalAlign: 'top' }}>
-                                  {diff || tP('bootstrap.noDiff')}
-                                </td>
-                                <td style={{ padding: '4px 6px', color: '#a78bfa', textAlign: 'right', verticalAlign: 'top' }}>
-                                  {p.fill_rate_pct != null ? `${p.fill_rate_pct.toFixed(1)}%` : '–'}
-                                </td>
-                                <td style={{ padding: '4px 6px', verticalAlign: 'top' }}>
-                                  {p.soundness_status === 'sound' && <span style={{ color: '#34d399', fontSize: '0.7rem' }}>✓</span>}
-                                  {p.soundness_status === 'unsound' && <span style={{ color: '#f87171', fontSize: '0.7rem' }}>✗</span>}
-                                  {p.soundness_status === 'unchecked' && <span style={{ color: '#71717a', fontSize: '0.7rem' }}>—</span>}
-                                  {p.soundness_status === 'error' && <span style={{ color: '#fbbf24', fontSize: '0.7rem' }}>err</span>}
-                                </td>
-                                <td style={{ padding: '4px 6px', textAlign: 'right', verticalAlign: 'top' }}>
-                                  {p.plan_run_id != null && (
-                                    <button type="button"
-                                      onClick={() => handleDeleteCoveredRun(p.plan_run_id!)}
-                                      style={{
-                                        fontSize: '0.7rem', padding: '1px 6px',
-                                        background: 'transparent', color: '#f87171',
-                                        border: '1px solid rgba(248,113,113,0.4)', borderRadius: 4,
-                                        cursor: 'pointer',
-                                      }}>
-                                      {tc('delete')}
-                                    </button>
+                {bootstrapPreview.already_run.length > 0 && (() => {
+                  // KPI columns: 'asc' direction = lower-is-better (gini, starvation),
+                  // 'desc' = higher-is-better. Default sort dir on first click matches `better`.
+                  const kpiCols: Array<{ key: keyof BootstrapPreset; label: string; better: 'asc' | 'desc'; fmt: (v: number) => string }> = [
+                    { key: 'fill_rate_pct',                label: tP('bootstrap.kpi.fill'),        better: 'desc', fmt: (v) => `${v.toFixed(1)}%` },
+                    { key: 'gini',                         label: tP('bootstrap.kpi.gini'),        better: 'asc',  fmt: (v) => v.toFixed(2) },
+                    { key: 'p10_fill_ratio',               label: tP('bootstrap.kpi.p10'),         better: 'desc', fmt: (v) => v.toFixed(2) },
+                    { key: 'on_time_count',                label: tP('bootstrap.kpi.onTime'),      better: 'desc', fmt: (v) => String(v) },
+                    { key: 'manufacturing_total_quantity', label: tP('bootstrap.kpi.mfg'),         better: 'desc', fmt: (v) => qtyFmt(v) },
+                    { key: 'inventory_consumed_total',     label: tP('bootstrap.kpi.invConsumed'), better: 'desc', fmt: (v) => qtyFmt(v) },
+                  ];
+                  const filtered = bootstrapKbSoundOnly
+                    ? bootstrapPreview.already_run.filter((p) => p.soundness_status === 'sound')
+                    : bootstrapPreview.already_run;
+                  const sorted = bootstrapKbSort
+                    ? [...filtered].sort((a, b) => {
+                        const k = bootstrapKbSort.key as keyof BootstrapPreset;
+                        const av = a[k];
+                        const bv = b[k];
+                        if (av == null && bv == null) return 0;
+                        if (av == null) return 1;   // missing always sinks
+                        if (bv == null) return -1;
+                        const cmp = Number(av) - Number(bv);
+                        return bootstrapKbSort.dir === 'asc' ? cmp : -cmp;
+                      })
+                    : filtered;
+                  const handleSortClick = (key: string, defaultDir: 'asc' | 'desc') => {
+                    setBootstrapKbSort((prev) => {
+                      if (!prev || prev.key !== key) return { key, dir: defaultDir };
+                      if (prev.dir === defaultDir) return { key, dir: defaultDir === 'asc' ? 'desc' : 'asc' };
+                      return null;
+                    });
+                  };
+                  const sortIndicator = (key: string) => {
+                    if (!bootstrapKbSort || bootstrapKbSort.key !== key) return '';
+                    return bootstrapKbSort.dir === 'asc' ? ' ↑' : ' ↓';
+                  };
+                  const offLibraryCount = bootstrapPreview.already_run.filter((p) => p.library === false).length;
+                  return (
+                    <details style={{ marginTop: '1rem', fontSize: '0.78rem', color: '#71717a' }} open>
+                      <summary style={{ cursor: 'pointer' }}>
+                        {tP('bootstrap.alreadyRunHeading', { n: bootstrapPreview.already_run.length })}
+                        {offLibraryCount > 0 && (
+                          <span style={{ marginLeft: 6, color: '#52525b', fontSize: '0.72rem' }}>
+                            {tP('bootstrap.kbOffLibraryCount', { n: offLibraryCount })}
+                          </span>
+                        )}
+                      </summary>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', margin: '0.5rem 0', flexWrap: 'wrap' }}>
+                        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: '0.72rem', color: '#a1a1aa', cursor: 'pointer' }}>
+                          <input
+                            type="checkbox"
+                            checked={bootstrapKbSoundOnly}
+                            onChange={(e) => setBootstrapKbSoundOnly(e.target.checked)}
+                          />
+                          <span>{tP('bootstrap.kbSoundOnly')}</span>
+                        </label>
+                        {bootstrapKbSort && (
+                          <button
+                            type="button"
+                            onClick={() => setBootstrapKbSort(null)}
+                            style={{ fontSize: '0.7rem', padding: '1px 8px', background: 'transparent', color: '#a1a1aa', border: '1px solid #3d3d40', borderRadius: 4, cursor: 'pointer' }}
+                          >{tP('bootstrap.kbClearSort')}</button>
+                        )}
+                        <span style={{ fontSize: '0.7rem', color: '#52525b', marginLeft: 'auto' }}>
+                          {tP('bootstrap.kbHint')}
+                        </span>
+                      </div>
+                      <div style={{ overflowX: 'auto' }}>
+                        <table style={{ width: '100%', marginTop: '0.25rem', borderCollapse: 'collapse', fontSize: '0.74rem' }}>
+                          <thead>
+                            <tr style={{ color: '#a1a1aa', borderBottom: '1px solid #3d3d40' }}>
+                              <th style={{ width: 18, padding: '4px 6px' }} />
+                              <th style={{ padding: '4px 6px', textAlign: 'left', whiteSpace: 'nowrap' }}>{tP('bootstrap.kbCol.preset')}</th>
+                              <th style={{ padding: '4px 6px', textAlign: 'left' }}>{tP('bootstrap.kbCol.axis')}</th>
+                              <th style={{ padding: '4px 6px', textAlign: 'left' }}>{tP('bootstrap.kbCol.diff')}</th>
+                              {kpiCols.map((c) => (
+                                <th key={String(c.key)} style={{ padding: '4px 6px', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleSortClick(String(c.key), c.better)}
+                                    title={c.better === 'asc' ? tP('bootstrap.kpi.lowerBetter') : tP('bootstrap.kpi.higherBetter')}
+                                    style={{ background: 'none', border: 'none', color: bootstrapKbSort?.key === c.key ? '#e4e4e7' : '#a1a1aa', cursor: 'pointer', padding: 0, fontSize: '0.72rem', fontWeight: bootstrapKbSort?.key === c.key ? 600 : 400 }}
+                                  >{c.label}{sortIndicator(String(c.key))}</button>
+                                </th>
+                              ))}
+                              <th style={{ padding: '4px 6px' }} />
+                              <th style={{ padding: '4px 6px' }} />
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {sorted.map((p) => {
+                              const expanded = bootstrapExpandedPresets.has(p.preset_id);
+                              // Self-describing config summary (no baseline framing) — see
+                              // presetConfigSummary above. Storage is full JSON; this is
+                              // purely how it's rendered in the row.
+                              const summary = presetConfigSummary(p.config);
+                              const renderKpi = (k: keyof BootstrapPreset, fmt: (v: number) => string) => {
+                                const v = p[k];
+                                if (v == null) return <span style={{ color: '#52525b' }}>–</span>;
+                                return <span>{fmt(Number(v))}</span>;
+                              };
+                              return (
+                                <React.Fragment key={p.preset_id}>
+                                  <tr style={{ borderBottom: expanded ? 'none' : '1px solid #27272a' }}>
+                                    <td style={{ padding: '4px 6px', width: 18, cursor: 'pointer', color: '#71717a', verticalAlign: 'top' }}
+                                        onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
+                                      {expanded ? '▾' : '▸'}
+                                    </td>
+                                    <td style={{ padding: '4px 6px', fontFamily: 'monospace', color: '#a1a1aa', cursor: 'pointer', verticalAlign: 'top', whiteSpace: 'nowrap' }}
+                                        onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
+                                      {p.preset_label}
+                                      {p.library === false && (
+                                        <span title={tP('bootstrap.kbOffLibraryTooltip')} style={{ marginLeft: 4, fontSize: '0.62rem', background: '#3b0764', color: '#e9d5ff', borderRadius: 4, padding: '0px 5px' }}>
+                                          {tP('bootstrap.kbOffLibraryBadge')}
+                                        </span>
+                                      )}
+                                      {p.source_plan_run_deleted && (
+                                        <span title={tP('bootstrap.kbSourceDeleted')} style={{ marginLeft: 4, fontSize: '0.62rem', color: '#71717a', fontStyle: 'italic' }}>(orphan)</span>
+                                      )}
+                                    </td>
+                                    <td style={{ padding: '4px 6px', verticalAlign: 'top', whiteSpace: 'nowrap' }}>
+                                      <span style={{ fontSize: '0.66rem', background: '#3f3f46', borderRadius: 4, padding: '1px 6px', color: '#a1a1aa' }}>{p.primary_axis}</span>
+                                    </td>
+                                    <td style={{ padding: '4px 6px', fontFamily: 'monospace', fontSize: '0.68rem', color: '#a1a1aa', verticalAlign: 'top' }}>
+                                      {summary}
+                                    </td>
+                                    {kpiCols.map((c) => (
+                                      <td key={String(c.key)} style={{ padding: '4px 6px', color: '#a78bfa', textAlign: 'right', verticalAlign: 'top', whiteSpace: 'nowrap' }}>
+                                        {renderKpi(c.key, c.fmt)}
+                                      </td>
+                                    ))}
+                                    <td style={{ padding: '4px 6px', verticalAlign: 'top' }}>
+                                      {p.soundness_status === 'sound' && <span style={{ color: '#34d399', fontSize: '0.7rem' }}>✓</span>}
+                                      {p.soundness_status === 'unsound' && <span style={{ color: '#f87171', fontSize: '0.7rem' }}>✗</span>}
+                                      {p.soundness_status === 'unchecked' && <span style={{ color: '#71717a', fontSize: '0.7rem' }}>—</span>}
+                                      {p.soundness_status === 'error' && <span style={{ color: '#fbbf24', fontSize: '0.7rem' }}>err</span>}
+                                    </td>
+                                    <td style={{ padding: '4px 6px', textAlign: 'right', verticalAlign: 'top' }}>
+                                      {p.kb_record_id != null && (
+                                        <button type="button"
+                                          onClick={() => handleDeleteKbRecord(p.kb_record_id!)}
+                                          title={tP('bootstrap.kbDeleteTooltip')}
+                                          style={{
+                                            fontSize: '0.7rem', padding: '1px 6px',
+                                            background: 'transparent', color: '#f87171',
+                                            border: '1px solid rgba(248,113,113,0.4)', borderRadius: 4,
+                                            cursor: 'pointer',
+                                          }}>
+                                          {tc('delete')}
+                                        </button>
+                                      )}
+                                    </td>
+                                  </tr>
+                                  {expanded && (
+                                    <tr style={{ borderBottom: '1px solid #27272a' }}>
+                                      <td colSpan={6 + kpiCols.length} style={{ padding: '0 6px 6px 26px' }}>
+                                        <pre style={{
+                                          margin: 0, fontSize: '0.66rem', color: '#a1a1aa',
+                                          background: '#0a0a0a', padding: '6px 8px', borderRadius: 4,
+                                          overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                        }}>
+                                          {JSON.stringify(p.config, null, 2)}
+                                        </pre>
+                                      </td>
+                                    </tr>
                                   )}
-                                </td>
-                              </tr>
-                              {expanded && (
-                                <tr style={{ borderBottom: '1px solid #27272a' }}>
-                                  <td colSpan={7} style={{ padding: '0 6px 6px 26px' }}>
-                                    <pre style={{
-                                      margin: 0, fontSize: '0.66rem', color: '#a1a1aa',
-                                      background: '#0a0a0a', padding: '6px 8px', borderRadius: 4,
-                                      overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                                    }}>
-                                      {JSON.stringify(p.config, null, 2)}
-                                    </pre>
-                                  </td>
-                                </tr>
-                              )}
-                            </React.Fragment>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </details>
-                )}
+                                </React.Fragment>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </details>
+                  );
+                })()}
               </>
             )}
           </div>
@@ -6702,7 +6867,78 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
               {planRunHistoryLoading && <p style={{ color: '#71717a' }}>{tP('runHistory.loading')}</p>}
               {!planRunHistoryLoading && planRunHistory.length === 0 && <p style={{ color: '#71717a' }}>{tP('runHistory.empty')}</p>}
-              {!planRunHistoryLoading && planRunHistory.map((run) => {
+              {!planRunHistoryLoading && planRunHistory.length > 0 && (() => {
+                const kpiOptions: Array<{ key: keyof PlanRun; label: string; better: 'asc' | 'desc' }> = [
+                  { key: 'fill_rate_pct',                label: tP('bootstrap.kpi.fill'),        better: 'desc' },
+                  { key: 'gini',                         label: tP('bootstrap.kpi.gini'),        better: 'asc'  },
+                  { key: 'p10_fill_ratio',               label: tP('bootstrap.kpi.p10'),         better: 'desc' },
+                  { key: 'on_time_count',                label: tP('bootstrap.kpi.onTime'),      better: 'desc' },
+                  { key: 'manufacturing_total_quantity', label: tP('bootstrap.kpi.mfg'),         better: 'desc' },
+                  { key: 'inventory_consumed_total',     label: tP('bootstrap.kpi.invConsumed'), better: 'desc' },
+                ];
+                return (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.75rem', flexWrap: 'wrap', fontSize: '0.72rem', color: '#a1a1aa' }}>
+                    <span>{tP('runHistory.sortBy')}</span>
+                    {kpiOptions.map((opt) => {
+                      const k = String(opt.key);
+                      const active = planRunHistorySort?.key === k;
+                      const ind = active ? (planRunHistorySort?.dir === 'asc' ? ' ↑' : ' ↓') : '';
+                      return (
+                        <button
+                          key={k}
+                          type="button"
+                          onClick={() => setPlanRunHistorySort((prev) => {
+                            if (!prev || prev.key !== k) return { key: k, dir: opt.better };
+                            if (prev.dir === opt.better) return { key: k, dir: opt.better === 'asc' ? 'desc' : 'asc' };
+                            return null;
+                          })}
+                          title={opt.better === 'asc' ? tP('bootstrap.kpi.lowerBetter') : tP('bootstrap.kpi.higherBetter')}
+                          style={{
+                            fontSize: '0.7rem', padding: '1px 8px',
+                            background: active ? '#27272a' : 'transparent',
+                            color: active ? '#e4e4e7' : '#a1a1aa',
+                            border: '1px solid #3d3d40', borderRadius: 4, cursor: 'pointer',
+                            fontWeight: active ? 600 : 400,
+                          }}
+                        >{opt.label}{ind}</button>
+                      );
+                    })}
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, marginLeft: '0.5rem', cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={planRunHistorySoundOnly}
+                        onChange={(e) => setPlanRunHistorySoundOnly(e.target.checked)}
+                      />
+                      <span>{tP('bootstrap.kbSoundOnly')}</span>
+                    </label>
+                    {planRunHistorySort && (
+                      <button
+                        type="button"
+                        onClick={() => setPlanRunHistorySort(null)}
+                        style={{ fontSize: '0.7rem', padding: '1px 8px', background: 'transparent', color: '#a1a1aa', border: '1px solid #3d3d40', borderRadius: 4, cursor: 'pointer' }}
+                      >{tP('bootstrap.kbClearSort')}</button>
+                    )}
+                  </div>
+                );
+              })()}
+              {!planRunHistoryLoading && (() => {
+                const filtered = planRunHistorySoundOnly
+                  ? planRunHistory.filter((r) => r.soundness_status === 'sound')
+                  : planRunHistory;
+                const sorted = planRunHistorySort
+                  ? [...filtered].sort((a, b) => {
+                      const k = planRunHistorySort.key as keyof PlanRun;
+                      const av = a[k];
+                      const bv = b[k];
+                      if (av == null && bv == null) return 0;
+                      if (av == null) return 1;
+                      if (bv == null) return -1;
+                      const cmp = Number(av) - Number(bv);
+                      return planRunHistorySort.dir === 'asc' ? cmp : -cmp;
+                    })
+                  : filtered;
+                return sorted;
+              })().map((run) => {
                 const editing = planRunEditing[run.id];
                 const isSavingEdit = !!planRunEditSaving[run.id];
                 const isActive = run.is_active === true;
@@ -6915,6 +7151,30 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       </button>
                     </div>
                   </div>
+                  {/* KPI strip — compact summary of the headline metrics from the run's
+                      result snapshot. Only shown when the run has KPI data. */}
+                  {(run.fill_rate_pct != null || run.gini != null || run.on_time_count != null) && (
+                    <div style={{ display: 'flex', gap: '0.75rem', marginTop: 4, fontSize: '0.72rem', color: '#a1a1aa', flexWrap: 'wrap' }}>
+                      {run.fill_rate_pct != null && (
+                        <span><span style={{ color: '#71717a' }}>{tP('bootstrap.kpi.fill')}</span> <span style={{ color: '#a78bfa' }}>{run.fill_rate_pct.toFixed(1)}%</span></span>
+                      )}
+                      {run.gini != null && (
+                        <span><span style={{ color: '#71717a' }}>{tP('bootstrap.kpi.gini')}</span> <span style={{ color: '#a78bfa' }}>{run.gini.toFixed(2)}</span></span>
+                      )}
+                      {run.p10_fill_ratio != null && (
+                        <span><span style={{ color: '#71717a' }}>{tP('bootstrap.kpi.p10')}</span> <span style={{ color: '#a78bfa' }}>{run.p10_fill_ratio.toFixed(2)}</span></span>
+                      )}
+                      {run.on_time_count != null && (
+                        <span><span style={{ color: '#71717a' }}>{tP('bootstrap.kpi.onTime')}</span> <span style={{ color: '#a78bfa' }}>{run.on_time_count}</span></span>
+                      )}
+                      {run.manufacturing_total_quantity != null && (
+                        <span><span style={{ color: '#71717a' }}>{tP('bootstrap.kpi.mfg')}</span> <span style={{ color: '#a78bfa' }}>{qtyFmt(run.manufacturing_total_quantity)}</span></span>
+                      )}
+                      {run.inventory_consumed_total != null && (
+                        <span><span style={{ color: '#71717a' }}>{tP('bootstrap.kpi.invConsumed')}</span> <span style={{ color: '#a78bfa' }}>{qtyFmt(run.inventory_consumed_total)}</span></span>
+                      )}
+                    </div>
+                  )}
                   {/* Name display / edit */}
                   {editing ? (
                     <div style={{ marginTop: '0.5rem', display: 'flex', flexDirection: 'column', gap: 6 }}>
