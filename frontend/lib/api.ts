@@ -1387,9 +1387,10 @@ export type BootstrapPreset = {
   preset_index: number;
   primary_axis: string;
   config: Record<string, unknown>;
-  /** True when this entry corresponds to a row in the curated LIBRARY; false
-   *  for user-driven configs that landed in KB outside the library matrix. */
-  library?: boolean;
+  /** Set on `next_batch[]` entries: this preset's config is already in the KB,
+   *  so submitting it unchanged will be skipped at the dedup step. The dialog
+   *  surfaces an "in KB" hint and offers Edit-config to make it unique. */
+  already_covered?: boolean;
   // Present only on items in `already_run[]` — carries the KB record id (for
   // delete) + the source plan_run pointer (may be deleted) + headline KPIs.
   // KB rows are dissociated from plan_runs; the source link can be severed
@@ -1420,33 +1421,81 @@ export type BootstrapPreview = {
   batch_size: number;
   already_run: BootstrapPreset[];
   next_batch: BootstrapPreset[];
+  /** Axis-level metadata for the dialog's next-batch UI. One entry per
+   *  knob the user can vary off the baseline. */
+  axes?: BootstrapAxisSpec[];
+};
+
+export type BootstrapAxisSpec = {
+  /** Canonical knob id (matches the backend's switch in buildConfigForAxisValue). */
+  name: string;
+  /** Display label. */
+  label: string;
+  /** Short help text. */
+  description: string;
+  /** "int" | "bool" | "enum" — drives the input widget. */
+  value_type: 'int' | 'bool' | 'enum';
+  /** Populated for value_type='enum'. */
+  enum_values?: string[];
+  /** Value at the baseline — shown as a "varies from X" hint. */
+  baseline_value: unknown;
+  /** Suggested initial value when the user enables this axis (next-uncovered). */
+  default_seed: unknown;
+  /** Values the curated library enumerates (datalist suggestions). */
+  variations: unknown[];
+  /** Group id — axes in the same group share a collapsible header in the
+   *  dialog. Captures logical dependencies (e.g. consolidation cluster). */
+  group: string;
 };
 
 export type BootstrapStartResponse =
   | { status: 'library_exhausted'; library_size: number; message: string }
-  | { bootstrap_job_id: string; total: number; presets: BootstrapPreset[] };
+  | { status: 'all_already_covered'; library_size: number; message: string; skipped: BootstrapPreset[] }
+  | { bootstrap_job_id: string; total: number; presets: BootstrapPreset[]; skipped: BootstrapPreset[] };
 
 export type BootstrapJobStatus = {
-  status: 'running' | 'completed' | 'unknown';
+  status: 'running' | 'completed' | 'cancelled' | 'unknown';
   total: number;
   completed: number;
   current_preset_id: string;
   current_preset_label: string;
+  cancelled?: boolean;
   plan_run_ids: number[];
   errors: string[];
 };
 
-export async function getBootstrapPreview(caseId: number, batchSize = 5): Promise<BootstrapPreview> {
-  const r = await fetch(`${API}/cases/${caseId}/bootstrap?batch_size=${batchSize}`);
+/** "Best run" criterion that drives the suggestion seed in the KB dialog.
+ *  • fill_rate → seed = highest fill_rate_pct (tiebreak gini asc)
+ *  • fairness  → seed = lowest gini (tiebreak fill_rate desc)
+ *  • pareto    → seed = balanced winner: max (fill_rate_pct/100 - gini) */
+export type BootstrapCriterion = 'fill_rate' | 'fairness' | 'pareto';
+
+export async function getBootstrapPreview(
+  caseId: number,
+  batchSize = 5,
+  criterion: BootstrapCriterion = 'fill_rate',
+): Promise<BootstrapPreview> {
+  const r = await fetch(`${API}/cases/${caseId}/bootstrap?batch_size=${batchSize}&criterion=${criterion}`);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
 
-export async function startBootstrap(caseId: number, batchSize = 5): Promise<BootstrapStartResponse> {
+/** Start a KB expansion batch.
+ *  When `presets` is provided, those override the system's selectNextBatch —
+ *  use this when the user has reviewed/edited the suggested configs in the
+ *  KB dialog. Each entry needs preset_id, preset_label, primary_axis, config.
+ *  When omitted, the server picks the next round-robin batch from the library. */
+export async function startBootstrap(
+  caseId: number,
+  batchSize = 5,
+  presets?: Array<Pick<BootstrapPreset, 'preset_id' | 'preset_label' | 'primary_axis' | 'config'>>,
+): Promise<BootstrapStartResponse> {
+  const body: Record<string, unknown> = { batch_size: batchSize };
+  if (presets && presets.length > 0) body.presets = presets;
   const r = await fetch(`${API}/cases/${caseId}/bootstrap`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ batch_size: batchSize }),
+    body: JSON.stringify(body),
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
@@ -1456,6 +1505,13 @@ export async function getBootstrapJobStatus(caseId: number, jobId: string): Prom
   const r = await fetch(`${API}/cases/${caseId}/bootstrap/status/${jobId}`);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
+}
+
+/** Interrupt a running KB expansion job. Cooperative — the currently running
+ *  preset finishes; subsequent presets are skipped. Job ends in status=cancelled. */
+export async function cancelBootstrap(caseId: number, jobId: string): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/bootstrap/cancel/${jobId}`, { method: 'POST' });
+  if (!r.ok) throw new Error(await r.text());
 }
 
 /** Delete a KB record. Does NOT touch the source plan_run (KB is dissociated). */

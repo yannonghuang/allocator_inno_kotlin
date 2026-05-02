@@ -304,7 +304,14 @@ fun Routing.allocateRoutes() {
                 ?: throw NoSuchElementException("Case not found")
         }
         val batchSize = (call.request.queryParameters["batch_size"]?.toIntOrNull() ?: 5).coerceIn(1, com.allocator.services.CaseBootstrap.LIBRARY.size)
-        call.respond(com.allocator.services.CaseBootstrap.statusFor(caseId, batchSize))
+        val criterion = call.request.queryParameters["criterion"]
+            ?.takeIf { it in setOf(
+                com.allocator.services.CaseBootstrap.CRITERION_FILL_RATE,
+                com.allocator.services.CaseBootstrap.CRITERION_FAIRNESS,
+                com.allocator.services.CaseBootstrap.CRITERION_PARETO,
+            ) }
+            ?: com.allocator.services.CaseBootstrap.CRITERION_FILL_RATE
+        call.respond(com.allocator.services.CaseBootstrap.statusFor(caseId, batchSize, criterion))
     }
 
     // ── POST /cases/{case_id}/bootstrap — fire next batch of preset runs ──────
@@ -327,16 +334,63 @@ fun Routing.allocateRoutes() {
         val body = runCatching { call.receiveText() }.getOrElse { "" }
         val payload = if (body.isBlank()) JsonObject(emptyMap())
                       else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrElse { JsonObject(emptyMap()) }
-        val batchSize = (payload["batch_size"]?.jsonPrimitive?.intOrNull ?: 5).coerceIn(1, com.allocator.services.CaseBootstrap.LIBRARY.size)
+        // Batch size is uncapped (well, sanity-bounded) — KB is uncapped too,
+        // and selectNextBatch naturally returns at most as many uncovered
+        // library presets as exist. Higher values just let the user start a
+        // larger run when they have many edits queued.
+        val batchSize = (payload["batch_size"]?.jsonPrimitive?.intOrNull ?: 5).coerceIn(1, 100)
 
-        val presets = com.allocator.services.CaseBootstrap.selectNextBatch(caseId, batchSize)
-        if (presets.isEmpty()) {
+        // Optional client-supplied preset list. When present, these replace
+        // selectNextBatch wholesale — the user has reviewed and possibly edited
+        // the system suggestions in the dialog. Each entry must carry preset_id,
+        // preset_label, primary_axis, and a config JsonObject. Anything missing
+        // falls back to selectNextBatch.
+        val presetsOverride: List<com.allocator.services.BootstrapPreset>? = (payload["presets"] as? JsonArray)?.let { arr ->
+            arr.mapIndexedNotNull { idx, el ->
+                val obj = el as? JsonObject ?: return@mapIndexedNotNull null
+                val cfg = obj["config"] as? JsonObject ?: return@mapIndexedNotNull null
+                val pid = obj["preset_id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+                    ?: "custom-$idx"
+                val label = obj["preset_label"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+                    ?: pid
+                val axis = obj["primary_axis"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+                    ?: "user-driven"
+                com.allocator.services.BootstrapPreset(
+                    presetId = pid, label = label, index = idx + 1,
+                    primaryAxis = axis, config = cfg,
+                )
+            }.takeIf { it.isNotEmpty() }
+        }
+
+        val proposedPresets = presetsOverride ?: com.allocator.services.CaseBootstrap.selectNextBatch(caseId, batchSize)
+        if (proposedPresets.isEmpty()) {
             call.respond(buildJsonObject {
                 put("status", "library_exhausted")
                 put("library_size", com.allocator.services.CaseBootstrap.LIBRARY.size)
                 put("message", "All bootstrap presets have been run for this case. " +
                     "The case's knowledge base now spans the curated library — use the planning agent " +
                     "for ad-hoc explorations, or run plans manually for case-specific tuning.")
+            })
+            return@post
+        }
+        // Final dedup at submission time. The next_batch suggestions are
+        // computed on dialog open and may be stale (parallel run, edits that
+        // collide with an existing kb_record, etc.). Drop any preset whose
+        // config signature is already covered. The skipped list is returned
+        // to the client for a "skipped N presets" notice.
+        val coveredSigs = com.allocator.services.CaseBootstrap.coveredSignaturesFor(caseId)
+        val (presets, skippedDup) = proposedPresets.partition { preset ->
+            com.allocator.services.CaseBootstrap.signatureFor(preset.config) !in coveredSigs
+        }
+        if (presets.isEmpty()) {
+            call.respond(buildJsonObject {
+                put("status", "all_already_covered")
+                put("library_size", com.allocator.services.CaseBootstrap.LIBRARY.size)
+                put("message", "All submitted presets match a config already covered in the Knowledge Base. " +
+                    "Edit the configs to differ from existing entries, or use the planning agent for analysis.")
+                putJsonArray("skipped") {
+                    skippedDup.forEach { add(com.allocator.services.CaseBootstrap.toJson(it)) }
+                }
             })
             return@post
         }
@@ -351,6 +405,7 @@ fun Routing.allocateRoutes() {
             "current_preset_label" to presets.first().label,
             "plan_run_ids" to mutableListOf<Int>(),
             "errors" to mutableListOf<String>(),
+            "cancelled" to false,
         )
 
         engineScope.launch { runBootstrapBatchBackground(bootstrapJobId, caseId, presets, data) }
@@ -360,6 +415,12 @@ fun Routing.allocateRoutes() {
             put("total", presets.size)
             putJsonArray("presets") {
                 presets.forEach { add(com.allocator.services.CaseBootstrap.toJson(it)) }
+            }
+            // Surface any presets that were dropped at submission time because
+            // their config signature already exists in KB. Frontend uses this
+            // to show a "skipped N" notice.
+            putJsonArray("skipped") {
+                skippedDup.forEach { add(com.allocator.services.CaseBootstrap.toJson(it)) }
             }
         })
     }
@@ -394,8 +455,25 @@ fun Routing.allocateRoutes() {
             put("completed", JsonPrimitive(state["completed"] as? Int ?: 0))
             put("current_preset_id", state["current_preset_id"]?.toString() ?: "")
             put("current_preset_label", state["current_preset_label"]?.toString() ?: "")
+            put("cancelled", JsonPrimitive(state["cancelled"] == true))
             putJsonArray("plan_run_ids") { planRunIds.forEach { add(JsonPrimitive(it)) } }
             putJsonArray("errors") { errors.forEach { add(JsonPrimitive(it)) } }
+        })
+    }
+
+    // ── POST /cases/{case_id}/bootstrap/cancel/{job_id} — request interrupt ───
+    // Sets the cooperative-cancel flag. The currently-running preset (if any)
+    // finishes; subsequent presets are skipped. Job ends in status=cancelled.
+    post("/cases/{case_id}/bootstrap/cancel/{job_id}") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val jobId = call.parameters["job_id"] ?: throw IllegalArgumentException("Invalid job_id")
+        val state = bootstrapJobs[jobId] ?: throw NoSuchElementException("Bootstrap job not found")
+        if (state["case_id"] != caseId) throw NoSuchElementException("Bootstrap job not found for this case")
+        state["cancelled"] = true
+        call.respond(buildJsonObject {
+            put("status", state["status"]?.toString() ?: "running")
+            put("cancelled", JsonPrimitive(true))
         })
     }
 
@@ -1942,6 +2020,12 @@ internal suspend fun runBootstrapBatchBackground(
     data: Map<String, List<Map<String, Any?>>>,
 ) {
     for (preset in presets) {
+        // Cooperative cancellation: bail out before starting a new preset if
+        // the user clicked Interrupt. The current preset (if any) finishes —
+        // the planning engine doesn't expose a clean mid-run cancel — but no
+        // further presets begin. Job ends in status=cancelled, distinct from
+        // completed so the UI can show "stopped early".
+        if (bootstrapJobs[bootstrapJobId]?.get("cancelled") == true) break
         bootstrapJobs[bootstrapJobId]?.let {
             it["current_preset_id"] = preset.presetId
             it["current_preset_label"] = preset.label
@@ -1960,7 +2044,9 @@ internal suspend fun runBootstrapBatchBackground(
             it["completed"] = (it["completed"] as Int) + 1
         }
     }
-    bootstrapJobs[bootstrapJobId]?.let { it["status"] = "completed" }
+    bootstrapJobs[bootstrapJobId]?.let {
+        it["status"] = if (it["cancelled"] == true) "cancelled" else "completed"
+    }
 }
 
 /** Run one preset end-to-end: insert plan_run, run planner, persist, soundness. */

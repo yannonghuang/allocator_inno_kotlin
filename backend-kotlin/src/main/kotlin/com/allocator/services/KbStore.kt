@@ -155,15 +155,8 @@ object KbStore {
     /**
      * Backfill: for any successful + sound plan_run on this case that doesn't
      * yet have a corresponding kb_record, create one. Idempotent. Called
-     * lazily on KB read so historical successful runs (regardless of whether
-     * they were bootstrap-tagged) get represented in the KB.
-     *
-     * Backfill is conservative — only success status AND sound soundness
-     * count, since older runs are unverified at scale and we don't want to
-     * pollute the KB with unsound or in-progress data. Going forward, every
-     * successful run is captured directly via the upsertFromPlanRun hook on
-     * each save / soundness-recheck path, so soundness can be "unchecked"
-     * for in-flight rows; only the *backfill* threshold is strict.
+     * lazily on KB read so historical successful runs surface in the KB
+     * (the agent and dedup both rely on the entire KB).
      */
     fun backfillForCase(caseId: Int) = transaction {
         val existingSigs = KbRecords.selectAll()
@@ -182,8 +175,6 @@ object KbStore {
             val configJson = runCatching { json.parseToJsonElement(configRaw).jsonObject }.getOrNull() ?: continue
             val sig = CaseBootstrap.signatureFor(configJson)
             if (sig in existingSigs) continue
-            // Use upsertFromPlanRun for consistency (re-reads inside its own
-            // transaction; nested transactions are no-ops in Exposed).
             upsertFromPlanRun(row[PlanRuns.id])
         }
     }
