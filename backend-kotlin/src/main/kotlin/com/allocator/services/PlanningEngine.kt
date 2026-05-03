@@ -1515,29 +1515,15 @@ fun plan(
     val elaborateAtThisLevel = shouldElaborateAtDepth(depth, methodCfg.depth)
 
     // ── Waterfall multi-method allocation ──────────────────────────────────
-    // When `max_methods > 1`, run sequential exhaustion across the top-
-    // `max_methods` ranked methods. Slot 1 plans the full demand; whatever
-    // can't be filled flows to slot 2 as residual; etc. Each slot consumes
-    // inventory in place so slot N+1 sees slot N's commitments. No re-ranking
-    // between iterations — order is fixed at the start of the demand.
-    //
-    // The same loop covers two patterns naturally:
-    //   • Reactive fallback — when a slot returns blocked, the loop continues
-    //     to the next method (`continue` at the blockedReason branch).
-    //   • Proactive split — when a slot partially covers, residual flows to
-    //     the next method.
-    //
-    // Applies at ALL levels (not just root). Earlier the gate was
-    // `elaborateAtThisLevel`, restricting waterfall to root via
-    // method_selection.depth. That left deeper multi-method sites stuck on
-    // single-method preference picks: if slot 1's chosen method led to a
-    // blocked subchain (e.g. `move 1000→VIRTUAL` for a parent whose @1000
-    // children lacked supply), the demand failed entirely even when an
-    // alternate method (`move 2000→VIRTUAL`) would have routed cleanly.
-    // Per-level effort is bounded by `maxMethods` (default 2); scoring sims
-    // force `max_methods=1` so recursive scoring stays cheap. Most BOM nodes
-    // have a single method anyway, so the actual cost increase is modest.
-    val useWaterfall = methodCfg.maxMethods > 1 && effectiveMethods.size > 1
+    // Restricted to root via `elaborateAtThisLevel` (gated by
+    // `method_selection.depth=1`). Waterfall does both reactive fallback
+    // and proactive split in one loop, but firing it at every BOM depth
+    // explodes combinatorially even with `maxMethods=2` (observed: 22k
+    // multi-method log lines / 30s on case 171). Reactive fallback at
+    // deeper levels is handled below in the single-method path — cheaper
+    // because it only fires on a hard block, not on every multi-method
+    // site.
+    val useWaterfall = methodCfg.maxMethods > 1 && elaborateAtThisLevel && effectiveMethods.size > 1
     if (useWaterfall) {
         // Rank methods once. Preference mode → ascending preference int (cascade
         // order). Elaborate mode → composite score descending. Failed elaborate
@@ -1614,17 +1600,6 @@ fun plan(
             slot.latestCommit?.let { c ->
                 if (latestCommit == null || c > latestCommit) latestCommit = c
             }
-            // At non-root multi-method sites, stop after the first non-blocked
-            // slot. Reactive fallback (continue on blockedReason above) still
-            // applies at every level — that's what unblocks alternate routes
-            // when the preferred method's subchain dies. But proactive split
-            // (continuing into more methods to absorb partial residual) is
-            // limited to the root via `elaborateAtThisLevel`. Without this
-            // guard, every partial-fulfilling method at every BOM depth
-            // would cascade into additional methods, recursing into THEIR
-            // multi-method subtrees — combinatorial blowup observed in case
-            // 171 (22k multi-method log lines / 30s vs 1.6k baseline).
-            if (!elaborateAtThisLevel) break
         }
 
         val totalCommitted = demandNetQty - residual
@@ -1676,31 +1651,68 @@ fun plan(
     }
 
     // ── Single-method commit via the shared planMethodSlot helper ───────────
-    val slot = planMethodSlot(
-        m = m, slotQty = demandNetQty,
-        productId = productId, locationId = locationId,
-        demand = demand, demandId = demandId,
-        requestTimeDt = requestTimeDt, reqTimeStr = reqTimeStr,
-        inventory = inventory, data = data,
-        depth = depth, path = path,
-        config = config, preferDemandId = preferDemandId,
-        overrideIndex = overrideIndex, budget = budget,
-        useSingleVariant = useSingleVariant,
-        scoreWeights = scoreWeights, topN = topN,
-        variantOverride = variantOverride,
-        methodChoiceExplanation = methodChoiceExplanation,
-        overrideActive = overrideActive,
-    )
+    // Reactive fallback: if the picked method's slot blocks at 0 achievable,
+    // try the next method by preference. Bounded by methodCfg.maxMethods
+    // (default 2). Only fires on a HARD block (blockedReason != null) — a
+    // partial-fulfill is treated as commit-and-done, no further methods
+    // tried. This is the cheap analogue of waterfall that operator intent
+    // requires at all BOM levels: when the preferred method's subchain dies
+    // (e.g. cycled or starved), the alternate route gets a chance.
+    val rankedForFallback: List<Map<String, Any?>> = effectiveMethods
+        .sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
+    val firstIdx = rankedForFallback.indexOfFirst {
+        (it["type"] == m["type"]) &&
+            (it["location_id"] == m["location_id"]) &&
+            (it["from_location_id"] == m["from_location_id"])
+    }.coerceAtLeast(0)
+    val fallbackOrder = if (firstIdx >= 0) {
+        listOf(rankedForFallback[firstIdx]) + rankedForFallback.filterIndexed { i, _ -> i != firstIdx }
+    } else listOf(m) + rankedForFallback
+    val cap = methodCfg.maxMethods.coerceAtMost(fallbackOrder.size)
 
-    if (slot.blockedReason != null) {
-        // Whole slot blocked at qty 0. Surface the failed-child reason at the
-        // demand level and emit the blocked WO placeholder so the UI tree still
-        // shows the attempted method and its (failed) children.
-        demandFulfilledList.add(committedRow(0.0, reqTimeStr, slot.blockedReason))
-        val failedPegging = listOf(slot.methodPeggingNode) + peggingChildren
-        return Triple(demandFulfilledList, emptyList(), demandNode(failedPegging, reqTimeStr, slot.blockedReason, committedQty = taken))
+    var slot: MethodSlotResult? = null
+    val blockedSlotsPegging = mutableListOf<Map<String, Any?>>()
+    var lastBlockedReason: String? = null
+    for ((slotIdx, candidate) in fallbackOrder.take(cap).withIndex()) {
+        val labelPrefix = if (slotIdx == 0) methodChoiceExplanation
+            else "Reactive fallback ${slotIdx + 1}/$cap (preferred method blocked): " +
+                "${candidate["type"]}@${candidate["location_id"] ?: candidate["to_location_id"] ?: ""}"
+        val attempt = planMethodSlot(
+            m = candidate, slotQty = demandNetQty,
+            productId = productId, locationId = locationId,
+            demand = demand, demandId = demandId,
+            requestTimeDt = requestTimeDt, reqTimeStr = reqTimeStr,
+            inventory = inventory, data = data,
+            depth = depth, path = path,
+            config = config, preferDemandId = preferDemandId,
+            overrideIndex = overrideIndex, budget = budget,
+            useSingleVariant = useSingleVariant,
+            scoreWeights = scoreWeights, topN = topN,
+            variantOverride = variantOverride,
+            methodChoiceExplanation = labelPrefix,
+            overrideActive = overrideActive,
+        )
+        if (attempt.blockedReason != null) {
+            // Hard block: keep the failed WO for diagnosis, advance to next method.
+            blockedSlotsPegging.add(attempt.methodPeggingNode)
+            lastBlockedReason = attempt.blockedReason
+            continue
+        }
+        slot = attempt
+        break
     }
 
+    if (slot == null) {
+        // Every method blocked. Surface the last failed reason and include all
+        // failed-method WOs so the UI shows what was attempted at this site.
+        demandFulfilledList.add(committedRow(0.0, reqTimeStr, lastBlockedReason ?: "no_methods_succeeded"))
+        val failedPegging = blockedSlotsPegging + peggingChildren
+        return Triple(demandFulfilledList, emptyList(), demandNode(failedPegging, reqTimeStr, lastBlockedReason, committedQty = taken))
+    }
+
+    // Earlier blocked attempts (if any) are kept alongside the successful WO
+    // so the pegging UI shows the full fallback trail.
+    peggingChildren.addAll(blockedSlotsPegging)
     peggingChildren.add(slot.methodPeggingNode)
 
     // "partial" is NOT a failure reason — it keeps is_failed=false so enrichCommittedDemands
