@@ -1469,17 +1469,6 @@ fun plan(
     val purchaseAllowed = config?.get("purchase_allowed") != false  // default true
     val methods = getMethods(productId, locationId, data)
         .let { if (purchaseAllowed) it else it.filter { m -> m["type"] != "purchase" } }
-        // Proactive cycle filter: drop move methods whose source location of the same
-        // product is already in the planning path. Going there would immediately
-        // bottleneck on a cycle_stopped child and the slot would block — picking a
-        // doomed method preempts non-cyclic alternatives at the same level (e.g.
-        // make-at-this-location). With this filter, single-method picking surfaces
-        // the non-cyclic candidate naturally instead of relying on reactive cycle
-        // detection inside planMethodSlot. Inventory at this location is taken
-        // before this point regardless, so the partial inv-take still sticks.
-        .filterNot { m ->
-            m["type"] == "move" && Pair(productId, (m["from_location_id"] as? String)?.trim() ?: "") in path
-        }
     if (methods.isEmpty()) {
         demandFulfilledList.add(committedRow(demandNetQty, reqTimeStr, "no_methods"))
         return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, reqTimeStr, "no_methods", committedQty = taken))
