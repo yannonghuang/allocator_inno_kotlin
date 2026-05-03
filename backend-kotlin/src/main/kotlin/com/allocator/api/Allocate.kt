@@ -2464,7 +2464,16 @@ private fun formatTs(ts: kotlinx.datetime.Instant): String {
 /** Recursively converts a JsonElement to native Kotlin types so config maps can be read with normal == checks. */
 internal fun jsonElementToNative(element: JsonElement): Any? = when (element) {
     is JsonNull      -> null
-    is JsonPrimitive -> element.booleanOrNull ?: element.longOrNull ?: element.doubleOrNull ?: element.content
+    is JsonPrimitive -> when {
+        // Respect JSON's string typing. JsonPrimitive.longOrNull etc. parse the
+        // *content* regardless of whether the source was quoted, so a quoted
+        // numeric-looking string like "1000" (a valid location_id) would get
+        // coerced to Long(1000) — then any downstream `as? String` cast fails.
+        // The soundness checker's R7d_purchase_lid_missing rule was firing on
+        // valid runs because of this. Preserve string typing first.
+        element.isString -> element.content
+        else             -> element.booleanOrNull ?: element.longOrNull ?: element.doubleOrNull ?: element.content
+    }
     is JsonObject    -> element.entries.associate { (k, v) -> k to jsonElementToNative(v) }
     is JsonArray     -> element.map { jsonElementToNative(it) }
 }
