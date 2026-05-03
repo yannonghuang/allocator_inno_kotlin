@@ -813,6 +813,14 @@ internal fun scoreMethodsForElaborate(
                 if ((s["quantity"] as? Number)?.toDouble() ?: 0.0 <= 0) continue
                 val ct = s["commit_time"] as? String
                 val reason = s["commit_reason"] as? String ?: ""
+                // cycle_stopped/cycle_detected rows are emitted at full residual qty
+                // with a `commit_time` set to the demand's request_due_time — they
+                // look like successful commits to a naive scoring loop, even though
+                // no production happened. Treat them as inert: no `maxCommit`
+                // contribution, no `anyFailed` flip. The method's *real* deliverable
+                // qty stays captured via `consumed` (inventory taken before the
+                // cycle stop) and via the non-cycle siblings in `solvedList`.
+                if (reason == "cycle_stopped" || reason == "cycle_detected") continue
                 if (ct == null || (reason.isNotBlank() && reason !in BENIGN_REASONS)) anyFailed = true
                 if (ct != null) parseDate(ct)?.let { dt -> if (maxCommit == null || dt > maxCommit) maxCommit = dt }
             }
@@ -866,7 +874,18 @@ internal fun getPreferredMethodElaborate(
 
     val scored = scoreMethodsForElaborate(
         methods, demand, inventory, data, requestTimeDt, config, depth, planningPath,
-    ).sortedByDescending { it.score }
+    ).sortedWith(
+        // Tiebreaker by preference (asc): when sims are tied — typically when every
+        // candidate hit the same downstream block (e.g. a deep cycle or a missing
+        // raw material), all methods score 0 or -1e9. Stable sort then preserves
+        // input order, which is `[buy, make, move]` from getMethods — making the
+        // planner pick the first iteration order rather than the highest-priority
+        // method. Falling back to preference asc here matches the cascade picker's
+        // tiebreaker and keeps elaborate's "sometimes-tied" behaviour consistent
+        // with operator expectations.
+        compareByDescending<MethodScore> { it.score }
+            .thenBy { (it.method["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
+    )
 
     val best = scored.first()
     if (best.failed) return getPreferredMethod(methods)
@@ -1062,15 +1081,23 @@ internal fun planMethodSlot(
             val immediateChildPid = bottleneck.child["product_id"]?.toString() ?: "?"
             val immediateChildLoc = bottleneck.child["location_id"]?.toString() ?: "?"
             // Pick a representative failure row from the bottleneck child's commit rows to
-            // unwrap deeper. Prefer rows whose reason is a `child_failed:` cascade — those
-            // carry the deeper subtree label. Otherwise fall back to the first hard-failure
-            // row's reason (e.g. "no_methods", "no_inventory"), which is already terminal.
+            // unwrap deeper. Priority order:
+            //  1. Cascade reason (`child_failed:...`) — carries the deeper subtree label.
+            //  2. Hard-failure reason (`no_methods`, `depth_limit`) — terminal.
+            //  3. cycle_stopped / cycle_detected — terminal cause too. Classified as
+            //     "benign" by isHardPlanningFailure (because they don't count toward
+            //     effective qty), but they ARE the real reason a cycled child failed.
+            //     Without this branch the helper falls through to the (?, ?, "no_inventory")
+            //     default — masking move-cycle blocks as fake inventory shortages.
             val bottleneckReason: String? = bottleneck.solvedList
                 .map { it["commit_reason"] as? String }
                 .firstOrNull { r -> r != null && r.startsWith("child_failed:") }
                 ?: bottleneck.solvedList
                     .map { it["commit_reason"] as? String }
                     .firstOrNull { r -> r != null && isHardPlanningFailure(r) }
+                ?: bottleneck.solvedList
+                    .map { it["commit_reason"] as? String }
+                    .firstOrNull { r -> r == "cycle_stopped" || r == "cycle_detected" }
             val (deepestPid, deepestLoc, terminalCause) = resolveDeepestCause(bottleneckReason)
             // If the cascade unwrap landed on "?" (broken/terminal pegging — expected when
             // the deepest child reported a non-cascade reason like "no_methods"), use the
@@ -1499,7 +1526,13 @@ fun plan(
         // candidates carry score=-1e9 and naturally sink to the bottom.
         val ranked: List<Map<String, Any?>> = if (useElaborateMethod) {
             scoreMethodsForElaborate(effectiveMethods, demand, inventory, data, requestTimeDt, config, depth, path)
-                .sortedByDescending { it.score }.map { it.method }
+                .sortedWith(
+                    // Tiebreaker by preference asc — see getPreferredMethodElaborate
+                    // for the rationale (tied sims under deep blocks would otherwise
+                    // pick whatever comes first in getMethods's iteration order).
+                    compareByDescending<MethodScore> { it.score }
+                        .thenBy { (it.method["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
+                ).map { it.method }
         } else {
             effectiveMethods.sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
         }
