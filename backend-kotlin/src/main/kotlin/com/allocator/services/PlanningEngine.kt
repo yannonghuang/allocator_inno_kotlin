@@ -1561,19 +1561,7 @@ fun plan(
         val methodOverrideActiveW = methodOverride != null && effectiveMethods.size < methods.size
         val overrideActiveW = methodOverrideActiveW || variantOverride != null
 
-        // Iteration bound: try every available method while the demand is
-        // not yet met. The configured `maxMethods` is no longer a hard cap —
-        // if the demand is still short after the first `maxMethods` slots,
-        // the loop continues into the remaining ranked methods. The
-        // residual-met check below is the real stop condition.
-        //
-        // Rationale: capping at maxMethods=2 leaves residual on the table
-        // when both top-ranked methods only partially fulfill (or when the
-        // top method blocks and the second only covers part of the residual
-        // due to its own constraints). Operator intent for "fallback to next
-        // preferred method" is "keep falling back as long as the demand is
-        // not satisfied" — bounded naturally by the finite candidate list.
-        val cap = ranked.size
+        val cap = methodCfg.maxMethods.coerceAtMost(ranked.size)
         var residual = demandNetQty
         var latestCommit: LocalDate? = null
         val allWos = mutableListOf<Map<String, Any?>>()
