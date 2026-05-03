@@ -9310,19 +9310,25 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   return Number((cc != null ? cc : c.quantity) ?? 0);
                 };
                 let childrenList = rawChildren;
-                // Fix: blocked work_order — collapse the failed subtree. The slot's
-                // method_choice_explanation already says "blocked: deep child X has no
-                // supply", so the tree below adds noise without information.
-                const isBlockedWo = node.type === 'work_order'
+                // Blocked work_order with no `failed` marker — collapse the subtree.
+                // The slot's method_choice_explanation already names the deepest
+                // bottleneck, so an empty/legacy 0-qty subtree below would add
+                // noise without information. WOs marked `failed: true` come from
+                // the AND-bottleneck blocked branch and carry the partial pegging
+                // tree (under-allocated children, deeper child_failed cascades) —
+                // those stay expandable so operators can inspect *why* the method
+                // was blocked.
+                const isLegacyBlockedWo = node.type === 'work_order'
+                  && !node.failed
                   && Number(node.quantity ?? 0) <= 1e-9
                   && rawChildren.length > 0;
-                if (isBlockedWo) {
+                if (isLegacyBlockedWo) {
                   childrenList = [];
                 }
                 // Fix: under OR-relation, hide siblings that contributed nothing when at
                 // least one DID contribute. OR semantics is "any one path supplies the
                 // parent" — failed alternatives are dead weight.
-                if (!isBlockedWo && node.children_relation === 'or' && childrenList.length > 1) {
+                if (!isLegacyBlockedWo && node.children_relation === 'or' && childrenList.length > 1) {
                   const contribCount = childrenList.reduce((n, c) => n + (childContrib(c) > 1e-9 ? 1 : 0), 0);
                   if (contribCount > 0 && contribCount < childrenList.length) {
                     childrenList = childrenList.filter((c) => childContrib(c) > 1e-9);

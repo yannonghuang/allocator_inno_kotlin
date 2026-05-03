@@ -232,6 +232,12 @@ export type PlanningPeggingNode = {
   max_lot_size?: number | null;
   /** For supply nodes: the specific supply record that was consumed. */
   supply_id?: string | null;
+  /** Marker on work_order nodes from the AND-bottleneck blocked branch.
+   *  Indicates a debug snapshot of "what would have happened" — the
+   *  subtree's child takes were rolled back at the planner level, but
+   *  the structure is preserved for diagnosis. UI keeps the children
+   *  expandable; soundness checker skips the entire subtree. */
+  failed?: boolean;
   children: PlanningPeggingNode[];
 };
 
