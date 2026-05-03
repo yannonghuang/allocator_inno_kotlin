@@ -1614,6 +1614,17 @@ fun plan(
             slot.latestCommit?.let { c ->
                 if (latestCommit == null || c > latestCommit) latestCommit = c
             }
+            // At non-root multi-method sites, stop after the first non-blocked
+            // slot. Reactive fallback (continue on blockedReason above) still
+            // applies at every level — that's what unblocks alternate routes
+            // when the preferred method's subchain dies. But proactive split
+            // (continuing into more methods to absorb partial residual) is
+            // limited to the root via `elaborateAtThisLevel`. Without this
+            // guard, every partial-fulfilling method at every BOM depth
+            // would cascade into additional methods, recursing into THEIR
+            // multi-method subtrees — combinatorial blowup observed in case
+            // 171 (22k multi-method log lines / 30s vs 1.6k baseline).
+            if (!elaborateAtThisLevel) break
         }
 
         val totalCommitted = demandNetQty - residual
