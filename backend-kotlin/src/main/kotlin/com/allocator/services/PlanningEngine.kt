@@ -1651,23 +1651,28 @@ fun plan(
     }
 
     // ── Single-method commit via the shared planMethodSlot helper ───────────
-    // Reactive fallback: if the picked method's slot blocks at 0 achievable,
-    // try the next method by preference. Bounded by methodCfg.maxMethods
-    // (default 2). Only fires on a HARD block (blockedReason != null) — a
-    // partial-fulfill is treated as commit-and-done, no further methods
-    // tried. This is the cheap analogue of waterfall that operator intent
-    // requires at all BOM levels: when the preferred method's subchain dies
-    // (e.g. cycled or starved), the alternate route gets a chance.
-    val rankedForFallback: List<Map<String, Any?>> = effectiveMethods
-        .sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
-    val firstIdx = rankedForFallback.indexOfFirst {
-        (it["type"] == m["type"]) &&
-            (it["location_id"] == m["location_id"]) &&
-            (it["from_location_id"] == m["from_location_id"])
-    }.coerceAtLeast(0)
-    val fallbackOrder = if (firstIdx >= 0) {
-        listOf(rankedForFallback[firstIdx]) + rankedForFallback.filterIndexed { i, _ -> i != firstIdx }
-    } else listOf(m) + rankedForFallback
+    // Reactive fallback: if the picked method blocks at 0 achievable, try
+    // the next method by preference. SCOPE: limited to **move-to-move**
+    // alternatives only (same product, different `from_location`). Catches
+    // the operator's primary case — picking the "wrong" source location
+    // when two moves are tied on preference (e.g. `move 1000→VIRTUAL`
+    // blocks because the @1000 chain dies; `move 2000→VIRTUAL` succeeds
+    // via the @2000 chain). The downstream BOM is the same; only the
+    // source location differs, so cost stays bounded.
+    //
+    // EXCLUDED: make-as-fallback. A make method's planMethodSlot recurses
+    // through its BOM children, each potentially multi-method, each with
+    // its own potential fallback. That recursion compounds — observed
+    // ~14× normal log volume on case 171 when fallback admitted make
+    // alternatives. If the picked method is `make` or `purchase`, no
+    // fallback. If the only alternatives are different types, no fallback.
+    val isMoveType = m["type"] == "move"
+    val moveAlternatives: List<Map<String, Any?>> = if (isMoveType) {
+        effectiveMethods
+            .filter { it["type"] == "move" && it["from_location_id"] != m["from_location_id"] }
+            .sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
+    } else emptyList()
+    val fallbackOrder = listOf(m) + moveAlternatives
     val cap = methodCfg.maxMethods.coerceAtMost(fallbackOrder.size)
 
     var slot: MethodSlotResult? = null
