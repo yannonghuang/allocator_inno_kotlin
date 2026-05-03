@@ -438,10 +438,20 @@ private fun collectDeepNeeds(
             // Non-terminal: recurse through BOM children to reach inventory-level components.
             // Follow all children in every alt_group (including OR-alternatives), but propagate
             // viaOrAlt=true so that inventory items reached via OR groups are not over-procured.
+            //
+            // OR vs AND distinction: variantsForMake groups BOM rows by alt_group. A non-null
+            // alt_group with multiple children is a real OR (alternative substitutes). The
+            // synthetic "__null__" key is the AND bucket — every child in it is REQUIRED, not
+            // alternative. Setting `isOrGroup = childList.size > 1` without the alt_group
+            // check incorrectly marks all-AND BOMs (e.g. case 171's 502-1824-02 with 11 NULL
+            // alt_group children) as OR, propagating viaOrAlt=true through the whole subtree.
+            // Downstream that flag tells single-demand consolidation groups to skip
+            // (line 574), leaving real inventory at the supply leaves untouched even though
+            // the chain genuinely needs them.
             val productionLocation = (method["location_id"] as? String)?.trim() ?: locationId
             val variants = variantsForMake(productId, productionLocation, qty, method, data)
-            for ((_, childList) in variants) {
-                val isOrGroup = childList.size > 1
+            for ((altKey, childList) in variants) {
+                val isOrGroup = altKey != "__null__" && childList.size > 1
                 for (child in childList) {
                     val cProductId  = (child["product_id"]  as? String)?.trim() ?: continue
                     val cLocationId = (child["location_id"] as? String)?.trim() ?: continue
