@@ -1515,19 +1515,29 @@ fun plan(
     val elaborateAtThisLevel = shouldElaborateAtDepth(depth, methodCfg.depth)
 
     // ── Waterfall multi-method allocation ──────────────────────────────────
-    // When `max_methods > 1` and we're at a level where method-selection logic
-    // applies (root only by default, top-N levels via method_selection.depth),
-    // run sequential exhaustion across the top-`max_methods` ranked methods.
-    // Slot 1 plans the full demand; whatever can't be filled flows to slot 2
-    // as residual; etc. Each slot consumes inventory in place so slot N+1
-    // sees slot N's commitments. No re-ranking between iterations — order is
-    // fixed at the start of the demand.
+    // When `max_methods > 1`, run sequential exhaustion across the top-
+    // `max_methods` ranked methods. Slot 1 plans the full demand; whatever
+    // can't be filled flows to slot 2 as residual; etc. Each slot consumes
+    // inventory in place so slot N+1 sees slot N's commitments. No re-ranking
+    // between iterations — order is fixed at the start of the demand.
     //
-    // Gating: method override-narrowed effectiveMethods, methods.size > 1,
-    // and elaborateAtThisLevel together prevent waterfall from firing deep
-    // in the BOM (where it would compound exponentially) or when the user
-    // pinned a single method via override.
-    val useWaterfall = methodCfg.maxMethods > 1 && elaborateAtThisLevel && effectiveMethods.size > 1
+    // The same loop covers two patterns naturally:
+    //   • Reactive fallback — when a slot returns blocked, the loop continues
+    //     to the next method (`continue` at the blockedReason branch).
+    //   • Proactive split — when a slot partially covers, residual flows to
+    //     the next method.
+    //
+    // Applies at ALL levels (not just root). Earlier the gate was
+    // `elaborateAtThisLevel`, restricting waterfall to root via
+    // method_selection.depth. That left deeper multi-method sites stuck on
+    // single-method preference picks: if slot 1's chosen method led to a
+    // blocked subchain (e.g. `move 1000→VIRTUAL` for a parent whose @1000
+    // children lacked supply), the demand failed entirely even when an
+    // alternate method (`move 2000→VIRTUAL`) would have routed cleanly.
+    // Per-level effort is bounded by `maxMethods` (default 2); scoring sims
+    // force `max_methods=1` so recursive scoring stays cheap. Most BOM nodes
+    // have a single method anyway, so the actual cost increase is modest.
+    val useWaterfall = methodCfg.maxMethods > 1 && effectiveMethods.size > 1
     if (useWaterfall) {
         // Rank methods once. Preference mode → ascending preference int (cascade
         // order). Elaborate mode → composite score descending. Failed elaborate
