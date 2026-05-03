@@ -105,9 +105,10 @@ data class SoundnessReport(
  * @param demands the case's input demand rows.
  * @param data full case data (bom, method_make, method_move, method_buy, supply).
  *        Needed to validate WOs against their declared BOM/method rows.
- * @param workOrders the run's `work_orders` field. Used to validate consumption
- *        of synthetic `consolidated_<pid>_<lid>` supply buckets against the
- *        producing WOs at that (pid, lid). Pass an empty list to skip R7c.
+ * @param workOrders the run's `work_orders` field. Currently informational
+ *        (not consulted by any active rule). R7c was previously bounded by
+ *        WO production at (pid|lid); now bounded by consolidator allocation,
+ *        which is read from the consolidator-emitted pegging entries instead.
  * @param committedDemands the run's `committed_demands` field. Used to check
  *        that each demand's reported committed quantity matches its pegging
  *        tree's root.committed_qty. Pass an empty list to skip the consistency
@@ -148,10 +149,9 @@ fun checkRunSoundness(
         committedQtyById[did] = (committedQtyById[did] ?: 0.0) + q
     }
 
-    // Total WO production at each (pid, lid). Used by R7c to bound consumption
-    // of the synthetic `consolidated_<pid>_<lid>` inventory bucket emitted by
-    // the leaf-legacy consolidator (Phase 2). One synthetic bucket aggregates
-    // all production at a component, so the cap is Σ over WOs at (pid, lid).
+    // Total WO production at each (pid, lid). Currently unused by any rule
+    // (R7c moved to a more correct cap below). Kept around because rule
+    // additions in this file commonly need this aggregation.
     val woQtyByComponent = mutableMapOf<String, Double>()
     for (wo in workOrders) {
         val pid = (wo["product_id"] as? String)?.trim() ?: continue
@@ -160,6 +160,36 @@ fun checkRunSoundness(
         if (pid.isBlank() || lid.isBlank() || qty <= 0) continue
         val key = "$pid|$lid"
         woQtyByComponent[key] = (woQtyByComponent[key] ?: 0.0) + qty
+    }
+
+    // R7c synthetic-bucket cap: bucket size at (pid|lid) is what the
+    // consolidator allocated there — not what the WOs produced. Each
+    // consolidator-emitted pegging entry (consolidated=true for multi-demand
+    // groups, passthrough=true for single-demand passthrough groups) carries
+    // a tree whose root committed_qty equals that group's producedQty (the
+    // sum of split shares = the synthetic bucket's contribution at the
+    // group's component). Sum across groups gives the bucket's total size.
+    //
+    // Why not WO production: the consolidator's planFn(syntheticDemand) can
+    // satisfy producedQty from EITHER real inventory consumption OR new WOs
+    // (or a mix). When the planFn drew from real inventory (e.g. 310-0362
+    // had a 29.4k physical supply), no WOs are emitted at that component
+    // but the bucket still gets sized for the consolidator's allocation.
+    // Comparing Σ leaves to WO production then false-positives whenever the
+    // bucket was inventory-backed.
+    val consolidatorAllocationByComponent = mutableMapOf<String, Double>()
+    for (entry in planningPegging) {
+        val isConsolidated = entry["consolidated"] == true
+        val isPassthrough = entry["passthrough"] == true
+        if (!isConsolidated && !isPassthrough) continue
+        @Suppress("UNCHECKED_CAST")
+        val tree = entry["tree"] as? Map<String, Any?> ?: continue
+        val pid = (tree["product_id"] as? String)?.trim() ?: continue
+        val lid = (tree["location_id"] as? String)?.trim() ?: continue
+        val committed = (tree["committed_qty"] as? Number)?.toDouble() ?: 0.0
+        if (pid.isBlank() || lid.isBlank() || committed <= 0) continue
+        val key = "$pid|$lid"
+        consolidatorAllocationByComponent[key] = (consolidatorAllocationByComponent[key] ?: 0.0) + committed
     }
 
     // For each demand_id, locate its canonical pegging tree.
@@ -309,25 +339,28 @@ fun checkRunSoundness(
     }
 
     // ── R7c synthetic-bucket bound ────────────────────────────────────────────
-    // Each `consolidated_<pid>_<lid>` synthetic inventory bucket aggregates the
-    // production of all WOs at (pid, lid). Cross-demand consumption from that
-    // bucket must not exceed total WO output at the same (pid, lid). Runtime's
-    // consumeFromInventory clamps takes to bucket.qty, so this bound holds by
-    // construction in normal operation; R7c catches bugs that bypass that path
-    // (e.g. pegging-tree edits, save-path corruption, wrong producer attribution).
-    // Skipped (no violation) when workOrders is empty — caller didn't pass them.
-    // Tolerance: same shape as R7b — absolute floor for small components,
-    // relative term for large-volume components where Σ over demands drifts.
-    if (woQtyByComponent.isNotEmpty()) {
+    // Each `consolidated_<pid>_<lid>` synthetic inventory bucket is sized to
+    // the consolidator's allocation at that component (= Σ split shares =
+    // producedQty across all groups at (pid|lid)). Per-demand consumption
+    // from that bucket must not exceed the bucket's size. Runtime's
+    // consumeFromInventory clamps takes to bucket.qty, so this bound holds
+    // by construction in normal operation; R7c catches bugs that bypass it
+    // (pegging-tree edits, save-path corruption, wrong producer attribution).
+    //
+    // Skipped (no violation) when consolidatorAllocationByComponent is empty —
+    // either the run didn't use leaf-legacy consolidation, or the caller
+    // didn't pass the consolidator's pegging entries.
+    if (consolidatorAllocationByComponent.isNotEmpty()) {
         for ((componentKey, totalConsumed) in crossDemandSyntheticConsumption) {
-            val produced = woQtyByComponent[componentKey] ?: 0.0
-            val tol = maxOf(config.tolerance, 1e-9 * produced)
-            if (totalConsumed > produced + tol) {
+            val cap = consolidatorAllocationByComponent[componentKey] ?: 0.0
+            val tol = maxOf(config.tolerance, 1e-9 * cap)
+            if (totalConsumed > cap + tol) {
                 crossViolations.add(Violation(
                     rule = "R7c_consolidated_overconsumption",
                     nodePath = "synthetic:$componentKey",
-                    message = "Σ consumption from synthetic 'consolidated_$componentKey' bucket exceeds total WO production at $componentKey.",
-                    expected = produced,
+                    message = "Σ consumption from synthetic 'consolidated_$componentKey' bucket exceeds " +
+                        "consolidator's allocation at $componentKey.",
+                    expected = cap,
                     actual = totalConsumed,
                 ))
             }
