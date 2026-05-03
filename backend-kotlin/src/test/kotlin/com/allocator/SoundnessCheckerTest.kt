@@ -532,4 +532,105 @@ class SoundnessCheckerTest : FunSpec({
         v.actual shouldBe 100.0
         v.message stringShouldContain "supply.qty"
     }
+
+    // ── R7c — synthetic-bucket cap tied to consolidator's allocation ──────────
+    //
+    // Regression for the WO-production-based cap that false-positived on every
+    // chat-driven plan with purchase=on. The cap is the consolidator's
+    // allocation at (pid|lid), read from the consolidator-emitted pegging
+    // entries (consolidated=true / passthrough=true), NOT from work_orders.
+    //
+    // Helper: build a consolidator-emitted entry. Marked consolidated=true
+    // means a multi-demand group's pegging tree; the root.committed_qty
+    // equals producedQty for that group at its (pid|lid).
+    fun consolidatorPegEntry(
+        pid: String,
+        lid: String,
+        committedQty: Double,
+        children: List<Map<String, Any?>> = emptyList(),
+    ) = mapOf(
+        "demand_id" to null,
+        "consolidated" to true,
+        "tree" to mapOf(
+            "type" to "demand",
+            "product_id" to pid,
+            "location_id" to lid,
+            "quantity" to committedQty,
+            "committed_qty" to committedQty,
+            "demand_id" to null,
+            "request_time" to "2024-11-01",
+            "commit_time" to "2024-11-01",
+            "children" to children,
+        ),
+    )
+
+    test("R7c sound: bucket consumption ≤ consolidator allocation, no WOs at component (inventory-backed bucket)") {
+        // Two demands consuming from a synthetic bucket sized 100. The bucket
+        // was filled by the consolidator drawing real inventory at FG@L1
+        // (not from new WOs at FG|L1) — i.e. NO purchase or make WOs at
+        // FG|L1 in the workOrders list. Pre-fix this would false-positive R7c
+        // because woQtyByComponent[FG|L1] = 0.
+        val demands = listOf(
+            demand("D1", "FG", "L1", qty = 60.0),
+            demand("D2", "FG", "L1", qty = 40.0),
+        )
+        val data = mapOf<String, List<Map<String, Any?>>>(
+            "supply" to listOf(supply("S_FG", "FG", "L1", 200.0)),
+        )
+        val d1 = demandNode("D1", "FG", "L1", 60.0, 60.0,
+            children = listOf(supplyLeaf("FG", "L1", "consolidated_FG_L1", 60.0)))
+        val d2 = demandNode("D2", "FG", "L1", 40.0, 40.0,
+            children = listOf(supplyLeaf("FG", "L1", "consolidated_FG_L1", 40.0)))
+        val cons = consolidatorPegEntry("FG", "L1", 100.0,
+            children = listOf(supplyLeaf("FG", "L1", "S_FG", 100.0)))
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", d1), pegEntry("D2", d2), cons),
+            demands = demands, data = data,
+            workOrders = emptyList(),  // no WOs — bucket is inventory-backed
+        )
+        report.crossDemandViolations.none { it.rule == "R7c_consolidated_overconsumption" } shouldBe true
+    }
+
+    test("R7c fires when bucket consumption exceeds consolidator allocation") {
+        // Consolidator allocated 100 at FG|L1, but demand pegging trees claim
+        // 150 from the synthetic bucket. That's an over-draw bug.
+        val demands = listOf(
+            demand("D1", "FG", "L1", qty = 100.0),
+            demand("D2", "FG", "L1", qty = 50.0),
+        )
+        val data = mapOf<String, List<Map<String, Any?>>>(
+            "supply" to listOf(supply("S_FG", "FG", "L1", 200.0)),
+        )
+        val d1 = demandNode("D1", "FG", "L1", 100.0, 100.0,
+            children = listOf(supplyLeaf("FG", "L1", "consolidated_FG_L1", 100.0)))
+        val d2 = demandNode("D2", "FG", "L1", 50.0, 50.0,
+            children = listOf(supplyLeaf("FG", "L1", "consolidated_FG_L1", 50.0)))
+        val cons = consolidatorPegEntry("FG", "L1", 100.0,
+            children = listOf(supplyLeaf("FG", "L1", "S_FG", 100.0)))
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", d1), pegEntry("D2", d2), cons),
+            demands = demands, data = data,
+        )
+        val v = report.crossDemandViolations.first { it.rule == "R7c_consolidated_overconsumption" }
+        v.expected shouldBe 100.0
+        v.actual shouldBe 150.0
+        v.message stringShouldContain "consolidator's allocation"
+    }
+
+    test("R7c skipped when no consolidator entries are present") {
+        // Pure non-consolidation run: no consolidated/passthrough entries.
+        // Even if a per-demand tree happens to reference a synthetic bucket,
+        // R7c can't establish a cap → silent (no violation, no crash).
+        val demands = listOf(demand("D1", "FG", "L1", qty = 50.0))
+        val data = mapOf<String, List<Map<String, Any?>>>(
+            "supply" to listOf(supply("S_FG", "FG", "L1", 100.0)),
+        )
+        val tree = demandNode("D1", "FG", "L1", 50.0, 50.0,
+            children = listOf(supplyLeaf("FG", "L1", "consolidated_FG_L1", 50.0)))
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", tree)),
+            demands = demands, data = data,
+        )
+        report.crossDemandViolations.none { it.rule == "R7c_consolidated_overconsumption" } shouldBe true
+    }
 })
