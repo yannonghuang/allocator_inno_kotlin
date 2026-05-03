@@ -477,19 +477,27 @@ internal fun childMaterialsForMove(method: Map<String, Any?>, quantity: Double):
 fun getMethods(productId: String, locationId: String, data: Map<String, List<Map<String, Any?>>>): List<Map<String, Any?>> {
     val pid = productId.trim()
     val loc = locationId.trim()
-    val virtualFallback = loc in setOf("", "VIRTUAL")
+    // Demand-location-less fallback: if the demand carries no location_id at all,
+    // we have no signal to filter by, so let any candidate method match. This is
+    // the only case where loc-mismatch is acceptable.
+    //
+    // Note: VIRTUAL is NOT treated as a wildcard. It is a real location like 1000
+    // or 2000. To deliver to VIRTUAL, the supply chain must include an explicit
+    // move into VIRTUAL — `make@1000` produces inventory at 1000, not VIRTUAL,
+    // and so does not directly satisfy a demand at VIRTUAL.
+    val emptyLocFallback = loc.isEmpty()
     val result = mutableListOf<Map<String, Any?>>()
 
     (data["method_buy"] ?: emptyList()).forEach { m ->
         if ((m["product_id"] as? String)?.trim() == pid) {
             val mLoc = (m["location_id"] as? String)?.trim() ?: ""
-            if (mLoc == loc || virtualFallback) result.add(mapOf("type" to "purchase") + m)
+            if (mLoc == loc || emptyLocFallback) result.add(mapOf("type" to "purchase") + m)
         }
     }
     (data["method_make"] ?: emptyList()).forEach { m ->
         if ((m["product_id"] as? String)?.trim() == pid) {
             val mLoc = (m["location_id"] as? String)?.trim() ?: ""
-            if (mLoc == loc || virtualFallback) result.add(mapOf("type" to "make") + m)
+            if (mLoc == loc || emptyLocFallback) result.add(mapOf("type" to "make") + m)
         }
     }
     (data["method_move"] ?: emptyList()).forEach { m ->
