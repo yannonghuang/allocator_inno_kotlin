@@ -73,7 +73,7 @@ private fun cfg(
     maxMethods: Int = 1,
     depth: Int = 1,
     weights: Triple<Double, Double, Double>? = null,   // (commit, inventory, purchase)
-    engine: String = "leaf-legacy",                    // "leaf-legacy" | "supply"
+    scope: String = "leaf-only",                       // "leaf-only" | "all"
     allocationMode: String = "fair",                   // "fair" | "proportional" | "priority_first"
     consolidationEnabled: Boolean = true,
     periodDays: Int = 0,
@@ -105,7 +105,7 @@ private fun cfg(
         put("enabled", consolidationEnabled)
         put("period_days", periodDays)
         put("allocation_mode", allocationMode)
-        put("engine", engine)
+        put("scope", scope)
     }
     putJsonObject("variant_selection") {
         put("multiple", true)
@@ -132,7 +132,7 @@ object CaseBootstrap {
     /**
      * The library — every entry is a **single-axis variation off the
      * baseline** (cfg() defaults: mode=preference, max_methods=1, depth=1,
-     * leaf-legacy, fair, consolidation=on, period=0, purchase=off, balanced
+     * leaf-only, fair, consolidation=on, period=0, purchase=off, balanced
      * weights). Each preset varies exactly ONE knob, so the planning agent
      * can compare any two presets and attribute the KPI delta unambiguously.
      *
@@ -163,8 +163,8 @@ object CaseBootstrap {
         // depth axis: planner recursion depth.
         for (d in listOf(2, 3, 4)) add("depth=$d", AXIS_DEPTH, cfg(depth = d))
 
-        // Engine axis: regulation scope.
-        add("engine=supply", AXIS_SCOPE, cfg(engine = "supply"))
+        // Scope axis: where the split policy applies (leaves only vs all levels).
+        add("scope=all", AXIS_SCOPE, cfg(scope = "all"))
 
         // Allocation mode axis.
         add("alloc=proportional",   AXIS_ALLOC, cfg(allocationMode = "proportional"))
@@ -271,9 +271,9 @@ object CaseBootstrap {
                     ms.entries.forEach { (k, v) -> if (k != "depth") put(k, v) }
                     put("depth", JsonPrimitive((parsedValue as? Number)?.toInt() ?: 1))
                 }
-                "engine" -> putJsonObject("consolidation") {
-                    cs.entries.forEach { (k, v) -> if (k != "engine") put(k, v) }
-                    put("engine", JsonPrimitive((parsedValue as? String) ?: "leaf-legacy"))
+                "scope" -> putJsonObject("consolidation") {
+                    cs.entries.forEach { (k, v) -> if (k != "scope") put(k, v) }
+                    put("scope", JsonPrimitive((parsedValue as? String) ?: "leaf-only"))
                 }
                 "allocation_mode" -> putJsonObject("consolidation") {
                     cs.entries.forEach { (k, v) -> if (k != "allocation_mode") put(k, v) }
@@ -390,7 +390,7 @@ object CaseBootstrap {
         ),
         // ── Consolidation cluster ────────────────────────────────────────
         // consolidation_enabled is the cluster's "primary" knob;
-        // engine, period_days, and allocation_mode are sub-knobs that live
+        // scope, period_days, and allocation_mode are sub-knobs that live
         // nested under consolidation in the planner config (see cfg()).
         AxisSpec(
             name = "consolidation_enabled", label = "Consolidation",
@@ -402,12 +402,12 @@ object CaseBootstrap {
             group = GROUP_CONSOLID,
         ),
         AxisSpec(
-            name = "engine", label = "Engine",
-            description = "Regulation scope: leaf-only vs whole-tree supply allocation.",
-            valueType = "enum", enumValues = listOf("leaf-legacy", "supply"),
-            baselineValue = JsonPrimitive("leaf-legacy"),
-            defaultSeed = JsonPrimitive("supply"),
-            variations = listOf("supply").map { JsonPrimitive(it) },
+            name = "scope", label = "Scope",
+            description = "Regulation scope: split policy at leaves only vs all levels.",
+            valueType = "enum", enumValues = listOf("leaf-only", "all"),
+            baselineValue = JsonPrimitive("leaf-only"),
+            defaultSeed = JsonPrimitive("all"),
+            variations = listOf("all").map { JsonPrimitive(it) },
             group = GROUP_CONSOLID,
         ),
         AxisSpec(
@@ -455,7 +455,7 @@ object CaseBootstrap {
         return when (axisName) {
             "max_methods" -> cfg(maxMethods = (parsedValue as? Number)?.toInt() ?: 1)
             "depth" -> cfg(depth = (parsedValue as? Number)?.toInt() ?: 1)
-            "engine" -> cfg(engine = (parsedValue as? String) ?: "leaf-legacy")
+            "scope" -> cfg(scope = (parsedValue as? String) ?: "leaf-only")
             "allocation_mode" -> cfg(allocationMode = (parsedValue as? String) ?: "fair")
             "consolidation_enabled" -> cfg(consolidationEnabled = (parsedValue as? Boolean) ?: true)
             "period_days" -> cfg(periodDays = (parsedValue as? Number)?.toInt() ?: 0)
@@ -664,13 +664,13 @@ object CaseBootstrap {
         val wC = fmtDbl(sw.dbl("commit_time", 0.4))
         val wI = fmtDbl(sw.dbl("inventory_consumed", 0.35))
         val wP = fmtDbl(sw.dbl("purchase", 0.25))
-        val engine = cs.str("engine", "leaf-legacy")
+        val scope = cs.str("scope", "leaf-only")
         val alloc = cs.str("allocation_mode", "fair")
         val consEnabled = cs.bool("enabled", true)
         val period = cs.int("period_days", 0)
         val purch = config.bool("purchase_allowed", false)
         return "m=$mode|max=$maxM|d=$depth|dopt=$depthOpt|w=$wC,$wI,$wP|" +
-            "eng=$engine|alloc=$alloc|cons=$consEnabled|p=$period|purch=$purch"
+            "scope=$scope|alloc=$alloc|cons=$consEnabled|p=$period|purch=$purch"
     }
 
     /** Wrap a preset's metadata bundle for plan_run.metadata. The signature is

@@ -26,7 +26,11 @@ import {
   getPlanStatus,
   planningCopilot,
   planningAgent,
+  listActivePlanJobs,
+  type ActivePlanJob,
   listPlanRuns,
+  // Post-response polling: chat reuses getPlanStatus to track plans that
+  // exceeded the agent's 25s blocking window.
   getPlanRun,
   deletePlanRun,
   type PlanRun,
@@ -930,7 +934,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [woPeggingRowKey, setWoPeggingRowKey] = useState<string | null>(null);
   const [bomRealPairs, setBomRealPairs] = useState<[string, string][] | null>(null);
   const [realMoveTriples, setRealMoveTriples] = useState<[string, string, string][] | null>(null);
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', engine: 'leaf-legacy' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', scope: 'leaf-only' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -938,6 +942,18 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [copilotMessages, setCopilotMessages] = useState<PlanningCopilotMessage[]>([]);
   const [copilotInput, setCopilotInput] = useState('');
   const [copilotLoading, setCopilotLoading] = useState(false);
+  // Live progress for an in-flight plan started by the agent. Two polling
+  // modes feed this state:
+  //   1. While a chat HTTP request is in flight (copilotLoading=true), we
+  //      poll /cases/{id}/plan/active-jobs every 1.5s.
+  //   2. After the chat response returned with `pending_job_id` (plan
+  //      exceeded the agent's 25s blocking window), we poll
+  //      /cases/{id}/plan/status/{jobId} every 1.5s until the plan finishes,
+  //      then append a synthetic completion assistant message.
+  // Mode 2 lets the user keep chatting (or just walk away) while the plan
+  // continues — they no longer have to re-prompt to see the result.
+  const [copilotActiveJob, setCopilotActiveJob] = useState<ActivePlanJob | null>(null);
+  const [copilotPendingJobId, setCopilotPendingJobId] = useState<string | null>(null);
   const [copilotPanelWidth, setCopilotPanelWidth] = useState(440);
   const copilotResizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [copilotResizing, setCopilotResizing] = useState(false);
@@ -1019,7 +1035,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (Number(sw.commit_time) !== 0.4 || Number(sw.inventory_consumed) !== 0.35 || Number(sw.purchase) !== 0.25) {
       diffs.push(`weights: (${sw.commit_time}, ${sw.inventory_consumed}, ${sw.purchase})`);
     }
-    if (cs.engine !== 'leaf-legacy') diffs.push(`engine: leaf-legacy → ${cs.engine}`);
+    if (cs.scope !== 'leaf-only') diffs.push(`scope: leaf-only → ${cs.scope}`);
     if (cs.allocation_mode !== 'fair') diffs.push(`allocation_mode: fair → ${cs.allocation_mode}`);
     if (cs.enabled === false) diffs.push(`consolidation: on → off`);
     if (Number(cs.period_days) !== 0) diffs.push(`period_days: 0 → ${cs.period_days}`);
@@ -1044,7 +1060,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (sw && (sw.commit_time != null || sw.inventory_consumed != null || sw.purchase != null)) {
       parts.push(`w=(${Number(sw.commit_time ?? 0)}, ${Number(sw.inventory_consumed ?? 0)}, ${Number(sw.purchase ?? 0)})`);
     }
-    parts.push(`eng=${cs.engine ?? 'leaf-legacy'}`);
+    parts.push(`scope=${cs.scope ?? 'leaf-only'}`);
     parts.push(`alloc=${cs.allocation_mode ?? 'fair'}`);
     parts.push(`cons=${cs.enabled === false ? 'off' : 'on'}`);
     if (Number(cs.period_days ?? 0) !== 0) parts.push(`p=${cs.period_days}`);
@@ -1066,7 +1082,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       enabled: true,
       period_days: 0,
       allocation_mode: 'fair',
-      engine: 'leaf-legacy',
+      scope: 'leaf-only',
     },
     variant_selection: { multiple: true },
     purchase_allowed: false,
@@ -1083,7 +1099,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     switch (axisName) {
       case 'max_methods':         ms.max_methods = value; break;
       case 'depth':               ms.depth = value; break;
-      case 'engine':              cs.engine = value; break;
+      case 'scope':               cs.scope = value; break;
       case 'allocation_mode':     cs.allocation_mode = value; break;
       case 'consolidation_enabled': cs.enabled = value; break;
       case 'period_days':         cs.period_days = value; break;
@@ -1372,7 +1388,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (/reset|default|clear|重置|默认|清除/.test(t)) {
       return {
         reply: tP('copilot.replies.reset'),
-        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, depth_optimal: false, max_methods: 2, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', engine: 'leaf-legacy' }, analyze_criticality: false, check_soundness: true },
+        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, depth_optimal: false, max_methods: 2, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', scope: 'leaf-only' }, analyze_criticality: false, check_soundness: true },
       };
     }
 
@@ -1384,6 +1400,171 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   useEffect(() => {
     copilotMessagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [copilotMessages]);
+
+  // Persist chat history per case in localStorage so the conversation
+  // survives navigating between pages or reopening the case. Capped at 100
+  // messages to keep the storage entry small. The pending_job_id flow is
+  // intentionally NOT persisted — if the user navigates away while a plan
+  // is in flight, the in-flight tracking dies with the page; the user can
+  // still inspect the saved run in the run-history list when they return.
+  const COPILOT_HISTORY_LIMIT = 100;
+  const copilotHistoryKey = (caseId: number) => `chat-history-${caseId}`;
+  // Hydrate on case load. Reset to an empty list if storage has nothing for
+  // this case (each case has its own conversation).
+  useEffect(() => {
+    if (!Number.isFinite(id)) return;
+    try {
+      const raw = window.localStorage.getItem(copilotHistoryKey(id));
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) setCopilotMessages(parsed as PlanningCopilotMessage[]);
+        else setCopilotMessages([]);
+      } else {
+        setCopilotMessages([]);
+      }
+    } catch {
+      setCopilotMessages([]);
+    }
+  }, [id]);
+  // Persist on every change. Trim to the most recent COPILOT_HISTORY_LIMIT
+  // entries before writing — long conversations otherwise grow without bound.
+  useEffect(() => {
+    if (!Number.isFinite(id)) return;
+    try {
+      const trimmed = copilotMessages.length > COPILOT_HISTORY_LIMIT
+        ? copilotMessages.slice(-COPILOT_HISTORY_LIMIT)
+        : copilotMessages;
+      window.localStorage.setItem(copilotHistoryKey(id), JSON.stringify(trimmed));
+    } catch {
+      /* localStorage might be full or disabled — silently skip */
+    }
+  }, [copilotMessages, id]);
+
+  // Mode 1 — in-flight chat: poll /plan/active-jobs every 1.5s. The first
+  // running job (matching this case) drives the inline progress bar.
+  useEffect(() => {
+    if (!copilotLoading || id == null) {
+      // Don't blank the bar if mode 2 is about to take over — clearing only
+      // happens explicitly when the pending job completes / fails.
+      if (!copilotPendingJobId) setCopilotActiveJob(null);
+      return;
+    }
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const jobs = await listActivePlanJobs(id);
+        if (cancelled) return;
+        // Pick the most-progressed running job (heuristic: highest current).
+        const best = jobs.reduce<ActivePlanJob | null>((acc, j) => {
+          if (!acc) return j;
+          return (j.progress.current ?? 0) > (acc.progress.current ?? 0) ? j : acc;
+        }, null);
+        setCopilotActiveJob(best);
+      } catch {
+        /* ignore polling failures — they're transient */
+      }
+    };
+    tick();
+    const handle = setInterval(tick, 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(handle);
+    };
+  }, [copilotLoading, id, copilotPendingJobId]);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Mode 2 — post-response tracking: when the agent handed back a
+  // pending_job_id (plan exceeded the 25s blocking window), keep polling
+  // /plan/status/{jobId} until the plan finishes. On completion, append a
+  // synthetic "✓ Plan run N completed" assistant message and refresh the
+  // run-history list. On failure, append a "⚠ Plan failed" message. Mode 1
+  // skips clearing copilotActiveJob while mode 2 is active so the progress
+  // bar stays visible across new chat turns.
+  useEffect(() => {
+    if (!copilotPendingJobId || id == null) return;
+    if (copilotLoading) return; // mode 1 owns the bar while a chat is in flight
+    let cancelled = false;
+    const jobId = copilotPendingJobId;
+    const tick = async () => {
+      try {
+        const status = await getPlanStatus(id, jobId);
+        if (cancelled) return;
+        const progress = status.progress;
+        if (progress) {
+          setCopilotActiveJob({
+            job_id: jobId,
+            status: status.status,
+            progress: { current: progress.current, total: progress.total },
+          });
+        }
+        if (status.status === 'completed') {
+          const delivery = status.result?.plan_kpis?.delivery;
+          const fillPct = delivery?.fill_rate_pct;
+          const tc = delivery?.total_committed;
+          const tr = delivery?.total_requested;
+          const planRunId = status.plan_run_id;
+          const summary = (planRunId != null && fillPct != null && tc != null && tr != null)
+            ? tP('copilot.planCompleted', {
+                runId: planRunId,
+                fillPct: fillPct.toFixed(2),
+                committed: tc.toLocaleString(),
+                requested: tr.toLocaleString(),
+              })
+            : tP('copilot.planCompletedNoKpis', { runId: planRunId ?? '?' });
+          setCopilotMessages((prev) => [...prev, { role: 'assistant', text: summary }]);
+          // Chat-driven runs are auto-saved server-side (runPlanBackground
+          // with autoSave=true persists the result, promotes to 'success',
+          // and seeds the KB). All we need to do here is fetch the persisted
+          // row (canonicalised config, resolved depth) and load it into the
+          // result panel — same shape as handleRestorePlanRun.
+          if (planRunId != null) {
+            (async () => {
+              try {
+                const full = await getPlanRun(id, planRunId);
+                if (full.result) setPlanResult(full.result as typeof planResult);
+                setCurrentPlanRunId(planRunId);
+                setFreshPlanRunId(planRunId);
+                setOverrideCandidateRunId(null);
+                setPlanRunSaveError(null);
+                setPlanWorkOrderPeggingCache({});
+                if (full.config) {
+                  const cfg = full.config as PlanningConfig;
+                  const chosen = full.chosen_depth ?? null;
+                  setPlanningConfig({
+                    ...cfg,
+                    method_selection: {
+                      ...cfg.method_selection,
+                      depth: chosen ?? cfg.method_selection?.depth ?? 1,
+                      depth_optimal: false,
+                    },
+                  });
+                }
+                listPlanRuns(id).then(setPlanRunHistory).catch(() => { /* ignore */ });
+              } catch {
+                // Fall back to the in-memory result so the panel isn't blank.
+                if (status.result) setPlanResult(status.result as typeof planResult);
+                listPlanRuns(id).then(setPlanRunHistory).catch(() => { /* ignore */ });
+              }
+            })();
+          }
+          setCopilotPendingJobId(null);
+          setCopilotActiveJob(null);
+        } else if (status.status === 'failed') {
+          const summary = tP('copilot.planFailed', { error: status.error ?? 'unknown' });
+          setCopilotMessages((prev) => [...prev, { role: 'assistant', text: summary }]);
+          setCopilotPendingJobId(null);
+          setCopilotActiveJob(null);
+        }
+      } catch {
+        /* transient */
+      }
+    };
+    tick();
+    const handle = setInterval(tick, 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(handle);
+    };
+  }, [copilotPendingJobId, id, copilotLoading]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!planJobId || id == null) return;
@@ -2553,12 +2734,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       });
     }
 
-    // Supply-engine path: when planResult carries supply_level_allocations,
+    // scope=all path: when planResult carries supply_level_allocations,
     // each record is a per-supply_id allocation summary that becomes its own
     // SupplySplitInfo entry. Multiple records for the same supply (different
     // groupKeys) are deduped by groupProductId|groupLocationId, just like the
-    // leaf-engine path above. The leaf engine emits an empty list here, so
-    // this loop is a no-op under it.
+    // scope=leaf-only path above. scope=leaf-only emits an empty list here,
+    // so this loop is a no-op under it.
     for (const rec of planResult.supply_level_allocations ?? []) {
       const info: SupplySplitInfo = {
         mode: rec.mode,
@@ -2631,10 +2812,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       // skipped: their consumption of this supply is direct, not via any merged group.
     }
 
-    // Supply-engine path: every demand allocated at a supply is bound to that
-    // supply's group label. No "direct" semantics under the supply engine —
-    // every consumption goes through supply-level allocation. Empty/absent
-    // under the leaf engine, so this loop is a no-op there.
+    // scope=all path: every demand allocated at a supply is bound to that
+    // supply's group label. No "direct" semantics under scope=all — every
+    // consumption goes through supply-level allocation. Empty/absent under
+    // scope=leaf-only, so this loop is a no-op there.
     for (const rec of planResult.supply_level_allocations ?? []) {
       const label = `${rec.group_product_id}@${rec.group_location_id}`;
       for (const did of Object.keys(rec.per_demand_allocations)) {
@@ -4163,16 +4344,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               <span style={{ color: '#a1a1aa' }}>{tP('config.regulationScope')}</span>
               <select
                 disabled={planningConfig.consolidation?.enabled !== true}
-                value={planningConfig.consolidation?.engine ?? 'leaf-legacy'}
+                value={planningConfig.consolidation?.scope ?? 'leaf-only'}
                 onChange={(e) => setPlanningConfig((c) => ({
                   ...c,
-                  consolidation: { ...c.consolidation, engine: e.target.value as 'leaf-legacy' | 'supply' },
+                  consolidation: { ...c.consolidation, scope: e.target.value as 'leaf-only' | 'all' },
                 }))}
                 style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
                 title={tP('config.scopeTooltip')}
               >
-                <option value="leaf-legacy">{tP('config.scopeLeavesOnly')}</option>
-                <option value="supply">{tP('config.scopeAllLevels')}</option>
+                <option value="leaf-only">{tP('config.scopeLeavesOnly')}</option>
+                <option value="all">{tP('config.scopeAllLevels')}</option>
               </select>
             </label>
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
@@ -4244,7 +4425,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 },
               },
               purchase_allowed: false,
-              consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', engine: 'leaf-legacy' },
+              consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', scope: 'leaf-only' },
             })}
             title={tP('config.resetDefaultsTitle')}
             style={{ padding: '6px 12px' }}
@@ -6945,15 +7126,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                     <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editConsolidationEnabled')}</span>
                                   </label>
                                   <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, opacity: cs.enabled !== false ? 1 : 0.4 }}>
-                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editEngine')}</span>
-                                    <select value={String(cs.engine ?? 'leaf-legacy')}
+                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editScope')}</span>
+                                    <select value={String(cs.scope ?? 'leaf-only')}
                                       disabled={cs.enabled === false}
                                       onChange={(e) => updateConfig((c) => {
                                         const v = (c.consolidation ?? {}) as Record<string, unknown>;
-                                        v.engine = e.target.value; c.consolidation = v;
+                                        v.scope = e.target.value; c.consolidation = v;
                                       })} style={inputStyle}>
-                                      <option value="leaf-legacy">leaf-legacy</option>
-                                      <option value="supply">supply</option>
+                                      <option value="leaf-only">leaf-only</option>
+                                      <option value="all">all</option>
                                     </select>
                                   </label>
                                   <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, opacity: cs.enabled !== false ? 1 : 0.4 }}>
@@ -8586,7 +8767,27 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   )}
                 </div>
               ))}
-              {copilotLoading && <p style={{ margin: 0, fontSize: '0.875rem', color: '#a1a1aa' }}>{tP('copilot.thinking')}</p>}
+              {(copilotLoading || copilotPendingJobId) && (
+                <div style={{ margin: '0.25rem 0', fontSize: '0.875rem', color: '#a1a1aa' }}>
+                  {copilotLoading && <p style={{ margin: 0 }}>{tP('copilot.thinking')}</p>}
+                  {copilotActiveJob && (() => {
+                    const cur = copilotActiveJob.progress?.current ?? 0;
+                    const tot = copilotActiveJob.progress?.total ?? 0;
+                    const pct = tot > 0 ? Math.min(100, (cur / tot) * 100) : 0;
+                    return (
+                      <div style={{ marginTop: '0.4rem' }}>
+                        <div style={{ fontSize: '0.75rem', color: '#71717a', marginBottom: 4, fontFamily: 'monospace' }}>
+                          plan {cur}/{tot} demands ({pct.toFixed(1)}%)
+                          {!copilotLoading && copilotPendingJobId && ` — ${tP('copilot.runningInBackground')}`}
+                        </div>
+                        <div style={{ height: 6, background: '#27272a', border: '1px solid #3d3d40', borderRadius: 3, overflow: 'hidden' }}>
+                          <div style={{ height: '100%', width: `${pct}%`, background: '#0ea5e9', transition: 'width 0.3s ease' }} />
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
               <div ref={copilotMessagesEndRef} />
             </div>
             <form
@@ -8620,6 +8821,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   // If the agent ran a plan, refresh the run-history list so the user sees it.
                   if (res.fresh_run_id != null && id != null) {
                     listPlanRuns(id).then(setPlanRunHistory).catch(() => { /* ignore */ });
+                  }
+                  // If the plan exceeded the agent's 25s wait window, the
+                  // backend hands the job_id back here; mode-2 polling above
+                  // takes over and posts the completion message itself.
+                  if (res.pending_job_id) {
+                    setCopilotPendingJobId(res.pending_job_id);
                   }
                 } catch {
                   // Agent unavailable — fall back to the copilot route, then to local rule-based parser.

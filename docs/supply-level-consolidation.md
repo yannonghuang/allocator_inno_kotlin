@@ -244,11 +244,11 @@ The current frontend's `splitInfos`, `demandPath`, multi-section CONSOLIDATION S
 
 ```yaml
 consolidation:
-  engine: "supply"  # new
-  # or "leaf-legacy" (current v2 behavior, kept for rollback)
+  scope: "all"        # supply-level allocator
+  # or "leaf-only"    (original v2 behavior, kept for rollback)
 ```
 
-`engine` defaults to `leaf-legacy` until the new engine has soaked.
+`scope` defaults to `leaf-only` until the all-levels path has soaked.
 
 ### Side-by-side validation
 
@@ -284,7 +284,7 @@ Once side-by-side validation shows the supply engine is at least as good on a re
 | **C** Per-demand initial commit (3a) | ✅ | `e0f8265` | 6 tests, ~150 LOC. Reuses `plan()`'s existing `budget` parameter; computes `actualDraws` for the compensation pass. |
 | **D** Compensation sub-phase (3b) | ✅ | `51b647b` | 8 tests, ~250 LOC. Pure analytical step — no `plan()` calls inside `compensate()`. |
 | **E** WO synthesis | ✅ | `abb91d4` | 8 tests, ~300 LOC. Output shape matches leaf engine's `consolidated:true` exactly so frontend chip + slide-in work without changes. |
-| **F** Orchestrator + feature flag | ✅ | `a7251b1` | 8 tests, ~400 LOC. `consolidation.engine: "supply"` activates the pipeline; default stays `"leaf-legacy"`. |
+| **F** Orchestrator + feature flag | ✅ | `a7251b1` | 8 tests, ~400 LOC. `consolidation.scope: "all"` activates the pipeline; default stays `"leaf-only"`. |
 | **G** Frontend reads supply-level allocations | ✅ | `6afa27b` | New `supply_level_allocations` field threaded through; chip + Path column populate from it under the supply engine. |
 | **H** Comparison harness | ✅ | `9353593` | 7 scenarios in `SupplyVsLeafEquivalenceTest`. Both engines produce equivalent committed qty + supply consumption on the patterns case 162 exercises. |
 | **Bug fix** budget snapshot | ✅ | `6f13b53` | Discovered in Phase H: `plan()`'s two-pass make-flow snapshotted inventory but not budget; caused empty supply-leaf children under shortage at deep RM. ~30 LOC fix. |
@@ -295,11 +295,11 @@ Total: ~1450 LOC backend + ~200 frontend. **222 tests, 0 failures.** Branch: `fe
 
 The supply engine is feature-complete and validated against the leaf engine on the synthetic equivalence harness. Default is unchanged (`leaf-legacy`). Migration steps remaining:
 
-1. **Real-data validation on case 162**: toggle `consolidation.engine = "supply"` in the case config, run Analyze impact, verify the `supply iter` log lines show convergence in 1-3 iters with no `(max)` warning. Compare WO counts and committed-qty totals against the leaf engine.
+1. **Real-data validation on case 162**: toggle `consolidation.scope = "all"` in the case config, run Analyze impact, verify the `supply iter` log lines show convergence in 1-3 iters with no `(max)` warning. Compare WO counts and committed-qty totals against scope=leaf-only.
 
-2. **Soak period**: leave default at `leaf-legacy`. Opt-in callers (case-by-case basis, set via the planning config) exercise the new engine to surface production-shape edge cases. Recommend at least one full release cycle of soak.
+2. **Soak period**: leave default at `leaf-only`. Opt-in callers (case-by-case basis, set via the planning config) exercise the all-levels path to surface production-shape edge cases. Recommend at least one full release cycle of soak.
 
-3. **Default flip**: change `ConsolidationConfig.engine`'s default from `"leaf-legacy"` to `"supply"` once soak validation passes. Keep the leaf engine reachable via `engine: "leaf-legacy"` for one further release as rollback insurance.
+3. **Default flip**: change `ConsolidationConfig.scope`'s default from `"leaf-only"` to `"all"` once soak validation passes. Keep scope=leaf-only reachable via `scope: "leaf-only"` for one further release as rollback insurance.
 
 4. **Leaf engine retirement**: after a full release with default flipped and no rollbacks, delete `runV2Iterated` and `mergeGroups` / `MergedGroup` infrastructure. Estimated removal: ~800 LOC.
 

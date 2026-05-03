@@ -493,6 +493,73 @@ fun Routing.allocateRoutes() {
         })
     }
 
+    // ── POST /cases/{case_id}/kb/resync ───────────────────────────────────────
+    //
+    // One-off sync: walk every status='success' plan_run for this case and
+    // upsert into kb_records. Permissive — does NOT filter on
+    // soundness_status, so legacy runs (success-but-unchecked, success-but-
+    // unsound) get covered. Idempotent. Use when KB has drifted out of sync
+    // with plan_run history (e.g. older chat-driven runs that never
+    // auto-saved before the autoSave hook landed).
+    post("/cases/{case_id}/kb/resync") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val stats = com.allocator.services.KbStore.resyncForCase(caseId)
+        call.respond(buildJsonObject {
+            put("candidate_runs", stats.candidateRuns)
+            put("unique_signatures", stats.uniqueSignatures)
+            put("added", stats.added)
+            put("skipped", stats.skipped)
+            put("total_kb_after", stats.totalAfter)
+        })
+    }
+
+    // ── POST /cases/{case_id}/kb/clean ────────────────────────────────────────
+    //
+    // Removal pass: enforce trust without violating KB dissociation.
+    //   - Orphaned KB rows (no live source plan_run) — KEPT as durable
+    //     testimony from when the source was sound.
+    //   - KB rows whose source is currently NOT sound+success but a sibling
+    //     sound+success run shares the signature — REFRESHED from that run.
+    //   - KB rows whose source is currently NOT sound+success and no sibling
+    //     sound+success exists — DELETED (no trustworthy backing).
+    post("/cases/{case_id}/kb/clean") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val stats = com.allocator.services.KbStore.cleanForCase(caseId)
+        call.respond(buildJsonObject {
+            put("kb_before", stats.kbBefore)
+            put("orphaned_kept", stats.orphanedKept)
+            put("refreshed", stats.refreshed)
+            put("deleted", stats.deleted)
+            put("kb_after", stats.kbAfter)
+        })
+    }
+
+    // ── GET /cases/{case_id}/plan/active-jobs ─────────────────────────────────
+    //
+    // Returns plan jobs currently running for this case. The chat-side progress
+    // bar polls this while the planning-agent HTTP request is blocked inside
+    // run_plan_async (which internally chains wait_for_plan up to 60s). The
+    // planning agent's chat panel uses this to surface live progress instead
+    // of leaving the user staring at a generic spinner.
+    get("/cases/{case_id}/plan/active-jobs") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val items = planJobs.entries.mapNotNull { (jobId, job) ->
+            if (job["case_id"] != caseId) return@mapNotNull null
+            if (job["status"] != "running") return@mapNotNull null
+            buildJsonObject {
+                put("job_id", jobId)
+                put("status", job["status"]?.toString() ?: "running")
+                put("progress", anyToJson(job["progress"]))
+            }
+        }
+        call.respond(buildJsonObject {
+            put("jobs", buildJsonArray { items.forEach { add(it) } })
+        })
+    }
+
     // ── GET /cases/{case_id}/plan/work-order-pegging ──────────────────────────
     get("/cases/{case_id}/plan/work-order-pegging") {
         val caseId = call.parameters["case_id"]?.toIntOrNull()
@@ -1892,6 +1959,7 @@ internal suspend fun runPlanBackground(
     caseId: Int,
     data: Map<String, List<Map<String, Any?>>>,
     config: Map<String, Any?>?,
+    autoSave: Boolean = false,
 ) {
     // Insert plan_run record at start, capturing current override snapshot
     val planRunId = transaction {
@@ -1948,15 +2016,20 @@ internal suspend fun runPlanBackground(
         }
         casePlanResults[caseId] = enriched
 
-        // Mark run as ready (result not yet persisted — user must explicitly save).
-        // When optimal-depth search ran, rewrite the config snapshot so subsequent
-        // "view config" displays reflect the depth that was actually used, and
-        // persist per-depth attempt durations so the UI can attribute elapsed
-        // time to the depth that was actually chosen.
+        // Mark run as ready (or auto-save when [autoSave] is true: write the
+        // result, promote to success, and seed the KB. The auto-save path is
+        // for chat-driven plans where the user already committed to the run
+        // by asking the agent to execute it — there's no separate "decide
+        // whether to keep this run" UX in the chat. Page-driven runs default
+        // to autoSave=false and use the explicit /save endpoint.
+        // When optimal-depth search ran, also rewrite the config snapshot so
+        // subsequent "view config" displays reflect the depth actually used.
+        val resultJson = if (autoSave) runCatching { anyToJson(enriched).toString() }.getOrElse { null } else null
         transaction {
             PlanRuns.update({ PlanRuns.id eq planRunId }) {
-                it[PlanRuns.status] = "ready"
+                it[PlanRuns.status] = if (autoSave) "success" else "ready"
                 it[PlanRuns.finishedAt] = kotlinx.datetime.Clock.System.now()
+                if (autoSave && resultJson != null) it[PlanRuns.result] = resultJson
                 if (chosenDepth != null) {
                     it[PlanRuns.config] = overrideConfigDepth(config, chosenDepth).toString()
                     it[PlanRuns.chosenDepth] = chosenDepth
@@ -1970,10 +2043,35 @@ internal suspend fun runPlanBackground(
                     }).toString()
                 }
             }
+            if (autoSave) {
+                @Suppress("UNCHECKED_CAST")
+                val supplyAllocs = (enriched["supply_allocations"] as? List<Map<String, Any?>>).orEmpty()
+                if (supplyAllocs.isNotEmpty()) {
+                    PlanSupplyAllocations.deleteWhere { PlanSupplyAllocations.planRunId eq planRunId }
+                    PlanSupplyAllocations.batchInsert(supplyAllocs) { alloc ->
+                        this[PlanSupplyAllocations.caseId]      = caseId
+                        this[PlanSupplyAllocations.planRunId]   = planRunId
+                        this[PlanSupplyAllocations.supplyId]    = alloc["supply_id"] as String
+                        this[PlanSupplyAllocations.demandId]    = alloc["demand_id"] as? String
+                        this[PlanSupplyAllocations.qtyConsumed] = (alloc["qty_consumed"] as? Number)?.toDouble() ?: 0.0
+                    }
+                }
+                com.allocator.services.emitPlanRunEvent(caseId, planRunId, "saved", buildJsonObject {
+                    put("source", JsonPrimitive("agent_auto_save"))
+                })
+            }
             if (chosenDepth != null) {
                 com.allocator.services.emitPlanRunEvent(caseId, planRunId, "optimal_depth_chosen", buildJsonObject {
                     put("depth", JsonPrimitive(chosenDepth))
                 })
+            }
+        }
+        if (autoSave) {
+            try {
+                val kbRowId = com.allocator.services.KbStore.upsertFromPlanRun(planRunId)
+                log.info("Auto-save: plan_run={} promoted to success, kb_record={}", planRunId, kbRowId)
+            } catch (e: Exception) {
+                log.warn("KB upsert failed for auto-saved run $planRunId: ${e.message}")
             }
         }
 
@@ -2338,9 +2436,9 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
                 "priority_first" -> "priority_first"
                 else             -> "fair"
             })
-            put("engine", when (consolidation["engine"]?.toString()) {
-                "supply" -> "supply"
-                else     -> "leaf-legacy"
+            put("scope", when (consolidation["scope"]?.toString()) {
+                "all" -> "all"
+                else  -> "leaf-only"
             })
         }
     }

@@ -333,14 +333,14 @@ export type PlanningConfig = {
     /**
      * Regulation scope: where the allocation_mode split policy is applied.
      * UI labels: "Leaves only" / "All levels".
-     *   'leaf-legacy' — at supply-bearing nodes only (raw inventory, leftover
-     *                   stock, prior-round WOs). Make/move WOs generated this
-     *                   round run unconstrained.
-     *   'supply'      — at supply-bearing nodes AND every make/move WO
-     *                   generated this round. Buy WOs are unbounded either
-     *                   way. See docs/supply-level-consolidation.md.
+     *   'leaf-only' — at supply-bearing nodes only (raw inventory, leftover
+     *                 stock, prior-round WOs). Make/move WOs generated this
+     *                 round run unconstrained.
+     *   'all'       — at supply-bearing nodes AND every make/move WO
+     *                 generated this round. Buy WOs are unbounded either
+     *                 way. See docs/supply-level-consolidation.md.
      */
-    engine?: 'leaf-legacy' | 'supply';
+    scope?: 'leaf-only' | 'all';
   };
   /**
    * Post-plan UI behavior toggles. These do not affect planner output — they
@@ -362,11 +362,11 @@ export type PlanSupplyAllocation = {
 
 /**
  * Per-(supply_id) allocation record emitted by the supply-level consolidation
- * engine (Phase 2's per-supply policy split + Phase 3b compensation results).
+ * pipeline (Phase 2's per-supply policy split + Phase 3b compensation results).
  * Frontend reads this list (when present in the plan result) to populate the
- * supply-view chip + slide-in's per-supply allocation info under the supply
- * engine. Empty/absent under the leaf engine — its splitInfos come from
- * consolidated pegging entries instead.
+ * supply-view chip + slide-in's per-supply allocation info when scope=all.
+ * Empty/absent under scope=leaf-only — its splitInfos come from consolidated
+ * pegging entries instead.
  */
 export type SupplyLevelAllocation = {
   supply_id: string;
@@ -385,6 +385,10 @@ export type PlanResult = {
   planning_pegging: PlanningPeggingEntry[];
   supply_allocations?: PlanSupplyAllocation[];
   supply_level_allocations?: SupplyLevelAllocation[];
+  /** Headline KPIs computed by the planner. Already declared as `PlanKpis`
+   *  earlier in this file (see `getPlanKpis`); pulled in here so the chat
+   *  panel can read fill_rate_pct etc. when a pending plan completes. */
+  plan_kpis?: PlanKpis;
 };
 
 export async function runPlan(
@@ -542,6 +546,10 @@ export type PlanningAgentResponse = {
   steps: PlanningAgentStep[];
   config_update: PlanningConfig | null;
   fresh_run_id: number | null;
+  /** When run_plan_async returned 'still_running' (plan exceeded the 25s
+   *  blocking window), this carries the job_id so the chat panel can keep
+   *  polling and post a completion message itself. */
+  pending_job_id?: string | null;
 };
 
 export async function planningAgent(
@@ -562,6 +570,26 @@ export async function planningAgent(
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
+}
+
+export type ActivePlanJob = {
+  job_id: string;
+  status: string;
+  progress: { current: number; total: number };
+};
+
+/**
+ * Polled by the planning agent's chat panel while a `run_plan_async` call is
+ * in flight (the chat HTTP request is blocked inside the 60-second
+ * wait_for_plan window). Lets the chat surface live progress instead of a
+ * generic spinner. Returns an empty list when no plan jobs are running for
+ * this case.
+ */
+export async function listActivePlanJobs(caseId: number): Promise<ActivePlanJob[]> {
+  const r = await fetch(`${API}/cases/${caseId}/plan/active-jobs`);
+  if (!r.ok) throw new Error(await r.text());
+  const body = await r.json();
+  return (body?.jobs ?? []) as ActivePlanJob[];
 }
 
 export async function listOverrides(caseId: number): Promise<ManualOverride[]> {

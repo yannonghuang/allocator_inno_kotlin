@@ -34,17 +34,17 @@ exposure of these ideas — the user usually wants the *idea*, not the knob.
 
 ### 1. Regulation scope — leaves only vs all levels
 
-`consolidation.engine` chooses **where** the split policy
+`consolidation.scope` chooses **where** the split policy
 (`allocation_mode`) is applied. The policy itself is the *how* (fair /
-proportional / priority_first); the engine is the *where*.
+proportional / priority_first); the scope is the *where*.
 
-- **Leaves only** (`engine = "leaf-legacy"`, UI label *"Leaves only"*):
+- **Leaves only** (`scope = "leaf-only"`, UI label *"Leaves only"*):
   Apply the split policy only at nodes that already hold supply — raw
   inventory, leftover stock, WOs carried over from a prior planning
   round. Make/move WOs generated this round run unconstrained. *Failure
   mode*: order-dependent at the leaf level; late claimants find empty
   shelves.
-- **All levels** (`engine = "supply"`, UI label *"All levels"*): Apply
+- **All levels** (`scope = "all"`, UI label *"All levels"*): Apply
   the split policy at supply-bearing nodes AND every make/move WO
   generated this round. Buy WOs are unbounded either way and never
   regulated. *Failure mode*: regulating at every WO output fragments
@@ -53,7 +53,7 @@ proportional / priority_first); the engine is the *where*.
 
 In the UI the control is labeled "Regulation scope". Use the friendly
 labels ("Leaves only", "All levels") when talking to users; use the
-config keys (`leaf-legacy`, `supply`) when calling tools.
+config keys (`leaf-only`, `all`) when calling tools.
 
 On case-171, *Leaves only* beat *All levels* ~3× on throughput
 because make operations need atomic shares; pervasive regulation
@@ -99,7 +99,7 @@ Every commit traces back to specific supplies via `planning_pegging`
 (demand → work order → child materials → supplies → leaf). This is the
 substrate for every "why" question. "Why did demand X commit only 50?"
 → walk its pegging. "Where did supply Y go?" → query
-`supply_level_allocations` (supply engine only).
+`supply_level_allocations` (scope=all only).
 
 ## Design principles (the load-bearing decisions)
 
@@ -139,8 +139,8 @@ regression evaporates when `max_methods` saturates available methods (~max=4).
 Operational exposure of **regulation scope** from Algorithmic ideas §1.
 Two orthogonal knobs:
 
-- `engine` (UI: "Regulation scope") = `"leaf-legacy"` ("Leaves only",
-  the default) | `"supply"` ("All levels"). Decides *where*
+- `scope` (UI: "Regulation scope") = `"leaf-only"` ("Leaves only",
+  the default) | `"all"` ("All levels"). Decides *where*
   `allocation_mode` is applied. Run 433 (Leaves only) vs Run 434 (All
   levels) on case-171, identical config otherwise: 80,752 vs 35,098
   committed; fill 25% vs 11%; Gini 0.39 vs 0.46; starvation 28% vs 19%;
@@ -156,7 +156,7 @@ Two orthogonal knobs:
   demands.
 - `period_days` — bucket width; 0 = single bucket regardless of due date.
 - `get_supply_split_explanation(supply_id)` works only with the "All
-  levels" scope (engine=supply).
+  levels" scope (consolidation.scope=all).
 
 ### Soundness check
 
@@ -184,7 +184,7 @@ The agent has these tools available; call them rather than guessing:
 | `list_plan_runs(limit?, status?)` | "What runs exist?" / "the latest run". Pass `status='success'` to skip contingent / failed. |
 | `get_kpis(run_id)` | KPI questions. Returns `no_plan_kpis` for contingent runs — fall through to the baseline run via `metadata.baselinePlanRunId`. |
 | `get_demand_pegging(run_id, demand_id)` | "Why is demand X partial?" / "what fulfilled demand X?". |
-| `get_supply_split_explanation(run_id, supply_id)` | "Why did demand A get more than demand B from supply X?" — only works when consolidation engine = `supply`. |
+| `get_supply_split_explanation(run_id, supply_id)` | "Why did demand A get more than demand B from supply X?" — only works when consolidation.scope = `all`. |
 | `get_run_config(run_id)` | "What config did run X use?". MUST-HAVE before any A/B comparison — confirms the single knob that differs, so KPI deltas are actually attributable. Returns config + override snapshot. |
 | `recheck_soundness(run_id, deep_check?)` | A soundness rule has shipped *since* run X — apply the current ruleset retroactively. Updates the run's badge. |
 | `get_soundness_summary(run_id)` | "How sound is run X — what rules failed, by how much?". Server-side rollup (rule, demand_count, violation_count, total_actual). Use INSTEAD of walking each demand's pegging. |
@@ -211,9 +211,9 @@ The agent has these tools available; call them rather than guessing:
 - **`inventory.consumed_total`** / **`manufacturing.total_quantity`**:
   total raw input consumed and total make output. **A multi-x gap on
   these between two runs with the same supplies almost always means
-  engine fragmentation, not a method-selection difference.** (Case-171:
-  Run 433 mfg=104,014 vs Run 434 mfg=28,036 — 3.7× gap = the
-  `supply` engine fragmenting shared inputs below the make threshold.)
+  scope fragmentation, not a method-selection difference.** (Case-171:
+  Run 433 mfg=104,014 vs Run 434 mfg=28,036 — 3.7× gap = scope=all
+  fragmenting shared inputs below the make threshold.)
 
 ## Failure modes to recognize
 
@@ -320,52 +320,122 @@ same general consolidation shape. Don't compare a run with consolidation
 off to one with it on; the KPI delta isn't attributable to the knob the
 user is asking about.
 
-### Multi-objective recommendations — use the bulk KPI snapshot
+### Multi-objective recommendations — use the KB tools, not in-prompt math
 
 When the user asks for advice that trades off multiple metrics — e.g.
 "maximize delivery while keeping fairness reasonable", "least purchase
-without hurting on-time", "best Gini achievable at fill ≥ 20%" — DO NOT
-fetch run KPIs one at a time. The `list_plan_runs(limit=50)` call now
-returns *all* headline KPIs inline per row: fill_rate_pct, gini,
-p10_fill_ratio, median_fill_ratio, starvation_pct, on_time_count,
-total_committed, total_requested, manufacturing_total_quantity,
-inventory_consumed_total. One round-trip → up to 50 rows of comparison
-data. Reason over that set in-prompt.
+without hurting on-time", "best Gini achievable at fill ≥ 20%" — call
+the KB tools. Don't compute frontiers by hand and don't N+1 `get_kpis`.
 
-Pattern for multi-objective questions:
+Two KB-aware tools query the case's `kb_records` table (one row per
+unique config-signature, with KPIs already extracted into a snapshot):
 
-1. `list_plan_runs(status='success', limit=50)` → KPI table for the
-   case's KB (or the most recent 50 if the KB exceeds that).
-2. **Compute the Pareto frontier in-prompt**: a run is on the frontier
-   if no other run dominates it on the user's chosen axes. For
-   "maximize fill, minimize gini": run A dominates run B iff
-   `A.fill ≥ B.fill AND A.gini ≤ B.gini AND (A.fill > B.fill OR
-   A.gini < B.gini)`. List the non-dominated runs.
-3. **Surface the trade-off curve**: e.g. "frontier runs by fill_rate
-   desc — Run 433 (25%, gini 0.39), Run 437 (22%, gini 0.34), Run 441
-   (18%, gini 0.28). Each step trades ~3 pp fill for ~0.05 Gini."
-4. `get_run_config` for the 1-2 frontier runs the user's stated
-   constraint admits — identify the config pattern (the load-bearing
-   knob(s)).
+  - `query_kb_runs(...)` — parametric filter+sort. Returns up to 100
+    rows. Use for "top N by metric", "best X under constraint Y", or
+    "all runs that varied axis Z". Always returns `total_in_kb` so
+    you can detect a sparse KB.
+  - `pareto_kb_runs(maximize=[…], minimize=[…])` — server-side Pareto
+    frontier. Returns ONLY non-dominated points + a `frontier_summary`
+    one-liner. Use for any multi-objective trade-off question.
+
+Decision matrix:
+
+| User intent                                         | Tool                                              |
+|-----------------------------------------------------|---------------------------------------------------|
+| "Best run on metric X" / "Top 5 by fill"            | `query_kb_runs(sort_by='fill_rate_desc', limit=5)`|
+| "Best fill with gini < 0.20"                        | `query_kb_runs(min_fill_rate=…, max_gini=0.20)`   |
+| "Best fill with reasonable fairness"                | `pareto_kb_runs(maximize=['fill_rate_pct'], minimize=['gini'])` |
+| "Least purchase without hurting on-time"            | `pareto_kb_runs(minimize=['total_requested'], maximize=['on_time_count'])` |
+| "Show me runs that varied the regulation scope"     | `query_kb_runs(primary_axis='scope')`             |
+| "Is the KB big enough to answer this?"              | `query_kb_runs(limit=1)` → check `total_in_kb`    |
+| "What should I try next?" / "recommend new configs" | `suggest_next_batch` — **only source of NOVEL proposals** |
+| "Is config X already in the KB?"                    | `is_signature_in_kb(signature)`                   |
+
+**Rule of thumb**: query/pareto tools are for *retrieval* (what we already
+know). `suggest_next_batch` is for *exploration* (what we don't yet know).
+Don't confuse them — answering "what should I run next?" with a
+`query_kb_runs` result is a category error: those rows are the past, not
+the future.
+
+Pattern for "best fill rate with reasonable fairness":
+
+1. `pareto_kb_runs(maximize=['fill_rate_pct'], minimize=['gini'])`
+   → frontier rows + one-liner summary.
+2. **Anchor "reasonable"**. If the user gave a number, use it.
+   Otherwise pick the knee of the frontier and *state the assumption*:
+   *"Treating gini ≤ 0.20 as 'reasonable' — say if you want stricter."*
+3. Pick the max-fill point under the threshold as the **headline**;
+   surface 1–2 nearby frontier points as **alternates** ("if you'd
+   accept gini=0.25, fill jumps to 28%").
+4. `get_run_config` on the headline + the nearest alternate. Find the
+   single load-bearing knob.
 5. **Reply with mechanism + frontier evidence**: don't just name a
-   config; explain WHY that frontier point exists (which knob bought
-   the trade-off), grounded in the algorithmic-ideas section.
+   config; quote the relevant algorithmic-ideas section to explain
+   *why* that frontier point exists (which knob bought the trade-off).
 
-When KB is small (<10 runs) and the frontier is sparse, suggest
-`/expand-kb` (the "Expand KB" button on the planning page) to add the
-next library batch and re-run the analysis.
+When `total_in_kb < 10`, the frontier is sparse. Tell the user and
+suggest `/expand-kb` (the "Expand KB" button on the planning page) to
+add the next curated batch, then re-run the analysis.
 
-> *Future tools (not yet implemented)* — once the KB grows past ~100
-> runs, `list_plan_runs(limit=50)` won't capture the full picture. We
-> plan to add `query_kb_runs(filters, sort, limit)` for parametric
-> filtering across all runs and `pareto_kb_runs(maximize, minimize)`
-> for server-side Pareto computation. Defer these until the user's
-> typical KB size exceeds the inline-bulk envelope.
+`list_plan_runs` still has its place — it's the right tool for raw
+plan-run history that includes contingents / failed / unsound runs
+(rows the KB excludes). Use `list_plan_runs` for "what was the most
+recent run" or "show me the failed runs"; use the KB tools for any
+KB-grounded advisory question.
+
+### Exploration — proposing NEW configs (not rehashing the KB)
+
+When the user asks for *next* configs to explore — phrasings like
+"what should I try?", "recommend configs to run", "next steps",
+"any configs you'd suggest beyond what's already there?" — the answer
+is NEVER an existing KB row. `query_kb_runs` returns the past;
+`suggest_next_batch` is the only tool that produces the future.
+
+`suggest_next_batch(criterion='fill_rate'|'fairness'|'pareto', batch_size=N)`:
+
+- Picks the case's current best run as **seed** (per the chosen
+  criterion — defaults to `fill_rate`).
+- Walks the AXIS_CATALOG of single-knob variations (max_methods,
+  depth, scope, allocation_mode, period_days, mode, score_weights,
+  consolidation_enabled, purchase_allowed). Each variation produces
+  a candidate by flipping ONE knob off the seed.
+- **Dedup'd against every signature already in the KB or in any
+  non-failed plan_run.** Candidates returned are guaranteed novel.
+- Empty result = single-axis library is exhausted around the current
+  best (the user has already explored every one-knob neighbor of the
+  best). At that point: tell them so, and offer to combine multiple
+  knobs manually via `update_config`.
+
+Pattern when the user asks for next configs:
+
+1. `suggest_next_batch(criterion='fill_rate', batch_size=3)` (or
+   `pareto` if the user's goal is multi-objective).
+2. Report each candidate's `label`, the knob it varies, and the
+   axis name. Don't quote the full signature back unless the user
+   asks for it.
+3. Offer to enqueue: *"Want me to run candidate #1? I'll
+   update_config and run_plan_async."* If yes, do exactly that.
+4. If `suggest_next_batch` returns empty: state the fact plainly
+   ("the curated single-axis library is exhausted around your
+   current best") and offer multi-knob combinations as the next
+   tier of exploration.
+
+What NOT to do:
+- DO NOT call `query_kb_runs` and label its rows as "configs to
+  explore" or "configurations you can try". Those are *records*,
+  not *proposals*.
+- DO NOT claim to "expand the knowledge base" — chat has no
+  expand_kb tool. Tell the user to click the **Expand KB** button
+  on the planning page.
+- DO NOT fabricate a signature and present it as novel. If you must
+  hand-construct one (e.g. user asked for a specific tweak), call
+  `is_signature_in_kb` on it first and only present it if
+  `exists=false`.
 
 ### Comparative diagnosis — DO NOT just list KPI deltas
 
 Common forms: "why is run X better than Y?", "fill rate dropped — why?",
-"the new engine is worse, what gives?". KPI numbers are the *evidence*;
+"the new scope is worse, what gives?". KPI numbers are the *evidence*;
 the **mechanism is the answer**. Always end on the mechanism.
 
 Pattern:
@@ -376,7 +446,7 @@ Pattern:
 2. `get_kpis(A)` and `get_kpis(B)`.
 3. Cross-check `manufacturing.total_quantity` and
    `inventory.consumed_total`. A multi-x gap on these from the same
-   supplies is the engine-fragmentation smoking gun.
+   supplies is the scope-fragmentation smoking gun.
 4. **If a soundness rule has shipped *between* the runs** (e.g. R7d
    landed after the orphan-fix), call `recheck_soundness(older_run)`
    then `get_soundness_summary(older_run)` to confirm/rule out a
@@ -384,9 +454,8 @@ Pattern:
    via orphan inventory consumption, so the older run's "better" fill
    rate may simply be dishonest accounting.
 5. **Explain via the relevant Mechanism section in this primer** (the
-   Consolidation engines block, the waterfall section, the
-   orphan-consumption failure mode, etc.). Quote the mechanism, anchor
-   the KPI gap to it.
+   Regulation scope block, the waterfall section, the orphan-consumption
+   failure mode, etc.). Quote the mechanism, anchor the KPI gap to it.
 
 Example — bad reply (data dump, no insight):
 
@@ -397,13 +466,14 @@ Example — bad reply (data dump, no insight):
 Example — good reply (mechanism-grounded):
 
 > "The only differing knob is the regulation scope. Run 434's *All
-> levels* (engine=supply) applies the split policy at every make/move
-> WO output too, not just at supply-bearing nodes. Under shortage that
-> fragments shared inputs into slivers, and AND-bottlenecks compute
-> MIN(child shares) — so slivers × MIN collapses to tiny make output.
-> Run 433's *Leaves only* (engine=leaf-legacy) regulates only at
-> nodes that already hold supply; the new make/move WOs run unconstrained,
-> preserving the integer-quantity atomicity AND-relations need. The
+> levels* (consolidation.scope=all) applies the split policy at every
+> make/move WO output too, not just at supply-bearing nodes. Under
+> shortage that fragments shared inputs into slivers, and AND-bottlenecks
+> compute MIN(child shares) — so slivers × MIN collapses to tiny make
+> output. Run 433's *Leaves only* (consolidation.scope=leaf-only)
+> regulates only at nodes that already hold supply; the new make/move
+> WOs run unconstrained, preserving the integer-quantity atomicity
+> AND-relations need. The
 > 3.7× mfg gap (104k vs 28k from the same supplies) is that
 > fragmentation, not a fairness/method-selection difference. Trade-off:
 > Leaves only wins throughput + complete orders (median fill 1.0); All
