@@ -199,7 +199,45 @@ private data class ChildPassResult(
     val wos: List<Map<String, Any?>>,
     val pegging: Map<String, Any?>?,
     val cTimes: List<LocalDate>,
+    val solvedList: List<Map<String, Any?>>,  // raw committedRow list — needed by the
+                                              // bottleneck branch to surface the deepest
+                                              // cause (vs the immediate failing child).
 )
+
+/**
+ * Walk a cascading commit_reason and return the deepest non-cascade triple
+ * (pid, loc, terminalCause). The planner's child_failed reasons nest like
+ * matryoshka dolls — each level wraps the immediate failing child + its
+ * own reason, which is itself often a child_failed cascade. Unwrapping all
+ * the way to the terminal cause makes the demand row's commit_reason point
+ * directly at the actual unfulfillable component instead of the outermost
+ * propagated label.
+ *
+ *   "child_failed:A@1(no_inventory)"
+ *     → (A, 1, no_inventory)
+ *
+ *   "child_failed:A@1(child_failed:B@2(no_methods))"
+ *     → (B, 2, no_methods)        // B@2 is the actual root cause
+ *
+ *   "no_methods"                   // already terminal, no pid/loc
+ *     → (?, ?, no_methods)
+ *
+ *   null                           // sensible default
+ *     → (?, ?, no_inventory)
+ *
+ * Callers pass `?` through when their own bottleneck child's pid/loc is
+ * available and more specific than the unwrap result.
+ */
+internal fun resolveDeepestCause(reason: String?): Triple<String, String, String> {
+    if (reason.isNullOrBlank()) return Triple("?", "?", "no_inventory")
+    val match = Regex("""^child_failed:([^@]+)@([^(]+)\((.+)\)$""").matchEntire(reason)
+        ?: return Triple("?", "?", reason)
+    val (pid, loc, cause) = match.destructured
+    return if (cause.startsWith("child_failed:"))
+        resolveDeepestCause(cause)
+    else
+        Triple(pid, loc, cause)
+}
 
 /**
  * Compute parent achievable qty from per-child first-pass results, given the
@@ -966,7 +1004,7 @@ internal fun planMethodSlot(
             else 0.0
         }
         val cTimes = solvedList.mapNotNull { s -> parseDate(s["commit_time"] as? String) }
-        childPassResults.add(ChildPassResult(c, neededQty, effectiveQty, cWos, cPegging, cTimes))
+        childPassResults.add(ChildPassResult(c, neededQty, effectiveQty, cWos, cPegging, cTimes, solvedList))
     }
 
     val anyChildShort = childPassResults.any { cr -> cr.effectiveQty < cr.neededQty - 1e-9 }
@@ -1009,23 +1047,47 @@ internal fun planMethodSlot(
                 budget.clear()
                 budget.putAll(budgetSnap)
             }
-            // Drop the failed-child pegging — those trees show first-pass takes
-            // that no longer exist post-restore. Keeping them would re-create the
-            // per-demand R4 violation we just spent the restore eliminating. The
-            // bottleneck product@location is preserved in method_choice_explanation,
-            // so debug context isn't lost.
+            // Keep the first-pass child pegging trees so the UI can show *why*
+            // this method was blocked — under-allocated child branches, deeper
+            // child_failed cascades, partial supply takes. The trees are stale
+            // (the inventory takes they reference were rolled back above), but
+            // they remain the most direct visual diagnosis of the bottleneck.
+            //
+            // To stop the soundness checker (R4 qty propagation, R7d orphan
+            // leaves) from flagging the rollback-induced inconsistencies as
+            // engine bugs, the blocked WO is marked `failed = true`. The
+            // checker treats any failed-marked subtree as a debug snapshot
+            // and skips it — the trees are accepted as expected-broken.
             val bottleneck = childPassResults.first { cr -> cr.effectiveQty < cr.neededQty - 1e-9 }
-            val childProduct = bottleneck.child["product_id"]?.toString() ?: "?"
-            val childLoc     = bottleneck.child["location_id"]?.toString() ?: "?"
-            val reason = "child_failed:${childProduct}@${childLoc}(no_inventory)"
+            val immediateChildPid = bottleneck.child["product_id"]?.toString() ?: "?"
+            val immediateChildLoc = bottleneck.child["location_id"]?.toString() ?: "?"
+            // Pick a representative failure row from the bottleneck child's commit rows to
+            // unwrap deeper. Prefer rows whose reason is a `child_failed:` cascade — those
+            // carry the deeper subtree label. Otherwise fall back to the first hard-failure
+            // row's reason (e.g. "no_methods", "no_inventory"), which is already terminal.
+            val bottleneckReason: String? = bottleneck.solvedList
+                .map { it["commit_reason"] as? String }
+                .firstOrNull { r -> r != null && r.startsWith("child_failed:") }
+                ?: bottleneck.solvedList
+                    .map { it["commit_reason"] as? String }
+                    .firstOrNull { r -> r != null && isHardPlanningFailure(r) }
+            val (deepestPid, deepestLoc, terminalCause) = resolveDeepestCause(bottleneckReason)
+            // If the cascade unwrap landed on "?" (broken/terminal pegging — expected when
+            // the deepest child reported a non-cascade reason like "no_methods"), use the
+            // immediate bottleneck child's own coordinates instead. Better an honest
+            // shallow label than a fabricated "?@?".
+            val deepPid = if (deepestPid == "?") immediateChildPid else deepestPid
+            val deepLoc = if (deepestLoc == "?") immediateChildLoc else deepestLoc
+            val reason = "child_failed:${deepPid}@${deepLoc}(${terminalCause})"
             val methodType = m["type"] as? String ?: ""
             val blockedWoNode = buildWoNode(
                 productId, productionLocation, 0.0, methodType, m,
                 reqDt, null, 0, 0.0,
-                "$methodChoiceExplanation — blocked: deep child $childProduct@$childLoc has no supply",
+                "$methodChoiceExplanation — blocked: deepest child $deepPid@$deepLoc ($terminalCause)",
                 variantExplanation, woChildrenRelation,
-                emptyList<Map<String, Any?>>(),  // no failed-child pegging — see comment above
+                childPassResults.mapNotNull { it.pegging },  // partial child pegging — see comment above
                 overrideActive,
+                failed = true,
             )
             return MethodSlotResult(
                 achievableQty = 0.0,
@@ -1670,23 +1732,30 @@ private fun buildWoNode(
     childrenRelation: String?,
     woChildren: List<Map<String, Any?>>,
     overrideActive: Boolean = false,
-): Map<String, Any?> = mapOf(
-    "type" to "work_order",
-    "product_id" to productId,
-    "location_id" to productionLocation,
-    "quantity" to roundQty(qty),
-    "start_time" to formatDate(startDt),
-    "end_time" to formatDate(lastEnd),
-    "method" to methodType,
-    "location_source" to (if (methodType == "move") m["from_location_id"] else null),
-    "method_choice_explanation" to methodChoiceExpl,
-    "variant_choice_explanation" to variantExpl.ifBlank { null },
-    "children_relation" to childrenRelation,
-    "lot_count" to (if (lotCount > 0) lotCount else null),
-    "max_lot_size" to lotSizeVal,
-    "override_active" to overrideActive,
-    "children" to woChildren,
-)
+    failed: Boolean = false,
+): Map<String, Any?> = buildMap {
+    put("type", "work_order")
+    put("product_id", productId)
+    put("location_id", productionLocation)
+    put("quantity", roundQty(qty))
+    put("start_time", formatDate(startDt))
+    put("end_time", formatDate(lastEnd))
+    put("method", methodType)
+    put("location_source", if (methodType == "move") m["from_location_id"] else null)
+    put("method_choice_explanation", methodChoiceExpl)
+    put("variant_choice_explanation", variantExpl.ifBlank { null })
+    put("children_relation", childrenRelation)
+    put("lot_count", if (lotCount > 0) lotCount else null)
+    put("max_lot_size", lotSizeVal)
+    put("override_active", overrideActive)
+    put("children", woChildren)
+    // Marker for the AND-bottleneck blocked branch: this WO is a debug snapshot
+    // of "what would have happened" — its subtree shows first-pass takes that
+    // were rolled back by inventory.clear()/inventory.addAll(snap) at the
+    // outer level. Soundness skips the entire subtree under failed=true to
+    // tolerate the broken/partial pegging it carries.
+    if (failed) put("failed", true)
+}
 
 // ── Phantom-loop pruning ───────────────────────────────────────────────────────
 

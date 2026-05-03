@@ -17,9 +17,10 @@ import io.kotest.matchers.shouldBe
  *
  * Post-fix: blocked branch restores `inventory` + `budget` from the
  * snapshots taken at planMethodSlot entry — symmetrical to the non-blocked
- * second-pass branch — and drops the failed-child pegging from the
- * placeholder WO so the tree doesn't claim consumption that no longer
- * exists.
+ * second-pass branch. The placeholder WO is marked `failed = true` and
+ * carries the partial child pegging trees for UI diagnosis; the soundness
+ * checker skips any subtree under a `failed = true` WO so the rollback-
+ * induced staleness in those trees is not flagged as an engine bug.
  */
 class PlanningEngineOrphanConsumptionTest : FunSpec({
 
@@ -96,18 +97,21 @@ class PlanningEngineOrphanConsumptionTest : FunSpec({
         inventory.qtyOf("SUP_A") shouldBe (100.0 plusOrMinus 1e-6)
         inventory.qtyOf("SUP_B") shouldBe (0.0 plusOrMinus 1e-6)
 
-        // The placeholder WO under the demand pegging should have NO children:
-        // the failed-child pegging trees were dropped post-fix to avoid lying
-        // about consumption.
+        // The placeholder WO under the demand pegging is marked failed=true and
+        // carries the partial child pegging trees so the UI can show *why* the
+        // method was blocked. Soundness skips failed=true subtrees, so the
+        // rollback-induced staleness in those trees is tolerated.
         @Suppress("UNCHECKED_CAST")
         val woNodes = (pegging?.get("children") as? List<Map<String, Any?>>) ?: emptyList()
-        // The placeholder WO is under the demand. It may live nested inside other
-        // pegging structure depending on how the demand node was built.
-        val placeholderWoChildren = woNodes
-            .firstOrNull { it["type"] == "work_order" }
-            ?.let { (it["children"] as? List<*>) ?: emptyList<Any>() }
-        // Either no WO emitted at all, or the WO has empty children.
-        (placeholderWoChildren?.isEmpty() ?: true) shouldBe true
+        val placeholderWo = woNodes.firstOrNull { it["type"] == "work_order" }
+        if (placeholderWo != null) {
+            placeholderWo["failed"] shouldBe true
+            (placeholderWo["quantity"] as? Number)?.toDouble() shouldBe (0.0 plusOrMinus 1e-6)
+            // Partial pegging is preserved for UI diagnosis (children of A and B).
+            @Suppress("UNCHECKED_CAST")
+            val placeholderWoChildren = (placeholderWo["children"] as? List<Map<String, Any?>>) ?: emptyList()
+            (placeholderWoChildren.size > 0) shouldBe true
+        }
     }
 
     // ── Test 2: multi-level subtree restore ─────────────────────────────────

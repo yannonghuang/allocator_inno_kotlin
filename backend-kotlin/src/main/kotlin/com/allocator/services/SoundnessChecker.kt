@@ -644,6 +644,16 @@ private class WalkContext(
     }
 
     private fun walkWorkOrder(node: Map<String, Any?>, path: String) {
+        // Failed-marker contract: nodes flagged `failed = true` are debug
+        // snapshots from the AND-bottleneck blocked branch in
+        // PlanningEngine.planMethodSlot. Their qty math, leaf consumption,
+        // and child pegging are deliberately stale — the first-pass takes
+        // were rolled back, but the structural snapshot is preserved so the
+        // UI can show the user *why* the method was blocked. Skip both rule
+        // evaluation and recursion: validating a known-broken snapshot would
+        // surface engine-bug-shaped violations (R4 qty propagation, R7d
+        // orphan leaves) for what is actually expected behaviour.
+        if (node["failed"] == true) return
         val method = node["method"]?.toString() ?: ""
         when (method) {
             "make" -> validateMakeWO(node, path)
