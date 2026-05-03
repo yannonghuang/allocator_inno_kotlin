@@ -304,7 +304,14 @@ fun Routing.allocateRoutes() {
                 ?: throw NoSuchElementException("Case not found")
         }
         val batchSize = (call.request.queryParameters["batch_size"]?.toIntOrNull() ?: 5).coerceIn(1, com.allocator.services.CaseBootstrap.LIBRARY.size)
-        call.respond(com.allocator.services.CaseBootstrap.statusFor(caseId, batchSize))
+        val criterion = call.request.queryParameters["criterion"]
+            ?.takeIf { it in setOf(
+                com.allocator.services.CaseBootstrap.CRITERION_FILL_RATE,
+                com.allocator.services.CaseBootstrap.CRITERION_FAIRNESS,
+                com.allocator.services.CaseBootstrap.CRITERION_PARETO,
+            ) }
+            ?: com.allocator.services.CaseBootstrap.CRITERION_FILL_RATE
+        call.respond(com.allocator.services.CaseBootstrap.statusFor(caseId, batchSize, criterion))
     }
 
     // ── POST /cases/{case_id}/bootstrap — fire next batch of preset runs ──────
@@ -327,16 +334,63 @@ fun Routing.allocateRoutes() {
         val body = runCatching { call.receiveText() }.getOrElse { "" }
         val payload = if (body.isBlank()) JsonObject(emptyMap())
                       else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrElse { JsonObject(emptyMap()) }
-        val batchSize = (payload["batch_size"]?.jsonPrimitive?.intOrNull ?: 5).coerceIn(1, com.allocator.services.CaseBootstrap.LIBRARY.size)
+        // Batch size is uncapped (well, sanity-bounded) — KB is uncapped too,
+        // and selectNextBatch naturally returns at most as many uncovered
+        // library presets as exist. Higher values just let the user start a
+        // larger run when they have many edits queued.
+        val batchSize = (payload["batch_size"]?.jsonPrimitive?.intOrNull ?: 5).coerceIn(1, 100)
 
-        val presets = com.allocator.services.CaseBootstrap.selectNextBatch(caseId, batchSize)
-        if (presets.isEmpty()) {
+        // Optional client-supplied preset list. When present, these replace
+        // selectNextBatch wholesale — the user has reviewed and possibly edited
+        // the system suggestions in the dialog. Each entry must carry preset_id,
+        // preset_label, primary_axis, and a config JsonObject. Anything missing
+        // falls back to selectNextBatch.
+        val presetsOverride: List<com.allocator.services.BootstrapPreset>? = (payload["presets"] as? JsonArray)?.let { arr ->
+            arr.mapIndexedNotNull { idx, el ->
+                val obj = el as? JsonObject ?: return@mapIndexedNotNull null
+                val cfg = obj["config"] as? JsonObject ?: return@mapIndexedNotNull null
+                val pid = obj["preset_id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+                    ?: "custom-$idx"
+                val label = obj["preset_label"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+                    ?: pid
+                val axis = obj["primary_axis"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+                    ?: "user-driven"
+                com.allocator.services.BootstrapPreset(
+                    presetId = pid, label = label, index = idx + 1,
+                    primaryAxis = axis, config = cfg,
+                )
+            }.takeIf { it.isNotEmpty() }
+        }
+
+        val proposedPresets = presetsOverride ?: com.allocator.services.CaseBootstrap.selectNextBatch(caseId, batchSize)
+        if (proposedPresets.isEmpty()) {
             call.respond(buildJsonObject {
                 put("status", "library_exhausted")
                 put("library_size", com.allocator.services.CaseBootstrap.LIBRARY.size)
                 put("message", "All bootstrap presets have been run for this case. " +
                     "The case's knowledge base now spans the curated library — use the planning agent " +
                     "for ad-hoc explorations, or run plans manually for case-specific tuning.")
+            })
+            return@post
+        }
+        // Final dedup at submission time. The next_batch suggestions are
+        // computed on dialog open and may be stale (parallel run, edits that
+        // collide with an existing kb_record, etc.). Drop any preset whose
+        // config signature is already covered. The skipped list is returned
+        // to the client for a "skipped N presets" notice.
+        val coveredSigs = com.allocator.services.CaseBootstrap.coveredSignaturesFor(caseId)
+        val (presets, skippedDup) = proposedPresets.partition { preset ->
+            com.allocator.services.CaseBootstrap.signatureFor(preset.config) !in coveredSigs
+        }
+        if (presets.isEmpty()) {
+            call.respond(buildJsonObject {
+                put("status", "all_already_covered")
+                put("library_size", com.allocator.services.CaseBootstrap.LIBRARY.size)
+                put("message", "All submitted presets match a config already covered in the Knowledge Base. " +
+                    "Edit the configs to differ from existing entries, or use the planning agent for analysis.")
+                putJsonArray("skipped") {
+                    skippedDup.forEach { add(com.allocator.services.CaseBootstrap.toJson(it)) }
+                }
             })
             return@post
         }
@@ -351,6 +405,7 @@ fun Routing.allocateRoutes() {
             "current_preset_label" to presets.first().label,
             "plan_run_ids" to mutableListOf<Int>(),
             "errors" to mutableListOf<String>(),
+            "cancelled" to false,
         )
 
         engineScope.launch { runBootstrapBatchBackground(bootstrapJobId, caseId, presets, data) }
@@ -361,7 +416,26 @@ fun Routing.allocateRoutes() {
             putJsonArray("presets") {
                 presets.forEach { add(com.allocator.services.CaseBootstrap.toJson(it)) }
             }
+            // Surface any presets that were dropped at submission time because
+            // their config signature already exists in KB. Frontend uses this
+            // to show a "skipped N" notice.
+            putJsonArray("skipped") {
+                skippedDup.forEach { add(com.allocator.services.CaseBootstrap.toJson(it)) }
+            }
         })
+    }
+
+    // ── DELETE /cases/{case_id}/kb-records/{record_id} — drop a KB row ────────
+    // Removes the KB snapshot but does NOT touch the source plan_run. Use the
+    // plan-run delete endpoint separately if you also want to drop the run.
+    delete("/cases/{case_id}/kb-records/{record_id}") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val recordId = call.parameters["record_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid record_id")
+        val removed = com.allocator.services.KbStore.deleteRecord(caseId, recordId)
+        if (!removed) throw NoSuchElementException("KB record not found")
+        call.respond(HttpStatusCode.NoContent)
     }
 
     // ── GET /cases/{case_id}/bootstrap/status/{job_id} — poll bootstrap ───────
@@ -381,8 +455,25 @@ fun Routing.allocateRoutes() {
             put("completed", JsonPrimitive(state["completed"] as? Int ?: 0))
             put("current_preset_id", state["current_preset_id"]?.toString() ?: "")
             put("current_preset_label", state["current_preset_label"]?.toString() ?: "")
+            put("cancelled", JsonPrimitive(state["cancelled"] == true))
             putJsonArray("plan_run_ids") { planRunIds.forEach { add(JsonPrimitive(it)) } }
             putJsonArray("errors") { errors.forEach { add(JsonPrimitive(it)) } }
+        })
+    }
+
+    // ── POST /cases/{case_id}/bootstrap/cancel/{job_id} — request interrupt ───
+    // Sets the cooperative-cancel flag. The currently-running preset (if any)
+    // finishes; subsequent presets are skipped. Job ends in status=cancelled.
+    post("/cases/{case_id}/bootstrap/cancel/{job_id}") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val jobId = call.parameters["job_id"] ?: throw IllegalArgumentException("Invalid job_id")
+        val state = bootstrapJobs[jobId] ?: throw NoSuchElementException("Bootstrap job not found")
+        if (state["case_id"] != caseId) throw NoSuchElementException("Bootstrap job not found for this case")
+        state["cancelled"] = true
+        call.respond(buildJsonObject {
+            put("status", state["status"]?.toString() ?: "running")
+            put("cancelled", JsonPrimitive(true))
         })
     }
 
@@ -399,6 +490,73 @@ fun Routing.allocateRoutes() {
             if (job["result"] != null) put("result", anyToJson(job["result"]))
             if (job["error"] != null) put("error", job["error"]?.toString() ?: "")
             planJobRunIds[jobId]?.let { put("plan_run_id", it) }
+        })
+    }
+
+    // ── POST /cases/{case_id}/kb/resync ───────────────────────────────────────
+    //
+    // One-off sync: walk every status='success' plan_run for this case and
+    // upsert into kb_records. Permissive — does NOT filter on
+    // soundness_status, so legacy runs (success-but-unchecked, success-but-
+    // unsound) get covered. Idempotent. Use when KB has drifted out of sync
+    // with plan_run history (e.g. older chat-driven runs that never
+    // auto-saved before the autoSave hook landed).
+    post("/cases/{case_id}/kb/resync") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val stats = com.allocator.services.KbStore.resyncForCase(caseId)
+        call.respond(buildJsonObject {
+            put("candidate_runs", stats.candidateRuns)
+            put("unique_signatures", stats.uniqueSignatures)
+            put("added", stats.added)
+            put("skipped", stats.skipped)
+            put("total_kb_after", stats.totalAfter)
+        })
+    }
+
+    // ── POST /cases/{case_id}/kb/clean ────────────────────────────────────────
+    //
+    // Removal pass: enforce trust without violating KB dissociation.
+    //   - Orphaned KB rows (no live source plan_run) — KEPT as durable
+    //     testimony from when the source was sound.
+    //   - KB rows whose source is currently NOT sound+success but a sibling
+    //     sound+success run shares the signature — REFRESHED from that run.
+    //   - KB rows whose source is currently NOT sound+success and no sibling
+    //     sound+success exists — DELETED (no trustworthy backing).
+    post("/cases/{case_id}/kb/clean") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val stats = com.allocator.services.KbStore.cleanForCase(caseId)
+        call.respond(buildJsonObject {
+            put("kb_before", stats.kbBefore)
+            put("orphaned_kept", stats.orphanedKept)
+            put("refreshed", stats.refreshed)
+            put("deleted", stats.deleted)
+            put("kb_after", stats.kbAfter)
+        })
+    }
+
+    // ── GET /cases/{case_id}/plan/active-jobs ─────────────────────────────────
+    //
+    // Returns plan jobs currently running for this case. The chat-side progress
+    // bar polls this while the planning-agent HTTP request is blocked inside
+    // run_plan_async (which internally chains wait_for_plan up to 60s). The
+    // planning agent's chat panel uses this to surface live progress instead
+    // of leaving the user staring at a generic spinner.
+    get("/cases/{case_id}/plan/active-jobs") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val items = planJobs.entries.mapNotNull { (jobId, job) ->
+            if (job["case_id"] != caseId) return@mapNotNull null
+            if (job["status"] != "running") return@mapNotNull null
+            buildJsonObject {
+                put("job_id", jobId)
+                put("status", job["status"]?.toString() ?: "running")
+                put("progress", anyToJson(job["progress"]))
+            }
+        }
+        call.respond(buildJsonObject {
+            put("jobs", buildJsonArray { items.forEach { add(it) } })
         })
     }
 
@@ -500,6 +658,12 @@ fun Routing.allocateRoutes() {
             val activeRunId = com.allocator.services.resolveActiveRunId(designatedId, successIds)
             val idStatusPairs = rows.map { it[PlanRuns.id] to it[PlanRuns.status] }
             val initialRunId = com.allocator.services.resolveInitialRunId(idStatusPairs)
+            // Pre-load KB snapshots for this case so each row can pick up its
+            // KPIs in O(1). KB rows are keyed by config signature; fall back
+            // to parsing plan_run.result directly when no KB row exists yet
+            // (e.g. unsound or in-flight runs that didn't backfill).
+            val kbBySig: Map<String, com.allocator.services.KbStore.KbRecord> =
+                com.allocator.services.KbStore.listForCase(caseId)
             rows.map { row ->
                 val snapshot = row[PlanRuns.overrideSnapshot]
                 val parsedSnapshot = snapshot?.let { runCatching { Json.parseToJsonElement(it) as? JsonArray }.getOrNull() }
@@ -510,12 +674,26 @@ fun Routing.allocateRoutes() {
                 val finishedInstant = row[PlanRuns.finishedAt]
                 val chosenDepth = row[PlanRuns.chosenDepth]
                 val attempts = parseAttempts(row[PlanRuns.attempts])
+                // KPI snapshot lookup: prefer the KB row (already extracted +
+                // cached) when present; otherwise compute on-the-fly from the
+                // run's stored result so unsound / in-flight runs still get
+                // KPI columns in the run-history view.
+                val configRaw = row[PlanRuns.config]
+                val configSig = configRaw?.let { raw ->
+                    runCatching { Json.parseToJsonElement(raw).jsonObject }.getOrNull()
+                        ?.let { com.allocator.services.CaseBootstrap.signatureFor(it) }
+                }
+                val kpis: JsonObject = configSig?.let { sig -> kbBySig[sig] }?.let { kb ->
+                    runCatching { Json.parseToJsonElement(kb.kpisSnapshotJson).jsonObject }.getOrNull()
+                } ?: com.allocator.services.KbStore.extractKpisFromResult(row[PlanRuns.result])
+                fun n(k: String): Double? = kpis[k]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
+                fun i(k: String): Int? = kpis[k]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
                 PlanRunResponse(
                     id = runId,
                     caseId = row[PlanRuns.caseId],
                     jobId = row[PlanRuns.jobId],
                     status = row[PlanRuns.status],
-                    config = row[PlanRuns.config]?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
+                    config = configRaw?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
                     overrideCount = overrideCount,
                     overrideSnapshotPreview = preview,
                     name = row[PlanRuns.name],
@@ -533,6 +711,16 @@ fun Routing.allocateRoutes() {
                     metadata = row[PlanRuns.metadata]?.let {
                         runCatching { Json.parseToJsonElement(it) }.getOrNull()
                     },
+                    fillRatePct = n("fill_rate_pct"),
+                    gini = n("gini"),
+                    p10FillRatio = n("p10_fill_ratio"),
+                    medianFillRatio = n("median_fill_ratio"),
+                    starvationPct = n("starvation_pct"),
+                    onTimeCount = i("on_time_count"),
+                    totalCommitted = n("total_committed"),
+                    totalRequested = n("total_requested"),
+                    mfgTotalQty = n("manufacturing_total_quantity"),
+                    invConsumedTotal = n("inventory_consumed_total"),
                 )
             }
         }
@@ -717,6 +905,12 @@ fun Routing.allocateRoutes() {
             ?: throw IllegalArgumentException("Invalid case_id")
         val runId = call.parameters["run_id"]?.toIntOrNull()
             ?: throw IllegalArgumentException("Invalid run_id")
+        // Detach KB rows so they survive the plan_run deletion — the KB is
+        // a design surface dissociated from plan_run lifecycle. The KB row
+        // keeps its KPI snapshot and config; only the source link is severed.
+        // (KbRecords.sourcePlanRunId has no FK by design so this is a manual
+        // book-keeping step rather than a DB cascade.)
+        com.allocator.services.KbStore.markPlanRunDeleted(runId)
         transaction {
             val deleted = PlanRuns.deleteWhere {
                 (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId)
@@ -788,13 +982,22 @@ fun Routing.allocateRoutes() {
                         this[PlanSupplyAllocations.qtyConsumed] = (alloc["qty_consumed"] as? Number)?.toDouble() ?: 0.0
                     }
                 }
-                // Delete the ready row (cascade wipes its plan_run_event rows)
+                // The ready row is about to be deleted (with KB rows detached
+                // first so the snapshot survives), and the target row gets the
+                // refreshed result.
+                com.allocator.services.KbStore.markPlanRunDeleted(runId)
                 PlanRuns.deleteWhere { PlanRuns.id eq runId }
                 com.allocator.services.emitPlanRunEvent(caseId, targetRunId, "overridden", buildJsonObject {
                     put("replaced_ready_run_id", JsonPrimitive(runId))
                     nameArg?.ifBlank { null }?.let { put("name", JsonPrimitive(it)) }
                     notesArg?.ifBlank { null }?.let { put("notes", JsonPrimitive(it)) }
                 })
+            }
+            // Refresh the KB snapshot for the target run with its new result.
+            try {
+                com.allocator.services.KbStore.upsertFromPlanRun(targetRunId)
+            } catch (e: Exception) {
+                log.warn("KB upsert failed for overridden run $targetRunId: ${e.message}")
             }
             call.respond(buildJsonObject { put("id", targetRunId); put("status", "success") })
             return@post
@@ -856,6 +1059,14 @@ fun Routing.allocateRoutes() {
                 nameArg?.ifBlank { null }?.let { put("name", JsonPrimitive(it)) }
                 notesArg?.ifBlank { null }?.let { put("notes", JsonPrimitive(it)) }
             })
+        }
+        // Snapshot into the dissociated KB store. Every successful run flows
+        // into the KB regardless of origin (user-initiated or KB expansion).
+        // The plan_run can later be deleted without losing this row.
+        try {
+            com.allocator.services.KbStore.upsertFromPlanRun(runId)
+        } catch (e: Exception) {
+            log.warn("KB upsert failed for saved run $runId: ${e.message}")
         }
         call.respond(buildJsonObject { put("id", runId); put("status", "success") })
     }
@@ -1090,6 +1301,14 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
             it[PlanRuns.soundnessReport] = reportJson.toString()
             it[PlanRuns.soundnessCheckedAt] = kotlinx.datetime.Clock.System.now()
         }
+    }
+    // Refresh the dissociated KB snapshot so the new soundness status flows
+    // through to the Knowledge Base view (and the agent's soundness-aware
+    // queries). Best-effort — soundness is the source of truth either way.
+    try {
+        com.allocator.services.KbStore.upsertFromPlanRun(runId)
+    } catch (e: Exception) {
+        log.warn("KB upsert failed after soundness recheck of run $runId: ${e.message}")
     }
     return reportJson
 }
@@ -1740,6 +1959,7 @@ internal suspend fun runPlanBackground(
     caseId: Int,
     data: Map<String, List<Map<String, Any?>>>,
     config: Map<String, Any?>?,
+    autoSave: Boolean = false,
 ) {
     // Insert plan_run record at start, capturing current override snapshot
     val planRunId = transaction {
@@ -1796,15 +2016,20 @@ internal suspend fun runPlanBackground(
         }
         casePlanResults[caseId] = enriched
 
-        // Mark run as ready (result not yet persisted — user must explicitly save).
-        // When optimal-depth search ran, rewrite the config snapshot so subsequent
-        // "view config" displays reflect the depth that was actually used, and
-        // persist per-depth attempt durations so the UI can attribute elapsed
-        // time to the depth that was actually chosen.
+        // Mark run as ready (or auto-save when [autoSave] is true: write the
+        // result, promote to success, and seed the KB. The auto-save path is
+        // for chat-driven plans where the user already committed to the run
+        // by asking the agent to execute it — there's no separate "decide
+        // whether to keep this run" UX in the chat. Page-driven runs default
+        // to autoSave=false and use the explicit /save endpoint.
+        // When optimal-depth search ran, also rewrite the config snapshot so
+        // subsequent "view config" displays reflect the depth actually used.
+        val resultJson = if (autoSave) runCatching { anyToJson(enriched).toString() }.getOrElse { null } else null
         transaction {
             PlanRuns.update({ PlanRuns.id eq planRunId }) {
-                it[PlanRuns.status] = "ready"
+                it[PlanRuns.status] = if (autoSave) "success" else "ready"
                 it[PlanRuns.finishedAt] = kotlinx.datetime.Clock.System.now()
+                if (autoSave && resultJson != null) it[PlanRuns.result] = resultJson
                 if (chosenDepth != null) {
                     it[PlanRuns.config] = overrideConfigDepth(config, chosenDepth).toString()
                     it[PlanRuns.chosenDepth] = chosenDepth
@@ -1818,10 +2043,35 @@ internal suspend fun runPlanBackground(
                     }).toString()
                 }
             }
+            if (autoSave) {
+                @Suppress("UNCHECKED_CAST")
+                val supplyAllocs = (enriched["supply_allocations"] as? List<Map<String, Any?>>).orEmpty()
+                if (supplyAllocs.isNotEmpty()) {
+                    PlanSupplyAllocations.deleteWhere { PlanSupplyAllocations.planRunId eq planRunId }
+                    PlanSupplyAllocations.batchInsert(supplyAllocs) { alloc ->
+                        this[PlanSupplyAllocations.caseId]      = caseId
+                        this[PlanSupplyAllocations.planRunId]   = planRunId
+                        this[PlanSupplyAllocations.supplyId]    = alloc["supply_id"] as String
+                        this[PlanSupplyAllocations.demandId]    = alloc["demand_id"] as? String
+                        this[PlanSupplyAllocations.qtyConsumed] = (alloc["qty_consumed"] as? Number)?.toDouble() ?: 0.0
+                    }
+                }
+                com.allocator.services.emitPlanRunEvent(caseId, planRunId, "saved", buildJsonObject {
+                    put("source", JsonPrimitive("agent_auto_save"))
+                })
+            }
             if (chosenDepth != null) {
                 com.allocator.services.emitPlanRunEvent(caseId, planRunId, "optimal_depth_chosen", buildJsonObject {
                     put("depth", JsonPrimitive(chosenDepth))
                 })
+            }
+        }
+        if (autoSave) {
+            try {
+                val kbRowId = com.allocator.services.KbStore.upsertFromPlanRun(planRunId)
+                log.info("Auto-save: plan_run={} promoted to success, kb_record={}", planRunId, kbRowId)
+            } catch (e: Exception) {
+                log.warn("KB upsert failed for auto-saved run $planRunId: ${e.message}")
             }
         }
 
@@ -1868,6 +2118,12 @@ internal suspend fun runBootstrapBatchBackground(
     data: Map<String, List<Map<String, Any?>>>,
 ) {
     for (preset in presets) {
+        // Cooperative cancellation: bail out before starting a new preset if
+        // the user clicked Interrupt. The current preset (if any) finishes —
+        // the planning engine doesn't expose a clean mid-run cancel — but no
+        // further presets begin. Job ends in status=cancelled, distinct from
+        // completed so the UI can show "stopped early".
+        if (bootstrapJobs[bootstrapJobId]?.get("cancelled") == true) break
         bootstrapJobs[bootstrapJobId]?.let {
             it["current_preset_id"] = preset.presetId
             it["current_preset_label"] = preset.label
@@ -1886,7 +2142,9 @@ internal suspend fun runBootstrapBatchBackground(
             it["completed"] = (it["completed"] as Int) + 1
         }
     }
-    bootstrapJobs[bootstrapJobId]?.let { it["status"] = "completed" }
+    bootstrapJobs[bootstrapJobId]?.let {
+        it["status"] = if (it["cancelled"] == true) "cancelled" else "completed"
+    }
 }
 
 /** Run one preset end-to-end: insert plan_run, run planner, persist, soundness. */
@@ -1964,6 +2222,17 @@ private suspend fun runOneBootstrapPreset(
             runSoundnessCheckForRun(caseId, planRunId, deepCheck = true)
         } catch (e: Exception) {
             log.warn("Bootstrap soundness check failed for run $planRunId: ${e.message}")
+        }
+
+        // Snapshot into the dissociated KB store. The plan_run can later be
+        // deleted (housekeeping, errors, etc.) without losing this KB row —
+        // see KbStore.markPlanRunDeleted, called from the plan_run DELETE
+        // handler. This call is idempotent so re-running the same preset
+        // refreshes the snapshot in place.
+        try {
+            com.allocator.services.KbStore.upsertFromPlanRun(planRunId)
+        } catch (e: Exception) {
+            log.warn("KB upsert failed for bootstrap run $planRunId: ${e.message}")
         }
 
         return planRunId
@@ -2167,9 +2436,9 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
                 "priority_first" -> "priority_first"
                 else             -> "fair"
             })
-            put("engine", when (consolidation["engine"]?.toString()) {
-                "supply" -> "supply"
-                else     -> "leaf-legacy"
+            put("scope", when (consolidation["scope"]?.toString()) {
+                "all" -> "all"
+                else  -> "leaf-only"
             })
         }
     }

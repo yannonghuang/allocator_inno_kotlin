@@ -300,3 +300,39 @@ object PlanRunEvents : Table("plan_run_event") {
     val createdAt   = timestamp("created_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 }
+
+/**
+ * Knowledge-base record. Independent persistence of a (config + KPI snapshot)
+ * pair, dissociated from the plan_run that produced it. KB records survive
+ * plan-run deletion — `sourcePlanRunDeleted` flips to true instead of cascading.
+ *
+ * Built from plan_runs at completion time (see KbStore.upsertFromPlanRun) but
+ * read independently by the Expand-KB dialog and the planning agent. The
+ * (caseId, signature) uniqueness reflects the library's "one row per
+ * configuration shape" semantics — re-running the same config replaces the
+ * snapshot rather than accumulating.
+ */
+object KbRecords : Table("kb_record") {
+    val id                    = integer("id").autoIncrement()
+    val caseId                = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    /** Canonical config signature; see CaseBootstrap.signatureFor. */
+    val signature             = varchar("signature", 512)
+    /** Library preset id when this row was seeded by bootstrap; null for ad-hoc / user-driven runs. */
+    val presetId              = varchar("preset_id", 64).nullable()
+    val presetLabel           = varchar("preset_label", 128).nullable()
+    val primaryAxis           = varchar("primary_axis", 32).nullable()
+    /** Full PlanningConfig JSON. */
+    val config                = text("config")
+    /** Headline KPI snapshot JSON: { fill_rate_pct, gini, p10_fill_ratio, ... }. */
+    val kpisSnapshot          = text("kpis_snapshot")
+    /** Most recent plan_run that wrote this record. NULL when the record was retained
+     *  after the source run was deleted (paired with sourcePlanRunDeleted=true). */
+    val sourcePlanRunId       = integer("source_plan_run_id").nullable()
+    val sourcePlanRunDeleted  = bool("source_plan_run_deleted").default(false)
+    val soundnessStatus       = varchar("soundness_status", 16).default("unchecked")
+    val createdAt             = timestamp("created_at").defaultExpression(CurrentTimestamp)
+    val updatedAt             = timestamp("updated_at").defaultExpression(CurrentTimestamp)
+    override val primaryKey = PrimaryKey(id)
+
+    init { uniqueIndex("uq_kb_record_case_signature", caseId, signature) }
+}

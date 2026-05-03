@@ -11,13 +11,13 @@ import io.kotest.matchers.shouldBe
  * End-to-end tests for the supply-level consolidation orchestrator (Phase F).
  *
  * Asserts:
- *   - parseConsolidationConfig threads through the new "engine" field
- *   - runPlanning dispatches correctly based on engine
- *   - Supply engine produces a sensible plan on simple BOMs (smoke test)
- *   - Supply engine matches the leaf engine on a no-shared-RM single-FG case
- *     (degenerate scenario where both engines should produce equivalent output)
- *   - Supply engine handles the "two demands sharing a deep raw material"
- *     case the leaf engine struggles with
+ *   - parseConsolidationConfig threads through the "scope" field
+ *   - runPlanning dispatches correctly based on consolidation.scope
+ *   - scope=all produces a sensible plan on simple BOMs (smoke test)
+ *   - scope=all matches scope=leaf-only on a no-shared-RM single-FG case
+ *     (degenerate scenario where both should produce equivalent output)
+ *   - scope=all handles the "two demands sharing a deep raw material"
+ *     case scope=leaf-only struggles with
  */
 class SupplyOrchestratorTest : FunSpec({
 
@@ -39,31 +39,31 @@ class SupplyOrchestratorTest : FunSpec({
 
     // ── Config parsing ────────────────────────────────────────────────────────
 
-    test("parseConsolidationConfig: engine defaults to leaf-legacy") {
+    test("parseConsolidationConfig: scope defaults to leaf-only") {
         val cfg = parseConsolidationConfig(mapOf(
             "consolidation" to mapOf("enabled" to true),
         ))
         cfg.enabled shouldBe true
-        cfg.engine shouldBe "leaf-legacy"
+        cfg.scope shouldBe "leaf-only"
     }
 
-    test("parseConsolidationConfig: engine = supply when explicitly set") {
+    test("parseConsolidationConfig: scope = all when explicitly set") {
         val cfg = parseConsolidationConfig(mapOf(
-            "consolidation" to mapOf("enabled" to true, "engine" to "supply"),
+            "consolidation" to mapOf("enabled" to true, "scope" to "all"),
         ))
-        cfg.engine shouldBe "supply"
+        cfg.scope shouldBe "all"
     }
 
-    test("parseConsolidationConfig: unknown engine string falls back to leaf-legacy") {
+    test("parseConsolidationConfig: unknown scope string falls back to leaf-only") {
         val cfg = parseConsolidationConfig(mapOf(
-            "consolidation" to mapOf("enabled" to true, "engine" to "bogus"),
+            "consolidation" to mapOf("enabled" to true, "scope" to "bogus"),
         ))
-        cfg.engine shouldBe "leaf-legacy"
+        cfg.scope shouldBe "leaf-only"
     }
 
     // ── End-to-end: smoke test, single demand single FG ───────────────────────
 
-    test("supply engine: single demand, single supply produces a committed plan") {
+    test("scope=all: single demand, single supply produces a committed plan") {
         val data = mapOf(
             "demand" to listOf(demand("D1", "FG", "L1", 10.0)),
             "bom" to listOf(bom("FG", "RM", rate = 1.0)),
@@ -76,7 +76,7 @@ class SupplyOrchestratorTest : FunSpec({
         val config = mapOf(
             "consolidation" to mapOf(
                 "enabled" to true,
-                "engine" to "supply",
+                "scope" to "all",
                 "allocation_mode" to "fair",
             ),
         )
@@ -96,7 +96,7 @@ class SupplyOrchestratorTest : FunSpec({
 
     // ── End-to-end: two demands sharing deep RM ──────────────────────────────
 
-    test("supply engine: two demands sharing a deep raw material — fair-allocate under shortage") {
+    test("scope=all: two demands sharing a deep raw material — fair-allocate under shortage") {
         // FG_A and FG_B both BOM down to RM. RM has 12; both demands need 10 each.
         // Fair under shortage → 6/6 split.
         val data = mapOf(
@@ -117,7 +117,7 @@ class SupplyOrchestratorTest : FunSpec({
         val config = mapOf(
             "consolidation" to mapOf(
                 "enabled" to true,
-                "engine" to "supply",
+                "scope" to "all",
                 "allocation_mode" to "fair",
             ),
         )
@@ -134,9 +134,9 @@ class SupplyOrchestratorTest : FunSpec({
         (totalConsumed <= 12.0 + 1e-6) shouldBe true
     }
 
-    // ── End-to-end: leaf vs supply engine on degenerate single-demand case ────
+    // ── End-to-end: leaf-only vs all on degenerate single-demand case ────
 
-    test("leaf vs supply: single demand single FG produces same committed qty") {
+    test("leaf-only vs all: single demand single FG produces same committed qty") {
         val data = mapOf(
             "demand" to listOf(demand("D1", "FG", "L1", 5.0)),
             "bom" to listOf(bom("FG", "RM", rate = 1.0)),
@@ -148,8 +148,8 @@ class SupplyOrchestratorTest : FunSpec({
         )
         val baseCfg = mapOf("enabled" to true, "allocation_mode" to "fair")
 
-        val leafResult = runPlanning(data, mapOf("consolidation" to baseCfg + ("engine" to "leaf-legacy")))
-        val supplyResult = runPlanning(data, mapOf("consolidation" to baseCfg + ("engine" to "supply")))
+        val leafResult = runPlanning(data, mapOf("consolidation" to baseCfg + ("scope" to "leaf-only")))
+        val supplyResult = runPlanning(data, mapOf("consolidation" to baseCfg + ("scope" to "all")))
 
         @Suppress("UNCHECKED_CAST")
         fun totalCommittedFG(r: Map<String, Any>): Double =
@@ -157,14 +157,14 @@ class SupplyOrchestratorTest : FunSpec({
                 .filter { it["product_id"] == "FG" }
                 .sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
 
-        // Both engines fully commit the demand on a degenerate single-demand fixture.
+        // Both scopes fully commit the demand on a degenerate single-demand fixture.
         totalCommittedFG(leafResult) shouldBe (5.0 plusOrMinus 1e-9)
         totalCommittedFG(supplyResult) shouldBe (5.0 plusOrMinus 1e-9)
     }
 
-    // ── Sanity: leaf engine still works (no regression from dispatch change) ──
+    // ── Sanity: leaf-only still reachable (no regression from dispatch change) ──
 
-    test("leaf engine still reachable with engine = leaf-legacy") {
+    test("leaf-only still reachable with scope = leaf-only") {
         val data = mapOf(
             "demand" to listOf(demand("D1", "FG", "L1", 5.0)),
             "bom" to listOf(bom("FG", "RM", rate = 1.0)),
@@ -177,7 +177,7 @@ class SupplyOrchestratorTest : FunSpec({
         val config = mapOf(
             "consolidation" to mapOf(
                 "enabled" to true,
-                "engine" to "leaf-legacy",
+                "scope" to "leaf-only",
                 "allocation_mode" to "fair",
             ),
         )
@@ -188,8 +188,8 @@ class SupplyOrchestratorTest : FunSpec({
         committed shouldHaveSize 1
     }
 
-    test("leaf engine is the default when engine is absent") {
-        // Older configs without an engine field continue to hit the leaf engine.
+    test("leaf-only is the default when scope is absent") {
+        // Older configs without a scope field continue to hit the leaf-only path.
         val data = mapOf(
             "demand" to listOf(demand("D1", "FG", "L1", 5.0)),
             "bom" to listOf(bom("FG", "RM", rate = 1.0)),
@@ -199,7 +199,9 @@ class SupplyOrchestratorTest : FunSpec({
             "supply" to listOf(supply("RM", "L1", 100.0, "S_RM")),
             "overrides" to emptyList<Map<String, Any?>>(),
         )
-        val config = mapOf("consolidation" to mapOf("enabled" to true))
+        val config = mapOf(
+            "consolidation" to mapOf("enabled" to true, "allocation_mode" to "fair"),
+        )
 
         val result = runPlanning(data, config)
         @Suppress("UNCHECKED_CAST")

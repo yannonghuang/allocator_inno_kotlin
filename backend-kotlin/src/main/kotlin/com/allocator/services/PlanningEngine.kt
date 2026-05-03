@@ -2404,11 +2404,13 @@ fun runPlanning(
     // the leaf engine (it expresses splitInfo via consolidated pegging entries instead).
     var supplyLevelAllocations: List<Map<String, Any?>> = emptyList()
     if (consolidationConfig.enabled) {
-        // Dispatch by configured engine. Default ("leaf-legacy") preserves the
-        // original v2 fixed-point pipeline; "supply" routes to the new supply-
-        // level orchestrator (see docs/supply-level-consolidation.md).
-        when (consolidationConfig.engine) {
-            "supply" -> {
+        // Dispatch by regulation scope. Default ("leaf-only") preserves the
+        // original v2 fixed-point pipeline (split policy at supply-bearing
+        // nodes only); "all" routes to the supply-level orchestrator that
+        // applies the policy at every make/move WO too — see
+        // docs/supply-level-consolidation.md.
+        when (consolidationConfig.scope) {
+            "all" -> {
                 val supply = runV2Supply(
                     demands, inventory, data, config, consolidationConfig, overrideIndex, progressCallback,
                 )

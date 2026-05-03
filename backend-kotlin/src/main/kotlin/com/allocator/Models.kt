@@ -112,6 +112,19 @@ data class PlanRunResponse(
      *  `bootstrap: true` + `preset_id` + `preset_label` + `primary_axis` +
      *  `signature` for KB-seeded runs; null for ordinary user-driven runs. */
     val metadata: JsonElement? = null,
+    // Inline KPI snapshot for the run-history sort/filter UI. Each is null
+    // when the run isn't success-status or KPIs weren't computed (contingent
+    // / failed / older runs). Source is plan_run.result -> plan_kpis subtree.
+    @SerialName("fill_rate_pct") val fillRatePct: Double? = null,
+    val gini: Double? = null,
+    @SerialName("p10_fill_ratio") val p10FillRatio: Double? = null,
+    @SerialName("median_fill_ratio") val medianFillRatio: Double? = null,
+    @SerialName("starvation_pct") val starvationPct: Double? = null,
+    @SerialName("on_time_count") val onTimeCount: Int? = null,
+    @SerialName("total_committed") val totalCommitted: Double? = null,
+    @SerialName("total_requested") val totalRequested: Double? = null,
+    @SerialName("manufacturing_total_quantity") val mfgTotalQty: Double? = null,
+    @SerialName("inventory_consumed_total") val invConsumedTotal: Double? = null,
 )
 
 @Serializable

@@ -6,18 +6,18 @@ import io.kotest.matchers.doubles.plusOrMinus
 import io.kotest.matchers.shouldBe
 
 /**
- * Side-by-side comparison harness — runs the leaf engine and the supply engine
+ * Side-by-side comparison harness — runs scope=leaf-only and scope=all
  * on the same fixture and asserts equivalence/improvement properties.
  *
  * This is the migration safety net (Phase H of supply-level consolidation).
  * Each scenario compares:
  *
  *   - **Total committed qty**: supply ≥ leaf  (no demand fulfillment regression)
- *   - **Supply consumption**: both engines respect supply caps  (no over-allocation)
+ *   - **Supply consumption**: both scopes respect supply caps  (no over-allocation)
  *   - **Output shape**: both produce a `committed_demands` list,
  *     `work_orders`, `planning_pegging`, `supply_allocations`
  *
- * Some scenarios additionally assert structural improvements the supply engine
+ * Some scenarios additionally assert structural improvements scope=all
  * is expected to deliver (fewer WOs via better consolidation, exact equality
  * of committed qty under abundance, etc.).
  *
@@ -45,10 +45,10 @@ class SupplyVsLeafEquivalenceTest : FunSpec({
         "priority" to priority,
     )
 
-    fun consConfig(engine: String, mode: String = "fair"): Map<String, Any?> = mapOf(
+    fun consConfig(scope: String, mode: String = "fair"): Map<String, Any?> = mapOf(
         "consolidation" to mapOf(
             "enabled" to true,
-            "engine" to engine,
+            "scope" to scope,
             "allocation_mode" to mode,
         ),
     )
@@ -77,7 +77,7 @@ class SupplyVsLeafEquivalenceTest : FunSpec({
 
     // ── Scenario 1: simple single demand, abundant supply ────────────────────
 
-    test("simple FG → RM, single demand: both engines fully commit") {
+    test("simple FG → RM, single demand: both scopes fully commit") {
         val data = mapOf(
             "demand" to listOf(demand("D1", "FG", "L1", 10.0)),
             "bom" to listOf(bom("FG", "RM", rate = 1.0)),
@@ -88,8 +88,8 @@ class SupplyVsLeafEquivalenceTest : FunSpec({
             "overrides" to emptyList<Map<String, Any?>>(),
         )
 
-        val leaf = runPlanning(data, consConfig("leaf-legacy"))
-        val supply = runPlanning(data, consConfig("supply"))
+        val leaf = runPlanning(data, consConfig("leaf-only"))
+        val supply = runPlanning(data, consConfig("all"))
 
         // Both fully commit the 10-unit demand.
         committedQty(leaf) shouldBe (10.0 plusOrMinus 1e-6)
@@ -102,7 +102,7 @@ class SupplyVsLeafEquivalenceTest : FunSpec({
 
     // ── Scenario 2: two demands sharing deep RM (the case-162 pattern) ───────
 
-    test("two demands sharing deep RM under abundance: both engines fully commit") {
+    test("two demands sharing deep RM under abundance: both scopes fully commit") {
         val data = mapOf(
             "demand" to listOf(
                 demand("D1", "FG_A", "L1", 10.0),
@@ -119,8 +119,8 @@ class SupplyVsLeafEquivalenceTest : FunSpec({
             "overrides" to emptyList<Map<String, Any?>>(),
         )
 
-        val leaf = runPlanning(data, consConfig("leaf-legacy"))
-        val supply = runPlanning(data, consConfig("supply"))
+        val leaf = runPlanning(data, consConfig("leaf-only"))
+        val supply = runPlanning(data, consConfig("all"))
 
         // Both fully satisfy 10 + 20 = 30 of FG.
         committedQty(leaf) shouldBe (30.0 plusOrMinus 1e-6)
@@ -130,11 +130,11 @@ class SupplyVsLeafEquivalenceTest : FunSpec({
         supplyConsumed(leaf, "S_RM") shouldBe (30.0 plusOrMinus 1e-6)
         supplyConsumed(supply, "S_RM") shouldBe (30.0 plusOrMinus 1e-6)
 
-        // Supply engine shouldn't emit MORE WOs than leaf (consolidation no worse).
+        // scope=all shouldn't emit MORE WOs than leaf (consolidation no worse).
         (woCount(supply) <= woCount(leaf) + 0).shouldBe(true)
     }
 
-    test("two demands sharing deep RM under shortage: both engines respect supply cap") {
+    test("two demands sharing deep RM under shortage: both scopes respect supply cap") {
         val data = mapOf(
             "demand" to listOf(
                 demand("D1", "FG_A", "L1", 10.0),
@@ -151,14 +151,14 @@ class SupplyVsLeafEquivalenceTest : FunSpec({
             "overrides" to emptyList<Map<String, Any?>>(),
         )
 
-        val leaf = runPlanning(data, consConfig("leaf-legacy", mode = "fair"))
-        val supply = runPlanning(data, consConfig("supply", mode = "fair"))
+        val leaf = runPlanning(data, consConfig("leaf-only", mode = "fair"))
+        val supply = runPlanning(data, consConfig("all", mode = "fair"))
 
-        // Both engines fully commit 12 of FG total (supply-limited, BOM rate 1:1).
+        // Both scopes fully commit 12 of FG total (supply-limited, BOM rate 1:1).
         committedQty(leaf) shouldBe (12.0 plusOrMinus 1e-6)
         committedQty(supply) shouldBe (12.0 plusOrMinus 1e-6)
 
-        // Both engines now correctly book 12 of S_RM as consumed. The earlier
+        // Both scopes now correctly book 12 of S_RM as consumed. The earlier
         // bookkeeping gap (per-demand pegging trees missing supply leaves
         // when budgetCap fires mid-make-recursion) was traced to plan()'s
         // first-pass exploratory call decrementing budget in-place, leaving
@@ -171,9 +171,9 @@ class SupplyVsLeafEquivalenceTest : FunSpec({
 
     // ── Scenario 3: alt-branch divergence ─────────────────────────────────────
 
-    test("alt branches with shared raw material under abundance: supply engine ≥ leaf for committed qty") {
+    test("alt branches with shared raw material under abundance: scope=all ≥ leaf for committed qty") {
         // FG → (B OR Bp) → RM. Both alts share the same downstream RM.
-        // Single demand can pick either alt at commit; both engines should
+        // Single demand can pick either alt at commit; both scopes should
         // fully commit since RM is abundant.
         val data = mapOf(
             "demand" to listOf(demand("D1", "FG", "L1", 10.0)),
@@ -190,10 +190,10 @@ class SupplyVsLeafEquivalenceTest : FunSpec({
             "overrides" to emptyList<Map<String, Any?>>(),
         )
 
-        val leaf = runPlanning(data, consConfig("leaf-legacy"))
-        val supply = runPlanning(data, consConfig("supply"))
+        val leaf = runPlanning(data, consConfig("leaf-only"))
+        val supply = runPlanning(data, consConfig("all"))
 
-        // Supply engine must not regress below leaf engine's commitment.
+        // scope=all must not regress below scope=leaf-only's commitment.
         (committedQty(supply) >= committedQty(leaf) - 1e-6).shouldBe(true)
         // Both should fully commit on this abundant fixture.
         committedQty(supply) shouldBe (10.0 plusOrMinus 1e-6)
@@ -215,7 +215,7 @@ class SupplyVsLeafEquivalenceTest : FunSpec({
             "overrides" to emptyList<Map<String, Any?>>(),
         )
 
-        val supply = runPlanning(data, consConfig("supply", mode = "priority_first"))
+        val supply = runPlanning(data, consConfig("all", mode = "priority_first"))
 
         // priority_first: D_hi gets first dibs (full 10), D_low gets the rest (2).
         @Suppress("UNCHECKED_CAST")
@@ -229,11 +229,11 @@ class SupplyVsLeafEquivalenceTest : FunSpec({
         lowQty shouldBe (2.0 plusOrMinus 1e-6)
     }
 
-    // ── Scenario 5: no consolidation (engine flag irrelevant) ────────────────
+    // ── Scenario 5: no consolidation (scope flag irrelevant) ────────────────
 
-    test("consolidation disabled: engine flag has no effect (both engines untouched)") {
-        // When consolidation.enabled = false, runPlanning skips both engines and
-        // calls legacyCommit directly. The engine flag should be ignored.
+    test("consolidation disabled: scope flag has no effect (both scopes untouched)") {
+        // When consolidation.enabled = false, runPlanning skips both scopes and
+        // calls legacyCommit directly. The scope flag should be ignored.
         val data = mapOf(
             "demand" to listOf(demand("D1", "FG", "L1", 10.0)),
             "bom" to listOf(bom("FG", "RM", rate = 1.0)),
@@ -247,16 +247,16 @@ class SupplyVsLeafEquivalenceTest : FunSpec({
         val noEngine = runPlanning(data, mapOf("consolidation" to mapOf("enabled" to false)))
         val withSupplyFlag = runPlanning(
             data,
-            mapOf("consolidation" to mapOf("enabled" to false, "engine" to "supply")),
+            mapOf("consolidation" to mapOf("enabled" to false, "scope" to "all")),
         )
 
         committedQty(noEngine) shouldBe committedQty(withSupplyFlag)
         woCount(noEngine) shouldBe woCount(withSupplyFlag)
     }
 
-    // ── Scenario 6: supply caps respected under both engines ─────────────────
+    // ── Scenario 6: supply caps respected under both scopes ─────────────────
 
-    test("supply consumption never exceeds supply qty under either engine") {
+    test("supply consumption never exceeds supply qty under either scope") {
         // Fan-out scenario: 5 demands sharing one limited RM.
         val supplies = listOf(supply("RM", "L1", 25.0, "S_RM"))
         val data = mapOf(
@@ -269,10 +269,10 @@ class SupplyVsLeafEquivalenceTest : FunSpec({
             "overrides" to emptyList<Map<String, Any?>>(),
         )
 
-        val leaf = runPlanning(data, consConfig("leaf-legacy", mode = "fair"))
-        val supply = runPlanning(data, consConfig("supply", mode = "fair"))
+        val leaf = runPlanning(data, consConfig("leaf-only", mode = "fair"))
+        val supply = runPlanning(data, consConfig("all", mode = "fair"))
 
-        // Both engines respect the 25-unit RM cap.
+        // Both scopes respect the 25-unit RM cap.
         (supplyConsumed(leaf, "S_RM") <= 25.0 + 1e-6).shouldBe(true)
         (supplyConsumed(supply, "S_RM") <= 25.0 + 1e-6).shouldBe(true)
     }

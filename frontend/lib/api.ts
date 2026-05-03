@@ -333,14 +333,14 @@ export type PlanningConfig = {
     /**
      * Regulation scope: where the allocation_mode split policy is applied.
      * UI labels: "Leaves only" / "All levels".
-     *   'leaf-legacy' — at supply-bearing nodes only (raw inventory, leftover
-     *                   stock, prior-round WOs). Make/move WOs generated this
-     *                   round run unconstrained.
-     *   'supply'      — at supply-bearing nodes AND every make/move WO
-     *                   generated this round. Buy WOs are unbounded either
-     *                   way. See docs/supply-level-consolidation.md.
+     *   'leaf-only' — at supply-bearing nodes only (raw inventory, leftover
+     *                 stock, prior-round WOs). Make/move WOs generated this
+     *                 round run unconstrained.
+     *   'all'       — at supply-bearing nodes AND every make/move WO
+     *                 generated this round. Buy WOs are unbounded either
+     *                 way. See docs/supply-level-consolidation.md.
      */
-    engine?: 'leaf-legacy' | 'supply';
+    scope?: 'leaf-only' | 'all';
   };
   /**
    * Post-plan UI behavior toggles. These do not affect planner output — they
@@ -362,11 +362,11 @@ export type PlanSupplyAllocation = {
 
 /**
  * Per-(supply_id) allocation record emitted by the supply-level consolidation
- * engine (Phase 2's per-supply policy split + Phase 3b compensation results).
+ * pipeline (Phase 2's per-supply policy split + Phase 3b compensation results).
  * Frontend reads this list (when present in the plan result) to populate the
- * supply-view chip + slide-in's per-supply allocation info under the supply
- * engine. Empty/absent under the leaf engine — its splitInfos come from
- * consolidated pegging entries instead.
+ * supply-view chip + slide-in's per-supply allocation info when scope=all.
+ * Empty/absent under scope=leaf-only — its splitInfos come from consolidated
+ * pegging entries instead.
  */
 export type SupplyLevelAllocation = {
   supply_id: string;
@@ -385,6 +385,10 @@ export type PlanResult = {
   planning_pegging: PlanningPeggingEntry[];
   supply_allocations?: PlanSupplyAllocation[];
   supply_level_allocations?: SupplyLevelAllocation[];
+  /** Headline KPIs computed by the planner. Already declared as `PlanKpis`
+   *  earlier in this file (see `getPlanKpis`); pulled in here so the chat
+   *  panel can read fill_rate_pct etc. when a pending plan completes. */
+  plan_kpis?: PlanKpis;
 };
 
 export async function runPlan(
@@ -542,6 +546,10 @@ export type PlanningAgentResponse = {
   steps: PlanningAgentStep[];
   config_update: PlanningConfig | null;
   fresh_run_id: number | null;
+  /** When run_plan_async returned 'still_running' (plan exceeded the 25s
+   *  blocking window), this carries the job_id so the chat panel can keep
+   *  polling and post a completion message itself. */
+  pending_job_id?: string | null;
 };
 
 export async function planningAgent(
@@ -562,6 +570,26 @@ export async function planningAgent(
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
+}
+
+export type ActivePlanJob = {
+  job_id: string;
+  status: string;
+  progress: { current: number; total: number };
+};
+
+/**
+ * Polled by the planning agent's chat panel while a `run_plan_async` call is
+ * in flight (the chat HTTP request is blocked inside the 60-second
+ * wait_for_plan window). Lets the chat surface live progress instead of a
+ * generic spinner. Returns an empty list when no plan jobs are running for
+ * this case.
+ */
+export async function listActivePlanJobs(caseId: number): Promise<ActivePlanJob[]> {
+  const r = await fetch(`${API}/cases/${caseId}/plan/active-jobs`);
+  if (!r.ok) throw new Error(await r.text());
+  const body = await r.json();
+  return (body?.jobs ?? []) as ActivePlanJob[];
 }
 
 export async function listOverrides(caseId: number): Promise<ManualOverride[]> {
@@ -618,6 +646,19 @@ export type PlanRun = {
   /** Free-form provenance — `{ bootstrap: true, preset_id, preset_label, ... }`
    *  for KB-seeded runs, undefined/null for user-driven. */
   metadata?: Record<string, unknown> | null;
+  // Inline KPI snapshot (from kb_records when present, else parsed from
+  // plan_run.result on the fly). Each is undefined when the run isn't
+  // success-status or KPIs weren't computed.
+  fill_rate_pct?: number;
+  gini?: number;
+  p10_fill_ratio?: number;
+  median_fill_ratio?: number;
+  starvation_pct?: number;
+  on_time_count?: number;
+  total_committed?: number;
+  total_requested?: number;
+  manufacturing_total_quantity?: number;
+  inventory_consumed_total?: number;
 };
 
 export type SoundnessViolation = {
@@ -1374,49 +1415,115 @@ export type BootstrapPreset = {
   preset_index: number;
   primary_axis: string;
   config: Record<string, unknown>;
-  // Present only on items in `already_run[]` — carries the matching
-  // plan_run's id + headline KPIs so the dialog can show coverage + offer
-  // delete inline.
+  /** Set on `next_batch[]` entries: this preset's config is already in the KB,
+   *  so submitting it unchanged will be skipped at the dedup step. The dialog
+   *  surfaces an "in KB" hint and offers Edit-config to make it unique. */
+  already_covered?: boolean;
+  // Present only on items in `already_run[]` — carries the KB record id (for
+  // delete) + the source plan_run pointer (may be deleted) + headline KPIs.
+  // KB rows are dissociated from plan_runs; the source link can be severed
+  // without losing this row.
+  kb_record_id?: number;
   plan_run_id?: number;
-  plan_run_status?: string;
+  source_plan_run_deleted?: boolean;
   soundness_status?: string;
   fill_rate_pct?: number;
+  gini?: number;
+  p10_fill_ratio?: number;
+  median_fill_ratio?: number;
+  starvation_pct?: number;
+  on_time_count?: number;
+  total_committed?: number;
+  total_requested?: number;
+  manufacturing_total_quantity?: number;
+  inventory_consumed_total?: number;
 };
 
 export type BootstrapPreview = {
   library_size: number;
   already_run_count: number;
   remaining_count: number;
+  /** Total KB rows on this case (library + user-driven). Backend addition;
+   *  may be undefined when talking to an older backend. */
+  kb_record_count?: number;
   batch_size: number;
   already_run: BootstrapPreset[];
   next_batch: BootstrapPreset[];
+  /** Axis-level metadata for the dialog's next-batch UI. One entry per
+   *  knob the user can vary off the baseline. */
+  axes?: BootstrapAxisSpec[];
+};
+
+export type BootstrapAxisSpec = {
+  /** Canonical knob id (matches the backend's switch in buildConfigForAxisValue). */
+  name: string;
+  /** Display label. */
+  label: string;
+  /** Short help text. */
+  description: string;
+  /** "int" | "bool" | "enum" — drives the input widget. */
+  value_type: 'int' | 'bool' | 'enum';
+  /** Populated for value_type='enum'. */
+  enum_values?: string[];
+  /** Value at the baseline — shown as a "varies from X" hint. */
+  baseline_value: unknown;
+  /** Suggested initial value when the user enables this axis (next-uncovered). */
+  default_seed: unknown;
+  /** Values the curated library enumerates (datalist suggestions). */
+  variations: unknown[];
+  /** Group id — axes in the same group share a collapsible header in the
+   *  dialog. Captures logical dependencies (e.g. consolidation cluster). */
+  group: string;
 };
 
 export type BootstrapStartResponse =
   | { status: 'library_exhausted'; library_size: number; message: string }
-  | { bootstrap_job_id: string; total: number; presets: BootstrapPreset[] };
+  | { status: 'all_already_covered'; library_size: number; message: string; skipped: BootstrapPreset[] }
+  | { bootstrap_job_id: string; total: number; presets: BootstrapPreset[]; skipped: BootstrapPreset[] };
 
 export type BootstrapJobStatus = {
-  status: 'running' | 'completed' | 'unknown';
+  status: 'running' | 'completed' | 'cancelled' | 'unknown';
   total: number;
   completed: number;
   current_preset_id: string;
   current_preset_label: string;
+  cancelled?: boolean;
   plan_run_ids: number[];
   errors: string[];
 };
 
-export async function getBootstrapPreview(caseId: number, batchSize = 5): Promise<BootstrapPreview> {
-  const r = await fetch(`${API}/cases/${caseId}/bootstrap?batch_size=${batchSize}`);
+/** "Best run" criterion that drives the suggestion seed in the KB dialog.
+ *  • fill_rate → seed = highest fill_rate_pct (tiebreak gini asc)
+ *  • fairness  → seed = lowest gini (tiebreak fill_rate desc)
+ *  • pareto    → seed = balanced winner: max (fill_rate_pct/100 - gini) */
+export type BootstrapCriterion = 'fill_rate' | 'fairness' | 'pareto';
+
+export async function getBootstrapPreview(
+  caseId: number,
+  batchSize = 5,
+  criterion: BootstrapCriterion = 'fill_rate',
+): Promise<BootstrapPreview> {
+  const r = await fetch(`${API}/cases/${caseId}/bootstrap?batch_size=${batchSize}&criterion=${criterion}`);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
 
-export async function startBootstrap(caseId: number, batchSize = 5): Promise<BootstrapStartResponse> {
+/** Start a KB expansion batch.
+ *  When `presets` is provided, those override the system's selectNextBatch —
+ *  use this when the user has reviewed/edited the suggested configs in the
+ *  KB dialog. Each entry needs preset_id, preset_label, primary_axis, config.
+ *  When omitted, the server picks the next round-robin batch from the library. */
+export async function startBootstrap(
+  caseId: number,
+  batchSize = 5,
+  presets?: Array<Pick<BootstrapPreset, 'preset_id' | 'preset_label' | 'primary_axis' | 'config'>>,
+): Promise<BootstrapStartResponse> {
+  const body: Record<string, unknown> = { batch_size: batchSize };
+  if (presets && presets.length > 0) body.presets = presets;
   const r = await fetch(`${API}/cases/${caseId}/bootstrap`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ batch_size: batchSize }),
+    body: JSON.stringify(body),
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
@@ -1426,4 +1533,17 @@ export async function getBootstrapJobStatus(caseId: number, jobId: string): Prom
   const r = await fetch(`${API}/cases/${caseId}/bootstrap/status/${jobId}`);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
+}
+
+/** Interrupt a running KB expansion job. Cooperative — the currently running
+ *  preset finishes; subsequent presets are skipped. Job ends in status=cancelled. */
+export async function cancelBootstrap(caseId: number, jobId: string): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/bootstrap/cancel/${jobId}`, { method: 'POST' });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+/** Delete a KB record. Does NOT touch the source plan_run (KB is dissociated). */
+export async function deleteKbRecord(caseId: number, recordId: number): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/kb-records/${recordId}`, { method: 'DELETE' });
+  if (!r.ok) throw new Error(await r.text());
 }

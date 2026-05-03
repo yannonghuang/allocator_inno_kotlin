@@ -26,7 +26,11 @@ import {
   getPlanStatus,
   planningCopilot,
   planningAgent,
+  listActivePlanJobs,
+  type ActivePlanJob,
   listPlanRuns,
+  // Post-response polling: chat reuses getPlanStatus to track plans that
+  // exceeded the agent's 25s blocking window.
   getPlanRun,
   deletePlanRun,
   type PlanRun,
@@ -83,8 +87,12 @@ import {
   getBootstrapPreview,
   startBootstrap,
   getBootstrapJobStatus,
+  cancelBootstrap,
+  deleteKbRecord,
+  type BootstrapPreset,
   type BootstrapPreview,
   type BootstrapJobStatus,
+  type BootstrapCriterion,
 } from '@/lib/api';
 import { computeHorizon, ScheduleBar, ScheduleHorizonRuler } from './_workOrderSchedule';
 
@@ -926,7 +934,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [woPeggingRowKey, setWoPeggingRowKey] = useState<string | null>(null);
   const [bomRealPairs, setBomRealPairs] = useState<[string, string][] | null>(null);
   const [realMoveTriples, setRealMoveTriples] = useState<[string, string, string][] | null>(null);
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', engine: 'leaf-legacy' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', scope: 'leaf-only' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -934,6 +942,18 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [copilotMessages, setCopilotMessages] = useState<PlanningCopilotMessage[]>([]);
   const [copilotInput, setCopilotInput] = useState('');
   const [copilotLoading, setCopilotLoading] = useState(false);
+  // Live progress for an in-flight plan started by the agent. Two polling
+  // modes feed this state:
+  //   1. While a chat HTTP request is in flight (copilotLoading=true), we
+  //      poll /cases/{id}/plan/active-jobs every 1.5s.
+  //   2. After the chat response returned with `pending_job_id` (plan
+  //      exceeded the agent's 25s blocking window), we poll
+  //      /cases/{id}/plan/status/{jobId} every 1.5s until the plan finishes,
+  //      then append a synthetic completion assistant message.
+  // Mode 2 lets the user keep chatting (or just walk away) while the plan
+  // continues — they no longer have to re-prompt to see the result.
+  const [copilotActiveJob, setCopilotActiveJob] = useState<ActivePlanJob | null>(null);
+  const [copilotPendingJobId, setCopilotPendingJobId] = useState<string | null>(null);
   const [copilotPanelWidth, setCopilotPanelWidth] = useState(440);
   const copilotResizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [copilotResizing, setCopilotResizing] = useState(false);
@@ -955,6 +975,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
 
   // ── Plan run history state ──────────────────────────────────────────────────
   const [planRunHistory, setPlanRunHistory] = useState<PlanRun[]>([]);
+  // Sort + filter for the run-history slide-in. Mirrors the KB workspace:
+  // null sort = default (created_at desc, as returned by the backend).
+  const [planRunHistorySort, setPlanRunHistorySort] = useState<{ key: string; dir: 'asc' | 'desc' } | null>(null);
+  const [planRunHistorySoundOnly, setPlanRunHistorySoundOnly] = useState(false);
   const currentRunIsContingent = currentPlanRunId != null &&
     planRunHistory.find(r => r.id === currentPlanRunId)?.status === 'contingent';
   const [planRunHistoryOpen, setPlanRunHistoryOpen] = useState(false);
@@ -966,8 +990,28 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [bootstrapStarting, setBootstrapStarting] = useState(false);
   const [bootstrapJobId, setBootstrapJobId] = useState<string | null>(null);
   const [bootstrapJobStatus, setBootstrapJobStatus] = useState<BootstrapJobStatus | null>(null);
+  const [bootstrapCancelling, setBootstrapCancelling] = useState(false);
+  // Notice surfaced when the start endpoint dropped some submitted presets
+  // because their config signature is already covered in the KB. Cleared
+  // when the dialog reopens or the user dismisses.
+  const [bootstrapSkippedNotice, setBootstrapSkippedNotice] = useState<BootstrapPreset[] | null>(null);
   const bootstrapPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [bootstrapExpandedPresets, setBootstrapExpandedPresets] = useState<Set<string>>(new Set());
+  // KB-inspector sort state. `key` matches a BootstrapPreset KPI field name;
+  // null = no sort (preserve backend / library order).
+  const [bootstrapKbSort, setBootstrapKbSort] = useState<{ key: string; dir: 'asc' | 'desc' } | null>(null);
+  const [bootstrapKbSoundOnly, setBootstrapKbSoundOnly] = useState(false);
+  // Which "best run" criterion drives the suggestion seed. Default fill_rate;
+  // user can switch to fairness (lowest gini) or pareto (balanced score).
+  const [bootstrapCriterion, setBootstrapCriterion] = useState<BootstrapCriterion>('fill_rate');
+  // Per-row config overrides. The backend suggests N single-knob variations
+  // around the best KB run; users can alter any row's config via the
+  // planning-page-style mini-form (max_methods dropdown, mode toggle, etc.)
+  // before submitting. Empty = use system suggestion as-is. Edits get
+  // re-dedup'd against KB on save.
+  const [bootstrapEditedConfigs, setBootstrapEditedConfigs] = useState<Record<string, Record<string, unknown>>>({});
+  // Set of preset_ids whose row is expanded to show the edit form.
+  const [bootstrapEditingRows, setBootstrapEditingRows] = useState<Set<string>>(new Set());
   const toggleBootstrapPresetExpanded = (presetId: string) => {
     setBootstrapExpandedPresets((prev) => {
       const next = new Set(prev);
@@ -986,29 +1030,110 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     const sw = (ms.score_weights ?? {}) as Record<string, number>;
     const diffs: string[] = [];
     if (ms.mode !== 'preference') diffs.push(`mode: preference → ${ms.mode}`);
-    if (Number(ms.max_methods) !== 2) diffs.push(`max_methods: 2 → ${ms.max_methods}`);
+    if (Number(ms.max_methods) !== 1) diffs.push(`max_methods: 1 → ${ms.max_methods}`);
     if (Number(ms.depth) !== 1) diffs.push(`depth: 1 → ${ms.depth}`);
     if (Number(sw.commit_time) !== 0.4 || Number(sw.inventory_consumed) !== 0.35 || Number(sw.purchase) !== 0.25) {
       diffs.push(`weights: (${sw.commit_time}, ${sw.inventory_consumed}, ${sw.purchase})`);
     }
-    if (cs.engine !== 'leaf-legacy') diffs.push(`engine: leaf-legacy → ${cs.engine}`);
+    if (cs.scope !== 'leaf-only') diffs.push(`scope: leaf-only → ${cs.scope}`);
     if (cs.allocation_mode !== 'fair') diffs.push(`allocation_mode: fair → ${cs.allocation_mode}`);
     if (cs.enabled === false) diffs.push(`consolidation: on → off`);
     if (Number(cs.period_days) !== 0) diffs.push(`period_days: 0 → ${cs.period_days}`);
     if (config.purchase_allowed === true) diffs.push(`purchase: off → on`);
     return diffs.join(' · ');
   };
-  const handleDeleteCoveredRun = async (planRunId: number) => {
+  /**
+   * Self-describing summary of a config — always emits the same set of axes,
+   * regardless of any baseline. Used in the KB / Already-covered list, where
+   * rows are heterogeneous (library + user-driven) and a baseline-relative
+   * diff would be misleading. Storage in kb_records is the full JSON; this
+   * function is purely presentation.
+   */
+  const presetConfigSummary = (config: Record<string, unknown>): string => {
+    const ms = (config.method_selection ?? {}) as Record<string, unknown>;
+    const cs = (config.consolidation ?? {}) as Record<string, unknown>;
+    const sw = (ms.score_weights ?? {}) as Record<string, number>;
+    const parts: string[] = [];
+    parts.push(`m=${ms.mode ?? 'preference'}`);
+    parts.push(`max=${ms.max_methods ?? 2}`);
+    parts.push(`d=${ms.depth ?? 1}`);
+    if (sw && (sw.commit_time != null || sw.inventory_consumed != null || sw.purchase != null)) {
+      parts.push(`w=(${Number(sw.commit_time ?? 0)}, ${Number(sw.inventory_consumed ?? 0)}, ${Number(sw.purchase ?? 0)})`);
+    }
+    parts.push(`scope=${cs.scope ?? 'leaf-only'}`);
+    parts.push(`alloc=${cs.allocation_mode ?? 'fair'}`);
+    parts.push(`cons=${cs.enabled === false ? 'off' : 'on'}`);
+    if (Number(cs.period_days ?? 0) !== 0) parts.push(`p=${cs.period_days}`);
+    parts.push(`purch=${config.purchase_allowed === true ? 'on' : 'off'}`);
+    return parts.join(' · ');
+  };
+  /** Canonical baseline config (mirrors the Kotlin cfg() defaults). */
+  const makeBaselineConfig = (): Record<string, unknown> => ({
+    method_selection: {
+      mode: 'preference',
+      depth: 1,
+      multiple: false,
+      elaborate: false,
+      max_methods: 1,
+      depth_optimal: false,
+      score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 },
+    },
+    consolidation: {
+      enabled: true,
+      period_days: 0,
+      allocation_mode: 'fair',
+      scope: 'leaf-only',
+    },
+    variant_selection: { multiple: true },
+    purchase_allowed: false,
+    analyze_criticality: false,
+    check_soundness: true,
+  });
+  /** Build a full PlanningConfig from baseline + a single axis-value override.
+   *  Mirrors the Kotlin buildConfigForAxisValue. The axis names must match
+   *  the backend's AXIS_CATALOG entries. */
+  const buildConfigFromAxisValue = (axisName: string, value: unknown): Record<string, unknown> => {
+    const cfg = makeBaselineConfig();
+    const ms = cfg.method_selection as Record<string, unknown>;
+    const cs = cfg.consolidation as Record<string, unknown>;
+    switch (axisName) {
+      case 'max_methods':         ms.max_methods = value; break;
+      case 'depth':               ms.depth = value; break;
+      case 'scope':               cs.scope = value; break;
+      case 'allocation_mode':     cs.allocation_mode = value; break;
+      case 'consolidation_enabled': cs.enabled = value; break;
+      case 'period_days':         cs.period_days = value; break;
+      case 'purchase_allowed':    cfg.purchase_allowed = value; break;
+      case 'mode':
+        ms.mode = value;
+        ms.elaborate = value === 'elaborate';
+        break;
+      // Compound axis: scoring profile implies mode=elaborate + a weight triple.
+      case 'score_weights': {
+        ms.mode = 'elaborate';
+        ms.elaborate = true;
+        const profile = String(value);
+        const weights: Record<string, number> =
+          profile === 'commit'    ? { commit_time: 1, inventory_consumed: 0, purchase: 0 } :
+          profile === 'inventory' ? { commit_time: 0, inventory_consumed: 1, purchase: 0 } :
+          profile === 'purchase'  ? { commit_time: 0, inventory_consumed: 0, purchase: 1 } :
+                                     { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 }; // balanced
+        ms.score_weights = weights;
+        break;
+      }
+    }
+    return cfg;
+  };
+  const handleDeleteKbRecord = async (recordId: number) => {
     if (!id) return;
     try {
-      await deletePlanRun(id, planRunId);
-      // Refresh preview so the deleted run drops out of "already covered".
-      const preview = await getBootstrapPreview(id, bootstrapBatchSize);
+      await deleteKbRecord(id, recordId);
+      // Refresh preview so the deleted KB row drops out of "already covered".
+      // The underlying plan_run (if any) is untouched — KB is dissociated.
+      const preview = await getBootstrapPreview(id, bootstrapBatchSize, bootstrapCriterion);
       setBootstrapPreview(preview);
-      // Run history may also be open; refresh it too.
-      loadPlanRunHistory();
     } catch (e) {
-      console.error('Failed to delete covered run', e);
+      console.error('Failed to delete KB record', e);
     }
   };
   const [planRunHistoryLoading, setPlanRunHistoryLoading] = useState(false);
@@ -1061,6 +1186,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planRunHistoryPanelWidth, setPlanRunHistoryPanelWidth] = useState(520);
   const planRunHistoryResizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [planRunHistoryResizing, setPlanRunHistoryResizing] = useState(false);
+  // KB slide-in panel resize state (mirrors planRunHistory).
+  const [bootstrapPanelWidth, setBootstrapPanelWidth] = useState(720);
+  const bootstrapResizeRef = useRef<{ startX: number; startW: number } | null>(null);
+  const [bootstrapResizing, setBootstrapResizing] = useState(false);
 
   /** Rule-based intent: map user message to config updates and a reply for method selection and consolidation. */
   function parseCopilotIntent(message: string, currentConfig: PlanningConfig): { reply: string; configUpdate?: PlanningConfig } {
@@ -1259,7 +1388,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (/reset|default|clear|重置|默认|清除/.test(t)) {
       return {
         reply: tP('copilot.replies.reset'),
-        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, depth_optimal: false, max_methods: 2, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', engine: 'leaf-legacy' }, analyze_criticality: false, check_soundness: true },
+        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, depth_optimal: false, max_methods: 2, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', scope: 'leaf-only' }, analyze_criticality: false, check_soundness: true },
       };
     }
 
@@ -1271,6 +1400,171 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   useEffect(() => {
     copilotMessagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [copilotMessages]);
+
+  // Persist chat history per case in localStorage so the conversation
+  // survives navigating between pages or reopening the case. Capped at 100
+  // messages to keep the storage entry small. The pending_job_id flow is
+  // intentionally NOT persisted — if the user navigates away while a plan
+  // is in flight, the in-flight tracking dies with the page; the user can
+  // still inspect the saved run in the run-history list when they return.
+  const COPILOT_HISTORY_LIMIT = 100;
+  const copilotHistoryKey = (caseId: number) => `chat-history-${caseId}`;
+  // Hydrate on case load. Reset to an empty list if storage has nothing for
+  // this case (each case has its own conversation).
+  useEffect(() => {
+    if (!Number.isFinite(id)) return;
+    try {
+      const raw = window.localStorage.getItem(copilotHistoryKey(id));
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) setCopilotMessages(parsed as PlanningCopilotMessage[]);
+        else setCopilotMessages([]);
+      } else {
+        setCopilotMessages([]);
+      }
+    } catch {
+      setCopilotMessages([]);
+    }
+  }, [id]);
+  // Persist on every change. Trim to the most recent COPILOT_HISTORY_LIMIT
+  // entries before writing — long conversations otherwise grow without bound.
+  useEffect(() => {
+    if (!Number.isFinite(id)) return;
+    try {
+      const trimmed = copilotMessages.length > COPILOT_HISTORY_LIMIT
+        ? copilotMessages.slice(-COPILOT_HISTORY_LIMIT)
+        : copilotMessages;
+      window.localStorage.setItem(copilotHistoryKey(id), JSON.stringify(trimmed));
+    } catch {
+      /* localStorage might be full or disabled — silently skip */
+    }
+  }, [copilotMessages, id]);
+
+  // Mode 1 — in-flight chat: poll /plan/active-jobs every 1.5s. The first
+  // running job (matching this case) drives the inline progress bar.
+  useEffect(() => {
+    if (!copilotLoading || id == null) {
+      // Don't blank the bar if mode 2 is about to take over — clearing only
+      // happens explicitly when the pending job completes / fails.
+      if (!copilotPendingJobId) setCopilotActiveJob(null);
+      return;
+    }
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const jobs = await listActivePlanJobs(id);
+        if (cancelled) return;
+        // Pick the most-progressed running job (heuristic: highest current).
+        const best = jobs.reduce<ActivePlanJob | null>((acc, j) => {
+          if (!acc) return j;
+          return (j.progress.current ?? 0) > (acc.progress.current ?? 0) ? j : acc;
+        }, null);
+        setCopilotActiveJob(best);
+      } catch {
+        /* ignore polling failures — they're transient */
+      }
+    };
+    tick();
+    const handle = setInterval(tick, 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(handle);
+    };
+  }, [copilotLoading, id, copilotPendingJobId]);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Mode 2 — post-response tracking: when the agent handed back a
+  // pending_job_id (plan exceeded the 25s blocking window), keep polling
+  // /plan/status/{jobId} until the plan finishes. On completion, append a
+  // synthetic "✓ Plan run N completed" assistant message and refresh the
+  // run-history list. On failure, append a "⚠ Plan failed" message. Mode 1
+  // skips clearing copilotActiveJob while mode 2 is active so the progress
+  // bar stays visible across new chat turns.
+  useEffect(() => {
+    if (!copilotPendingJobId || id == null) return;
+    if (copilotLoading) return; // mode 1 owns the bar while a chat is in flight
+    let cancelled = false;
+    const jobId = copilotPendingJobId;
+    const tick = async () => {
+      try {
+        const status = await getPlanStatus(id, jobId);
+        if (cancelled) return;
+        const progress = status.progress;
+        if (progress) {
+          setCopilotActiveJob({
+            job_id: jobId,
+            status: status.status,
+            progress: { current: progress.current, total: progress.total },
+          });
+        }
+        if (status.status === 'completed') {
+          const delivery = status.result?.plan_kpis?.delivery;
+          const fillPct = delivery?.fill_rate_pct;
+          const tc = delivery?.total_committed;
+          const tr = delivery?.total_requested;
+          const planRunId = status.plan_run_id;
+          const summary = (planRunId != null && fillPct != null && tc != null && tr != null)
+            ? tP('copilot.planCompleted', {
+                runId: planRunId,
+                fillPct: fillPct.toFixed(2),
+                committed: tc.toLocaleString(),
+                requested: tr.toLocaleString(),
+              })
+            : tP('copilot.planCompletedNoKpis', { runId: planRunId ?? '?' });
+          setCopilotMessages((prev) => [...prev, { role: 'assistant', text: summary }]);
+          // Chat-driven runs are auto-saved server-side (runPlanBackground
+          // with autoSave=true persists the result, promotes to 'success',
+          // and seeds the KB). All we need to do here is fetch the persisted
+          // row (canonicalised config, resolved depth) and load it into the
+          // result panel — same shape as handleRestorePlanRun.
+          if (planRunId != null) {
+            (async () => {
+              try {
+                const full = await getPlanRun(id, planRunId);
+                if (full.result) setPlanResult(full.result as typeof planResult);
+                setCurrentPlanRunId(planRunId);
+                setFreshPlanRunId(planRunId);
+                setOverrideCandidateRunId(null);
+                setPlanRunSaveError(null);
+                setPlanWorkOrderPeggingCache({});
+                if (full.config) {
+                  const cfg = full.config as PlanningConfig;
+                  const chosen = full.chosen_depth ?? null;
+                  setPlanningConfig({
+                    ...cfg,
+                    method_selection: {
+                      ...cfg.method_selection,
+                      depth: chosen ?? cfg.method_selection?.depth ?? 1,
+                      depth_optimal: false,
+                    },
+                  });
+                }
+                listPlanRuns(id).then(setPlanRunHistory).catch(() => { /* ignore */ });
+              } catch {
+                // Fall back to the in-memory result so the panel isn't blank.
+                if (status.result) setPlanResult(status.result as typeof planResult);
+                listPlanRuns(id).then(setPlanRunHistory).catch(() => { /* ignore */ });
+              }
+            })();
+          }
+          setCopilotPendingJobId(null);
+          setCopilotActiveJob(null);
+        } else if (status.status === 'failed') {
+          const summary = tP('copilot.planFailed', { error: status.error ?? 'unknown' });
+          setCopilotMessages((prev) => [...prev, { role: 'assistant', text: summary }]);
+          setCopilotPendingJobId(null);
+          setCopilotActiveJob(null);
+        }
+      } catch {
+        /* transient */
+      }
+    };
+    tick();
+    const handle = setInterval(tick, 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(handle);
+    };
+  }, [copilotPendingJobId, id, copilotLoading]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!planJobId || id == null) return;
@@ -1968,6 +2262,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
   }, [planRunHistoryResizing]);
 
+  useEffect(() => {
+    if (!bootstrapResizing) return;
+    const onMove = (e: MouseEvent) => {
+      const r = bootstrapResizeRef.current;
+      if (!r) return;
+      setBootstrapPanelWidth(Math.min(window.innerWidth * 0.95, Math.max(420, r.startW + (r.startX - e.clientX))));
+    };
+    const onUp = () => { bootstrapResizeRef.current = null; setBootstrapResizing(false); window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+  }, [bootstrapResizing]);
+
   // Defer tree building so first paint shows counts and "Building tree…" instead of blocking on huge graph
   useEffect(() => {
     if (!peggingData) {
@@ -2427,12 +2734,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       });
     }
 
-    // Supply-engine path: when planResult carries supply_level_allocations,
+    // scope=all path: when planResult carries supply_level_allocations,
     // each record is a per-supply_id allocation summary that becomes its own
     // SupplySplitInfo entry. Multiple records for the same supply (different
     // groupKeys) are deduped by groupProductId|groupLocationId, just like the
-    // leaf-engine path above. The leaf engine emits an empty list here, so
-    // this loop is a no-op under it.
+    // scope=leaf-only path above. scope=leaf-only emits an empty list here,
+    // so this loop is a no-op under it.
     for (const rec of planResult.supply_level_allocations ?? []) {
       const info: SupplySplitInfo = {
         mode: rec.mode,
@@ -2505,10 +2812,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       // skipped: their consumption of this supply is direct, not via any merged group.
     }
 
-    // Supply-engine path: every demand allocated at a supply is bound to that
-    // supply's group label. No "direct" semantics under the supply engine —
-    // every consumption goes through supply-level allocation. Empty/absent
-    // under the leaf engine, so this loop is a no-op there.
+    // scope=all path: every demand allocated at a supply is bound to that
+    // supply's group label. No "direct" semantics under scope=all — every
+    // consumption goes through supply-level allocation. Empty/absent under
+    // scope=leaf-only, so this loop is a no-op there.
     for (const rec of planResult.supply_level_allocations ?? []) {
       const label = `${rec.group_product_id}@${rec.group_location_id}`;
       for (const did of Object.keys(rec.per_demand_allocations)) {
@@ -2862,8 +3169,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (!id) return;
     setBootstrapDialogOpen(true);
     setBootstrapPreviewLoading(true);
+    setBootstrapSkippedNotice(null);
     try {
-      const preview = await getBootstrapPreview(id, bootstrapBatchSize);
+      const preview = await getBootstrapPreview(id, bootstrapBatchSize, bootstrapCriterion);
       setBootstrapPreview(preview);
     } catch {
       setBootstrapPreview(null);
@@ -2879,24 +3187,45 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     let cancelled = false;
     (async () => {
       try {
-        const preview = await getBootstrapPreview(id, bootstrapBatchSize);
+        const preview = await getBootstrapPreview(id, bootstrapBatchSize, bootstrapCriterion);
         if (!cancelled) setBootstrapPreview(preview);
       } catch { /* keep prior preview */ }
     })();
     return () => { cancelled = true; };
-  }, [bootstrapBatchSize, bootstrapDialogOpen, id]);
+  }, [bootstrapBatchSize, bootstrapCriterion, bootstrapDialogOpen, id]);
 
   const handleStartBootstrap = async () => {
     if (!id) return;
     setBootstrapStarting(true);
     try {
-      const r = await startBootstrap(id, bootstrapBatchSize);
+      // Build presets[] from the dialog's next_batch suggestions, applying
+      // any per-row edits the user has made. When no edits exist, omit the
+      // override so the backend re-runs selectNextBatch fresh.
+      const hasEdits = Object.keys(bootstrapEditedConfigs).length > 0;
+      const customPresets = hasEdits && bootstrapPreview
+        ? bootstrapPreview.next_batch.map((p) => ({
+            preset_id: p.preset_id,
+            preset_label: p.preset_label,
+            primary_axis: p.primary_axis,
+            config: bootstrapEditedConfigs[p.preset_id] ?? p.config,
+          }))
+        : undefined;
+      const r = await startBootstrap(id, bootstrapBatchSize, customPresets);
       if ('status' in r) {
-        // library_exhausted; refresh the preview so the dialog shows the
-        // exhausted message until the user dismisses.
-        const preview = await getBootstrapPreview(id, bootstrapBatchSize);
+        // Either library_exhausted or all submitted presets matched existing
+        // KB entries. Refresh the preview so the dialog shows the appropriate
+        // message; surface the skipped list if present.
+        if (r.status === 'all_already_covered' && r.skipped.length > 0) {
+          setBootstrapSkippedNotice(r.skipped);
+        }
+        const preview = await getBootstrapPreview(id, bootstrapBatchSize, bootstrapCriterion);
         setBootstrapPreview(preview);
         return;
+      }
+      // Partial dedup: some submitted presets ran, some were skipped. Show
+      // a notice so the user knows their batch was trimmed.
+      if (r.skipped && r.skipped.length > 0) {
+        setBootstrapSkippedNotice(r.skipped);
       }
       setBootstrapJobId(r.bootstrap_job_id);
       // Seed status immediately so the progress block can render before the
@@ -2910,10 +3239,25 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         plan_run_ids: [],
         errors: [],
       });
+      // Edits have been submitted — clear local override state so the next
+      // dialog open shows fresh system suggestions.
+      setBootstrapEditedConfigs({});
+      setBootstrapEditingRows(new Set());
     } catch (e) {
       console.error('Bootstrap start failed', e);
     } finally {
       setBootstrapStarting(false);
+    }
+  };
+  const handleCancelBootstrap = async () => {
+    if (!id || !bootstrapJobId) return;
+    setBootstrapCancelling(true);
+    try {
+      await cancelBootstrap(id, bootstrapJobId);
+      // The polling loop will pick up the new status; no need to setBootstrapJobStatus here.
+    } catch (e) {
+      console.error('Bootstrap cancel failed', e);
+      setBootstrapCancelling(false);
     }
   };
 
@@ -2925,10 +3269,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       try {
         const status = await getBootstrapJobStatus(id, bootstrapJobId);
         setBootstrapJobStatus(status);
-        if (status.status === 'completed') {
+        if (status.status === 'completed' || status.status === 'cancelled') {
           if (bootstrapPollRef.current) { clearInterval(bootstrapPollRef.current); bootstrapPollRef.current = null; }
-          // Refresh the preview + run history now that new runs exist.
-          getBootstrapPreview(id, bootstrapBatchSize).then(setBootstrapPreview).catch(() => {});
+          setBootstrapCancelling(false);
+          // Refresh the preview + run history now that new runs exist (some
+          // presets may have completed even on a cancelled run).
+          getBootstrapPreview(id, bootstrapBatchSize, bootstrapCriterion).then(setBootstrapPreview).catch(() => {});
           loadPlanRunHistory();
         }
       } catch { /* keep polling on transient errors */ }
@@ -3998,16 +4344,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               <span style={{ color: '#a1a1aa' }}>{tP('config.regulationScope')}</span>
               <select
                 disabled={planningConfig.consolidation?.enabled !== true}
-                value={planningConfig.consolidation?.engine ?? 'leaf-legacy'}
+                value={planningConfig.consolidation?.scope ?? 'leaf-only'}
                 onChange={(e) => setPlanningConfig((c) => ({
                   ...c,
-                  consolidation: { ...c.consolidation, engine: e.target.value as 'leaf-legacy' | 'supply' },
+                  consolidation: { ...c.consolidation, scope: e.target.value as 'leaf-only' | 'all' },
                 }))}
                 style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
                 title={tP('config.scopeTooltip')}
               >
-                <option value="leaf-legacy">{tP('config.scopeLeavesOnly')}</option>
-                <option value="supply">{tP('config.scopeAllLevels')}</option>
+                <option value="leaf-only">{tP('config.scopeLeavesOnly')}</option>
+                <option value="all">{tP('config.scopeAllLevels')}</option>
               </select>
             </label>
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
@@ -4079,7 +4425,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 },
               },
               purchase_allowed: false,
-              consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', engine: 'leaf-legacy' },
+              consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', scope: 'leaf-only' },
             })}
             title={tP('config.resetDefaultsTitle')}
             style={{ padding: '6px 12px' }}
@@ -6440,27 +6786,36 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         })}
       </section>
       )}
-      {/* ── Plan run history slide-in ──────────────────────────────────────────── */}
+      {/* ── Knowledge Base slide-in ────────────────────────────────────────────── */}
       {bootstrapDialogOpen && typeof document !== 'undefined' && createPortal(
         <div
-          style={{
-            position: 'fixed', inset: 0, zIndex: 9997, display: 'flex',
-            alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.55)',
-          }}
+          style={{ position: 'fixed', inset: 0, zIndex: 9997, display: 'flex', justifyContent: 'flex-end' }}
           role="dialog"
           aria-label={tP('bootstrap.title')}
-          onClick={closeBootstrapDialog}
         >
           <div
-            onClick={(e) => e.stopPropagation()}
+            style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)' }}
+            onClick={closeBootstrapDialog}
+            aria-hidden
+          />
+          <div
             style={{
-              background: '#1c1c1e', color: '#e4e4e7', borderRadius: 8,
-              padding: '1.25rem 1.5rem', width: 560, maxWidth: '92vw',
-              maxHeight: '90vh', overflowY: 'auto',
-              boxShadow: '0 20px 60px rgba(0,0,0,0.6)',
-              border: '1px solid #3d3d40',
+              position: 'relative', zIndex: 10,
+              width: bootstrapPanelWidth, maxWidth: '95vw', height: '100vh',
+              display: 'flex', flexDirection: 'column',
+              background: '#1c1c1e', color: '#e4e4e7',
+              boxShadow: '-4px 0 24px rgba(0,0,0,0.4)',
+              padding: '1.25rem 1.5rem',
+              overflowY: 'auto',
             }}
           >
+            {/* Resize handle */}
+            <div
+              role="separator"
+              aria-label="Resize panel"
+              onMouseDown={(e) => { e.preventDefault(); bootstrapResizeRef.current = { startX: e.clientX, startW: bootstrapPanelWidth }; setBootstrapResizing(true); }}
+              style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: 6, cursor: 'col-resize', zIndex: 11 }}
+            />
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
               <h3 style={{ margin: 0, color: '#fafafa' }}>{tP('bootstrap.title')}</h3>
               <button type="button" onClick={closeBootstrapDialog}
@@ -6473,35 +6828,108 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             </p>
 
             {/* Progress block (visible while a bootstrap job is running) */}
-            {bootstrapJobStatus && (
-              <div style={{ marginBottom: '0.75rem', padding: '0.6rem 0.75rem', background: '#0c1f3a', border: '1px solid #1d4ed8', borderRadius: 6 }}>
-                <div style={{ fontWeight: 600, color: '#93c5fd', fontSize: '0.85rem', marginBottom: '0.25rem' }}>
-                  {tP('bootstrap.progressTitle')}
+            {bootstrapJobStatus && (() => {
+              const total = bootstrapJobStatus.total;
+              const completed = bootstrapJobStatus.completed;
+              const pct = total > 0 ? (completed / total) * 100 : 0;
+              const isCancelled = bootstrapJobStatus.status === 'cancelled';
+              const isCompleted = bootstrapJobStatus.status === 'completed';
+              const isCancelInFlight = bootstrapJobStatus.cancelled === true && !isCancelled && !isCompleted;
+              const accentBg = isCancelled ? '#3a1f0c' : '#0c1f3a';
+              const accentBorder = isCancelled ? '#b45309' : '#1d4ed8';
+              const accentText = isCancelled ? '#fdba74' : '#93c5fd';
+              const barFill = isCancelled ? '#b45309' : isCancelInFlight ? '#fbbf24' : '#3b82f6';
+              const barTrack = isCancelled ? '#451a03' : '#1e3a8a';
+              return (
+                <div style={{ marginBottom: '0.75rem', padding: '0.6rem 0.75rem', background: accentBg, border: `1px solid ${accentBorder}`, borderRadius: 6 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.35rem' }}>
+                    <div style={{ fontWeight: 600, color: accentText, fontSize: '0.85rem' }}>
+                      {isCancelled
+                        ? tP('bootstrap.progressCancelled')
+                        : isCompleted
+                          ? tP('bootstrap.progressTitleDone')
+                          : tP('bootstrap.progressTitle')}
+                    </div>
+                    {!isCompleted && !isCancelled && (
+                      <button
+                        type="button"
+                        onClick={handleCancelBootstrap}
+                        disabled={bootstrapCancelling || isCancelInFlight}
+                        title={tP('bootstrap.interruptTooltip')}
+                        style={{
+                          fontSize: '0.72rem', padding: '2px 10px',
+                          background: isCancelInFlight ? '#27272a' : 'transparent',
+                          color: isCancelInFlight ? '#71717a' : '#fbbf24',
+                          border: '1px solid #b45309', borderRadius: 4,
+                          cursor: bootstrapCancelling || isCancelInFlight ? 'default' : 'pointer',
+                          opacity: bootstrapCancelling || isCancelInFlight ? 0.7 : 1,
+                        }}
+                      >
+                        {isCancelInFlight ? tP('bootstrap.interruptInflight') : tP('bootstrap.interrupt')}
+                      </button>
+                    )}
+                  </div>
+                  <div style={{ fontSize: '0.82rem', color: '#e4e4e7', marginBottom: '0.5rem' }}>
+                    {isCancelled
+                      ? tP('bootstrap.progressCancelledLine', { completed, total })
+                      : isCompleted
+                        ? tP('bootstrap.progressDone', { completed })
+                        : tP('bootstrap.progressLine', {
+                            completed,
+                            total,
+                            current: bootstrapJobStatus.current_preset_label,
+                          })}
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <div style={{ flex: 1, height: 12, background: barTrack, borderRadius: 6, overflow: 'hidden' }}>
+                      <div style={{
+                        height: '100%', background: barFill,
+                        width: `${pct}%`,
+                        transition: 'width 0.3s',
+                      }} />
+                    </div>
+                    <span style={{ fontSize: '0.78rem', color: '#a1a1aa', minWidth: 56, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                      {`${completed}/${total} (${pct.toFixed(0)}%)`}
+                    </span>
+                  </div>
+                  {isCancelInFlight && (
+                    <div style={{ marginTop: '0.4rem', fontSize: '0.72rem', color: '#fbbf24' }}>
+                      {tP('bootstrap.interruptHint')}
+                    </div>
+                  )}
+                  {bootstrapJobStatus.errors.length > 0 && (
+                    <div style={{ marginTop: '0.4rem', fontSize: '0.75rem', color: '#f87171' }}>
+                      <div style={{ fontWeight: 600 }}>{tP('bootstrap.progressErrors', { n: bootstrapJobStatus.errors.length })}</div>
+                      <ul style={{ margin: '0.2rem 0 0 1rem', padding: 0 }}>
+                        {bootstrapJobStatus.errors.map((e, i) => (<li key={i}>{e}</li>))}
+                      </ul>
+                    </div>
+                  )}
                 </div>
-                <div style={{ fontSize: '0.82rem', color: '#e4e4e7' }}>
-                  {bootstrapJobStatus.status === 'completed'
-                    ? tP('bootstrap.progressDone', { completed: bootstrapJobStatus.completed })
-                    : tP('bootstrap.progressLine', {
-                        completed: bootstrapJobStatus.completed,
-                        total: bootstrapJobStatus.total,
-                        current: bootstrapJobStatus.current_preset_label,
-                      })}
-                </div>
-                <div style={{ marginTop: '0.4rem', height: 6, background: '#1e3a8a', borderRadius: 3, overflow: 'hidden' }}>
-                  <div style={{
-                    height: '100%', background: '#3b82f6',
-                    width: `${bootstrapJobStatus.total > 0 ? (bootstrapJobStatus.completed / bootstrapJobStatus.total) * 100 : 0}%`,
-                    transition: 'width 0.3s',
-                  }} />
-                </div>
-                {bootstrapJobStatus.errors.length > 0 && (
-                  <div style={{ marginTop: '0.4rem', fontSize: '0.75rem', color: '#f87171' }}>
-                    <div style={{ fontWeight: 600 }}>{tP('bootstrap.progressErrors', { n: bootstrapJobStatus.errors.length })}</div>
-                    <ul style={{ margin: '0.2rem 0 0 1rem', padding: 0 }}>
-                      {bootstrapJobStatus.errors.map((e, i) => (<li key={i}>{e}</li>))}
+              );
+            })()}
+
+            {/* Skipped-dup notice — server-side dedup at start time dropped
+                some submitted presets because their config signature matched
+                an existing KB record. */}
+            {bootstrapSkippedNotice && bootstrapSkippedNotice.length > 0 && (
+              <div style={{ marginBottom: '0.75rem', padding: '0.5rem 0.75rem', background: '#3a1f0c', border: '1px solid #b45309', borderRadius: 6, color: '#fdba74' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
+                  <div style={{ fontSize: '0.78rem' }}>
+                    <div style={{ fontWeight: 600, marginBottom: 4 }}>{tP('bootstrap.skippedHeading', { n: bootstrapSkippedNotice.length })}</div>
+                    <div style={{ fontSize: '0.72rem', color: '#fed7aa' }}>{tP('bootstrap.skippedHint')}</div>
+                    <ul style={{ margin: '0.25rem 0 0 1rem', padding: 0, fontFamily: 'monospace', fontSize: '0.7rem', color: '#fed7aa' }}>
+                      {bootstrapSkippedNotice.map((p) => (
+                        <li key={p.preset_id}>{p.preset_label}</li>
+                      ))}
                     </ul>
                   </div>
-                )}
+                  <button
+                    type="button"
+                    onClick={() => setBootstrapSkippedNotice(null)}
+                    style={{ background: 'transparent', color: '#fdba74', border: '1px solid #b45309', borderRadius: 4, padding: '2px 8px', fontSize: '0.7rem', cursor: 'pointer' }}
+                  >{tP('bootstrap.skippedDismiss')}</button>
+                </div>
               </div>
             )}
 
@@ -6511,21 +6939,23 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 {bootstrapPreview.remaining_count === 0
                   ? tP('bootstrap.exhausted', { total: bootstrapPreview.library_size })
                   : tP('bootstrap.coverage', {
+                      kbCount: bootstrapPreview.kb_record_count ?? 0,
                       covered: bootstrapPreview.already_run_count,
                       total: bootstrapPreview.library_size,
                     })}
               </p>
             )}
 
-            {/* Batch size + Start (hidden while exhausted) */}
-            {bootstrapPreview && bootstrapPreview.remaining_count > 0 && (
+            {/* Batch size + Start. Always rendered — even when the library is
+                fully in KB, the user can edit a preset to define a new variation. */}
+            {bootstrapPreview && (
               <>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginBottom: '0.5rem' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
                   <label style={{ fontSize: '0.82rem', color: '#e4e4e7' }}>
                     {tP('bootstrap.batchSizeLabel')}:
                     <input
-                      type="number" min={1} max={bootstrapPreview.library_size} value={bootstrapBatchSize}
-                      onChange={(e) => setBootstrapBatchSize(Math.max(1, Math.min(bootstrapPreview.library_size, Number(e.target.value) || 5)))}
+                      type="number" min={1} value={bootstrapBatchSize}
+                      onChange={(e) => setBootstrapBatchSize(Math.max(1, Number(e.target.value) || 5))}
                       style={{
                         marginLeft: '0.5rem', width: 60, padding: '3px 6px',
                         background: '#27272a', color: '#e4e4e7',
@@ -6533,7 +6963,23 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       }}
                     />
                   </label>
-                  <span style={{ fontSize: '0.75rem', color: '#71717a' }}>{tP('bootstrap.batchSizeHint', { max: bootstrapPreview.library_size })}</span>
+                  <label style={{ fontSize: '0.82rem', color: '#e4e4e7' }} title={tP('bootstrap.criterionTooltip')}>
+                    {tP('bootstrap.criterionLabel')}:
+                    <select
+                      value={bootstrapCriterion}
+                      onChange={(e) => setBootstrapCriterion(e.target.value as BootstrapCriterion)}
+                      style={{
+                        marginLeft: '0.5rem', padding: '3px 6px',
+                        background: '#27272a', color: '#e4e4e7',
+                        border: '1px solid #52525b', borderRadius: 4, fontSize: '0.82rem',
+                      }}
+                    >
+                      <option value="fill_rate">{tP('bootstrap.criterionFillRate')}</option>
+                      <option value="fairness">{tP('bootstrap.criterionFairness')}</option>
+                      <option value="pareto">{tP('bootstrap.criterionPareto')}</option>
+                    </select>
+                  </label>
+                  <span style={{ fontSize: '0.75rem', color: '#71717a' }}>{tP('bootstrap.batchSizeHint')}</span>
                 </div>
 
                 <details style={{ marginBottom: '0.5rem', fontSize: '0.75rem', color: '#71717a' }}>
@@ -6547,39 +6993,184 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <div style={{ marginBottom: '0.5rem', fontSize: '0.82rem', color: '#a1a1aa', fontWeight: 600 }}>
                   {tP('bootstrap.nextBatchHeading')}
                 </div>
+                {/* Preset list: server suggests N single-knob variations
+                    around the case's current best (or BASELINE on cold-start).
+                    Each row is collapsed by default; expanding shows a
+                    planning-page-style mini config form so users can alter
+                    knobs before submitting. Edits get re-dedup'd at submit. */}
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.78rem', marginBottom: '0.75rem' }}>
                   <tbody>
                     {bootstrapPreview.next_batch.map((p) => {
-                      const expanded = bootstrapExpandedPresets.has(p.preset_id);
-                      const diff = presetDiffSummary(p.config);
+                      const editing = bootstrapEditingRows.has(p.preset_id);
+                      const editedConfig = bootstrapEditedConfigs[p.preset_id];
+                      const effectiveConfig = (editedConfig ?? p.config) as Record<string, unknown>;
+                      const isEdited = editedConfig != null;
+                      const summary = presetConfigSummary(effectiveConfig);
+                      const ms = (effectiveConfig.method_selection ?? {}) as Record<string, unknown>;
+                      const cs = (effectiveConfig.consolidation ?? {}) as Record<string, unknown>;
+                      const sw = (ms.score_weights ?? {}) as Record<string, number>;
+                      const elaborateOn = ms.mode === 'elaborate' || ms.elaborate === true;
+                      const updateConfig = (mutator: (cfg: Record<string, unknown>) => void) => {
+                        const next = JSON.parse(JSON.stringify(effectiveConfig)) as Record<string, unknown>;
+                        mutator(next);
+                        setBootstrapEditedConfigs((prev) => ({ ...prev, [p.preset_id]: next }));
+                      };
+                      const resetConfig = () => {
+                        setBootstrapEditedConfigs((prev) => { const n = { ...prev }; delete n[p.preset_id]; return n; });
+                      };
+                      const toggleEditing = () => {
+                        setBootstrapEditingRows((prev) => {
+                          const n = new Set(prev);
+                          if (n.has(p.preset_id)) n.delete(p.preset_id); else n.add(p.preset_id);
+                          return n;
+                        });
+                      };
+                      const inputStyle: React.CSSProperties = {
+                        padding: '2px 6px', background: '#27272a', color: '#e4e4e7',
+                        border: '1px solid #3d3d40', borderRadius: 4, fontSize: '0.78rem',
+                      };
                       return (
                         <React.Fragment key={p.preset_id}>
-                          <tr style={{ borderBottom: expanded ? 'none' : '1px solid #27272a' }}>
+                          <tr style={{ borderBottom: editing ? 'none' : '1px solid #27272a', background: isEdited ? 'rgba(251,146,60,0.06)' : undefined }}>
                             <td style={{ padding: '4px 6px', width: 18, cursor: 'pointer', color: '#71717a', verticalAlign: 'top' }}
-                                onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
-                              {expanded ? '▾' : '▸'}
+                                onClick={toggleEditing}>
+                              {editing ? '▾' : '▸'}
                             </td>
                             <td style={{ padding: '4px 6px', fontFamily: 'monospace', color: '#67e8f9', cursor: 'pointer', verticalAlign: 'top', whiteSpace: 'nowrap' }}
-                                onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
+                                onClick={toggleEditing}>
                               {p.preset_label}
+                              {isEdited && (
+                                <span title={tP('bootstrap.editedTooltip')} style={{ marginLeft: 5, fontSize: '0.62rem', background: '#7c2d12', color: '#fed7aa', borderRadius: 4, padding: '0px 5px' }}>
+                                  {tP('bootstrap.editedBadge')}
+                                </span>
+                              )}
                             </td>
                             <td style={{ padding: '4px 6px', verticalAlign: 'top', whiteSpace: 'nowrap' }}>
                               <span style={{ fontSize: '0.7rem', background: '#3f3f46', borderRadius: 4, padding: '1px 6px', color: '#a1a1aa' }}>{p.primary_axis}</span>
                             </td>
-                            <td style={{ padding: '4px 6px', fontFamily: 'monospace', fontSize: '0.72rem', color: diff ? '#fbbf24' : '#52525b', verticalAlign: 'top' }}>
-                              {diff || tP('bootstrap.noDiff')}
+                            <td style={{ padding: '4px 6px', fontFamily: 'monospace', fontSize: '0.7rem', color: '#a1a1aa', verticalAlign: 'top' }}>
+                              {summary}
                             </td>
                           </tr>
-                          {expanded && (
-                            <tr style={{ borderBottom: '1px solid #27272a' }}>
-                              <td colSpan={4} style={{ padding: '0 6px 6px 26px' }}>
-                                <pre style={{
-                                  margin: 0, fontSize: '0.68rem', color: '#a1a1aa',
-                                  background: '#0a0a0a', padding: '6px 8px', borderRadius: 4,
-                                  overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                                }}>
-                                  {JSON.stringify(p.config, null, 2)}
-                                </pre>
+                          {editing && (
+                            <tr style={{ borderBottom: '1px solid #27272a', background: '#0a0a0a' }}>
+                              <td colSpan={4} style={{ padding: '8px 12px 12px 28px' }}>
+                                {/* Method selection (supply side) */}
+                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'center', fontSize: '0.78rem', marginBottom: 6 }}>
+                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editMaxMethods')}</span>
+                                    <select value={Number(ms.max_methods ?? 1)}
+                                      onChange={(e) => updateConfig((c) => {
+                                        const m = (c.method_selection ?? {}) as Record<string, unknown>;
+                                        m.max_methods = parseInt(e.target.value, 10) || 1;
+                                        c.method_selection = m;
+                                      })}
+                                      style={inputStyle}>
+                                      {[1,2,3,4,5,6,7,8].map((n) => (<option key={n} value={n}>{n}</option>))}
+                                    </select>
+                                  </label>
+                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                    <input type="checkbox" checked={!!elaborateOn}
+                                      onChange={(e) => updateConfig((c) => {
+                                        const m = (c.method_selection ?? {}) as Record<string, unknown>;
+                                        m.elaborate = e.target.checked;
+                                        m.mode = e.target.checked ? 'elaborate' : 'preference';
+                                        c.method_selection = m;
+                                      })} />
+                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editElaborate')}</span>
+                                  </label>
+                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, opacity: elaborateOn ? 1 : 0.4 }}>
+                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editDepth')}</span>
+                                    <input type="number" min={1} max={10} disabled={!elaborateOn}
+                                      value={Number(ms.depth ?? 1)}
+                                      onChange={(e) => updateConfig((c) => {
+                                        const m = (c.method_selection ?? {}) as Record<string, unknown>;
+                                        m.depth = Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 1));
+                                        c.method_selection = m;
+                                      })}
+                                      style={{ ...inputStyle, width: 56 }} />
+                                  </label>
+                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                    <input type="checkbox" checked={effectiveConfig.purchase_allowed === true}
+                                      onChange={(e) => updateConfig((c) => { c.purchase_allowed = e.target.checked; })} />
+                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editPurchase')}</span>
+                                  </label>
+                                </div>
+                                {elaborateOn && (
+                                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'center', fontSize: '0.78rem', marginBottom: 6, paddingLeft: 8 }}>
+                                    <span style={{ fontSize: '0.7rem', color: '#71717a' }}>{tP('bootstrap.editWeights')}</span>
+                                    {(['commit_time','inventory_consumed','purchase'] as const).map((k) => (
+                                      <label key={k} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                        <span style={{ color: '#a1a1aa', fontSize: '0.72rem' }}>{k.replace('_',' ')}</span>
+                                        <input type="number" step={0.05} min={0} max={1}
+                                          value={Number(sw[k] ?? (k === 'commit_time' ? 0.4 : k === 'inventory_consumed' ? 0.35 : 0.25))}
+                                          onChange={(e) => updateConfig((c) => {
+                                            const m = (c.method_selection ?? {}) as Record<string, unknown>;
+                                            const w = { ...((m.score_weights ?? {}) as Record<string, number>) };
+                                            w[k] = Math.max(0, Math.min(1, parseFloat(e.target.value) || 0));
+                                            m.score_weights = w; c.method_selection = m;
+                                          })}
+                                          style={{ ...inputStyle, width: 64 }} />
+                                      </label>
+                                    ))}
+                                  </div>
+                                )}
+                                {/* Consolidation (demand side) */}
+                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'center', fontSize: '0.78rem', marginBottom: 6 }}>
+                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                    <input type="checkbox" checked={cs.enabled !== false}
+                                      onChange={(e) => updateConfig((c) => {
+                                        const v = (c.consolidation ?? {}) as Record<string, unknown>;
+                                        v.enabled = e.target.checked; c.consolidation = v;
+                                      })} />
+                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editConsolidationEnabled')}</span>
+                                  </label>
+                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, opacity: cs.enabled !== false ? 1 : 0.4 }}>
+                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editScope')}</span>
+                                    <select value={String(cs.scope ?? 'leaf-only')}
+                                      disabled={cs.enabled === false}
+                                      onChange={(e) => updateConfig((c) => {
+                                        const v = (c.consolidation ?? {}) as Record<string, unknown>;
+                                        v.scope = e.target.value; c.consolidation = v;
+                                      })} style={inputStyle}>
+                                      <option value="leaf-only">leaf-only</option>
+                                      <option value="all">all</option>
+                                    </select>
+                                  </label>
+                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, opacity: cs.enabled !== false ? 1 : 0.4 }}>
+                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editPeriodDays')}</span>
+                                    <input type="number" min={0} max={365}
+                                      disabled={cs.enabled === false}
+                                      value={Number(cs.period_days ?? 0)}
+                                      onChange={(e) => updateConfig((c) => {
+                                        const v = (c.consolidation ?? {}) as Record<string, unknown>;
+                                        v.period_days = Math.max(0, Math.min(365, parseInt(e.target.value, 10) || 0));
+                                        c.consolidation = v;
+                                      })}
+                                      style={{ ...inputStyle, width: 64 }} />
+                                  </label>
+                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, opacity: cs.enabled !== false ? 1 : 0.4 }}>
+                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editAllocation')}</span>
+                                    <select value={String(cs.allocation_mode ?? 'fair')}
+                                      disabled={cs.enabled === false}
+                                      onChange={(e) => updateConfig((c) => {
+                                        const v = (c.consolidation ?? {}) as Record<string, unknown>;
+                                        v.allocation_mode = e.target.value; c.consolidation = v;
+                                      })} style={inputStyle}>
+                                      <option value="fair">fair</option>
+                                      <option value="proportional">proportional</option>
+                                      <option value="priority_first">priority_first</option>
+                                    </select>
+                                  </label>
+                                </div>
+                                {isEdited && (
+                                  <div style={{ marginTop: 6 }}>
+                                    <button type="button" onClick={resetConfig}
+                                      style={{ fontSize: '0.7rem', padding: '2px 8px', background: 'transparent', color: '#a1a1aa', border: '1px solid #3d3d40', borderRadius: 4, cursor: 'pointer' }}>
+                                      {tP('bootstrap.editReset')}
+                                    </button>
+                                  </div>
+                                )}
                               </td>
                             </tr>
                           )}
@@ -6589,7 +7180,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   </tbody>
                 </table>
 
-                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem', marginTop: '0.5rem' }}>
                   <button type="button" onClick={closeBootstrapDialog}
                     style={{ padding: '5px 12px', background: 'transparent', color: '#a1a1aa', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>
                     {tP('bootstrap.cancel')}
@@ -6601,83 +7192,201 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       border: 'none', borderRadius: 6, cursor: 'pointer',
                       fontWeight: 600, opacity: bootstrapStarting || bootstrapJobStatus?.status === 'running' ? 0.6 : 1,
                     }}>
-                    {bootstrapStarting
-                      ? tP('bootstrap.starting')
-                      : tP('bootstrap.start', { n: bootstrapPreview.next_batch.length })}
+                    {(() => {
+                      if (bootstrapStarting) return tP('bootstrap.starting');
+                      // Count actual runs: sum of values across checked axes.
+                      // The server has already filtered duplicates; every
+                      // suggestion in next_batch becomes a run on Start.
+                      const willRun = bootstrapPreview.next_batch.length;
+                      return tP('bootstrap.start', { n: willRun });
+                    })()}
                   </button>
                 </div>
 
-                {bootstrapPreview.already_run.length > 0 && (
-                  <details style={{ marginTop: '1rem', fontSize: '0.78rem', color: '#71717a' }}>
-                    <summary style={{ cursor: 'pointer' }}>
-                      {tP('bootstrap.alreadyRunHeading', { n: bootstrapPreview.already_run.length })}
-                    </summary>
-                    <table style={{ width: '100%', marginTop: '0.5rem', borderCollapse: 'collapse', fontSize: '0.74rem' }}>
-                      <tbody>
-                        {bootstrapPreview.already_run.map((p) => {
-                          const expanded = bootstrapExpandedPresets.has(p.preset_id);
-                          const diff = presetDiffSummary(p.config);
-                          return (
-                            <React.Fragment key={p.preset_id}>
-                              <tr style={{ borderBottom: expanded ? 'none' : '1px solid #27272a' }}>
-                                <td style={{ padding: '4px 6px', width: 18, cursor: 'pointer', color: '#71717a', verticalAlign: 'top' }}
-                                    onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
-                                  {expanded ? '▾' : '▸'}
-                                </td>
-                                <td style={{ padding: '4px 6px', fontFamily: 'monospace', color: '#a1a1aa', cursor: 'pointer', verticalAlign: 'top', whiteSpace: 'nowrap' }}
-                                    onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
-                                  {p.preset_label}
-                                </td>
-                                <td style={{ padding: '4px 6px', verticalAlign: 'top', whiteSpace: 'nowrap' }}>
-                                  <span style={{ fontSize: '0.66rem', background: '#3f3f46', borderRadius: 4, padding: '1px 6px', color: '#a1a1aa' }}>{p.primary_axis}</span>
-                                </td>
-                                <td style={{ padding: '4px 6px', fontFamily: 'monospace', fontSize: '0.68rem', color: diff ? '#fbbf24' : '#52525b', verticalAlign: 'top' }}>
-                                  {diff || tP('bootstrap.noDiff')}
-                                </td>
-                                <td style={{ padding: '4px 6px', color: '#a78bfa', textAlign: 'right', verticalAlign: 'top' }}>
-                                  {p.fill_rate_pct != null ? `${p.fill_rate_pct.toFixed(1)}%` : '–'}
-                                </td>
-                                <td style={{ padding: '4px 6px', verticalAlign: 'top' }}>
-                                  {p.soundness_status === 'sound' && <span style={{ color: '#34d399', fontSize: '0.7rem' }}>✓</span>}
-                                  {p.soundness_status === 'unsound' && <span style={{ color: '#f87171', fontSize: '0.7rem' }}>✗</span>}
-                                  {p.soundness_status === 'unchecked' && <span style={{ color: '#71717a', fontSize: '0.7rem' }}>—</span>}
-                                  {p.soundness_status === 'error' && <span style={{ color: '#fbbf24', fontSize: '0.7rem' }}>err</span>}
-                                </td>
-                                <td style={{ padding: '4px 6px', textAlign: 'right', verticalAlign: 'top' }}>
-                                  {p.plan_run_id != null && (
-                                    <button type="button"
-                                      onClick={() => handleDeleteCoveredRun(p.plan_run_id!)}
-                                      style={{
-                                        fontSize: '0.7rem', padding: '1px 6px',
-                                        background: 'transparent', color: '#f87171',
-                                        border: '1px solid rgba(248,113,113,0.4)', borderRadius: 4,
-                                        cursor: 'pointer',
-                                      }}>
-                                      {tc('delete')}
-                                    </button>
+                {bootstrapPreview.already_run.length > 0 && (() => {
+                  // KPI columns: 'asc' direction = lower-is-better (gini, starvation),
+                  // 'desc' = higher-is-better. Default sort dir on first click matches `better`.
+                  const kpiCols: Array<{ key: keyof BootstrapPreset; label: string; better: 'asc' | 'desc'; fmt: (v: number) => string }> = [
+                    { key: 'fill_rate_pct',                label: tP('bootstrap.kpi.fill'),        better: 'desc', fmt: (v) => `${v.toFixed(1)}%` },
+                    { key: 'gini',                         label: tP('bootstrap.kpi.gini'),        better: 'asc',  fmt: (v) => v.toFixed(2) },
+                    { key: 'p10_fill_ratio',               label: tP('bootstrap.kpi.p10'),         better: 'desc', fmt: (v) => v.toFixed(2) },
+                    { key: 'on_time_count',                label: tP('bootstrap.kpi.onTime'),      better: 'desc', fmt: (v) => String(v) },
+                    { key: 'manufacturing_total_quantity', label: tP('bootstrap.kpi.mfg'),         better: 'desc', fmt: (v) => qtyFmt(v) },
+                    { key: 'inventory_consumed_total',     label: tP('bootstrap.kpi.invConsumed'), better: 'desc', fmt: (v) => qtyFmt(v) },
+                  ];
+                  const filtered = bootstrapKbSoundOnly
+                    ? bootstrapPreview.already_run.filter((p) => p.soundness_status === 'sound')
+                    : bootstrapPreview.already_run;
+                  const sorted = bootstrapKbSort
+                    ? [...filtered].sort((a, b) => {
+                        const k = bootstrapKbSort.key as keyof BootstrapPreset;
+                        const av = a[k];
+                        const bv = b[k];
+                        if (av == null && bv == null) return 0;
+                        if (av == null) return 1;   // missing always sinks
+                        if (bv == null) return -1;
+                        const cmp = Number(av) - Number(bv);
+                        return bootstrapKbSort.dir === 'asc' ? cmp : -cmp;
+                      })
+                    : filtered;
+                  const handleSortClick = (key: string, defaultDir: 'asc' | 'desc') => {
+                    setBootstrapKbSort((prev) => {
+                      if (!prev || prev.key !== key) return { key, dir: defaultDir };
+                      if (prev.dir === defaultDir) return { key, dir: defaultDir === 'asc' ? 'desc' : 'asc' };
+                      return null;
+                    });
+                  };
+                  const sortIndicator = (key: string) => {
+                    if (!bootstrapKbSort || bootstrapKbSort.key !== key) return '';
+                    return bootstrapKbSort.dir === 'asc' ? ' ↑' : ' ↓';
+                  };
+                  return (
+                    <details style={{ marginTop: '1rem', fontSize: '0.78rem', color: '#71717a' }} open>
+                      <summary style={{ cursor: 'pointer' }}>
+                        {tP('bootstrap.alreadyRunHeading', { n: bootstrapPreview.already_run.length })}
+                      </summary>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', margin: '0.5rem 0', flexWrap: 'wrap' }}>
+                        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: '0.72rem', color: '#a1a1aa', cursor: 'pointer' }}>
+                          <input
+                            type="checkbox"
+                            checked={bootstrapKbSoundOnly}
+                            onChange={(e) => setBootstrapKbSoundOnly(e.target.checked)}
+                          />
+                          <span>{tP('bootstrap.kbSoundOnly')}</span>
+                        </label>
+                        {bootstrapKbSort && (
+                          <button
+                            type="button"
+                            onClick={() => setBootstrapKbSort(null)}
+                            style={{ fontSize: '0.7rem', padding: '1px 8px', background: 'transparent', color: '#a1a1aa', border: '1px solid #3d3d40', borderRadius: 4, cursor: 'pointer' }}
+                          >{tP('bootstrap.kbClearSort')}</button>
+                        )}
+                        <span style={{ fontSize: '0.7rem', color: '#52525b', marginLeft: 'auto' }}>
+                          {tP('bootstrap.kbHint')}
+                        </span>
+                      </div>
+                      <div style={{ overflowX: 'auto' }}>
+                        <table style={{ width: '100%', marginTop: '0.25rem', borderCollapse: 'collapse', fontSize: '0.74rem' }}>
+                          <thead>
+                            <tr style={{ color: '#a1a1aa', borderBottom: '1px solid #3d3d40' }}>
+                              <th style={{ width: 18, padding: '4px 6px' }} />
+                              <th style={{ padding: '4px 6px', textAlign: 'left', whiteSpace: 'nowrap' }}>{tP('bootstrap.kbCol.preset')}</th>
+                              <th style={{ padding: '4px 6px', textAlign: 'left' }}>{tP('bootstrap.kbCol.axis')}</th>
+                              <th style={{ padding: '4px 6px', textAlign: 'left' }}>{tP('bootstrap.kbCol.diff')}</th>
+                              {kpiCols.map((c) => (
+                                <th key={String(c.key)} style={{ padding: '4px 6px', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleSortClick(String(c.key), c.better)}
+                                    title={c.better === 'asc' ? tP('bootstrap.kpi.lowerBetter') : tP('bootstrap.kpi.higherBetter')}
+                                    style={{ background: 'none', border: 'none', color: bootstrapKbSort?.key === c.key ? '#e4e4e7' : '#a1a1aa', cursor: 'pointer', padding: 0, fontSize: '0.72rem', fontWeight: bootstrapKbSort?.key === c.key ? 600 : 400 }}
+                                  >{c.label}{sortIndicator(String(c.key))}</button>
+                                </th>
+                              ))}
+                              <th style={{ padding: '4px 6px' }} />
+                              <th style={{ padding: '4px 6px' }} />
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {sorted.map((p) => {
+                              const expanded = bootstrapExpandedPresets.has(p.preset_id);
+                              // Self-describing config summary (no baseline framing) — see
+                              // presetConfigSummary above. Storage is full JSON; this is
+                              // purely how it's rendered in the row.
+                              const summary = presetConfigSummary(p.config);
+                              const renderKpi = (k: keyof BootstrapPreset, fmt: (v: number) => string) => {
+                                const v = p[k];
+                                if (v == null) return <span style={{ color: '#52525b' }}>–</span>;
+                                return <span>{fmt(Number(v))}</span>;
+                              };
+                              return (
+                                <React.Fragment key={p.preset_id}>
+                                  <tr style={{ borderBottom: expanded ? 'none' : '1px solid #27272a' }}>
+                                    <td style={{ padding: '4px 6px', width: 18, cursor: 'pointer', color: '#71717a', verticalAlign: 'top' }}
+                                        onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
+                                      {expanded ? '▾' : '▸'}
+                                    </td>
+                                    <td style={{ padding: '4px 6px', fontFamily: 'monospace', color: '#a1a1aa', cursor: 'pointer', verticalAlign: 'top', whiteSpace: 'nowrap' }}
+                                        onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
+                                      {p.preset_label}
+                                      {(() => {
+                                        // Axis-diff count vs the static baseline (cfg() defaults). The
+                                        // single-axis property is what the agent uses for clean
+                                        // comparative pairs; surface it as a glanceable badge so users
+                                        // can quickly find diagnostic-quality rows.
+                                        const diffStr = presetDiffSummary(p.config);
+                                        const axisCount = diffStr ? diffStr.split(' · ').length : 0;
+                                        const tone = axisCount === 0
+                                          ? { bg: '#1e3a8a', fg: '#bfdbfe' }   // baseline itself
+                                          : axisCount === 1
+                                            ? { bg: '#14532d', fg: '#bbf7d0' } // single-axis (curated quality)
+                                            : { bg: '#3f3f46', fg: '#a1a1aa' }; // multi-axis
+                                        return (
+                                          <span title={tP('bootstrap.axisDiffTooltip', { n: axisCount })}
+                                            style={{ marginLeft: 4, fontSize: '0.62rem', background: tone.bg, color: tone.fg, borderRadius: 4, padding: '0px 5px' }}>
+                                            {tP('bootstrap.axisDiffBadge', { n: axisCount })}
+                                          </span>
+                                        );
+                                      })()}
+                                      {p.source_plan_run_deleted && (
+                                        <span title={tP('bootstrap.kbSourceDeleted')} style={{ marginLeft: 4, fontSize: '0.62rem', color: '#71717a', fontStyle: 'italic' }}>(orphan)</span>
+                                      )}
+                                    </td>
+                                    <td style={{ padding: '4px 6px', verticalAlign: 'top', whiteSpace: 'nowrap' }}>
+                                      <span style={{ fontSize: '0.66rem', background: '#3f3f46', borderRadius: 4, padding: '1px 6px', color: '#a1a1aa' }}>{p.primary_axis}</span>
+                                    </td>
+                                    <td style={{ padding: '4px 6px', fontFamily: 'monospace', fontSize: '0.68rem', color: '#a1a1aa', verticalAlign: 'top' }}>
+                                      {summary}
+                                    </td>
+                                    {kpiCols.map((c) => (
+                                      <td key={String(c.key)} style={{ padding: '4px 6px', color: '#a78bfa', textAlign: 'right', verticalAlign: 'top', whiteSpace: 'nowrap' }}>
+                                        {renderKpi(c.key, c.fmt)}
+                                      </td>
+                                    ))}
+                                    <td style={{ padding: '4px 6px', verticalAlign: 'top' }}>
+                                      {p.soundness_status === 'sound' && <span style={{ color: '#34d399', fontSize: '0.7rem' }}>✓</span>}
+                                      {p.soundness_status === 'unsound' && <span style={{ color: '#f87171', fontSize: '0.7rem' }}>✗</span>}
+                                      {p.soundness_status === 'unchecked' && <span style={{ color: '#71717a', fontSize: '0.7rem' }}>—</span>}
+                                      {p.soundness_status === 'error' && <span style={{ color: '#fbbf24', fontSize: '0.7rem' }}>err</span>}
+                                    </td>
+                                    <td style={{ padding: '4px 6px', textAlign: 'right', verticalAlign: 'top' }}>
+                                      {p.kb_record_id != null && (
+                                        <button type="button"
+                                          onClick={() => handleDeleteKbRecord(p.kb_record_id!)}
+                                          title={tP('bootstrap.kbDeleteTooltip')}
+                                          style={{
+                                            fontSize: '0.7rem', padding: '1px 6px',
+                                            background: 'transparent', color: '#f87171',
+                                            border: '1px solid rgba(248,113,113,0.4)', borderRadius: 4,
+                                            cursor: 'pointer',
+                                          }}>
+                                          {tc('delete')}
+                                        </button>
+                                      )}
+                                    </td>
+                                  </tr>
+                                  {expanded && (
+                                    <tr style={{ borderBottom: '1px solid #27272a' }}>
+                                      <td colSpan={6 + kpiCols.length} style={{ padding: '0 6px 6px 26px' }}>
+                                        <pre style={{
+                                          margin: 0, fontSize: '0.66rem', color: '#a1a1aa',
+                                          background: '#0a0a0a', padding: '6px 8px', borderRadius: 4,
+                                          overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                        }}>
+                                          {JSON.stringify(p.config, null, 2)}
+                                        </pre>
+                                      </td>
+                                    </tr>
                                   )}
-                                </td>
-                              </tr>
-                              {expanded && (
-                                <tr style={{ borderBottom: '1px solid #27272a' }}>
-                                  <td colSpan={7} style={{ padding: '0 6px 6px 26px' }}>
-                                    <pre style={{
-                                      margin: 0, fontSize: '0.66rem', color: '#a1a1aa',
-                                      background: '#0a0a0a', padding: '6px 8px', borderRadius: 4,
-                                      overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                                    }}>
-                                      {JSON.stringify(p.config, null, 2)}
-                                    </pre>
-                                  </td>
-                                </tr>
-                              )}
-                            </React.Fragment>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </details>
-                )}
+                                </React.Fragment>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </details>
+                  );
+                })()}
               </>
             )}
           </div>
@@ -6702,7 +7411,78 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
               {planRunHistoryLoading && <p style={{ color: '#71717a' }}>{tP('runHistory.loading')}</p>}
               {!planRunHistoryLoading && planRunHistory.length === 0 && <p style={{ color: '#71717a' }}>{tP('runHistory.empty')}</p>}
-              {!planRunHistoryLoading && planRunHistory.map((run) => {
+              {!planRunHistoryLoading && planRunHistory.length > 0 && (() => {
+                const kpiOptions: Array<{ key: keyof PlanRun; label: string; better: 'asc' | 'desc' }> = [
+                  { key: 'fill_rate_pct',                label: tP('bootstrap.kpi.fill'),        better: 'desc' },
+                  { key: 'gini',                         label: tP('bootstrap.kpi.gini'),        better: 'asc'  },
+                  { key: 'p10_fill_ratio',               label: tP('bootstrap.kpi.p10'),         better: 'desc' },
+                  { key: 'on_time_count',                label: tP('bootstrap.kpi.onTime'),      better: 'desc' },
+                  { key: 'manufacturing_total_quantity', label: tP('bootstrap.kpi.mfg'),         better: 'desc' },
+                  { key: 'inventory_consumed_total',     label: tP('bootstrap.kpi.invConsumed'), better: 'desc' },
+                ];
+                return (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.75rem', flexWrap: 'wrap', fontSize: '0.72rem', color: '#a1a1aa' }}>
+                    <span>{tP('runHistory.sortBy')}</span>
+                    {kpiOptions.map((opt) => {
+                      const k = String(opt.key);
+                      const active = planRunHistorySort?.key === k;
+                      const ind = active ? (planRunHistorySort?.dir === 'asc' ? ' ↑' : ' ↓') : '';
+                      return (
+                        <button
+                          key={k}
+                          type="button"
+                          onClick={() => setPlanRunHistorySort((prev) => {
+                            if (!prev || prev.key !== k) return { key: k, dir: opt.better };
+                            if (prev.dir === opt.better) return { key: k, dir: opt.better === 'asc' ? 'desc' : 'asc' };
+                            return null;
+                          })}
+                          title={opt.better === 'asc' ? tP('bootstrap.kpi.lowerBetter') : tP('bootstrap.kpi.higherBetter')}
+                          style={{
+                            fontSize: '0.7rem', padding: '1px 8px',
+                            background: active ? '#27272a' : 'transparent',
+                            color: active ? '#e4e4e7' : '#a1a1aa',
+                            border: '1px solid #3d3d40', borderRadius: 4, cursor: 'pointer',
+                            fontWeight: active ? 600 : 400,
+                          }}
+                        >{opt.label}{ind}</button>
+                      );
+                    })}
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, marginLeft: '0.5rem', cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={planRunHistorySoundOnly}
+                        onChange={(e) => setPlanRunHistorySoundOnly(e.target.checked)}
+                      />
+                      <span>{tP('bootstrap.kbSoundOnly')}</span>
+                    </label>
+                    {planRunHistorySort && (
+                      <button
+                        type="button"
+                        onClick={() => setPlanRunHistorySort(null)}
+                        style={{ fontSize: '0.7rem', padding: '1px 8px', background: 'transparent', color: '#a1a1aa', border: '1px solid #3d3d40', borderRadius: 4, cursor: 'pointer' }}
+                      >{tP('bootstrap.kbClearSort')}</button>
+                    )}
+                  </div>
+                );
+              })()}
+              {!planRunHistoryLoading && (() => {
+                const filtered = planRunHistorySoundOnly
+                  ? planRunHistory.filter((r) => r.soundness_status === 'sound')
+                  : planRunHistory;
+                const sorted = planRunHistorySort
+                  ? [...filtered].sort((a, b) => {
+                      const k = planRunHistorySort.key as keyof PlanRun;
+                      const av = a[k];
+                      const bv = b[k];
+                      if (av == null && bv == null) return 0;
+                      if (av == null) return 1;
+                      if (bv == null) return -1;
+                      const cmp = Number(av) - Number(bv);
+                      return planRunHistorySort.dir === 'asc' ? cmp : -cmp;
+                    })
+                  : filtered;
+                return sorted;
+              })().map((run) => {
                 const editing = planRunEditing[run.id];
                 const isSavingEdit = !!planRunEditSaving[run.id];
                 const isActive = run.is_active === true;
@@ -6915,6 +7695,30 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       </button>
                     </div>
                   </div>
+                  {/* KPI strip — compact summary of the headline metrics from the run's
+                      result snapshot. Only shown when the run has KPI data. */}
+                  {(run.fill_rate_pct != null || run.gini != null || run.on_time_count != null) && (
+                    <div style={{ display: 'flex', gap: '0.75rem', marginTop: 4, fontSize: '0.72rem', color: '#a1a1aa', flexWrap: 'wrap' }}>
+                      {run.fill_rate_pct != null && (
+                        <span><span style={{ color: '#71717a' }}>{tP('bootstrap.kpi.fill')}</span> <span style={{ color: '#a78bfa' }}>{run.fill_rate_pct.toFixed(1)}%</span></span>
+                      )}
+                      {run.gini != null && (
+                        <span><span style={{ color: '#71717a' }}>{tP('bootstrap.kpi.gini')}</span> <span style={{ color: '#a78bfa' }}>{run.gini.toFixed(2)}</span></span>
+                      )}
+                      {run.p10_fill_ratio != null && (
+                        <span><span style={{ color: '#71717a' }}>{tP('bootstrap.kpi.p10')}</span> <span style={{ color: '#a78bfa' }}>{run.p10_fill_ratio.toFixed(2)}</span></span>
+                      )}
+                      {run.on_time_count != null && (
+                        <span><span style={{ color: '#71717a' }}>{tP('bootstrap.kpi.onTime')}</span> <span style={{ color: '#a78bfa' }}>{run.on_time_count}</span></span>
+                      )}
+                      {run.manufacturing_total_quantity != null && (
+                        <span><span style={{ color: '#71717a' }}>{tP('bootstrap.kpi.mfg')}</span> <span style={{ color: '#a78bfa' }}>{qtyFmt(run.manufacturing_total_quantity)}</span></span>
+                      )}
+                      {run.inventory_consumed_total != null && (
+                        <span><span style={{ color: '#71717a' }}>{tP('bootstrap.kpi.invConsumed')}</span> <span style={{ color: '#a78bfa' }}>{qtyFmt(run.inventory_consumed_total)}</span></span>
+                      )}
+                    </div>
+                  )}
                   {/* Name display / edit */}
                   {editing ? (
                     <div style={{ marginTop: '0.5rem', display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -7963,7 +8767,27 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   )}
                 </div>
               ))}
-              {copilotLoading && <p style={{ margin: 0, fontSize: '0.875rem', color: '#a1a1aa' }}>{tP('copilot.thinking')}</p>}
+              {(copilotLoading || copilotPendingJobId) && (
+                <div style={{ margin: '0.25rem 0', fontSize: '0.875rem', color: '#a1a1aa' }}>
+                  {copilotLoading && <p style={{ margin: 0 }}>{tP('copilot.thinking')}</p>}
+                  {copilotActiveJob && (() => {
+                    const cur = copilotActiveJob.progress?.current ?? 0;
+                    const tot = copilotActiveJob.progress?.total ?? 0;
+                    const pct = tot > 0 ? Math.min(100, (cur / tot) * 100) : 0;
+                    return (
+                      <div style={{ marginTop: '0.4rem' }}>
+                        <div style={{ fontSize: '0.75rem', color: '#71717a', marginBottom: 4, fontFamily: 'monospace' }}>
+                          plan {cur}/{tot} demands ({pct.toFixed(1)}%)
+                          {!copilotLoading && copilotPendingJobId && ` — ${tP('copilot.runningInBackground')}`}
+                        </div>
+                        <div style={{ height: 6, background: '#27272a', border: '1px solid #3d3d40', borderRadius: 3, overflow: 'hidden' }}>
+                          <div style={{ height: '100%', width: `${pct}%`, background: '#0ea5e9', transition: 'width 0.3s ease' }} />
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
               <div ref={copilotMessagesEndRef} />
             </div>
             <form
@@ -7997,6 +8821,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   // If the agent ran a plan, refresh the run-history list so the user sees it.
                   if (res.fresh_run_id != null && id != null) {
                     listPlanRuns(id).then(setPlanRunHistory).catch(() => { /* ignore */ });
+                  }
+                  // If the plan exceeded the agent's 25s wait window, the
+                  // backend hands the job_id back here; mode-2 polling above
+                  // takes over and posts the completion message itself.
+                  if (res.pending_job_id) {
+                    setCopilotPendingJobId(res.pending_job_id);
                   }
                 } catch {
                   // Agent unavailable — fall back to the copilot route, then to local rule-based parser.

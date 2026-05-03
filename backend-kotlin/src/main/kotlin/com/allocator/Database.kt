@@ -81,6 +81,10 @@ fun initDatabase() {
         migrateSchema()
     }
     log.info("Schema ready.")
+
+    // Data migrations (run after DDL). Each is idempotent — a no-op once
+    // the touched rows are already in the target form.
+    com.allocator.services.ScopeRenameMigration.run()
 }
 
 /** Create the application database via a connection to the 'postgres' maintenance DB. */
@@ -99,7 +103,8 @@ private fun createTables() {
         Demands, MethodBuys, MethodMakes, ProductLocations,
         Supplies, MethodMoves, AllocationRuns, AllocationActions,
         ManualOverrides, PlanRuns, MaterialEvents, MaterialImpactAssessments,
-        PlanSupplyAllocations, NegotiationWaits, PlanRunEvents, AgentMemory
+        PlanSupplyAllocations, NegotiationWaits, PlanRunEvents, AgentMemory,
+        KbRecords
     )
 }
 

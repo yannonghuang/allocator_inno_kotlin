@@ -6,7 +6,8 @@ import io.ktor.server.netty.*
 
 fun main() {
     initDatabase()
-    embeddedServer(Netty, port = 8000, host = "0.0.0.0", module = Application::module)
+    val port = System.getenv("PORT")?.toIntOrNull() ?: 8000
+    embeddedServer(Netty, port = port, host = "0.0.0.0", module = Application::module)
         .start(wait = true)
 }
 

@@ -5,7 +5,9 @@ import com.allocator.Cases
 import com.allocator.PlanRuns
 import org.jetbrains.exposed.sql.SortOrder
 import org.jetbrains.exposed.sql.max
+import com.allocator.services.CaseBootstrap
 import com.allocator.services.CaseLoader
+import com.allocator.services.KbStore
 import com.allocator.services.LlmAgentMessage
 import com.allocator.services.LlmNotConfiguredException
 import com.allocator.services.LlmTool
@@ -86,6 +88,10 @@ private data class AgentResponse(
     val steps: List<AgentStep>,
     @SerialName("config_update") val configUpdate: JsonObject? = null,
     @SerialName("fresh_run_id") val freshRunId: Int? = null,
+    // When run_plan_async returned status='still_running' (plan exceeded the
+    // 25s blocking window), this carries the job_id so the frontend can keep
+    // polling /plan/status/{job_id} and post a completion message itself.
+    @SerialName("pending_job_id") val pendingJobId: String? = null,
 )
 
 // ── Knowledge primer (curated value props + design + ops + glossary) ────────
@@ -141,16 +147,17 @@ Planner knowledge (from docs/waterfall-allocation.md):
   - mode = "preference" (lowest preference int wins) | "elaborate" (composite scoring
     of commit_time / inventory_consumed / purchase; ~3-4× slower wall-time).
   - method_selection.depth gates elaborate to top N BOM levels (default 1 = root only).
-  - consolidation.engine ("regulation scope" in the UI):
-      • "leaf-legacy" → UI label "Leaves only". Split policy applies only at
+  - consolidation.scope (the "regulation scope" knob):
+      • "leaf-only" → UI label "Leaves only". Split policy applies only at
         nodes that already hold supply (raw inventory, leftover stock, WOs
         carried over from a prior planning round). Make/move WOs generated
         this round run unconstrained.
-      • "supply" → UI label "All levels". Split policy applies at supply-
+      • "all" → UI label "All levels". Split policy applies at supply-
         bearing nodes AND every make/move WO generated this round. Buy WOs
         are unbounded either way.
-    Use the friendly labels when talking to users; use the keys when calling
-    tools (the config field is still `engine`).
+    Use the friendly labels when talking to users; use the keys ("leaf-only" /
+    "all") when calling tools. The config field is `scope` under
+    `consolidation` (e.g. consolidation.scope = "all").
   - consolidation.allocation_mode = "fair" (priority-first when ample, proportional
     under shortage) | "proportional" | "priority_first".
   - On case-171 the empirical sweet spot is mode=preference + max_methods=2.
@@ -164,6 +171,44 @@ Tactics:
   - When a plan finishes, end your reply with the plan_run_id and the headline KPIs.
   - When you make a config change, the user will see it applied to the form; you don't
     need to repeat it verbatim — just explain the *why* in their language.
+
+EXECUTION RULES:
+  - `run_plan_async` is non-blocking — it returns in under a second with a
+    job_id and status='started'. The plan runs in the background and the
+    chat panel posts the completion KPIs itself. Your reply should be ONE
+    short sentence: "Plan started — I'll show the result here when it
+    lands." Do NOT call `wait_for_plan`, `get_kpis`, or any other follow-up
+    tool to fetch the result; the user will see the completion message
+    automatically. Do NOT fabricate KPIs; the result is posted by the
+    chat panel, not by you.
+  - When the user asks to run a candidate from `suggest_next_batch`, you
+    MUST pass the candidate's `config` object to `update_config` VERBATIM
+    — every top-level key AND every nested field, even ones unchanged from
+    the current working config. Reason: `update_config` is a deep MERGE,
+    so any field you omit silently keeps the prior value, which will
+    diverge from the candidate's signature (e.g. period_days, scope,
+    allocation_mode often drop out and the actual run uses the wrong
+    config). Treat the candidate.config as a recipe you must transcribe
+    completely, not paraphrase.
+
+HONESTY RULES (these override "be helpful"):
+  - NEVER claim to have done something you didn't do. If the user asks you to "expand
+    the KB", you have NO tool to expand it from chat — say so plainly: "I can't expand
+    the KB from chat — click the 'Expand KB' button on the planning page, then ask me
+    again." Do NOT pretend the expansion happened. Do NOT silently fall through to
+    query_kb_runs and present existing rows as 'newly added'.
+  - When the user asks for "configs to try next" / "what should I explore?" /
+    "recommend new configurations": you MUST call suggest_next_batch. That tool is the
+    ONLY source of NOVEL proposals (single-axis variations off the current best,
+    dedup'd against every existing KB row + plan_run). DO NOT fall back to
+    query_kb_runs and present existing KB rows as proposals — those are NOT novel,
+    and the user can already see them. If suggest_next_batch returns an empty list,
+    say so honestly: "the curated single-axis library is exhausted for this case —
+    you've already explored every variation around the current best".
+  - Before recommending a specific signature in any context, if you constructed it
+    yourself (rather than reading it from suggest_next_batch), call is_signature_in_kb
+    on it first. If exists=true, the proposal is NOT novel — pick something else or
+    say so.
 """
 
 // ── Tool registry ────────────────────────────────────────────────────────────
@@ -205,14 +250,22 @@ private val TOOLS: List<LlmTool> = listOf(
     ),
     tool(
         "run_plan_async",
-        "Kick off a plan run with the working config. Returns job_id. " +
-            "Pair with wait_for_plan to block until completion.",
+        "Start a plan run with the working config — NON-BLOCKING. Returns in <1 second with " +
+            "{job_id, status='started', total_demands}. The chat panel polls in the background " +
+            "and posts the completion KPIs automatically when the plan finishes; you do NOT " +
+            "wait, do NOT call wait_for_plan, do NOT call get_kpis after this. Your reply " +
+            "should be a single short sentence telling the user the plan is running and that " +
+            "the result will appear shortly. The completion message is appended by the " +
+            "frontend, NOT by you.",
         emptyParams(),
     ),
     tool(
         "wait_for_plan",
-        "Block until a plan job completes (or times out at 10 minutes). " +
-            "Returns plan_run_id, status, fill_rate_pct, total_committed, total_requested.",
+        "Re-check a plan job started in a PRIOR turn (rare). Use only when the user comes back " +
+            "later asking 'is my plan done?' and you have the job_id from a previous turn — " +
+            "but normally the chat panel auto-posts completion, so this is almost never " +
+            "needed. Returns the same shape as run_plan_async. Do NOT call this in the same " +
+            "turn as run_plan_async.",
         buildJsonObject {
             put("type", "object")
             putJsonObject("properties") {
@@ -245,6 +298,135 @@ private val TOOLS: List<LlmTool> = listOf(
                     put("description",
                         "Optional status filter: 'success' | 'contingent' | 'failed' | 'running'. " +
                             "Omit to include all statuses.")
+                }
+            }
+            put("required", buildJsonArray { })
+        },
+    ),
+    tool(
+        "query_kb_runs",
+        "Parametric filter+sort over the case's Knowledge Base of plan runs (kb_records). " +
+            "Use this for KB-grounded questions when the KB has more rows than fit in " +
+            "list_plan_runs(50): 'top N by metric X', 'best fill under constraint Y', " +
+            "'all runs that varied axis Z'. Returns one row per (case, config-signature) — " +
+            "no duplicates from re-runs. Each row carries a kpis snapshot inline " +
+            "(fill_rate_pct, gini, p10_fill_ratio, median_fill_ratio, starvation_pct, " +
+            "on_time_count, total_committed, total_requested, manufacturing_total_quantity, " +
+            "inventory_consumed_total) plus plan_run_id (use this for downstream " +
+            "get_run_config / get_kpis calls — NOT kb_record_id, which is internal), " +
+            "signature, preset_id, primary_axis, soundness_status. Includes total_in_kb " +
+            "so you can detect a sparse KB (suggest /expand-kb when <10).",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("soundness_status") {
+                    put("type", "string")
+                    put("description", "Filter to one of: sound | unsound | unchecked. Omit for any.")
+                }
+                putJsonObject("min_fill_rate") { put("type", "number"); put("description", "fill_rate_pct ≥ this.") }
+                putJsonObject("max_gini")      { put("type", "number"); put("description", "gini ≤ this.") }
+                putJsonObject("min_p10_fill")  { put("type", "number"); put("description", "p10_fill_ratio ≥ this.") }
+                putJsonObject("primary_axis") {
+                    put("type", "string")
+                    put("description", "Use one of these short axis names — NOT dotted paths: " +
+                        "'scope', 'mode', 'max_methods', 'depth', 'score_weights', " +
+                        "'allocation_mode', 'period_days', 'purchase_allowed', " +
+                        "'consolidation_enabled', 'elaborate'. Only runs that bootstrap-" +
+                        "varied this axis off baseline.")
+                }
+                putJsonObject("preset_id") { put("type", "string"); put("description", "Filter to a single bootstrap preset id.") }
+                putJsonObject("sort_by") {
+                    put("type", "string")
+                    put("description",
+                        "fill_rate_desc | gini_asc | p10_fill_desc | starvation_asc | newest_first. " +
+                            "Default: fill_rate_desc.")
+                }
+                putJsonObject("limit") {
+                    put("type", "integer")
+                    put("description", "Max rows; default 20, hard-capped at 100.")
+                }
+            }
+            put("required", buildJsonArray { })
+        },
+    ),
+    tool(
+        "pareto_kb_runs",
+        "Compute the Pareto frontier of the case's KB over user-chosen KPI objectives. " +
+            "Use for multi-objective questions like 'best fill rate with reasonable fairness' " +
+            "or 'least purchase without hurting on-time': returns ONLY non-dominated runs, " +
+            "saving you from computing the frontier in-prompt. Pre-filter via min_fill_rate / " +
+            "max_gini to constrain the input set. KPI names must come from: fill_rate_pct, " +
+            "gini, p10_fill_ratio, median_fill_ratio, starvation_pct, on_time_count, " +
+            "total_committed, total_requested, manufacturing_total_quantity, " +
+            "inventory_consumed_total. Returns frontier rows sorted by the first maximize " +
+            "axis desc, plus a frontier_summary one-liner (e.g. '5 frontier points; " +
+            "fill_rate spans 11–25, gini spans 0.28–0.42').",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("maximize") {
+                    put("type", "array")
+                    putJsonObject("items") { put("type", "string") }
+                    put("description", "KPI names to maximize, e.g. ['fill_rate_pct'].")
+                }
+                putJsonObject("minimize") {
+                    put("type", "array")
+                    putJsonObject("items") { put("type", "string") }
+                    put("description", "KPI names to minimize, e.g. ['gini'].")
+                }
+                putJsonObject("soundness_status") {
+                    put("type", "string")
+                    put("description", "Default 'sound'. Pass 'any' to include unsound/unchecked.")
+                }
+                putJsonObject("min_fill_rate") { put("type", "number") }
+                putJsonObject("max_gini")      { put("type", "number") }
+            }
+            put("required", buildJsonArray { add("maximize"); add("minimize") })
+        },
+    ),
+    tool(
+        "is_signature_in_kb",
+        "Check whether a given config-signature already has a KB record for this case. " +
+            "Use this BEFORE recommending a 'config to try next' to confirm the proposal is " +
+            "actually novel — never propose a signature that returns exists=true. The signature " +
+            "format is the canonical pipe-delimited string emitted by the planner " +
+            "(e.g. 'm=preference|max=2|d=1|...|scope=leaf-only|alloc=fair|cons=true|p=0|purch=false'). " +
+            "Returns {exists: bool, total_in_kb: int}.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("signature") {
+                    put("type", "string")
+                    put("description", "The exact canonical signature to check.")
+                }
+            }
+            put("required", buildJsonArray { add("signature") })
+        },
+    ),
+    tool(
+        "suggest_next_batch",
+        "Generate up to N candidate configs to run NEXT — single-axis variations off the case's " +
+            "current best run, dedup'd against EVERY signature already in the KB or in any " +
+            "non-failed plan_run. This is the only tool that produces NOVEL configs (never " +
+            "rehashes). Each candidate is a draft — use update_config + run_plan_async to " +
+            "actually queue it. Empty result means the curated single-axis library is exhausted " +
+            "for this case (the user has already explored every variation around the current " +
+            "best). When the user asks 'what should I try next?' / 'recommend configs to " +
+            "explore' / 'next steps', call this — DO NOT fall back to query_kb_runs and " +
+            "present existing rows as proposals.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("criterion") {
+                    put("type", "string")
+                    put("description", "Which 'best run' to seed variations from: " +
+                        "'fill_rate' (default — best by fill_rate_pct desc), " +
+                        "'fairness' (best by gini asc), " +
+                        "'pareto' (Pareto-balanced over fill+fairness).")
+                }
+                putJsonObject("batch_size") {
+                    put("type", "integer")
+                    put("description", "Max candidates to return (default 3, hard-capped at 10).")
                 }
             }
             put("required", buildJsonArray { })
@@ -531,17 +713,37 @@ private suspend fun toolRunPlanAsync(
         "result" to null,
         "error" to null,
     )
-    engineScope.launch { runPlanBackground(jobId, caseId, data, configMap) }
+    // autoSave=true: chat-driven plans always commit to history + KB. There's
+    // no equivalent "decide whether to keep this run" UX in chat (the user
+    // already opted in by asking the agent to run it). The page-driven path
+    // (POST /cases/{id}/plan?async=true) keeps the explicit save flow.
+    engineScope.launch { runPlanBackground(jobId, caseId, data, configMap, autoSave = true) }
+    // Truly non-blocking. Earlier we tried chaining wait_for_plan up to 60s
+    // (then 25s) here so the agent could report KPIs in the same turn —
+    // but gpt-4o-mini frequently squeezes in extra tool calls after the
+    // wait returns, and the cumulative chat HTTP request blew past the
+    // Next.js dev-server proxy's 60s rewrite timeout, dropping users into
+    // the planningCopilot fallback. The job_id is returned immediately;
+    // the chat panel's mode-2 polling on /plan/status/{job_id} reports
+    // completion (and posts a synthetic "✓ Plan run N completed" message)
+    // entirely outside the chat HTTP request.
     return ToolResult(
         summary = loc(
-            "Started plan job $jobId ($total demands)",
-            "已启动计划任务 $jobId（$total 个需求）",
+            "Plan job $jobId started ($total demands) — chat will post the result when it lands",
+            "计划任务 $jobId 已启动（$total 个需求）— 完成后聊天会自动展示结果",
             locale,
         ),
         payload = buildJsonObject {
             put("job_id", jobId)
-            put("status", "running")
+            put("status", "started")
             put("total_demands", total)
+            put(
+                "note",
+                "The plan is running in the background. The chat panel polls and will append a " +
+                    "completion message when it finishes — you do NOT need to call wait_for_plan " +
+                    "or get_kpis. Just tell the user the plan started and that the result will " +
+                    "appear automatically.",
+            )
         },
     )
 }
@@ -549,7 +751,12 @@ private suspend fun toolRunPlanAsync(
 private suspend fun toolWaitForPlan(args: JsonObject, locale: String): ToolResult {
     val jobId = args["job_id"]?.jsonPrimitive?.contentOrNull
         ?: return toolError("`job_id` is required", locale)
-    val deadline = System.currentTimeMillis() + 60 * 1000
+    // 25-second window — must finish well below the Next.js dev-server proxy
+    // timeout (60s) AND leave headroom for the surrounding LLM round trips.
+    // When the wait expires with status=still_running, the frontend takes
+    // over polling /plan/status/{job_id} and posts a completion message
+    // when the plan finally lands.
+    val deadline = System.currentTimeMillis() + 25 * 1000
     while (System.currentTimeMillis() < deadline) {
         val job = planJobs[jobId] ?: return toolError("job $jobId not found (server restart?)", locale)
         when (job["status"]) {
@@ -609,10 +816,11 @@ private suspend fun toolWaitForPlan(args: JsonObject, locale: String): ToolResul
             put("progress_total", total)
             put(
                 "note",
-                "60-second wait window expired but plan is still in flight. " +
-                    "Reply to the user immediately with the job_id and total progress; " +
-                    "tell them to come back in a couple minutes and ask for the result. " +
-                    "Don't loop on wait_for_plan — the chat timeout will kick in.",
+                "60-second wait window expired; plan is still in flight. End your turn now: " +
+                    "tell the user the progress (e.g. \"$current of $total demands processed\"), " +
+                    "include the job_id, and ask them to come back in a minute or two for the " +
+                    "result. Do NOT call wait_for_plan again — the chat HTTP request will time " +
+                    "out before the plan finishes.",
             )
         },
     )
@@ -723,6 +931,243 @@ private fun toolListPlanRuns(caseId: Int, args: JsonObject, locale: String): Too
     )
 }
 
+// ── KB-aware tools (query / Pareto frontier over kb_records) ────────────────
+
+private fun kbRecordToJson(r: KbStore.KbRecord): JsonObject {
+    val kpis = runCatching { jsonParser.parseToJsonElement(r.kpisSnapshotJson).jsonObject }
+        .getOrElse { JsonObject(emptyMap()) }
+    return buildJsonObject {
+        // The headline `plan_run_id` is what get_run_config / get_kpis /
+        // get_demand_pegging consume. `kb_record_id` is an internal book-
+        // keeping id (one row per (case, signature) — re-runs upsert in
+        // place). When the source plan_run was deleted, plan_run_id is null.
+        if (r.sourcePlanRunId != null) put("plan_run_id", r.sourcePlanRunId)
+        put("kb_record_id", r.id)
+        put("signature", r.signature)
+        if (r.presetId != null) put("preset_id", r.presetId)
+        if (r.presetLabel != null) put("preset_label", r.presetLabel)
+        if (r.primaryAxis != null) put("primary_axis", r.primaryAxis)
+        put("soundness_status", r.soundnessStatus)
+        put("source_plan_run_deleted", r.sourcePlanRunDeleted)
+        put("kpis", kpis)
+    }
+}
+
+private fun parseSortBy(s: String?): KbStore.KbSortBy = when (s?.trim()?.lowercase()) {
+    "fill_rate_desc", null, "" -> KbStore.KbSortBy.FILL_RATE_DESC
+    "gini_asc"        -> KbStore.KbSortBy.GINI_ASC
+    "p10_fill_desc"   -> KbStore.KbSortBy.P10_FILL_DESC
+    "starvation_asc"  -> KbStore.KbSortBy.STARVATION_ASC
+    "newest_first", "created_desc" -> KbStore.KbSortBy.NEWEST_FIRST
+    else -> KbStore.KbSortBy.FILL_RATE_DESC
+}
+
+private fun jsonArrayOfStrings(el: JsonElement?): List<String> {
+    val arr = el as? JsonArray ?: return emptyList()
+    return arr.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+}
+
+private fun toolQueryKbRuns(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    // Lazy backfill — pulls any sound + successful plan_run that didn't get
+    // upserted into kb_records (defense in depth against auto-save misses,
+    // legacy rows, etc). Idempotent and bounded by case size.
+    runCatching { KbStore.backfillForCase(caseId) }
+    val limit = (args["limit"]?.jsonPrimitive?.intOrNull ?: 20).coerceIn(1, 100)
+    val sortBy = parseSortBy(args["sort_by"]?.jsonPrimitive?.contentOrNull)
+    val filter = KbStore.KbQueryFilter(
+        soundnessStatus = args["soundness_status"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() && it != "any" },
+        minFillRate = args["min_fill_rate"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull(),
+        maxGini = args["max_gini"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull(),
+        minP10Fill = args["min_p10_fill"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull(),
+        primaryAxis = args["primary_axis"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() },
+        presetId = args["preset_id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() },
+    )
+    val result = KbStore.query(caseId, filter, sortBy, limit)
+    val summary =
+        if (result.totalInKb == 0)
+            loc("KB empty for case $caseId — suggest /expand-kb",
+                "案例 $caseId 的 KB 为空 — 建议运行 /expand-kb", locale)
+        else
+            loc("${result.rows.size} of ${result.totalInKb} KB rows match",
+                "${result.rows.size}/${result.totalInKb} 条 KB 记录匹配", locale)
+    return ToolResult(
+        summary = summary,
+        payload = buildJsonObject {
+            put("count", result.rows.size)
+            put("total_in_kb", result.totalInKb)
+            put("runs", buildJsonArray {
+                result.rows.forEach { add(kbRecordToJson(it)) }
+            })
+        },
+    )
+}
+
+private fun toolParetoKbRuns(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    runCatching { KbStore.backfillForCase(caseId) }
+    val maximize = jsonArrayOfStrings(args["maximize"])
+    val minimize = jsonArrayOfStrings(args["minimize"])
+    val rawSoundness = args["soundness_status"]?.jsonPrimitive?.contentOrNull?.trim()
+    val soundness = when {
+        rawSoundness.isNullOrBlank() -> "sound"   // default: only sound runs
+        rawSoundness == "any"        -> null
+        else                         -> rawSoundness
+    }
+    val prefilter = KbStore.KbQueryFilter(
+        soundnessStatus = soundness,
+        minFillRate = args["min_fill_rate"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull(),
+        maxGini = args["max_gini"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull(),
+    )
+    val result = KbStore.paretoFrontier(caseId, maximize, minimize, prefilter)
+    if (result.errors.isNotEmpty()) {
+        return ToolResult(
+            summary = loc(
+                "pareto: ${result.errors.joinToString("; ")}",
+                "pareto 错误：${result.errors.joinToString("; ")}",
+                locale,
+            ),
+            payload = buildJsonObject {
+                put("error", result.errors.joinToString("; "))
+                put("allowed_kpi_names", buildJsonArray { KbStore.KPI_ALLOWLIST.forEach { add(it) } })
+            },
+        )
+    }
+    // Build a one-line frontier summary scanning the parsed KPIs of the frontier rows.
+    val frontierKpis = result.frontier.map { KbStore.parseKpiSnapshot(it.kpisSnapshotJson) }
+    val spans = (maximize + minimize).joinToString("; ") { kpi ->
+        val vals = frontierKpis.mapNotNull { it[kpi] }
+        if (vals.isEmpty()) "$kpi n/a"
+        else "$kpi spans ${"%.2f".format(vals.min())}–${"%.2f".format(vals.max())}"
+    }
+    val frontierSummary = "${result.frontier.size} frontier point(s); $spans"
+    val summary =
+        if (result.totalInKb == 0)
+            loc("KB empty for case $caseId — suggest /expand-kb",
+                "案例 $caseId 的 KB 为空 — 建议运行 /expand-kb", locale)
+        else
+            loc("${result.frontier.size} frontier of ${result.totalInKb} KB rows",
+                "在 ${result.totalInKb} 条 KB 记录中找到 ${result.frontier.size} 个帕累托前沿点", locale)
+    return ToolResult(
+        summary = summary,
+        payload = buildJsonObject {
+            put("count", result.frontier.size)
+            put("total_in_kb", result.totalInKb)
+            put("frontier_summary", frontierSummary)
+            put("runs", buildJsonArray {
+                result.frontier.forEach { add(kbRecordToJson(it)) }
+            })
+        },
+    )
+}
+
+private fun toolIsSignatureInKb(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val sig = args["signature"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`signature` is required", locale)
+    val (exists, total) = transaction {
+        // Authoritative: kb_records covers KB-promoted runs; plan_run.config
+        // covers user-driven runs that haven't been promoted yet (e.g. unsound).
+        // Either match means the signature is "already tried".
+        val kbHit = com.allocator.KbRecords.selectAll()
+            .where { (com.allocator.KbRecords.caseId eq caseId) and (com.allocator.KbRecords.signature eq sig) }
+            .firstOrNull() != null
+        if (kbHit) {
+            return@transaction true to com.allocator.KbRecords.selectAll()
+                .where { com.allocator.KbRecords.caseId eq caseId }.count().toInt()
+        }
+        // Fall back: scan non-failed plan_runs and recompute signature.
+        val planRunHit = com.allocator.PlanRuns.selectAll()
+            .where { (com.allocator.PlanRuns.caseId eq caseId) and (com.allocator.PlanRuns.status neq "failed") }
+            .toList().any { row ->
+                val raw = row[com.allocator.PlanRuns.config] ?: return@any false
+                val cfg = runCatching { jsonParser.parseToJsonElement(raw).jsonObject }.getOrNull()
+                    ?: return@any false
+                CaseBootstrap.signatureFor(cfg) == sig
+            }
+        planRunHit to com.allocator.KbRecords.selectAll()
+            .where { com.allocator.KbRecords.caseId eq caseId }.count().toInt()
+    }
+    return ToolResult(
+        summary = if (exists)
+            loc("signature already in KB / plan_run history",
+                "签名已存在于 KB / plan_run 历史中", locale)
+        else
+            loc("signature is NOVEL — safe to propose",
+                "签名是新的 — 可以推荐", locale),
+        payload = buildJsonObject {
+            put("exists", exists)
+            put("total_in_kb", total)
+            put("signature", sig)
+        },
+    )
+}
+
+private fun toolSuggestNextBatch(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val batchSize = (args["batch_size"]?.jsonPrimitive?.intOrNull ?: 3).coerceIn(1, 10)
+    val criterionRaw = args["criterion"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotBlank() }
+    val criterion = when (criterionRaw) {
+        null, "fill_rate" -> CaseBootstrap.CRITERION_FILL_RATE
+        "fairness"        -> CaseBootstrap.CRITERION_FAIRNESS
+        "pareto"          -> CaseBootstrap.CRITERION_PARETO
+        else -> return toolError(
+            "criterion must be 'fill_rate', 'fairness', or 'pareto' (got '$criterionRaw')",
+            locale,
+        )
+    }
+    val candidates = CaseBootstrap.selectNextBatch(caseId, batchSize, criterion)
+    if (candidates.isEmpty()) {
+        return ToolResult(
+            summary = loc(
+                "single-axis library exhausted for case $caseId — no novel proposals",
+                "案例 $caseId 的单轴变体已穷尽 — 无新建议",
+                locale,
+            ),
+            payload = buildJsonObject {
+                put("count", 0)
+                put("criterion", criterion)
+                put(
+                    "note",
+                    "All single-axis variations off the current best are already in the KB or " +
+                        "plan_run history. Suggest the user combine multiple knobs manually via " +
+                        "update_config, or revisit older configs with new soundness rules.",
+                )
+            },
+        )
+    }
+    return ToolResult(
+        summary = loc(
+            "${candidates.size} candidate config(s) (criterion=$criterion)",
+            "${candidates.size} 个候选配置（criterion=$criterion）",
+            locale,
+        ),
+        payload = buildJsonObject {
+            put("count", candidates.size)
+            put("criterion", criterion)
+            put("candidates", buildJsonArray {
+                candidates.forEach { p ->
+                    add(buildJsonObject {
+                        put("preset_id", p.presetId)
+                        put("label", p.label)
+                        put("primary_axis", p.primaryAxis)
+                        put("signature", CaseBootstrap.signatureFor(p.config))
+                        put("config", p.config)
+                    })
+                }
+            })
+            put(
+                "note",
+                "Each candidate is a single-knob variation off the current best, dedup'd against " +
+                    "every signature in this case's KB + plan_run history. To run one, call " +
+                    "update_config with `partial` set to the EXACT candidate.config object — " +
+                    "every top-level key (purchase_allowed, method_selection, variant_selection, " +
+                    "consolidation, analyze_criticality, check_soundness) and every nested field " +
+                    "(consolidation.period_days, consolidation.scope, …) MUST be present. " +
+                    "update_config is a deep MERGE — anything you omit silently keeps the prior " +
+                    "working-config value, which will diverge from the candidate's signature. " +
+                    "Then call run_plan_async (it auto-saves and the chat panel posts the result).",
+            )
+        },
+    )
+}
+
 private fun toolGetKpis(caseId: Int, args: JsonObject, locale: String): ToolResult {
     val runId = args["run_id"]?.jsonPrimitive?.intOrNull
         ?: return toolError("`run_id` is required", locale)
@@ -796,7 +1241,7 @@ private fun toolGetSupplySplitExplanation(caseId: Int, args: JsonObject, locale:
     val match = sla.firstOrNull { it["supply_id"]?.toString() == supplyId }
         ?: return toolError(
             "supply $supplyId not in supply_level_allocations for run $runId — " +
-                "either run used 'Leaves only' regulation scope (engine=leaf-legacy) " +
+                "either run used 'Leaves only' regulation scope (consolidation.scope=leaf-only) " +
                 "or supply wasn't consolidated",
             locale,
         )
@@ -1024,6 +1469,7 @@ private suspend fun runAgentLoop(
 ): AgentResponse {
     var workingConfig = initialConfig
     var freshRunId: Int? = null
+    var pendingJobId: String? = null
     val steps = mutableListOf<AgentStep>()
     // Locale drives only the tool result summaries shown in the chat-step trace
     // — the LLM-rendered reply already mirrors the user's language via the
@@ -1084,6 +1530,7 @@ private suspend fun runAgentLoop(
                 steps = steps,
                 configUpdate = workingConfig.takeIf { it != initialConfig },
                 freshRunId = freshRunId,
+                pendingJobId = pendingJobId,
             )
         }
 
@@ -1097,10 +1544,21 @@ private suspend fun runAgentLoop(
                 .getOrElse { JsonObject(emptyMap()) }
             val (result, configAfter) = dispatchTool(caseId, call, args, workingConfig, locale)
             workingConfig = configAfter
-            // wait_for_plan succeeded → capture run id for the response envelope.
-            if (call.name == "wait_for_plan") {
-                val rid = (result.payload as? JsonObject)?.get("plan_run_id")?.jsonPrimitive?.intOrNull
-                if (rid != null) freshRunId = rid
+            // run_plan_async always returns immediately with status='started';
+            // wait_for_plan (rarely called now) may return 'completed',
+            // 'still_running', or 'failed'. In any in-flight case the
+            // frontend takes over via pending_job_id polling.
+            if (call.name == "run_plan_async" || call.name == "wait_for_plan") {
+                val payload = result.payload as? JsonObject
+                val rid = payload?.get("plan_run_id")?.jsonPrimitive?.intOrNull
+                val status = payload?.get("status")?.jsonPrimitive?.contentOrNull
+                if (rid != null) {
+                    freshRunId = rid
+                    pendingJobId = null
+                } else if (status == "started" || status == "running" || status == "still_running") {
+                    val jid = payload?.get("job_id")?.jsonPrimitive?.contentOrNull
+                    if (jid != null) pendingJobId = jid
+                }
             }
             steps.add(AgentStep(tool = call.name, args = args, resultSummary = result.summary))
             convo.add(LlmAgentMessage(role = "tool", toolCallId = call.id, content = result.payload.toString()))
@@ -1116,6 +1574,7 @@ private suspend fun runAgentLoop(
         steps = steps,
         configUpdate = workingConfig.takeIf { it != initialConfig },
         freshRunId = freshRunId,
+        pendingJobId = pendingJobId,
     )
 }
 
@@ -1132,6 +1591,10 @@ private suspend fun dispatchTool(
         "run_plan_async" -> Pair(toolRunPlanAsync(caseId, workingConfig, locale), workingConfig)
         "wait_for_plan" -> Pair(toolWaitForPlan(args, locale), workingConfig)
         "list_plan_runs" -> Pair(toolListPlanRuns(caseId, args, locale), workingConfig)
+        "query_kb_runs" -> Pair(toolQueryKbRuns(caseId, args, locale), workingConfig)
+        "pareto_kb_runs" -> Pair(toolParetoKbRuns(caseId, args, locale), workingConfig)
+        "is_signature_in_kb" -> Pair(toolIsSignatureInKb(caseId, args, locale), workingConfig)
+        "suggest_next_batch" -> Pair(toolSuggestNextBatch(caseId, args, locale), workingConfig)
         "get_kpis" -> Pair(toolGetKpis(caseId, args, locale), workingConfig)
         "get_demand_pegging" -> Pair(toolGetDemandPegging(caseId, args, locale), workingConfig)
         "get_supply_split_explanation" -> Pair(toolGetSupplySplitExplanation(caseId, args, locale), workingConfig)
