@@ -85,6 +85,15 @@ private const val DEFAULT_MAX_METHODS = 2
  *  method slots. Prevents trivial 0.x-unit second WOs from lot-size or
  *  bottleneck-rounding leftovers. */
 private const val MIN_WATERFALL_RESIDUAL = 0.5
+
+/** Maximum real-make recursion depth admitted at the reactive-fallback site
+ *  in plan(). A `make` alternative whose precomputed `maxMakeDepth` exceeds
+ *  this cap is structurally too deep to attempt — the make would either
+ *  recurse uselessly or compound. Empirically 3 covers typical case-171
+ *  patterns (e.g. 260-0385.make → 280-1786.make → leaf supply, depth=2)
+ *  while leaving headroom; bumping higher trades recovery potential for
+ *  recursion cost. */
+private const val FALLBACK_MAKE_DEPTH_CAP = 3
 private fun parseMaxMethods(rawMax: Any?, multiple: Boolean, multiplePresent: Boolean): Int {
     if (rawMax != null) {
         val n = (rawMax as? Number)?.toInt()
@@ -507,6 +516,112 @@ fun getMethods(productId: String, locationId: String, data: Map<String, List<Map
         }
     }
     return result
+}
+
+/**
+ * Compute the minimum real-make-recursion depth needed to source `productId`
+ * at `locationId` via any structurally-feasible path through the location-
+ * aware method graph. Used by the reactive-fallback site in plan() to gate
+ * make alternatives — a make whose `maxMakeDepth` exceeds the budget cap is
+ * skipped without recursing, preventing wasteful exploration of structurally
+ * doomed paths.
+ *
+ * Edge semantics:
+ *   • Direct supply at (pid, lid):                              depth = 0
+ *   • Buy at (pid, lid) (purchase_allowed):                     depth = 0
+ *   • Move from (pid, source_lid) to (pid, lid):                depth = maxMakeDepth(pid, source_lid)
+ *       — moves traverse the location graph WITHOUT consuming budget
+ *   • Make at (pid, lid):
+ *       - Real parent (non-VirtualProduct):                     depth = 1 + max child depth
+ *       - VirtualProduct parent:                                depth = max child depth (transparent)
+ *       - Variants (alt_groups): pick the variant with min max child depth
+ *
+ * Cycle handling: an `inProgress` set marks nodes currently being explored.
+ * Hitting an in-progress node returns `Int.MAX_VALUE` for that branch — the
+ * cycle path is structurally unable to bottom out via supply/buy and is
+ * useless as a make-fallback target.
+ *
+ * Date-aware supply NOT considered — the cache is a structural feasibility
+ * filter; the runtime planner still does date-aware allocation and may
+ * legitimately fail even when the cache says depth is small. The cache's
+ * job is to skip *wasteful* recursion, not all failed recursion.
+ *
+ * Memoized via the `cache` parameter — first call populates, subsequent calls
+ * are O(1) lookup. Caller owns the cache lifetime (typically reset per
+ * planning run).
+ */
+internal fun maxMakeDepth(
+    productId: String,
+    locationId: String,
+    data: Map<String, List<Map<String, Any?>>>,
+    purchaseAllowed: Boolean,
+    cache: MutableMap<Pair<String, String>, Int>,
+    inProgress: MutableSet<Pair<String, String>> = mutableSetOf(),
+): Int {
+    val key = Pair(productId, locationId)
+    cache[key]?.let { return it }
+    if (key in inProgress) return Int.MAX_VALUE
+    inProgress.add(key)
+    try {
+        var minDepth = Int.MAX_VALUE
+
+        // Direct supply at (pid, lid)
+        val hasSupply = (data["supply"] ?: emptyList()).any { s ->
+            (s["product_id"] as? String)?.trim() == productId &&
+                (s["location_id"] as? String)?.trim() == locationId &&
+                ((s["qty"] as? Number)?.toDouble() ?: 0.0) > 0
+        }
+        if (hasSupply) minDepth = 0
+
+        if (minDepth > 0) {
+            val methods = getMethods(productId, locationId, data)
+                .let { if (purchaseAllowed) it else it.filter { m -> m["type"] != "purchase" } }
+
+            for (m in methods) {
+                val depth = when (m["type"]) {
+                    "purchase" -> 0
+                    "move" -> {
+                        val source = (m["from_location_id"] as? String)?.trim()
+                        if (source.isNullOrBlank()) Int.MAX_VALUE
+                        else maxMakeDepth(productId, source, data, purchaseAllowed, cache, inProgress)
+                    }
+                    "make" -> {
+                        val variants = variantsForMake(productId, locationId, 1.0, m, data)
+                        if (variants.isEmpty()) Int.MAX_VALUE
+                        else {
+                            // For each variant (alt_group), need max child depth.
+                            // Across variants (OR semantics for alt-groups), pick min.
+                            var minVariantDepth = Int.MAX_VALUE
+                            for ((_, childList) in variants) {
+                                var maxChildDepth = 0
+                                var allReachable = true
+                                for (c in childList) {
+                                    val cPid = (c["product_id"] as? String)?.trim() ?: continue
+                                    val cLid = (c["location_id"] as? String)?.trim() ?: locationId
+                                    val cDepth = maxMakeDepth(cPid, cLid, data, purchaseAllowed, cache, inProgress)
+                                    if (cDepth == Int.MAX_VALUE) { allReachable = false; break }
+                                    if (cDepth > maxChildDepth) maxChildDepth = cDepth
+                                }
+                                if (allReachable && maxChildDepth < minVariantDepth) minVariantDepth = maxChildDepth
+                            }
+                            if (minVariantDepth == Int.MAX_VALUE) Int.MAX_VALUE
+                            else if (productId.startsWith("VirtualProduct_")) minVariantDepth
+                            else if (minVariantDepth >= Int.MAX_VALUE - 1) Int.MAX_VALUE
+                            else 1 + minVariantDepth
+                        }
+                    }
+                    else -> Int.MAX_VALUE
+                }
+                if (depth < minDepth) minDepth = depth
+                if (minDepth == 0) break
+            }
+        }
+
+        cache[key] = minDepth
+        return minDepth
+    } finally {
+        inProgress.remove(key)
+    }
 }
 
 /** Pick best method by preference (lowest number). */
@@ -960,6 +1075,7 @@ internal fun planMethodSlot(
     variantOverride: Map<String, Any?>?,
     methodChoiceExplanation: String,
     overrideActive: Boolean,
+    feasibilityCache: MutableMap<Pair<String, String>, Int>? = null,
 ): MethodSlotResult {
     val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
     val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
@@ -1023,7 +1139,7 @@ internal fun planMethodSlot(
         val neededQty = (c["quantity"] as? Number)?.toDouble() ?: 0.0
         val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
             "quantity" to neededQty, "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget)
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget, feasibilityCache = feasibilityCache)
         val effectiveQty = solvedList.sumOf { s ->
             val r = s["commit_reason"] as? String
             if (r == "cycle_stopped" || r == "cycle_detected") 0.0
@@ -1162,7 +1278,7 @@ internal fun planMethodSlot(
                 val cReqDt = dateAddDays(reqDt, -leadDays)
                 val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
                     "quantity" to c["quantity"], "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
-                val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget)
+                val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget, feasibilityCache = feasibilityCache)
                 childWos.addAll(cWos)
                 if (cPegging != null) childPeggingNodes.add(cPegging)
                 solvedList.forEach { s -> parseDate(s["commit_time"] as? String)?.let { commitTimes.add(it) } }
@@ -1362,6 +1478,14 @@ fun plan(
      * Stage-3 alternative to demand-tagged synthetic supply buckets.
      */
     budget: MutableMap<String, Double>? = null,
+    /**
+     * Memoized make-feasibility cache: `(pid, lid) → maxMakeDepth`. When non-null,
+     * the reactive-fallback site admits make-as-fallback for products whose depth
+     * is bounded by [FALLBACK_MAKE_DEPTH_CAP]. Caller-owned; computed lazily on
+     * first query. Pass `mutableMapOf()` from the planning entry to enable, or
+     * leave `null` to keep fallback move-only.
+     */
+    feasibilityCache: MutableMap<Pair<String, String>, Int>? = null,
 ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
 
     val productId = (demand["product_id"] as? String)?.trim() ?: ""
@@ -1585,6 +1709,7 @@ fun plan(
                 variantOverride = variantOverride,
                 methodChoiceExplanation = slotLabel,
                 overrideActive = overrideActiveW,
+                feasibilityCache = feasibilityCache,
             )
             // Always record the slot's pegging node so the UI shows every attempt
             // (including blocked ones with zero qty). Hard-failures still consume
@@ -1652,27 +1777,45 @@ fun plan(
 
     // ── Single-method commit via the shared planMethodSlot helper ───────────
     // Reactive fallback: if the picked method blocks at 0 achievable, try
-    // the next method by preference. SCOPE: limited to **move-to-move**
-    // alternatives only (same product, different `from_location`). Catches
-    // the operator's primary case — picking the "wrong" source location
-    // when two moves are tied on preference (e.g. `move 1000→VIRTUAL`
-    // blocks because the @1000 chain dies; `move 2000→VIRTUAL` succeeds
-    // via the @2000 chain). The downstream BOM is the same; only the
-    // source location differs, so cost stays bounded.
+    // alternatives by preference. Two flavours of alternative are admitted:
     //
-    // EXCLUDED: make-as-fallback. A make method's planMethodSlot recurses
-    // through its BOM children, each potentially multi-method, each with
-    // its own potential fallback. That recursion compounds — observed
-    // ~14× normal log volume on case 171 when fallback admitted make
-    // alternatives. If the picked method is `make` or `purchase`, no
-    // fallback. If the only alternatives are different types, no fallback.
+    //  1) Move-to-move (same product, different `from_location`). Catches the
+    //     operator's primary case — tied-preference moves at the same site
+    //     where one source's downstream chain dies but another succeeds
+    //     (e.g. `move 1000→VIRTUAL` blocks via the @1000 chain;
+    //     `move 2000→VIRTUAL` succeeds via @2000). Downstream BOM is the
+    //     same — only the starting location differs, so cost is bounded.
+    //
+    //  2) Real make alternatives gated by [maxMakeDepth] feasibility cache.
+    //     The cache pre-computes the minimum real-make-recursion depth needed
+    //     to source `(productId, locationId)` via any structurally-feasible
+    //     path (moves are free traversals, makes count). A make whose depth
+    //     exceeds [FALLBACK_MAKE_DEPTH_CAP] is skipped without recursing —
+    //     no wasteful exploration of structurally doomed BOM subtrees. Only
+    //     fires when [feasibilityCache] is provided.
+    //
+    // VirtualProduct_* targets are exempt from the make filter (their only
+    // method is make by data-model construction).
     val isMoveType = m["type"] == "move"
     val moveAlternatives: List<Map<String, Any?>> = if (isMoveType) {
         effectiveMethods
             .filter { it["type"] == "move" && it["from_location_id"] != m["from_location_id"] }
             .sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
     } else emptyList()
-    val fallbackOrder = listOf(m) + moveAlternatives
+    val makeAlternatives: List<Map<String, Any?>> = if (feasibilityCache != null) {
+        val purchaseAllowedForCache = config?.get("purchase_allowed") != false
+        effectiveMethods
+            .filter { it["type"] == "make" && it !== m }
+            .filter {
+                if (productId.startsWith("VirtualProduct_")) true
+                else {
+                    val depth = maxMakeDepth(productId, locationId, data, purchaseAllowedForCache, feasibilityCache)
+                    depth <= FALLBACK_MAKE_DEPTH_CAP
+                }
+            }
+            .sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
+    } else emptyList()
+    val fallbackOrder = listOf(m) + moveAlternatives + makeAlternatives
     val cap = methodCfg.maxMethods.coerceAtMost(fallbackOrder.size)
 
     var slot: MethodSlotResult? = null
@@ -1696,6 +1839,7 @@ fun plan(
             variantOverride = variantOverride,
             methodChoiceExplanation = labelPrefix,
             overrideActive = overrideActive,
+            feasibilityCache = feasibilityCache,
         )
         if (attempt.blockedReason != null) {
             // Hard block: keep the failed WO for diagnosis, advance to next method.
@@ -2454,6 +2598,11 @@ private fun legacyCommit(
     val workOrders = mutableListOf<Map<String, Any?>>()
     val planningPegging = mutableListOf<Map<String, Any?>>()
     val total = demands.size
+    // One feasibility cache shared across all demands in this commit pass.
+    // Lazily populated on first query at the reactive-fallback site;
+    // unaffected demands incur no cost. Stable across the loop because
+    // `data` and `purchase_allowed` don't change mid-commit.
+    val feasibilityCache: MutableMap<Pair<String, String>, Int> = mutableMapOf()
     demands.forEachIndexed { i, d ->
         val reqStr = d["request_due_time"] as? String ?: d["request_time"] as? String
         val reqDt = parseDate(reqStr)
@@ -2464,6 +2613,7 @@ private fun legacyCommit(
             d, inventory, data, reqDt,
             config = config, preferDemandId = prefId, overrideIndex = overrideIndex,
             budget = demandBudget,
+            feasibilityCache = feasibilityCache,
         )
         committedDemands.addAll(solvedList)
         workOrders.addAll(wos)
