@@ -1818,15 +1818,30 @@ fun plan(
     val fallbackOrder = listOf(m) + moveAlternatives + makeAlternatives
     val cap = methodCfg.maxMethods.coerceAtMost(fallbackOrder.size)
 
-    var slot: MethodSlotResult? = null
-    val blockedSlotsPegging = mutableListOf<Map<String, Any?>>()
+    // Mini-waterfall over `fallbackOrder`. Three flavours of advancement:
+    //   • Reactive fallback — slot blocks (achievable=0). `continue` to next.
+    //   • Proactive split into a MAKE — when the previous slot succeeded only
+    //     partially AND the next slot is a make, run it for residual qty.
+    //     Bounded by feasibilityCache having admitted the make in the first
+    //     place (it gates by maxMakeDepth).
+    //   • Otherwise (next slot is move and prev succeeded): break — splitting
+    //     across moves at deep levels causes 2^N compounding (case 171's
+    //     SUB_PCBA-style chains).
+    val combinedWos = mutableListOf<Map<String, Any?>>()
+    val combinedPegging = mutableListOf<Map<String, Any?>>()
+    var residual = demandNetQty
+    var totalAchievable = 0.0
+    var anyChildShortAccum = false
+    var latestCommit: LocalDate? = null
     var lastBlockedReason: String? = null
     for ((slotIdx, candidate) in fallbackOrder.take(cap).withIndex()) {
+        if (slotIdx > 0 && residual <= MIN_WATERFALL_RESIDUAL) break
         val labelPrefix = if (slotIdx == 0) methodChoiceExplanation
-            else "Reactive fallback ${slotIdx + 1}/$cap (preferred method blocked): " +
-                "${candidate["type"]}@${candidate["location_id"] ?: candidate["to_location_id"] ?: ""}"
+            else "Fallback slot ${slotIdx + 1}/$cap: " +
+                "${candidate["type"]}@${candidate["location_id"] ?: candidate["to_location_id"] ?: ""}" +
+                " (residual=${roundQty(residual).toLong()})"
         val attempt = planMethodSlot(
-            m = candidate, slotQty = demandNetQty,
+            m = candidate, slotQty = if (slotIdx == 0) demandNetQty else residual,
             productId = productId, locationId = locationId,
             demand = demand, demandId = demandId,
             requestTimeDt = requestTimeDt, reqTimeStr = reqTimeStr,
@@ -1841,35 +1856,40 @@ fun plan(
             overrideActive = overrideActive,
             feasibilityCache = feasibilityCache,
         )
+        combinedPegging.add(attempt.methodPeggingNode)
         if (attempt.blockedReason != null) {
-            // Hard block: keep the failed WO for diagnosis, advance to next method.
-            blockedSlotsPegging.add(attempt.methodPeggingNode)
+            // Reactive fallback: try the next method on hard block.
             lastBlockedReason = attempt.blockedReason
             continue
         }
-        slot = attempt
-        break
+        combinedWos.addAll(attempt.wos)
+        totalAchievable += attempt.achievableQty
+        residual -= attempt.achievableQty
+        if (attempt.anyChildShort) anyChildShortAccum = true
+        attempt.latestCommit?.let { c -> if (latestCommit == null || c > latestCommit) latestCommit = c }
+
+        // Proactive split allowed only when the next admitted slot is a make.
+        // Move-to-move split would compound at deep multi-move sites; make
+        // alternatives are gated by feasibilityCache and naturally bounded.
+        val nextIdx = slotIdx + 1
+        if (nextIdx >= cap) break
+        if (fallbackOrder[nextIdx]["type"] != "make") break
     }
 
-    if (slot == null) {
-        // Every method blocked. Surface the last failed reason and include all
-        // failed-method WOs so the UI shows what was attempted at this site.
+    if (totalAchievable <= 1e-9) {
+        // Every slot blocked. Surface the last failed reason and include all
+        // attempted WOs so the UI shows the full fallback trail.
         demandFulfilledList.add(committedRow(0.0, reqTimeStr, lastBlockedReason ?: "no_methods_succeeded"))
-        val failedPegging = blockedSlotsPegging + peggingChildren
+        val failedPegging = combinedPegging + peggingChildren
         return Triple(demandFulfilledList, emptyList(), demandNode(failedPegging, reqTimeStr, lastBlockedReason, committedQty = taken))
     }
 
-    // Earlier blocked attempts (if any) are kept alongside the successful WO
-    // so the pegging UI shows the full fallback trail.
-    peggingChildren.addAll(blockedSlotsPegging)
-    peggingChildren.add(slot.methodPeggingNode)
-
-    // "partial" is NOT a failure reason — it keeps is_failed=false so enrichCommittedDemands
-    // counts achievableQty toward effectiveCommitted and computes shortage correctly.
-    val partialReason = if (slot.anyChildShort && slot.achievableQty < demandNetQty - 1e-9) "partial" else null
-    val commitTimeStr = formatDate(slot.latestCommit)
-    demandFulfilledList.add(committedRow(slot.achievableQty, commitTimeStr, partialReason))
-    return Triple(demandFulfilledList, slot.wos, demandNode(peggingChildren, commitTimeStr, partialReason, committedQty = taken + slot.achievableQty))
+    // Some commit. Combine all attempted WOs (success + blocked) in pegging.
+    peggingChildren.addAll(combinedPegging)
+    val partialReason = if ((anyChildShortAccum || combinedPegging.size > 1) && residual > 1e-9) "partial" else null
+    val commitTimeStr = formatDate(latestCommit)
+    demandFulfilledList.add(committedRow(totalAchievable, commitTimeStr, partialReason))
+    return Triple(demandFulfilledList, combinedWos, demandNode(peggingChildren, commitTimeStr ?: reqTimeStr, partialReason, committedQty = taken + totalAchievable))
 }
 
 // ── Lot-batching helper ────────────────────────────────────────────────────────
