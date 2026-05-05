@@ -145,6 +145,16 @@ fun checkRunSoundness(
     for (row in committedDemands) {
         val did = row["demand_id"]?.toString() ?: continue
         if (did.isBlank()) continue
+        // Skip hard-planning-failure rows. plan() emits a committedRow with
+        // `quantity=residual` and `commit_reason=no_methods | no_preferred_method
+        // | cycle_stopped | depth_limit | child_failed:*` to flag the SHORTFALL,
+        // not actual commit. The tree root's committed_qty correctly reports 0
+        // in those cases, so summing the shortfall qty here causes spurious R0
+        // mismatches (Negative_Inventory_* pseudo-demands and any fully-blocked
+        // real demand). Benign reasons (inventory, partial, null) and the
+        // `no_methods_succeeded` zero-qty placeholder pass through.
+        val reason = row["commit_reason"] as? String
+        if (isHardPlanningFailure(reason)) continue
         val q = (row["quantity"] as? Number)?.toDouble() ?: 0.0
         committedQtyById[did] = (committedQtyById[did] ?: 0.0) + q
     }

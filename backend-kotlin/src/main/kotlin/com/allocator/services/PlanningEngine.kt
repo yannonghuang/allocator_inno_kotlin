@@ -200,6 +200,23 @@ internal fun isHardPlanningFailure(reason: String?): Boolean {
     return true  // no_methods, no_preferred_method, depth_limit, child_failed:*, etc.
 }
 
+/**
+ * Classify a planning block reason as *structural* — i.e. dependent only on
+ * `data` (BOM/methods topology), not on inventory state or path context.
+ *
+ * Used by the reactive-fallback site to memoize "this make is doomed" answers
+ * across demands. Once a make-fallback for (pid, lid) blocks on a structural
+ * cascade, no future demand can succeed at the same site for the same reason.
+ *
+ * Conservative inclusion: only `no_methods` and `no_preferred_method`
+ * (raw + cascaded forms via `child_failed:*(...)`). NOT `cycle_stopped`
+ * (path-dependent), NOT `no_inventory` / `partial` (state-dependent).
+ */
+internal fun isStructuralFailure(reason: String?): Boolean {
+    if (reason.isNullOrBlank()) return false
+    return reason.contains("no_methods") || reason.contains("no_preferred_method")
+}
+
 /** Holds the first-pass planning result for a single child material. */
 private data class ChildPassResult(
     val child: Map<String, Any?>,
@@ -257,6 +274,52 @@ internal fun resolveDeepestCause(reason: String?): Triple<String, String, String
  * pass is appropriate (AND) or whether to keep first-pass per-variant commits
  * as-is (OR — each variant already represents an independent attempt).
  */
+/**
+ * Compute the root-bottleneck child keys using iter-0 budget caps.
+ *
+ * The genuine origin of an AND-min cap is the child whose iter-0 fair-share
+ * (cap / needed-qty ratio) is the smallest among siblings. Iter-N convergence
+ * later smears all siblings down to align with this child, so the post-
+ * convergence ratios all tie — losing the origin's identity. The iter-0
+ * snapshot in [initialBudget] preserves it.
+ *
+ * Returns the key set (typically size 1, possibly more on ties within 1e-9).
+ * Empty if [initialBudget] is null, no child has a finite cap, or the spread
+ * between min and max iter-0 ratios is below 5% (no clear origin).
+ *
+ * Called from BOTH the AND-bottleneck branch (where current AND-min fires)
+ * AND the no-shortage branch (where it doesn't, e.g. the post-convergence
+ * pass that builds the displayed tree). The latter is critical: without
+ * tagging there, the deeper level's signal is overwritten when the outer
+ * level's second-pass plan() rebuilds children at the converged qty.
+ */
+private fun computeRootBottleneckKeys(
+    childPassResults: List<ChildPassResult>,
+    initialBudget: Map<String, Double>?,
+): Set<Pair<String, String>> {
+    if (initialBudget == null) return emptySet()
+    val ratios = childPassResults.map { cr ->
+        val pid = (cr.child["product_id"] as? String)?.trim() ?: ""
+        val lid = (cr.child["location_id"] as? String)?.trim() ?: ""
+        val cap = initialBudget["$pid|$lid"]
+        if (cap != null && cr.neededQty > 1e-9) cap / cr.neededQty
+        else Double.POSITIVE_INFINITY
+    }
+    val finite = ratios.filter { it.isFinite() }
+    if (finite.isEmpty()) return emptySet()
+    val minR = finite.min()
+    val maxR = finite.max()
+    if (maxR <= minR * 1.05 + 1e-6) return emptySet()
+    return childPassResults.zip(ratios)
+        .filter { (_, r) -> r.isFinite() && r <= minR + 1e-9 }
+        .map { (cr, _) ->
+            val pid = (cr.child["product_id"] as? String)?.trim() ?: ""
+            val lid = (cr.child["location_id"] as? String)?.trim() ?: ""
+            Pair(pid, lid)
+        }
+        .toSet()
+}
+
 private fun computeRawAchievable(
     childPassResults: List<ChildPassResult>,
     demandNetQty: Double,
@@ -1041,6 +1104,17 @@ internal data class MethodSlotResult(
     val latestCommit: LocalDate?,
     val anyChildShort: Boolean,
     val blockedReason: String?,
+    /**
+     * Set when the method blocked AND the immediate bottleneck child is
+     * structurally dead at THIS level — its first-pass effectiveQty was 0
+     * AND its own commit_reason includes a raw `no_methods` (not cascade),
+     * meaning the BOM child literally has no methods at its location AND no
+     * inventory. Distinguishes genuine structural deadness (safe to memoize
+     * across demands) from capacity-driven cascades (the immediate child has
+     * a working method that failed downstream — qty- and inventory-state-
+     * dependent, must NOT be cached). Default false.
+     */
+    val immediateBottleneckTrulyStructural: Boolean = false,
 )
 
 /**
@@ -1076,6 +1150,8 @@ internal fun planMethodSlot(
     methodChoiceExplanation: String,
     overrideActive: Boolean,
     feasibilityCache: MutableMap<Pair<String, String>, Int>? = null,
+    structuralFailedMakes: MutableMap<Pair<String, String>, String>? = null,
+    initialBudget: Map<String, Double>? = null,
 ): MethodSlotResult {
     val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
     val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
@@ -1139,7 +1215,7 @@ internal fun planMethodSlot(
         val neededQty = (c["quantity"] as? Number)?.toDouble() ?: 0.0
         val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
             "quantity" to neededQty, "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget, feasibilityCache = feasibilityCache)
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget)
         val effectiveQty = solvedList.sumOf { s ->
             val r = s["commit_reason"] as? String
             if (r == "cycle_stopped" || r == "cycle_detected") 0.0
@@ -1156,9 +1232,29 @@ internal fun planMethodSlot(
     var achievableParentQty: Double
     if (!anyChildShort || childMaterials.isEmpty()) {
         achievableParentQty = slotQty
+        // Root-bottleneck tagging on the no-shortage path. Required because
+        // the OUTER planMethodSlot's second pass calls plan() at the
+        // post-convergence achievable qty, where deeper children fit
+        // exactly — landing here. Without tagging in this branch, the
+        // iter-0 root-bottleneck signal computed by a DEEPER planMethodSlot
+        // (during its own AND-min branch) is discarded when the outer
+        // level rebuilds the tree from scratch. Same iter-0 cap analysis
+        // as the AND branch below; see [ROOTBN] log there for details.
+        val rootKeys = computeRootBottleneckKeys(childPassResults, initialBudget)
+        if (rootKeys.isNotEmpty()) {
+            log.info("[ROOTBN-fit] parent={}@{} did={} qty={} keys={}",
+                productId, productionLocation, demandId, slotQty, rootKeys)
+        }
         childPassResults.forEach { cr ->
             childWos.addAll(cr.wos)
-            if (cr.pegging != null) childPeggingNodes.add(cr.pegging)
+            val peg = cr.pegging
+            if (peg != null) {
+                val pid = (cr.child["product_id"] as? String)?.trim() ?: ""
+                val lid = (cr.child["location_id"] as? String)?.trim() ?: ""
+                val key = Pair(pid, lid)
+                val tagged: Map<String, Any?> = if (key in rootKeys) peg + ("is_root_bottleneck" to true) else peg
+                childPeggingNodes.add(tagged)
+            }
             commitTimes.addAll(cr.cTimes)
         }
     } else {
@@ -1230,16 +1326,68 @@ internal fun planMethodSlot(
             val deepPid = if (deepestPid == "?") immediateChildPid else deepestPid
             val deepLoc = if (deepestLoc == "?") immediateChildLoc else deepestLoc
             val reason = "child_failed:${deepPid}@${deepLoc}(${terminalCause})"
+            // Diagnostic: emit one log line per blocked-path AND-min so the
+            // consolidation/commit phase root cause is visible in run logs.
+            // Grep `[ANDMIN]` to see the cascade chain — the smallest-scale
+            // entry (deepest cascade level) names the genuine root leaf.
+            log.info("[ANDMIN-block] parent={}@{} did={} qty={} achievable=0 immediate-bottleneck={}@{} (effective={}/needed={}) deepest-leaf={}@{} cause={}",
+                productId, locationId, demandId, slotQty,
+                immediateChildPid, immediateChildLoc, bottleneck.effectiveQty, bottleneck.neededQty,
+                deepPid, deepLoc, terminalCause)
             val methodType = m["type"] as? String ?: ""
+            // Tag bottleneck children with `is_bottleneck=true` so the UI surfaces
+            // them on the failed branch too (mirrors the partial-success case).
+            // Tied children at the min ratio are all flagged.
+            val blockedRatios = childPassResults.map { cr ->
+                if (cr.neededQty > 1e-9) cr.effectiveQty / cr.neededQty
+                else Double.POSITIVE_INFINITY
+            }
+            val blockedMinRatio = blockedRatios.min()
+            val blockedBottleneckKeys: Set<Pair<String, String>> = childPassResults
+                .zip(blockedRatios)
+                .filter { (_, r) -> r <= blockedMinRatio + 1e-9 }
+                .map { (cr, _) ->
+                    val pid = (cr.child["product_id"] as? String)?.trim() ?: ""
+                    val lid = (cr.child["location_id"] as? String)?.trim() ?: ""
+                    Pair(pid, lid)
+                }
+                .toSet()
+            // Root-bottleneck on the blocked path — see partial-path branch
+            // for rationale. Uses iter-0 budget caps + spread check to
+            // identify origin leaf among siblings with meaningfully
+            // different fair-shares.
+            val blockedRootKeys = computeRootBottleneckKeys(childPassResults, initialBudget)
+            val taggedChildPeggings: List<Map<String, Any?>> = childPassResults.mapNotNull { cr ->
+                val peg = cr.pegging ?: return@mapNotNull null
+                val pid = (cr.child["product_id"] as? String)?.trim() ?: ""
+                val lid = (cr.child["location_id"] as? String)?.trim() ?: ""
+                val key = Pair(pid, lid)
+                var tagged = peg
+                if (key in blockedBottleneckKeys) tagged = tagged + ("is_bottleneck" to true)
+                if (key in blockedRootKeys) tagged = tagged + ("is_root_bottleneck" to true)
+                tagged
+            }
             val blockedWoNode = buildWoNode(
                 productId, productionLocation, 0.0, methodType, m,
                 reqDt, null, 0, 0.0,
                 "$methodChoiceExplanation — blocked: deepest child $deepPid@$deepLoc ($terminalCause)",
                 variantExplanation, woChildrenRelation,
-                childPassResults.mapNotNull { it.pegging },  // partial child pegging — see comment above
+                taggedChildPeggings,
                 overrideActive,
                 failed = true,
             )
+            // Genuinely-structural classification: the AND-min bottleneck child
+            // returned 0 AND its own solvedList carries a raw `no_methods` /
+            // `no_preferred_method` row (not just a cascaded child_failed:...).
+            // That means THIS child has zero methods at its product/location
+            // AND had no inventory — true topological dead-end, safe to memo.
+            // Cascade-only cases (the child has a method but it failed deeper)
+            // are runtime-dependent and excluded.
+            val immediateTrulyStructural = bottleneck.effectiveQty <= 1e-9 &&
+                bottleneck.solvedList.any { row ->
+                    val r = row["commit_reason"] as? String
+                    r == "no_methods" || r == "no_preferred_method"
+                }
             return MethodSlotResult(
                 achievableQty = 0.0,
                 wos = emptyList(),
@@ -1247,6 +1395,7 @@ internal fun planMethodSlot(
                 latestCommit = null,
                 anyChildShort = true,
                 blockedReason = reason,
+                immediateBottleneckTrulyStructural = immediateTrulyStructural,
             )
         }
         achievableParentQty = capped
@@ -1258,6 +1407,79 @@ internal fun planMethodSlot(
                 commitTimes.addAll(cr.cTimes)
             }
         } else {
+            // ── Identify AND-bottleneck child(ren). Only meaningful when the
+            // parent was actually capped by an AND-min (achievableParentQty <
+            // slotQty). The bottleneck is the child(ren) whose first-pass
+            // ratio (effectiveQty / neededQty) equals the min over all
+            // children. Tied children are all flagged. Empty when the parent
+            // delivered its full request (no cap), or under OR-split (no
+            // single bottleneck — supply is summed across variants).
+            // First-pass pegging keyed by (pid, lid) for bottleneck children. The
+            // first-pass exploration ran at full qty (slotQty) and recursively
+            // identified bottlenecks at every deeper level — those flags are
+            // already baked into `cr.pegging`. Second-pass operates at AND-min
+            // qty where all descendants fit, so its tree carries no deeper
+            // bottleneck info. By preserving first-pass pegging for the
+            // bottleneck child(ren), the deeper bottleneck chain (e.g. "260-0385
+            // @2000 was the limiter at 11607" → "supply cap at 260-0385_2000_111
+            // was the leaf cause") survives into the displayed tree.
+            val bottleneckPegging: Map<Pair<String, String>, Map<String, Any?>?> =
+                if (achievableParentQty < slotQty - 1e-6) {
+                    val ratios = childPassResults.map { cr ->
+                        if (cr.neededQty > 1e-9) cr.effectiveQty / cr.neededQty
+                        else Double.POSITIVE_INFINITY
+                    }
+                    val minRatio = ratios.min()
+                    // Diagnostic: emit one log line per partial-success AND-min cap.
+                    // Grep `[ANDMIN]` to trace the cascade chain — the smallest-
+                    // scale entry (deepest cascade level) names the genuine root leaf.
+                    val tied = childPassResults.zip(ratios)
+                        .filter { (_, r) -> r <= minRatio + 1e-9 }
+                        .map { (cr, _) ->
+                            val pid = (cr.child["product_id"] as? String)?.trim() ?: ""
+                            val lid = (cr.child["location_id"] as? String)?.trim() ?: ""
+                            "$pid@$lid(eff=${cr.effectiveQty}/need=${cr.neededQty})"
+                        }
+                    log.info("[ANDMIN-partial] parent={}@{} did={} qty={} achievable={} tied-bottlenecks={}",
+                        productId, productionLocation, demandId, slotQty, achievableParentQty, tied)
+                    childPassResults.zip(ratios)
+                        .filter { (_, r) -> r <= minRatio + 1e-9 }
+                        .associate { (cr, _) ->
+                            val pid = (cr.child["product_id"] as? String)?.trim() ?: ""
+                            val lid = (cr.child["location_id"] as? String)?.trim() ?: ""
+                            Pair(pid, lid) to cr.pegging
+                        }
+                } else emptyMap()
+
+            // Root-bottleneck identification using iter-0 budget caps. The
+            // child whose `initialBudget[pid|lid] / cr.neededQty` is the
+            // smallest is the GENUINE constraint (origin) — distinct from
+            // `bottleneckPegging` above which uses post-convergence first-
+            // pass ratios where multiple siblings tie at the smeared
+            // AND-feasible point. Tagged with `is_root_bottleneck=true`;
+            // smearing-aligned siblings still carry `is_bottleneck=true`.
+            //
+            // Critically NOT gated on `achievableParentQty < slotQty`. The
+            // displayed final-iteration tree calls plan() at the converged
+            // slotQty (e.g. 198), where every sibling's *current* budget cap
+            // fits exactly — so the current-iteration AND-min check sees
+            // no constraint. But the iter-0 caps (e.g. 246 vs 11607) reveal
+            // which sibling was the origin that *caused* the convergence.
+            // We surface that origin even when the current call shows no
+            // bottleneck, otherwise the badge never appears in the tree.
+            //
+            // Spread check: only flag when iter-0 caps differ meaningfully
+            // between siblings. Uniform caps mean either no constraint or
+            // pre-balanced shares — neither identifies a single origin.
+            // Empty when initialBudget is null (run wasn't started by
+            // runV2Iterated, or this demand had no consolidation entry) or
+            // when no child has a finite-cap entry.
+            val rootBottleneckKeys = computeRootBottleneckKeys(childPassResults, initialBudget)
+            if (rootBottleneckKeys.isNotEmpty()) {
+                log.info("[ROOTBN] parent={}@{} did={} qty={} achievable={} keys={}",
+                    productId, productionLocation, demandId, slotQty, achievableParentQty, rootBottleneckKeys)
+            }
+
             // ── Second pass: restore inventory + budget and re-plan at achievable qty
             inventory.clear()
             inventory.addAll(inventorySnap)
@@ -1278,9 +1500,25 @@ internal fun planMethodSlot(
                 val cReqDt = dateAddDays(reqDt, -leadDays)
                 val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
                     "quantity" to c["quantity"], "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
-                val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget, feasibilityCache = feasibilityCache)
+                val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget)
                 childWos.addAll(cWos)
-                if (cPegging != null) childPeggingNodes.add(cPegging)
+                val cPid = (c["product_id"] as? String)?.trim() ?: ""
+                val cLid = (c["location_id"] as? String)?.trim() ?: ""
+                val key = Pair(cPid, cLid)
+                if (cPegging != null) {
+                    // Tag the second-pass pegging with `is_bottleneck=true` for
+                    // children that were the AND-min limiter at first-pass, and
+                    // `is_root_bottleneck=true` for the genuine origin per iter-0
+                    // budget cap. The two flags differ: `is_bottleneck` covers
+                    // ALL siblings tied at the post-convergence smeared cap;
+                    // `is_root_bottleneck` covers only the leaf whose iter-0
+                    // cap-to-need ratio was the smallest (the origin that
+                    // dragged the others down via convergence).
+                    var tagged = cPegging
+                    if (key in bottleneckPegging) tagged = tagged + ("is_bottleneck" to true)
+                    if (key in rootBottleneckKeys) tagged = tagged + ("is_root_bottleneck" to true)
+                    childPeggingNodes.add(tagged)
+                }
                 solvedList.forEach { s -> parseDate(s["commit_time"] as? String)?.let { commitTimes.add(it) } }
             }
 
@@ -1486,6 +1724,25 @@ fun plan(
      * leave `null` to keep fallback move-only.
      */
     feasibilityCache: MutableMap<Pair<String, String>, Int>? = null,
+    /**
+     * Memoized structural-failure set for makes. When a make-fallback for
+     * (pid, lid) hard-blocks on a structural cascade (no_methods /
+     * no_preferred_method anywhere in its BOM tree), this set records (pid, lid)
+     * so subsequent demands skip the make admission entirely — the failure
+     * depends only on `data`, so the answer is the same for every caller.
+     * Cuts the per-demand recursion cost on shared structurally-doomed subtrees.
+     */
+    structuralFailedMakes: MutableMap<Pair<String, String>, String>? = null,
+    /**
+     * Optional iter-0 snapshot of consolidation-engine per-leaf budget caps
+     * for THIS demand. Used by planMethodSlot to identify the *origin* leaf
+     * of the AND-bottleneck (smallest cap-to-need ratio among siblings) —
+     * tagged with `is_root_bottleneck=true` to distinguish from the
+     * post-convergence smearing-aligned siblings (`is_bottleneck=true`).
+     * Read-only; immutable across the plan walk. Pass-through to recursive
+     * plan() calls so deeper levels can also identify their own roots.
+     */
+    initialBudget: Map<String, Double>? = null,
 ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
 
     val productId = (demand["product_id"] as? String)?.trim() ?: ""
@@ -1710,6 +1967,8 @@ fun plan(
                 methodChoiceExplanation = slotLabel,
                 overrideActive = overrideActiveW,
                 feasibilityCache = feasibilityCache,
+                structuralFailedMakes = structuralFailedMakes,
+                initialBudget = initialBudget,
             )
             // Always record the slot's pegging node so the UI shows every attempt
             // (including blocked ones with zero qty). Hard-failures still consume
@@ -1802,15 +2061,17 @@ fun plan(
             .filter { it["type"] == "move" && it["from_location_id"] != m["from_location_id"] }
             .sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
     } else emptyList()
-    val makeAlternatives: List<Map<String, Any?>> = if (feasibilityCache != null) {
+
+    val cachedMakeFailureReason = structuralFailedMakes?.get(Pair(productId, locationId))
+    val makeAlternatives: List<Map<String, Any?>> = if (feasibilityCache != null && cachedMakeFailureReason == null) {
         val purchaseAllowedForCache = config?.get("purchase_allowed") != false
         effectiveMethods
             .filter { it["type"] == "make" && it !== m }
             .filter {
                 if (productId.startsWith("VirtualProduct_")) true
                 else {
-                    val depth = maxMakeDepth(productId, locationId, data, purchaseAllowedForCache, feasibilityCache)
-                    depth <= FALLBACK_MAKE_DEPTH_CAP
+                    val mkDepth = maxMakeDepth(productId, locationId, data, purchaseAllowedForCache, feasibilityCache)
+                    mkDepth <= FALLBACK_MAKE_DEPTH_CAP
                 }
             }
             .sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
@@ -1855,11 +2116,30 @@ fun plan(
             methodChoiceExplanation = labelPrefix,
             overrideActive = overrideActive,
             feasibilityCache = feasibilityCache,
+            structuralFailedMakes = structuralFailedMakes,
+            initialBudget = initialBudget,
         )
         combinedPegging.add(attempt.methodPeggingNode)
         if (attempt.blockedReason != null) {
             // Reactive fallback: try the next method on hard block.
             lastBlockedReason = attempt.blockedReason
+            // Memoize structural make failures so future demands skip the
+            // doomed BOM walk. Only memo for actual make slots (slotIdx>0
+            // gating into makeAlternatives), and only when the failure is
+            // structural (no_methods cascade), not state-dependent.
+            if (slotIdx > 0 && candidate["type"] == "make"
+                && structuralFailedMakes != null
+                && attempt.immediateBottleneckTrulyStructural
+            ) {
+                // Only memoize when the make's IMMEDIATE bottleneck child is
+                // genuinely structurally dead — topological dead-end at this
+                // level, no methods + no inventory at the child's own pid/lid.
+                // Capacity-driven cascades where the immediate child has a
+                // method that failed deeper are state-dependent and excluded
+                // (their failure depends on runtime inventory state, not data
+                // topology — caching them across demands is unsound).
+                structuralFailedMakes[Pair(productId, locationId)] = attempt.blockedReason
+            }
             continue
         }
         combinedWos.addAll(attempt.wos)
@@ -1874,6 +2154,46 @@ fun plan(
         val nextIdx = slotIdx + 1
         if (nextIdx >= cap) break
         if (fallbackOrder[nextIdx]["type"] != "make") break
+    }
+
+    // Diagnostic stub: when structuralFailedMakes excluded the make from
+    // admission, emit a synthetic blocked work_order pegging node so the user
+    // sees the make was considered (and why it was skipped) without paying
+    // for the recursion. The stub carries qty=0 and the cached failure reason
+    // from the first demand that hit this dead end.
+    if (cachedMakeFailureReason != null) {
+        val stubMakeMethod = effectiveMethods.firstOrNull { it["type"] == "make" }
+        if (stubMakeMethod != null) {
+            // Unwrap the cascade reason to surface the deepest structural cause
+            // (e.g. "child_failed:280-0511-03@2000(no_methods)" → child=280-0511-03,
+            // loc=2000, cause=no_methods). Embed as a synthetic demand-leaf child
+            // so the make stub becomes expandable and the user can see WHICH BOM
+            // child caused the structural failure.
+            val (deepPid, deepLoc, terminalCause) = resolveDeepestCause(cachedMakeFailureReason)
+            val syntheticLeaf = mapOf<String, Any?>(
+                "type" to "demand",
+                "demand_id" to demandId,
+                "product_id" to (if (deepPid == "?") productId else deepPid),
+                "location_id" to (if (deepLoc == "?") locationId else deepLoc),
+                "quantity" to 0,
+                "committed_qty" to 0,
+                "commit_reason" to terminalCause,
+                "children" to emptyList<Any>(),
+            )
+            combinedPegging.add(mapOf(
+                "type" to "work_order",
+                "product_id" to productId,
+                "location_id" to locationId,
+                "quantity" to 0,
+                "method" to "make",
+                "method_choice_explanation" to
+                    "Make skipped: cached structural failure ($cachedMakeFailureReason). " +
+                    "A prior demand attempted make at this product/location and hit a " +
+                    "no_methods cascade; reusing that result here to avoid redundant recursion.",
+                "failed" to true,
+                "children" to listOf(syntheticLeaf),
+            ))
+        }
     }
 
     if (totalAchievable <= 1e-9) {
@@ -2023,18 +2343,37 @@ private fun prunePhantomLoops(
     node: Map<String, Any?>,
     isRoot: Boolean = false,
     parentIsMoveWo: Boolean = false,
+    insideFailedWo: Boolean = false,
 ): Map<String, Any?>? {
     val type = node["type"] as? String
     if (type == "supply" || type == "purchase") return node
-    if (type == "demand" && node["commit_reason"] == "cycle_stopped") return null
+    if (type == "demand" && node["commit_reason"] == "cycle_stopped") {
+        // Inside a failed=true work_order's subtree, cycle_stopped demand
+        // nodes ARE the diagnostic (showing where the BOM walk hit the
+        // cycle). Keep them as leaf nodes so users can see the cause.
+        // Outside failed subtrees, drop as "phantom move cycle" noise.
+        if (insideFailedWo) {
+            return node.toMutableMap().apply { put("children", emptyList<Any>()) }
+        }
+        return null
+    }
 
     val isMoveWo = type == "work_order" &&
         (node["method"] as? String)?.lowercase() == "move"
 
-    val prunedChildren = (node["children"] as? List<Map<String, Any?>>)
-        ?.mapNotNull { prunePhantomLoops(it, isRoot = false, parentIsMoveWo = isMoveWo) } ?: emptyList()
+    // Track failed-WO context for descendants. Once inside a failed branch,
+    // every nested cycle_stopped demand is a diagnostic, not noise.
+    val explicitlyFailed = node["failed"] == true
+    val descendantInsideFailedWo = insideFailedWo || (type == "work_order" && explicitlyFailed)
 
-    if (type == "work_order" && prunedChildren.isEmpty()) return null
+    val prunedChildren = (node["children"] as? List<Map<String, Any?>>)
+        ?.mapNotNull { prunePhantomLoops(it, isRoot = false, parentIsMoveWo = isMoveWo, insideFailedWo = descendantInsideFailedWo) } ?: emptyList()
+
+    // Preserve explicitly-failed work_orders even when empty — they're
+    // diagnostic markers (failed move with cycle_stopped child pruned out,
+    // make stub injected when structuralFailedMakes memo'd, AND-bottleneck
+    // blocked branch). Stripping them hides why the parent demand failed.
+    if (type == "work_order" && prunedChildren.isEmpty() && !explicitlyFailed) return null
     // Only prune childless demand nodes that are transit stops inside a move chain,
     // not real component demands (children of make WOs or the root).
     if (type == "demand" && prunedChildren.isEmpty() && !isRoot && parentIsMoveWo) return null
@@ -2076,6 +2415,16 @@ internal fun extractSupplyAllocations(
     // Walk variant 1: attribute every supply leaf to a single demand id (default behavior).
     fun walk(node: Map<String, Any?>, demandId: String?) {
         val type = node["type"] as? String
+        // Skip subtrees rooted at failed=true work_orders — those carry the
+        // AND-bottleneck blocked-branch diagnostic snapshot (first-pass child
+        // peggings that were rolled back at the planner level via inventory
+        // restore). Their supply-leaf qtys never actually drew from inventory,
+        // so attributing them as `qty_consumed` over-counts and blows the
+        // cap-enforcement budget downstream (one supply lot reports 100% util
+        // while another reports 0%, and per-demand totals double-count first-
+        // pass exploration). Mirrors the same `failed=true` filter applied
+        // by prunePhantomLoops on the UI render path.
+        if (type == "work_order" && node["failed"] == true) return
         val supplyId = node["supply_id"] as? String
         if ((type == "supply" || type == "purchase") && !supplyId.isNullOrBlank()) {
             val rawQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
@@ -2106,6 +2455,8 @@ internal fun extractSupplyAllocations(
     // consolidated supply, rather than to a synthetic null/unknown demand.
     fun walkSplit(node: Map<String, Any?>, weights: Map<String, Double>) {
         val type = node["type"] as? String
+        // Skip failed=true subtrees — see walk() for rationale.
+        if (type == "work_order" && node["failed"] == true) return
         val supplyId = node["supply_id"] as? String
         if ((type == "supply" || type == "purchase") && !supplyId.isNullOrBlank()) {
             val rawQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
@@ -2437,6 +2788,27 @@ private fun runV2Iterated(
     var lastConsolidatedWOs: List<Map<String, Any?>> = emptyList()
     var lastConsolidatedPegging: List<Map<String, Any?>> = emptyList()
     var lastCommit = LegacyCommitResult(emptyList(), emptyList(), emptyList())
+    // Shared feasibility cache across consolidation + legacyCommit. Stable across
+    // iters because it depends only on `data` and `purchase_allowed`, neither of
+    // which change here. Memoizes maxMakeDepth(pid, lid) lookups; without it the
+    // reactive-fallback site at plan() can't admit make alternatives (cache=null
+    // short-circuits makeAlternatives to empty).
+    val feasibilityCache: MutableMap<Pair<String, String>, Int> = mutableMapOf()
+    // Structural-failure memo for makes — see plan()'s structuralFailedMakes
+    // doc. Co-scoped with feasibilityCache. Value is the cached blocked reason
+    // so the admission-skip site can emit a diagnostic stub pegging node.
+    val structuralFailedMakes: MutableMap<Pair<String, String>, String> = mutableMapOf()
+
+    // Iter-0 snapshot of consolidation-engine per-(demand, leaf) budget caps.
+    // The compensate-equivalent loop below refines `memberCaps` across iters,
+    // converging all of a demand's leaves to the AND-feasible production point —
+    // which smears the bottleneck identity (every leaf reports the same final
+    // cap). The iter-0 snapshot preserves the *origin*: the leaf with the
+    // smallest cap-to-need ratio at iter-0 is the genuine root constraint.
+    // Threaded into legacyCommit so the per-demand bottleneck-identification
+    // logic can flag it with `is_root_bottleneck`, distinct from the post-
+    // convergence `is_bottleneck` flag on smearing-aligned siblings.
+    var iter0AllocationSnapshot: Map<Any?, Map<String, Double>>? = null
 
     for (iter in 0 until MAX_PLANNING_ITERATIONS) {
         // Revert inventory to snapshot at the start of every iteration (incl. iter 0,
@@ -2455,7 +2827,10 @@ private fun runV2Iterated(
         val consResult = runConsolidation(
             consGroups, inventory, data, consolidationConfig, planConfig = config,
         ) { dem, inv, dat, reqDt, depth, path, cfg, prefId ->
-            plan(dem, inv, dat, reqDt, depth, path, cfg, prefId, overrideIndex = overrideIndex)
+            plan(dem, inv, dat, reqDt, depth, path, cfg, prefId,
+                overrideIndex = overrideIndex,
+                feasibilityCache = feasibilityCache,
+                structuralFailedMakes = structuralFailedMakes)
         }
 
         // Emit one untagged supply per (pid, lid) for every produced component.
@@ -2491,6 +2866,12 @@ private fun runV2Iterated(
         // Snapshot initial budgets before phase 3 mutates them.
         val initialBudgets: Map<Any?, Map<String, Double>> = consResult.allocation
             .mapValues { (_, allocs) -> allocs.toMap() }
+        // Capture iter-0 snapshot once, before any cap-refinement smearing.
+        // See `iter0AllocationSnapshot` declaration for rationale.
+        if (iter == 0) {
+            iter0AllocationSnapshot = consResult.allocation
+                .mapValues { (_, allocs) -> allocs.toMap() }
+        }
         val budgets: Map<Any?, MutableMap<String, Double>> = consResult.allocation.mapValues { (_, allocs) ->
             allocs.mapValues { (_, q) -> q }.toMutableMap()
         }
@@ -2513,6 +2894,9 @@ private fun runV2Iterated(
             useTaggedLookup = false,
             progressCallback = iterCb,
             budgets = budgets,
+            sharedFeasibilityCache = feasibilityCache,
+            sharedStructuralFailedMakes = structuralFailedMakes,
+            iter0Allocation = iter0AllocationSnapshot,
         )
 
         // Over-production: any leftover budget at the merged leaf.
@@ -2613,6 +2997,23 @@ private fun legacyCommit(
      * consumed in-place during planning.
      */
     budgets: Map<Any?, MutableMap<String, Double>>? = null,
+    /**
+     * Optional shared feasibility cache. When passed in (e.g. from runV2Iterated),
+     * memoization persists across the consolidation + commit phases of one iteration.
+     * If null, an empty cache is created and discarded at the end of this call.
+     */
+    sharedFeasibilityCache: MutableMap<Pair<String, String>, Int>? = null,
+    /** Optional shared structural-failure memo, see plan()'s docs. */
+    sharedStructuralFailedMakes: MutableMap<Pair<String, String>, String>? = null,
+    /**
+     * Optional iter-0 snapshot of the consolidation engine's per-(demand, leaf)
+     * allocation, captured BEFORE the cap-refinement loop in runV2Iterated
+     * smears them. Used by plan()/planMethodSlot() to identify the *origin*
+     * leaf (smallest cap-to-need ratio) and tag its pegging with
+     * `is_root_bottleneck=true`, distinct from the post-convergence
+     * `is_bottleneck` flag on smearing-aligned siblings.
+     */
+    iter0Allocation: Map<Any?, Map<String, Double>>? = null,
 ): LegacyCommitResult {
     val committedDemands = mutableListOf<Map<String, Any?>>()
     val workOrders = mutableListOf<Map<String, Any?>>()
@@ -2622,18 +3023,32 @@ private fun legacyCommit(
     // Lazily populated on first query at the reactive-fallback site;
     // unaffected demands incur no cost. Stable across the loop because
     // `data` and `purchase_allowed` don't change mid-commit.
-    val feasibilityCache: MutableMap<Pair<String, String>, Int> = mutableMapOf()
+    val feasibilityCache: MutableMap<Pair<String, String>, Int> = sharedFeasibilityCache ?: mutableMapOf()
+    val structuralFailedMakes: MutableMap<Pair<String, String>, String> = sharedStructuralFailedMakes ?: mutableMapOf()
     demands.forEachIndexed { i, d ->
         val reqStr = d["request_due_time"] as? String ?: d["request_time"] as? String
         val reqDt = parseDate(reqStr)
         val demandId = d["demand_id"]
         val prefId = if (useTaggedLookup) demandId else null
         val demandBudget = budgets?.get(demandId)
+        // Diagnostic: dump the budget map handed to this demand's plan walk.
+        // Tells us whether per-(demand, leaf) caps from consolidation are
+        // present (case 3 from the 246-mystery analysis) or only the
+        // merged-leaf entry (cases 1/2 — leftover-state-driven). Filter to
+        // the demand of interest to keep log volume bounded.
+        if (demandId?.toString() == "10041744_10" && demandBudget != null) {
+            val entries = demandBudget.entries.sortedBy { it.key }
+                .joinToString(", ") { (k, v) -> "$k=${"%.1f".format(v)}" }
+            log.info("[BUDGET] did={} entryCount={} entries={}",
+                demandId, demandBudget.size, entries)
+        }
         val (solvedList, wos, peggingNode) = plan(
             d, inventory, data, reqDt,
             config = config, preferDemandId = prefId, overrideIndex = overrideIndex,
             budget = demandBudget,
             feasibilityCache = feasibilityCache,
+            structuralFailedMakes = structuralFailedMakes,
+            initialBudget = iter0Allocation?.get(demandId),
         )
         committedDemands.addAll(solvedList)
         workOrders.addAll(wos)

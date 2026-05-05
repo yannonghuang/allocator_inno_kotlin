@@ -70,6 +70,20 @@ fun runInitialCommit(
     overrideIndex: Map<String, Map<String, Any?>>,
     allocations: SupplyAllocations,
     progressCallback: ((Map<String, Any?>) -> Unit)? = null,
+    /**
+     * Optional shared feasibility cache. Threaded into each demand's plan() call
+     * so the reactive-fallback site can admit make alternatives via maxMakeDepth
+     * memoization. Pass the same map across all runInitialCommit calls within
+     * one runV2Supply invocation to amortize the recursion cost.
+     */
+    feasibilityCache: MutableMap<Pair<String, String>, Int>? = null,
+    /**
+     * Optional shared structural-failure memo for makes. Once a make-fallback
+     * for (pid, lid) hard-blocks on a structural cascade (no_methods), this set
+     * records (pid, lid) so future demands skip the doomed walk. See
+     * PlanningEngine.plan()'s structuralFailedMakes doc.
+     */
+    structuralFailedMakes: MutableMap<Pair<String, String>, String>? = null,
 ): InitialCommitResult {
     val committedDemands = mutableListOf<Map<String, Any?>>()
     val workOrders = mutableListOf<Map<String, Any?>>()
@@ -116,6 +130,8 @@ fun runInitialCommit(
             preferDemandId = null,    // supply-level consolidation has no tagged synthetic buckets
             overrideIndex = overrideIndex,
             budget = budget,
+            feasibilityCache = feasibilityCache,
+            structuralFailedMakes = structuralFailedMakes,
         )
 
         committedDemands.addAll(solvedList)

@@ -918,6 +918,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planWoPurchaseOnly, setPlanWoPurchaseOnly] = useState(false);
   const [planWoMoveOnly, setPlanWoMoveOnly] = useState(false);
   const [planWoHasOverride, setPlanWoHasOverride] = useState(false);
+  const [planWoFilterDemandId, setPlanWoFilterDemandId] = useState('');
   const [planWoPivot, setPlanWoPivot] = useState<'none' | 'prod_area' | 'location' | 'nested' | 'demand'>('none');
   const [planWoLayoutMode, setPlanWoLayoutMode] = useState<'data' | 'split' | 'timeline'>('split');
   const [woPegHighlightRow, setWoPegHighlightRow] = useState<WoEnrichedRow | null>(null);
@@ -2512,6 +2513,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     // `consolidated_<demandId>_<pid>` bucket (for that product/location).
     const taggedConsumption = new Map<string, Map<string, number>>();
     const collectTagged = (node: PlanningPeggingNode, entryDemandId: string): void => {
+      // Same failed=true skip as walk() — see rationale there.
+      if (node.type === 'work_order' && (node as { failed?: boolean }).failed === true) return;
       if (node.type === 'supply' && node.supply_id && node.supply_id.startsWith(`consolidated_${entryDemandId}_`)) {
         const pid = node.product_id ?? '';
         const lid = node.location_id ?? '';
@@ -2540,6 +2543,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       activeDemandId: string | null,
       consolidatedWeights: Map<string, number> | null,
     ): void => {
+      // Skip subtrees rooted at failed=true work_orders. Those carry the
+      // AND-bottleneck blocked-branch diagnostic snapshot — first-pass child
+      // peggings whose inventory takes were rolled back at the planner
+      // level. Their supply-leaf qtys never actually drew from inventory,
+      // so attributing them as `qty_consumed` over-counts (one supply lot
+      // reports 100% util while another reports 0%, and per-demand totals
+      // double-count first-pass exploration). Mirrors the backend
+      // extractSupplyAllocations + soundness checker filters.
+      if (node.type === 'work_order' && (node as { failed?: boolean }).failed === true) return;
+
       const effectiveDemandId = node.type === 'demand' && node.demand_id ? node.demand_id : activeDemandId;
 
       if (node.type === 'supply' && node.supply_id) {
@@ -5035,6 +5048,35 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       />
                       <span>{tP('workOrders.filterHasOverride')}</span>
                     </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <span>Demand:</span>
+                      <input
+                        type="text"
+                        list="plan-wo-demand-filter-list"
+                        value={planWoFilterDemandId}
+                        onChange={(e) => setPlanWoFilterDemandId(e.target.value)}
+                        placeholder="demand_id"
+                        style={{ width: '11rem', padding: '2px 6px', fontSize: '0.78rem', background: '#27272a', border: '1px solid #3f3f46', borderRadius: 3, color: '#e4e4e7' }}
+                        title="Show only WOs pegged to this demand (matches demand_id or any consolidated split-detail demand)"
+                      />
+                      {planWoFilterDemandId && (
+                        <button
+                          type="button"
+                          className="secondary"
+                          style={{ fontSize: '0.7rem', padding: '1px 6px' }}
+                          onClick={() => setPlanWoFilterDemandId('')}
+                        >×</button>
+                      )}
+                      <datalist id="plan-wo-demand-filter-list">
+                        {Array.from(new Set((planResult.committed_demands ?? [])
+                          .map((d) => d.demand_id)
+                          .filter((d): d is string => !!d)))
+                          .slice(0, 200)
+                          .map((did) => (
+                            <option key={did} value={did} />
+                          ))}
+                      </datalist>
+                    </label>
                   </div>
                   <div style={{ marginTop: '0.2rem', marginBottom: '0.4rem' }}>
                     <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.72rem', color: '#71717a', cursor: 'pointer' }}>
@@ -5163,6 +5205,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         if (planWoMoveOnly && (r.method ?? '').toLowerCase() !== 'move') return false;
                         if (planWoHasOverride && !woHasSavedOverride(r)) return false;
                         return true;
+                      });
+                    }
+                    // Demand-id filter: show only WOs pegged to this demand. Mirrors
+                    // buildWoDemandGroups: a WO is pegged to demand D if r.demand_id === D
+                    // OR D appears in r.wo_consolidation_split_details (consolidated row).
+                    const demandIdFilter = planWoFilterDemandId.trim();
+                    if (demandIdFilter) {
+                      workOrderRows = workOrderRows.filter((r) => {
+                        if (r.demand_id === demandIdFilter) return true;
+                        return r.wo_consolidation_split_details?.some((d) => d.demand_id === demandIdFilter) ?? false;
                       });
                     }
                     // Build the set of "backed" WO signatures: product|location|method triples for
@@ -9458,8 +9510,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           ? 'rgba(250, 204, 21, 0.28)'
                           : isAnyMatch
                             ? 'rgba(250, 204, 21, 0.12)'
-                            : depth % 2 === 0 ? 'rgba(255,255,255,0.04)' : 'transparent',
-                        border: isActiveMatch ? '1px solid #facc15' : 'none',
+                            : node.is_bottleneck
+                              ? 'rgba(248, 113, 113, 0.12)'
+                              : depth % 2 === 0 ? 'rgba(255,255,255,0.04)' : 'transparent',
+                        border: isActiveMatch
+                          ? '1px solid #facc15'
+                          : node.is_bottleneck ? '1px solid rgba(248, 113, 113, 0.55)' : 'none',
                         borderRadius: 4,
                         color: '#e4e4e7',
                         cursor: expandable ? 'pointer' : 'default',
@@ -9469,6 +9525,33 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <span style={{ width: 14, flexShrink: 0 }}>{expandable ? (isExpanded ? '▼' : '▶') : '·'}</span>
                       <span style={{ width: 18, flexShrink: 0, fontSize: '0.9em', color: typeColor }} title={typeLabel}>{icon}</span>
                       <span style={{ flex: 1, color: typeColor }}>{label}</span>
+                      {node.is_root_bottleneck && (
+                        <span
+                          title="根因 (root cause): 此子节点的iter-0分配份额(cap/need比率)在AND兄弟中最小，是真正的源头瓶颈。其他兄弟节点之所以也被标记为瓶颈,是因为合并迭代过程将它们的分配下调到根因子节点的水平。要解除该需求的瓶颈,只能针对根因节点扩容或减少竞争。"
+                          style={{
+                            fontSize: '0.7em',
+                            color: '#fff',
+                            background: 'rgba(220, 38, 38, 0.85)',
+                            padding: '1px 6px',
+                            borderRadius: 3,
+                            flexShrink: 0,
+                            fontWeight: 700,
+                          }}
+                        >根因</span>
+                      )}
+                      {node.is_bottleneck && !node.is_root_bottleneck && (
+                        <span
+                          title="此子节点的首轮可达量比父节点其他兄弟低,决定了AND取min的瓶颈"
+                          style={{
+                            fontSize: '0.7em',
+                            color: '#fca5a5',
+                            background: 'rgba(248, 113, 113, 0.18)',
+                            padding: '1px 6px',
+                            borderRadius: 3,
+                            flexShrink: 0,
+                          }}
+                        >瓶颈</span>
+                      )}
                     </button>
                     {node.type === 'work_order' && node.method_choice_explanation && (() => {
                       const explanationPath = `explain-${path}`;

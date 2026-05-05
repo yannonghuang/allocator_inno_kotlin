@@ -238,6 +238,22 @@ export type PlanningPeggingNode = {
    *  the structure is preserved for diagnosis. UI keeps the children
    *  expandable; soundness checker skips the entire subtree. */
   failed?: boolean;
+  /** Marker on demand nodes that AND-bottlenecked their parent make.
+   *  Set on the child(ren) whose first-pass `effectiveQty / neededQty`
+   *  ratio was the minimum across the parent's AND children — the limiter
+   *  whose constraint propagated up through `min` to cap the parent's
+   *  achievable qty. Useful for visually surfacing which sibling caused
+   *  a partial commit at the parent level. Tied limiters are all flagged. */
+  is_bottleneck?: boolean;
+  /** Marker on the GENUINE root bottleneck — the child whose iter-0
+   *  consolidation-allocation cap (cap/need ratio) was the smallest among
+   *  AND siblings. Distinct from `is_bottleneck`, which after the
+   *  consolidation-engine cap-refinement loop converges, ends up flagging
+   *  ALL siblings tied at the smeared AND-feasible point. The root flag
+   *  identifies the ORIGIN that dragged the others down via convergence
+   *  — typically the only child a user can actually unblock by adding
+   *  supply or reducing competition. */
+  is_root_bottleneck?: boolean;
   children: PlanningPeggingNode[];
 };
 

@@ -123,6 +123,15 @@ internal fun runV2Supply(
     // between iters so each iter sees the same starting state.
     val initialInventory: List<Map<String, Any?>> = inventory.map { it.toMap() }
 
+    // Shared feasibility cache across all Phase 3a/3c plan() calls. Stable for
+    // the run since `data` and `purchase_allowed` don't change. Without it, the
+    // reactive-fallback site at plan() can't admit make alternatives.
+    val feasibilityCache: MutableMap<Pair<String, String>, Int> = mutableMapOf()
+    // Structural-failure memo for makes — once a make-fallback for (pid, lid)
+    // hard-blocks on a no_methods cascade, future demands skip the doomed walk.
+    // Value is the cached reason for diagnostic stub pegging nodes.
+    val structuralFailedMakes: MutableMap<Pair<String, String>, String> = mutableMapOf()
+
     // Compensation loop (Phase 3a + 3b).
     var commit: InitialCommitResult? = null
     var iterations = 0
@@ -153,6 +162,8 @@ internal fun runV2Supply(
         // 3a — initial / re-commit with current caps.
         commit = runInitialCommit(
             demands, inventory, data, config, overrideIndex, allocations, iterCb,
+            feasibilityCache = feasibilityCache,
+            structuralFailedMakes = structuralFailedMakes,
         )
 
         // Capture matrix misses. runInitialCommit now reports actualDraws via
@@ -243,6 +254,8 @@ internal fun runV2Supply(
     for (b in initialInventory) inventory.add(b.toMutableMap())
     commit = runInitialCommit(
         demands, inventory, data, config, overrideIndex, allocations, progressCallback,
+        feasibilityCache = feasibilityCache,
+        structuralFailedMakes = structuralFailedMakes,
     )
     log.info(
         "supply Phase 3c (final commit): produced {} WOs from {} demand(s) under converged caps",
