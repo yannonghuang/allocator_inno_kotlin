@@ -1,8 +1,25 @@
-# Supply-level consolidation — design
+# Supply-level consolidation — design (RETIRED)
 
-**Status:** Draft. Replaces the leaf-level consolidation engine (v2) with a supply-level allocator. Behind a feature flag during migration.
+**Status:** **RETIRED 2026-05.** The supply-level allocator
+(`consolidation.scope = "all"`) was removed from the runtime; only the
+leaf-level fixed-point pipeline (`runV2Iterated`) remains. This document is
+preserved for historical context only — do NOT use it to design new
+features. The supply orchestrator (`SupplyOrchestrator.kt`,
+`SupplyCommit.kt`) was deleted from the codebase. Old `plan_run` and
+`kb_record` rows that referenced `scope=all` are silently coerced to
+leaf-only on parse; the
+[`ConfigRetirementMigration`](../backend-kotlin/src/main/kotlin/com/allocator/services/ConfigRetirementMigration.kt)
+scrubs the dead `scope` field from saved JSON at startup.
 
-**Branch:** `feat/supply-level-consolidation`
+**Why retired:** empirically the supply engine never beat the leaf engine
+on case-171's headline metrics — fragmentation cost (the MFG total drops
+from 104k to 28k under scope=all) outweighed the per-supply fairness
+gains. Per-demand BOM walks under the leaf engine, with the iter-0 cap
+snapshot + root-bottleneck flag (added 2026-05) for diagnostic clarity,
+turn out to be the better architecture. See [waterfall-allocation.md](waterfall-allocation.md)
+for the active design.
+
+**Branch (historical):** `feat/supply-level-consolidation`
 
 **Author:** designed in collaboration, 2026-04-26.
 

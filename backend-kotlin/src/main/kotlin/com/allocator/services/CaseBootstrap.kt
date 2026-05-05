@@ -37,8 +37,8 @@ import org.jetbrains.exposed.sql.transactions.transaction
  *
  * Library design: each preset varies one load-bearing knob off a clean
  * baseline (preference, max=1, leaf-only, fair, no purchase, consolidation
- * on). Generation 1 covers the baseline + max-method sweep + regulation
- * scope; generation 2 covers allocation modes + consolidation + first
+ * on). Generation 1 covers the baseline + max-method sweep + max BOM
+ * depth; generation 2 covers allocation modes + consolidation + first
  * elaborate; generation 3 fills the elaborate weight space + combined
  * variants. The agent's evidence-grounding tactic depends on having pairs
  * that differ in exactly one knob, so the matrix is intentionally
@@ -72,8 +72,8 @@ private fun cfg(
     mode: String = "preference",
     maxMethods: Int = 1,
     depth: Int = 1,
+    maxBomDepth: Int = 3,                              // make-fallback admission cap (default 3)
     weights: Triple<Double, Double, Double>? = null,   // (commit, inventory, purchase)
-    scope: String = "leaf-only",                       // "leaf-only" | "all"
     allocationMode: String = "fair",                   // "fair" | "proportional" | "priority_first"
     consolidationEnabled: Boolean = true,
     periodDays: Int = 0,
@@ -85,7 +85,7 @@ private fun cfg(
         put("multiple", false)
         put("elaborate", mode == "elaborate")
         put("max_methods", maxMethods)
-        put("depth_optimal", false)
+        put("max_bom_depth", maxBomDepth)
         if (weights != null) {
             putJsonObject("score_weights") {
                 put("commit_time", weights.first)
@@ -105,7 +105,6 @@ private fun cfg(
         put("enabled", consolidationEnabled)
         put("period_days", periodDays)
         put("allocation_mode", allocationMode)
-        put("scope", scope)
     }
     putJsonObject("variant_selection") {
         put("multiple", true)
@@ -123,7 +122,7 @@ object CaseBootstrap {
     private const val AXIS_BASELINE   = "baseline"
     private const val AXIS_MAX        = "max_methods"
     private const val AXIS_DEPTH      = "depth"
-    private const val AXIS_SCOPE      = "regulation_scope"
+    private const val AXIS_BOM_DEPTH  = "max_bom_depth"
     private const val AXIS_ALLOC      = "allocation_mode"
     private const val AXIS_CONSOLID   = "consolidation"
     private const val AXIS_PURCHASE   = "purchase"
@@ -163,8 +162,9 @@ object CaseBootstrap {
         // depth axis: planner recursion depth.
         for (d in listOf(2, 3, 4)) add("depth=$d", AXIS_DEPTH, cfg(depth = d))
 
-        // Scope axis: where the split policy applies (leaves only vs all levels).
-        add("scope=all", AXIS_SCOPE, cfg(scope = "all"))
+        // max_bom_depth axis: make-fallback admission cap. Default is 3, so we
+        // include 1 (no make-fallback), 2, 4, 5 to bracket sensitivity.
+        for (n in listOf(1, 2, 4, 5)) add("bom_depth=$n", AXIS_BOM_DEPTH, cfg(maxBomDepth = n))
 
         // Allocation mode axis.
         add("alloc=proportional",   AXIS_ALLOC, cfg(allocationMode = "proportional"))
@@ -271,9 +271,9 @@ object CaseBootstrap {
                     ms.entries.forEach { (k, v) -> if (k != "depth") put(k, v) }
                     put("depth", JsonPrimitive((parsedValue as? Number)?.toInt() ?: 1))
                 }
-                "scope" -> putJsonObject("consolidation") {
-                    cs.entries.forEach { (k, v) -> if (k != "scope") put(k, v) }
-                    put("scope", JsonPrimitive((parsedValue as? String) ?: "leaf-only"))
+                "max_bom_depth" -> putJsonObject("method_selection") {
+                    ms.entries.forEach { (k, v) -> if (k != "max_bom_depth") put(k, v) }
+                    put("max_bom_depth", JsonPrimitive((parsedValue as? Number)?.toInt() ?: 3))
                 }
                 "allocation_mode" -> putJsonObject("consolidation") {
                     cs.entries.forEach { (k, v) -> if (k != "allocation_mode") put(k, v) }
@@ -402,13 +402,13 @@ object CaseBootstrap {
             group = GROUP_CONSOLID,
         ),
         AxisSpec(
-            name = "scope", label = "Scope",
-            description = "Regulation scope: split policy at leaves only vs all levels.",
-            valueType = "enum", enumValues = listOf("leaf-only", "all"),
-            baselineValue = JsonPrimitive("leaf-only"),
-            defaultSeed = JsonPrimitive("all"),
-            variations = listOf("all").map { JsonPrimitive(it) },
-            group = GROUP_CONSOLID,
+            name = "max_bom_depth", label = "Max BOM depth",
+            description = "Make-fallback admission cap. Caps the recursion depth admitted at the reactive make-fallback site; deeper makes are skipped.",
+            valueType = "int", enumValues = emptyList(),
+            baselineValue = JsonPrimitive(3),
+            defaultSeed = JsonPrimitive(2),
+            variations = listOf(1, 2, 4, 5).map { JsonPrimitive(it) },
+            group = GROUP_METHOD,
         ),
         AxisSpec(
             name = "period_days", label = "Period (days)",
@@ -455,7 +455,7 @@ object CaseBootstrap {
         return when (axisName) {
             "max_methods" -> cfg(maxMethods = (parsedValue as? Number)?.toInt() ?: 1)
             "depth" -> cfg(depth = (parsedValue as? Number)?.toInt() ?: 1)
-            "scope" -> cfg(scope = (parsedValue as? String) ?: "leaf-only")
+            "max_bom_depth" -> cfg(maxBomDepth = (parsedValue as? Number)?.toInt() ?: 3)
             "allocation_mode" -> cfg(allocationMode = (parsedValue as? String) ?: "fair")
             "consolidation_enabled" -> cfg(consolidationEnabled = (parsedValue as? Boolean) ?: true)
             "period_days" -> cfg(periodDays = (parsedValue as? Number)?.toInt() ?: 0)
@@ -660,17 +660,16 @@ object CaseBootstrap {
         val mode = ms.str("mode", "preference")
         val maxM = ms.int("max_methods", 1)
         val depth = ms.int("depth", 1)
-        val depthOpt = ms.bool("depth_optimal", false)
+        val bomDepth = ms.int("max_bom_depth", 3)
         val wC = fmtDbl(sw.dbl("commit_time", 0.4))
         val wI = fmtDbl(sw.dbl("inventory_consumed", 0.35))
         val wP = fmtDbl(sw.dbl("purchase", 0.25))
-        val scope = cs.str("scope", "leaf-only")
         val alloc = cs.str("allocation_mode", "fair")
         val consEnabled = cs.bool("enabled", true)
         val period = cs.int("period_days", 0)
         val purch = config.bool("purchase_allowed", false)
-        return "m=$mode|max=$maxM|d=$depth|dopt=$depthOpt|w=$wC,$wI,$wP|" +
-            "scope=$scope|alloc=$alloc|cons=$consEnabled|p=$period|purch=$purch"
+        return "m=$mode|max=$maxM|d=$depth|bom=$bomDepth|w=$wC,$wI,$wP|" +
+            "alloc=$alloc|cons=$consEnabled|p=$period|purch=$purch"
     }
 
     /** Wrap a preset's metadata bundle for plan_run.metadata. The signature is

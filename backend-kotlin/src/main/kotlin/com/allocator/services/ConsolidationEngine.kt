@@ -161,17 +161,6 @@ data class ConsolidationConfig(
     val enabled: Boolean = false,
     val periodDays: Int = 365,
     val allocationMode: String = "fair",  // "proportional" | "priority_first" | "fair"
-    /**
-     * Which scope the split policy applies at, when [enabled].
-     *   "leaf-only" — the original v2 mergeGroups + per-group consolidation
-     *                 pipeline. Split policy applies only at supply-bearing
-     *                 nodes (raw inventory, leftover stock, carry-over WOs);
-     *                 make/move WOs generated this round run unconstrained.
-     *   "all"      — supply-level allocation: every inventory-bearing node
-     *                gets a column, allocation policy fires at every make/move
-     *                WO output too. See docs/supply-level-consolidation.md.
-     */
-    val scope: String = "leaf-only",
 )
 
 /** Output of runConsolidation(). */
@@ -195,11 +184,9 @@ fun parseConsolidationConfig(config: Map<String, Any?>?): ConsolidationConfig {
         "priority_first" -> "priority_first"
         else             -> "fair"
     }
-    val scope = when (m["scope"]?.toString()) {
-        "all" -> "all"
-        else  -> "leaf-only"  // includes null and any unknown value
-    }
-    return ConsolidationConfig(enabled, periodDays, allocationMode, scope)
+    // Note: legacy `scope=all` configs are silently coerced to leaf-only on
+    // re-plan. The supply-level orchestrator was retired in 2026-05.
+    return ConsolidationConfig(enabled, periodDays, allocationMode)
 }
 
 // ── Time bucketing ────────────────────────────────────────────────────────────

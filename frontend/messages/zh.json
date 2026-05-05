@@ -276,6 +276,9 @@
       }
     },
     "config": {
+      "groupMethodSelection": "方法选择",
+      "groupConsolidation": "需求合并",
+      "groupPostPlan": "计划后分析",
       "methodSelection": "方法选择：",
       "elaborateMethod": "使用精细方法选择（较慢；按提交/库存/采购评分对方法排序，而非按优先级排序）",
       "methodMaxCount": "最多方法数",
@@ -283,8 +286,8 @@
       "checkSoundness": "完整性校验",
       "checkSoundnessTooltip": "每次成功规划后自动按 spec.md 规则进行完整性校验（始终深度校验，含 R8 叶到根链路守恒）。结果以徽章形式显示在该运行旁，点击徽章可打开完整报告。",
       "methodDepth": "深度",
-      "depthOptimal": "最优",
-      "depthOptimalHint": "自动搜索最佳深度：规划器从 depth=1, 2, 3 … 依次运行，并在加权计划评分（交付 / 库存 / 采购）相对上一深度首次未改善时停止。最多 10。每一步都需运行一次完整计划，请谨慎使用。",
+      "maxBomDepth": "最大 BOM 深度",
+      "maxBomDepthHint": "在反应式 make-fallback 节点上允许的最大真实 make 递归深度。当 make 候选的预计算深度超过该上限时，将被直接跳过，不再递归——在深 BOM 上限制成本，同时仍接纳结构上可行的回退方案。默认 3，范围 1–10。",
       "weightsLabel": "评分权重：",
       "weightCommit": "交付",
       "weightInventory": "库存",
@@ -297,15 +300,11 @@
       "priorityFirst": "优先级优先",
       "proportional": "按比例",
       "fair": "公平",
-      "regulationScope": "调控范围：",
-      "scopeLeavesOnly": "仅末端",
-      "scopeAllLevels": "全链路",
-      "scopeTooltip": "拆分策略应用的范围。仅末端 — 仅在已持有供应的节点上（原料库存、剩余库存、上一轮规划遗留的 WO）；本轮新生成的生产/调拨订单不受调控。全链路 — 已持有供应的节点 加上 本轮新生成的每一个生产/调拨订单。采购订单视为无限来源，两种模式下均不受调控。",
       "analyzeCriticality": "分析关键度",
       "analyzingCriticality": "分析中…（{done}/{total}）",
       "criticalityClear": "清除",
       "resetDefaults": "重置配置",
-      "resetDefaultsTitle": "重置计划配置：按偏好方法选择（深度 1）、禁用采购、合并开启（365 天桶、公平拆分、调控范围=仅末端）"
+      "resetDefaultsTitle": "重置计划配置：按偏好方法选择（深度 1）、最大 BOM 深度 3、禁用采购、合并开启（365 天桶、公平拆分）"
     },
     "runPlan": "运行计划",
     "running": "计划运行中…",
@@ -369,7 +368,7 @@
       "editPurchase": "允许采购",
       "editWeights": "评分权重",
       "editConsolidationEnabled": "合并",
-      "editScope": "scope",
+      "editMaxBomDepth": "最大 BOM 深度",
       "editPeriodDays": "周期（天）",
       "editAllocation": "分配",
       "editConfig": "编辑配置",
@@ -677,7 +676,7 @@
       "examplesTitle": "向规划代理提问，例如：",
       "examplesBody": "",
       "examplesMethod": "",
-      "examplesRest": "「以全链路调控运行一次计划」、「对比 433 号和 434 号运行」、「为什么 X 号需求只部分满足？」、「重新校验最新运行的合理性」、「显示 431 号运行的 KPI」、「最多方法 2」、「使用精细方法选择」、「显示当前配置」。",
+      "examplesRest": "「对比 433 号和 434 号运行」、「为什么 X 号需求只部分满足？」、「重新校验最新运行的合理性」、「显示 431 号运行的 KPI」、「最多方法 2」、「最大 BOM 深度 4」、「使用精细方法选择」、「显示当前配置」。",
       "roleUser": "您",
       "roleCopilot": "代理",
       "thinking": "思考中…",
@@ -692,8 +691,7 @@
         "showConfigMethod": "{methodMode}",
         "showConfigMethodDepth": "{methodMode}（深度 {depth}）",
         "methodDepth": "已将方法精细**深度**设为 {depth}。规划器将在最顶部 {depth} 个递归层级对候选方法进行评分。请重新运行计划以生效。",
-        "methodDepthOptimal": "已启用**最优深度搜索**。规划器将依次运行 depth=1, 2, 3 …，并在加权计划评分（交付 / 库存 / 采购）首次未改善时停止。最多 10。请重新运行计划以生效。",
-        "methodDepthManual": "已关闭最优深度搜索。规划器将使用固定深度。请重新运行计划以生效。",
+        "methodMaxBomDepth": "已将**最大 BOM 深度**设为 {depth}。该值约束反应式 make-fallback 节点上允许的最大真实 make 递归深度；超过该深度的 make 将被跳过。请重新运行计划以生效。",
         "methodMaxMethods": "**最多方法数**已设为 {n}。规划器每个需求最多尝试 {n} 个排序后的方法：第 1 个先承担全部需求，第 2 个接管剩余部分，依此类推（瀑布式分配）。库存按顺序结转。请重新运行计划以生效。",
         "methodElaborate": "方法选择已设为**精细（按模拟评分）**。规划器会模拟每个方法的子物料并选择最早提交、最多消耗库存、最少采购的方法。速度较慢。请重新运行计划以生效。",
         "methodPreference": "方法选择已设为**按偏好（级联）**。规划器先尝试最优先的方法；若其子物料无法规划，则回退到下一个偏好方法。请重新运行计划以生效。",
@@ -715,8 +713,8 @@
         "criticalityOff": "已关闭关键度分析。",
         "soundnessOn": "已启用**计划后完整性校验**（始终深度校验）。每次成功的规划都会自动校验，结果以徽章形式显示在该运行旁。",
         "soundnessOff": "已关闭计划后完整性校验。",
-        "reset": "已重置为默认：按偏好（级联）方法选择，深度 1、最多方法 2、禁用采购、合并开启（365 天桶，公平拆分）、关键度关闭、完整性校验开启。请重新运行计划以生效。",
-        "help": "我可以处理方法选择（模式、深度、最多方法数）、采购、共享组件合并以及计划后开关（关键度、完整性校验）。尝试：「按偏好」、「精细方法」、「方法深度 2」、「最多方法 3」、「禁用采购」、「允许采购」、「启用合并」、「设置 14 天桶」、「按比例拆分」、「关闭完整性校验」、「启用关键度」或「显示配置」。"
+        "reset": "已重置为默认：按偏好（级联）方法选择，深度 1、最多方法 2、最大 BOM 深度 3、禁用采购、合并开启（365 天桶，公平拆分）、关键度关闭、完整性校验开启。请重新运行计划以生效。",
+        "help": "我可以处理方法选择（模式、深度、最多方法数、最大 BOM 深度）、采购、共享组件合并以及计划后开关（关键度、完整性校验）。尝试：「按偏好」、「精细方法」、「方法深度 2」、「最多方法 3」、「最大 BOM 深度 4」、「禁用采购」、「允许采购」、「启用合并」、「设置 14 天桶」、「按比例拆分」、「关闭完整性校验」、「启用关键度」或「显示配置」。"
       }
     },
     "runHistory": {
@@ -736,10 +734,6 @@
       "jobSuffix": " · 任务 {job}…",
       "overrideCount": "{n} 条覆盖",
       "elapsedTitle": "耗时（开始 → 完成）",
-      "elapsedBreakdownTitle": "最优深度搜索 — 各深度耗时：",
-      "elapsedBreakdownTotal": "  搜索总计：{ms}",
-      "chosenDepthChip": "⚡ 最优深度：{depth}",
-      "chosenDepthTitle": "本次运行通过最优深度搜索选定的深度",
       "namePlaceholder": "名称（可选）",
       "notesPlaceholder": "备注（可选）",
       "chips": {
