@@ -145,6 +145,16 @@ fun checkRunSoundness(
     for (row in committedDemands) {
         val did = row["demand_id"]?.toString() ?: continue
         if (did.isBlank()) continue
+        // Skip hard-planning-failure rows. plan() emits a committedRow with
+        // `quantity=residual` and `commit_reason=no_methods | no_preferred_method
+        // | cycle_stopped | depth_limit | child_failed:*` to flag the SHORTFALL,
+        // not actual commit. The tree root's committed_qty correctly reports 0
+        // in those cases, so summing the shortfall qty here causes spurious R0
+        // mismatches (Negative_Inventory_* pseudo-demands and any fully-blocked
+        // real demand). Benign reasons (inventory, partial, null) and the
+        // `no_methods_succeeded` zero-qty placeholder pass through.
+        val reason = row["commit_reason"] as? String
+        if (isHardPlanningFailure(reason)) continue
         val q = (row["quantity"] as? Number)?.toDouble() ?: 0.0
         committedQtyById[did] = (committedQtyById[did] ?: 0.0) + q
     }
@@ -644,6 +654,16 @@ private class WalkContext(
     }
 
     private fun walkWorkOrder(node: Map<String, Any?>, path: String) {
+        // Failed-marker contract: nodes flagged `failed = true` are debug
+        // snapshots from the AND-bottleneck blocked branch in
+        // PlanningEngine.planMethodSlot. Their qty math, leaf consumption,
+        // and child pegging are deliberately stale — the first-pass takes
+        // were rolled back, but the structural snapshot is preserved so the
+        // UI can show the user *why* the method was blocked. Skip both rule
+        // evaluation and recursion: validating a known-broken snapshot would
+        // surface engine-bug-shaped violations (R4 qty propagation, R7d
+        // orphan leaves) for what is actually expected behaviour.
+        if (node["failed"] == true) return
         val method = node["method"]?.toString() ?: ""
         when (method) {
             "make" -> validateMakeWO(node, path)
