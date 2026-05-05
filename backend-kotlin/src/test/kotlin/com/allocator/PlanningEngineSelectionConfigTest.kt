@@ -183,23 +183,21 @@ class PlanningEngineSelectionConfigTest : FunSpec({
         resolveMethodSelection(mapOf("method_selection" to mapOf("mode" to "elaborate"))).scoreWeights shouldBe null
     }
 
-    // ── method_selection.depth_optimal ──────────────────────────────────────
+    // ── method_selection.max_bom_depth (make-fallback admission cap) ────────
 
-    test("method_selection.depth_optimal defaults to false when absent") {
-        resolveMethodSelection(null).depthOptimal shouldBe false
-        resolveMethodSelection(mapOf("method_selection" to mapOf("mode" to "elaborate"))).depthOptimal shouldBe false
+    test("method_selection.max_bom_depth defaults to 3 when absent") {
+        resolveMethodSelection(null).maxBomDepth shouldBe 3
+        resolveMethodSelection(mapOf("method_selection" to mapOf("mode" to "elaborate"))).maxBomDepth shouldBe 3
     }
 
-    test("method_selection.depth_optimal=true is parsed") {
-        val cfg = resolveMethodSelection(mapOf(
-            "method_selection" to mapOf("mode" to "elaborate", "depth_optimal" to true)
-        ))
-        cfg.depthOptimal shouldBe true
+    test("method_selection.max_bom_depth integer is parsed and clamped to [1, 10]") {
+        resolveMethodSelection(mapOf("method_selection" to mapOf("max_bom_depth" to 5))).maxBomDepth shouldBe 5
+        resolveMethodSelection(mapOf("method_selection" to mapOf("max_bom_depth" to 0))).maxBomDepth shouldBe 1
+        resolveMethodSelection(mapOf("method_selection" to mapOf("max_bom_depth" to 99))).maxBomDepth shouldBe 10
     }
 
-    test("method_selection.depth_optimal accepts only true/false (other truthy treated as false)") {
-        resolveMethodSelection(mapOf("method_selection" to mapOf("depth_optimal" to "yes"))).depthOptimal shouldBe false
-        resolveMethodSelection(mapOf("method_selection" to mapOf("depth_optimal" to 1))).depthOptimal shouldBe false
+    test("method_selection.max_bom_depth non-numeric falls back to default") {
+        resolveMethodSelection(mapOf("method_selection" to mapOf("max_bom_depth" to "deep"))).maxBomDepth shouldBe 3
     }
 
     // ── variant_selection ────────────────────────────────────────────────────

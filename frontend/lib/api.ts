@@ -254,6 +254,12 @@ export type PlanningPeggingNode = {
    *  — typically the only child a user can actually unblock by adding
    *  supply or reducing competition. */
   is_root_bottleneck?: boolean;
+  /** Diagnostic message attached to a failed demand node when commit_reason
+   *  is `no_methods` / `no_preferred_method`. Spells out why no method could
+   *  source this (product, location): purchase filtered out, methods exist
+   *  at other locations, or no methods at all. Rendered inline in the
+   *  pegging panel in place of the generic "No work orders" copy. */
+  failure_explanation?: string | null;
   children: PlanningPeggingNode[];
 };
 
@@ -338,10 +344,14 @@ export type PlanningConfig = {
      * elaborate score desc). Inventory carries forward across slots.
      */
     max_methods?: number;
+    /**
+     * Maximum real-make recursion depth admitted at the reactive make-fallback
+     * site. Default 3; clamped 1..10 by the backend. A make alternative whose
+     * precomputed maxMakeDepth exceeds this cap is skipped without recursing.
+     */
+    max_bom_depth?: number;
     /** Relative weights for elaborate scoring. Backend normalizes so absolute values don't matter. */
     score_weights?: { commit_time?: number; inventory_consumed?: number; purchase?: number };
-    /** When true, backend iterates depth=1..N picking the first non-improving step (using score_weights). */
-    depth_optimal?: boolean;
   };
   /** When false, the buy/purchase method is excluded from planning. Default: true. */
   purchase_allowed?: boolean;
@@ -352,17 +362,6 @@ export type PlanningConfig = {
     period_days?: number;
     /** How to split consolidated output among competing demands. Default: fair. */
     allocation_mode?: 'priority_first' | 'proportional' | 'fair';
-    /**
-     * Regulation scope: where the allocation_mode split policy is applied.
-     * UI labels: "Leaves only" / "All levels".
-     *   'leaf-only' — at supply-bearing nodes only (raw inventory, leftover
-     *                 stock, prior-round WOs). Make/move WOs generated this
-     *                 round run unconstrained.
-     *   'all'       — at supply-bearing nodes AND every make/move WO
-     *                 generated this round. Buy WOs are unbounded either
-     *                 way. See docs/supply-level-consolidation.md.
-     */
-    scope?: 'leaf-only' | 'all';
   };
   /**
    * Post-plan UI behavior toggles. These do not affect planner output — they

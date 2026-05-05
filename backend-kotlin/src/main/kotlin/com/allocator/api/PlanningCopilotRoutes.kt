@@ -68,11 +68,8 @@ Intent → config mapping (interpret any phrasing that conveys the same intent):
 4) **Set the elaborate search depth to N** (e.g. "method depth 3", "search depth 2", "方法深度 3", "深度 2")
    → method_selection: { "depth": N } (clamp N ≥ 1). Only meaningful when mode is elaborate.
 
-4d) **Optimal / auto depth — let the planner pick the best depth** (e.g. "optimal depth", "auto depth", "find best depth", "自动深度", "最优深度")
-    → method_selection: { "mode": "elaborate", "depth_optimal": true }. Planner iterates depth=1,2,3… and stops at the first depth where the weighted plan score does not improve. Capped at 10. Re-run plan to apply.
-
-4e) **Manual / fixed depth — disable auto-depth** (e.g. "fixed depth", "manual depth", "固定深度")
-    → method_selection: { "depth_optimal": false }.
+4d) **Set max BOM depth for make-fallback admission to N** (e.g. "max BOM depth 4", "make-fallback depth 2", "最大BOM深度 3")
+    → method_selection: { "max_bom_depth": N } (clamp 1..10). Default 3. Caps the recursion depth admitted at the reactive make-fallback site; deeper makes are skipped without recursing.
 
 4a) **Earliest delivery / fastest commit** (weights-only intent; only meaningful when mode is elaborate)
     → method_selection: { "score_weights": { "commit_time": 1, "inventory_consumed": 0, "purchase": 0 } }.
@@ -123,7 +120,7 @@ Intent → config mapping (interpret any phrasing that conveys the same intent):
     → check_soundness: false.
 
 Valid config_update keys:
-- method_selection: object with optional "multiple" (bool), "mode" ("preference" | "elaborate"), "depth" (int ≥ 1), "depth_optimal" (bool), "score_weights" ({ commit_time, inventory_consumed, purchase } — numeric, backend normalizes).
+- method_selection: object with optional "multiple" (bool), "mode" ("preference" | "elaborate"), "depth" (int ≥ 1), "max_methods" (int ≥ 1; default 2; waterfall cap), "max_bom_depth" (int 1..10; default 3; make-fallback admission cap), "score_weights" ({ commit_time, inventory_consumed, purchase } — numeric, backend normalizes).
 - purchase_allowed: boolean (top-level, not nested).
 - consolidation: object with optional "enabled" (bool), "period_days" (int 0..365; 0 = single bucket), "allocation_mode" ("fair" | "proportional" | "priority_first").
 - analyze_criticality: boolean (top-level). Post-plan UI toggle, does not affect the planner itself.
@@ -183,7 +180,7 @@ private suspend fun llmParse(
         val pa = cu["purchase_allowed"]?.jsonPrimitive?.booleanOrNull
         val ac = cu["analyze_criticality"]?.jsonPrimitive?.booleanOrNull
         val sc = cu["check_soundness"]?.jsonPrimitive?.booleanOrNull
-        val msOk = ms?.let { "multiple" in it || "elaborate" in it || "mode" in it || "depth" in it || "depth_optimal" in it || "score_weights" in it } == true
+        val msOk = ms?.let { "multiple" in it || "elaborate" in it || "mode" in it || "depth" in it || "max_methods" in it || "max_bom_depth" in it || "score_weights" in it } == true
         val csOk = cs?.let { "enabled" in it || "period_days" in it || "allocation_mode" in it } == true
         val paOk = pa != null
         val acOk = ac != null
@@ -227,10 +224,10 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
     if (t.isBlank()) {
         return bi(
             "You can tell me how you'd like planning to behave—for example \"max methods 2\", " +
-                "\"use elaborate method selection\", \"check soundness off\", or \"allow purchase\". " +
-                "You can also ask to see the current settings.",
-            "您可以告诉我希望规划如何运行 — 例如「最多方法 2」、「使用精细方法选择」、" +
-                "「关闭完整性校验」、或「允许采购」。您也可以让我显示当前配置。",
+                "\"max BOM depth 4\", \"use elaborate method selection\", \"check soundness off\", " +
+                "or \"allow purchase\". You can also ask to see the current settings.",
+            "您可以告诉我希望规划如何运行 — 例如「最多方法 2」、「最大 BOM 深度 4」、" +
+                "「使用精细方法选择」、「关闭完整性校验」、或「允许采购」。您也可以让我显示当前配置。",
             raw,
         ) to null
     }
@@ -251,12 +248,7 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
                 val wc = sw?.get("commit_time")?.jsonPrimitive?.doubleOrNull
                 val wi = sw?.get("inventory_consumed")?.jsonPrimitive?.doubleOrNull
                 val wp = sw?.get("purchase")?.jsonPrimitive?.doubleOrNull
-                val depthOptimal = ms["depth_optimal"]?.jsonPrimitive?.booleanOrNull == true
-                val depthLabel = if (zh) {
-                    if (depthOptimal) "自动深度（最优搜索）" else "深度 $depth"
-                } else {
-                    if (depthOptimal) "auto-depth (optimal search)" else "depth $depth"
-                }
+                val depthLabel = if (zh) "深度 $depth" else "depth $depth"
                 val label = when {
                     wc != null && wi != null && wp != null -> {
                         val weightDesc = if (zh) when {
@@ -279,6 +271,8 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
             else -> parts.add(if (zh) "按偏好选择方法（单一最优）" else "method by preference (single best)")
         }
         parts.add(if (zh) "最多方法数 $maxMethods" else "max methods $maxMethods")
+        val maxBomDepth = ms["max_bom_depth"]?.jsonPrimitive?.intOrNull?.coerceIn(1, 10) ?: 3
+        parts.add(if (zh) "最大 BOM 深度 $maxBomDepth" else "max BOM depth $maxBomDepth")
         parts.add(if (purchaseAllowed == false) (if (zh) "禁用采购" else "purchase disabled") else (if (zh) "允许采购" else "purchase allowed"))
         val csEnabled = cs["enabled"]?.jsonPrimitive?.booleanOrNull
         if (csEnabled == false) {
@@ -311,30 +305,25 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
         val sep = if (zh) "、" else ", "
         val desc = if (parts.isEmpty()) (if (zh) "默认" else "default") else parts.joinToString(sep)
         return bi(
-            "Right now we're using $desc. If you'd like to switch, just say so—e.g. \"max methods 2\", \"elaborate methods\", \"method depth 3\", \"allow purchase\", \"check soundness off\", or \"disable consolidation\".",
-            "当前配置：$desc。如需切换，告诉我即可 — 例如「最多方法 2」、「精细方法」、「方法深度 3」、「允许采购」、「关闭完整性校验」或「禁用合并」。",
+            "Right now we're using $desc. If you'd like to switch, just say so—e.g. \"max methods 2\", \"elaborate methods\", \"method depth 3\", \"max BOM depth 4\", \"allow purchase\", \"check soundness off\", or \"disable consolidation\".",
+            "当前配置：$desc。如需切换，告诉我即可 — 例如「最多方法 2」、「精细方法」、「方法深度 3」、「最大 BOM 深度 4」、「允许采购」、「关闭完整性校验」或「禁用合并」。",
             raw,
         ) to null
     }
 
-    // ── Optimal depth search (auto-pick depth) ──
-    if (Regex("optimal depth|auto depth|auto-depth|best depth|find depth|search depth").containsMatchIn(t) ||
-        Regex("自动深度|最优深度|最佳深度").containsMatchIn(raw)
-    ) {
+    // ── Max BOM depth (e.g. "max bom depth 4", "make-fallback depth 2", "最大BOM深度 3") ──
+    val bomDepthMatch = Regex("max(?:imum)?\\s*bom\\s*depth\\s*(?:=|:|to)?\\s*(\\d+)|make[- ]fallback\\s*depth\\s*(?:=|:|to)?\\s*(\\d+)").find(t)
+    val zhBomDepthMatch = Regex("最大\\s*BOM\\s*深度\\s*[:=]?\\s*(\\d+)|BOM\\s*深度\\s*[:=]?\\s*(\\d+)").find(raw)
+    if (bomDepthMatch != null || zhBomDepthMatch != null) {
+        val n = (bomDepthMatch?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }
+            ?: zhBomDepthMatch?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }
+            ?: "3").toIntOrNull() ?: 3
+        val d = n.coerceIn(1, 10)
         return bi(
-            "Enabling optimal depth search: planner will iterate depth=1, 2, 3 … and stop at the first depth where the weighted plan score does not improve. Capped at 10. Re-run plan to apply.",
-            "已启用最优深度搜索：规划器将依次尝试 depth=1, 2, 3 …，并在加权计划评分首次未改善时停止。最多 10。请重新运行计划以生效。",
+            "Setting max BOM depth to $d. Caps the recursion depth admitted at the make-fallback site; deeper makes are skipped. Re-run plan to apply.",
+            "已将最大 BOM 深度设为 $d。该值约束 make-fallback 的递归深度，更深的 make 将被跳过。请重新运行计划以生效。",
             raw,
-        ) to mergeMethodSelection(current, mapOf("mode" to JsonPrimitive("elaborate"), "depth_optimal" to JsonPrimitive(true)))
-    }
-    if (Regex("manual depth|fixed depth|disable optimal depth|disable auto[- ]depth|turn off auto[- ]depth").containsMatchIn(t) ||
-        Regex("固定深度|手动深度|关闭自动深度|关闭最优深度").containsMatchIn(raw)
-    ) {
-        return bi(
-            "Disabling optimal depth search. Planner will use the fixed depth value.",
-            "已关闭最优深度搜索。规划器将使用固定深度值。",
-            raw,
-        ) to mergeMethodSelection(current, mapOf("depth_optimal" to JsonPrimitive(false)))
+        ) to mergeMethodSelection(current, mapOf("max_bom_depth" to JsonPrimitive(d)))
     }
 
     // ── Method depth (e.g. "method depth 3", "depth to 2", "方法深度 3", "深度 2") ──
@@ -349,7 +338,7 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
             "Setting elaborate method depth to $d. Re-run plan to apply (depth only takes effect when method mode is elaborate).",
             "已将精细方法深度设为 $d。请重新运行计划以生效（仅在方法模式为「精细」时生效）。",
             raw,
-        ) to mergeMethodSelection(current, mapOf("depth" to JsonPrimitive(d), "depth_optimal" to JsonPrimitive(false)))
+        ) to mergeMethodSelection(current, mapOf("depth" to JsonPrimitive(d)))
     }
 
     // ── Score weights (only applicable when elaborate mode is on) ──

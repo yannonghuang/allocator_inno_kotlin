@@ -45,10 +45,16 @@ internal data class MethodSelectionConfig(
     /** Cap on how many methods waterfall may invoke per demand. >= 1; default 2. */
     val maxMethods: Int,
     val scoreWeights: Map<String, Any?>?,  // drives elaborate scoring (commit_time / inventory_consumed / purchase)
-    val depthOptimal: Boolean = false,     // when true, caller iterates depth=1..N picking the first non-improving step
+    /** Maximum real-make recursion depth admitted at the reactive make-fallback
+     *  site in plan(). A make alternative whose precomputed [maxMakeDepth]
+     *  exceeds this cap is skipped without recursing — too deep to attempt
+     *  productively. Default 3 (covers typical case-171 patterns). */
+    val maxBomDepth: Int = DEFAULT_MAX_BOM_DEPTH,
 ) {
     val elaborate: Boolean get() = mode == "elaborate"
 }
+
+internal const val DEFAULT_MAX_BOM_DEPTH = 3
 
 /** Effective variant_selection config. */
 internal data class VariantSelectionConfig(
@@ -86,14 +92,24 @@ private const val DEFAULT_MAX_METHODS = 2
  *  bottleneck-rounding leftovers. */
 private const val MIN_WATERFALL_RESIDUAL = 0.5
 
-/** Maximum real-make recursion depth admitted at the reactive-fallback site
- *  in plan(). A `make` alternative whose precomputed `maxMakeDepth` exceeds
- *  this cap is structurally too deep to attempt — the make would either
- *  recurse uselessly or compound. Empirically 3 covers typical case-171
- *  patterns (e.g. 260-0385.make → 280-1786.make → leaf supply, depth=2)
- *  while leaving headroom; bumping higher trades recovery potential for
- *  recursion cost. */
-private const val FALLBACK_MAKE_DEPTH_CAP = 3
+/** Parse `method_selection.max_bom_depth`: integer ≥ 1, defaults to
+ *  [DEFAULT_MAX_BOM_DEPTH] (3). Caps at 10 to bound recursion cost.
+ *
+ *  This is the maximum real-make recursion depth admitted at the reactive
+ *  make-fallback site in plan(). A `make` alternative whose precomputed
+ *  [maxMakeDepth] exceeds this cap is structurally too deep to attempt —
+ *  the make would either recurse uselessly or compound. */
+private const val MAX_BOM_DEPTH_HARD_CAP = 10
+private fun parseMaxBomDepth(raw: Any?): Int {
+    if (raw == null) return DEFAULT_MAX_BOM_DEPTH
+    val n = (raw as? Number)?.toInt()
+    if (n == null) {
+        log.warn("Invalid method_selection.max_bom_depth={}; defaulting to {}", raw, DEFAULT_MAX_BOM_DEPTH)
+        return DEFAULT_MAX_BOM_DEPTH
+    }
+    return n.coerceIn(1, MAX_BOM_DEPTH_HARD_CAP)
+}
+
 private fun parseMaxMethods(rawMax: Any?, multiple: Boolean, multiplePresent: Boolean): Int {
     if (rawMax != null) {
         val n = (rawMax as? Number)?.toInt()
@@ -145,19 +161,16 @@ internal fun resolveMethodSelection(config: Map<String, Any?>?): MethodSelection
         @Suppress("UNCHECKED_CAST")
         vs?.get("score_weights") as? Map<String, Any?>
     }
-    val depthOptimal = raw["depth_optimal"] == true
+    val maxBomDepth = parseMaxBomDepth(raw["max_bom_depth"])
     return MethodSelectionConfig(
         mode = mode,
         depth = depth,
         multiple = multiple,
         maxMethods = maxMethods,
         scoreWeights = weights,
-        depthOptimal = depthOptimal,
+        maxBomDepth = maxBomDepth,
     )
 }
-
-/** Soft cap on how many depths the optimal-depth search will try. Each iteration costs a full plan. */
-internal const val MAX_OPTIMAL_DEPTH = 10
 
 /**
  * True when we are still within the top `levels` recursion levels and should
@@ -1719,9 +1732,9 @@ fun plan(
     /**
      * Memoized make-feasibility cache: `(pid, lid) → maxMakeDepth`. When non-null,
      * the reactive-fallback site admits make-as-fallback for products whose depth
-     * is bounded by [FALLBACK_MAKE_DEPTH_CAP]. Caller-owned; computed lazily on
-     * first query. Pass `mutableMapOf()` from the planning entry to enable, or
-     * leave `null` to keep fallback move-only.
+     * is bounded by `method_selection.max_bom_depth` (default 3). Caller-owned;
+     * computed lazily on first query. Pass `mutableMapOf()` from the planning
+     * entry to enable, or leave `null` to keep fallback move-only.
      */
     feasibilityCache: MutableMap<Pair<String, String>, Int>? = null,
     /**
@@ -1848,11 +1861,51 @@ fun plan(
 
     // 2) Get methods
     val purchaseAllowed = config?.get("purchase_allowed") != false  // default true
-    val methods = getMethods(productId, locationId, data)
-        .let { if (purchaseAllowed) it else it.filter { m -> m["type"] != "purchase" } }
+    val methodsRaw = getMethods(productId, locationId, data)
+    val methods = if (purchaseAllowed) methodsRaw else methodsRaw.filter { m -> m["type"] != "purchase" }
     if (methods.isEmpty()) {
+        // Diagnostic: surface WHY no methods were available so the pegging
+        // tree carries enough context to answer "which component has no
+        // supply?". Three flavours, in priority order:
+        //   1. Buy filtered out by purchase_allowed=false — cheap fix.
+        //   2. Methods exist at OTHER locations of this product — data issue
+        //      (no move-to-here / make-at-here defined).
+        //   3. Truly no methods anywhere — terminal data gap.
+        // Attached to the demand node as `failure_explanation` so the UI can
+        // render it inline in the failed-pegging area (no awkward synthetic
+        // work_order child with a fake method label).
+        val buyFiltered = !purchaseAllowed && methodsRaw.any { it["type"] == "purchase" }
+        val otherLocsForMake = (data["method_make"] ?: emptyList())
+            .filter { (it["product_id"] as? String)?.trim() == productId }
+            .mapNotNull { (it["location_id"] as? String)?.trim() }
+            .filter { it != locationId && it.isNotBlank() }
+            .distinct()
+        val otherLocsForMove = (data["method_move"] ?: emptyList())
+            .filter { (it["product_id"] as? String)?.trim() == productId }
+            .mapNotNull { (it["to_location_id"] as? String)?.trim() }
+            .filter { it != locationId && it.isNotBlank() }
+            .distinct()
+        val otherLocs = (otherLocsForMake + otherLocsForMove).distinct()
+        val explanation = buildString {
+            append("No supply method for $productId @ $locationId.")
+            if (buyFiltered) {
+                append(" A buy method exists at this location but is excluded because " +
+                    "purchase_allowed=false; enable purchase to admit it.")
+            }
+            if (otherLocs.isNotEmpty()) {
+                append(" The product CAN be produced at: ${otherLocs.joinToString(", ")}, " +
+                    "but no method (move-to-$locationId or make-at-$locationId) is defined to " +
+                    "bring it here. Add a method_move row from one of those locations to " +
+                    "$locationId, or define a make recipe at $locationId.")
+            }
+            if (!buyFiltered && otherLocs.isEmpty()) {
+                append(" No method exists for this product at any location — " +
+                    "data gap (missing method_make / method_move / method_buy rows).")
+            }
+        }
         demandFulfilledList.add(committedRow(demandNetQty, reqTimeStr, "no_methods"))
-        return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, reqTimeStr, "no_methods", committedQty = taken))
+        val baseNode = demandNode(peggingChildren, reqTimeStr, "no_methods", committedQty = taken)
+        return Triple(demandFulfilledList, emptyList(), baseNode + ("failure_explanation" to explanation))
     }
 
     if (methods.size > 1) {
@@ -2049,9 +2102,10 @@ fun plan(
     //     The cache pre-computes the minimum real-make-recursion depth needed
     //     to source `(productId, locationId)` via any structurally-feasible
     //     path (moves are free traversals, makes count). A make whose depth
-    //     exceeds [FALLBACK_MAKE_DEPTH_CAP] is skipped without recursing —
-    //     no wasteful exploration of structurally doomed BOM subtrees. Only
-    //     fires when [feasibilityCache] is provided.
+    //     exceeds `methodCfg.maxBomDepth` (UI knob "Max BOM depth", default 3)
+    //     is skipped without recursing — no wasteful exploration of
+    //     structurally doomed BOM subtrees. Only fires when [feasibilityCache]
+    //     is provided.
     //
     // VirtualProduct_* targets are exempt from the make filter (their only
     // method is make by data-model construction).
@@ -2063,15 +2117,24 @@ fun plan(
     } else emptyList()
 
     val cachedMakeFailureReason = structuralFailedMakes?.get(Pair(productId, locationId))
+    // Track makes that were excluded by the depth gate so we can surface a
+    // diagnostic stub at the end. When the recipe is structurally infeasible
+    // under the current `purchase_allowed` (e.g. transitive children are
+    // buy-only with no inventory), maxMakeDepth returns Int.MAX_VALUE and the
+    // make silently disappears from fallbackOrder — making "why didn't make
+    // fire?" hard to answer from the pegging tree alone.
+    var excludedMakeDepth: Int? = null   // computed depth (Int.MAX_VALUE => structural)
     val makeAlternatives: List<Map<String, Any?>> = if (feasibilityCache != null && cachedMakeFailureReason == null) {
         val purchaseAllowedForCache = config?.get("purchase_allowed") != false
-        effectiveMethods
-            .filter { it["type"] == "make" && it !== m }
+        val rawMakes = effectiveMethods.filter { it["type"] == "make" && it !== m }
+        rawMakes
             .filter {
                 if (productId.startsWith("VirtualProduct_")) true
                 else {
                     val mkDepth = maxMakeDepth(productId, locationId, data, purchaseAllowedForCache, feasibilityCache)
-                    mkDepth <= FALLBACK_MAKE_DEPTH_CAP
+                    val admitted = mkDepth <= methodCfg.maxBomDepth
+                    if (!admitted && excludedMakeDepth == null) excludedMakeDepth = mkDepth
+                    admitted
                 }
             }
             .sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
@@ -2192,6 +2255,44 @@ fun plan(
                     "no_methods cascade; reusing that result here to avoid redundant recursion.",
                 "failed" to true,
                 "children" to listOf(syntheticLeaf),
+            ))
+        }
+    }
+
+    // Diagnostic stub: when the make-fallback feasibility cache excluded the
+    // make from admission (because maxMakeDepth exceeds method_selection.
+    // max_bom_depth, often Int.MAX_VALUE — the recipe is structurally
+    // infeasible under the current `purchase_allowed`), emit a stub so the
+    // user sees the make was considered. Only fires when the structural-
+    // failure stub above didn't already fire (mutually exclusive — the cache
+    // gate runs BEFORE structuralFailedMakes was consulted, so if we got here
+    // with cachedMakeFailureReason != null we already emitted that stub).
+    if (cachedMakeFailureReason == null && excludedMakeDepth != null) {
+        val stubMakeMethod = effectiveMethods.firstOrNull { it["type"] == "make" }
+        if (stubMakeMethod != null) {
+            val depthValue = excludedMakeDepth!!
+            val isStructural = depthValue == Int.MAX_VALUE
+            val purchaseAllowedFlag = config?.get("purchase_allowed") != false
+            val explanation = if (isStructural) {
+                "Make skipped: recipe is structurally infeasible (maxMakeDepth=∞). " +
+                    "Some transitive BOM child has no terminal source under the current " +
+                    "configuration (purchase_allowed=$purchaseAllowedFlag) — typically a " +
+                    "buy-only leaf with no inventory at the needed location. Enable purchase " +
+                    "or provision inventory upstream to admit this make."
+            } else {
+                "Make skipped: maxMakeDepth=$depthValue exceeds method_selection." +
+                    "max_bom_depth=${methodCfg.maxBomDepth}. Raise max_bom_depth to admit " +
+                    "this deeper recipe."
+            }
+            combinedPegging.add(mapOf(
+                "type" to "work_order",
+                "product_id" to productId,
+                "location_id" to locationId,
+                "quantity" to 0,
+                "method" to "make",
+                "method_choice_explanation" to explanation,
+                "failed" to true,
+                "children" to emptyList<Any>(),
             ))
         }
     }
@@ -3133,38 +3234,18 @@ fun runPlanning(
     // Disabled → run phase 3 directly against real inventory; useTaggedLookup
     // is needed only for supply-split overrides (real buckets split per demand).
     val commitResult: LegacyCommitResult
-    // Per-(supply_id) allocation records emitted only by the supply engine. Empty under
-    // the leaf engine (it expresses splitInfo via consolidated pegging entries instead).
-    var supplyLevelAllocations: List<Map<String, Any?>> = emptyList()
+    // Empty list — retained for shape compatibility with historical consumers
+    // that still read `supply_level_allocations` from enriched plan results.
+    // The supply-level orchestrator (consolidation.scope="all") was retired
+    // in 2026-05; only the leaf-level fixed-point pipeline remains.
+    val supplyLevelAllocations: List<Map<String, Any?>> = emptyList()
     if (consolidationConfig.enabled) {
-        // Dispatch by regulation scope. Default ("leaf-only") preserves the
-        // original v2 fixed-point pipeline (split policy at supply-bearing
-        // nodes only); "all" routes to the supply-level orchestrator that
-        // applies the policy at every make/move WO too — see
-        // docs/supply-level-consolidation.md.
-        when (consolidationConfig.scope) {
-            "all" -> {
-                val supply = runV2Supply(
-                    demands, inventory, data, config, consolidationConfig, overrideIndex, progressCallback,
-                )
-                // Supply engine puts ALL WOs (consolidated + passthrough) into one
-                // list. consolidatedPegging carries one entry per multi-demand WO
-                // group so the WO-pegging endpoint can locate trees for merged WOs;
-                // per-demand pegging trees come through commitResult.planningPegging.
-                consolidatedWOs.addAll(supply.workOrders)
-                consolidatedPegging.addAll(supply.consolidatedPegging)
-                commitResult = supply.commitResult
-                supplyLevelAllocations = supply.supplyLevelAllocations
-            }
-            else -> {
-                val iterated = runV2Iterated(
-                    demands, inventory, data, config, consolidationConfig, overrideIndex, progressCallback,
-                )
-                consolidatedWOs.addAll(iterated.consolidatedWOs)
-                consolidatedPegging.addAll(iterated.consolidatedPegging)
-                commitResult = iterated.commitResult
-            }
-        }
+        val iterated = runV2Iterated(
+            demands, inventory, data, config, consolidationConfig, overrideIndex, progressCallback,
+        )
+        consolidatedWOs.addAll(iterated.consolidatedWOs)
+        consolidatedPegging.addAll(iterated.consolidatedPegging)
+        commitResult = iterated.commitResult
     } else {
         commitResult = legacyCommit(
             demands, inventory, data, config, overrideIndex,

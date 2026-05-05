@@ -121,7 +121,7 @@ internal data class MethodSelectionConfig(
     val multiple: Boolean,                                  //   legacy parse only
     val maxMethods: Int,     // ≥ 1                         — waterfall cap
     val scoreWeights: Map<String, Any?>?,
-    val depthOptimal: Boolean = false,
+    val maxBomDepth: Int = 3,  // 1..10                     — make-fallback admission cap
 )
 ```
 
@@ -133,33 +133,111 @@ The config schema accepted on input (JSON):
     "mode": "preference",
     "depth": 1,
     "max_methods": 2,
+    "max_bom_depth": 3,
     "elaborate": false,
-    "score_weights": { "commit_time": 1.0, "inventory_consumed": 0.0, "purchase": 0.0 },
-    "depth_optimal": false
+    "score_weights": { "commit_time": 1.0, "inventory_consumed": 0.0, "purchase": 0.0 }
   }
 }
 ```
 
-Legacy keys still parsed but ignored on input: `multiple`, `split_mechanism`.
-The frontend strips both before re-submitting saved configs (defense in
-depth). Saved `plan_run.config` rows are immutable audit data — the backend
-never re-executes them, so historical `split_mechanism: "equal"` rows display
-unchanged in the run-history UI.
+Legacy keys still parsed but ignored on input: `multiple`, `split_mechanism`,
+`depth_optimal`. The frontend strips them before re-submitting saved configs
+(defense in depth). Saved `plan_run.config` rows are immutable audit data —
+the backend never re-executes them, so historical legacy rows display
+unchanged in the run-history UI; the
+[`ConfigRetirementMigration`](../backend-kotlin/src/main/kotlin/com/allocator/services/ConfigRetirementMigration.kt)
+scrubs `depth_optimal`/`scope` from saved configs at startup so KB
+signatures stay comparable.
+
+## Reactive fallback within a single method slot
+
+The waterfall described above is the *outer* loop — slot N+1 fires only when
+slot N hit capacity. There's also an *inner* fallback that fires reactively
+when a single method blocks. It's distinct from the outer waterfall (which
+operates on the demand's ranked method list); the inner fallback decides
+what to do with **the chosen method's own structurally-equivalent
+alternatives** when its primary attempt returns 0.
+
+Two flavours of inner fallback are admitted at the single-method path
+([`PlanningEngine.kt::plan()`](../backend-kotlin/src/main/kotlin/com/allocator/services/PlanningEngine.kt)
+around line 2050):
+
+### 1. Move-to-move fallback
+
+When the primary method is a `move` and blocks, scan `effectiveMethods` for
+*other* moves of the same product that differ only by `from_location_id`.
+Tied-preference move sources are common (e.g. `move 1000→VIRTUAL` and
+`move 2000→VIRTUAL` both ranked at preference 1). When the @1000 chain dies
+downstream but the @2000 chain has feasible inventory, this admits the
+@2000 source as a same-method fallback.
+
+Cost is bounded — downstream BOM is identical for both moves; only the
+starting location changes.
+
+### 2. Make-fallback gated by `max_bom_depth`
+
+When the primary method is non-make (typically a blocked `move` or
+`purchase`), real `make` alternatives may be admitted as fallback —
+provided the BOM under that make is structurally feasible to plan. Without
+the gate this is dangerous: a make whose recipe recurses through 8 levels
+of intermediates might collapse on a deep no-inventory subtree, burning
+recursion cost for nothing.
+
+The gate is the **`maxMakeDepth` feasibility cache**, computed lazily per
+`(product_id, location_id)` and bounded by `method_selection.max_bom_depth`
+(UI label "Max BOM depth", default 3, range 1–10):
+
+  - `maxMakeDepth(pid, lid)` returns the minimum real-make-recursion depth
+    needed to source `(pid, lid)` via *any* structurally-feasible path
+    (moves traverse free, makes count). The recursion descends through
+    candidate methods at each level and picks the cheapest.
+  - A make alternative whose precomputed depth exceeds
+    `methodCfg.maxBomDepth` is dropped from the fallback list — no plan()
+    call, no inventory mutation, no waste.
+  - Memoization: the cache is owned by the planning entry (one cache per
+    `runV2Iterated` invocation), so per-demand walks share cost. Without
+    memoization, a 200-demand case re-walks the same intermediate
+    feasibility tree thousands of times.
+
+Special-case: `VirtualProduct_*` targets are exempt from the cap — by data
+construction they have no other method type than make, so the depth gate
+would always block the only feasible source.
+
+### Why the cap exists at all
+
+Empirically 3 covers typical real BOMs (e.g. `260-0385.make →
+280-1786.make → leaf supply`, depth 2) while leaving headroom. Bumping
+higher trades recovery potential for recursion cost — most blocked makes
+are blocked because of leaf-level supply gaps that no amount of recursion
+will fix. Setting `max_bom_depth = 1` disables the make-fallback
+entirely (no make-as-fallback admitted), useful for benchmarking the
+"pure waterfall" baseline.
+
+### Cached structural failure
+
+A separate memo (`structuralFailedMakes`) records `(pid, lid)` pairs
+whose make-fallback was *attempted* and hard-blocked on a structural
+cascade (e.g. `no_methods` at every leaf). Future demands skip these
+without re-attempting. The memo distinguishes structural failure from
+capacity-driven failure (the latter is runtime-dependent and might
+succeed for a different demand under different inventory pressure).
 
 ## Where to look in the code
 
 | Responsibility | Location |
 |---|---|
-| `MethodSelectionConfig` definition | `backend-kotlin/src/main/kotlin/com/allocator/services/PlanningEngine.kt` (around line 44) |
-| `parseMaxMethods` parser + DEFAULT_MAX_METHODS | same file (around line 87) |
-| `MIN_WATERFALL_RESIDUAL` constant | same file (around line 92) |
-| `planMethodSlot` helper (extracted per-method body) | same file (around line 824) |
+| `MethodSelectionConfig` definition | `backend-kotlin/src/main/kotlin/com/allocator/services/PlanningEngine.kt` (around line 41) |
+| `parseMaxMethods` parser + DEFAULT_MAX_METHODS | same file (around line 100) |
+| `parseMaxBomDepth` parser + `DEFAULT_MAX_BOM_DEPTH = 3` | same file (around line 50, 96) |
+| `MIN_WATERFALL_RESIDUAL` constant | same file (around line 87) |
+| `maxMakeDepth` feasibility helper | same file (around line 632) |
+| `planMethodSlot` helper (extracted per-method body) | same file (around line 1145) |
 | Waterfall loop + gating | `plan()` body, after `effectiveMethods` is computed |
-| Single-method path (calls `planMethodSlot` once) | `plan()` body, after the waterfall block |
-| Form: max-methods dropdown | `frontend/app/cases/[id]/_CaseSectionPage.tsx` |
+| Single-method path + reactive move/make fallback | `plan()` body, after the waterfall block (around line 2050) |
+| Form: max-methods + max-bom-depth inputs | `frontend/app/cases/[id]/_CaseSectionPage.tsx` |
 | Outgoing config normalization | `frontend/lib/api.ts` `normalizeMethodSelection` |
-| Persistence | `backend-kotlin/src/main/kotlin/com/allocator/api/Allocate.kt` (around line 1895) |
-| Tests | `backend-kotlin/src/test/kotlin/com/allocator/WaterfallAllocationTest.kt` |
+| Persistence | `backend-kotlin/src/main/kotlin/com/allocator/api/Allocate.kt` (around line 1820) |
+| Tests | `backend-kotlin/src/test/kotlin/com/allocator/WaterfallAllocationTest.kt`, `MakeFallbackTest.kt` |
 
 ## Trade-offs vs proportional split
 

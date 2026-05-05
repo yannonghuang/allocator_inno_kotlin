@@ -2,7 +2,11 @@ package com.allocator.api
 
 import com.allocator.AgentMemory
 import com.allocator.Cases
+import com.allocator.MethodBuys
+import com.allocator.MethodMakes
+import com.allocator.MethodMoves
 import com.allocator.PlanRuns
+import com.allocator.Supplies
 import org.jetbrains.exposed.sql.SortOrder
 import org.jetbrains.exposed.sql.max
 import com.allocator.services.CaseBootstrap
@@ -147,24 +151,52 @@ Planner knowledge (from docs/waterfall-allocation.md):
   - mode = "preference" (lowest preference int wins) | "elaborate" (composite scoring
     of commit_time / inventory_consumed / purchase; ~3-4× slower wall-time).
   - method_selection.depth gates elaborate to top N BOM levels (default 1 = root only).
-  - consolidation.scope (the "regulation scope" knob):
-      • "leaf-only" → UI label "Leaves only". Split policy applies only at
-        nodes that already hold supply (raw inventory, leftover stock, WOs
-        carried over from a prior planning round). Make/move WOs generated
-        this round run unconstrained.
-      • "all" → UI label "All levels". Split policy applies at supply-
-        bearing nodes AND every make/move WO generated this round. Buy WOs
-        are unbounded either way.
-    Use the friendly labels when talking to users; use the keys ("leaf-only" /
-    "all") when calling tools. The config field is `scope` under
-    `consolidation` (e.g. consolidation.scope = "all").
+  - method_selection.max_bom_depth (default 3) caps the recursion depth admitted
+    at the reactive make-fallback site. A make alternative whose precomputed
+    maxMakeDepth exceeds this cap is skipped without recursing — clamps cost
+    on deep BOMs while still admitting structurally feasible fallbacks.
   - consolidation.allocation_mode = "fair" (priority-first when ample, proportional
-    under shortage) | "proportional" | "priority_first".
+    under shortage) | "proportional" | "priority_first". Split policy applies at
+    supply-bearing nodes (raw inventory, leftover stock, carry-over WOs).
   - On case-171 the empirical sweet spot is mode=preference + max_methods=2.
 
 Tactics:
   - Reach for tools when the user asks "what would happen if…", "why…", or "how much…".
     Don't guess KPIs — call get_kpis. Don't guess pegging — call get_demand_pegging.
+  - When a demand fails or commits short ("why didn't X commit?", "supply chain loop",
+    "no supply method", "为什么 X 没满"), report TWO ORTHOGONAL AXES — never collapse them:
+
+    **Supply-side (瓶颈 / orange `is_bottleneck`)** — the BOM/inventory chain
+    couldn't deliver. Trace the cascade reason in pegging:
+      1. `get_demand_pegging(run_id, demand_id)` — root demand carries
+         `failure_explanation` for `no_methods`. Quote verbatim if present.
+      2. Walk the failed nodes; find the deepest leaf with the smallest first-pass
+         effective/needed ratio. If the user pushes back, call `get_product_methods`
+         and `get_product_supply` on that leaf to confirm:
+            • `make` exists at L1+L2 but no `move-to-needed-loc` → data gap.
+            • `buy` exists but `purchase_allowed=false` → config gap.
+            • `move` source has zero supply at the source → upstream provisioning gap.
+
+    **Demand-side (根因 / red `is_root_bottleneck`)** — consolidation's fair-share
+    split with competing demands left this demand with the tightest share-vs-need
+    ratio at the flagged child. Independent of supply.
+      1. From the pegging, find children with `is_root_bottleneck=true`.
+      2. `get_leaf_competition(run_id, product_id, location_id)` — returns actual
+         draws for every demand that consumed at that leaf, plus
+         total_initial_supply. Use this to articulate the demand-side story:
+         "demand X got C/T (≈C%) because demand(s) [Y, Z] together consumed
+         K/T (≈K%) under allocation_mode=…".
+      3. Suggest demand-side levers: priority change for X, switch
+         allocation_mode, change consolidation period, etc.
+
+    **Synthesize**: report both axes when both fire. Template —
+       Supply: <single-line cause + concrete fix>.
+       Demand allocation: <competition story + concrete lever>.
+       The two are independent — applying one fix without the other still leaves
+       the demand short. Pick whichever is cheaper for the user.
+
+    **Anti-pattern**: dumping the pegging tree as a markdown bullet list. The user
+    saw it in the UI. Your job is to NAME root causes (one per axis when both fire).
   - Persist durable preferences via write_memory (e.g. user said "I never want purchase"
     → write_memory("purchase_default", false)). Memory is per-case.
   - Mirror the user's language (English / Chinese). Keep replies tight; be conversational.
@@ -186,7 +218,7 @@ EXECUTION RULES:
     — every top-level key AND every nested field, even ones unchanged from
     the current working config. Reason: `update_config` is a deep MERGE,
     so any field you omit silently keeps the prior value, which will
-    diverge from the candidate's signature (e.g. period_days, scope,
+    diverge from the candidate's signature (e.g. period_days,
     allocation_mode often drop out and the actual run uses the wrong
     config). Treat the candidate.config as a recipe you must transcribe
     completely, not paraphrase.
@@ -329,7 +361,7 @@ private val TOOLS: List<LlmTool> = listOf(
                 putJsonObject("primary_axis") {
                     put("type", "string")
                     put("description", "Use one of these short axis names — NOT dotted paths: " +
-                        "'scope', 'mode', 'max_methods', 'depth', 'score_weights', " +
+                        "'mode', 'max_methods', 'depth', 'max_bom_depth', 'score_weights', " +
                         "'allocation_mode', 'period_days', 'purchase_allowed', " +
                         "'consolidation_enabled', 'elaborate'. Only runs that bootstrap-" +
                         "varied this axis off baseline.")
@@ -390,7 +422,7 @@ private val TOOLS: List<LlmTool> = listOf(
             "Use this BEFORE recommending a 'config to try next' to confirm the proposal is " +
             "actually novel — never propose a signature that returns exists=true. The signature " +
             "format is the canonical pipe-delimited string emitted by the planner " +
-            "(e.g. 'm=preference|max=2|d=1|...|scope=leaf-only|alloc=fair|cons=true|p=0|purch=false'). " +
+            "(e.g. 'm=preference|max=2|d=1|bom=3|...|alloc=fair|cons=true|p=0|purch=false'). " +
             "Returns {exists: bool, total_in_kb: int}.",
         buildJsonObject {
             put("type", "object")
@@ -447,7 +479,9 @@ private val TOOLS: List<LlmTool> = listOf(
     tool(
         "get_demand_pegging",
         "Fetch the pegging tree for one demand in a plan run. Used to explain why a demand " +
-            "was fulfilled across multiple work orders or hit partial fulfillment.",
+            "was fulfilled across multiple work orders or hit partial fulfillment. Failed " +
+            "demands carry a `failure_explanation` field on the root demand node when the " +
+            "commit_reason is `no_methods` — surface it verbatim instead of paraphrasing.",
         buildJsonObject {
             put("type", "object")
             putJsonObject("properties") {
@@ -458,16 +492,58 @@ private val TOOLS: List<LlmTool> = listOf(
         },
     ),
     tool(
-        "get_supply_split_explanation",
-        "For a consolidated supply, return how its produced quantity was split across competing " +
-            "demands. Reads supply_level_allocations from the plan result.",
+        "get_product_methods",
+        "Read the case's static method registry for one product: every method_make, " +
+            "method_move, and method_buy row defined for it. Use this when a demand fails " +
+            "with `no_methods` / `no supply method` and the user asks why — combine with " +
+            "get_product_supply to confirm whether the failure is a data gap (no method " +
+            "row at the needed location) or a configuration gap (purchase disabled, etc.). " +
+            "Returns { make: [{location, preference, lead_time}], move: [{from, to, " +
+            "transit_time, preference}], buy: [{location, preference}] } — empty arrays " +
+            "for method types with no rows.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("product_id") { put("type", "string") }
+            }
+            put("required", buildJsonArray { add("product_id") })
+        },
+    ),
+    tool(
+        "get_product_supply",
+        "Read the case's supply table for one product: every initial-inventory row " +
+            "(supply_id, location, qty, supply_date). Pair with get_product_methods to " +
+            "diagnose 'why did this demand fail?' — the typical answer is either zero " +
+            "supply at the needed (product, location) AND no make/move/buy method to " +
+            "produce it there. Returns [{supply_id, location, qty, supply_date}], sorted " +
+            "by location then supply_date.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("product_id") { put("type", "string") }
+            }
+            put("required", buildJsonArray { add("product_id") })
+        },
+    ),
+    tool(
+        "get_leaf_competition",
+        "**Demand-side root-cause story.** For one (product, location) leaf in a plan run, " +
+            "list all demands that drew from it — with actual qty consumed and share-of-" +
+            "total-supply percentage. Use this to articulate the 根因 (red badge / " +
+            "`is_root_bottleneck`) story on a pegging tree: 'demand X got C/T (≈C%) of " +
+            "supply because demands [Y, Z] together consumed K/T (≈K%) under " +
+            "allocation_mode=…'. Pairs with `get_demand_pegging`'s 瓶颈 (supply-side) " +
+            "signal to give the user both fix-it levers. Returns { product_id, " +
+            "location_id, total_initial_supply, competitor_count, competitors: " +
+            "[{ demand_id, actual_draw_qty, share_pct }] } sorted by actual_draw_qty desc.",
         buildJsonObject {
             put("type", "object")
             putJsonObject("properties") {
                 putJsonObject("run_id") { put("type", "integer") }
-                putJsonObject("supply_id") { put("type", "string") }
+                putJsonObject("product_id") { put("type", "string") }
+                putJsonObject("location_id") { put("type", "string") }
             }
-            put("required", buildJsonArray { add("run_id"); add("supply_id") })
+            put("required", buildJsonArray { add("run_id"); add("product_id"); add("location_id") })
         },
     ),
     tool(
@@ -1159,7 +1235,7 @@ private fun toolSuggestNextBatch(caseId: Int, args: JsonObject, locale: String):
                     "update_config with `partial` set to the EXACT candidate.config object — " +
                     "every top-level key (purchase_allowed, method_selection, variant_selection, " +
                     "consolidation, analyze_criticality, check_soundness) and every nested field " +
-                    "(consolidation.period_days, consolidation.scope, …) MUST be present. " +
+                    "(consolidation.period_days, consolidation.allocation_mode, method_selection.max_bom_depth, …) MUST be present. " +
                     "update_config is a deep MERGE — anything you omit silently keeps the prior " +
                     "working-config value, which will diverge from the candidate's signature. " +
                     "Then call run_plan_async (it auto-saves and the chat panel posts the result).",
@@ -1219,42 +1295,287 @@ private fun toolGetDemandPegging(caseId: Int, args: JsonObject, locale: String):
     val pegging = result["planning_pegging"] as? List<Map<String, Any?>> ?: emptyList()
     val entry = pegging.firstOrNull { it["demand_id"]?.toString()?.trim() == demandId.trim() }
         ?: return toolError("demand $demandId not in run $runId pegging", locale)
+
+    // Cap the payload to keep the LLM context tractable — a deep BOM with
+    // 200+ AND-children + virtual products easily blows past 128k tokens
+    // (~133k observed on case-172 888_F11). Walk the tree, keep only nodes
+    // along the failure path: failed=true work_orders, is_bottleneck /
+    // is_root_bottleneck demand nodes, leaves with non-trivial commit_reason,
+    // and the immediate children of the root for context. Fulfilled subtrees
+    // collapse to a "{n_children} fulfilled children" summary leaf.
+    @Suppress("UNCHECKED_CAST")
+    val tree = entry["tree"] as? Map<String, Any?>
+    val prunedTree = tree?.let { pruneTreeForAgent(it, depthFromRoot = 0) }
+    val prunedEntry = entry.toMutableMap().apply { if (prunedTree != null) put("tree", prunedTree) }
+
+    val payload = anyToJson(prunedEntry)
+    val payloadStr = payload.toString()
+    val originalSize = anyToJson(entry).toString().length
+    val summarySuffix = if (originalSize > payloadStr.length + 1024) {
+        " (pruned ${originalSize}→${payloadStr.length} chars; fulfilled subtrees collapsed)"
+    } else ""
+
     return ToolResult(
         summary = loc(
-            "Pegging tree for demand $demandId",
-            "需求 $demandId 的支撑链",
+            "Pegging tree for demand $demandId$summarySuffix",
+            "需求 $demandId 的支撑链$summarySuffix",
             locale,
         ),
-        payload = anyToJson(entry),
+        payload = payload,
     )
 }
 
-private fun toolGetSupplySplitExplanation(caseId: Int, args: JsonObject, locale: String): ToolResult {
-    val runId = args["run_id"]?.jsonPrimitive?.intOrNull
-        ?: return toolError("`run_id` is required", locale)
-    val supplyId = args["supply_id"]?.jsonPrimitive?.contentOrNull
-        ?: return toolError("`supply_id` is required", locale)
-    val result = loadPlanResultFromDb(caseId, runId)
-        ?: return toolError("plan run $runId not found for case $caseId", locale)
-    @Suppress("UNCHECKED_CAST")
-    val sla = result["supply_level_allocations"] as? List<Map<String, Any?>> ?: emptyList()
-    val match = sla.firstOrNull { it["supply_id"]?.toString() == supplyId }
-        ?: return toolError(
-            "supply $supplyId not in supply_level_allocations for run $runId — " +
-                "either run used 'Leaves only' regulation scope (consolidation.scope=leaf-only) " +
-                "or supply wasn't consolidated",
-            locale,
-        )
-    @Suppress("UNCHECKED_CAST")
-    val perDemand = match["per_demand_allocations"] as? Map<String, Any?> ?: emptyMap()
+/**
+ * Walk the pegging tree and keep only nodes that explain the failure.
+ *
+ *   - Always keep: root + immediate children (give the LLM the demand's top-level shape).
+ *   - Keep on the failure path: nodes with `failed=true`, `is_bottleneck`,
+ *     `is_root_bottleneck`, or with a non-success `commit_reason`.
+ *   - Drop fully-fulfilled subtrees deeper than 2 levels — substitute a
+ *     leaf node `{type: "summary", note: "…N fulfilled descendants"}`.
+ *   - Always preserve `failure_explanation` on the root.
+ *
+ * Result: typical full pegging shrinks 5-50x (we've measured 130k → 5k chars
+ * on case-172 888_F11) while keeping the load-bearing diagnosis intact.
+ */
+@Suppress("UNCHECKED_CAST")
+private fun pruneTreeForAgent(node: Map<String, Any?>, depthFromRoot: Int): Map<String, Any?> {
+    val children = node["children"] as? List<Map<String, Any?>> ?: emptyList()
+
+    fun isFailureRelevant(n: Map<String, Any?>): Boolean {
+        if (n["failed"] == true) return true
+        if (n["is_bottleneck"] == true) return true
+        if (n["is_root_bottleneck"] == true) return true
+        val reason = n["commit_reason"] as? String
+        if (!reason.isNullOrBlank() && reason !in BENIGN_COMMIT_REASONS) return true
+        // Recursively check: if any descendant is failure-relevant, keep this node.
+        val grandKids = n["children"] as? List<Map<String, Any?>> ?: return false
+        return grandKids.any { isFailureRelevant(it) }
+    }
+
+    val keptChildren = mutableListOf<Map<String, Any?>>()
+    var collapsedCount = 0
+    var collapsedTotalQty = 0.0
+    for (c in children) {
+        val keep = depthFromRoot < 2 || isFailureRelevant(c)
+        if (keep) {
+            keptChildren.add(pruneTreeForAgent(c, depthFromRoot + 1))
+        } else {
+            collapsedCount++
+            collapsedTotalQty += (c["quantity"] as? Number)?.toDouble() ?: 0.0
+        }
+    }
+    if (collapsedCount > 0) {
+        keptChildren.add(mapOf(
+            "type" to "summary",
+            "note" to "…$collapsedCount fulfilled subtree(s) collapsed (total qty ${collapsedTotalQty}). Call get_demand_pegging again with a different demand_id, or get_product_methods/supply for a specific component, if you need to inspect them.",
+            "children" to emptyList<Any>(),
+        ))
+    }
+    return node.toMutableMap().apply { put("children", keptChildren) }
+}
+
+/** Commit reasons that indicate normal fulfillment (not a failure path). */
+private val BENIGN_COMMIT_REASONS = setOf("inventory", "partial", "")
+
+private fun toolGetProductMethods(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val productId = args["product_id"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`product_id` is required", locale)
+    if (productId.isBlank()) return toolError("`product_id` cannot be blank", locale)
+
+    val (makes, moves, buys) = transaction {
+        val makeRows = MethodMakes.selectAll()
+            .where { (MethodMakes.caseId eq caseId) and (MethodMakes.productId eq productId) }
+            .map { row ->
+                buildJsonObject {
+                    put("location", JsonPrimitive(row[MethodMakes.locationId]))
+                    put("preference", JsonPrimitive(row[MethodMakes.preference]))
+                    put("lead_time", JsonPrimitive(row[MethodMakes.leadTime]))
+                    put("bom_id", JsonPrimitive(row[MethodMakes.bomId]))
+                }
+            }
+            .sortedBy { (it["location"] as? JsonPrimitive)?.contentOrNull ?: "" }
+        val moveRows = MethodMoves.selectAll()
+            .where { (MethodMoves.caseId eq caseId) and (MethodMoves.productId eq productId) }
+            .map { row ->
+                buildJsonObject {
+                    put("from", JsonPrimitive(row[MethodMoves.fromLocationId]))
+                    put("to", JsonPrimitive(row[MethodMoves.toLocationId]))
+                    put("transit_time", JsonPrimitive(row[MethodMoves.transitTime]))
+                    put("preference", JsonPrimitive(row[MethodMoves.preference]))
+                }
+            }
+            .sortedWith(compareBy(
+                { (it["from"] as? JsonPrimitive)?.contentOrNull ?: "" },
+                { (it["to"] as? JsonPrimitive)?.contentOrNull ?: "" },
+            ))
+        val buyRows = MethodBuys.selectAll()
+            .where { (MethodBuys.caseId eq caseId) and (MethodBuys.productId eq productId) }
+            .map { row ->
+                buildJsonObject {
+                    put("location", JsonPrimitive(row[MethodBuys.locationId]))
+                    put("preference", JsonPrimitive(row[MethodBuys.preference]))
+                    put("lead_days_supply", JsonPrimitive(row[MethodBuys.leadDaysSupply]))
+                }
+            }
+            .sortedBy { (it["location"] as? JsonPrimitive)?.contentOrNull ?: "" }
+        Triple(makeRows, moveRows, buyRows)
+    }
+
+    val payload = buildJsonObject {
+        put("product_id", JsonPrimitive(productId))
+        put("make", JsonArray(makes))
+        put("move", JsonArray(moves))
+        put("buy", JsonArray(buys))
+    }
     return ToolResult(
         summary = loc(
-            "Supply $supplyId split across ${perDemand.size} demands",
-            "供应 $supplyId 在 ${perDemand.size} 个需求间分配",
+            "Methods for $productId — make:${makes.size} move:${moves.size} buy:${buys.size}",
+            "$productId 的方法定义 — make:${makes.size} move:${moves.size} buy:${buys.size}",
             locale,
         ),
-        payload = anyToJson(match),
+        payload = payload,
     )
+}
+
+private fun toolGetProductSupply(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val productId = args["product_id"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`product_id` is required", locale)
+    if (productId.isBlank()) return toolError("`product_id` cannot be blank", locale)
+
+    val rows = transaction {
+        Supplies.selectAll()
+            .where { (Supplies.caseId eq caseId) and (Supplies.productId eq productId) }
+            .map { row ->
+                buildJsonObject {
+                    put("supply_id", JsonPrimitive(row[Supplies.supplyId]))
+                    put("location", JsonPrimitive(row[Supplies.locationId]))
+                    put("qty", JsonPrimitive(row[Supplies.qty]))
+                    put("supply_date", JsonPrimitive(row[Supplies.supplyDate]))
+                }
+            }
+            .sortedWith(compareBy(
+                { (it["location"] as? JsonPrimitive)?.contentOrNull ?: "" },
+                { (it["supply_date"] as? JsonPrimitive)?.contentOrNull ?: "" },
+            ))
+    }
+    val totalQty = rows.sumOf { (it["qty"] as? JsonPrimitive)?.contentOrNull?.toDoubleOrNull() ?: 0.0 }
+    val payload = buildJsonObject {
+        put("product_id", JsonPrimitive(productId))
+        put("total_qty", JsonPrimitive(totalQty))
+        put("rows", JsonArray(rows))
+    }
+    return ToolResult(
+        summary = loc(
+            "Supply for $productId — ${rows.size} rows, total qty ${totalQty}",
+            "$productId 的供应 — ${rows.size} 行，总量 ${totalQty}",
+            locale,
+        ),
+        payload = payload,
+    )
+}
+
+private fun toolGetLeafCompetition(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val runId = args["run_id"]?.jsonPrimitive?.intOrNull
+        ?: return toolError("`run_id` is required", locale)
+    val productId = args["product_id"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`product_id` is required", locale)
+    val locationId = args["location_id"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`location_id` is required", locale)
+    if (productId.isBlank() || locationId.isBlank()) {
+        return toolError("`product_id` and `location_id` cannot be blank", locale)
+    }
+
+    val result = loadPlanResultFromDb(caseId, runId)
+        ?: return toolError("plan run $runId not found for case $caseId", locale)
+
+    // Total initial supply at the leaf (case-scoped).
+    val totalSupply = transaction {
+        Supplies.selectAll()
+            .where {
+                (Supplies.caseId eq caseId) and (Supplies.productId eq productId) and (Supplies.locationId eq locationId)
+            }
+            .sumOf { it[Supplies.qty] }
+    }
+
+    // Actual draws: walk planning_pegging supply leaves and aggregate qty by demand_id.
+    // Each pegging entry is keyed by demand_id; supply leaves under it carry the qty
+    // that demand actually pulled from physical inventory at this (pid, lid).
+    // (Note: iter-0 consolidation fair-shares were considered for persistence but
+    // dropped — they bloated plan_run.result by hundreds of KB per demand and
+    // OOM'd the listing endpoint. Actual draws cover the demand-side competition
+    // story well enough on their own.)
+    @Suppress("UNCHECKED_CAST")
+    val planningPegging = (result["planning_pegging"] as? List<Map<String, Any?>>) ?: emptyList()
+    val actualByDemand = mutableMapOf<String, Double>()
+    for (entry in planningPegging) {
+        val demandId = entry["demand_id"]?.toString() ?: continue
+        @Suppress("UNCHECKED_CAST")
+        val tree = entry["tree"] as? Map<String, Any?> ?: continue
+        accumulateLeafDraws(tree, productId, locationId, demandId, actualByDemand)
+    }
+
+    val rows = actualByDemand.entries
+        .filter { it.value > 1e-9 }
+        .sortedByDescending { it.value }
+        .map { (did, qty) -> did to qty }
+
+    val competitorsJson = JsonArray(rows.map { (did, qty) ->
+        buildJsonObject {
+            put("demand_id", JsonPrimitive(did))
+            put("actual_draw_qty", JsonPrimitive(qty))
+            put("share_pct", JsonPrimitive(if (totalSupply > 1e-9) qty * 100.0 / totalSupply else 0.0))
+        }
+    })
+
+    val payload = buildJsonObject {
+        put("product_id", JsonPrimitive(productId))
+        put("location_id", JsonPrimitive(locationId))
+        put("total_initial_supply", JsonPrimitive(totalSupply))
+        put("competitor_count", JsonPrimitive(rows.size))
+        put("competitors", competitorsJson)
+    }
+    return ToolResult(
+        summary = loc(
+            "Competition at $productId @ $locationId — ${rows.size} demand(s), total supply ${totalSupply}",
+            "$productId @ $locationId 的竞争 — ${rows.size} 个需求，总供应 ${totalSupply}",
+            locale,
+        ),
+        payload = payload,
+    )
+}
+
+/**
+ * Walk a pegging tree and accumulate qty pulled from supply leaves at the
+ * given (pid, lid). Skips `failed=true` subtrees (rolled back at the planner
+ * level — those qtys never landed in real consumption). Skips synthetic
+ * consolidated supply ids (`consolidated_*`) — those are intermediate
+ * accounting, not real inventory draws.
+ */
+@Suppress("UNCHECKED_CAST")
+private fun accumulateLeafDraws(
+    node: Map<String, Any?>,
+    targetPid: String,
+    targetLid: String,
+    demandId: String,
+    accumulator: MutableMap<String, Double>,
+) {
+    if (node["failed"] == true) return
+    val type = node["type"] as? String
+    if (type == "supply" || type == "purchase") {
+        val pid = (node["product_id"] as? String)?.trim()
+        val lid = (node["location_id"] as? String)?.trim()
+        val supplyId = node["supply_id"]?.toString()
+        val isConsolidated = supplyId?.startsWith("consolidated_") == true
+        if (!isConsolidated && pid == targetPid && lid == targetLid) {
+            val qty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
+            if (qty > 1e-9) {
+                accumulator.merge(demandId, qty, Double::plus)
+            }
+        }
+    }
+    val children = node["children"] as? List<Map<String, Any?>> ?: return
+    for (c in children) accumulateLeafDraws(c, targetPid, targetLid, demandId, accumulator)
 }
 
 private fun toolGetRunConfig(caseId: Int, args: JsonObject, locale: String): ToolResult {
@@ -1560,8 +1881,11 @@ private suspend fun runAgentLoop(
                     if (jid != null) pendingJobId = jid
                 }
             }
+            val payloadStr = result.payload.toString()
+            log.info("planning-agent tool={} payload_chars={} summary={}",
+                call.name, payloadStr.length, result.summary)
             steps.add(AgentStep(tool = call.name, args = args, resultSummary = result.summary))
-            convo.add(LlmAgentMessage(role = "tool", toolCallId = call.id, content = result.payload.toString()))
+            convo.add(LlmAgentMessage(role = "tool", toolCallId = call.id, content = payloadStr))
         }
         log.info("planning-agent iter={} tool_calls={} steps_total={}", iter + 1, resp.toolCalls.size, steps.size)
     }
@@ -1597,7 +1921,9 @@ private suspend fun dispatchTool(
         "suggest_next_batch" -> Pair(toolSuggestNextBatch(caseId, args, locale), workingConfig)
         "get_kpis" -> Pair(toolGetKpis(caseId, args, locale), workingConfig)
         "get_demand_pegging" -> Pair(toolGetDemandPegging(caseId, args, locale), workingConfig)
-        "get_supply_split_explanation" -> Pair(toolGetSupplySplitExplanation(caseId, args, locale), workingConfig)
+        "get_product_methods" -> Pair(toolGetProductMethods(caseId, args, locale), workingConfig)
+        "get_product_supply" -> Pair(toolGetProductSupply(caseId, args, locale), workingConfig)
+        "get_leaf_competition" -> Pair(toolGetLeafCompetition(caseId, args, locale), workingConfig)
         "get_run_config" -> Pair(toolGetRunConfig(caseId, args, locale), workingConfig)
         "recheck_soundness" -> Pair(toolRecheckSoundness(caseId, args, locale), workingConfig)
         "get_soundness_summary" -> Pair(toolGetSoundnessSummary(caseId, args, locale), workingConfig)

@@ -32,32 +32,20 @@ These are the load-bearing design decisions to reason **from** when
 answering "why" questions. The config sections below are mechanical
 exposure of these ideas — the user usually wants the *idea*, not the knob.
 
-### 1. Regulation scope — leaves only vs all levels
+### 1. Leaf-level regulation (the only path)
 
-`consolidation.scope` chooses **where** the split policy
-(`allocation_mode`) is applied. The policy itself is the *how* (fair /
-proportional / priority_first); the scope is the *where*.
+`consolidation.allocation_mode` (fair / proportional / priority_first)
+applies at supply-bearing nodes — raw inventory, leftover stock, WOs
+carried over from a prior planning round. Make/move WOs generated this
+round run unconstrained.
 
-- **Leaves only** (`scope = "leaf-only"`, UI label *"Leaves only"*):
-  Apply the split policy only at nodes that already hold supply — raw
-  inventory, leftover stock, WOs carried over from a prior planning
-  round. Make/move WOs generated this round run unconstrained. *Failure
-  mode*: order-dependent at the leaf level; late claimants find empty
-  shelves.
-- **All levels** (`scope = "all"`, UI label *"All levels"*): Apply
-  the split policy at supply-bearing nodes AND every make/move WO
-  generated this round. Buy WOs are unbounded either way and never
-  regulated. *Failure mode*: regulating at every WO output fragments
-  shared inputs into slivers, which collapse to tiny output at
-  AND-bottlenecks via `MIN(child shares)`.
-
-In the UI the control is labeled "Regulation scope". Use the friendly
-labels ("Leaves only", "All levels") when talking to users; use the
-config keys (`leaf-only`, `all`) when calling tools.
-
-On case-171, *Leaves only* beat *All levels* ~3× on throughput
-because make operations need atomic shares; pervasive regulation
-fragments them.
+This is the only consolidation path. A historical "All levels" mode
+(applying the split policy at every make/move WO output) was tried in
+2026-04 but retired in 2026-05 — pervasive regulation fragments shared
+inputs into slivers that collapse to tiny output at AND-bottlenecks via
+`MIN(child shares)`. On case-171 the supply-level engine ran ~3×
+*worse* on throughput. Atomicity (next section) is incompatible with
+fine-grained regulation at every BOM level.
 
 ### 2. AND-bottleneck atomicity
 
@@ -98,8 +86,9 @@ over headline KPIs**, especially when comparing across planner versions.
 Every commit traces back to specific supplies via `planning_pegging`
 (demand → work order → child materials → supplies → leaf). This is the
 substrate for every "why" question. "Why did demand X commit only 50?"
-→ walk its pegging. "Where did supply Y go?" → query
-`supply_level_allocations` (scope=all only).
+→ walk its pegging. The `is_root_bottleneck` flag (red 根因 badge in the
+UI) marks the genuine origin leaf in AND-bottleneck cascades, distinct
+from `is_bottleneck` (orange 瓶颈) on convergence-aligned siblings.
 
 ## Design principles (the load-bearing decisions)
 
@@ -116,6 +105,11 @@ substrate for every "why" question. "Why did demand X commit only 50?"
 - **`max_methods`** (default 2): waterfall cap. `1` = single best method,
   no fallback. `2-4` = exhaust the best, fall back to the next only if the
   first hit capacity. Inventory carries forward across slots.
+- **`max_bom_depth`** (default 3, range 1–10): make-fallback admission cap.
+  When the chosen method blocks, real `make` alternatives may be admitted
+  as a reactive fallback IF their precomputed `maxMakeDepth` is at most
+  this value. Set to 1 to disable make-fallback entirely. See
+  `docs/waterfall-allocation.md` "Reactive fallback" section.
 - **No re-ranking between waterfall iterations** in v1 — order is frozen.
 
 ### Why waterfall replaced proportional split
@@ -136,27 +130,20 @@ regression evaporates when `max_methods` saturates available methods (~max=4).
 
 ### Consolidation — `consolidation`
 
-Operational exposure of **regulation scope** from Algorithmic ideas §1.
 Two orthogonal knobs:
 
-- `scope` (UI: "Regulation scope") = `"leaf-only"` ("Leaves only",
-  the default) | `"all"` ("All levels"). Decides *where*
-  `allocation_mode` is applied. Run 433 (Leaves only) vs Run 434 (All
-  levels) on case-171, identical config otherwise: 80,752 vs 35,098
-  committed; fill 25% vs 11%; Gini 0.39 vs 0.46; starvation 28% vs 19%;
-  mfg total_quantity 104k vs 28k. The mfg gap is the fragmentation
-  smoking gun. *Leaves only* is the default because it dominates on
-  throughput; switch to *All levels* when minimum-service-level fairness
-  matters more than aggregate output.
 - `allocation_mode` = `"fair"` (priority-first when ample, proportional
   under shortage) | `"proportional"` (qty-weighted share) |
   `"priority_first"` (highest priority filled first, may starve others).
   Decides *how* a contested supply is split. `fair` and `proportional`
   produce identical splits when supply is short, which is most case-171
-  demands.
+  demands. The split policy applies at supply-bearing nodes (raw
+  inventory, leftover stock, carry-over WOs).
 - `period_days` — bucket width; 0 = single bucket regardless of due date.
-- `get_supply_split_explanation(supply_id)` works only with the "All
-  levels" scope (consolidation.scope=all).
+
+The supply-level orchestrator (historical `consolidation.scope = "all"`)
+was retired in 2026-05; only the leaf-level fixed-point pipeline remains.
+Old runs with `scope=all` are silently coerced to leaf-only on parse.
 
 ### Soundness check
 
@@ -183,8 +170,10 @@ The agent has these tools available; call them rather than guessing:
 | `wait_for_plan(job_id)` | Always paired with `run_plan_async`. Blocks up to 10 min. |
 | `list_plan_runs(limit?, status?)` | "What runs exist?" / "the latest run". Pass `status='success'` to skip contingent / failed. |
 | `get_kpis(run_id)` | KPI questions. Returns `no_plan_kpis` for contingent runs — fall through to the baseline run via `metadata.baselinePlanRunId`. |
-| `get_demand_pegging(run_id, demand_id)` | "Why is demand X partial?" / "what fulfilled demand X?". |
-| `get_supply_split_explanation(run_id, supply_id)` | "Why did demand A get more than demand B from supply X?" — only works when consolidation.scope = `all`. |
+| `get_demand_pegging(run_id, demand_id)` | "Why is demand X partial?" / "what fulfilled demand X?". The pegging tree carries `is_root_bottleneck` (red 根因 badge) and `is_bottleneck` (orange 瓶颈 badge) flags identifying the AND-min origin and convergence-aligned siblings. **For failed demands**: the root demand node carries `failure_explanation` when commit_reason is `no_methods` — quote it; don't paraphrase. |
+| `get_product_methods(product_id)` | "Where is product P sourced from?" / "what methods exist for P?". Reads the case's static method registry — make/move/buy rows for the product. Use to confirm a hypothesis from `failure_explanation` or to verify a user's proposed fix (e.g. "would adding move 1000→VIRTUAL help?"). |
+| `get_product_supply(product_id)` | "Where is product P stocked?". Reads the supply table for the product — supply_id, location, qty, supply_date, plus a total_qty rollup. Pair with `get_product_methods` to triage failed demands: zero supply at needed location AND no method to source there ⇒ data gap. |
+| `get_leaf_competition(run_id, product_id, location_id)` | **Demand-side root-cause story.** When a child has the red 根因 (`is_root_bottleneck`) badge, this tool tells you WHY: lists every competing demand that drew from that leaf with actual qty consumed and share-of-total-supply %. Use to articulate "demand X got 33% because demands Y and Z together consumed 67% under allocation_mode=fair". Independent of supply availability — pure demand-side allocation diagnostic. |
 | `get_run_config(run_id)` | "What config did run X use?". MUST-HAVE before any A/B comparison — confirms the single knob that differs, so KPI deltas are actually attributable. Returns config + override snapshot. |
 | `recheck_soundness(run_id, deep_check?)` | A soundness rule has shipped *since* run X — apply the current ruleset retroactively. Updates the run's badge. |
 | `get_soundness_summary(run_id)` | "How sound is run X — what rules failed, by how much?". Server-side rollup (rule, demand_count, violation_count, total_actual). Use INSTEAD of walking each demand's pegging. |
@@ -209,11 +198,9 @@ The agent has these tools available; call them rather than guessing:
 - **`starvation_pct`**: % of demands with 0 fill (committed_qty ≤ ε).
 - **`on_time_count`**: # demands committed by their due date.
 - **`inventory.consumed_total`** / **`manufacturing.total_quantity`**:
-  total raw input consumed and total make output. **A multi-x gap on
-  these between two runs with the same supplies almost always means
-  scope fragmentation, not a method-selection difference.** (Case-171:
-  Run 433 mfg=104,014 vs Run 434 mfg=28,036 — 3.7× gap = scope=all
-  fragmenting shared inputs below the make threshold.)
+  total raw input consumed and total make output. Large gaps between
+  two runs with the same supplies usually indicate a method-selection or
+  ranking change that re-shaped which BOM paths the planner walked.
 
 ## Failure modes to recognize
 
@@ -226,6 +213,78 @@ The agent has these tools available; call them rather than guessing:
 - **`no_methods_succeeded`** → no candidate method had a feasible BOM path.
   Often means inventory was fully depleted earlier in the waterfall, OR a
   sibling demand consumed shared supply first.
+
+### Failed-demand triage workflow
+
+When the user asks "why did demand X fail?" / "why didn't this commit?" /
+"supply chain loop" / "no supply method" / "为什么 X 没满", report TWO
+ORTHOGONAL AXES — never collapse them.
+
+#### The two axes
+
+The pegging tree carries two distinct flag types:
+
+- **瓶颈 / orange / `is_bottleneck`** = **supply-side limiter**.
+  This child's BOM/inventory chain couldn't deliver enough; its first-pass
+  `effectiveQty / neededQty` ratio is the smallest among AND siblings, so
+  it caps the parent via `min(child shares)`. Fix the supply chain at
+  this child (provision inventory, enable purchase, add a method row).
+
+- **根因 / red / `is_root_bottleneck`** = **demand-side allocation
+  origin**. Of all the AND siblings, consolidation's fair-share split
+  with *competing demands* left THIS demand with the tightest
+  share-vs-need ratio at this child (computed at iter-0, before
+  convergence smearing). Independent of supply — visible whether or
+  not 瓶颈 fires. Fix the demand-side allocation (raise this demand's
+  priority, change `allocation_mode`, change consolidation
+  `period_days`, or reduce competition).
+
+The two axes can co-occur OR diverge. They answer different questions
+and lead to different fixes:
+
+| Failure mode | 瓶颈 (supply) | 根因 (demand) |
+|---|---|---|
+| Pure consolidation contention | smeared-cap cohort | iter-0 origin (often tied) |
+| Structural (no inventory, no methods, purchase off) | failed children — true blockage | unrelated to current failure — points at next contention if structural is fixed |
+| Healthy plan | none | none |
+
+#### Step-by-step
+
+1. **`get_demand_pegging(run_id, demand_id)`** — first move every time.
+   - If commit_reason is `no_methods`, the root demand node carries a
+     `failure_explanation` that names the missing method row(s) and any
+     config gating (`purchase_allowed=false`). **Quote it verbatim.**
+   - Identify children with `is_bottleneck=true` (supply axis) and
+     `is_root_bottleneck=true` (demand axis). They may overlap or be
+     entirely different children.
+
+2. **For the supply axis (瓶颈):**
+   - Trace the failed cascade in the tree to the deepest leaf.
+   - Optionally call `get_product_methods` / `get_product_supply` on
+     that leaf to confirm a hypothesis (data gap vs config gap vs
+     upstream-provisioning gap).
+   - Concrete fix: name the missing CSV row OR the config flip.
+
+3. **For the demand axis (根因):**
+   - Call `get_leaf_competition(run_id, product_id, location_id)` on
+     the flagged leaf. Returns actual draws + share-of-total-supply
+     for every demand that consumed at that leaf.
+   - Concrete fix: priority change for THIS demand, switch
+     `allocation_mode` (e.g. `fair → priority_first`), change
+     `period_days`, or reduce contention.
+
+4. **Synthesize.** Report both axes when both fire — even if one of them
+   is forward-looking (e.g. structural failure dominates today, but
+   demand-side root would tighten next once supply is fixed). Template:
+
+   > Supply: \<single-line cause + concrete fix\>.
+   > Demand allocation: \<competition story + concrete lever\>.
+   > The two are independent — fixing only one still leaves X short.
+
+Anti-pattern: dumping the pegging tree as a markdown bullet list, OR
+collapsing the two axes ("the cause is …" without distinguishing).
+The user saw the tree; your job is to NAME the cause along each axis
+and suggest the cheapest lever to pull.
 - **`R7d_orphan_leaf_under_blocked_wo`** in soundness report → a legacy
   bug (now fixed) where the planner's AND-bottleneck blocked branch
   failed to restore inventory after first-pass takes. Stock was claimed
@@ -346,7 +405,7 @@ Decision matrix:
 | "Best fill with gini < 0.20"                        | `query_kb_runs(min_fill_rate=…, max_gini=0.20)`   |
 | "Best fill with reasonable fairness"                | `pareto_kb_runs(maximize=['fill_rate_pct'], minimize=['gini'])` |
 | "Least purchase without hurting on-time"            | `pareto_kb_runs(minimize=['total_requested'], maximize=['on_time_count'])` |
-| "Show me runs that varied the regulation scope"     | `query_kb_runs(primary_axis='scope')`             |
+| "Show me runs that varied the make-fallback depth" | `query_kb_runs(primary_axis='max_bom_depth')`     |
 | "Is the KB big enough to answer this?"              | `query_kb_runs(limit=1)` → check `total_in_kb`    |
 | "What should I try next?" / "recommend new configs" | `suggest_next_batch` — **only source of NOVEL proposals** |
 | "Is config X already in the KB?"                    | `is_signature_in_kb(signature)`                   |
@@ -459,25 +518,21 @@ Pattern:
 
 Example — bad reply (data dump, no insight):
 
-> "Run 433 had higher fill rate (25%) and more manufacturing output
-> (104k) than 434 (11%, 28k), so 'Leaves only' was more effective at
-> using inventory."
+> "Run A had higher fill rate (15%) than Run B (13%), and more methods
+> tried (max_methods=2 vs 1). So waterfall is better."
 
 Example — good reply (mechanism-grounded):
 
-> "The only differing knob is the regulation scope. Run 434's *All
-> levels* (consolidation.scope=all) applies the split policy at every
-> make/move WO output too, not just at supply-bearing nodes. Under
-> shortage that fragments shared inputs into slivers, and AND-bottlenecks
-> compute MIN(child shares) — so slivers × MIN collapses to tiny make
-> output. Run 433's *Leaves only* (consolidation.scope=leaf-only)
-> regulates only at nodes that already hold supply; the new make/move
-> WOs run unconstrained, preserving the integer-quantity atomicity
-> AND-relations need. The
-> 3.7× mfg gap (104k vs 28k from the same supplies) is that
-> fragmentation, not a fairness/method-selection difference. Trade-off:
-> Leaves only wins throughput + complete orders (median fill 1.0); All
-> levels wins minimum-service-level fairness (starvation 19% vs 28%)."
+> "The only differing knob is `max_methods` (1 vs 2). At `max=1` the
+> planner commits the best-ranked method on each demand and stops; at
+> `max=2` it falls back to the next ranked method when the first hits
+> capacity (waterfall, 'best supply win'). The +1.8 pp fill comes from
+> exactly that — demands whose preferred method's supply ran out
+> previously gave up; now they pick up the residual on a secondary
+> method. Trade-off: on-time drops by ~20 demands because slot 2's
+> supply typically has longer lead/transit than slot 1, so the late
+> commit slips past the due date. If on-time is paramount, stay at
+> `max=1`."
 
 The bad reply describes *what* happened; the good reply explains *why*
 mechanically. This is the difference between a dashboard summarizer and

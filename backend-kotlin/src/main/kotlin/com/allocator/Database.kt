@@ -83,8 +83,12 @@ fun initDatabase() {
     log.info("Schema ready.")
 
     // Data migrations (run after DDL). Each is idempotent — a no-op once
-    // the touched rows are already in the target form.
+    // the touched rows are already in the target form. Order matters:
+    // ScopeRenameMigration converges engine→scope first; then
+    // ConfigRetirementMigration retires scope + depth_optimal entirely and
+    // recomputes signatures so dedup survives.
     com.allocator.services.ScopeRenameMigration.run()
+    com.allocator.services.ConfigRetirementMigration.run()
 }
 
 /** Create the application database via a connection to the 'postgres' maintenance DB. */

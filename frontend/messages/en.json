@@ -276,6 +276,9 @@
       }
     },
     "config": {
+      "groupMethodSelection": "Method selection",
+      "groupConsolidation": "Demand consolidation",
+      "groupPostPlan": "Post-plan analysis",
       "methodSelection": "Method selection:",
       "elaborateMethod": "Use elaborate method selection (slower; ranks methods by commit/inventory/purchase score instead of preference order)",
       "methodMaxCount": "Max methods",
@@ -283,8 +286,8 @@
       "checkSoundness": "Check soundness",
       "checkSoundnessTooltip": "Auto-validate every successful plan against the spec.md soundness rules (always deep — includes R8 leaf-to-root chain conservation). Result shown as a badge on the run; click to open the full report.",
       "methodDepth": "depth",
-      "depthOptimal": "optimal",
-      "depthOptimalHint": "Auto-search the best depth: planner runs depth=1, 2, 3 … and stops at the first depth where the weighted plan score (commit / inventory / purchase) does not improve over the previous depth. Capped at 10. Each step costs a full plan, so use sparingly.",
+      "maxBomDepth": "max BOM depth",
+      "maxBomDepthHint": "Maximum real-make recursion depth admitted at the reactive make-fallback site. A make alternative whose precomputed depth exceeds this cap is skipped without recursing — clamps cost on deep BOMs while still admitting structurally feasible fallbacks. Default 3; range 1–10.",
       "weightsLabel": "Score weights:",
       "weightCommit": "delivery",
       "weightInventory": "inventory",
@@ -297,15 +300,11 @@
       "priorityFirst": "Priority first",
       "proportional": "Proportional",
       "fair": "Fair",
-      "regulationScope": "Regulation scope:",
-      "scopeLeavesOnly": "Leaves only",
-      "scopeAllLevels": "All levels",
-      "scopeTooltip": "Where the split policy applies. Leaves only — at supply-bearing nodes (raw inventory, leftover stock, WOs carried over from a prior planning round); make/move orders generated this round run unconstrained. All levels — at supply-bearing nodes AND every make/move order generated this round. Buy orders are unbounded either way and never regulated.",
       "analyzeCriticality": "Analyze Criticality",
       "analyzingCriticality": "Analyzing… ({done}/{total})",
       "criticalityClear": "Clear",
       "resetDefaults": "Reset config",
-      "resetDefaultsTitle": "Reset planning config: method by preference (depth 1), purchase disallowed, consolidation on (365-day bucket, fair split, regulation scope = Leaves only)"
+      "resetDefaultsTitle": "Reset planning config: method by preference (depth 1, max BOM depth 3), purchase disallowed, consolidation on (365-day bucket, fair split)"
     },
     "runPlan": "Run plan",
     "running": "Running plan…",
@@ -369,7 +368,7 @@
       "editPurchase": "purchase allowed",
       "editWeights": "score weights",
       "editConsolidationEnabled": "consolidation",
-      "editScope": "scope",
+      "editMaxBomDepth": "max BOM depth",
       "editPeriodDays": "period (days)",
       "editAllocation": "allocation",
       "editConfig": "Edit config",
@@ -677,7 +676,7 @@
       "examplesTitle": "Ask the planning agent — try:",
       "examplesBody": "",
       "examplesMethod": "",
-      "examplesRest": "\"run a plan with All-levels regulation\", \"compare runs 433 and 434\", \"why did demand X commit partial?\", \"recheck soundness on the latest run\", \"show KPIs for run 431\", \"max methods 2\", \"use elaborate method selection\", \"show current config\".",
+      "examplesRest": "\"compare runs 433 and 434\", \"why did demand X commit partial?\", \"recheck soundness on the latest run\", \"show KPIs for run 431\", \"max methods 2\", \"max BOM depth 4\", \"use elaborate method selection\", \"show current config\".",
       "roleUser": "You",
       "roleCopilot": "Agent",
       "thinking": "Thinking…",
@@ -692,8 +691,7 @@
         "showConfigMethod": "{methodMode}",
         "showConfigMethodDepth": "{methodMode} (depth {depth})",
         "methodDepth": "Set method elaborate **depth** to {depth}. The planner will score candidate methods at the top {depth} recursion level(s). Re-run plan to apply.",
-        "methodDepthOptimal": "Enabled **optimal depth search**. The planner will run depth=1, 2, 3 … and stop at the first depth where the weighted plan score (commit / inventory / purchase) does not improve. Capped at 10. Re-run plan to apply.",
-        "methodDepthManual": "Disabled optimal depth search. The planner will use the fixed depth value. Re-run plan to apply.",
+        "methodMaxBomDepth": "Set **max BOM depth** to {depth}. Caps the recursion depth admitted at the reactive make-fallback site; deeper makes are skipped. Re-run plan to apply.",
         "methodMaxMethods": "Set **max methods** to {n}. The planner tries up to {n} ranked methods per demand; slot 1 plans the full demand, slot 2 picks up whatever's left, and so on (waterfall). Inventory carries forward across slots. Re-run plan to apply.",
         "methodElaborate": "Set method selection to **elaborate (score by simulation)**. The planner simulates each method's child materials and picks the one with earliest commit, most inventory consumed, and least purchase. Slower. Re-run plan to apply.",
         "methodPreference": "Set method selection to **by preference (cascade)**. The planner tries the most preferred method first; if its child materials cannot be planned, it falls back to the next preferred method. Re-run plan to apply.",
@@ -715,8 +713,8 @@
         "criticalityOff": "Disabled analyze criticality.",
         "soundnessOn": "Enabled **post-plan soundness check** (always deep). Each successful plan will be auto-validated; result shown as a badge on the run.",
         "soundnessOff": "Disabled post-plan soundness check.",
-        "reset": "Reset to defaults: by preference (cascade) method selection at depth 1, max methods 2, purchase disallowed, consolidation on (365-day bucket, fair split), criticality off, soundness check on. Re-run plan to apply.",
-        "help": "I handle method selection (mode, depth, max methods), purchase, shared-component consolidation, and the post-plan toggles (criticality, soundness). Try: \"by preference\", \"elaborate method\", \"method depth 2\", \"max methods 3\", \"no purchase\", \"allow purchase\", \"enable consolidation\", \"set 14 day bucket\", \"proportional split\", \"check soundness off\", \"analyze criticality\", or \"show config\"."
+        "reset": "Reset to defaults: by preference (cascade) method selection at depth 1, max methods 2, max BOM depth 3, purchase disallowed, consolidation on (365-day bucket, fair split), criticality off, soundness check on. Re-run plan to apply.",
+        "help": "I handle method selection (mode, depth, max methods, max BOM depth), purchase, shared-component consolidation, and the post-plan toggles (criticality, soundness). Try: \"by preference\", \"elaborate method\", \"method depth 2\", \"max methods 3\", \"max BOM depth 4\", \"no purchase\", \"allow purchase\", \"enable consolidation\", \"set 14 day bucket\", \"proportional split\", \"check soundness off\", \"analyze criticality\", or \"show config\"."
       }
     },
     "runHistory": {
@@ -736,10 +734,6 @@
       "jobSuffix": " · job {job}…",
       "overrideCount": "{n, plural, one {# override} other {# overrides}}",
       "elapsedTitle": "Elapsed time (run start → finish)",
-      "elapsedBreakdownTitle": "Optimal-depth search — per-depth elapsed:",
-      "elapsedBreakdownTotal": "  search total: {ms}",
-      "chosenDepthChip": "⚡ optimal depth: {depth}",
-      "chosenDepthTitle": "Depth picked by the optimal-depth search for this run",
       "namePlaceholder": "Name (optional)",
       "notesPlaceholder": "Notes (optional)",
       "chips": {

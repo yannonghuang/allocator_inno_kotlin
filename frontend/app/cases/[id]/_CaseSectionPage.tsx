@@ -935,7 +935,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [woPeggingRowKey, setWoPeggingRowKey] = useState<string | null>(null);
   const [bomRealPairs, setBomRealPairs] = useState<[string, string][] | null>(null);
   const [realMoveTriples, setRealMoveTriples] = useState<[string, string, string][] | null>(null);
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', scope: 'leaf-only' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1033,10 +1033,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (ms.mode !== 'preference') diffs.push(`mode: preference → ${ms.mode}`);
     if (Number(ms.max_methods) !== 1) diffs.push(`max_methods: 1 → ${ms.max_methods}`);
     if (Number(ms.depth) !== 1) diffs.push(`depth: 1 → ${ms.depth}`);
+    if (ms.max_bom_depth != null && Number(ms.max_bom_depth) !== 3) diffs.push(`max_bom_depth: 3 → ${ms.max_bom_depth}`);
     if (Number(sw.commit_time) !== 0.4 || Number(sw.inventory_consumed) !== 0.35 || Number(sw.purchase) !== 0.25) {
       diffs.push(`weights: (${sw.commit_time}, ${sw.inventory_consumed}, ${sw.purchase})`);
     }
-    if (cs.scope !== 'leaf-only') diffs.push(`scope: leaf-only → ${cs.scope}`);
     if (cs.allocation_mode !== 'fair') diffs.push(`allocation_mode: fair → ${cs.allocation_mode}`);
     if (cs.enabled === false) diffs.push(`consolidation: on → off`);
     if (Number(cs.period_days) !== 0) diffs.push(`period_days: 0 → ${cs.period_days}`);
@@ -1058,10 +1058,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     parts.push(`m=${ms.mode ?? 'preference'}`);
     parts.push(`max=${ms.max_methods ?? 2}`);
     parts.push(`d=${ms.depth ?? 1}`);
+    parts.push(`bom=${ms.max_bom_depth ?? 3}`);
     if (sw && (sw.commit_time != null || sw.inventory_consumed != null || sw.purchase != null)) {
       parts.push(`w=(${Number(sw.commit_time ?? 0)}, ${Number(sw.inventory_consumed ?? 0)}, ${Number(sw.purchase ?? 0)})`);
     }
-    parts.push(`scope=${cs.scope ?? 'leaf-only'}`);
     parts.push(`alloc=${cs.allocation_mode ?? 'fair'}`);
     parts.push(`cons=${cs.enabled === false ? 'off' : 'on'}`);
     if (Number(cs.period_days ?? 0) !== 0) parts.push(`p=${cs.period_days}`);
@@ -1076,14 +1076,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       multiple: false,
       elaborate: false,
       max_methods: 1,
-      depth_optimal: false,
+      max_bom_depth: 3,
       score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 },
     },
     consolidation: {
       enabled: true,
       period_days: 0,
       allocation_mode: 'fair',
-      scope: 'leaf-only',
     },
     variant_selection: { multiple: true },
     purchase_allowed: false,
@@ -1237,17 +1236,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       };
     }
 
-    if (/optimal depth|auto depth|auto-depth|best depth|find depth|search depth|自动深度|最优深度|最佳深度/.test(t)) {
+    const bomDepthMatch = t.match(/max(?:imum)?\s*bom\s*depth\s*(?:=|:|to)?\s*(\d+)|make[- ]fallback\s*depth\s*(?:=|:|to)?\s*(\d+)|最大\s*BOM\s*深度\s*[:=]?\s*(\d+)|BOM\s*深度\s*[:=]?\s*(\d+)/);
+    if (bomDepthMatch) {
+      const d = Math.max(1, Math.min(10, parseInt(bomDepthMatch[1] ?? bomDepthMatch[2] ?? bomDepthMatch[3] ?? bomDepthMatch[4] ?? '3', 10)));
       return {
-        reply: tP('copilot.replies.methodDepthOptimal'),
-        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false, depth_optimal: true } },
-      };
-    }
-
-    if (/manual depth|fixed depth|固定深度|手动深度|关闭(自动|最优)深度/.test(t)) {
-      return {
-        reply: tP('copilot.replies.methodDepthManual'),
-        configUpdate: { method_selection: { ...ms, depth_optimal: false } },
+        reply: tP('copilot.replies.methodMaxBomDepth', { depth: d }),
+        configUpdate: { method_selection: { ...ms, max_bom_depth: d } },
       };
     }
 
@@ -1256,7 +1250,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       const d = Math.max(1, Math.min(500, parseInt(depthMatch[1] ?? depthMatch[2] ?? depthMatch[3] ?? '1', 10)));
       return {
         reply: tP('copilot.replies.methodDepth', { depth: d }),
-        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false, depth: d, depth_optimal: false } },
+        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false, depth: d } },
       };
     }
 
@@ -1389,7 +1383,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (/reset|default|clear|重置|默认|清除/.test(t)) {
       return {
         reply: tP('copilot.replies.reset'),
-        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, depth_optimal: false, max_methods: 2, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', scope: 'leaf-only' }, analyze_criticality: false, check_soundness: true },
+        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, max_methods: 2, max_bom_depth: 3, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' }, analyze_criticality: false, check_soundness: true },
       };
     }
 
@@ -1535,7 +1529,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     method_selection: {
                       ...cfg.method_selection,
                       depth: chosen ?? cfg.method_selection?.depth ?? 1,
-                      depth_optimal: false,
                     },
                   });
                 }
@@ -1995,7 +1988,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             method_selection: {
               ...cfg.method_selection,
               depth: chosen ?? cfg.method_selection?.depth ?? 1,
-              depth_optimal: false,
             },
           });
         }
@@ -3317,9 +3309,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         setPlanRunSaveError(null);
         setPlanWorkOrderPeggingCache({});
         if (full.config) {
-          // Default the depth to the run's chosen_depth (from optimal search) when present;
-          // fall back to 1 so the form starts from a sane baseline rather than carrying
-          // over whatever depth was in the saved config snapshot.
+          // Default the depth to the run's chosen_depth (legacy, set when the
+          // retired optimal-depth search ran) when present; fall back to 1 so
+          // the form starts from a sane baseline rather than carrying over
+          // whatever depth was in the saved config snapshot.
           const cfg = full.config as PlanningConfig;
           const chosen = full.chosen_depth ?? null;
           setPlanningConfig({
@@ -3327,7 +3320,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             method_selection: {
               ...cfg.method_selection,
               depth: chosen ?? 1,
-              depth_optimal: false,
             },
           });
         }
@@ -4164,231 +4156,236 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       <section>
         <h2>{tSec('planning')}</h2>
         <div style={{ marginBottom: '0.75rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap', marginBottom: '0.5rem' }}>
-            <span style={{ color: '#a1a1aa', fontSize: '0.875rem' }}>{tP('config.methodSelection')}</span>
-            {/* Max methods (replaces the legacy `multiple` boolean). Defaults to 2 in
-                sync with the backend; legacy `multiple: false` reads as 1, `multiple: true` as 2. */}
-            <label
-              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', cursor: 'pointer' }}
-              title={tP('config.methodMaxCountTooltip')}
-            >
-              <span style={{ color: '#a1a1aa' }}>{tP('config.methodMaxCount')}</span>
-              <select
-                value={(() => {
-                  const ms = planningConfig.method_selection;
-                  if (typeof ms?.max_methods === 'number') return Math.max(1, Math.min(4, Math.trunc(ms.max_methods)));
-                  if (ms?.multiple === false) return 1;
-                  return 2;
-                })()}
-                onChange={(e) => setPlanningConfig((c) => {
-                  const v = Math.max(1, Math.min(4, parseInt(e.target.value, 10) || 2));
-                  // Drop legacy `multiple` on save; backend resolution prefers max_methods anyway.
-                  const { multiple: _drop, ...rest } = c.method_selection ?? {};
-                  void _drop;
-                  return { ...c, method_selection: { ...rest, max_methods: v } };
-                })}
-                style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+          {/* ── Group 1: Method selection (how methods are ranked + tried per demand) ── */}
+          <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.65rem', margin: '0 0 0.55rem' }}>
+            <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              {tP('config.groupMethodSelection')}
+            </legend>
+            {/* Row 1 — Bounds: how far the planner exhausts methods + how deep make-fallback admits. */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+              {/* Max methods (replaces the legacy `multiple` boolean). Defaults to 2 in
+                  sync with the backend; legacy `multiple: false` reads as 1, `multiple: true` as 2. */}
+              <label
+                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', cursor: 'pointer' }}
+                title={tP('config.methodMaxCountTooltip')}
               >
-                <option value={1}>1</option>
-                <option value={2}>2</option>
-                <option value={3}>3</option>
-                <option value={4}>4</option>
-              </select>
-            </label>
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
-              <input
-                type="checkbox"
-                checked={(() => {
-                  const ms = planningConfig.method_selection;
-                  if (ms?.mode === 'elaborate') return true;
-                  if (ms?.mode === 'preference') return false;
-                  return ms?.elaborate === true;
-                })()}
-                onChange={(e) => setPlanningConfig((c) => ({
+                <span style={{ color: '#a1a1aa' }}>{tP('config.methodMaxCount')}</span>
+                <select
+                  value={(() => {
+                    const ms = planningConfig.method_selection;
+                    if (typeof ms?.max_methods === 'number') return Math.max(1, Math.min(4, Math.trunc(ms.max_methods)));
+                    if (ms?.multiple === false) return 1;
+                    return 2;
+                  })()}
+                  onChange={(e) => setPlanningConfig((c) => {
+                    const v = Math.max(1, Math.min(4, parseInt(e.target.value, 10) || 2));
+                    // Drop legacy `multiple` on save; backend resolution prefers max_methods anyway.
+                    const { multiple: _drop, ...rest } = c.method_selection ?? {};
+                    void _drop;
+                    return { ...c, method_selection: { ...rest, max_methods: v } };
+                  })}
+                  style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+                >
+                  <option value={1}>1</option>
+                  <option value={2}>2</option>
+                  <option value={3}>3</option>
+                  <option value={4}>4</option>
+                </select>
+              </label>
+              <label
+                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }}
+                title={tP('config.maxBomDepthHint')}
+              >
+                <span style={{ color: '#a1a1aa' }}>{tP('config.maxBomDepth')}</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={10}
+                  value={planningConfig.method_selection?.max_bom_depth ?? 3}
+                  onChange={(e) => {
+                    const v = Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 3));
+                    setPlanningConfig((c) => ({ ...c, method_selection: { ...c.method_selection, max_bom_depth: v } }));
+                  }}
+                  style={{ width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+                />
+              </label>
+            </div>
+
+            {/* Row 2 — Elaborate scoring: toggle + recursion depth + per-axis weights. All gated on the toggle. */}
+            {(() => {
+              const elaborateOn = planningConfig.method_selection?.elaborate === true
+                || planningConfig.method_selection?.mode === 'elaborate';
+              const weights = planningConfig.method_selection?.score_weights;
+              const wCommit = weights?.commit_time ?? 0.4;
+              const wInv = weights?.inventory_consumed ?? 0.35;
+              const wPurchase = weights?.purchase ?? 0.25;
+              const updateWeight = (key: 'commit_time' | 'inventory_consumed' | 'purchase', v: number) => {
+                const clamped = Math.max(0, Math.min(1, isNaN(v) ? 0 : v));
+                setPlanningConfig((c) => ({
                   ...c,
                   method_selection: {
                     ...c.method_selection,
-                    elaborate: e.target.checked,
-                    mode: e.target.checked ? 'elaborate' : 'preference',
+                    score_weights: {
+                      commit_time: key === 'commit_time' ? clamped : (c.method_selection?.score_weights?.commit_time ?? 0.4),
+                      inventory_consumed: key === 'inventory_consumed' ? clamped : (c.method_selection?.score_weights?.inventory_consumed ?? 0.35),
+                      purchase: key === 'purchase' ? clamped : (c.method_selection?.score_weights?.purchase ?? 0.25),
+                    },
                   },
-                }))}
-              />
-              <span>{tP('config.elaborateMethod')}</span>
-            </label>
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.method_selection?.elaborate === true ? 1 : 0.4 }}>
-              <span style={{ color: '#a1a1aa' }}>{tP('config.methodDepth')}</span>
-              <input
-                type="number"
-                min={1}
-                max={500}
-                disabled={planningConfig.method_selection?.elaborate !== true || planningConfig.method_selection?.depth_optimal === true}
-                value={planningConfig.method_selection?.depth ?? 1}
-                onChange={(e) => {
-                  const v = Math.max(1, Math.min(500, parseInt(e.target.value, 10) || 1));
-                  setPlanningConfig((c) => ({ ...c, method_selection: { ...c.method_selection, depth: v } }));
-                }}
-                style={{ width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
-              />
-            </label>
-            <label
-              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', cursor: 'pointer', opacity: planningConfig.method_selection?.elaborate === true ? 1 : 0.4 }}
-              title={tP('config.depthOptimalHint')}
-            >
+                }));
+              };
+              const inputStyle: React.CSSProperties = { width: 64, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' };
+              const gatedLabelStyle: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.875rem', opacity: elaborateOn ? 1 : 0.4 };
+              return (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.9rem', flexWrap: 'wrap', marginTop: '0.45rem' }} title={tP('config.weightsHint')}>
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={elaborateOn}
+                      onChange={(e) => setPlanningConfig((c) => ({
+                        ...c,
+                        method_selection: {
+                          ...c.method_selection,
+                          elaborate: e.target.checked,
+                          mode: e.target.checked ? 'elaborate' : 'preference',
+                        },
+                      }))}
+                    />
+                    <span>{tP('config.elaborateMethod')}</span>
+                  </label>
+                  <label style={gatedLabelStyle}>
+                    <span style={{ color: '#a1a1aa' }}>{tP('config.methodDepth')}</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={500}
+                      disabled={!elaborateOn}
+                      value={planningConfig.method_selection?.depth ?? 1}
+                      onChange={(e) => {
+                        const v = Math.max(1, Math.min(500, parseInt(e.target.value, 10) || 1));
+                        setPlanningConfig((c) => ({ ...c, method_selection: { ...c.method_selection, depth: v } }));
+                      }}
+                      style={{ width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+                    />
+                  </label>
+                  <span style={{ color: '#a1a1aa', fontSize: '0.8rem', opacity: elaborateOn ? 1 : 0.5 }}>{tP('config.weightsLabel')}</span>
+                  <label style={gatedLabelStyle}>
+                    <span style={{ color: '#a1a1aa' }}>{tP('config.weightCommit')}</span>
+                    <input type="number" min={0} max={1} step={0.05}
+                      disabled={!elaborateOn}
+                      value={wCommit}
+                      onChange={(e) => updateWeight('commit_time', parseFloat(e.target.value))}
+                      style={inputStyle} />
+                  </label>
+                  <label style={gatedLabelStyle}>
+                    <span style={{ color: '#a1a1aa' }}>{tP('config.weightInventory')}</span>
+                    <input type="number" min={0} max={1} step={0.05}
+                      disabled={!elaborateOn}
+                      value={wInv}
+                      onChange={(e) => updateWeight('inventory_consumed', parseFloat(e.target.value))}
+                      style={inputStyle} />
+                  </label>
+                  <label style={gatedLabelStyle}>
+                    <span style={{ color: '#a1a1aa' }}>{tP('config.weightPurchase')}</span>
+                    <input type="number" min={0} max={1} step={0.05}
+                      disabled={!elaborateOn}
+                      value={wPurchase}
+                      onChange={(e) => updateWeight('purchase', parseFloat(e.target.value))}
+                      style={inputStyle} />
+                  </label>
+                </div>
+              );
+            })()}
+
+            {/* Row 3 — Buy-method gate. Independent of mode/depth/weights. */}
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', marginTop: '0.45rem' }}>
               <input
                 type="checkbox"
-                disabled={planningConfig.method_selection?.elaborate !== true}
-                checked={planningConfig.method_selection?.depth_optimal === true}
-                onChange={(e) => setPlanningConfig((c) => ({
-                  ...c,
-                  method_selection: { ...c.method_selection, depth_optimal: e.target.checked },
-                }))}
+                checked={planningConfig.purchase_allowed !== false}
+                onChange={(e) => setPlanningConfig((c) => ({ ...c, purchase_allowed: e.target.checked }))}
               />
-              <span style={{ color: '#a1a1aa' }}>{tP('config.depthOptimal')}</span>
+              <span>{tP('config.purchaseAllowed')}</span>
             </label>
-          </div>
-          {(() => {
-            const elaborateOn = planningConfig.method_selection?.elaborate === true;
-            const weights = planningConfig.method_selection?.score_weights;
-            const wCommit = weights?.commit_time ?? 0.4;
-            const wInv = weights?.inventory_consumed ?? 0.35;
-            const wPurchase = weights?.purchase ?? 0.25;
-            const updateWeight = (key: 'commit_time' | 'inventory_consumed' | 'purchase', v: number) => {
-              const clamped = Math.max(0, Math.min(1, isNaN(v) ? 0 : v));
-              setPlanningConfig((c) => ({
-                ...c,
-                method_selection: {
-                  ...c.method_selection,
-                  score_weights: {
-                    commit_time: key === 'commit_time' ? clamped : (c.method_selection?.score_weights?.commit_time ?? 0.4),
-                    inventory_consumed: key === 'inventory_consumed' ? clamped : (c.method_selection?.score_weights?.inventory_consumed ?? 0.35),
-                    purchase: key === 'purchase' ? clamped : (c.method_selection?.score_weights?.purchase ?? 0.25),
-                  },
-                },
-              }));
-            };
-            const inputStyle: React.CSSProperties = { width: 64, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' };
-            const labelStyle: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.875rem', opacity: elaborateOn ? 1 : 0.4 };
-            return (
-              <div
-                style={{ display: 'flex', alignItems: 'center', gap: '0.9rem', flexWrap: 'wrap', marginBottom: '0.5rem', marginLeft: '1rem' }}
-                title={tP('config.weightsHint')}
+          </fieldset>
+
+          {/* ── Group 2: Demand consolidation (sharing across demands) ── */}
+          <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
+            <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              {tP('config.groupConsolidation')}
+            </legend>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={planningConfig.consolidation?.enabled === true}
+                  onChange={(e) => setPlanningConfig((c) => ({
+                    ...c,
+                    consolidation: { ...c.consolidation, enabled: e.target.checked },
+                  }))}
+                />
+                <span>{tP('config.consolidate')}</span>
+              </label>
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}>
+                <span style={{ color: '#a1a1aa' }}>{tP('config.bucketDays')}</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={365}
+                  disabled={planningConfig.consolidation?.enabled !== true}
+                  value={planningConfig.consolidation?.period_days ?? 0}
+                  onChange={(e) => {
+                    const raw = parseInt(e.target.value, 10);
+                    const v = Math.max(0, Math.min(365, Number.isNaN(raw) ? 0 : raw));
+                    setPlanningConfig((c) => ({ ...c, consolidation: { ...c.consolidation, period_days: v } }));
+                  }}
+                  style={{ width: 64, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+                />
+              </label>
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}>
+                <span style={{ color: '#a1a1aa' }}>{tP('config.splitPolicy')}</span>
+                <select
+                  disabled={planningConfig.consolidation?.enabled !== true}
+                  value={planningConfig.consolidation?.allocation_mode ?? 'fair'}
+                  onChange={(e) => setPlanningConfig((c) => ({
+                    ...c,
+                    consolidation: { ...c.consolidation, allocation_mode: e.target.value as 'priority_first' | 'proportional' | 'fair' },
+                  }))}
+                  style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+                >
+                  <option value="fair">{tP('config.fair')}</option>
+                  <option value="proportional">{tP('config.proportional')}</option>
+                  <option value="priority_first">{tP('config.priorityFirst')}</option>
+                </select>
+              </label>
+            </div>
+          </fieldset>
+
+          {/* ── Group 3: Post-plan analysis (run AFTER planning, do not affect planner) ── */}
+          <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
+            <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              {tP('config.groupPostPlan')}
+            </legend>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={analyzeCriticalityEnabled}
+                  onChange={(e) => setAnalyzeCriticalityEnabled(e.target.checked)}
+                />
+                <span style={{ fontSize: '0.875rem' }}>{tP('config.analyzeCriticality')}</span>
+              </label>
+              <label
+                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}
+                title={tP('config.checkSoundnessTooltip')}
               >
-                <span style={{ color: '#a1a1aa', fontSize: '0.8rem', opacity: elaborateOn ? 1 : 0.5 }}>{tP('config.weightsLabel')}</span>
-                <label style={labelStyle}>
-                  <span style={{ color: '#a1a1aa' }}>{tP('config.weightCommit')}</span>
-                  <input type="number" min={0} max={1} step={0.05}
-                    disabled={!elaborateOn}
-                    value={wCommit}
-                    onChange={(e) => updateWeight('commit_time', parseFloat(e.target.value))}
-                    style={inputStyle} />
-                </label>
-                <label style={labelStyle}>
-                  <span style={{ color: '#a1a1aa' }}>{tP('config.weightInventory')}</span>
-                  <input type="number" min={0} max={1} step={0.05}
-                    disabled={!elaborateOn}
-                    value={wInv}
-                    onChange={(e) => updateWeight('inventory_consumed', parseFloat(e.target.value))}
-                    style={inputStyle} />
-                </label>
-                <label style={labelStyle}>
-                  <span style={{ color: '#a1a1aa' }}>{tP('config.weightPurchase')}</span>
-                  <input type="number" min={0} max={1} step={0.05}
-                    disabled={!elaborateOn}
-                    value={wPurchase}
-                    onChange={(e) => updateWeight('purchase', parseFloat(e.target.value))}
-                    style={inputStyle} />
-                </label>
-              </div>
-            );
-          })()}
-          <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem', cursor: 'pointer' }}>
-            <input
-              type="checkbox"
-              checked={planningConfig.purchase_allowed !== false}
-              onChange={(e) => setPlanningConfig((c) => ({ ...c, purchase_allowed: e.target.checked }))}
-            />
-            <span>{tP('config.purchaseAllowed')}</span>
-          </label>
-          <div style={{ marginTop: '0.5rem', display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
-              <input
-                type="checkbox"
-                checked={planningConfig.consolidation?.enabled === true}
-                onChange={(e) => setPlanningConfig((c) => ({
-                  ...c,
-                  consolidation: { ...c.consolidation, enabled: e.target.checked },
-                }))}
-              />
-              <span>{tP('config.consolidate')}</span>
-            </label>
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}>
-              <span style={{ color: '#a1a1aa' }}>{tP('config.bucketDays')}</span>
-              <input
-                type="number"
-                min={0}
-                max={365}
-                disabled={planningConfig.consolidation?.enabled !== true}
-                value={planningConfig.consolidation?.period_days ?? 0}
-                onChange={(e) => {
-                  const raw = parseInt(e.target.value, 10);
-                  const v = Math.max(0, Math.min(365, Number.isNaN(raw) ? 0 : raw));
-                  setPlanningConfig((c) => ({ ...c, consolidation: { ...c.consolidation, period_days: v } }));
-                }}
-                style={{ width: 64, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
-              />
-            </label>
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}>
-              <span style={{ color: '#a1a1aa' }}>{tP('config.splitPolicy')}</span>
-              <select
-                disabled={planningConfig.consolidation?.enabled !== true}
-                value={planningConfig.consolidation?.allocation_mode ?? 'fair'}
-                onChange={(e) => setPlanningConfig((c) => ({
-                  ...c,
-                  consolidation: { ...c.consolidation, allocation_mode: e.target.value as 'priority_first' | 'proportional' | 'fair' },
-                }))}
-                style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
-              >
-                <option value="fair">{tP('config.fair')}</option>
-                <option value="proportional">{tP('config.proportional')}</option>
-                <option value="priority_first">{tP('config.priorityFirst')}</option>
-              </select>
-            </label>
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}>
-              <span style={{ color: '#a1a1aa' }}>{tP('config.regulationScope')}</span>
-              <select
-                disabled={planningConfig.consolidation?.enabled !== true}
-                value={planningConfig.consolidation?.scope ?? 'leaf-only'}
-                onChange={(e) => setPlanningConfig((c) => ({
-                  ...c,
-                  consolidation: { ...c.consolidation, scope: e.target.value as 'leaf-only' | 'all' },
-                }))}
-                style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
-                title={tP('config.scopeTooltip')}
-              >
-                <option value="leaf-only">{tP('config.scopeLeavesOnly')}</option>
-                <option value="all">{tP('config.scopeAllLevels')}</option>
-              </select>
-            </label>
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
-              <input
-                type="checkbox"
-                checked={analyzeCriticalityEnabled}
-                onChange={(e) => setAnalyzeCriticalityEnabled(e.target.checked)}
-              />
-              <span style={{ fontSize: '0.875rem' }}>{tP('config.analyzeCriticality')}</span>
-            </label>
-            <label
-              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}
-              title={tP('config.checkSoundnessTooltip')}
-            >
-              <input
-                type="checkbox"
-                checked={checkSoundnessEnabled}
-                onChange={(e) => setCheckSoundnessEnabled(e.target.checked)}
-              />
-              <span style={{ fontSize: '0.875rem' }}>{tP('config.checkSoundness')}</span>
-            </label>
-          </div>
+                <input
+                  type="checkbox"
+                  checked={checkSoundnessEnabled}
+                  onChange={(e) => setCheckSoundnessEnabled(e.target.checked)}
+                />
+                <span style={{ fontSize: '0.875rem' }}>{tP('config.checkSoundness')}</span>
+              </label>
+            </div>
+          </fieldset>
           <br style={{ marginTop: '0.25rem' }} />
           <button
             type="button"
@@ -4434,11 +4431,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 multiple: false,
                 elaborate: false,
                 depth: 1,
-                depth_optimal: false,
+                max_bom_depth: 3,
                 score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 },
               },
               purchase_allowed: false,
-              consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair', scope: 'leaf-only' },
+              consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' },
             })}
             title={tP('config.resetDefaultsTitle')}
             style={{ padding: '6px 12px' }}
@@ -4911,8 +4908,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           stickyHeader
                           rowStyle={(r) => {
                             const k = `demand|${r.demand_id ?? ''}|${r.product_id}|${r.location_id}`;
+                            const isPegged = woPeggingRowKey === k;
+                            // Pegging-selected wins over failed: when the user clicks Show on
+                            // a failed demand, they need a clear visual anchor. We layer the
+                            // sky-blue pegging accent ON TOP of the failed-row red wash so
+                            // both signals remain readable.
+                            if (isPegged) {
+                              return r.is_failed
+                                ? { background: 'rgba(56,189,248,0.22)', outline: '2px solid #38bdf8', borderLeft: '3px solid #f87171' }
+                                : { background: 'rgba(56,189,248,0.22)', outline: '2px solid #38bdf8' };
+                            }
                             if (r.is_failed) return { background: 'rgba(248,113,113,0.08)', outline: '1px solid rgba(248,113,113,0.3)' };
-                            if (woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
                             return undefined;
                           }}
                           columns={[
@@ -7143,30 +7149,45 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                       style={{ ...inputStyle, width: 56 }} />
                                   </label>
                                   <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editMaxBomDepth')}</span>
+                                    <input type="number" min={1} max={10}
+                                      value={Number(ms.max_bom_depth ?? 3)}
+                                      onChange={(e) => updateConfig((c) => {
+                                        const m = (c.method_selection ?? {}) as Record<string, unknown>;
+                                        m.max_bom_depth = Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 3));
+                                        c.method_selection = m;
+                                      })}
+                                      style={{ ...inputStyle, width: 56 }} />
+                                  </label>
+                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                                     <input type="checkbox" checked={effectiveConfig.purchase_allowed === true}
                                       onChange={(e) => updateConfig((c) => { c.purchase_allowed = e.target.checked; })} />
                                     <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editPurchase')}</span>
                                   </label>
                                 </div>
-                                {elaborateOn && (
-                                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'center', fontSize: '0.78rem', marginBottom: 6, paddingLeft: 8 }}>
-                                    <span style={{ fontSize: '0.7rem', color: '#71717a' }}>{tP('bootstrap.editWeights')}</span>
-                                    {(['commit_time','inventory_consumed','purchase'] as const).map((k) => (
-                                      <label key={k} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                                        <span style={{ color: '#a1a1aa', fontSize: '0.72rem' }}>{k.replace('_',' ')}</span>
-                                        <input type="number" step={0.05} min={0} max={1}
-                                          value={Number(sw[k] ?? (k === 'commit_time' ? 0.4 : k === 'inventory_consumed' ? 0.35 : 0.25))}
-                                          onChange={(e) => updateConfig((c) => {
-                                            const m = (c.method_selection ?? {}) as Record<string, unknown>;
-                                            const w = { ...((m.score_weights ?? {}) as Record<string, number>) };
-                                            w[k] = Math.max(0, Math.min(1, parseFloat(e.target.value) || 0));
-                                            m.score_weights = w; c.method_selection = m;
-                                          })}
-                                          style={{ ...inputStyle, width: 64 }} />
-                                      </label>
-                                    ))}
-                                  </div>
-                                )}
+                                {/* Score weights — always rendered so the knob is discoverable;
+                                    dimmed + disabled when elaborate is off (mirrors the planning
+                                    page pattern). Editing weights with elaborate off has no effect
+                                    on the run, but pre-staging them then flipping the toggle is a
+                                    common workflow. */}
+                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'center', fontSize: '0.78rem', marginBottom: 6, paddingLeft: 8, opacity: elaborateOn ? 1 : 0.45 }}>
+                                  <span style={{ fontSize: '0.7rem', color: '#71717a' }}>{tP('bootstrap.editWeights')}</span>
+                                  {(['commit_time','inventory_consumed','purchase'] as const).map((k) => (
+                                    <label key={k} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                      <span style={{ color: '#a1a1aa', fontSize: '0.72rem' }}>{k.replace('_',' ')}</span>
+                                      <input type="number" step={0.05} min={0} max={1}
+                                        disabled={!elaborateOn}
+                                        value={Number(sw[k] ?? (k === 'commit_time' ? 0.4 : k === 'inventory_consumed' ? 0.35 : 0.25))}
+                                        onChange={(e) => updateConfig((c) => {
+                                          const m = (c.method_selection ?? {}) as Record<string, unknown>;
+                                          const w = { ...((m.score_weights ?? {}) as Record<string, number>) };
+                                          w[k] = Math.max(0, Math.min(1, parseFloat(e.target.value) || 0));
+                                          m.score_weights = w; c.method_selection = m;
+                                        })}
+                                        style={{ ...inputStyle, width: 64 }} />
+                                    </label>
+                                  ))}
+                                </div>
                                 {/* Consolidation (demand side) */}
                                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'center', fontSize: '0.78rem', marginBottom: 6 }}>
                                   <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
@@ -7176,18 +7197,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                         v.enabled = e.target.checked; c.consolidation = v;
                                       })} />
                                     <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editConsolidationEnabled')}</span>
-                                  </label>
-                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, opacity: cs.enabled !== false ? 1 : 0.4 }}>
-                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editScope')}</span>
-                                    <select value={String(cs.scope ?? 'leaf-only')}
-                                      disabled={cs.enabled === false}
-                                      onChange={(e) => updateConfig((c) => {
-                                        const v = (c.consolidation ?? {}) as Record<string, unknown>;
-                                        v.scope = e.target.value; c.consolidation = v;
-                                      })} style={inputStyle}>
-                                      <option value="leaf-only">leaf-only</option>
-                                      <option value="all">all</option>
-                                    </select>
                                   </label>
                                   <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, opacity: cs.enabled !== false ? 1 : 0.4 }}>
                                     <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editPeriodDays')}</span>
@@ -7541,11 +7550,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 const isInitial = run.is_initial === true;
                 const isDesignated = run.is_active_designated === true;
                 const isDesignating = !!planRunDesignating[run.id];
-                const isOptimal = typeof run.chosen_depth === 'number';
-                // Left border priority: green (active) > blue (initial) > amber (optimal-depth).
-                // Optimal-depth runs get an amber accent so they're distinguishable at a glance
-                // without overriding the active/initial cues, which carry stronger meaning.
-                const accent = isActive ? '#4ade80' : isInitial ? '#60a5fa' : isOptimal ? '#f59e0b' : 'transparent';
+                // Left border priority: green (active) > blue (initial).
+                const accent = isActive ? '#4ade80' : isInitial ? '#60a5fa' : 'transparent';
                 const expandedTab = planRunExpandedTab[run.id] ?? null;
                 const detail = planRunDetailCache[run.id];
                 const detailLoading = !!planRunDetailLoading[run.id];
@@ -7556,7 +7562,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   paddingLeft: '0.75rem',
                   paddingBottom: '0.75rem',
                   marginBottom: '0.75rem',
-                  background: isActive ? 'rgba(74,222,128,0.04)' : isInitial ? 'rgba(96,165,250,0.04)' : isOptimal ? 'rgba(245,158,11,0.04)' : 'transparent',
+                  background: isActive ? 'rgba(74,222,128,0.04)' : isInitial ? 'rgba(96,165,250,0.04)' : 'transparent',
                 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                     <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
@@ -7591,46 +7597,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           {isDesignated ? tP('runHistory.chips.activeDesignated') : tP('runHistory.chips.active')}
                         </span>
                       )}
-                      {typeof run.chosen_depth === 'number' && (
-                        <span
-                          title={tP('runHistory.chosenDepthTitle')}
-                          style={{
-                            fontSize: '0.75rem',
-                            fontWeight: 600,
-                            color: '#fef3c7',
-                            background: '#92400e',
-                            border: '1px solid #f59e0b',
-                            borderRadius: 8,
-                            padding: '1px 8px',
-                          }}
-                        >
-                          {tP('runHistory.chosenDepthChip', { depth: run.chosen_depth })}
-                        </span>
-                      )}
                       <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>
                         {new Date(run.created_at).toLocaleString()}
                       </span>
-                      {typeof run.duration_ms === 'number' && run.duration_ms >= 0 && (() => {
-                        const attempts = run.attempts ?? null;
-                        const hasAttempts = Array.isArray(attempts) && attempts.length > 0;
-                        const elapsedTitle = hasAttempts
-                          ? [
-                              tP('runHistory.elapsedBreakdownTitle'),
-                              ...attempts.map((a) => `  depth ${a.depth}: ${formatElapsedMs(a.duration_ms)}`),
-                              tP('runHistory.elapsedBreakdownTotal', {
-                                ms: formatElapsedMs(attempts.reduce((s, a) => s + a.duration_ms, 0)),
-                              }),
-                            ].join('\n')
-                          : tP('runHistory.elapsedTitle');
-                        return (
-                          <span
-                            title={elapsedTitle}
-                            style={{ fontSize: '0.75rem', color: '#a1a1aa', background: '#27272a', borderRadius: 8, padding: '1px 7px' }}
-                          >
-                            {formatElapsedMs(run.duration_ms)}
-                          </span>
-                        );
-                      })()}
+                      {typeof run.duration_ms === 'number' && run.duration_ms >= 0 && (
+                        <span
+                          title={tP('runHistory.elapsedTitle')}
+                          style={{ fontSize: '0.75rem', color: '#a1a1aa', background: '#27272a', borderRadius: 8, padding: '1px 7px' }}
+                        >
+                          {formatElapsedMs(run.duration_ms)}
+                        </span>
+                      )}
                       {run.override_count > 0 && (
                         <span style={{ background: '#7c3aed', color: '#fff', borderRadius: 8, padding: '1px 6px', fontSize: '0.72rem' }}>
                           {tP('runHistory.overrideCount', { n: run.override_count })}
@@ -8988,6 +8965,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             <div
               role="separator"
               aria-label="Resize planning pegging panel"
+              title="Drag to resize"
               onMouseDown={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -8999,11 +8977,51 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 left: 0,
                 top: 0,
                 bottom: 0,
-                width: 6,
+                width: 8,
                 cursor: 'col-resize',
                 zIndex: 11,
+                background: planPeggingResizing ? 'rgba(56, 189, 248, 0.45)' : 'rgba(255, 255, 255, 0.05)',
+                borderLeft: planPeggingResizing ? '1px solid #38bdf8' : '1px solid rgba(255, 255, 255, 0.08)',
+                transition: planPeggingResizing ? 'none' : 'background 120ms ease, border-color 120ms ease',
               }}
-            />
+              onMouseEnter={(e) => {
+                if (planPeggingResizing) return;
+                (e.currentTarget as HTMLDivElement).style.background = 'rgba(56, 189, 248, 0.25)';
+                (e.currentTarget as HTMLDivElement).style.borderLeftColor = 'rgba(56, 189, 248, 0.6)';
+              }}
+              onMouseLeave={(e) => {
+                if (planPeggingResizing) return;
+                (e.currentTarget as HTMLDivElement).style.background = 'rgba(255, 255, 255, 0.05)';
+                (e.currentTarget as HTMLDivElement).style.borderLeftColor = 'rgba(255, 255, 255, 0.08)';
+              }}
+            >
+              {/* Subtle vertical grip dots, vertically centered, fade in on hover. */}
+              <div
+                style={{
+                  position: 'absolute',
+                  left: '50%',
+                  top: '50%',
+                  transform: 'translate(-50%, -50%)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 3,
+                  pointerEvents: 'none',
+                  opacity: planPeggingResizing ? 1 : 0.5,
+                }}
+              >
+                {[0, 1, 2, 3].map((i) => (
+                  <span
+                    key={i}
+                    style={{
+                      width: 2,
+                      height: 2,
+                      borderRadius: '50%',
+                      background: planPeggingResizing ? '#bae6fd' : '#71717a',
+                    }}
+                  />
+                ))}
+              </div>
+            </div>
             {previousPeggingContext && (
               <div style={{ marginBottom: '0.5rem' }}>
                 <button
@@ -9525,9 +9543,30 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <span style={{ width: 14, flexShrink: 0 }}>{expandable ? (isExpanded ? '▼' : '▶') : '·'}</span>
                       <span style={{ width: 18, flexShrink: 0, fontSize: '0.9em', color: typeColor }} title={typeLabel}>{icon}</span>
                       <span style={{ flex: 1, color: typeColor }}>{label}</span>
+                      {/* Two orthogonal failure axes — render both when present:
+                          • 瓶颈 (orange) = SUPPLY-side: this child's BOM/inventory chain
+                            couldn't deliver enough; first-pass effective/needed ratio is
+                            the smallest among AND siblings, capping the parent via min.
+                          • 根因 (red) = DEMAND-side: consolidation's fair-share split with
+                            competing demands left this demand with the tightest share-
+                            vs-need ratio at this child (computed at iter-0). Independent
+                            of supply — visible whether or not 瓶颈 fires. */}
+                      {node.is_bottleneck && (
+                        <span
+                          title="瓶颈 (supply-side limiter): 此子节点的供应链(BOM/库存/子配方)无法满足需求 — 其首轮可达量与需求量之比在AND兄弟中最小,通过MIN(子份额)封顶父节点的可达量。属供应侧约束。修复方向: 增加库存、启用采购、补充方法行(method_make/move/buy)、或解除更深处配方的阻塞。"
+                          style={{
+                            fontSize: '0.7em',
+                            color: '#fca5a5',
+                            background: 'rgba(248, 113, 113, 0.18)',
+                            padding: '1px 6px',
+                            borderRadius: 3,
+                            flexShrink: 0,
+                          }}
+                        >瓶颈</span>
+                      )}
                       {node.is_root_bottleneck && (
                         <span
-                          title="根因 (root cause): 此子节点的iter-0分配份额(cap/need比率)在AND兄弟中最小，是真正的源头瓶颈。其他兄弟节点之所以也被标记为瓶颈,是因为合并迭代过程将它们的分配下调到根因子节点的水平。要解除该需求的瓶颈,只能针对根因节点扩容或减少竞争。"
+                          title="根因 (demand-side allocation origin): 在iter-0合并阶段,该需求与其他需求竞争此叶子时分到的份额相对其需求量最紧 — 即同一AND层级中, 该需求的(份额/需求)比率最小。与供应是否充足无关 — 即使供应充足,本需求在此叶子上的配额最先吃紧。修复方向: 调整本需求优先级、改变 allocation_mode (fair/proportional/priority_first)、改变合并 period_days、或减少其他需求在此叶子的竞争压力。"
                           style={{
                             fontSize: '0.7em',
                             color: '#fff',
@@ -9538,19 +9577,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             fontWeight: 700,
                           }}
                         >根因</span>
-                      )}
-                      {node.is_bottleneck && !node.is_root_bottleneck && (
-                        <span
-                          title="此子节点的首轮可达量比父节点其他兄弟低,决定了AND取min的瓶颈"
-                          style={{
-                            fontSize: '0.7em',
-                            color: '#fca5a5',
-                            background: 'rgba(248, 113, 113, 0.18)',
-                            padding: '1px 6px',
-                            borderRadius: 3,
-                            flexShrink: 0,
-                          }}
-                        >瓶颈</span>
                       )}
                     </button>
                     {node.type === 'work_order' && node.method_choice_explanation && (() => {
@@ -9615,7 +9641,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           : consolidatedSourceTrees.length > 0
                             ? null /* rendered below */
                             : node.type === 'demand'
-                              ? <p style={{ margin: 0, fontSize: '0.8rem', color: '#f87171' }}>No work orders — planning could not fulfill this demand (no method or child failed).</p>
+                              ? (node.failure_explanation
+                                  ? <p style={{ margin: 0, fontSize: '0.8rem', color: '#f87171', lineHeight: 1.4 }}>{node.failure_explanation}</p>
+                                  : <p style={{ margin: 0, fontSize: '0.8rem', color: '#f87171' }}>No work orders — planning could not fulfill this demand (no method or child failed).</p>)
                               : node.type === 'work_order'
                                 ? <p style={{ margin: 0, fontSize: '0.8rem', color: '#71717a' }}>No component breakdown (leaf work order or depth-limited).</p>
                                 : null
