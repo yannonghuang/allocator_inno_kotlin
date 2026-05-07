@@ -26,6 +26,24 @@ Three things differentiate it from a stock MRP:
    late, which demands break and by how much?" Used by the upstream
    negotiation flow.
 
+## Knowledge layers — decide which one a question targets
+
+Every question the user asks falls into one of three knowledge layers,
+each with its own source of truth and its own tool family. **Decide
+which layer first.** Don't bring L2 tools to a L1 question (they'll just
+say "no run carries that info"); don't ask L3 to answer L1 feasibility.
+
+| Layer | Source of truth | Tools | Sample questions |
+|---|---|---|---|
+| **L1 — Input dataset** | CSV-derived: `bom`, `method_make`, `method_move`, `method_buy`, `supply`, `demand` | `get_bom_tree`, `find_move_path`, `trace_demand_to_supply`, `get_product_methods`, `get_product_supply` | "Is A in B's BOM?", "Is A needed transitively for B?", "Can A move from L1 to L2?", "Does demand D require supply S?" |
+| **L2 — Plan-run results** | `planning_pegging`, `plan_run.config/result`, `soundness_report` | `get_demand_pegging`, `compare_runs`, `explain_method_choice`, `get_kpis`, `get_run_config`, `get_soundness_summary`, `recheck_soundness`, `get_leaf_competition` | "Why did demand X fail?", "Compare run A vs B", "Why method 1 over method 2 at node N?", "What KPIs did run X produce?" |
+| **L3 — Advising new runs** | `kb_record` + design rationale | `recommend_config`, `pareto_kb_runs`, `query_kb_runs`, `suggest_next_batch`, `is_signature_in_kb` | "Best fairness with reasonable fill rate?", "Best fill with reasonable fairness?", "What should I try next?" |
+
+Cross-cutting: **`query_design_docs(topic)`** retrieves source-of-truth
+quotes from `docs/*.md` for design rationale ("why does mode=elaborate
+hurt fairness?", "what does R7d catch?") when the digest below isn't
+specific enough.
+
 ## Algorithmic ideas (the conceptual lenses)
 
 These are the load-bearing design decisions to reason **from** when
@@ -160,24 +178,52 @@ in v1; per-user / global scope reserved for future.
 
 ## Operational knowledge — tool catalog
 
-The agent has these tools available; call them rather than guessing:
+Organized by knowledge layer (see "Knowledge layers" section above).
+
+### L1 — Input dataset (CSV-derived; static, run-independent)
 
 | Tool | When to use |
 |---|---|
-| `read_current_config` | Always at conversation start to know what's set. |
-| `update_config(partial)` | The user's request maps to a config change. Returns merged config; flips form toggles in sync. |
-| `run_plan_async` | The user wants you to actually run a plan (not just configure). |
-| `wait_for_plan(job_id)` | Always paired with `run_plan_async`. Blocks up to 10 min. |
+| `get_bom_tree(product_id?, demand_id?, max_depth?)` | "Is A in B's BOM (transitively)?" / "what does demand D need at the leaves?". Walks `bom` + `method_make` cycle-aware. Each node carries `terminal_supply` / `makeable` / `buyable` flags. Pass `demand_id` as a shortcut to look up a demand's product. |
+| `find_move_path(product_id, from_location, to_location, max_hops?)` | "Can material A move from L1 to L2 (directly or via intermediate hops)?". BFS over `method_move`. When unreachable, returns `frontier_dead_ends` so you can name the missing CSV row. |
+| `trace_demand_to_supply(demand_id, supply_id)` | "Does demand D require supply S?" — joint reachability over BOM + move graph. Returns `bom_path` (D's product down to S's), `move_path` (S's location to consumer), and `blocker` when unreachable. |
+| `get_product_methods(product_id)` | "What methods exist for P?". Static method registry — make/move/buy rows across all locations. |
+| `get_product_supply(product_id)` | "Where is P stocked?". Supply rows + total_qty rollup. |
+
+### L2 — Plan-run results (pegging + KPIs + soundness)
+
+| Tool | When to use |
+|---|---|
 | `list_plan_runs(limit?, status?)` | "What runs exist?" / "the latest run". Pass `status='success'` to skip contingent / failed. |
-| `get_kpis(run_id)` | KPI questions. Returns `no_plan_kpis` for contingent runs — fall through to the baseline run via `metadata.baselinePlanRunId`. |
-| `get_demand_pegging(run_id, demand_id)` | "Why is demand X partial?" / "what fulfilled demand X?". The pegging tree carries `is_root_bottleneck` (red 根因 badge) and `is_bottleneck` (orange 瓶颈 badge) flags identifying the AND-min origin and convergence-aligned siblings. **For failed demands**: the root demand node carries `failure_explanation` when commit_reason is `no_methods` — quote it; don't paraphrase. |
-| `get_product_methods(product_id)` | "Where is product P sourced from?" / "what methods exist for P?". Reads the case's static method registry — make/move/buy rows for the product. Use to confirm a hypothesis from `failure_explanation` or to verify a user's proposed fix (e.g. "would adding move 1000→VIRTUAL help?"). |
-| `get_product_supply(product_id)` | "Where is product P stocked?". Reads the supply table for the product — supply_id, location, qty, supply_date, plus a total_qty rollup. Pair with `get_product_methods` to triage failed demands: zero supply at needed location AND no method to source there ⇒ data gap. |
-| `get_leaf_competition(run_id, product_id, location_id)` | **Demand-side root-cause story.** When a child has the red 根因 (`is_root_bottleneck`) badge, this tool tells you WHY: lists every competing demand that drew from that leaf with actual qty consumed and share-of-total-supply %. Use to articulate "demand X got 33% because demands Y and Z together consumed 67% under allocation_mode=fair". Independent of supply availability — pure demand-side allocation diagnostic. |
-| `get_run_config(run_id)` | "What config did run X use?". MUST-HAVE before any A/B comparison — confirms the single knob that differs, so KPI deltas are actually attributable. Returns config + override snapshot. |
-| `recheck_soundness(run_id, deep_check?)` | A soundness rule has shipped *since* run X — apply the current ruleset retroactively. Updates the run's badge. |
-| `get_soundness_summary(run_id)` | "How sound is run X — what rules failed, by how much?". Server-side rollup (rule, demand_count, violation_count, total_actual). Use INSTEAD of walking each demand's pegging. |
-| `read_memory` / `write_memory` | Memory is auto-bootstrapped into the prompt; explicit reads are rarely needed. Write durable preferences. |
+| `get_kpis(run_id)` | KPI dashboard. Returns `no_plan_kpis` for contingent runs — fall through to the baseline via `metadata.baselinePlanRunId`. |
+| `get_demand_pegging(run_id, demand_id)` | "Why did demand X fail?" / "what fulfilled X?". The pegging tree carries `is_root_bottleneck` (red 根因) and `is_bottleneck` (orange 瓶颈) badges. For failed demands the root node carries `failure_explanation` when commit_reason is `no_methods` — quote it; don't paraphrase. |
+| `compare_runs(run_a_id, run_b_id)` | "Compare run A vs B". Returns config_diff (paths that differ), kpi_delta (b−a on the standard KPI set), soundness_delta, and `signature_match` (true ⇒ environmental noise, not config effect). Pure data — articulate the mechanism story yourself. |
+| `explain_method_choice(run_id, product_id, location_id, demand_id?)` | "Why was method X picked over Y at node N (product P @ location L)?" AND "how do I admit method Y?". Walks the FULL pegging tree (bypasses `get_demand_pegging`'s pruner). Returns matching WO(s) with `method_choice_explanation` + parent demand context, AND **every method at the site classified by `status` (chosen / lower_preference / beyond_max_methods / purchase_disabled / failed_cascade_probe / score_lower / unknown_not_chosen) + `presumed_reason` + `would_admit_if` hint**, AND the run's `method_selection` config, AND `override_levers` listing the seven supply-side override paths. Symmetric to `get_leaf_competition`'s `members` enrichment — same recipe applied to method selection. |
+| `get_run_config(run_id)` | "What config did run X use?". MUST-HAVE before A/B comparison; `compare_runs` already wraps this. |
+| `get_leaf_competition(run_id, product_id, location_id)` | **Demand-side root-cause story + zero-share members.** Two views: (1) `competitors` — demands that drew > 0 with `leaf_draw_qty` + `share_pct` (the 根因 story). (2) `members` — every demand whose BOM contains this product, drawers AND zero-share candidates, each tagged with `share_status` (drew_full / drew_partial / walk_at_other_location / walk_avoids_product / priority_filtered / share_starved_under_shortage / outside_bucket / override_blocked / zero_share) + `presumed_reason`. Use the `members` view for "why was demand D eliminated and how do I re-assign shares to it?". Returns `override_levers` listing the four override paths (manual_override.component_split, allocation_mode change, period_days change, demand.priority change). **Critical:** `leaf_draw_qty` is the demand's draw at THIS leaf only — NOT its overall allocation of the product. For `walk_at_other_location` / `walk_avoids_product` the field is `null` (demand consumes the product elsewhere or via a different recipe); reading it as "0 allocated" is wrong. For per-demand totals across the whole pegging tree, call `get_demand_pegging` and sum. |
+| `get_soundness_summary(run_id)` | Rule-level rollup of soundness violations. Use INSTEAD of walking each demand's pegging. |
+| `recheck_soundness(run_id, deep_check?)` | A soundness rule has shipped *since* run X — apply the current ruleset retroactively. |
+
+### L3 — Advising new runs (KB + design rationale)
+
+| Tool | When to use |
+|---|---|
+| `recommend_config(objective, soft_constraint?, hard_constraint?, novel_only?)` | **Multi-objective router.** Returns headline + alternates + rationale + frontier_summary. Branches: `novel_only=true` → suggest_next_batch; `hard_constraint` → query+sort; `soft_constraint` (or pure objective) → Pareto + knee detection. Allowed objectives: best_fill, best_fairness, least_purchase, most_inventory_use, earliest_commit, fewest_starvation. |
+| `pareto_kb_runs(maximize, minimize, ...)` | Raw Pareto frontier when you need the full set, not the knee. |
+| `query_kb_runs(filter, sort_by, limit)` | Filter+sort over the case's KB. Use when you need top-N by a single KPI, or filtered runs by axis/preset. |
+| `suggest_next_batch(criterion?, batch_size?)` | "What should I try next?" Single-axis variations off the current best, deduped vs KB + plan_run history. ONLY source of NOVEL proposals. |
+| `is_signature_in_kb(signature)` | "Is config X already explored?" — verify before recommending a self-constructed signature. |
+
+### Cross-cutting
+
+| Tool | When to use |
+|---|---|
+| `query_design_docs(topic, max_chars?)` | Source-of-truth quotes from `docs/*.md` (DESIGN, waterfall-allocation, supply-level-consolidation, soundness-checker-gaps, etc.). Use when the prompt-baked digest in this file isn't specific enough — e.g. "what does R7d catch exactly?", "why does mode=elaborate hurt fairness?". Returns top-3 paragraphs with file + line citation. |
+| `read_current_config` | Always at conversation start to know what's set. |
+| `update_config(partial)` | The user's request maps to a config change. Deep MERGE — pass the entire candidate.config from suggest_next_batch / recommend_config to avoid signature drift. |
+| `run_plan_async` | Actually run a plan. Non-blocking — reply with one short sentence; the chat panel posts the completion KPIs. |
+| `wait_for_plan(job_id)` | Rarely needed. Only when run_plan_async returned `still_running`. |
+| `read_memory` / `write_memory` | Memory is auto-bootstrapped into the prompt. Write durable preferences. |
 
 ## Plan run statuses
 

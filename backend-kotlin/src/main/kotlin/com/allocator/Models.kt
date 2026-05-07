@@ -30,6 +30,11 @@ data class CaseDetailResponse(
     @SerialName("supply_count")  val supplyCount: Int = 0,
     @SerialName("run_count")     val runCount: Int = 0,
     @SerialName("plan_run_count") val planRunCount: Int = 0,
+    /** The case's active plan run (designated → falls back to latest success
+     *  via [com.allocator.services.resolveActiveRunId]). Null when the case
+     *  has no successful runs. The page uses this on open to select which
+     *  run to load by default. */
+    @SerialName("active_plan_run_id") val activePlanRunId: Int? = null,
 )
 
 @Serializable

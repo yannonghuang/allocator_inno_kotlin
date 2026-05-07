@@ -2,7 +2,7 @@
 
 import React from 'react';
 
-export type ScheduleGranularity = 'week' | 'month' | 'quarter';
+export type ScheduleGranularity = 'day' | 'week' | 'month' | 'quarter';
 
 export type Horizon = {
   start: Date;
@@ -36,12 +36,24 @@ export function computeHorizon<T extends { start_time: string | null; end_time: 
     if (Number.isFinite(minMs) && Number.isFinite(maxMs) && maxMs === minMs) {
       const start = new Date(minMs);
       const end = new Date(maxMs + DAY_MS);
-      return { start, end, granularity: 'week' };
+      return { start, end, granularity: 'day' };
     }
     return null;
   }
   const spanDays = (maxMs - minMs) / DAY_MS;
-  const granularity: ScheduleGranularity = spanDays <= 90 ? 'week' : spanDays <= 540 ? 'month' : 'quarter';
+  // Tighter thresholds so each tier produces 4-12 native ticks before the
+  // adaptive stepping in generateTicks kicks in. The previous 90/540 split
+  // overcrowded the high end of the month tier (a 540-day span produced 18
+  // monthly labels — visually mushed in a ~400px column). The new tiers:
+  //   day:     ≤ 14 days   (≤ 14 ticks before subsampling)
+  //   week:    ≤ 70 days   (≤ 10 ticks)
+  //   month:   ≤ 365 days  (≤ 12 ticks)
+  //   quarter: > 365 days  (≤ 12 ticks for ~3 years)
+  const granularity: ScheduleGranularity =
+    spanDays <= 14 ? 'day'
+    : spanDays <= 70 ? 'week'
+    : spanDays <= 365 ? 'month'
+    : 'quarter';
   return { start: new Date(minMs), end: new Date(maxMs), granularity };
 }
 
@@ -173,37 +185,58 @@ function isoWeekNumber(d: Date): number {
   return 1 + Math.round((diff - ((yearStart.getUTCDay() + 6) % 7)) / 7);
 }
 
+/** Target visible tick count. Adaptive stepping subsamples raw ticks when
+ *  generateTicks would emit more than this — keeps labels readable in a
+ *  ~400px column without overlap. */
+const TARGET_TICK_COUNT = 10;
+
 function generateTicks(horizon: Horizon, locale: string): { ms: number; label: string }[] {
   const { start, end, granularity } = horizon;
-  const ticks: { ms: number; label: string }[] = [];
+  const raw: { ms: number; label: string }[] = [];
 
-  if (granularity === 'week') {
+  let dayFmt: Intl.DateTimeFormat
+  let monthFmt: Intl.DateTimeFormat;
+  try {
+    dayFmt = new Intl.DateTimeFormat(locale, { month: 'short', day: 'numeric', timeZone: 'UTC' });
+    monthFmt = new Intl.DateTimeFormat(locale, { month: 'short', year: 'numeric', timeZone: 'UTC' });
+  } catch {
+    dayFmt = new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+    monthFmt = new Intl.DateTimeFormat('en', { month: 'short', year: 'numeric', timeZone: 'UTC' });
+  }
+
+  if (granularity === 'day') {
+    const cur = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()));
+    while (cur.getTime() <= end.getTime()) {
+      raw.push({ ms: cur.getTime(), label: dayFmt.format(cur) });
+      cur.setUTCDate(cur.getUTCDate() + 1);
+    }
+  } else if (granularity === 'week') {
     const cur = startOfUtcWeek(start);
     while (cur.getTime() <= end.getTime()) {
-      ticks.push({ ms: cur.getTime(), label: `Wk ${isoWeekNumber(cur)}` });
+      raw.push({ ms: cur.getTime(), label: `Wk ${isoWeekNumber(cur)}` });
       cur.setUTCDate(cur.getUTCDate() + 7);
     }
   } else if (granularity === 'month') {
     const cur = startOfUtcMonth(start);
-    let monthFmt: Intl.DateTimeFormat;
-    try {
-      monthFmt = new Intl.DateTimeFormat(locale, { month: 'short', year: 'numeric', timeZone: 'UTC' });
-    } catch {
-      monthFmt = new Intl.DateTimeFormat('en', { month: 'short', year: 'numeric', timeZone: 'UTC' });
-    }
     while (cur.getTime() <= end.getTime()) {
-      ticks.push({ ms: cur.getTime(), label: monthFmt.format(cur) });
+      raw.push({ ms: cur.getTime(), label: monthFmt.format(cur) });
       cur.setUTCMonth(cur.getUTCMonth() + 1);
     }
   } else {
     const cur = startOfUtcQuarter(start);
     while (cur.getTime() <= end.getTime()) {
       const q = Math.floor(cur.getUTCMonth() / 3) + 1;
-      ticks.push({ ms: cur.getTime(), label: `Q${q} ${cur.getUTCFullYear()}` });
+      raw.push({ ms: cur.getTime(), label: `Q${q} ${cur.getUTCFullYear()}` });
       cur.setUTCMonth(cur.getUTCMonth() + 3);
     }
   }
-  return ticks;
+
+  // Adaptive subsampling: when raw produces more than TARGET_TICK_COUNT
+  // ticks, step by ⌈raw / TARGET⌉ so labels don't overlap. Keeps the first
+  // tick anchored to the granularity boundary so labels remain meaningful.
+  if (raw.length <= TARGET_TICK_COUNT) return raw;
+  const step = Math.ceil(raw.length / TARGET_TICK_COUNT);
+  return raw.filter((_, i) => i % step === 0);
 }
 
 export function ScheduleHorizonRuler({

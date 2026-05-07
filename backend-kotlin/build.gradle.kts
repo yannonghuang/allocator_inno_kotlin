@@ -73,6 +73,30 @@ tasks.withType<Test> {
     useJUnitPlatform()
 }
 
+// Bundle the project-root docs/*.md into the JAR's classpath under `docs/` so
+// the planning agent's `query_design_docs` tool can read them at runtime via
+// classloader.getResource("docs/<filename>"). The docs directory lives at the
+// repo root (one level up from this Gradle project) for local builds. For
+// Docker builds (build context = ./backend-kotlin/), drop a copy at
+// ./backend-kotlin/docs/ — the gradle task picks up whichever exists. The agent
+// tool degrades gracefully (empty index → no hits) when neither is present.
+tasks.named<Copy>("processResources") {
+    val rootDocs = project.rootDir.resolve("../docs")
+    val localDocs = project.rootDir.resolve("docs")
+    val docsSrc = when {
+        rootDocs.isDirectory -> rootDocs
+        localDocs.isDirectory -> localDocs
+        else -> null
+    }
+    if (docsSrc != null) {
+        from(docsSrc) {
+            include("*.md")
+            into("docs")
+        }
+    }
+    duplicatesStrategy = DuplicatesStrategy.WARN
+}
+
 tasks.withType<ShadowJar> {
     archiveBaseName.set("allocator-backend")
     archiveClassifier.set("")

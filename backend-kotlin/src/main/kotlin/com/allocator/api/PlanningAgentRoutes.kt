@@ -1,11 +1,15 @@
 package com.allocator.api
 
 import com.allocator.AgentMemory
+import com.allocator.Boms
 import com.allocator.Cases
+import com.allocator.Demands
+import com.allocator.ManualOverrides
 import com.allocator.MethodBuys
 import com.allocator.MethodMakes
 import com.allocator.MethodMoves
 import com.allocator.PlanRuns
+import com.allocator.Products
 import com.allocator.Supplies
 import org.jetbrains.exposed.sql.SortOrder
 import org.jetbrains.exposed.sql.max
@@ -29,6 +33,7 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
@@ -37,6 +42,7 @@ import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -71,6 +77,11 @@ private data class AgentRequest(
     val message: String? = null,
     @SerialName("current_config") val currentConfig: JsonObject? = null,
     val history: List<AgentHistoryItem>? = null,
+    /** The plan_run id the user is currently viewing on the page (e.g. selected
+     *  in the run-history dropdown). Lets the agent default to this run when
+     *  the user asks a run-scoped question without naming a number. Null when
+     *  the user hasn't selected a run (e.g. a fresh case before the first plan). */
+    @SerialName("viewing_run_id") val viewingRunId: Int? = null,
 )
 
 @Serializable
@@ -113,6 +124,71 @@ private val AGENT_KNOWLEDGE: String by lazy {
         log.warn("agent-knowledge.md not found on classpath; agent will run with system prompt only.")
         ""
     }
+}
+
+// ── Design-doc retrieval (L3 cross-cutting) ─────────────────────────────────
+//
+// The agent's `query_design_docs` tool retrieves source-of-truth quotes from
+// docs/*.md when the prompt-baked digest in agent-knowledge.md isn't enough.
+// We index paragraphs (split on blank lines) once at JVM startup so per-call
+// search is O(N paragraphs × topic-length) — trivial at the current scale of
+// ~9 docs and ~hundreds of paragraphs.
+//
+// Source files are bundled into the JAR via build.gradle.kts processResources
+// task (copies docs/*.md into resources/docs/). When the docs/ resource path
+// is missing (e.g. fresh CI checkout), the agent tool returns empty results —
+// graceful degradation, no crash.
+
+private data class DesignDocParagraph(
+    val file: String,        // e.g. "waterfall-allocation.md"
+    val lineStart: Int,      // 1-based line in source file
+    val text: String,        // the paragraph body (preserves markdown)
+)
+
+private val DESIGN_DOC_FILES: List<String> = listOf(
+    "DESIGN.md",
+    "waterfall-allocation.md",
+    "supply-level-consolidation.md",
+    "planner-conservation-fixes.md",
+    "planner-orphan-consumption.md",
+    "planner-soundness-followups.md",
+    "soundness-checker-gaps.md",
+    "planning-agent.md",
+)
+
+private val DESIGN_DOC_INDEX: List<DesignDocParagraph> by lazy {
+    val out = mutableListOf<DesignDocParagraph>()
+    val cl = ::DESIGN_DOC_INDEX.javaClass.classLoader
+    for (filename in DESIGN_DOC_FILES) {
+        val res = cl.getResource("docs/$filename") ?: continue
+        val text = runCatching { res.readText() }.getOrNull() ?: continue
+        // Split on blank lines (one or more). Track line numbers for citation.
+        val lines = text.lines()
+        var paraStart = 1
+        val buf = StringBuilder()
+        var firstLineInPara = 1
+        for ((idx, line) in lines.withIndex()) {
+            val lineNo = idx + 1
+            if (line.isBlank()) {
+                if (buf.isNotBlank()) {
+                    out.add(DesignDocParagraph(filename, firstLineInPara, buf.toString().trim()))
+                }
+                buf.clear()
+                paraStart = lineNo + 1
+                firstLineInPara = paraStart
+            } else {
+                if (buf.isEmpty()) firstLineInPara = lineNo
+                buf.appendLine(line)
+            }
+        }
+        if (buf.isNotBlank()) out.add(DesignDocParagraph(filename, firstLineInPara, buf.toString().trim()))
+    }
+    if (out.isEmpty()) {
+        log.warn("design-doc index is empty — docs/*.md not found on classpath. Run gradle build to bundle them, or check the processResources task.")
+    } else {
+        log.info("design-doc index built: ${out.size} paragraphs across ${out.map { it.file }.distinct().size} file(s).")
+    }
+    out
 }
 
 // ── System prompt ────────────────────────────────────────────────────────────
@@ -161,42 +237,158 @@ Planner knowledge (from docs/waterfall-allocation.md):
   - On case-171 the empirical sweet spot is mode=preference + max_methods=2.
 
 Tactics:
+  - **Decide which knowledge layer the question lives in BEFORE picking a tool.**
+    Three layers, three sources of truth (full table in agent-knowledge.md):
+      • L1 — input dataset (CSVs: bom, method_*, supply, demand). Tools:
+        get_bom_tree, find_move_path, trace_demand_to_supply,
+        get_product_methods, get_product_supply.
+        Use for: "is A in B's BOM?", "can A move L1→L2?",
+        "does demand D require supply S?".
+      • L2 — plan-run results (pegging, kpis, soundness). Tools:
+        get_demand_pegging, compare_runs, explain_method_choice,
+        get_kpis, get_run_config, get_soundness_summary,
+        get_leaf_competition.
+        Use for: "why did X fail?", "compare A vs B", "why was method 1
+        chosen over method 2 at node N?" (call explain_method_choice —
+        it bypasses the pegging-tree pruner so successful WOs deep in
+        the tree stay visible).
+      • L3 — advising new runs (KB + design rationale). Tools:
+        recommend_config, pareto_kb_runs, query_kb_runs, suggest_next_batch.
+        Use for: "best X with reasonable Y?", "what should I try next?".
+    Cross-cutting: query_design_docs(topic) for source-of-truth quotes from
+    docs/*.md when this primer's digest isn't specific enough.
+    DON'T bring L2 tools to a L1 question (no run carries that info).
+    DON'T ask L3 to answer a L1 feasibility question.
+
+  - **Identifier formats are opaque.** product_id and location_id are arbitrary
+    strings — product codes commonly contain hyphens (e.g. `502-2991`,
+    `260-0312-02`, `M51__688`). Pass them VERBATIM from the user. Don't split
+    on `-`, `_`, `@`, or `/` to invent separate fields. If the user says
+    "502-2991 at location 2000", call with product_id=`502-2991` and
+    location_id=`2000`, not product_id=`502` and location_id=`2991`.
+
+  - **Defaulting `run_id` when the user omits it.** The system prompt carries
+    `<viewing_run_id>` (the run currently shown on the user's page) and
+    `<active_run_id>` (the case's designated active run, or the latest
+    success). When a tool needs `run_id` and the user didn't name one:
+      1. If `<viewing_run_id>` is a number, use it. The user is almost
+         certainly asking about the run they're looking at.
+      2. Else if `<active_run_id>` is a number, use it. State your assumption
+         in the reply ("Using the active run #N — let me know if you meant a
+         different one.").
+      3. Else (both `(none)`) — ask the user which run.
+    Don't invent a run number. If a prior turn in this same chat named a run
+    and the topic clearly continued, that takes precedence over both anchors.
+
   - Reach for tools when the user asks "what would happen if…", "why…", or "how much…".
     Don't guess KPIs — call get_kpis. Don't guess pegging — call get_demand_pegging.
   - When a demand fails or commits short ("why didn't X commit?", "supply chain loop",
-    "no supply method", "为什么 X 没满"), report TWO ORTHOGONAL AXES — never collapse them:
+    "no supply method", "为什么 X 没满", "哪个物料是瓶颈", "what's the bottleneck",
+    "what's the root cause", "shortage origin"), the unifying concept is:
 
-    **Supply-side (瓶颈 / orange `is_bottleneck`)** — the BOM/inventory chain
-    couldn't deliver. Trace the cascade reason in pegging:
+    **SHORTAGE ORIGIN** = any pegging node with `is_bottleneck=true` OR
+    `is_root_bottleneck=true`. Both flags identify ORIGINS of shortage. Once
+    shortage crosses an origin, propagation up the tree is identical — the
+    distinction matters only for the FIX, not for the DIAGNOSIS. Report all
+    origins under one heading; never say "no bottleneck" when a node carries
+    `is_root_bottleneck=true` (or vice versa).
+
+    The two kinds (used to pick the right lever, NOT to bifurcate the diagnosis):
+
+    **Kind=supply (瓶颈 / orange `is_bottleneck`)** — the BOM/inventory chain
+    couldn't deliver at this leaf. Cascade reasons:
       1. `get_demand_pegging(run_id, demand_id)` — root demand carries
          `failure_explanation` for `no_methods`. Quote verbatim if present.
-      2. Walk the failed nodes; find the deepest leaf with the smallest first-pass
-         effective/needed ratio. If the user pushes back, call `get_product_methods`
-         and `get_product_supply` on that leaf to confirm:
+      2. Walk failed nodes; find the deepest leaf with the smallest first-pass
+         effective/needed ratio. If pushback, call `get_product_methods` and
+         `get_product_supply` on that leaf:
             • `make` exists at L1+L2 but no `move-to-needed-loc` → data gap.
             • `buy` exists but `purchase_allowed=false` → config gap.
             • `move` source has zero supply at the source → upstream provisioning gap.
+      Levers: add a method, raise supply, allow purchase, fix transit edge.
 
-    **Demand-side (根因 / red `is_root_bottleneck`)** — consolidation's fair-share
-    split with competing demands left this demand with the tightest share-vs-need
-    ratio at the flagged child. Independent of supply.
-      1. From the pegging, find children with `is_root_bottleneck=true`.
-      2. `get_leaf_competition(run_id, product_id, location_id)` — returns actual
-         draws for every demand that consumed at that leaf, plus
-         total_initial_supply. Use this to articulate the demand-side story:
-         "demand X got C/T (≈C%) because demand(s) [Y, Z] together consumed
+    **Kind=demand (根因 / red `is_root_bottleneck`)** — consolidation's fair-share
+    split left this demand with the tightest share-vs-need ratio at the flagged
+    child (independent of supply).
+      1. `get_leaf_competition(run_id, product_id, location_id)` — actual
+         draws for every demand at the leaf + total_initial_supply.
+      2. Articulate: "demand X got C/T (≈C%) because demand(s) [Y, Z] consumed
          K/T (≈K%) under allocation_mode=…".
-      3. Suggest demand-side levers: priority change for X, switch
-         allocation_mode, change consolidation period, etc.
+      Levers: priority change for X, switch allocation_mode, change
+      consolidation period, manual_override.component_split.
 
-    **Synthesize**: report both axes when both fire. Template —
-       Supply: <single-line cause + concrete fix>.
-       Demand allocation: <competition story + concrete lever>.
-       The two are independent — applying one fix without the other still leaves
-       the demand short. Pick whichever is cheaper for the user.
+    **Mandatory workflow for any bottleneck/origin question:**
+      1. Call `get_demand_pegging(run_id, demand_id)` and read `critical_path`.
+         It is the ONLY field you need for this question. Each entry is
+         `{pid, lid, kind, depth}` covering every dominator in the critical-
+         path SUB-TREE. AND junctions contribute one child (the AND-min); OR
+         junctions contribute every contributing child (so the path BRANCHES).
+         THE CRITICAL PATH IS A TREE, NOT A CHAIN. Children with 0
+         contribution (and their subtrees) are excluded.
+      2. If `critical_path` is empty → "没有瓶颈物料 / no bottleneck."
+      3. Optional drill-in: for terminals (entries where the next entry's
+         depth ≤ current's depth) you may follow up with
+         `get_product_methods` / `get_product_supply` (kind=supply) or
+         `get_leaf_competition` (kind=demand) — but only if the user asks
+         for the FIX, not for the bottleneck itself.
 
-    **Anti-pattern**: dumping the pegging tree as a markdown bullet list. The user
-    saw it in the UI. Your job is to NAME root causes (one per axis when both fire).
+      **Required reply shape — quote `critical_path_pretty` verbatim
+      inside a fenced code block.** It's a pre-formatted multi-line
+      string with strict per-depth indentation (2 spaces per level)
+      and language-localized kind labels. Wrap it in triple backticks
+      so the indentation renders as-is — markdown collapses leading
+      whitespace outside of code fences. Don't reformat the lines,
+      don't re-derive them from `critical_path`, don't add "起源
+      (terminals)" lines, don't add fix recommendations unless asked.
+      Other flagged nodes in the tree are NOT origins for THIS demand —
+      they may be flagged for a different demand or live on a
+      non-contributing OR-branch. Never list them.
+
+         需求 <D> 的关键路径上的物料：
+         ```
+         <critical_path_pretty here, verbatim>
+         ```
+
+    **CRITICAL — never fabricate a bottleneck story.** Before narrating
+    `get_leaf_competition` as a competition/bottleneck cause:
+      • Confirm the response carries `is_origin: true`. If `false` (or if
+        `headroom > 0`), this leaf is NOT a shortage origin — it has slack,
+        and the small `leaf_draw_qty` for a demand reflects small NEED, not
+        exhausted supply. State that plainly: "311-0436@2000 isn't a
+        bottleneck — supply 41,958 > total drawn 10,656; the small allocation
+        reflects how much 10041744_10 needed at this leaf, not competition."
+      • The right leaves to query are the ones in `origins` from
+        get_demand_pegging (terminals of the critical-path sub-tree). Don't
+        guess; don't pick arbitrary leaves.
+      • A leaf with multiple drawers is competition, but competition is only
+        a BOTTLENECK when supply was exhausted. Always quote total_supply,
+        total_drawn, and headroom in your reasoning.
+
+    **Anti-pattern (observed)**: calling `get_leaf_competition` on one
+    arbitrary leaf, seeing `is_origin: false`, and concluding "no bottleneck
+    material" — while other terminals in `origins` ARE origins. Walk every
+    entry in `origins` before concluding.
+
+    **Anti-pattern**: replying "no bottleneck material" when a kind=demand
+    entry exists in `critical_path`, or vice versa. Both kinds are origins.
+    Also: dumping the pegging tree as bullets — the user saw it in the UI.
+    Your job is to NAME the origins from `critical_path`.
+
+    **Anti-pattern (per-demand allocation table)**: when the user asks "how
+    much P@L did each demand get?" / "list 物料 P@L 在这些需求中的分配", do
+    NOT report `get_leaf_competition.members[*].leaf_draw_qty` (or
+    `competitors[*].leaf_draw_qty`) as the demand's overall allocation of P.
+    Those fields are LEAF-side draws — a demand with `share_status` of
+    `walk_at_other_location` (consumes P at a different location row) or
+    `walk_avoids_product` (took a different recipe alternative) carries
+    leaf_draw_qty=null at this leaf even though it may consume P elsewhere
+    in its pegging tree. For per-demand totals, call `get_demand_pegging`
+    on each demand and sum P@L usage from the tree. If the question is
+    really "did demand D draw at THIS leaf?", say so — and quote
+    leaf_draw_qty alongside share_status so the scope is unambiguous.
+    Cross-check: if you previously stated a non-zero P consumption for
+    demand D from `get_demand_pegging`, do not later report 0/null at this
+    leaf without reconciling the two metrics explicitly.
   - Persist durable preferences via write_memory (e.g. user said "I never want purchase"
     → write_memory("purchase_default", false)). Memory is per-case.
   - Mirror the user's language (English / Chinese). Keep replies tight; be conversational.
@@ -481,7 +673,21 @@ private val TOOLS: List<LlmTool> = listOf(
         "Fetch the pegging tree for one demand in a plan run. Used to explain why a demand " +
             "was fulfilled across multiple work orders or hit partial fulfillment. Failed " +
             "demands carry a `failure_explanation` field on the root demand node when the " +
-            "commit_reason is `no_methods` — surface it verbatim instead of paraphrasing.",
+            "commit_reason is `no_methods` — surface it verbatim instead of paraphrasing. " +
+            "**Always read `origins` and `critical_path` first** for the " +
+            "'where's the bottleneck?' answer. The critical path is a SUB-TREE of " +
+            "the pegging tree composed of dominators (AND junctions: single AND-min " +
+            "child; OR junctions: every contributing child). It can branch — multiple " +
+            "origins are normal when alternative supply paths each carry a shortage. " +
+            "`critical_path` = depth-first flat list of `{pid, lid, kind, depth}` for " +
+            "every node in the sub-tree (depth=1 is a child of the demand). " +
+            "`origins` = list of terminal nodes (leaves of the sub-tree) — these are " +
+            "the actual originating sources to fix. `critical_path_pretty` = the same " +
+            "info as `critical_path`, pre-formatted as an indented multi-line string " +
+            "with localized kind labels — quote it verbatim inside a fenced code block " +
+            "for the answer. Empty origins+critical_path means the demand has no " +
+            "shortage origins (fully fulfilled, or failed for non-shortage reasons — " +
+            "check failure_explanation).",
         buildJsonObject {
             put("type", "object")
             putJsonObject("properties") {
@@ -527,15 +733,37 @@ private val TOOLS: List<LlmTool> = listOf(
     ),
     tool(
         "get_leaf_competition",
-        "**Demand-side root-cause story.** For one (product, location) leaf in a plan run, " +
-            "list all demands that drew from it — with actual qty consumed and share-of-" +
-            "total-supply percentage. Use this to articulate the 根因 (red badge / " +
-            "`is_root_bottleneck`) story on a pegging tree: 'demand X got C/T (≈C%) of " +
-            "supply because demands [Y, Z] together consumed K/T (≈K%) under " +
-            "allocation_mode=…'. Pairs with `get_demand_pegging`'s 瓶颈 (supply-side) " +
-            "signal to give the user both fix-it levers. Returns { product_id, " +
-            "location_id, total_initial_supply, competitor_count, competitors: " +
-            "[{ demand_id, actual_draw_qty, share_pct }] } sorted by actual_draw_qty desc.",
+        "**Demand-side root-cause story + zero-share members.** Two views over a (product, " +
+            "location) leaf in a plan run. **`leaf_draw_qty` is the demand's draw at THIS " +
+            "leaf only — NOT the demand's overall allocation of the product.** A demand may " +
+            "consume the same product at another location (status=walk_at_other_location) " +
+            "or take a different recipe (status=walk_avoids_product); for those the field " +
+            "is null, not 0.0. For per-demand totals across all leaves, call " +
+            "`get_demand_pegging` and sum the tree.\n" +
+            "  • `competitors` — demands that drew > 0 with leaf_draw_qty + share_pct. " +
+            "    Use for the 根因 (red badge / `is_root_bottleneck`) story: 'demand X got " +
+            "    C/T (≈C%) because demands [Y, Z] together consumed K/T (≈K%) under " +
+            "    allocation_mode=...'.\n" +
+            "  • `members` — all demands whose BOM contains this product, drawers AND " +
+            "    zero-share candidates, each tagged with `share_status` and " +
+            "    `presumed_reason`. Use for 'why was demand D eliminated and how do I " +
+            "    re-assign shares to it?'. Status values: drew_full / drew_partial / " +
+            "    walk_at_other_location / walk_avoids_product (both = BOM contains pid " +
+            "    but planner walk took a different branch — leaf_draw_qty=null, NOT actual " +
+            "    elimination) / priority_filtered / share_starved_under_shortage / " +
+            "    outside_bucket / override_blocked / zero_share. The `override_levers` " +
+            "    array names the four override paths available (manual_override.component_split, " +
+            "    change allocation_mode, change period_days, change demand.priority).\n" +
+            "Returns { product_id, location_id, total_initial_supply, competitor_count, " +
+            "competitors: [...], member_count, zero_share_count, members: [...], " +
+            "consolidation: { enabled, allocation_mode, period_days }, override_levers }.\n" +
+            "**Empty-leaf branch:** when (pid, lid) has no supply rows (e.g. the product is " +
+            "made or bought rather than inventoried), the response collapses to " +
+            "{ ..., note, supply_locations_for_product: [...], usages: [{ demand_id, " +
+            "locations: [...] }], usage_demand_count }. `usages` answers the " +
+            "demand-side question 'which demands USE this product?' — distinct from " +
+            "the supply-side 'who drew from this leaf?'. Don't conflate empty supply " +
+            "with empty usage.",
         buildJsonObject {
             put("type", "object")
             putJsonObject("properties") {
@@ -544,6 +772,204 @@ private val TOOLS: List<LlmTool> = listOf(
                 putJsonObject("location_id") { put("type", "string") }
             }
             put("required", buildJsonArray { add("run_id"); add("product_id"); add("location_id") })
+        },
+    ),
+    tool(
+        "get_bom_tree",
+        "**L1 / dataset-feasibility.** Expand the BOM recipe tree for a product or a " +
+            "demand from the `bom` + `method_make` tables. Use to answer 'is A in B's " +
+            "BOM?' / 'is A needed transitively for B?' / 'what does demand D require " +
+            "at the leaves?'. Pass either `product_id` directly OR `demand_id` (looks " +
+            "up the demand's product). Walks the tree (cycle-aware) and returns each " +
+            "node with its children plus flags: `terminal_supply` (any supply rows for " +
+            "this product), `makeable` (has a method_make), `buyable` (has a " +
+            "method_buy), `alt_group` (when multiple recipes exist at this level), " +
+            "`child_qty` (BOM rate from parent). Cycles render as `cycle_to: \"P\"`. " +
+            "Cap depth via `max_depth` (default 4, max 8) — most real BOMs are 2-5 deep.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("product_id") { put("type", "string") }
+                putJsonObject("demand_id") {
+                    put("type", "string")
+                    put("description", "Alternative to product_id; looks up the demand's product.")
+                }
+                putJsonObject("max_depth") {
+                    put("type", "integer")
+                    put("description", "Recursion depth limit, clamped to [1, 8]. Default 4.")
+                }
+            }
+            put("required", buildJsonArray { })
+        },
+    ),
+    tool(
+        "find_move_path",
+        "**L1 / dataset-feasibility.** BFS shortest path over `method_move` edges for a " +
+            "single product from `from_location` to `to_location`. Use to answer 'can " +
+            "material A move from L1 to L2 (directly or via intermediate hops)?'. When " +
+            "reachable: returns the path with each hop's transit_time + preference, plus " +
+            "total_transit_time and hop count. When unreachable: returns " +
+            "{ reachable: false, explored: [...] } so you can name the missing CSV row " +
+            "(e.g. 'add method_move <product> from <last-explored-loc> to <to_location>'). " +
+            "Caps at 6 hops; same-location returns hops=0.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("product_id") { put("type", "string") }
+                putJsonObject("from_location") { put("type", "string") }
+                putJsonObject("to_location") { put("type", "string") }
+                putJsonObject("max_hops") {
+                    put("type", "integer")
+                    put("description", "Hop limit, clamped to [1, 10]. Default 6.")
+                }
+            }
+            put("required", buildJsonArray { add("product_id"); add("from_location"); add("to_location") })
+        },
+    ),
+    tool(
+        "recommend_config",
+        "**L3 / advising new runs.** Multi-objective router: given a target " +
+            "objective and an optional constraint, recommend a config from KB (or " +
+            "propose a novel one). Decision tree:\n" +
+            "  • `novel_only=true` → delegates to suggest_next_batch with the " +
+            "    objective mapped to a criterion. Returns up to 3 novel proposals.\n" +
+            "  • `hard_constraint` set → query KB with the constraint as filter, " +
+            "    sort by objective. Returns top-3 from the filtered set.\n" +
+            "  • `soft_constraint` set → Pareto frontier on objective × " +
+            "    soft_constraint.kpi, then knee detection (max distance from " +
+            "    utopia line). Returns the knee + 1-2 nearby points.\n" +
+            "  • Pure objective (no constraint) → Pareto with a sensible default " +
+            "    secondary axis (e.g. best_fill defaults to gini).\n" +
+            "Allowed objectives: best_fill, best_fairness, least_purchase, " +
+            "most_inventory_use, earliest_commit, fewest_starvation. Returns " +
+            "{ headline, alternates, rationale, frontier_summary, total_in_kb, " +
+            "source } where `source` ∈ {kb_pareto, kb_query, novel, ...}.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("objective") {
+                    put("type", "string")
+                    put("description", "best_fill | best_fairness | least_purchase | most_inventory_use | earliest_commit | fewest_starvation")
+                }
+                putJsonObject("soft_constraint") {
+                    put("type", "object")
+                    put("description", "{ kpi, qualifier (\"reasonable\"|\"strict\") } — anchors the secondary axis for Pareto knee detection.")
+                }
+                putJsonObject("hard_constraint") {
+                    put("type", "object")
+                    put("description", "{ kpi, op (\"<\"|\"<=\"|\">\"|\">=\"), value } — hard threshold applied as a pre-filter.")
+                }
+                putJsonObject("novel_only") {
+                    put("type", "boolean")
+                    put("description", "If true, restrict to novel single-axis variations not yet in KB.")
+                }
+            }
+            put("required", buildJsonArray { add("objective") })
+        },
+    ),
+    tool(
+        "query_design_docs",
+        "**Cross-cutting / source-of-truth retrieval.** Substring search over the " +
+            "project's design docs (DESIGN.md, waterfall-allocation.md, " +
+            "supply-level-consolidation.md, planner-conservation-fixes.md, etc.). " +
+            "Returns the top-3 matching paragraphs with file + line citation, capped " +
+            "at `max_chars` total response size. Use when the prompt-baked digest in " +
+            "agent-knowledge.md isn't sufficient and you need a precise quote " +
+            "(e.g. 'why does mode=elaborate hurt fairness?', 'what does R7d catch?'). " +
+            "Returns { topic, hits: [{ file, line, text, score }], total_paragraphs, " +
+            "truncated: bool }.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("topic") {
+                    put("type", "string")
+                    put("description", "Keyword(s) to search for. Case-insensitive substring; multiple words ranked by per-word match count.")
+                }
+                putJsonObject("max_chars") {
+                    put("type", "integer")
+                    put("description", "Max total response chars (sum of paragraph text). Default 2000, hard cap 4000.")
+                }
+            }
+            put("required", buildJsonArray { add("topic") })
+        },
+    ),
+    tool(
+        "explain_method_choice",
+        "**L2 / per-WO method-selection rationale + non-chosen-alternative classification.** " +
+            "Answers 'why method X over Y at node N (product P @ location L)?' AND 'how do " +
+            "I admit method Y?'. Walks the FULL pegging tree (bypasses get_demand_pegging's " +
+            "pruner) to find the WO at (product_id, location_id), returns its " +
+            "method_choice_explanation + parent demand context, AND lists every method at " +
+            "the site classified by `status` + `presumed_reason` + `would_admit_if` hint:\n" +
+            "  • `chosen` — selected by the planner\n" +
+            "  • `lower_preference` — preference > chosen waterfall's max\n" +
+            "  • `beyond_max_methods` — preference rank > methodCfg.max_methods\n" +
+            "  • `purchase_disabled` — type=buy but purchase_allowed=false\n" +
+            "  • `failed_cascade_probe` — tried but BOM probe blocked deeper (failed=true)\n" +
+            "  • `score_lower` — elaborate-mode catch-all for losing alternatives\n" +
+            "Plus an `override_levers` array naming the seven supply-side override paths " +
+            "(manual_override.method_selection / change max_methods / change max_bom_depth / " +
+            "change mode / change score_weights / flip purchase_allowed / re-rank " +
+            "preference). Symmetric to get_leaf_competition's `members` enrichment. When " +
+            "`demand_id` is provided, scope to one demand's tree; otherwise return all " +
+            "matches across the run.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("run_id") { put("type", "integer") }
+                putJsonObject("product_id") { put("type", "string") }
+                putJsonObject("location_id") { put("type", "string") }
+                putJsonObject("demand_id") {
+                    put("type", "string")
+                    put("description", "Optional — restrict matches to one demand's pegging tree.")
+                }
+            }
+            put("required", buildJsonArray { add("run_id"); add("product_id"); add("location_id") })
+        },
+    ),
+    tool(
+        "compare_runs",
+        "**L2 / plan-run comparison.** Side-by-side data for two plan runs: per-axis " +
+            "config diff (only the paths that differ), KPI delta on the standard set " +
+            "(fill_rate_pct, gini, p10_fill_ratio, median_fill_ratio, starvation_pct, " +
+            "on_time_count, manufacturing_total_quantity, inventory_consumed_total), " +
+            "and soundness-status delta. Also returns a `signature_match` boolean — " +
+            "when true, both runs use the canonical-equivalent config and any KPI " +
+            "delta is environmental noise (inventory state, etc.), not a config " +
+            "effect. Pure data; the agent articulates the mechanism story (e.g. 'mode " +
+            "= elaborate trades 3 min wall-time for ...') using agent-knowledge.md " +
+            "tactics. Returns { a: {id, signature, soundness_status, kpis}, b: {...}, " +
+            "signature_match, config_diff: [{path, a, b}], kpi_delta: {kpi: ±value}, " +
+            "soundness_delta: 'a→b' }.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("run_a_id") { put("type", "integer") }
+                putJsonObject("run_b_id") { put("type", "integer") }
+            }
+            put("required", buildJsonArray { add("run_a_id"); add("run_b_id") })
+        },
+    ),
+    tool(
+        "trace_demand_to_supply",
+        "**L1 / dataset-feasibility.** Joint reachability: does supply S have a " +
+            "structural path to feed demand D, given the BOM + method graph? Combines " +
+            "BOM containment (S's product must appear in D's recipe tree, transitively) " +
+            "with location feasibility (S's location must reach the recipe step's " +
+            "location via method_move chain, OR be the same location). Static — does " +
+            "NOT consult plan-run pegging. Returns { reachable: bool, demand: {...}, " +
+            "supply: {...}, bom_path: [...] (chain from D's product down to S's), " +
+            "move_path: [...] (S's location to the consuming recipe location), " +
+            "blocker: string? }. When unreachable, `blocker` names the failing edge " +
+            "(e.g. 'S's product not in D's recipe' or 'no method_move from S's location " +
+            "to the consuming recipe location').",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("demand_id") { put("type", "string") }
+                putJsonObject("supply_id") { put("type", "string") }
+            }
+            put("required", buildJsonArray { add("demand_id"); add("supply_id") })
         },
     ),
     tool(
@@ -1244,6 +1670,184 @@ private fun toolSuggestNextBatch(caseId: Int, args: JsonObject, locale: String):
     )
 }
 
+/**
+ * Multi-objective config recommendation. Wraps [KbStore.recommendConfig] with
+ * arg parsing + JSON output shaping. The router internally chooses among
+ * Pareto-knee, hard-constraint query, and novel-suggest branches based on
+ * which arguments are populated.
+ */
+private fun toolRecommendConfig(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val objective = args["objective"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`objective` is required", locale)
+
+    val softConstraint: com.allocator.services.KbStore.SoftConstraint? = run {
+        val obj = args["soft_constraint"] as? JsonObject ?: return@run null
+        val kpi = obj["kpi"]?.jsonPrimitive?.contentOrNull?.trim()
+        val qual = obj["qualifier"]?.jsonPrimitive?.contentOrNull?.trim() ?: "reasonable"
+        if (kpi.isNullOrBlank()) null
+        else com.allocator.services.KbStore.SoftConstraint(kpi, qual)
+    }
+    val hardConstraint: com.allocator.services.KbStore.HardConstraint? = run {
+        val obj = args["hard_constraint"] as? JsonObject ?: return@run null
+        val kpi = obj["kpi"]?.jsonPrimitive?.contentOrNull?.trim()
+        val op = obj["op"]?.jsonPrimitive?.contentOrNull?.trim()
+        val value = obj["value"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
+        if (kpi.isNullOrBlank() || op.isNullOrBlank() || value == null) null
+        else com.allocator.services.KbStore.HardConstraint(kpi, op, value)
+    }
+    val novelOnly = args["novel_only"]?.jsonPrimitive?.booleanOrNull == true
+
+    val rec = com.allocator.services.KbStore.recommendConfig(
+        caseId = caseId,
+        objective = objective,
+        softConstraint = softConstraint,
+        hardConstraint = hardConstraint,
+        novelOnly = novelOnly,
+    )
+
+    if (rec.errors.isNotEmpty()) {
+        return toolError(rec.errors.joinToString("; "), locale)
+    }
+
+    fun renderRow(rec: com.allocator.services.KbStore.KbRecord): JsonObject = buildJsonObject {
+        put("id", JsonPrimitive(rec.id))
+        put("signature", JsonPrimitive(rec.signature))
+        put("preset_id", JsonPrimitive(rec.presetId))
+        put("preset_label", JsonPrimitive(rec.presetLabel))
+        put("primary_axis", JsonPrimitive(rec.primaryAxis))
+        put("soundness_status", JsonPrimitive(rec.soundnessStatus))
+        put("source_plan_run_id", rec.sourcePlanRunId?.let { JsonPrimitive(it) } ?: JsonNull)
+        put("kpis", runCatching { jsonParser.parseToJsonElement(rec.kpisSnapshotJson) }.getOrElse { JsonObject(emptyMap()) })
+        put("config", runCatching { jsonParser.parseToJsonElement(rec.configJson) }.getOrElse { JsonObject(emptyMap()) })
+    }
+
+    val payload = buildJsonObject {
+        put("objective", JsonPrimitive(objective))
+        put("source", JsonPrimitive(rec.source))
+        put("total_in_kb", JsonPrimitive(rec.totalInKb))
+        if (rec.frontierSummary != null) put("frontier_summary", JsonPrimitive(rec.frontierSummary))
+        put("rationale", JsonPrimitive(rec.rationale))
+        put("headline", rec.headline?.let { renderRow(it) } ?: JsonNull)
+        put("alternates", JsonArray(rec.alternates.map { renderRow(it) }))
+    }
+
+    val sumEn = rec.headline?.let { "Recommended: ${it.presetLabel ?: it.signature.take(40)} (source=${rec.source})" }
+        ?: "No recommendation (${rec.source})"
+    val sumZh = rec.headline?.let { "推荐：${it.presetLabel ?: it.signature.take(40)} (来源=${rec.source})" }
+        ?: "无推荐 (${rec.source})"
+    return ToolResult(
+        summary = loc(sumEn, sumZh, locale),
+        payload = payload,
+    )
+}
+
+/**
+ * Substring-search the design-doc paragraph index. Returns the top-3 hits
+ * ranked by per-word match count, capped at [max_chars] total response size.
+ *
+ * Doesn't take caseId — design docs are global (shared across cases).
+ */
+private fun toolQueryDesignDocs(args: JsonObject, locale: String): ToolResult {
+    val topicRaw = args["topic"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`topic` is required", locale)
+    if (topicRaw.isBlank()) return toolError("`topic` cannot be blank", locale)
+    val maxChars = (args["max_chars"]?.jsonPrimitive?.intOrNull ?: 2000).coerceIn(200, 4000)
+
+    val index = DESIGN_DOC_INDEX
+    if (index.isEmpty()) {
+        return ToolResult(
+            summary = loc(
+                "Design-doc index empty (docs/*.md not bundled into JAR). Build via gradle.",
+                "设计文档索引为空（docs/*.md 未打包进 JAR）。请通过 gradle 重新构建。",
+                locale,
+            ),
+            payload = buildJsonObject {
+                put("topic", JsonPrimitive(topicRaw))
+                put("hits", JsonArray(emptyList()))
+                put("total_paragraphs", JsonPrimitive(0))
+                put("truncated", JsonPrimitive(false))
+            },
+        )
+    }
+
+    // Score each paragraph by the count of word matches (case-insensitive).
+    // Multi-word topics rank paragraphs that hit MORE of the words higher.
+    val words = topicRaw.lowercase().split(Regex("\\s+")).filter { it.isNotBlank() }.distinct()
+    if (words.isEmpty()) return toolError("`topic` has no searchable words", locale)
+
+    data class Scored(val para: DesignDocParagraph, val score: Int)
+    val ranked = index
+        .map { p ->
+            val lowered = p.text.lowercase()
+            val score = words.count { w -> lowered.contains(w) }
+            Scored(p, score)
+        }
+        .filter { it.score > 0 }
+        .sortedWith(
+            compareByDescending<Scored> { it.score }
+                .thenBy { it.para.file }
+                .thenBy { it.para.lineStart },
+        )
+
+    if (ranked.isEmpty()) {
+        return ToolResult(
+            summary = loc(
+                "No design-doc match for `$topicRaw`",
+                "未找到与「$topicRaw」匹配的设计文档段落",
+                locale,
+            ),
+            payload = buildJsonObject {
+                put("topic", JsonPrimitive(topicRaw))
+                put("hits", JsonArray(emptyList()))
+                put("total_paragraphs", JsonPrimitive(index.size))
+                put("truncated", JsonPrimitive(false))
+            },
+        )
+    }
+
+    // Take top-3, then truncate the tail when total response exceeds maxChars.
+    val take = ranked.take(3)
+    var running = 0
+    val included = mutableListOf<Scored>()
+    var truncated = false
+    for (s in take) {
+        if (running + s.para.text.length > maxChars) {
+            // Include a partial last paragraph if room.
+            val remaining = maxChars - running
+            if (remaining > 100) {
+                val truncatedPara = s.para.copy(text = s.para.text.take(remaining) + "…")
+                included.add(s.copy(para = truncatedPara))
+                running += remaining
+            }
+            truncated = true
+            break
+        }
+        included.add(s)
+        running += s.para.text.length
+    }
+
+    return ToolResult(
+        summary = loc(
+            "Design-doc hits for `$topicRaw`: ${included.size} paragraph(s) across ${included.map { it.para.file }.distinct().size} file(s)",
+            "「$topicRaw」匹配 ${included.size} 个段落，覆盖 ${included.map { it.para.file }.distinct().size} 个文件",
+            locale,
+        ),
+        payload = buildJsonObject {
+            put("topic", JsonPrimitive(topicRaw))
+            put("total_paragraphs", JsonPrimitive(index.size))
+            put("truncated", JsonPrimitive(truncated))
+            put("hits", JsonArray(included.map { s ->
+                buildJsonObject {
+                    put("file", JsonPrimitive(s.para.file))
+                    put("line", JsonPrimitive(s.para.lineStart))
+                    put("score", JsonPrimitive(s.score))
+                    put("text", JsonPrimitive(s.para.text))
+                }
+            }))
+        },
+    )
+}
+
 private fun toolGetKpis(caseId: Int, args: JsonObject, locale: String): ToolResult {
     val runId = args["run_id"]?.jsonPrimitive?.intOrNull
         ?: return toolError("`run_id` is required", locale)
@@ -1293,8 +1897,45 @@ private fun toolGetDemandPegging(caseId: Int, args: JsonObject, locale: String):
         ?: return toolError("plan run $runId not found for case $caseId", locale)
     @Suppress("UNCHECKED_CAST")
     val pegging = result["planning_pegging"] as? List<Map<String, Any?>> ?: emptyList()
-    val entry = pegging.firstOrNull { it["demand_id"]?.toString()?.trim() == demandId.trim() }
-        ?: return toolError("demand $demandId not in run $runId pegging", locale)
+    val matchingEntries = pegging.filter { it["demand_id"]?.toString()?.trim() == demandId.trim() }
+    if (matchingEntries.isEmpty()) {
+        return toolError("demand $demandId not in run $runId pegging", locale)
+    }
+    // The pegging list can carry MULTIPLE entries for the same demand_id —
+    // typically one root demand tree (rooted at the demand's actual pid+lid)
+    // plus one or more make-WO sub-trees that the planner emits as its own
+    // pegging entries (for component-level work orders). Picking the first
+    // match silently grabs a sub-tree, missing all flagged origin nodes which
+    // are computed at the root-demand level. To pick the ROOT entry:
+    //   1. Look up the demand's actual product_id + location_id from the
+    //      Demands table.
+    //   2. Pick the entry whose tree root matches that pid+lid.
+    //   3. If lookup or match fails, fall back to the entry without
+    //      `passthrough`/`per_demand_allocations` keys (sub-tree markers),
+    //      then to the entry whose tree has the most children.
+    val (demandPid, demandLid) = transaction {
+        Demands.selectAll()
+            .where { (Demands.caseId eq caseId) and (Demands.demandId eq demandId.trim()) }
+            .firstOrNull()
+            ?.let { it[Demands.productId] to it[Demands.locationId] }
+            ?: (null to null)
+    }
+    fun treeRootMatches(entry: Map<String, Any?>): Boolean {
+        @Suppress("UNCHECKED_CAST")
+        val t = entry["tree"] as? Map<String, Any?> ?: return false
+        val tpid = (t["product_id"] as? String)?.trim()
+        val tlid = (t["location_id"] as? String)?.trim()
+        return tpid == demandPid && tlid == demandLid
+    }
+    fun isLikelySubtree(entry: Map<String, Any?>): Boolean =
+        entry.containsKey("passthrough") || entry.containsKey("per_demand_allocations")
+    val entry = matchingEntries.firstOrNull(::treeRootMatches)
+        ?: matchingEntries.firstOrNull { !isLikelySubtree(it) }
+        ?: matchingEntries.maxByOrNull { e ->
+            @Suppress("UNCHECKED_CAST")
+            ((e["tree"] as? Map<String, Any?>)?.get("children") as? List<*>)?.size ?: 0
+        }
+        ?: matchingEntries.first()
 
     // Cap the payload to keep the LLM context tractable — a deep BOM with
     // 200+ AND-children + virtual products easily blows past 128k tokens
@@ -1306,7 +1947,85 @@ private fun toolGetDemandPegging(caseId: Int, args: JsonObject, locale: String):
     @Suppress("UNCHECKED_CAST")
     val tree = entry["tree"] as? Map<String, Any?>
     val prunedTree = tree?.let { pruneTreeForAgent(it, depthFromRoot = 0) }
-    val prunedEntry = entry.toMutableMap().apply { if (prunedTree != null) put("tree", prunedTree) }
+
+    // Pre-compute a flat list of shortage origins from the FULL tree (before
+    // pruning, so we don't miss anything). Each origin = a node with
+    // `is_bottleneck=true` or `is_root_bottleneck=true`. The agent is bad at
+    // walking deep nested JSON to extract flagged nodes — it tends to pick
+    // an arbitrary AND-child and stop. Surfacing this flat list ensures the
+    // agent always knows WHICH leaves are origins without needing to inspect
+    // the tree itself.
+    val origins = mutableListOf<JsonObject>()
+    if (tree != null) collectShortageOrigins(tree, origins)
+    // De-duplicate by (pid, lid, kinds) — a leaf can appear multiple times
+    // in the tree (different AND-paths) but is the same origin logically.
+    val originsKeyed = origins
+        .map { o ->
+            val key = "${o["product_id"]?.jsonPrimitive?.contentOrNull}|" +
+                "${o["location_id"]?.jsonPrimitive?.contentOrNull}|" +
+                "${o["kind"]?.jsonPrimitive?.contentOrNull}"
+            key to o
+        }
+        .associate { it }
+    val originsJson = JsonArray(originsKeyed.values.toList())
+
+    // Critical path: the dominator SUB-TREE from root demand to its
+    // originating sources. AND junctions stay single-child; OR junctions
+    // branch (every contributing child is a dominator). Result is a depth-
+    // first flat list of {pid, lid, kind, depth}; terminals (leaves of the
+    // sub-tree) are the actual origins — usually multiple when OR junctions
+    // fan out.
+    val criticalPathSteps = if (tree != null) traceCriticalPath(tree) else emptyList()
+    // Terminals: a step is a leaf of the sub-tree iff the next step's depth
+    // is ≤ this step's depth (or there is no next step). Skip the root.
+    val terminalIndices = criticalPathSteps.indices.filter { i ->
+        if (i == 0) return@filter false  // root
+        val nextDepth = criticalPathSteps.getOrNull(i + 1)?.second
+        nextDepth == null || nextDepth <= criticalPathSteps[i].second
+    }.toSet()
+    // Emit critical_path with depth, skipping the root (depth=0) since it's
+    // the demand itself (already named in the question).
+    val criticalPathJson = JsonArray(criticalPathSteps.drop(1).map { (node, depth) ->
+        buildJsonObject {
+            put("product_id", JsonPrimitive((node["product_id"] as? String).orEmpty()))
+            put("location_id", JsonPrimitive((node["location_id"] as? String).orEmpty()))
+            put("kind", JsonPrimitive(criticalPathKind(node)))
+            put("depth", JsonPrimitive(depth))
+        }
+    })
+    val terminalSteps = terminalIndices.sorted().map { criticalPathSteps[it] }
+    val originsListJson = JsonArray(terminalSteps.map { (node, depth) ->
+        buildJsonObject {
+            put("product_id", JsonPrimitive((node["product_id"] as? String).orEmpty()))
+            put("location_id", JsonPrimitive((node["location_id"] as? String).orEmpty()))
+            put("kind", JsonPrimitive(criticalPathKind(node)))
+            put("depth", JsonPrimitive(depth))
+        }
+    })
+
+    // Pre-rendered indented form of `critical_path` for the agent to quote
+    // verbatim. The agent was prone to flattening the indentation when
+    // transcribing entries itself; building the lines here makes the visual
+    // structure deterministic. Kind labels are localized to the user's
+    // language so the agent doesn't translate them inconsistently.
+    val criticalPathPretty = criticalPathSteps.drop(1).joinToString("\n") { (node, depth) ->
+        val pid = (node["product_id"] as? String).orEmpty()
+        val lid = (node["location_id"] as? String).orEmpty()
+        val kindLabel = when (criticalPathKind(node)) {
+            "supply" -> if (locale == "zh") "瓶颈" else "supply"
+            "demand" -> if (locale == "zh") "根因" else "demand"
+            else     -> if (locale == "zh") "关键路径" else "transit"
+        }
+        "${"  ".repeat(depth - 1)}depth $depth: $pid@$lid ($kindLabel)"
+    }
+
+    val prunedEntry = LinkedHashMap<String, Any?>().apply {
+        put("origins", originsListJson)
+        put("critical_path", criticalPathJson)
+        put("critical_path_pretty", JsonPrimitive(criticalPathPretty))
+        entry.forEach { (k, v) -> if (k != "tree") put(k, v) }
+        if (prunedTree != null) put("tree", prunedTree)
+    }
 
     val payload = anyToJson(prunedEntry)
     val payloadStr = payload.toString()
@@ -1314,15 +2033,137 @@ private fun toolGetDemandPegging(caseId: Int, args: JsonObject, locale: String):
     val summarySuffix = if (originalSize > payloadStr.length + 1024) {
         " (pruned ${originalSize}→${payloadStr.length} chars; fulfilled subtrees collapsed)"
     } else ""
+    val originSummary = if (originsListJson.isNotEmpty()) {
+        val rendered = originsListJson.take(5).joinToString(", ") { o ->
+            val obj = o as JsonObject
+            "${obj["product_id"]?.jsonPrimitive?.contentOrNull}@${obj["location_id"]?.jsonPrimitive?.contentOrNull}(${obj["kind"]?.jsonPrimitive?.contentOrNull})"
+        }
+        val ellipsis = if (originsListJson.size > 5) ", ..." else ""
+        " · ${originsListJson.size} origin(s): $rendered$ellipsis; critical path of ${criticalPathJson.size} step(s)"
+    } else if (originsJson.isEmpty()) {
+        " · no shortage origins"
+    } else {
+        " · ${originsJson.size} shortage origin(s) (no critical-path tree built)"
+    }
 
     return ToolResult(
         summary = loc(
-            "Pegging tree for demand $demandId$summarySuffix",
-            "需求 $demandId 的支撑链$summarySuffix",
+            "Pegging tree for demand $demandId$originSummary$summarySuffix",
+            "需求 $demandId 的支撑链$originSummary$summarySuffix",
             locale,
         ),
         payload = payload,
     )
+}
+
+/** Trace the critical path — a SUB-TREE of the pegging tree containing every
+ *  dominator from root demand down to its originating sources. Reflects the
+ *  AND/OR distinction:
+ *   - **AND junction** (e.g., a method WO requiring all BOM components):
+ *     pick the single AND-min child. The planner pre-marks it via
+ *     `is_bottleneck` / `is_root_bottleneck`. Tie-breaker: smallest
+ *     committed_qty/quantity ratio, then tree order. If no direct child is
+ *     flagged but a descendant is, descend through the transit child with
+ *     the smallest ratio (method WO between BOM levels carries no flag).
+ *   - **OR junction** (e.g., a demand with alternative supply paths):
+ *     EVERY contributing child (quantity > 0 OR committed_qty > 0) is a
+ *     dominator. Recurse into all of them. The path branches.
+ *  Returns the sub-tree as a depth-first flat list of (node, depth) pairs.
+ *  Caller post-processes terminals (origins) by checking depth-vs-next. */
+@Suppress("UNCHECKED_CAST")
+private fun traceCriticalPath(root: Map<String, Any?>): List<Pair<Map<String, Any?>, Int>> {
+    fun hasFlaggedDescendant(n: Map<String, Any?>): Boolean {
+        if (n["is_bottleneck"] == true || n["is_root_bottleneck"] == true) return true
+        val kids = n["children"] as? List<Map<String, Any?>> ?: return false
+        return kids.any(::hasFlaggedDescendant)
+    }
+    fun ratio(c: Map<String, Any?>): Double {
+        val q = (c["quantity"] as? Number)?.toDouble() ?: 0.0
+        val cq = (c["committed_qty"] as? Number)?.toDouble() ?: q
+        return if (q < 1e-9) 0.0 else cq / q
+    }
+    fun contributed(c: Map<String, Any?>): Boolean {
+        val q = (c["quantity"] as? Number)?.toDouble() ?: 0.0
+        val cq = (c["committed_qty"] as? Number)?.toDouble() ?: q
+        return q > 1e-9 || cq > 1e-9
+    }
+    fun relationOf(n: Map<String, Any?>): String {
+        val explicit = (n["children_relation"] as? String)?.lowercase()
+        if (explicit == "or" || explicit == "and") return explicit
+        // Fallback: work_order children are BOM components (AND); demand
+        // children are alternative paths (OR); supply/purchase have no
+        // meaningful children. Default OR keeps the walker open at unknown
+        // node types so we don't miss flagged descendants.
+        return if ((n["type"] as? String) == "work_order") "and" else "or"
+    }
+
+    val result = mutableListOf<Pair<Map<String, Any?>, Int>>()
+    fun walk(node: Map<String, Any?>, depth: Int) {
+        result.add(node to depth)
+        val children = node["children"] as? List<Map<String, Any?>> ?: return
+        if (children.isEmpty()) return
+        // Universal rule: a child (and its subtree) with 0 contribution is NOT
+        // on the critical path. The path traces actual flow.
+        val contributing = children.filter(::contributed)
+        if (contributing.isEmpty()) return
+        if (relationOf(node) == "or") {
+            // OR: every contributing child is a dominator.
+            for (c in contributing) walk(c, depth + 1)
+        } else {
+            // AND: single dominator — the AND-min among contributing children.
+            val flagged = contributing.filter { c ->
+                c["is_bottleneck"] == true || c["is_root_bottleneck"] == true
+            }
+            val next = if (flagged.isNotEmpty()) {
+                flagged.minByOrNull(::ratio)
+            } else {
+                // Transit through a contributing child with a flagged descendant
+                // (e.g. method WO node between demand and BOM components).
+                val transit = contributing.filter(::hasFlaggedDescendant)
+                if (transit.isEmpty()) null else transit.minByOrNull(::ratio)
+            }
+            if (next != null) walk(next, depth + 1)
+        }
+    }
+    walk(root, 0)
+    return result
+}
+
+/** Classify a critical-path node's kind. Root demand isn't flagged; everything
+ *  else falls into supply or demand kind (root_bottleneck preferred when both
+ *  fire — demand-side is the more specific verdict). */
+private fun criticalPathKind(node: Map<String, Any?>): String = when {
+    node["is_root_bottleneck"] == true -> "demand"
+    node["is_bottleneck"] == true -> "supply"
+    else -> "root"
+}
+
+/** Walk a pegging tree and collect every node carrying `is_bottleneck=true`
+ *  or `is_root_bottleneck=true`. Each emitted entry: `{product_id, location_id,
+ *  kind: "supply" | "demand"}`. Allocator's two flags can both fire on the same
+ *  node (rare); when so, two entries emit (one per kind). */
+@Suppress("UNCHECKED_CAST")
+private fun collectShortageOrigins(node: Map<String, Any?>, out: MutableList<JsonObject>) {
+    val pid = (node["product_id"] as? String)?.trim()
+    val lid = (node["location_id"] as? String)?.trim()
+    if (!pid.isNullOrBlank() && !lid.isNullOrBlank()) {
+        if (node["is_bottleneck"] == true) {
+            out.add(buildJsonObject {
+                put("product_id", JsonPrimitive(pid))
+                put("location_id", JsonPrimitive(lid))
+                put("kind", JsonPrimitive("supply"))
+            })
+        }
+        if (node["is_root_bottleneck"] == true) {
+            out.add(buildJsonObject {
+                put("product_id", JsonPrimitive(pid))
+                put("location_id", JsonPrimitive(lid))
+                put("kind", JsonPrimitive("demand"))
+            })
+        }
+    }
+    val children = node["children"] as? List<Map<String, Any?>> ?: return
+    for (c in children) collectShortageOrigins(c, out)
 }
 
 /**
@@ -1489,6 +2330,40 @@ private fun toolGetLeafCompetition(caseId: Int, args: JsonObject, locale: String
     val result = loadPlanResultFromDb(caseId, runId)
         ?: return toolError("plan run $runId not found for case $caseId", locale)
 
+    // Defensive: catch the common LLM input-parsing error where a hyphenated
+    // product code (e.g. "502-2991") was split as product="502", location="2991".
+    // If `productId` isn't a real product in this case AND `${productId}-${locationId}`
+    // IS a real product, return an early error pointing at the corrected identifier
+    // so the agent retries with the right args instead of producing a confidently
+    // wrong "no usage" answer.
+    val productExists = transaction {
+        Products.selectAll()
+            .where { (Products.caseId eq caseId) and (Products.productId eq productId) }
+            .limit(1).count() > 0L
+    }
+    if (!productExists) {
+        val joined = "$productId-$locationId"
+        val joinedExists = transaction {
+            Products.selectAll()
+                .where { (Products.caseId eq caseId) and (Products.productId eq joined) }
+                .limit(1).count() > 0L
+        }
+        if (joinedExists) {
+            return toolError(
+                "product_id `$productId` not found in case $caseId, but `$joined` IS a known product. " +
+                    "Did you split a hyphenated product code? Re-call with product_id=`$joined` and " +
+                    "the actual location_id (product codes are opaque strings and may contain hyphens).",
+                locale,
+            )
+        }
+        // Real unknown — return a clear error so the agent doesn't hallucinate.
+        return toolError(
+            "product_id `$productId` not found in case $caseId. Verify the product code; " +
+                "case product_ids are opaque strings (often hyphenated, e.g. `502-2991`).",
+            locale,
+        )
+    }
+
     // Total initial supply at the leaf (case-scoped).
     val totalSupply = transaction {
         Supplies.selectAll()
@@ -1498,6 +2373,84 @@ private fun toolGetLeafCompetition(caseId: Int, args: JsonObject, locale: String
             .sumOf { it[Supplies.qty] }
     }
 
+    @Suppress("UNCHECKED_CAST")
+    val planningPegging = (result["planning_pegging"] as? List<Map<String, Any?>>) ?: emptyList()
+
+    // Empty-leaf early return: when this (pid, lid) has no supply at all, the
+    // queried location isn't a real consolidation leaf for this product.
+    // Returning a full members[] classification in that case produces an
+    // all-walk_skipped table that mostly confuses the agent ("did consolidation
+    // strip everyone?"). Instead, surface:
+    //   1. The product's actual supply locations (so caller can re-query a real leaf).
+    //   2. The demands whose pegging walks visit this product (made/bought via
+    //      work orders, not drawn from inventory) — answers "which demands
+    //      USE this product?" without the caller needing a different tool.
+    if (totalSupply <= 1e-9) {
+        val otherLocs: List<String> = transaction {
+            Supplies.selectAll()
+                .where { (Supplies.caseId eq caseId) and (Supplies.productId eq productId) }
+                .mapNotNull { it[Supplies.locationId] }
+                .distinct()
+        }
+        // Walk pegging trees to find demands whose walks include this product
+        // at any location (work_order or demand nodes). Distinguishes "no
+        // supply" (the supply-side answer) from "no usage" (the demand-side
+        // answer) — those are very different.
+        val usageByDemand = mutableMapOf<String, Set<String>>()
+        for (entry in planningPegging) {
+            val demandId = entry["demand_id"]?.toString() ?: continue
+            @Suppress("UNCHECKED_CAST")
+            val tree = entry["tree"] as? Map<String, Any?> ?: continue
+            val locs = mutableSetOf<String>()
+            peggingProductLocations(tree, productId, locs)
+            if (locs.isNotEmpty()) usageByDemand[demandId] = locs
+        }
+        val hint = when {
+            otherLocs.isEmpty() && usageByDemand.isEmpty() ->
+                "no supply rows for $productId, and no demand pegging walk visits it — this product is unused in run #$runId"
+            otherLocs.isEmpty() ->
+                "no supply rows for $productId — this product is made/bought via work orders (not inventoried). " +
+                    "${usageByDemand.size} demand(s) use it; see `usages` for the list"
+            usageByDemand.isEmpty() ->
+                "no supply at $productId@$locationId; supply exists at: ${otherLocs.joinToString(", ")} — " +
+                    "re-query with one of those location_ids. No demand walk visits this product in run #$runId."
+            else ->
+                "no supply at $productId@$locationId; supply exists at: ${otherLocs.joinToString(", ")}. " +
+                    "${usageByDemand.size} demand(s) use this product (see `usages`); for supply-side competition, re-query at a real supply location."
+        }
+        val usagesJson = JsonArray(
+            usageByDemand.entries
+                .sortedBy { it.key }
+                .map { (did, locs) ->
+                    buildJsonObject {
+                        put("demand_id", JsonPrimitive(did))
+                        put("locations", JsonArray(locs.sorted().map { JsonPrimitive(it) }))
+                    }
+                }
+        )
+        val payload = buildJsonObject {
+            put("product_id", JsonPrimitive(productId))
+            put("location_id", JsonPrimitive(locationId))
+            put("total_initial_supply", JsonPrimitive(0.0))
+            put("competitor_count", JsonPrimitive(0))
+            put("competitors", JsonArray(emptyList()))
+            put("note", JsonPrimitive(hint))
+            put("supply_locations_for_product", JsonArray(otherLocs.map { JsonPrimitive(it) }))
+            put("usages", usagesJson)
+            put("usage_demand_count", JsonPrimitive(usageByDemand.size))
+        }
+        val summaryEn = "No supply at $productId @ $locationId — " +
+            (if (otherLocs.isNotEmpty()) "supply exists at ${otherLocs.joinToString(",")}; " else "") +
+            "${usageByDemand.size} demand(s) use this product"
+        val summaryZh = "$productId @ $locationId 无供应 — " +
+            (if (otherLocs.isNotEmpty()) "供应位于 ${otherLocs.joinToString(",")}；" else "") +
+            "${usageByDemand.size} 个需求使用该产品"
+        return ToolResult(
+            summary = loc(summaryEn, summaryZh, locale),
+            payload = payload,
+        )
+    }
+
     // Actual draws: walk planning_pegging supply leaves and aggregate qty by demand_id.
     // Each pegging entry is keyed by demand_id; supply leaves under it carry the qty
     // that demand actually pulled from physical inventory at this (pid, lid).
@@ -1505,44 +2458,381 @@ private fun toolGetLeafCompetition(caseId: Int, args: JsonObject, locale: String
     // dropped — they bloated plan_run.result by hundreds of KB per demand and
     // OOM'd the listing endpoint. Actual draws cover the demand-side competition
     // story well enough on their own.)
-    @Suppress("UNCHECKED_CAST")
-    val planningPegging = (result["planning_pegging"] as? List<Map<String, Any?>>) ?: emptyList()
     val actualByDemand = mutableMapOf<String, Double>()
+    // Cross-reference the pegging-tree origin flags: which demands (if any)
+    // carry `is_bottleneck=true` or `is_root_bottleneck=true` at THIS exact
+    // (pid, lid)? A leaf that isn't an origin for any demand is NOT a bottleneck
+    // — even if multiple demands draw from it. Surfacing this prevents the agent
+    // from fabricating bottleneck narratives around healthy leaves with slack.
+    val supplyOriginDemands = mutableListOf<String>()
+    val demandOriginDemands = mutableListOf<String>()
     for (entry in planningPegging) {
         val demandId = entry["demand_id"]?.toString() ?: continue
         @Suppress("UNCHECKED_CAST")
         val tree = entry["tree"] as? Map<String, Any?> ?: continue
         accumulateLeafDraws(tree, productId, locationId, demandId, actualByDemand)
+        val (supplyFlag, demandFlag) = peggingOriginFlagsAt(tree, productId, locationId)
+        if (supplyFlag) supplyOriginDemands.add(demandId)
+        if (demandFlag) demandOriginDemands.add(demandId)
     }
+    val isOrigin = supplyOriginDemands.isNotEmpty() || demandOriginDemands.isNotEmpty()
 
     val rows = actualByDemand.entries
         .filter { it.value > 1e-9 }
         .sortedByDescending { it.value }
         .map { (did, qty) -> did to qty }
 
+    val totalDrawn = rows.sumOf { it.second }
+    val headroom = totalSupply - totalDrawn
+
     val competitorsJson = JsonArray(rows.map { (did, qty) ->
         buildJsonObject {
             put("demand_id", JsonPrimitive(did))
-            put("actual_draw_qty", JsonPrimitive(qty))
+            put("leaf_draw_qty", JsonPrimitive(qty))
             put("share_pct", JsonPrimitive(if (totalSupply > 1e-9) qty * 100.0 / totalSupply else 0.0))
         }
     })
+
+    // ── Members + reason classification (consolidation override use-case) ──
+    //
+    // The above `competitors` array lists demands that drew > 0 from this
+    // leaf. For the "re-assign shares to a system-eliminated demand" workflow,
+    // the user also needs visibility into ZERO-SHARE candidates — demands that
+    // could have competed at this leaf but were eliminated by consolidation
+    // policy (priority_filtered, share_starved_under_shortage, outside_bucket,
+    // override_blocked) or never actually walked through this leaf
+    // (walk_skipped — false positive of BOM containment).
+    //
+    // Approach: BOM-containment closure (cheap recompute) intersected with
+    // each demand's planner-walk reach, classified against the run's
+    // consolidation policy + priority data + manual_override state. No
+    // persistence required (plan_run.result stays compact).
+
+    // Build reverse-BOM closure: products whose recipe transitively contains
+    // the leaf's product. A demand at FG product F is a "candidate" iff
+    // F is in this closure (or F == leaf.pid for direct demands).
+    val candidateProducts: Set<String> = transaction {
+        val rows = Boms.selectAll().where { Boms.caseId eq caseId }.toList()
+        val parentsByChild = rows.groupBy({ it[Boms.childId] }, { it[Boms.parentId] })
+            .mapValues { it.value.toSet() }
+        val out = mutableSetOf<String>()
+        val queue = ArrayDeque<Pair<String, Int>>()
+        queue.add(productId to 0)
+        val visited = mutableSetOf(productId)
+        while (queue.isNotEmpty()) {
+            val (cur, depth) = queue.removeFirst()
+            if (depth >= 12) continue   // generous cap; deeper BOMs are unusual
+            for (p in parentsByChild[cur] ?: emptySet()) {
+                if (visited.add(p)) { out.add(p); queue.add(p to depth + 1) }
+            }
+        }
+        out + productId
+    }
+
+    // Pull demand metadata for the candidate set.
+    data class DemandRow(
+        val demandId: String,
+        val productId: String,
+        val locationId: String?,
+        val priority: Int?,
+        val requestDueTime: String?,
+        val quantity: Double,
+    )
+    val candidates: List<DemandRow> = transaction {
+        Demands.selectAll()
+            .where { (Demands.caseId eq caseId) and (Demands.productId inList candidateProducts) }
+            .map {
+                DemandRow(
+                    demandId = it[Demands.demandId],
+                    productId = it[Demands.productId],
+                    locationId = it[Demands.locationId],
+                    priority = it[Demands.priority],
+                    requestDueTime = it[Demands.requestDueTime],
+                    quantity = it[Demands.quantity],
+                )
+            }
+    }
+
+    // Track which candidate demands' planner walks actually reached this exact
+    // (pid, lid) — touching a work_order or demand node. Distinguishes
+    // "eliminated at consolidation" from "different BOM branch / skipped".
+    // Also collect the full set of locations each demand visits this product
+    // at, so a "walk_skipped" verdict can distinguish "walked at a different
+    // location" from "walk doesn't touch this product at all".
+    val reachedThisLeaf = mutableSetOf<String>()
+    val productLocsByDemand = mutableMapOf<String, Set<String>>()
+    for (entry in planningPegging) {
+        val demandId = entry["demand_id"]?.toString() ?: continue
+        @Suppress("UNCHECKED_CAST")
+        val tree = entry["tree"] as? Map<String, Any?> ?: continue
+        if (peggingReachesLeaf(tree, productId, locationId)) reachedThisLeaf.add(demandId)
+        val locs = mutableSetOf<String>()
+        peggingProductLocations(tree, productId, locs)
+        if (locs.isNotEmpty()) productLocsByDemand[demandId] = locs
+    }
+
+    // Run config: consolidation policy + period.
+    val runConfigJson: JsonObject? = transaction {
+        PlanRuns.selectAll().where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }
+            .firstOrNull()?.get(PlanRuns.config)
+    }?.let { raw -> runCatching { jsonParser.parseToJsonElement(raw).jsonObject }.getOrNull() }
+    val consolidationConfig = (runConfigJson?.get("consolidation") as? JsonObject) ?: JsonObject(emptyMap())
+    val allocationMode = consolidationConfig["allocation_mode"]?.jsonPrimitive?.contentOrNull ?: "fair"
+    val periodDays = consolidationConfig["period_days"]?.jsonPrimitive?.intOrNull ?: 0
+    val consolidationEnabled = consolidationConfig["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
+
+    // Manual overrides on supplies at this (pid, lid) — surfaces when a
+    // component_split override has zeroed a demand's share at a specific
+    // supply_id under this leaf.
+    val activeOverrides: List<Pair<String, JsonObject>> = transaction {
+        ManualOverrides.selectAll()
+            .where { (ManualOverrides.caseId eq caseId) and (ManualOverrides.entityType eq "supply") }
+            .mapNotNull { row ->
+                val key = row[ManualOverrides.entityKey]
+                val payload = runCatching {
+                    jsonParser.parseToJsonElement(row[ManualOverrides.payload]).jsonObject
+                }.getOrNull() ?: return@mapNotNull null
+                key to payload
+            }
+    }
+
+    // Classify each candidate: drawer (full / partial), zero-share (with
+    // presumed reason), or walk_skipped (false positive of BOM containment).
+    val drawerPriorities = candidates
+        .filter { it.demandId in actualByDemand && (actualByDemand[it.demandId] ?: 0.0) > 1e-9 }
+        .mapNotNull { it.priority }
+    val drawerMinPriority = drawerPriorities.minOrNull()
+    val drawerTotalRequested = candidates
+        .filter { (actualByDemand[it.demandId] ?: 0.0) > 1e-9 }
+        .sumOf { it.quantity }
+    val isUnderShortage = drawerTotalRequested > totalSupply + 1e-6
+
+    // Approximate the consolidation bucket window from drawers' request_due_time
+    // range. A candidate whose due_time falls outside [min−1d, max+period_days]
+    // is presumed `outside_bucket`. Imprecise but useful as a heuristic.
+    val drawerDueTimes = candidates
+        .filter { (actualByDemand[it.demandId] ?: 0.0) > 1e-9 }
+        .mapNotNull { it.requestDueTime }
+        .sorted()
+
+    fun classify(d: DemandRow): Pair<String, String> {
+        val actual = actualByDemand[d.demandId] ?: 0.0
+        if (actual >= d.quantity - 1e-6) return "drew_full" to "fulfilled in full"
+        if (actual > 1e-9) return "drew_partial" to "drew $actual of ${d.quantity}"
+        // Zero-share path. First check if walk reached this leaf at all.
+        if (d.demandId !in reachedThisLeaf) {
+            val productLocs = productLocsByDemand[d.demandId].orEmpty()
+            return if (productLocs.isNotEmpty()) {
+                // Demand's walk visits this product, but at other location(s).
+                // Not an elimination at this leaf — caller likely queried the
+                // wrong location for this demand.
+                "walk_at_other_location" to
+                    "demand walks $productId at ${productLocs.joinToString(",")}, not at $locationId — no elimination happened at this leaf for this demand"
+            } else {
+                // Demand never visits this product — different recipe
+                // alternative chosen upstream (e.g. method_make picked a sibling
+                // BOM branch that skips $productId entirely).
+                "walk_avoids_product" to
+                    "demand's walk doesn't visit $productId at any location — likely a different recipe alternative was chosen upstream"
+            }
+        }
+        // Walk reached, drew zero. Classify by policy + priority + shortage.
+        if (!consolidationEnabled) {
+            return "zero_share" to "consolidation disabled — share elimination didn't happen at this leaf; check upstream methods"
+        }
+        // Manual override check: any active override on a supply at this
+        // (pid, lid) that names this demand_id explicitly with qty=0?
+        val overrideHit = activeOverrides.any { (_, payload) ->
+            val allocs = payload["allocations"] as? JsonArray ?: return@any false
+            allocs.any { el ->
+                val obj = el as? JsonObject ?: return@any false
+                val did = obj["demand_id"]?.jsonPrimitive?.contentOrNull
+                val qty = obj["qty"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
+                did == d.demandId && (qty ?: 0.0) <= 1e-9
+            }
+        }
+        if (overrideHit) return "override_blocked" to "manual_override component_split set qty=0 for this demand at this supply"
+
+        if (allocationMode == "priority_first" && drawerMinPriority != null && d.priority != null && d.priority > drawerMinPriority) {
+            return "priority_filtered" to "policy=priority_first; this demand's priority ${d.priority} > top drawers' priority $drawerMinPriority"
+        }
+        if (drawerDueTimes.isNotEmpty() && d.requestDueTime != null) {
+            val minDue = drawerDueTimes.first()
+            val maxDue = drawerDueTimes.last()
+            // String comparison works for ISO-format dates. Period_days widens the upper bound conceptually.
+            if (d.requestDueTime < minDue || d.requestDueTime > maxDue) {
+                return "outside_bucket" to "request_due_time ${d.requestDueTime} falls outside drawers' window [$minDue..$maxDue]; period_days=$periodDays may be too tight"
+            }
+        }
+        if (isUnderShortage) {
+            return "share_starved_under_shortage" to "policy=$allocationMode under shortage (drawers' total req ${drawerTotalRequested.toLong()} > supply ${totalSupply.toLong()})"
+        }
+        return "zero_share" to "presumed eliminated by consolidation but specific reason not derivable from policy=$allocationMode + priority + shortage signals; inspect manual_override or upstream walks"
+    }
+
+    val membersJson = JsonArray(candidates.map { d ->
+        val (status, reason) = classify(d)
+        // Null leaf_draw_qty when the demand didn't actually compete at this
+        // leaf — `walk_at_other_location` (consumes the product elsewhere) and
+        // `walk_avoids_product` (different recipe). A literal 0.0 here misleads
+        // the agent into reporting "0 allocation" when the demand may consume
+        // this material at another (pid, lid) row in its pegging tree. For
+        // those statuses, force the agent to read share_status / presumed_reason.
+        val leafDrawQty: JsonElement = if (status == "walk_at_other_location" || status == "walk_avoids_product") {
+            JsonNull
+        } else {
+            JsonPrimitive(actualByDemand[d.demandId] ?: 0.0)
+        }
+        buildJsonObject {
+            put("demand_id", JsonPrimitive(d.demandId))
+            put("product_id", JsonPrimitive(d.productId))
+            put("location_id", JsonPrimitive(d.locationId))
+            put("priority", d.priority?.let { JsonPrimitive(it) } ?: JsonNull)
+            put("request_due_time", JsonPrimitive(d.requestDueTime))
+            put("requested_qty", JsonPrimitive(d.quantity))
+            put("leaf_draw_qty", leafDrawQty)
+            put("share_status", JsonPrimitive(status))
+            put("presumed_reason", JsonPrimitive(reason))
+        }
+    })
+
+    val zeroShareCount = candidates.count {
+        val a = actualByDemand[it.demandId] ?: 0.0
+        a <= 1e-9 && it.demandId in reachedThisLeaf
+    }
+
+    // Build a guidance note when this leaf is NOT a shortage origin. Without
+    // this, the LLM tends to fabricate a bottleneck story whenever it sees
+    // "demand X drew C, demand Y drew K" — even if total_supply >> sum(draws).
+    // We make the non-origin verdict structurally hard to ignore: explicit
+    // boolean + plain-language note + headroom number.
+    val originNote: String? = when {
+        !isOrigin && headroom > 1e-6 ->
+            "This leaf is NOT a shortage origin for any demand in run #$runId. " +
+                "Total supply ${totalSupply.toLong()} > total drawn ${totalDrawn.toLong()} " +
+                "(headroom ${headroom.toLong()}). Do NOT narrate a bottleneck/competition " +
+                "story for this leaf — the small leaf_draw_qty for any demand reflects " +
+                "small NEED, not exhausted supply. Look elsewhere in the pegging tree for " +
+                "nodes flagged is_bottleneck=true or is_root_bottleneck=true."
+        !isOrigin ->
+            "This leaf is NOT flagged as a shortage origin in any demand's pegging tree. " +
+                "Don't infer a bottleneck from the competitor list alone — confirm against " +
+                "is_bottleneck / is_root_bottleneck flags from get_demand_pegging."
+        else -> null
+    }
 
     val payload = buildJsonObject {
         put("product_id", JsonPrimitive(productId))
         put("location_id", JsonPrimitive(locationId))
         put("total_initial_supply", JsonPrimitive(totalSupply))
+        put("total_drawn", JsonPrimitive(totalDrawn))
+        put("headroom", JsonPrimitive(headroom))
+        put("is_origin", JsonPrimitive(isOrigin))
+        put("supply_origin_for_demands", JsonArray(supplyOriginDemands.distinct().map { JsonPrimitive(it) }))
+        put("demand_origin_for_demands", JsonArray(demandOriginDemands.distinct().map { JsonPrimitive(it) }))
+        if (originNote != null) put("origin_note", JsonPrimitive(originNote))
         put("competitor_count", JsonPrimitive(rows.size))
         put("competitors", competitorsJson)
+        put("member_count", JsonPrimitive(candidates.size))
+        put("zero_share_count", JsonPrimitive(zeroShareCount))
+        put("members", membersJson)
+        put("consolidation", buildJsonObject {
+            put("enabled", JsonPrimitive(consolidationEnabled))
+            put("allocation_mode", JsonPrimitive(allocationMode))
+            put("period_days", JsonPrimitive(periodDays))
+        })
+        put("override_levers", buildJsonArray {
+            // Surface the override paths the agent can recommend. Caller
+            // (LLM) picks the appropriate one based on share_status.
+            add(JsonPrimitive("manual_override.component_split — re-assign shares at the supply level"))
+            add(JsonPrimitive("change consolidation.allocation_mode (fair / proportional / priority_first)"))
+            add(JsonPrimitive("change consolidation.period_days — widen / narrow the merge bucket"))
+            add(JsonPrimitive("change demand.priority — affects priority_first ordering"))
+        })
     }
+    val originTag = if (isOrigin) {
+        val kinds = buildList {
+            if (supplyOriginDemands.isNotEmpty()) add("supply")
+            if (demandOriginDemands.isNotEmpty()) add("demand")
+        }.joinToString("+")
+        "origin($kinds)"
+    } else "NOT an origin"
     return ToolResult(
         summary = loc(
-            "Competition at $productId @ $locationId — ${rows.size} demand(s), total supply ${totalSupply}",
-            "$productId @ $locationId 的竞争 — ${rows.size} 个需求，总供应 ${totalSupply}",
+            "Competition at $productId @ $locationId — $originTag, ${rows.size} drawer(s), " +
+                "$zeroShareCount zero-share, supply ${totalSupply.toLong()}, drawn ${totalDrawn.toLong()}, " +
+                "headroom ${headroom.toLong()}",
+            "$productId @ $locationId — $originTag, ${rows.size} 抽取者, $zeroShareCount 零份额, " +
+                "供应 ${totalSupply.toLong()}, 已取 ${totalDrawn.toLong()}, 余量 ${headroom.toLong()}",
             locale,
         ),
         payload = payload,
     )
+}
+
+/** True iff the pegging tree contains a work_order or demand node at the given
+ *  (pid, lid). Used to detect whether a demand's planner walk actually reached
+ *  this leaf — distinguishes consolidation "eliminated" from BOM-branch
+ *  "skipped". Skips `failed=true` subtrees (rolled-back diagnostic snapshots). */
+@Suppress("UNCHECKED_CAST")
+private fun peggingReachesLeaf(node: Map<String, Any?>, targetPid: String, targetLid: String): Boolean {
+    if (node["failed"] == true) return false
+    val pid = (node["product_id"] as? String)?.trim()
+    val lid = (node["location_id"] as? String)?.trim()
+    val type = node["type"] as? String
+    if ((type == "demand" || type == "work_order") && pid == targetPid && lid == targetLid) {
+        return true
+    }
+    val children = node["children"] as? List<Map<String, Any?>> ?: return false
+    return children.any { peggingReachesLeaf(it, targetPid, targetLid) }
+}
+
+/** Walk a demand's pegging tree and check whether (targetPid, targetLid)
+ *  appears as a node carrying `is_bottleneck=true` and/or
+ *  `is_root_bottleneck=true`. Returns a Pair<supplyOrigin, demandOrigin>; both
+ *  default to false if the leaf isn't flagged. Used by [toolGetLeafCompetition]
+ *  to refuse to look like a bottleneck story when the queried leaf isn't
+ *  actually a shortage origin for any demand. */
+private fun peggingOriginFlagsAt(
+    node: Map<String, Any?>,
+    targetPid: String,
+    targetLid: String,
+): Pair<Boolean, Boolean> {
+    val pid = (node["product_id"] as? String)?.trim()
+    val lid = (node["location_id"] as? String)?.trim()
+    var supply = false
+    var demand = false
+    if (pid == targetPid && lid == targetLid) {
+        if (node["is_bottleneck"] == true) supply = true
+        if (node["is_root_bottleneck"] == true) demand = true
+    }
+    @Suppress("UNCHECKED_CAST")
+    val children = node["children"] as? List<Map<String, Any?>>
+    if (children != null) {
+        for (c in children) {
+            val (s, d) = peggingOriginFlagsAt(c, targetPid, targetLid)
+            if (s) supply = true
+            if (d) demand = true
+            if (supply && demand) break
+        }
+    }
+    return supply to demand
+}
+
+/** Collect all locations where a demand's pegging walk visits `targetPid`
+ *  (work_order or demand nodes). Used to refine `walk_skipped` into either
+ *  "walked at a different location" or "walk doesn't touch this product at all". */
+private fun peggingProductLocations(node: Map<String, Any?>, targetPid: String, out: MutableSet<String>) {
+    if (node["failed"] == true) return
+    val pid = (node["product_id"] as? String)?.trim()
+    val lid = (node["location_id"] as? String)?.trim()
+    val type = node["type"] as? String
+    if ((type == "demand" || type == "work_order") && pid == targetPid && !lid.isNullOrBlank()) {
+        out.add(lid)
+    }
+    @Suppress("UNCHECKED_CAST")
+    val children = node["children"] as? List<Map<String, Any?>> ?: return
+    for (c in children) peggingProductLocations(c, targetPid, out)
 }
 
 /**
@@ -1578,6 +2868,430 @@ private fun accumulateLeafDraws(
     for (c in children) accumulateLeafDraws(c, targetPid, targetLid, demandId, accumulator)
 }
 
+// ── L1 dataset-feasibility tools ────────────────────────────────────────────
+//
+// Static, plan-run-independent answers about the case's CSV-derived data:
+// BOM containment, location-graph reachability, and the joint demand↔supply
+// "is there a structural path?" question. Answer "is A in B's BOM?", "can A
+// move L1→L2?", and "does demand D require supply S?" without consulting any
+// pegging tree. Pair with [toolGetProductMethods] / [toolGetProductSupply]
+// for the per-leaf method + inventory views.
+
+/** Hard cap on BOM-tree recursion depth surfaced via the agent tool. Most
+ *  real BOMs are 2-5 levels; bumping higher trades response size for
+ *  completeness on unusually deep recipes. */
+private const val BOM_TREE_MAX_DEPTH_CAP = 8
+private const val MOVE_PATH_MAX_HOPS_CAP = 10
+
+private fun toolGetBomTree(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val productIdArg = args["product_id"]?.jsonPrimitive?.contentOrNull?.trim()
+    val demandIdArg = args["demand_id"]?.jsonPrimitive?.contentOrNull?.trim()
+    val maxDepth = (args["max_depth"]?.jsonPrimitive?.intOrNull ?: 4)
+        .coerceIn(1, BOM_TREE_MAX_DEPTH_CAP)
+
+    // Resolve productId — caller can pass either directly or via demand_id shortcut.
+    val productId: String = when {
+        !productIdArg.isNullOrBlank() -> productIdArg
+        !demandIdArg.isNullOrBlank() -> {
+            val demandRow = transaction {
+                Demands.selectAll()
+                    .where { (Demands.caseId eq caseId) and (Demands.demandId eq demandIdArg) }
+                    .firstOrNull()
+            } ?: return toolError("demand_id `$demandIdArg` not found in case $caseId", locale)
+            demandRow[Demands.productId]
+        }
+        else -> return toolError("either `product_id` or `demand_id` is required", locale)
+    }
+
+    // Pull the case's BOM rows + method/supply existence indicators in one pass.
+    // For ~hundreds of BOM rows + dozens of methods this fits easily in memory;
+    // the alternative (per-node DB query) hits N×depth round-trips.
+    val (bomByParent, makeProducts, buyProducts, supplyProducts) = transaction {
+        val bomRows = Boms.selectAll().where { Boms.caseId eq caseId }.toList()
+        val byParent = bomRows.groupBy { it[Boms.parentId] }
+        val makes = MethodMakes.selectAll().where { MethodMakes.caseId eq caseId }
+            .map { it[MethodMakes.productId] }.toSet()
+        val buys = MethodBuys.selectAll().where { MethodBuys.caseId eq caseId }
+            .map { it[MethodBuys.productId] }.toSet()
+        val supplies = Supplies.selectAll().where { Supplies.caseId eq caseId }
+            .map { it[Supplies.productId] }.toSet()
+        Tuple4(byParent, makes, buys, supplies)
+    }
+
+    fun build(pid: String, depth: Int, parentRate: Double?, altGroup: String?, inProgress: MutableSet<String>): Map<String, Any?> {
+        // Cycle: render the back-edge instead of recursing.
+        if (pid in inProgress) {
+            return mapOf(
+                "product_id" to pid,
+                "level" to depth,
+                "cycle_to" to pid,
+            )
+        }
+        val terminalSupply = pid in supplyProducts
+        val makeable = pid in makeProducts
+        val buyable = pid in buyProducts
+        val node = mutableMapOf<String, Any?>(
+            "product_id" to pid,
+            "level" to depth,
+            "terminal_supply" to terminalSupply,
+            "makeable" to makeable,
+            "buyable" to buyable,
+        )
+        if (parentRate != null) node["child_qty"] = parentRate
+        if (altGroup != null) node["alt_group"] = altGroup
+
+        if (depth >= maxDepth) {
+            // Don't expand further — surface as a leaf with truncated flag.
+            node["children"] = emptyList<Any>()
+            node["truncated"] = true
+            return node
+        }
+        // Walk this product's BOM children. Note: `bom` rows can repeat
+        // (per-location duplicates); de-dup by (child_id, alt_group) and
+        // pick the first observed rate.
+        val rows = bomByParent[pid] ?: emptyList()
+        if (rows.isEmpty()) {
+            node["children"] = emptyList<Any>()
+            return node
+        }
+        val seen = mutableSetOf<Pair<String, String?>>()
+        val children = mutableListOf<Map<String, Any?>>()
+        inProgress.add(pid)
+        for (row in rows) {
+            val cid = row[Boms.childId]
+            val ag = row[Boms.altGroup]
+            val key = cid to ag
+            if (!seen.add(key)) continue
+            val rate = row[Boms.rate]
+            children.add(build(cid, depth + 1, rate, ag, inProgress))
+        }
+        inProgress.remove(pid)
+        node["children"] = children
+        return node
+    }
+
+    val tree = build(productId, 0, null, null, mutableSetOf())
+    val payload = buildJsonObject {
+        put("product_id", JsonPrimitive(productId))
+        if (!demandIdArg.isNullOrBlank()) put("demand_id", JsonPrimitive(demandIdArg))
+        put("max_depth", JsonPrimitive(maxDepth))
+        put("tree", anyToJson(tree))
+    }
+    return ToolResult(
+        summary = loc(
+            "BOM tree for $productId (depth $maxDepth)",
+            "$productId 的BOM树（深度 $maxDepth）",
+            locale,
+        ),
+        payload = payload,
+    )
+}
+
+/** Tiny tuple holder — Kotlin std only ships up to Triple. */
+private data class Tuple4<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
+
+private fun toolFindMovePath(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val productId = args["product_id"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`product_id` is required", locale)
+    val from = args["from_location"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`from_location` is required", locale)
+    val to = args["to_location"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`to_location` is required", locale)
+    val maxHops = (args["max_hops"]?.jsonPrimitive?.intOrNull ?: 6)
+        .coerceIn(1, MOVE_PATH_MAX_HOPS_CAP)
+
+    if (productId.isBlank() || from.isBlank() || to.isBlank()) {
+        return toolError("`product_id`, `from_location`, `to_location` cannot be blank", locale)
+    }
+
+    if (from == to) {
+        return ToolResult(
+            summary = loc(
+                "Same location ($from) — no move needed for $productId",
+                "$productId 同位置 ($from) 无需调拨",
+                locale,
+            ),
+            payload = buildJsonObject {
+                put("product_id", JsonPrimitive(productId))
+                put("from_location", JsonPrimitive(from))
+                put("to_location", JsonPrimitive(to))
+                put("reachable", JsonPrimitive(true))
+                put("hops", JsonPrimitive(0))
+                put("path", JsonArray(emptyList()))
+                put("total_transit_time", JsonPrimitive(0.0))
+            },
+        )
+    }
+
+    // Load all move edges for this product, scoped to case.
+    data class Edge(val from: String, val to: String, val transitTime: Double, val preference: Int?)
+    val edges: List<Edge> = transaction {
+        MethodMoves.selectAll()
+            .where { (MethodMoves.caseId eq caseId) and (MethodMoves.productId eq productId) }
+            .map {
+                Edge(
+                    from = it[MethodMoves.fromLocationId],
+                    to = it[MethodMoves.toLocationId],
+                    transitTime = it[MethodMoves.transitTime] ?: 0.0,
+                    preference = it[MethodMoves.preference],
+                )
+            }
+    }
+    val edgesByFrom: Map<String, List<Edge>> = edges.groupBy { it.from }
+
+    // BFS for shortest hop path (preference / transit time used as tiebreaker
+    // among equal-hop alternatives — pick lowest preference, then shortest
+    // transit). For a typical 3-5 location graph this is trivial.
+    data class Visit(val loc: String, val pathEdges: List<Edge>)
+    val queue: ArrayDeque<Visit> = ArrayDeque()
+    queue.add(Visit(from, emptyList()))
+    val visited = mutableSetOf(from)
+    val explored = mutableListOf<String>()
+    var found: List<Edge>? = null
+
+    while (queue.isNotEmpty() && found == null) {
+        val v = queue.removeFirst()
+        explored.add(v.loc)
+        if (v.pathEdges.size >= maxHops) continue
+        val outgoing = edgesByFrom[v.loc] ?: continue
+        // Sort by preference for tiebreaker stability — BFS first hits via
+        // shortest hop count, but among same-hop alternatives we prefer the
+        // lower-preference edge.
+        for (e in outgoing.sortedWith(compareBy({ it.preference ?: Int.MAX_VALUE }, { it.transitTime }))) {
+            if (e.to in visited) continue
+            visited.add(e.to)
+            val newPath = v.pathEdges + e
+            if (e.to == to) {
+                found = newPath
+                break
+            }
+            queue.add(Visit(e.to, newPath))
+        }
+    }
+
+    val payload = buildJsonObject {
+        put("product_id", JsonPrimitive(productId))
+        put("from_location", JsonPrimitive(from))
+        put("to_location", JsonPrimitive(to))
+        if (found != null) {
+            put("reachable", JsonPrimitive(true))
+            put("hops", JsonPrimitive(found.size))
+            put("total_transit_time", JsonPrimitive(found.sumOf { it.transitTime }))
+            put("path", JsonArray(found.map { e ->
+                buildJsonObject {
+                    put("from", JsonPrimitive(e.from))
+                    put("to", JsonPrimitive(e.to))
+                    put("transit_time", JsonPrimitive(e.transitTime))
+                    put("preference", JsonPrimitive(e.preference))
+                }
+            }))
+        } else {
+            put("reachable", JsonPrimitive(false))
+            put("explored", JsonArray(explored.distinct().map { JsonPrimitive(it) }))
+            // Hint: name the locations we reached but couldn't advance from.
+            // The agent can convert that into a CSV-row recommendation.
+            val frontier = explored.distinct().filter { l -> edgesByFrom[l].isNullOrEmpty() }
+            if (frontier.isNotEmpty()) {
+                put("frontier_dead_ends", JsonArray(frontier.map { JsonPrimitive(it) }))
+            }
+        }
+    }
+    return ToolResult(
+        summary = loc(
+            if (found != null) "Move path $from→$to for $productId — ${found.size} hop(s)"
+            else "No move path $from→$to for $productId (explored ${explored.distinct().size} loc(s))",
+            if (found != null) "$productId 调拨路径 $from→$to — ${found.size} 跳"
+            else "$productId 无调拨路径 $from→$to (探索了 ${explored.distinct().size} 个位置)",
+            locale,
+        ),
+        payload = payload,
+    )
+}
+
+private fun toolTraceDemandToSupply(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val demandId = args["demand_id"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`demand_id` is required", locale)
+    val supplyId = args["supply_id"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`supply_id` is required", locale)
+
+    // Resolve demand + supply rows.
+    data class Demand(val pid: String, val lid: String?, val qty: Double, val priority: Int?)
+    data class Supply(val pid: String, val lid: String, val qty: Double)
+    val demand: Demand
+    val supplies: List<Supply>
+    try {
+        val (d, s) = transaction {
+            val dRow = Demands.selectAll()
+                .where { (Demands.caseId eq caseId) and (Demands.demandId eq demandId) }
+                .firstOrNull() ?: return@transaction null to emptyList<Supply>()
+            val sRows = Supplies.selectAll()
+                .where { (Supplies.caseId eq caseId) and (Supplies.supplyId eq supplyId) }
+                .map { Supply(it[Supplies.productId], it[Supplies.locationId] ?: "", (it[Supplies.qty])) }
+            Demand(dRow[Demands.productId], dRow[Demands.locationId], dRow[Demands.quantity], dRow[Demands.priority]) to sRows
+        }
+        if (d == null) return toolError("demand `$demandId` not found in case $caseId", locale)
+        if (s.isEmpty()) return toolError("supply `$supplyId` not found in case $caseId", locale)
+        demand = d
+        supplies = s
+    } catch (e: Exception) {
+        return toolError("lookup failed: ${e.message}", locale)
+    }
+
+    // Each supply_id can have multiple rows (one per location). Try each in turn —
+    // a successful path through ANY of them counts as reachable.
+    val supplyProductId = supplies.first().pid
+    if (supplies.any { it.pid != supplyProductId }) {
+        return toolError(
+            "supply_id `$supplyId` resolves to multiple product_ids (${supplies.map { it.pid }.distinct()}); ambiguous",
+            locale,
+        )
+    }
+
+    // BOM containment: walk demand product's recipe tree, look for supply's product.
+    // Reuses the same BOM map pattern as toolGetBomTree but stops as soon as we
+    // find the target — and captures the path.
+    val bomByParent: Map<String, List<org.jetbrains.exposed.sql.ResultRow>> = transaction {
+        Boms.selectAll().where { Boms.caseId eq caseId }.toList().groupBy { it[Boms.parentId] }
+    }
+
+    data class BomStep(val from: String, val to: String, val rate: Double?, val altGroup: String?)
+    val bomPath: List<BomStep>? = run {
+        if (supplyProductId == demand.pid) return@run emptyList()
+        val parents = mutableMapOf<String, BomStep>()
+        val queue = ArrayDeque<String>()
+        queue.add(demand.pid)
+        val visited = mutableSetOf(demand.pid)
+        var found = false
+        while (queue.isNotEmpty()) {
+            val cur = queue.removeFirst()
+            val children = bomByParent[cur] ?: continue
+            for (row in children) {
+                val child = row[Boms.childId]
+                if (child in visited) continue
+                visited.add(child)
+                parents[child] = BomStep(cur, child, row[Boms.rate], row[Boms.altGroup])
+                if (child == supplyProductId) {
+                    found = true
+                    break
+                }
+                queue.add(child)
+            }
+            if (found) break
+        }
+        if (!found) null
+        else {
+            // Reconstruct from supplyProductId back to demand.pid.
+            val path = mutableListOf<BomStep>()
+            var cursor: String? = supplyProductId
+            while (cursor != null) {
+                val step = parents[cursor] ?: break
+                path.add(0, step)
+                cursor = step.from
+                if (cursor == demand.pid) break
+            }
+            path
+        }
+    }
+
+    val reachable: Boolean
+    val movePath: List<Map<String, Any?>>
+    val blocker: String?
+    if (bomPath == null) {
+        reachable = false
+        movePath = emptyList()
+        blocker = "supply's product `$supplyProductId` does not appear in demand's BOM (no transitive containment under `${demand.pid}`)"
+    } else {
+        // The supply's product needs to reach the consuming recipe's location.
+        // For a transitive BOM hit, the consuming location is the demand's
+        // top-level location_id (BOMs in this codebase are location-agnostic;
+        // method_make rows define which locations can produce a given product,
+        // and method_move shifts inventory between locations). The simplest
+        // heuristic: can the supply at its location reach the demand's location
+        // for the supply's own product? If they share a location, it's free.
+        val demandLocation = demand.lid ?: ""
+        val anyReachable = supplies.any { s ->
+            if (s.lid == demandLocation || demandLocation.isBlank()) true
+            else {
+                // Re-use BFS logic over method_move scoped to the supply's product.
+                val edges = transaction {
+                    MethodMoves.selectAll()
+                        .where { (MethodMoves.caseId eq caseId) and (MethodMoves.productId eq supplyProductId) }
+                        .map { Triple(it[MethodMoves.fromLocationId], it[MethodMoves.toLocationId], it[MethodMoves.transitTime] ?: 0.0) }
+                }
+                val edgesByFrom = edges.groupBy { it.first }
+                val q = ArrayDeque<String>()
+                q.add(s.lid)
+                val visited = mutableSetOf(s.lid)
+                var hit = false
+                while (q.isNotEmpty()) {
+                    val cur = q.removeFirst()
+                    if (cur == demandLocation) { hit = true; break }
+                    for (e in edgesByFrom[cur] ?: emptyList()) {
+                        if (e.second !in visited) { visited.add(e.second); q.add(e.second) }
+                    }
+                }
+                hit
+            }
+        }
+        reachable = anyReachable
+        movePath = if (anyReachable) {
+            // Compute the path for one matching supply (the first that reached).
+            // For simplicity, capture the source locations we have, and let the
+            // agent call find_move_path explicitly for the precise path if needed.
+            supplies.map { s ->
+                mapOf<String, Any?>(
+                    "supply_location" to s.lid,
+                    "supply_qty" to s.qty,
+                    "needs_move_to" to demandLocation,
+                )
+            }
+        } else emptyList()
+        blocker = if (anyReachable) null
+            else "supply at location(s) ${supplies.map { it.lid }.distinct()} cannot reach demand's location `$demandLocation` for product `$supplyProductId` via method_move chain"
+    }
+
+    val payload = buildJsonObject {
+        put("demand", buildJsonObject {
+            put("demand_id", JsonPrimitive(demandId))
+            put("product_id", JsonPrimitive(demand.pid))
+            put("location_id", JsonPrimitive(demand.lid))
+            put("quantity", JsonPrimitive(demand.qty))
+            if (demand.priority != null) put("priority", JsonPrimitive(demand.priority))
+        })
+        put("supply", buildJsonObject {
+            put("supply_id", JsonPrimitive(supplyId))
+            put("product_id", JsonPrimitive(supplyProductId))
+            put("locations", JsonArray(supplies.map { s ->
+                buildJsonObject {
+                    put("location_id", JsonPrimitive(s.lid))
+                    put("qty", JsonPrimitive(s.qty))
+                }
+            }))
+        })
+        put("reachable", JsonPrimitive(reachable))
+        put("bom_path", JsonArray((bomPath ?: emptyList()).map { step ->
+            buildJsonObject {
+                put("parent", JsonPrimitive(step.from))
+                put("child", JsonPrimitive(step.to))
+                put("rate", JsonPrimitive(step.rate))
+                if (step.altGroup != null) put("alt_group", JsonPrimitive(step.altGroup))
+            }
+        }))
+        put("move_path", JsonArray(movePath.map { anyToJson(it) }))
+        if (blocker != null) put("blocker", JsonPrimitive(blocker))
+    }
+    return ToolResult(
+        summary = loc(
+            if (reachable) "Demand $demandId CAN be fed by supply $supplyId (BOM depth ${bomPath?.size ?: 0})"
+            else "Demand $demandId CANNOT be fed by supply $supplyId — ${blocker?.take(80)}",
+            if (reachable) "需求 $demandId 可由供应 $supplyId 喂入（BOM 深度 ${bomPath?.size ?: 0}）"
+            else "需求 $demandId 无法由供应 $supplyId 喂入 — ${blocker?.take(80)}",
+            locale,
+        ),
+        payload = payload,
+    )
+}
+
 private fun toolGetRunConfig(caseId: Int, args: JsonObject, locale: String): ToolResult {
     val runId = args["run_id"]?.jsonPrimitive?.intOrNull
         ?: return toolError("`run_id` is required", locale)
@@ -1606,6 +3320,386 @@ private fun toolGetRunConfig(caseId: Int, args: JsonObject, locale: String): Too
             put("config", configJson)
             put("override_snapshot", overrideJson)
         },
+    )
+}
+
+/** Compare two plan runs side-by-side: config diff + KPI delta + soundness
+ *  delta. Pure data — the LLM articulates the mechanism story. Mirrors
+ *  [toolGetDemandPegging]'s data-tool pattern (no narrative bundling).
+ *
+ *  Performance: lazily loads `plan_run.result` only when KB has no snapshot
+ *  for the run's signature (matches the listing-endpoint optimization in
+ *  [Allocate.kt]).
+ */
+private fun toolCompareRuns(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val aId = args["run_a_id"]?.jsonPrimitive?.intOrNull
+        ?: return toolError("`run_a_id` is required", locale)
+    val bId = args["run_b_id"]?.jsonPrimitive?.intOrNull
+        ?: return toolError("`run_b_id` is required", locale)
+
+    data class RunSlot(
+        val id: Int,
+        val configJson: JsonObject,
+        val signature: String,
+        val kpis: JsonObject,
+        val soundnessStatus: String,
+    )
+
+    fun loadRun(runId: Int): RunSlot? = transaction {
+        val row = PlanRuns.selectAll()
+            .where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }
+            .firstOrNull() ?: return@transaction null
+        val cfgRaw = row[PlanRuns.config] ?: "{}"
+        val cfg = runCatching { jsonParser.parseToJsonElement(cfgRaw).jsonObject }
+            .getOrElse { JsonObject(emptyMap()) }
+        val sig = runCatching { CaseBootstrap.signatureFor(cfg) }.getOrElse { "" }
+        // KPI lookup: prefer KB row by signature; fall back to lazy result parse.
+        val kbBySig: Map<String, com.allocator.services.KbStore.KbRecord> =
+            com.allocator.services.KbStore.listForCase(caseId)
+        val kpis: JsonObject = kbBySig[sig]?.let { kb ->
+            runCatching { jsonParser.parseToJsonElement(kb.kpisSnapshotJson).jsonObject }.getOrNull()
+        } ?: com.allocator.services.KbStore.extractKpisFromResult(row[PlanRuns.result])
+        RunSlot(
+            id = runId,
+            configJson = cfg,
+            signature = sig,
+            kpis = kpis,
+            soundnessStatus = row[PlanRuns.soundnessStatus],
+        )
+    }
+
+    val a = loadRun(aId) ?: return toolError("plan run $aId not found for case $caseId", locale)
+    val b = loadRun(bId) ?: return toolError("plan run $bId not found for case $caseId", locale)
+
+    // Structural JSON diff — flatten paths, only emit entries that differ.
+    val configDiff: List<Map<String, Any?>> = diffJsonObjects(a.configJson, b.configJson, "")
+
+    // KPI delta — only over the standard set, b - a.
+    val kpiNames = listOf(
+        "fill_rate_pct", "gini", "p10_fill_ratio", "median_fill_ratio",
+        "starvation_pct", "on_time_count", "manufacturing_total_quantity",
+        "inventory_consumed_total", "total_committed", "total_requested",
+    )
+    val kpiDelta: Map<String, Double?> = kpiNames.associateWith { name ->
+        val av = (a.kpis[name] as? JsonPrimitive)?.contentOrNull?.toDoubleOrNull()
+        val bv = (b.kpis[name] as? JsonPrimitive)?.contentOrNull?.toDoubleOrNull()
+        if (av == null || bv == null) null else (bv - av)
+    }
+
+    val signatureMatch = a.signature == b.signature && a.signature.isNotBlank()
+    val payload = buildJsonObject {
+        put("a", buildJsonObject {
+            put("id", JsonPrimitive(a.id))
+            put("signature", JsonPrimitive(a.signature))
+            put("soundness_status", JsonPrimitive(a.soundnessStatus))
+            put("kpis", a.kpis)
+        })
+        put("b", buildJsonObject {
+            put("id", JsonPrimitive(b.id))
+            put("signature", JsonPrimitive(b.signature))
+            put("soundness_status", JsonPrimitive(b.soundnessStatus))
+            put("kpis", b.kpis)
+        })
+        put("signature_match", JsonPrimitive(signatureMatch))
+        put("config_diff", JsonArray(configDiff.map { entry -> anyToJson(entry) }))
+        put("kpi_delta", buildJsonObject {
+            for ((k, v) in kpiDelta) {
+                put(k, if (v == null) JsonNull else JsonPrimitive(v))
+            }
+        })
+        put("soundness_delta", JsonPrimitive("${a.soundnessStatus} → ${b.soundnessStatus}"))
+    }
+
+    val diffSummary = if (signatureMatch) "configs identical (signature match)"
+        else "${configDiff.size} config path(s) differ"
+    return ToolResult(
+        summary = loc(
+            "Compare runs $aId vs $bId — $diffSummary",
+            "对比运行 $aId 与 $bId — $diffSummary",
+            locale,
+        ),
+        payload = payload,
+    )
+}
+
+/** Recursive structural diff. For each leaf path that differs between [a] and
+ *  [b], emit `{path, a, b}`. Treats nested JsonObject as a sub-tree to diff;
+ *  arrays + primitives compared by structural equality. Order-agnostic via
+ *  the union-of-keys traversal. */
+private fun diffJsonObjects(a: JsonObject, b: JsonObject, prefix: String): List<Map<String, Any?>> {
+    val keys = (a.keys + b.keys).toSortedSet()
+    val result = mutableListOf<Map<String, Any?>>()
+    for (k in keys) {
+        val path = if (prefix.isEmpty()) k else "$prefix.$k"
+        val av = a[k]
+        val bv = b[k]
+        when {
+            av == null && bv == null -> {}  // unreachable but defensive
+            av == null -> result.add(mapOf("path" to path, "a" to null, "b" to jsonElementToAny(bv!!)))
+            bv == null -> result.add(mapOf("path" to path, "a" to jsonElementToAny(av), "b" to null))
+            av is JsonObject && bv is JsonObject -> result.addAll(diffJsonObjects(av, bv, path))
+            av != bv -> result.add(mapOf("path" to path, "a" to jsonElementToAny(av), "b" to jsonElementToAny(bv)))
+        }
+    }
+    return result
+}
+
+/** Unwrap a JsonElement into a Kotlin primitive/list/map for serialization
+ *  via [anyToJson]. Used by the diff to emit comparable values without
+ *  requiring the LLM to parse JsonElement strings. */
+private fun jsonElementToAny(e: JsonElement): Any? = when (e) {
+    is JsonNull -> null
+    is JsonPrimitive -> e.booleanOrNull ?: e.intOrNull ?: e.doubleOrNull ?: e.contentOrNull
+    is JsonArray -> e.map { jsonElementToAny(it) }
+    is JsonObject -> e.mapValues { jsonElementToAny(it.value) }
+}
+
+/**
+ * Explain a per-WO method choice — "why was method X picked over Y at node N?".
+ *
+ * Walks the FULL planning_pegging tree (not pruned for context-window safety
+ * like get_demand_pegging does) to find every work_order at the requested
+ * (product_id, location_id) and returns each with its method_choice_explanation
+ * + parent demand context. Also bundles the static alternatives at the site
+ * (from the method_* tables) and the run's method_selection config so the
+ * LLM can explain the selection criterion (preference int comparison vs
+ * elaborate composite scoring).
+ *
+ * The pegging-tree pruner I added earlier collapses fulfilled subtrees deeper
+ * than 2 levels, which means questions about successful WOs deep in the tree
+ * may not be answerable from get_demand_pegging alone. This tool bypasses the
+ * pruner by reading the un-pruned planning_pegging entry directly.
+ */
+private fun toolExplainMethodChoice(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val runId = args["run_id"]?.jsonPrimitive?.intOrNull
+        ?: return toolError("`run_id` is required", locale)
+    val productId = args["product_id"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`product_id` is required", locale)
+    val locationId = args["location_id"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`location_id` is required", locale)
+    if (productId.isBlank() || locationId.isBlank()) {
+        return toolError("`product_id` / `location_id` cannot be blank", locale)
+    }
+    val demandFilter = args["demand_id"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotBlank() }
+
+    val result = loadPlanResultFromDb(caseId, runId)
+        ?: return toolError("plan run $runId not found for case $caseId", locale)
+
+    @Suppress("UNCHECKED_CAST")
+    val planningPegging = (result["planning_pegging"] as? List<Map<String, Any?>>) ?: emptyList()
+
+    // Each match is one WO instance at the (pid, lid) site, with its parent
+    // demand context for disambiguation. The same site can appear under
+    // multiple parents (e.g., consolidated component shared by multiple FGs).
+    data class WoMatch(
+        val demandId: String?,
+        val parentPid: String?, val parentLid: String?, val parentQty: Double?,
+        val woMethod: String,
+        val woQty: Double,
+        val woFailed: Boolean,
+        val methodExplanation: String?,
+        val variantExplanation: String?,
+        val locationSource: String?,
+    )
+
+    val matches = mutableListOf<WoMatch>()
+
+    @Suppress("UNCHECKED_CAST")
+    fun walk(node: Map<String, Any?>, parentPid: String?, parentLid: String?, parentQty: Double?, demandId: String?) {
+        val type = node["type"] as? String
+        when (type) {
+            "demand" -> {
+                val nextPid = node["product_id"] as? String
+                val nextLid = node["location_id"] as? String
+                val nextQty = (node["quantity"] as? Number)?.toDouble()
+                val children = node["children"] as? List<Map<String, Any?>> ?: return
+                // Parent of a WO is the demand directly above it; recurse with
+                // this demand as the parent context.
+                for (c in children) walk(c, nextPid, nextLid, nextQty, demandId)
+            }
+            "work_order" -> {
+                val pid = (node["product_id"] as? String)?.trim()
+                val lid = (node["location_id"] as? String)?.trim()
+                if (pid == productId && lid == locationId) {
+                    matches.add(WoMatch(
+                        demandId = demandId,
+                        parentPid = parentPid, parentLid = parentLid, parentQty = parentQty,
+                        woMethod = (node["method"] as? String) ?: "",
+                        woQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0,
+                        woFailed = node["failed"] == true,
+                        methodExplanation = node["method_choice_explanation"] as? String,
+                        variantExplanation = node["variant_choice_explanation"] as? String,
+                        locationSource = node["location_source"] as? String,
+                    ))
+                }
+                val children = node["children"] as? List<Map<String, Any?>> ?: return
+                for (c in children) walk(c, parentPid, parentLid, parentQty, demandId)
+            }
+            else -> {
+                val children = node["children"] as? List<Map<String, Any?>> ?: return
+                for (c in children) walk(c, parentPid, parentLid, parentQty, demandId)
+            }
+        }
+    }
+
+    for (entry in planningPegging) {
+        val entryDemandId = entry["demand_id"]?.toString()
+        if (demandFilter != null && entryDemandId != demandFilter) continue
+        @Suppress("UNCHECKED_CAST")
+        val tree = entry["tree"] as? Map<String, Any?> ?: continue
+        walk(tree, null, null, null, entryDemandId)
+    }
+
+    // Static alternatives at the site (regardless of which one the planner
+    // picked). Caller can compare the chosen method to these to articulate
+    // "elaborate scored make@2000 higher than move-from-1000@2000 because…".
+    val availableMethods: List<Map<String, Any?>> = transaction {
+        val makes = MethodMakes.selectAll()
+            .where { (MethodMakes.caseId eq caseId) and (MethodMakes.productId eq productId) and (MethodMakes.locationId eq locationId) }
+            .map { mapOf("type" to "make", "location" to it[MethodMakes.locationId], "preference" to it[MethodMakes.preference], "lead_time" to it[MethodMakes.leadTime]) }
+        val moves = MethodMoves.selectAll()
+            .where { (MethodMoves.caseId eq caseId) and (MethodMoves.productId eq productId) and (MethodMoves.toLocationId eq locationId) }
+            .map { mapOf("type" to "move", "from" to it[MethodMoves.fromLocationId], "to" to it[MethodMoves.toLocationId], "preference" to it[MethodMoves.preference], "transit_time" to it[MethodMoves.transitTime]) }
+        val buys = MethodBuys.selectAll()
+            .where { (MethodBuys.caseId eq caseId) and (MethodBuys.productId eq productId) and (MethodBuys.locationId eq locationId) }
+            .map { mapOf("type" to "buy", "location" to it[MethodBuys.locationId], "preference" to it[MethodBuys.preference]) }
+        (makes + moves + buys).sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
+    }
+
+    // Run config so the LLM knows the selection criterion (preference vs elaborate)
+    // and the score weights / depth caps in effect.
+    val configRaw = transaction {
+        PlanRuns.selectAll().where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }
+            .firstOrNull()?.get(PlanRuns.config)
+    }
+    val configJsonFull: JsonObject = configRaw?.let { raw ->
+        runCatching { jsonParser.parseToJsonElement(raw).jsonObject }.getOrNull()
+    } ?: JsonObject(emptyMap())
+    val msConfig: JsonObject = (configJsonFull["method_selection"] as? JsonObject) ?: JsonObject(emptyMap())
+    val purchaseAllowed = configJsonFull["purchase_allowed"]?.jsonPrimitive?.booleanOrNull != false
+    val mode = msConfig["mode"]?.jsonPrimitive?.contentOrNull ?: "preference"
+    val maxMethods = msConfig["max_methods"]?.jsonPrimitive?.intOrNull ?: 2
+
+    // ── Per-alternative status classification (supply-side override use-case) ──
+    //
+    // Symmetric to the demand-side `members` enrichment in get_leaf_competition.
+    // For each method in `available_methods_at_site`, classify against the
+    // chosen method(s) + selection criteria + cascade-probe failures captured
+    // in pegging. Yields actionable "would_admit_if" hints so the agent can
+    // narrate "method 2 was eliminated by max_methods cap of 2 — bump to 3
+    // to admit it" (or "manually override method_selection at this site").
+    //
+    // Status values (mirrors the demand-side taxonomy):
+    //   • chosen                   — selected by the planner; in matches
+    //   • lower_preference         — preference > chosen waterfall's max
+    //                                (cascade mode picked a higher-ranked one)
+    //   • beyond_max_methods       — preference rank exceeds methodCfg.maxMethods
+    //   • purchase_disabled        — type=buy with purchase_allowed=false
+    //   • failed_cascade_probe     — appears in pegging with failed=true
+    //                                (cascade picker tried, BOM probe blocked)
+    //   • score_lower              — elaborate mode catch-all for losing alts
+    //   • unknown_not_chosen       — neither chosen nor matched a known reason
+
+    data class MethodKey(val type: String, val fromLoc: String?)
+    fun keyOf(m: WoMatch): MethodKey =
+        MethodKey(m.woMethod, m.locationSource?.takeIf { it.isNotBlank() })
+    fun keyOfAvail(am: Map<String, Any?>): MethodKey =
+        MethodKey((am["type"] as? String) ?: "", am["from"] as? String)
+
+    val chosenSucceededKeys: Set<MethodKey> = matches
+        .filter { !it.woFailed }
+        .map { keyOf(it) }.toSet()
+    val failedCascadeKeys: Set<MethodKey> = matches
+        .filter { it.woFailed }
+        .map { keyOf(it) }.toSet()
+    // Among admitted (non-failed) chosen methods, the highest preference is
+    // the cascade's "last waterfall slot" — alternatives beyond this lose by
+    // ranking. Used to classify lower_preference vs beyond_max_methods.
+    val chosenSucceededPrefs = availableMethods
+        .filter { keyOfAvail(it) in chosenSucceededKeys }
+        .mapNotNull { (it["preference"] as? Number)?.toInt() }
+    val chosenMaxPref = chosenSucceededPrefs.maxOrNull()
+
+    val classifiedMethods: List<Map<String, Any?>> = availableMethods.mapIndexed { rank, am ->
+        val key = keyOfAvail(am)
+        val amType = key.type
+        val amPref = (am["preference"] as? Number)?.toInt()
+        val (status, reason, hint) = when {
+            key in chosenSucceededKeys ->
+                Triple("chosen", "selected by the planner at this site", null)
+            amType == "buy" && !purchaseAllowed ->
+                Triple("purchase_disabled", "method type=buy but purchase_allowed=false on this run", "set purchase_allowed=true (or manually override method_selection)")
+            key in failedCascadeKeys ->
+                Triple("failed_cascade_probe", "cascade picker tried this method but its BOM probe blocked deeper (failed=true in pegging)", "non-trivial — fix upstream inventory or methods at the deeper bottleneck (call get_demand_pegging on a relevant demand to trace)")
+            // beyond_max_methods: this alt's rank (1-based) > maxMethods AND
+            // its preference is worse than chosen's last slot. Only meaningful
+            // when waterfall is on (maxMethods > 1).
+            amPref != null && chosenMaxPref != null && amPref > chosenMaxPref && (rank + 1) > maxMethods ->
+                Triple("beyond_max_methods", "preference $amPref ranks position ${rank + 1} which exceeds max_methods=$maxMethods", "set method_selection.max_methods >= ${rank + 1} (or manually override method_selection)")
+            // lower_preference: preference is worse than chosen, but within
+            // the max_methods cap — meaning the cascade simply preferred the
+            // higher-ranked one and the residual didn't reach this slot.
+            amPref != null && chosenMaxPref != null && amPref > chosenMaxPref ->
+                Triple("lower_preference", "preference $amPref > chosen waterfall's max preference $chosenMaxPref; cascade ordering elected the higher-ranked method", "manual method_selection override OR re-rank this method's preference in method_${amType} CSV")
+            // elaborate-mode catch-all for losing alternatives.
+            mode == "elaborate" ->
+                Triple("score_lower", "elaborate composite scoring placed this method below the chosen one (exact rejected score not persisted)", "manual method_selection override OR change method_selection.score_weights to favor the dimension this method is strong on")
+            else ->
+                Triple("unknown_not_chosen", "not chosen for an unidentified reason (no preference comparison applies); inspect the run config or the chosen WO's method_choice_explanation", "manual method_selection override at this site")
+        }
+        am + mapOf<String, Any?>(
+            "status" to status,
+            "presumed_reason" to reason,
+            "would_admit_if" to hint,
+        )
+    }
+
+    val payload = buildJsonObject {
+        put("product_id", JsonPrimitive(productId))
+        put("location_id", JsonPrimitive(locationId))
+        if (demandFilter != null) put("demand_id_filter", JsonPrimitive(demandFilter))
+        put("match_count", JsonPrimitive(matches.size))
+        put("matches", JsonArray(matches.map { m ->
+            buildJsonObject {
+                put("demand_id", m.demandId?.let { JsonPrimitive(it) } ?: JsonNull)
+                put("parent_pid", m.parentPid?.let { JsonPrimitive(it) } ?: JsonNull)
+                put("parent_lid", m.parentLid?.let { JsonPrimitive(it) } ?: JsonNull)
+                put("parent_qty", m.parentQty?.let { JsonPrimitive(it) } ?: JsonNull)
+                put("chosen_method", JsonPrimitive(m.woMethod))
+                put("wo_qty", JsonPrimitive(m.woQty))
+                put("failed", JsonPrimitive(m.woFailed))
+                put("method_choice_explanation", m.methodExplanation?.let { JsonPrimitive(it) } ?: JsonNull)
+                if (m.variantExplanation != null) put("variant_choice_explanation", JsonPrimitive(m.variantExplanation))
+                if (m.locationSource != null) put("location_source", JsonPrimitive(m.locationSource))
+            }
+        }))
+        put("available_methods_at_site", anyToJson(classifiedMethods))
+        put("selection_mode", JsonPrimitive(mode))
+        put("max_methods", JsonPrimitive(maxMethods))
+        put("max_bom_depth", JsonPrimitive(msConfig["max_bom_depth"]?.jsonPrimitive?.intOrNull ?: 3))
+        put("purchase_allowed", JsonPrimitive(purchaseAllowed))
+        msConfig["score_weights"]?.let { put("score_weights", it) }
+        put("override_levers", buildJsonArray {
+            // Symmetric to get_leaf_competition's override_levers — names the
+            // supply-side override paths so the agent can recommend the right
+            // one based on the alternative's `status`.
+            add(JsonPrimitive("manual_override.method_selection — pin a specific method at this (pid, lid) site"))
+            add(JsonPrimitive("change method_selection.max_methods — admit more waterfall slots"))
+            add(JsonPrimitive("change method_selection.max_bom_depth — admit make alternatives with deeper recipes"))
+            add(JsonPrimitive("change method_selection.mode (preference / elaborate) — switch the selection criterion"))
+            add(JsonPrimitive("change method_selection.score_weights — re-weight commit_time / inventory_consumed / purchase (elaborate only)"))
+            add(JsonPrimitive("change purchase_allowed — admit/exclude method_buy"))
+            add(JsonPrimitive("change preference values in method_make/move/buy CSV — re-rank globally"))
+        })
+    }
+
+    val sumEn = if (matches.isEmpty()) "No WO at $productId@$locationId in run $runId"
+        else "${matches.size} WO match(es) for $productId@$locationId — chosen: ${matches.first().woMethod} (${availableMethods.size} method(s) available at site)"
+    val sumZh = if (matches.isEmpty()) "运行 $runId 未找到 $productId@$locationId 的 WO"
+        else "$productId@$locationId 匹配 ${matches.size} 个 WO — 选用：${matches.first().woMethod}（站点可用方法 ${availableMethods.size} 个）"
+    return ToolResult(
+        summary = loc(sumEn, sumZh, locale),
+        payload = payload,
     )
 }
 
@@ -1787,6 +3881,7 @@ private suspend fun runAgentLoop(
     userMessage: String,
     initialConfig: JsonObject,
     history: List<AgentHistoryItem>,
+    viewingRunId: Int? = null,
 ): AgentResponse {
     var workingConfig = initialConfig
     var freshRunId: Int? = null
@@ -1810,7 +3905,25 @@ private suspend fun runAgentLoop(
     //                            current.
     //   3. <memory>            — per-case agent_memory entries
     //   4. <current_config>    — the working PlanningConfig
+    //   5. <viewing_run_id>    — the run the user is currently viewing on the
+    //                            page (from the request); the default anchor
+    //                            for run-scoped questions without a number.
+    //   6. <active_run_id>     — the case's designated active run (or latest
+    //                            successful), via resolveActiveRunId; the
+    //                            secondary fallback when nothing is being
+    //                            viewed.
     val memory = loadMemory(caseId)
+    // Resolve the case's active run id with the same logic the rest of the
+    // app uses (designated → falls back to latest success). When the case has
+    // no successful runs yet this is null and the agent must ask the user.
+    val activeRunId: Int? = transaction {
+        val designatedId = Cases.selectAll().where { Cases.id eq caseId }
+            .firstOrNull()?.get(Cases.designatedActivePlanRunId)
+        val successIds = PlanRuns.selectAll()
+            .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
+            .map { it[PlanRuns.id] }
+        com.allocator.services.resolveActiveRunId(designatedId, successIds)
+    }
     val systemWithMemory = buildString {
         append(SYSTEM_PROMPT_INTRO)
         if (AGENT_KNOWLEDGE.isNotBlank()) {
@@ -1823,6 +3936,12 @@ private suspend fun runAgentLoop(
         append("\n\n<current_config>\n")
         append(workingConfig.toString())
         append("\n</current_config>")
+        append("\n\n<viewing_run_id>")
+        append(viewingRunId?.toString() ?: "(none)")
+        append("</viewing_run_id>")
+        append("\n<active_run_id>")
+        append(activeRunId?.toString() ?: "(none)")
+        append("</active_run_id>")
     }
 
     val convo = mutableListOf<LlmAgentMessage>()
@@ -1924,6 +4043,13 @@ private suspend fun dispatchTool(
         "get_product_methods" -> Pair(toolGetProductMethods(caseId, args, locale), workingConfig)
         "get_product_supply" -> Pair(toolGetProductSupply(caseId, args, locale), workingConfig)
         "get_leaf_competition" -> Pair(toolGetLeafCompetition(caseId, args, locale), workingConfig)
+        "get_bom_tree" -> Pair(toolGetBomTree(caseId, args, locale), workingConfig)
+        "find_move_path" -> Pair(toolFindMovePath(caseId, args, locale), workingConfig)
+        "trace_demand_to_supply" -> Pair(toolTraceDemandToSupply(caseId, args, locale), workingConfig)
+        "compare_runs" -> Pair(toolCompareRuns(caseId, args, locale), workingConfig)
+        "explain_method_choice" -> Pair(toolExplainMethodChoice(caseId, args, locale), workingConfig)
+        "recommend_config" -> Pair(toolRecommendConfig(caseId, args, locale), workingConfig)
+        "query_design_docs" -> Pair(toolQueryDesignDocs(args, locale), workingConfig)
         "get_run_config" -> Pair(toolGetRunConfig(caseId, args, locale), workingConfig)
         "recheck_soundness" -> Pair(toolRecheckSoundness(caseId, args, locale), workingConfig)
         "get_soundness_summary" -> Pair(toolGetSoundnessSummary(caseId, args, locale), workingConfig)
@@ -1956,7 +4082,7 @@ fun Routing.planningAgentRoutes() {
         val history = req.history ?: emptyList()
 
         val response = try {
-            runAgentLoop(caseId, userMessage, initialConfig, history)
+            runAgentLoop(caseId, userMessage, initialConfig, history, req.viewingRunId)
         } catch (e: LlmNotConfiguredException) {
             log.warn("planning-agent: LLM not configured: {}", e.message)
             call.respond(

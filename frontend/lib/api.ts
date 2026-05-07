@@ -1,6 +1,6 @@
 const API = typeof window !== 'undefined' ? '/allocator/api' : 'http://localhost:8000';
 
-export type Case = { id: number; name: string; created_at: string; demand_count?: number; supply_count?: number; run_count?: number; plan_run_count?: number };
+export type Case = { id: number; name: string; created_at: string; demand_count?: number; supply_count?: number; run_count?: number; plan_run_count?: number; active_plan_run_id?: number | null };
 export type AllocationRun = { id: number; case_id: number; created_at: string; status: string; config?: Record<string, unknown> };
 export type AllocationAction = { id: number; run_id: number; variant_key: string; req_component_ids: string[]; qty: number; demand_id?: string; target_product_id?: string; target_location_id?: string };
 export type FeasibleDemand = { demand_id: string; customer_id?: string | null; customer?: string | null; product_id: string; requested_qty: number; allocated_qty: number; fulfillment_rate?: number | null; status: string; suggested_revision?: string; request_due_time?: string | null; revised_time?: string | null };
@@ -577,7 +577,11 @@ export async function planningAgent(
   caseId: number,
   message: string,
   currentConfig: PlanningConfig,
-  history: PlanningCopilotMessage[]
+  history: PlanningCopilotMessage[],
+  /** The plan_run id the user is currently viewing on the page. Lets the agent
+   *  default to this run when the user asks a run-scoped question without
+   *  naming a number. Pass null when no run is selected. */
+  viewingRunId: number | null
 ): Promise<PlanningAgentResponse> {
   const r = await fetch(`${API}/cases/${caseId}/planning-agent`, {
     method: 'POST',
@@ -587,6 +591,7 @@ export async function planningAgent(
       current_config: currentConfig,
       // The agent's history shape mirrors the copilot's: role + content.
       history: history.map((m) => ({ role: m.role, content: m.text })),
+      viewing_run_id: viewingRunId,
     }),
   });
   if (!r.ok) throw new Error(await r.text());

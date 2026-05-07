@@ -80,6 +80,11 @@ fun Routing.caseRoutes() {
                     val supplyCount   = Supplies.selectAll().where { Supplies.caseId eq caseId }.count().toInt()
                     val allocRunCount = AllocationRuns.selectAll().where { AllocationRuns.caseId eq caseId }.count().toInt()
                     val planRunCount  = PlanRuns.selectAll().where { PlanRuns.caseId eq caseId }.count().toInt()
+                    val designatedId  = c[Cases.designatedActivePlanRunId]
+                    val successIds    = PlanRuns.selectAll()
+                        .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
+                        .map { it[PlanRuns.id] }
+                    val activePlanRunId = com.allocator.services.resolveActiveRunId(designatedId, successIds)
                     CaseDetailResponse(
                         id = c[Cases.id],
                         name = c[Cases.name],
@@ -88,6 +93,7 @@ fun Routing.caseRoutes() {
                         supplyCount  = supplyCount,
                         runCount     = allocRunCount,
                         planRunCount = planRunCount,
+                        activePlanRunId = activePlanRunId,
                     )
                 }
                 call.respond(detail)
