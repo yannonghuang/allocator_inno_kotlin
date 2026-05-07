@@ -539,4 +539,306 @@ object KbStore {
         val frontier = paretoFrontierPure(filtered, maximize, minimize)
         return ParetoResult(frontier = frontier, totalInKb = all.size, errors = emptyList())
     }
+
+    // ── Recommend-config router (Layer-3 multi-objective wrapper) ───────────────
+
+    /** Maps a user-facing objective string to (primary KPI to optimize, direction).
+     *  Direction: true = maximize, false = minimize. */
+    private val OBJECTIVE_TO_KPI: Map<String, Pair<String, Boolean>> = mapOf(
+        "best_fill"           to ("fill_rate_pct" to true),
+        "best_fairness"       to ("gini" to false),
+        "least_purchase"      to ("total_requested" to false),
+        "most_inventory_use"  to ("inventory_consumed_total" to true),
+        "earliest_commit"     to ("on_time_count" to true),
+        "fewest_starvation"   to ("starvation_pct" to false),
+    )
+
+    /** Sensible secondary axis when only an objective is given (no constraint).
+     *  Pareto pairing: primary objective vs the natural counter-axis. */
+    private val OBJECTIVE_DEFAULT_SECONDARY: Map<String, Pair<String, Boolean>> = mapOf(
+        "best_fill"           to ("gini" to false),
+        "best_fairness"       to ("fill_rate_pct" to true),
+        "least_purchase"      to ("on_time_count" to true),
+        "most_inventory_use"  to ("total_requested" to false),
+        "earliest_commit"     to ("gini" to false),
+        "fewest_starvation"   to ("fill_rate_pct" to true),
+    )
+
+    /** Result of [recommendConfig]. `headline` is the recommended row;
+     *  `alternates` are 1-2 nearby Pareto points or runner-ups in a sorted query. */
+    data class RecommendResult(
+        val headline: KbRecord?,
+        val alternates: List<KbRecord>,
+        val rationale: String,
+        val frontierSummary: String?,
+        val totalInKb: Int,
+        val source: String,                 // "kb_pareto" | "kb_query" | "novel" | "kb_pareto_default" | "empty_kb"
+        val errors: List<String>,
+    )
+
+    /** Hard-constraint shape passed to [recommendConfig]. */
+    data class HardConstraint(val kpi: String, val op: String, val value: Double)
+
+    /** Soft-constraint qualifier — translates to a knee-detection threshold on the
+     *  secondary axis. "reasonable" picks the knee; "strict" tightens the
+     *  threshold (top-half of the secondary axis range). */
+    data class SoftConstraint(val kpi: String, val qualifier: String)
+
+    /**
+     * Multi-objective router. Decides between three branches based on which
+     * arguments are populated:
+     *
+     *   1. `novelOnly = true`  → defer to [CaseBootstrap.selectNextBatch] for
+     *                            single-axis variations off the case's current
+     *                            best on the requested objective.
+     *   2. `hardConstraint`    → translate to a [KbQueryFilter] and sort by the
+     *                            objective. Returns top-3 from the filtered set.
+     *   3. otherwise (with or without `softConstraint`) → Pareto frontier on
+     *                            the objective × secondary axis, then knee
+     *                            detection (max distance from the utopia line)
+     *                            to pick the headline + 1-2 nearby points.
+     *
+     *  Pure data — caller (the agent tool dispatch) renders the rationale + ships
+     *  it to the LLM. The rationale string is informational only; the LLM still
+     *  articulates the mechanism using agent-knowledge.md tactics.
+     */
+    fun recommendConfig(
+        caseId: Int,
+        objective: String,
+        softConstraint: SoftConstraint? = null,
+        hardConstraint: HardConstraint? = null,
+        novelOnly: Boolean = false,
+    ): RecommendResult {
+        val errors = mutableListOf<String>()
+        val (primaryKpi, primaryMaximize) = OBJECTIVE_TO_KPI[objective] ?: run {
+            return RecommendResult(
+                null, emptyList(), "", null, 0, "error",
+                listOf("unknown objective `$objective` — allowed: ${OBJECTIVE_TO_KPI.keys.sorted()}"),
+            )
+        }
+        if (hardConstraint != null && hardConstraint.kpi !in KPI_ALLOWLIST) {
+            errors.add("unknown KPI in hard_constraint: ${hardConstraint.kpi}")
+        }
+        if (softConstraint != null && softConstraint.kpi !in KPI_ALLOWLIST) {
+            errors.add("unknown KPI in soft_constraint: ${softConstraint.kpi}")
+        }
+        if (errors.isNotEmpty()) {
+            return RecommendResult(null, emptyList(), "", null, 0, "error", errors)
+        }
+
+        // Branch 1: novel-only. Wraps CaseBootstrap.selectNextBatch with the
+        // criterion mapped from the objective. Returns proposals as fake KbRecord-
+        // shaped rows so the tool result shape stays uniform; the `source` field
+        // and the rationale text disambiguate.
+        if (novelOnly) {
+            val criterion = when (objective) {
+                "best_fill" -> CaseBootstrap.CRITERION_FILL_RATE
+                "best_fairness" -> CaseBootstrap.CRITERION_FAIRNESS
+                else -> CaseBootstrap.CRITERION_PARETO
+            }
+            val candidates = CaseBootstrap.selectNextBatch(caseId, batchSize = 3, criterion = criterion)
+            if (candidates.isEmpty()) {
+                return RecommendResult(
+                    null, emptyList(),
+                    "Curated single-axis library is exhausted for this case — every variation around the current best is already in the KB or a non-failed plan_run.",
+                    null, listForCase(caseId).size, "novel", emptyList(),
+                )
+            }
+            // Render the first candidate as the headline; remaining as alternates.
+            val total = listForCase(caseId).size
+            return RecommendResult(
+                headline = candidates.first().toKbRecordShape(),
+                alternates = candidates.drop(1).map { it.toKbRecordShape() },
+                rationale = "Novel single-axis variations off the current best (criterion=$criterion). " +
+                    "Headline: ${candidates.first().label} (axis: ${candidates.first().primaryAxis}). " +
+                    "Run via update_config + run_plan_async to actually queue.",
+                frontierSummary = null,
+                totalInKb = total,
+                source = "novel",
+                errors = emptyList(),
+            )
+        }
+
+        // Branch 2: hard constraint. Translate to KbQueryFilter and sort by objective.
+        if (hardConstraint != null) {
+            val filter = hardConstraintToFilter(hardConstraint)
+            val sortBy = when (objective) {
+                "best_fill" -> KbSortBy.FILL_RATE_DESC
+                "best_fairness" -> KbSortBy.GINI_ASC
+                "fewest_starvation" -> KbSortBy.STARVATION_ASC
+                else -> KbSortBy.FILL_RATE_DESC   // fallback — agent can refine
+            }
+            val r = query(caseId, filter, sortBy, limit = 5)
+            if (r.rows.isEmpty()) {
+                return RecommendResult(
+                    null, emptyList(),
+                    "No KB row satisfies the hard constraint ${hardConstraint.kpi} ${hardConstraint.op} ${hardConstraint.value}. Try relaxing it, or call recommend_config with novel_only=true to explore.",
+                    null, r.totalInKb, "kb_query", emptyList(),
+                )
+            }
+            return RecommendResult(
+                headline = r.rows.first(),
+                alternates = r.rows.drop(1).take(2),
+                rationale = "Best $objective subject to ${hardConstraint.kpi} ${hardConstraint.op} ${hardConstraint.value}: " +
+                    "${r.rows.size} of ${r.totalInKb} KB rows pass; headline ranked by $objective.",
+                frontierSummary = null,
+                totalInKb = r.totalInKb,
+                source = "kb_query",
+                errors = emptyList(),
+            )
+        }
+
+        // Branch 3: soft constraint or pure objective → Pareto + knee detection.
+        val (secondaryKpi, secondaryMaximize) = if (softConstraint != null) {
+            // soft_constraint names the secondary axis explicitly. Direction infers
+            // from "reasonable" (lower = better → minimize for gini-like KPIs;
+            // higher = better for fill-like KPIs). Use the allowlist heuristic:
+            // KPIs that are "lower-is-better" by convention.
+            val lowerBetter = setOf("gini", "starvation_pct", "total_requested")
+            (softConstraint.kpi to (softConstraint.kpi !in lowerBetter))
+        } else {
+            OBJECTIVE_DEFAULT_SECONDARY[objective]
+                ?: ("gini" to false)
+        }
+        val maximize = mutableListOf<String>()
+        val minimize = mutableListOf<String>()
+        if (primaryMaximize) maximize.add(primaryKpi) else minimize.add(primaryKpi)
+        if (secondaryMaximize) maximize.add(secondaryKpi) else minimize.add(secondaryKpi)
+        // De-dup if primary == secondary (degenerate case).
+        val maxList = maximize.distinct()
+        val minList = minimize.distinct()
+
+        val p = paretoFrontier(caseId, maxList, minList, KbQueryFilter())
+        if (p.errors.isNotEmpty()) {
+            return RecommendResult(null, emptyList(), "", null, p.totalInKb, "error", p.errors)
+        }
+        if (p.frontier.isEmpty()) {
+            return RecommendResult(
+                null, emptyList(),
+                "KB is empty (or no rows passed pre-filter). Run bootstrap to seed runs first.",
+                null, p.totalInKb, "empty_kb", emptyList(),
+            )
+        }
+        // Knee detection on the 2D frontier (primary, secondary).
+        val (knee, alternates, summary) = pickKnee(
+            p.frontier, primaryKpi, primaryMaximize, secondaryKpi, secondaryMaximize,
+        )
+        val source = if (softConstraint != null) "kb_pareto" else "kb_pareto_default"
+        val qualifierText = softConstraint?.qualifier?.let { " ($it)" } ?: ""
+        val rationale = buildString {
+            append("$objective via Pareto on $primaryKpi × $secondaryKpi$qualifierText. ")
+            append("${p.frontier.size} frontier points; ")
+            append("knee at $primaryKpi=${headlineKpi(knee, primaryKpi)}, $secondaryKpi=${headlineKpi(knee, secondaryKpi)}. ")
+            if (softConstraint == null) {
+                append("(No soft constraint given; using default secondary axis $secondaryKpi. ")
+                append("Pass soft_constraint to anchor a different counter-axis.)")
+            }
+        }
+        return RecommendResult(
+            headline = knee,
+            alternates = alternates,
+            rationale = rationale,
+            frontierSummary = summary,
+            totalInKb = p.totalInKb,
+            source = source,
+            errors = emptyList(),
+        )
+    }
+
+    private fun headlineKpi(rec: KbRecord, kpi: String): String {
+        val v = parseKpiSnapshot(rec.kpisSnapshotJson)[kpi] ?: return "—"
+        return "%.3f".format(v).trimEnd('0').trimEnd('.')
+    }
+
+    private fun hardConstraintToFilter(hc: HardConstraint): KbQueryFilter {
+        // Map (kpi, op, value) onto KbQueryFilter's existing fields where possible;
+        // unsupported combinations fall through with no filter (agent will see the
+        // full list and can re-filter). Today the filter supports min_fill_rate /
+        // max_gini / min_p10_fill — extend if needed as new constraints appear.
+        return when (hc.kpi to hc.op) {
+            "fill_rate_pct" to ">=" -> KbQueryFilter(minFillRate = hc.value)
+            "fill_rate_pct" to ">"  -> KbQueryFilter(minFillRate = hc.value + 1e-6)
+            "gini" to "<="          -> KbQueryFilter(maxGini = hc.value)
+            "gini" to "<"           -> KbQueryFilter(maxGini = hc.value - 1e-6)
+            "p10_fill_ratio" to ">=" -> KbQueryFilter(minP10Fill = hc.value)
+            "p10_fill_ratio" to ">"  -> KbQueryFilter(minP10Fill = hc.value + 1e-6)
+            else -> KbQueryFilter()   // unsupported combination — return everything
+        }
+    }
+
+    /**
+     * Knee detection on a 2D Pareto frontier. The "knee" is the point where the
+     * trade-off bends sharpest — the typical "best balance" recommendation.
+     *
+     * Algorithm: max distance from the line connecting the two extreme frontier
+     * points (utopia/anti-utopia line). Robust on ≤ ~50 points; trivial cost.
+     * Returns (knee, [up to 2 alternates], frontierSummary).
+     */
+    private fun pickKnee(
+        frontier: List<KbRecord>,
+        primaryKpi: String, primaryMaximize: Boolean,
+        secondaryKpi: String, secondaryMaximize: Boolean,
+    ): Triple<KbRecord, List<KbRecord>, String> {
+        if (frontier.size == 1) {
+            val single = frontier.single()
+            val k = parseKpiSnapshot(single.kpisSnapshotJson)
+            val pv = k[primaryKpi]
+            val sv = k[secondaryKpi]
+            val summary = "Single-point frontier: $primaryKpi=${pv}, $secondaryKpi=${sv}."
+            return Triple(single, emptyList(), summary)
+        }
+        // Project to (primary, secondary) coords; flip signs so "better" is always +.
+        data class Pt(val rec: KbRecord, val x: Double, val y: Double)
+        val pts = frontier.mapNotNull { rec ->
+            val k = parseKpiSnapshot(rec.kpisSnapshotJson)
+            val px = k[primaryKpi] ?: return@mapNotNull null
+            val py = k[secondaryKpi] ?: return@mapNotNull null
+            val x = if (primaryMaximize) px else -px
+            val y = if (secondaryMaximize) py else -py
+            Pt(rec, x, y)
+        }.sortedBy { it.x }
+        if (pts.size < 2) {
+            // All rows missing one of the KPIs. Fall back to the first frontier row.
+            val r = frontier.first()
+            return Triple(r, emptyList(), "Insufficient KPI coverage to compute knee; returning frontier[0].")
+        }
+        // Line from pts.first() to pts.last(); compute perpendicular distance for each.
+        val a = pts.first(); val b = pts.last()
+        val dx = b.x - a.x; val dy = b.y - a.y
+        val denom = kotlin.math.sqrt(dx * dx + dy * dy).coerceAtLeast(1e-9)
+        val withDist = pts.map { p ->
+            val num = kotlin.math.abs(dy * p.x - dx * p.y + b.x * a.y - b.y * a.x)
+            p to (num / denom)
+        }
+        val knee = withDist.maxBy { it.second }.first
+        val alternates = withDist
+            .filter { it.first.rec.id != knee.rec.id }
+            .sortedByDescending { it.second }
+            .take(2)
+            .map { it.first.rec }
+        val xs = pts.map { it.x }
+        val ys = pts.map { it.y }
+        val xRange = "%.3f".format(xs.min()) + "–" + "%.3f".format(xs.max())
+        val yRange = "%.3f".format(ys.min()) + "–" + "%.3f".format(ys.max())
+        val summary = "${pts.size} frontier points; ${primaryKpi}${if (primaryMaximize) "" else " (negated)"} spans $xRange, " +
+            "${secondaryKpi}${if (secondaryMaximize) "" else " (negated)"} spans $yRange."
+        return Triple(knee.rec, alternates, summary)
+    }
+
+    /** Synthesize a KbRecord-shaped row from a CaseBootstrap.BootstrapPreset for
+     *  uniform tool-output shape on the novel branch. KPI snapshot is empty —
+     *  the candidate hasn't been run yet. */
+    private fun BootstrapPreset.toKbRecordShape(): KbRecord = KbRecord(
+        id = -1,
+        caseId = -1,
+        signature = CaseBootstrap.signatureFor(config),
+        presetId = presetId,
+        presetLabel = label,
+        primaryAxis = primaryAxis,
+        configJson = config.toString(),
+        kpisSnapshotJson = "{}",
+        sourcePlanRunId = null,
+        sourcePlanRunDeleted = false,
+        soundnessStatus = "unchecked",
+    )
 }

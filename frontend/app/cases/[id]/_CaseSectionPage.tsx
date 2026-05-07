@@ -24,7 +24,6 @@ import {
   runPlan,
   runPlanAsync,
   getPlanStatus,
-  planningCopilot,
   planningAgent,
   listActivePlanJobs,
   type ActivePlanJob,
@@ -1396,44 +1395,63 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     copilotMessagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [copilotMessages]);
 
-  // Persist chat history per case in localStorage so the conversation
-  // survives navigating between pages or reopening the case. Capped at 100
-  // messages to keep the storage entry small. The pending_job_id flow is
-  // intentionally NOT persisted — if the user navigates away while a plan
-  // is in flight, the in-flight tracking dies with the page; the user can
-  // still inspect the saved run in the run-history list when they return.
+  // Per-(case, run) chat history in localStorage so switching between runs
+  // doesn't pollute the agent's context with the previous run's trace, and
+  // navigating back to a run resumes its prior thread. Capped at 100
+  // messages per thread. The pending_job_id flow is intentionally NOT
+  // persisted — if the user navigates away while a plan is in flight, the
+  // in-flight tracking dies with the page; the user can still inspect the
+  // saved run in the run-history list when they return.
+  //
+  // One effect handles three branches based on whether the storage key
+  // (chat-history-{caseId}-run-{runId} or -norun) changed since the last
+  // run. `justLoadedRef` suppresses the redundant persist that would
+  // otherwise fire right after a load (queued setCopilotMessages from the
+  // load triggers this effect again with the loaded content).
   const COPILOT_HISTORY_LIMIT = 100;
-  const copilotHistoryKey = (caseId: number) => `chat-history-${caseId}`;
-  // Hydrate on case load. Reset to an empty list if storage has nothing for
-  // this case (each case has its own conversation).
+  const copilotHistoryKey = (caseId: number, runId: number | null) =>
+    runId != null ? `chat-history-${caseId}-run-${runId}` : `chat-history-${caseId}-norun`;
+  const previousKeyRef = useRef<string | null>(null);
+  const justLoadedRef = useRef(false);
   useEffect(() => {
     if (!Number.isFinite(id)) return;
-    try {
-      const raw = window.localStorage.getItem(copilotHistoryKey(id));
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) setCopilotMessages(parsed as PlanningCopilotMessage[]);
-        else setCopilotMessages([]);
-      } else {
+    const key = copilotHistoryKey(id, currentPlanRunId);
+    if (previousKeyRef.current === key) {
+      if (justLoadedRef.current) {
+        justLoadedRef.current = false;
+        return;
+      }
+      try {
+        const trimmed = copilotMessages.length > COPILOT_HISTORY_LIMIT
+          ? copilotMessages.slice(-COPILOT_HISTORY_LIMIT)
+          : copilotMessages;
+        window.localStorage.setItem(key, JSON.stringify(trimmed));
+      } catch {
+        /* localStorage might be full or disabled — silently skip */
+      }
+    } else {
+      // Key changed — save outgoing thread under previous key first so it
+      // can be restored if the user navigates back, then load incoming.
+      if (previousKeyRef.current) {
+        try {
+          const trimmed = copilotMessages.length > COPILOT_HISTORY_LIMIT
+            ? copilotMessages.slice(-COPILOT_HISTORY_LIMIT)
+            : copilotMessages;
+          window.localStorage.setItem(previousKeyRef.current, JSON.stringify(trimmed));
+        } catch {
+          /* localStorage might be full or disabled — silently skip */
+        }
+      }
+      try {
+        const raw = window.localStorage.getItem(key);
+        setCopilotMessages(raw ? (JSON.parse(raw) as PlanningCopilotMessage[]) : []);
+      } catch {
         setCopilotMessages([]);
       }
-    } catch {
-      setCopilotMessages([]);
+      previousKeyRef.current = key;
+      justLoadedRef.current = true;
     }
-  }, [id]);
-  // Persist on every change. Trim to the most recent COPILOT_HISTORY_LIMIT
-  // entries before writing — long conversations otherwise grow without bound.
-  useEffect(() => {
-    if (!Number.isFinite(id)) return;
-    try {
-      const trimmed = copilotMessages.length > COPILOT_HISTORY_LIMIT
-        ? copilotMessages.slice(-COPILOT_HISTORY_LIMIT)
-        : copilotMessages;
-      window.localStorage.setItem(copilotHistoryKey(id), JSON.stringify(trimmed));
-    } catch {
-      /* localStorage might be full or disabled — silently skip */
-    }
-  }, [copilotMessages, id]);
+  }, [copilotMessages, id, currentPlanRunId]);
 
   // Mode 1 — in-flight chat: poll /plan/active-jobs every 1.5s. The first
   // running job (matching this case) drives the inline progress bar.
@@ -1735,6 +1753,86 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     setWoPeggingActiveDemandId(null);
   }, [planPeggingContext]);
 
+  // When the pegging panel opens for a demand, auto-expand the critical-path
+  // chain so the gold-tagged transit nodes are visible without the user
+  // hunting through collapsed AND-children. Mirrors the Kotlin
+  // `traceCriticalPath` algorithm.
+  useEffect(() => {
+    if (!planPeggingContext || planPeggingContext.type === 'supply' || !planResult) return;
+    const demandIdNorm = String(planPeggingContext.row.demand_id ?? '').trim();
+    if (!demandIdNorm) return;
+    const matchingEntries = planResult.planning_pegging?.filter(
+      (e) => String(e.demand_id ?? '').trim() === demandIdNorm,
+    ) ?? [];
+    const entry = matchingEntries.length > 0 ? matchingEntries[matchingEntries.length - 1] : undefined;
+    const tree = entry?.tree;
+    if (!tree) return;
+
+    const hasFlaggedDescendant = (n: PlanningPeggingNode): boolean => {
+      if (n.is_bottleneck || n.is_root_bottleneck) return true;
+      return (n.children ?? []).some(hasFlaggedDescendant);
+    };
+    const ratio = (c: PlanningPeggingNode): number => {
+      const q = Number(c.quantity ?? 0);
+      const cq = Number((c as { committed_qty?: number | null }).committed_qty ?? q);
+      return q < 1e-9 ? 0 : cq / q;
+    };
+    const contributed = (c: PlanningPeggingNode): boolean => {
+      const q = Number(c.quantity ?? 0);
+      const cq = Number((c as { committed_qty?: number | null }).committed_qty ?? q);
+      return q > 1e-9 || cq > 1e-9;
+    };
+    const relationOf = (n: PlanningPeggingNode): 'and' | 'or' => {
+      const explicit = (n as { children_relation?: string | null }).children_relation;
+      if (explicit === 'and' || explicit === 'or') return explicit;
+      return n.type === 'work_order' ? 'and' : 'or';
+    };
+    const paths = new Set<string>();
+    const walk = (n: PlanningPeggingNode | null, p: string): void => {
+      if (!n) return;
+      paths.add(p);
+      const kids = n.children ?? [];
+      if (kids.length === 0) return;
+      const contributingKids = kids
+        .map((c, i) => ({ c, i }))
+        .filter(({ c }) => contributed(c));
+      if (contributingKids.length === 0) return;
+      if (relationOf(n) === 'or') {
+        contributingKids.forEach(({ c, i }) => walk(c, `${p}-${i}`));
+        return;
+      }
+      const flagged = contributingKids.filter(({ c }) => c.is_bottleneck || c.is_root_bottleneck);
+      let pick: { c: PlanningPeggingNode; i: number } | null = null;
+      if (flagged.length > 0) {
+        flagged.sort((a, b) => {
+          const ra = ratio(a.c);
+          const rb = ratio(b.c);
+          if (Math.abs(ra - rb) > 1e-9) return ra - rb;
+          return a.i - b.i;
+        });
+        pick = flagged[0];
+      } else {
+        const transit = contributingKids.filter(({ c }) => hasFlaggedDescendant(c));
+        if (transit.length === 0) return;
+        transit.sort((a, b) => {
+          const ra = ratio(a.c);
+          const rb = ratio(b.c);
+          if (Math.abs(ra - rb) > 1e-9) return ra - rb;
+          return a.i - b.i;
+        });
+        pick = transit[0];
+      }
+      walk(pick.c, `${p}-${pick.i}`);
+    };
+    walk(tree, '0');
+    if (paths.size <= 1) return;
+    setPlanPeggingExpanded((prev) => {
+      const next = new Set(prev);
+      paths.forEach((p) => next.add(p));
+      return next;
+    });
+  }, [planPeggingContext, planResult]);
+
   // Reset assessment result/history when a different supply is opened in the
   // breakdown slide-in (where the assessment UI now lives).
   const currentExplainSupplyId = supExplainRow?.supplyId ?? null;
@@ -1969,29 +2067,40 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     } catch { /* ignore */ }
   };
 
-  const loadLatestPlanRun = async () => {
+  const loadLatestPlanRun = async (caseDetail: CaseType | null, signal: { cancelled: boolean }) => {
     try {
       const runs = await listPlanRuns(id);
+      if (signal.cancelled) return;
       setPlanRunHistory(runs);
-      const latest = runs.find((r) => r.status === 'success');
-      if (!latest) return;
-      const full = await getPlanRun(id, latest.id);
+      // Prefer the case's active plan run (designated → falls back to latest
+      // success via the backend's resolveActiveRunId). The active id is
+      // already in `caseDetail` from the shared init fetch — don't refetch
+      // (parallel getCase calls can race and produce different UI defaults).
+      const activeId: number | null = caseDetail?.active_plan_run_id ?? null;
+      const target = activeId != null
+        ? runs.find((r) => r.id === activeId && r.status === 'success')
+        : null;
+      const fallback = runs.find((r) => r.status === 'success');
+      const chosen = target ?? fallback;
+      if (!chosen) return;
+      const full = await getPlanRun(id, chosen.id);
+      if (signal.cancelled) return;
       if (full.result) {
         setPlanResult(full.result as typeof planResult);
-        setCurrentPlanRunId(latest.id);
+        setCurrentPlanRunId(chosen.id);
         setPlanWorkOrderPeggingCache({});
         if (full.config) {
           const cfg = full.config as PlanningConfig;
-          const chosen = full.chosen_depth ?? null;
+          const chosenDepth = full.chosen_depth ?? null;
           setPlanningConfig({
             ...cfg,
             method_selection: {
               ...cfg.method_selection,
-              depth: chosen ?? cfg.method_selection?.depth ?? 1,
+              depth: chosenDepth ?? cfg.method_selection?.depth ?? 1,
             },
           });
         }
-        restoreCriticality(latest.id);
+        restoreCriticality(chosen.id);
       }
     } catch {
       // non-fatal — plan results simply won't be pre-loaded
@@ -1999,13 +2108,38 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   };
 
   useEffect(() => {
+    // Cancellation pattern: in React StrictMode dev (and HMR remounts), the
+    // effect fires twice — setup, cleanup, setup again. The first setup's
+    // async work is cancelled via signal.cancelled when the cleanup runs;
+    // the second setup runs cleanly. Only the surviving invocation writes
+    // state, so we don't race two parallel getCase / loadLatestPlanRun
+    // chains that previously caused active-then-latest flicker.
+    const signal = { cancelled: false };
     setLoading(true);
     setError(null);
     const timeoutId = setTimeout(() => setLoading(false), 20000);
-    Promise.all([loadCase(), loadRuns(), loadOverrides(), loadLatestPlanRun()]).finally(() => {
+    (async () => {
+      // Single shared getCase fetch — used by both the case-detail panel and
+      // the active-run resolver below. Avoids two parallel calls racing.
+      const caseDetail = await getCase(id).catch((e) => {
+        if (!signal.cancelled) {
+          setError(e instanceof Error ? e.message : 'Failed to load case');
+        }
+        return null;
+      });
+      if (signal.cancelled) return;
+      if (caseDetail) setC(caseDetail);
+      await Promise.all([
+        loadRuns(),
+        loadOverrides(),
+        loadLatestPlanRun(caseDetail, signal),
+      ]);
+    })().finally(() => {
+      if (signal.cancelled) return;
       clearTimeout(timeoutId);
       setLoading(false);
     });
+    return () => { signal.cancelled = true; };
   }, [id]);
 
   useEffect(() => {
@@ -5025,18 +5159,18 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
                         type="checkbox"
-                        checked={planWoPurchaseOnly}
-                        onChange={(e) => setPlanWoPurchaseOnly(e.target.checked)}
-                      />
-                      <span>{tP('workOrders.filterPurchaseOnly')}</span>
-                    </label>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
-                      <input
-                        type="checkbox"
                         checked={planWoMoveOnly}
                         onChange={(e) => setPlanWoMoveOnly(e.target.checked)}
                       />
                       <span>{tP('workOrders.filterMoveOnly')}</span>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input
+                        type="checkbox"
+                        checked={planWoPurchaseOnly}
+                        onChange={(e) => setPlanWoPurchaseOnly(e.target.checked)}
+                      />
+                      <span>{tP('workOrders.filterPurchaseOnly')}</span>
                     </label>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
@@ -8752,7 +8886,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             <div style={{ padding: '1rem 1.25rem', borderBottom: '1px solid #3d3d40', flexShrink: 0 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
                 <h3 style={{ margin: 0, color: '#fafafa' }}>{tP('copilot.title')}</h3>
-                <button type="button" onClick={() => setCopilotOpen(false)} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tP('copilot.close')}</button>
+                <div style={{ display: 'flex', gap: '0.5rem' }}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (copilotMessages.length > 0 && !window.confirm(tP('copilot.clearConfirm'))) return;
+                      setCopilotMessages([]);
+                      setCopilotPendingJobId(null);
+                      setCopilotActiveJob(null);
+                      setCopilotInput('');
+                    }}
+                    disabled={copilotMessages.length === 0 && !copilotInput && !copilotPendingJobId}
+                    style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}
+                  >{tP('copilot.clear')}</button>
+                  <button type="button" onClick={() => setCopilotOpen(false)} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tP('copilot.close')}</button>
+                </div>
               </div>
               <p style={{ margin: 0, fontSize: '0.8rem', color: '#a1a1aa' }}>
                 <strong>{tP('copilot.methods')}</strong> {planningConfig.method_selection?.multiple === true
@@ -8841,7 +8989,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 };
                 try {
                   // Try the full agent first; fall back to copilot if it 5xxs (e.g. OPENAI key missing).
-                  const res = await planningAgent(id, text, planningConfig, copilotMessages);
+                  const res = await planningAgent(id, text, planningConfig, copilotMessages, currentPlanRunId);
                   applyConfig(res.config_update);
                   setCopilotMessages((prev) => [
                     ...prev,
@@ -8857,21 +9005,26 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   if (res.pending_job_id) {
                     setCopilotPendingJobId(res.pending_job_id);
                   }
-                } catch {
-                  // Agent unavailable — fall back to the copilot route, then to local rule-based parser.
-                  try {
-                    const res = await planningCopilot(id, text, planningConfig, copilotMessages);
-                    applyConfig(res.config_update);
-                    setCopilotMessages((prev) => [...prev, { role: 'assistant', text: res.reply }]);
-                  } catch {
-                    const { reply, configUpdate } = parseCopilotIntent(text, planningConfig);
-                    if (configUpdate) setPlanningConfig((prev) => ({
+                } catch (err) {
+                  // Agent failed (timeout, 5xx, network). Try the local
+                  // config-intent parser for offline command shapes
+                  // ("max methods 2", "禁用采购", "show config"); if that
+                  // doesn't match, surface the actual error rather than
+                  // routing through the copilot, whose catch-all
+                  // "我不太理解" hid real failures behind a config-help
+                  // message even when the user asked a domain question.
+                  const { reply, configUpdate } = parseCopilotIntent(text, planningConfig);
+                  if (configUpdate) {
+                    setPlanningConfig((prev) => ({
                       ...prev,
                       ...configUpdate,
                       method_selection: configUpdate.method_selection ? { ...prev.method_selection, ...configUpdate.method_selection } : prev.method_selection,
                       consolidation: configUpdate.consolidation ? { ...prev.consolidation, ...configUpdate.consolidation } : prev.consolidation,
                     }));
                     setCopilotMessages((prev) => [...prev, { role: 'assistant', text: reply }]);
+                  } else {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    setCopilotMessages((prev) => [...prev, { role: 'assistant', text: msg }]);
                   }
                 } finally {
                   setCopilotLoading(false);
@@ -9079,6 +9232,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <>{' '}{tP('peggingPanel.descriptionOrSiblings')}</>
               )}
             </p>
+            {planPeggingContext.type !== 'supply' && (
+              <p style={{ margin: 0, marginBottom: '0.5rem', fontSize: '0.75rem', color: '#a1a1aa' }}>
+                {tP('peggingPanel.legendShortageOrigins')}
+              </p>
+            )}
             {planPeggingContext.type === 'supply' && (() => {
               const ctx = planPeggingContext;
               return (
@@ -9320,6 +9478,78 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 }
               }
 
+              // Critical path = the dominator SUB-TREE of the pegging tree.
+              //   - AND junction (work_order parents): single AND-min child.
+              //     Planner pre-flags it via is_bottleneck / is_root_bottleneck;
+              //     break ties by smallest committed_qty/quantity ratio, then
+              //     tree order. If no direct child is flagged but a descendant
+              //     is, descend through the transit child with smallest ratio
+              //     (method WO between BOM levels carries no flag).
+              //   - OR junction (demand parents, alternative paths): every
+              //     contributing child (qty>0 OR committed_qty>0) is a
+              //     dominator. The path BRANCHES.
+              // Mirrors the backend `traceCriticalPath` Kotlin helper exactly.
+              const criticalPathSet = new Set<string>();
+              const hasFlaggedDescendant = (n: PlanningPeggingNode): boolean => {
+                if (n.is_bottleneck || n.is_root_bottleneck) return true;
+                return (n.children ?? []).some(hasFlaggedDescendant);
+              };
+              const ratio = (c: PlanningPeggingNode): number => {
+                const q = Number(c.quantity ?? 0);
+                const cq = Number((c as { committed_qty?: number | null }).committed_qty ?? q);
+                return q < 1e-9 ? 0 : cq / q;
+              };
+              const contributed = (c: PlanningPeggingNode): boolean => {
+                const q = Number(c.quantity ?? 0);
+                const cq = Number((c as { committed_qty?: number | null }).committed_qty ?? q);
+                return q > 1e-9 || cq > 1e-9;
+              };
+              const relationOf = (n: PlanningPeggingNode): 'and' | 'or' => {
+                const explicit = (n as { children_relation?: string | null }).children_relation;
+                if (explicit === 'and' || explicit === 'or') return explicit;
+                return n.type === 'work_order' ? 'and' : 'or';
+              };
+              const buildCriticalPath = (n: PlanningPeggingNode | null, path: string): void => {
+                if (!n) return;
+                criticalPathSet.add(path);
+                const kids = n.children ?? [];
+                if (kids.length === 0) return;
+                // Universal rule: exclude children (and subtrees) with 0
+                // contribution. Critical path traces actual flow.
+                const contributingKids = kids
+                  .map((c, i) => ({ c, i }))
+                  .filter(({ c }) => contributed(c));
+                if (contributingKids.length === 0) return;
+                if (relationOf(n) === 'or') {
+                  contributingKids.forEach(({ c, i }) => buildCriticalPath(c, `${path}-${i}`));
+                  return;
+                }
+                // AND: single dominator.
+                const flagged = contributingKids.filter(({ c }) => c.is_bottleneck || c.is_root_bottleneck);
+                let pick: { c: PlanningPeggingNode; i: number } | null = null;
+                if (flagged.length > 0) {
+                  flagged.sort((a, b) => {
+                    const ra = ratio(a.c);
+                    const rb = ratio(b.c);
+                    if (Math.abs(ra - rb) > 1e-9) return ra - rb;
+                    return a.i - b.i;
+                  });
+                  pick = flagged[0];
+                } else {
+                  const transit = contributingKids.filter(({ c }) => hasFlaggedDescendant(c));
+                  if (transit.length === 0) return;
+                  transit.sort((a, b) => {
+                    const ra = ratio(a.c);
+                    const rb = ratio(b.c);
+                    if (Math.abs(ra - rb) > 1e-9) return ra - rb;
+                    return a.i - b.i;
+                  });
+                  pick = transit[0];
+                }
+                buildCriticalPath(pick.c, `${path}-${pick.i}`);
+              };
+              buildCriticalPath(tree, '0');
+
               const runSearch = (query: string) => {
                 const q = query.trim().toLowerCase();
                 if (!q || !tree) {
@@ -9508,6 +9738,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 }
                 const isActiveMatch = planPeggingMatchPath === path;
                 const isAnyMatch = planPeggingMatchPaths.includes(path);
+                const onCriticalPath = criticalPathSet.has(path);
+                // Transit nodes on the critical path lack 瓶颈/根因 badges
+                // (they're method WOs or single-OR pass-throughs between BOM
+                // components). Mark them explicitly so each row on the path
+                // is visibly tagged. Skip the root: it's the demand itself.
+                const isTransitOnPath = onCriticalPath
+                  && path !== '0'
+                  && !node.is_bottleneck
+                  && !node.is_root_bottleneck;
                 return (
                   <div
                     key={path}
@@ -9528,12 +9767,24 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           ? 'rgba(250, 204, 21, 0.28)'
                           : isAnyMatch
                             ? 'rgba(250, 204, 21, 0.12)'
-                            : node.is_bottleneck
+                            : (onCriticalPath && node.is_root_bottleneck)
+                              // Root cause (kind=demand) — keep red to flag the
+                              // demand-side allocation origin distinctly.
                               ? 'rgba(248, 113, 113, 0.12)'
-                              : depth % 2 === 0 ? 'rgba(255,255,255,0.04)' : 'transparent',
+                              : (onCriticalPath && (node.is_bottleneck || isTransitOnPath))
+                                // Bottleneck (kind=supply) and transit nodes
+                                // share the gold treatment — they're all
+                                // critical-path elements with the same
+                                // remediation framing (supply-side levers).
+                                ? 'rgba(250, 204, 21, 0.08)'
+                                : depth % 2 === 0 ? 'rgba(255,255,255,0.04)' : 'transparent',
                         border: isActiveMatch
                           ? '1px solid #facc15'
-                          : node.is_bottleneck ? '1px solid rgba(248, 113, 113, 0.55)' : 'none',
+                          : (onCriticalPath && node.is_root_bottleneck)
+                            ? '1px solid rgba(248, 113, 113, 0.55)'
+                            : (onCriticalPath && (node.is_bottleneck || isTransitOnPath))
+                              ? '1px solid rgba(250, 204, 21, 0.55)'
+                              : 'none',
                         borderRadius: 4,
                         color: '#e4e4e7',
                         cursor: expandable ? 'pointer' : 'default',
@@ -9543,30 +9794,36 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <span style={{ width: 14, flexShrink: 0 }}>{expandable ? (isExpanded ? '▼' : '▶') : '·'}</span>
                       <span style={{ width: 18, flexShrink: 0, fontSize: '0.9em', color: typeColor }} title={typeLabel}>{icon}</span>
                       <span style={{ flex: 1, color: typeColor }}>{label}</span>
-                      {/* Two orthogonal failure axes — render both when present:
-                          • 瓶颈 (orange) = SUPPLY-side: this child's BOM/inventory chain
-                            couldn't deliver enough; first-pass effective/needed ratio is
-                            the smallest among AND siblings, capping the parent via min.
-                          • 根因 (red) = DEMAND-side: consolidation's fair-share split with
-                            competing demands left this demand with the tightest share-
-                            vs-need ratio at this child (computed at iter-0). Independent
-                            of supply — visible whether or not 瓶颈 fires. */}
-                      {node.is_bottleneck && (
+                      {/* Shortage origin = any node with `is_bottleneck` OR
+                          `is_root_bottleneck`. Both flags identify ORIGINS of
+                          shortage; once it crosses an origin, propagation up the
+                          tree is identical. The kind only matters for the FIX:
+                          • 瓶颈 (orange-red badge) = kind=supply. The BOM/inventory
+                            chain couldn't deliver — first-pass effective/needed ratio
+                            is the smallest among AND siblings, capping the parent.
+                            Fix: add method, raise supply, allow purchase.
+                          • 根因 (red badge) = kind=demand. Consolidation's fair-share
+                            split left this demand with the tightest share-vs-need ratio
+                            at this child (iter-0). Independent of supply.
+                            Fix: change priority / allocation_mode / period_days.
+                          The shared red outline on the row says "origin"; the
+                          badge color says which kind. */}
+                      {onCriticalPath && node.is_bottleneck && (
                         <span
-                          title="瓶颈 (supply-side limiter): 此子节点的供应链(BOM/库存/子配方)无法满足需求 — 其首轮可达量与需求量之比在AND兄弟中最小,通过MIN(子份额)封顶父节点的可达量。属供应侧约束。修复方向: 增加库存、启用采购、补充方法行(method_make/move/buy)、或解除更深处配方的阻塞。"
+                          title="瓶颈 (supply-side limiter on critical path): 此子节点的供应链(BOM/库存/子配方)无法满足需求 — 其首轮可达量与需求量之比在AND兄弟中最小,通过MIN(子份额)封顶父节点的可达量。属供应侧约束。修复方向: 增加库存、启用采购、补充方法行(method_make/move/buy)、或解除更深处配方的阻塞。"
                           style={{
                             fontSize: '0.7em',
-                            color: '#fca5a5',
-                            background: 'rgba(248, 113, 113, 0.18)',
+                            color: '#facc15',
+                            background: 'rgba(250, 204, 21, 0.16)',
                             padding: '1px 6px',
                             borderRadius: 3,
                             flexShrink: 0,
                           }}
                         >瓶颈</span>
                       )}
-                      {node.is_root_bottleneck && (
+                      {onCriticalPath && node.is_root_bottleneck && (
                         <span
-                          title="根因 (demand-side allocation origin): 在iter-0合并阶段,该需求与其他需求竞争此叶子时分到的份额相对其需求量最紧 — 即同一AND层级中, 该需求的(份额/需求)比率最小。与供应是否充足无关 — 即使供应充足,本需求在此叶子上的配额最先吃紧。修复方向: 调整本需求优先级、改变 allocation_mode (fair/proportional/priority_first)、改变合并 period_days、或减少其他需求在此叶子的竞争压力。"
+                          title="根因 (demand-side allocation origin on critical path): 在iter-0合并阶段,该需求与其他需求竞争此叶子时分到的份额相对其需求量最紧 — 即同一AND层级中, 该需求的(份额/需求)比率最小。与供应是否充足无关 — 即使供应充足,本需求在此叶子上的配额最先吃紧。修复方向: 调整本需求优先级、改变 allocation_mode (fair/proportional/priority_first)、改变合并 period_days、或减少其他需求在此叶子的竞争压力。"
                           style={{
                             fontSize: '0.7em',
                             color: '#fff',
@@ -9577,6 +9834,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             fontWeight: 700,
                           }}
                         >根因</span>
+                      )}
+                      {isTransitOnPath && (
+                        <span
+                          title="关键路径上的中转节点 (Critical-path transit): 此节点本身不是短缺起源 (无 瓶颈/根因 标志)，但它在从需求到起源的支配链上。"
+                          style={{
+                            fontSize: '0.7em',
+                            color: '#facc15',
+                            background: 'rgba(250, 204, 21, 0.16)',
+                            padding: '1px 6px',
+                            borderRadius: 3,
+                            flexShrink: 0,
+                          }}
+                        >★ 关键路径</span>
                       )}
                     </button>
                     {node.type === 'work_order' && node.method_choice_explanation && (() => {
