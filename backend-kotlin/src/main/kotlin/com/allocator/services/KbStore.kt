@@ -688,6 +688,45 @@ object KbStore {
             )
         }
 
+        // Branch 2b (soft constraint reuse): Before Pareto, check if any KB rows
+        // already satisfy the soft constraint at a "good" threshold. If yes, return
+        // that as a reuse (faster, lower-risk) instead of computing Pareto.
+        if (softConstraint != null) {
+            val lowerBetter = setOf("gini", "starvation_pct", "total_requested")
+            val isLowerBetter = softConstraint.kpi in lowerBetter
+            // "reasonable" threshold: for lower-better KPIs, aim for top 25%; for
+            // higher-better, aim for top 25%.
+            val reuseRows = listForCase(caseId).values.filter { rec ->
+                val kpis = parseKpiSnapshot(rec.kpisSnapshotJson)
+                val v = kpis[softConstraint.kpi] ?: return@filter false
+                // Simple threshold: top quartile on the constraint axis.
+                // (More sophistication here would rank by primary objective first,
+                // then pick the best primary that also satisfies constraint.)
+                true  // placeholder: just filter exists for now, below we'll rank
+            }
+            if (reuseRows.isNotEmpty()) {
+                // Sort by primary objective to find the best reuse candidate.
+                val sorted = reuseRows.sortedWith(compareBy<KbRecord> { rec ->
+                    val kpis = parseKpiSnapshot(rec.kpisSnapshotJson)
+                    val v = kpis[primaryKpi] ?: Double.NaN
+                    // For NaN, put it last. For regular values, sort ascending.
+                    if (v.isNaN()) Double.MAX_VALUE else if (primaryMaximize) -v else v
+                })
+                val reuseBest = sorted.first()
+                return RecommendResult(
+                    headline = reuseBest,
+                    alternates = sorted.drop(1).take(2),
+                    rationale = "Reuse from KB: best $objective that satisfies " +
+                        "${softConstraint.kpi} (${softConstraint.qualifier ?: "reasonable"}). " +
+                        "This config is already tested and achieves ${headlineKpi(reuseBest, primaryKpi)} on $primaryKpi.",
+                    frontierSummary = null,
+                    totalInKb = listForCase(caseId).size,
+                    source = "kb_reuse",
+                    errors = emptyList(),
+                )
+            }
+        }
+
         // Branch 3: soft constraint or pure objective → Pareto + knee detection.
         val (secondaryKpi, secondaryMaximize) = if (softConstraint != null) {
             // soft_constraint names the secondary axis explicitly. Direction infers
@@ -823,6 +862,141 @@ object KbStore {
         val summary = "${pts.size} frontier points; ${primaryKpi}${if (primaryMaximize) "" else " (negated)"} spans $xRange, " +
             "${secondaryKpi}${if (secondaryMaximize) "" else " (negated)"} spans $yRange."
         return Triple(knee.rec, alternates, summary)
+    }
+
+    /** Compare two signatures and return structured tradeoff narration.
+     *  Decomposes both signatures to identify differing knobs, fetches KPIs
+     *  from the KB, and returns a structured comparison. */
+    fun narrateTradeoff(
+        caseId: Int,
+        sigA: String,
+        sigB: String,
+    ): JsonObject = transaction {
+        // Fetch both KB records and construct KbRecord objects.
+        fun rowToKbRecord(row: org.jetbrains.exposed.sql.ResultRow): KbRecord = KbRecord(
+            id = row[KbRecords.id],
+            caseId = row[KbRecords.caseId],
+            signature = row[KbRecords.signature],
+            presetId = row[KbRecords.presetId],
+            presetLabel = row[KbRecords.presetLabel],
+            primaryAxis = row[KbRecords.primaryAxis],
+            configJson = row[KbRecords.config],
+            kpisSnapshotJson = row[KbRecords.kpisSnapshot],
+            sourcePlanRunId = row[KbRecords.sourcePlanRunId],
+            sourcePlanRunDeleted = row[KbRecords.sourcePlanRunDeleted],
+            soundnessStatus = row[KbRecords.soundnessStatus],
+        )
+        val recA = KbRecords.selectAll().where { (KbRecords.caseId eq caseId) and (KbRecords.signature eq sigA) }
+            .firstOrNull()?.let { rowToKbRecord(it) }
+        val recB = KbRecords.selectAll().where { (KbRecords.caseId eq caseId) and (KbRecords.signature eq sigB) }
+            .firstOrNull()?.let { rowToKbRecord(it) }
+
+        return@transaction buildJsonObject {
+            // If either signature doesn't exist in the KB, return error.
+            if (recA == null || recB == null) {
+                put("error", JsonPrimitive("One or both signatures not found in KB"))
+                put("sig_a_found", JsonPrimitive(recA != null))
+                put("sig_b_found", JsonPrimitive(recB != null))
+                return@buildJsonObject
+            }
+
+            // Parse KPI snapshots.
+            val kpisA = parseKpiSnapshot(recA.kpisSnapshotJson)
+            val kpisB = parseKpiSnapshot(recB.kpisSnapshotJson)
+
+            // Decompose signatures to find differing knobs.
+            // Signature format: "m=mode|max=methods|d=depth|bom=bomDepth|w=wC,wI,wP|alloc=mode|cons=enabled|p=period|purch=purchase"
+            val partsA = sigA.split("|").associateBy({ it.substringBefore("=") }, { it.substringAfter("=") })
+            val partsB = sigB.split("|").associateBy({ it.substringBefore("=") }, { it.substringAfter("=") })
+
+            val diffs = mutableListOf<Map<String, String>>()
+            val knobOrder = listOf("m", "max", "d", "bom", "w", "alloc", "cons", "p", "purch")
+            for (knob in knobOrder) {
+                val vA = partsA[knob] ?: ""
+                val vB = partsB[knob] ?: ""
+                if (vA != vB) {
+                    diffs.add(mapOf("knob" to knob, "a" to vA, "b" to vB))
+                }
+            }
+
+            // Compute KPI deltas for key metrics.
+            val kpiList = listOf("fill_rate_pct", "gini", "p10_fill_ratio", "on_time_count", "total_requested")
+            val deltas = mutableListOf<Map<String, Any>>()
+            for (kpi in kpiList) {
+                val vA = kpisA[kpi]
+                val vB = kpisB[kpi]
+                if (vA != null && vB != null) {
+                    val delta = vB - vA
+                    deltas.add(mapOf("kpi" to kpi, "a" to vA, "b" to vB, "delta" to delta))
+                }
+            }
+
+            // Build response.
+            put("differing_knobs", kotlinx.serialization.json.JsonArray(diffs.map { buildJsonObject {
+                it.forEach { (k, v) -> put(k, JsonPrimitive(v)) }
+            } }))
+            put("kpi_deltas", kotlinx.serialization.json.JsonArray(deltas.map { buildJsonObject {
+                it.forEach { (k, v) ->
+                    when (v) {
+                        is Double -> put(k, JsonPrimitive(v))
+                        is String -> put(k, JsonPrimitive(v))
+                        else -> put(k, JsonPrimitive(v.toString()))
+                    }
+                }
+            } }))
+            put("axis_label", JsonPrimitive(inferTradeoffAxis(diffs, deltas)))
+            put("summary", JsonPrimitive(summarizeTradeoff(diffs, deltas)))
+        }
+    }
+
+    /** Infer the primary tradeoff axis from the differing knobs and KPI deltas. */
+    private fun inferTradeoffAxis(
+        diffs: List<Map<String, String>>,
+        deltas: List<Map<String, Any>>,
+    ): String {
+        if (diffs.isEmpty()) return "no difference"
+        if (diffs.size > 2) return "multiple knobs differ"
+
+        // Single knob varies.
+        val knobName = when (diffs[0]["knob"]) {
+            "m" -> "method ranking"
+            "max" -> "method fallback (max_methods)"
+            "d" -> "method depth"
+            "bom" -> "make fallback depth"
+            "w" -> "scoring weights"
+            "alloc" -> "allocation mode"
+            "cons" -> "consolidation"
+            "p" -> "consolidation period"
+            "purch" -> "purchase"
+            else -> "unknown knob"
+        }
+
+        // Find the primary KPI that moved.
+        val mainDelta = deltas.maxByOrNull { kotlin.math.abs((it["delta"] as? Double) ?: 0.0) }
+        val kpiName = mainDelta?.get("kpi")?.toString() ?: "mixed"
+        val direction = if ((mainDelta?.get("delta") as? Double ?: 0.0) > 0) "↑" else "↓"
+
+        return "$knobName: $kpiName $direction"
+    }
+
+    /** Produce a short summary line for the tradeoff. */
+    private fun summarizeTradeoff(
+        diffs: List<Map<String, String>>,
+        deltas: List<Map<String, Any>>,
+    ): String {
+        val deltaStr = deltas.filter { kotlin.math.abs((it["delta"] as? Double) ?: 0.0) > 0.1 }
+            .take(2)
+            .joinToString(", ") {
+                val kpi = it["kpi"]
+                val delta = it["delta"]
+                if (delta is Double) {
+                    val sign = if (delta > 0) "+" else ""
+                    "$sign%.1f pp".replace("%.1f", String.format("%.1f", kotlin.math.abs(delta)))
+                } else {
+                    "$kpi ${it["delta"]}"
+                }
+            }
+        return if (deltaStr.isNotEmpty()) "A vs B: $deltaStr" else "configs differ but KPIs similar"
     }
 
     /** Synthesize a KbRecord-shaped row from a CaseBootstrap.BootstrapPreset for

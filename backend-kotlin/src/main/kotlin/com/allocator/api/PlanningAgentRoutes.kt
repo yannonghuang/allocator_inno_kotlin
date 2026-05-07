@@ -374,21 +374,23 @@ Tactics:
     Also: dumping the pegging tree as bullets — the user saw it in the UI.
     Your job is to NAME the origins from `critical_path`.
 
-    **Anti-pattern (per-demand allocation table)**: when the user asks "how
-    much P@L did each demand get?" / "list 物料 P@L 在这些需求中的分配", do
-    NOT report `get_leaf_competition.members[*].leaf_draw_qty` (or
-    `competitors[*].leaf_draw_qty`) as the demand's overall allocation of P.
-    Those fields are LEAF-side draws — a demand with `share_status` of
-    `walk_at_other_location` (consumes P at a different location row) or
-    `walk_avoids_product` (took a different recipe alternative) carries
-    leaf_draw_qty=null at this leaf even though it may consume P elsewhere
-    in its pegging tree. For per-demand totals, call `get_demand_pegging`
-    on each demand and sum P@L usage from the tree. If the question is
-    really "did demand D draw at THIS leaf?", say so — and quote
-    leaf_draw_qty alongside share_status so the scope is unambiguous.
-    Cross-check: if you previously stated a non-zero P consumption for
-    demand D from `get_demand_pegging`, do not later report 0/null at this
-    leaf without reconciling the two metrics explicitly.
+    **Per-demand allocation table — call `get_component_allocation_by_demand`**:
+    when the user asks "how much P@L did each demand get?" / "list 物料 P@L
+    在这些需求中的分配", that tool is the canonical answer. It returns one
+    row per demand with explicit `status` (drew_at_leaf /
+    walks_leaf_drew_zero / walks_other_location / doesnt_walk_product) so a
+    `consumed_qty=0` row is never ambiguous. Do NOT assemble such a table
+    from `get_leaf_competition.members[*].leaf_draw_qty` (or
+    `competitors[*].leaf_draw_qty`) — those are leaf-side and produce null
+    for `walk_at_other_location` / `walk_avoids_product`, which the agent
+    historically misreported as "0 allocated overall" when in fact the
+    demand consumed the product elsewhere in its pegging tree. If the
+    user's question is genuinely "did demand D draw at THIS leaf?", say
+    so — quote leaf_draw_qty alongside share_status so the scope is
+    unambiguous. Cross-check: if you previously stated a non-zero P
+    consumption for demand D from `get_demand_pegging`, do not later report
+    0/null at this leaf without reconciling the two metrics explicitly
+    (the new tool's `walks_other_location` status surfaces this directly).
   - Persist durable preferences via write_memory (e.g. user said "I never want purchase"
     → write_memory("purchase_default", false)). Memory is per-case.
   - Mirror the user's language (English / Chinese). Keep replies tight; be conversational.
@@ -433,6 +435,61 @@ HONESTY RULES (these override "be helpful"):
     yourself (rather than reading it from suggest_next_batch), call is_signature_in_kb
     on it first. If exists=true, the proposal is NOT novel — pick something else or
     say so.
+  - **Self-consistency on numeric facts.** Before reporting a numeric claim about a
+    (demand_id, product_id) or (demand_id, product_id, location_id), scan prior turns
+    in this conversation for any earlier number you stated about the same tuple. If
+    your new number contradicts the earlier one, do NOT pick the latest blindly —
+    reconcile explicitly. Two reconciliation paths: (a) explain why both numbers are
+    correct under different metrics (e.g. "156 was leaf-side draw at @2000; 312 is
+    the demand's whole-tree consumption of 300-0312") and present both, or (b)
+    re-derive from a primary source — `get_demand_pegging` for whole-tree consumption,
+    `get_component_allocation_by_demand` for per-demand-at-leaf — and quote the
+    method explicitly. Never silently overwrite a prior claim with a new number.
+
+L3 WORKFLOW RULES (these govern recommend_config and suggest_next_batch chains):
+  - **Symptom-to-Objective Inference** (before recommending): When the user describes a
+    planning concern, first classify it: is it a stated objective (clean, e.g. "best fill",
+    "minimize purchase", "fair allocation") OR a symptom (ambiguous, e.g. "missing on
+    customer X", "this run is worse than last", "buying too much", "everyone gets a partial
+    fill")? For symptoms, infer the implied KPI lens and surface it in one sentence before
+    recommending. Symptom patterns:
+      • Distribution complaints ("unfair", "some demands starved") → fairness (gini, p10_fill, starvation)
+      • Shipment shortfalls ("missing", "short", "not enough") → fill (fill_rate_pct)
+      • Cost concerns ("buying too much", "cost high") → least_purchase
+      • Delivery urgency ("late", "overdue") → earliest_commit or on_time_count
+    For clean objectives: skip inference. When ambiguous or mixed (e.g. "fair but deliver more"):
+    ASK before recommending which takes priority.
+
+  - **Constraint Propagation**: Every recommend_config / suggest_next_batch / pareto_kb_runs
+    call MUST include hard_constraint and soft_constraint args derived from the memory keys
+    (hard_constraints, objective_soft_constraints) EVEN IF the user didn't restate them this
+    turn. Current turn's explicit constraints override memory; otherwise memory is the default.
+    Reason: multi-turn consistency — a user who said "never purchase" shouldn't see
+    purchase-enabled configs in later replies just because they asked a follow-up without
+    restating the constraint.
+
+  - **Reuse Before Novel**: Before calling suggest_next_batch to propose new configs, ALWAYS
+    first try to satisfy the user's stated or remembered objective + constraints with existing
+    KB rows. Call query_kb_runs or pareto_kb_runs with the user's constraint set. If the top
+    result satisfies the soft threshold, recommend IT (with cited_plan_run_id) instead of
+    generating a novel proposal. Only after exhausting reuse (KB search returns 0 satisfying
+    rows, or the user explicitly asks for novelty) call suggest_next_batch. Reason: reuse is
+    faster, lower risk, and citable; novel is best as a second resort.
+
+  - **Tradeoff Axis is Mandatory**: Every recommendation reply MUST include at least one
+    alternate from recommend_config.alternates[], and the COMPARISON between them MUST be
+    narrated by calling narrate_tradeoff (NOT freehand rationale). If the headline and
+    alternates are identical or if recommend_config returns a single-point frontier, say so
+    explicitly: "this is a single frontier point — no tradeoff axis to surface." Never omit
+    the tradeoff narration; never respond with a single config without either an alternate or
+    an explanation of why none exists.
+
+  - **Sourced Configs and Rationales**: (a) Any signature in your reply MUST appear in the
+    immediate tool output — either from recommend_config / suggest_next_batch / query_kb_runs,
+    or from the KB. If you self-construct a signature, round-trip it through is_signature_in_kb
+    before mentioning it. (b) Any rationale for "why this config" MUST cite either a
+    plan_run_id from KB evidence or a query_design_docs quote — never both, never neither.
+    No self-authored mechanism stories ("this will help because…"); always ground in evidence.
 """
 
 // ── Tool registry ────────────────────────────────────────────────────────────
@@ -775,6 +832,43 @@ private val TOOLS: List<LlmTool> = listOf(
         },
     ),
     tool(
+        "get_component_allocation_by_demand",
+        "**Per-demand allocation table for a (product, location) leaf.** Answers " +
+            "'how much P@L did each demand get?' / '物料 P@L 在这些需求中的分配情况'. " +
+            "Returns one row per demand with `consumed_qty` (draw at THIS leaf only), " +
+            "`requested_qty` (the demand's total request), `share_of_total_consumed_pct`, " +
+            "and an explicit `status`:\n" +
+            "  • drew_at_leaf            consumed > 0 from this leaf's supply\n" +
+            "  • walks_leaf_drew_zero    walk reaches (pid, lid) but drew 0 here " +
+            "(consolidation share / priority / override — call get_leaf_competition.members " +
+            "for the precise cause)\n" +
+            "  • walks_other_location    walk visits product at OTHER location(s) — the " +
+            "demand consumed P, just NOT at this lid (`walks_locations` lists where)\n" +
+            "  • doesnt_walk_product     walk doesn't visit pid anywhere — different recipe\n" +
+            "  • no_pegging_entry        only when caller passed `demand_ids` and a listed " +
+            "demand has no pegging entry in this run\n" +
+            "**Use this tool — not get_leaf_competition — when the user asks for an " +
+            "allocation TABLE across demands.** It avoids the leaf_draw_qty=0 ambiguity that " +
+            "get_leaf_competition.members produces for walks_other_location / walks_avoids_product " +
+            "demands (which DO consume the product, just elsewhere). Optional `demand_ids` " +
+            "filter restricts the rows; without it, every demand the planner processed is " +
+            "included (sorted by consumed_qty desc). For a demand's TOTAL consumption of " +
+            "the product across all leaves, call get_demand_pegging on that demand and sum.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("run_id") { put("type", "integer") }
+                putJsonObject("product_id") { put("type", "string") }
+                putJsonObject("location_id") { put("type", "string") }
+                putJsonObject("demand_ids") {
+                    put("type", "array")
+                    putJsonObject("items") { put("type", "string") }
+                }
+            }
+            put("required", buildJsonArray { add("run_id"); add("product_id"); add("location_id") })
+        },
+    ),
+    tool(
         "get_bom_tree",
         "**L1 / dataset-feasibility.** Expand the BOM recipe tree for a product or a " +
             "demand from the `bom` + `method_make` tables. Use to answer 'is A in B's " +
@@ -865,6 +959,29 @@ private val TOOLS: List<LlmTool> = listOf(
                 }
             }
             put("required", buildJsonArray { add("objective") })
+        },
+    ),
+    tool(
+        "narrate_tradeoff",
+        "**L3 / tradeoff narration.** Compare two configurations by signature and return " +
+            "structured tradeoff analysis: which knobs differ, which KPIs delta, and a " +
+            "one-line axis-of-tradeoff label. Use this whenever you need to narrate why " +
+            "recommend_config.alternates exist — never use freehand comparison. Returns " +
+            "{ differing_knobs: [{ knob, a, b }], kpi_deltas: [{ kpi, a, b, delta }], " +
+            "axis_label: string, summary: string }.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("sig_a") {
+                    put("type", "string")
+                    put("description", "First signature (canonical form, e.g. from recommend_config or KB).")
+                }
+                putJsonObject("sig_b") {
+                    put("type", "string")
+                    put("description", "Second signature (canonical form).")
+                }
+            }
+            put("required", buildJsonArray { add("sig_a"); add("sig_b") })
         },
     ),
     tool(
@@ -1738,6 +1855,31 @@ private fun toolRecommendConfig(caseId: Int, args: JsonObject, locale: String): 
     return ToolResult(
         summary = loc(sumEn, sumZh, locale),
         payload = payload,
+    )
+}
+
+/**
+ * Compare two configurations by signature and narrate the tradeoff.
+ * Returns structured diff of knobs, KPI deltas, and a one-line axis label.
+ */
+private fun toolNarrateTradeoff(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val sigA = args["sig_a"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`sig_a` is required", locale)
+    val sigB = args["sig_b"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`sig_b` is required", locale)
+
+    val result = com.allocator.services.KbStore.narrateTradeoff(caseId, sigA, sigB)
+
+    // Check for error.
+    if (result["error"] != null) {
+        return toolError(result["error"]?.jsonPrimitive?.contentOrNull ?: "unknown error", locale)
+    }
+
+    val sumEn = result["summary"]?.jsonPrimitive?.contentOrNull ?: "configs compared"
+    val sumZh = "配置对比：${result["axis_label"]?.jsonPrimitive?.contentOrNull ?: "不同"}"
+    return ToolResult(
+        summary = loc(sumEn, sumZh, locale),
+        payload = result,
     )
 }
 
@@ -2866,6 +3008,180 @@ private fun accumulateLeafDraws(
     }
     val children = node["children"] as? List<Map<String, Any?>> ?: return
     for (c in children) accumulateLeafDraws(c, targetPid, targetLid, demandId, accumulator)
+}
+
+/**
+ * Per-demand allocation of a (product, location) leaf in a plan run. Answers
+ * the user's question shape "how much P@L did each demand get?" with an
+ * unambiguous one-row-per-demand table.
+ *
+ * Distinct from [toolGetLeafCompetition] in framing: that tool centers on the
+ * leaf (competition + zero-share members for a 根因 story), this one centers
+ * on the per-demand table (clean rows, one per demand, with an explicit
+ * `status` per row that disambiguates the four "consumed=0" cases). No
+ * `competitors`/`members` split — a single `by_demand` array sorted by
+ * consumed_qty desc.
+ *
+ * Statuses (so the agent never reads a 0 as overall elimination):
+ *   • drew_at_leaf            consumed > 0 from this leaf's supply rows
+ *   • walks_leaf_drew_zero    walk reaches (pid, lid) but consumed 0 here
+ *                             (consolidation share / priority / override)
+ *   • walks_other_location    walk visits product at OTHER location(s) — the
+ *                             demand consumed P, just not at THIS lid
+ *   • doesnt_walk_product     walk doesn't visit pid anywhere — different
+ *                             recipe or branch chosen upstream; demand may
+ *                             still be fulfilled via a different material
+ *   • no_pegging_entry        only when caller passed `demand_ids` and a
+ *                             listed demand has no pegging entry in this run
+ */
+private fun toolGetComponentAllocationByDemand(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val runId = args["run_id"]?.jsonPrimitive?.intOrNull
+        ?: return toolError("`run_id` is required", locale)
+    val productId = args["product_id"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`product_id` is required", locale)
+    val locationId = args["location_id"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`location_id` is required", locale)
+    if (productId.isBlank() || locationId.isBlank()) {
+        return toolError("`product_id` and `location_id` cannot be blank", locale)
+    }
+    val demandIdFilter: Set<String> = args["demand_ids"]?.jsonArray
+        ?.mapNotNull { it.jsonPrimitive.contentOrNull?.trim()?.takeIf { s -> s.isNotBlank() } }
+        ?.toSet().orEmpty()
+
+    // Defensive: catch the hyphen-split LLM error (e.g. product=`502-2991` mis-passed
+    // as product=`502`, location=`2991`). Mirrors [toolGetLeafCompetition].
+    val productExists = transaction {
+        Products.selectAll()
+            .where { (Products.caseId eq caseId) and (Products.productId eq productId) }
+            .limit(1).count() > 0L
+    }
+    if (!productExists) {
+        val joined = "$productId-$locationId"
+        val joinedExists = transaction {
+            Products.selectAll()
+                .where { (Products.caseId eq caseId) and (Products.productId eq joined) }
+                .limit(1).count() > 0L
+        }
+        if (joinedExists) {
+            return toolError(
+                "product_id `$productId` not found in case $caseId, but `$joined` IS a known product. " +
+                    "Did you split a hyphenated product code? Re-call with product_id=`$joined` and " +
+                    "the actual location_id (product codes are opaque strings and may contain hyphens).",
+                locale,
+            )
+        }
+        return toolError(
+            "product_id `$productId` not found in case $caseId. Verify the product code; " +
+                "case product_ids are opaque strings (often hyphenated, e.g. `502-2991`).",
+            locale,
+        )
+    }
+
+    val result = loadPlanResultFromDb(caseId, runId)
+        ?: return toolError("plan run $runId not found for case $caseId", locale)
+
+    @Suppress("UNCHECKED_CAST")
+    val planningPegging = (result["planning_pegging"] as? List<Map<String, Any?>>) ?: emptyList()
+
+    // Iterate every pegging entry (mirrors [toolGetLeafCompetition]). A demand
+    // can have multiple entries (root tree + per-WO sub-trees); accumulating
+    // across all of them is consistent with leaf_competition's draw counting.
+    val consumedByDemand = mutableMapOf<String, Double>()
+    val visitedByDemand = mutableMapOf<String, MutableSet<String>>()
+    val seenDemands = mutableSetOf<String>()
+    for (entry in planningPegging) {
+        val did = entry["demand_id"]?.toString()?.trim() ?: continue
+        if (demandIdFilter.isNotEmpty() && did !in demandIdFilter) continue
+        @Suppress("UNCHECKED_CAST")
+        val tree = entry["tree"] as? Map<String, Any?> ?: continue
+        seenDemands.add(did)
+        accumulateLeafDraws(tree, productId, locationId, did, consumedByDemand)
+        peggingProductLocations(tree, productId, visitedByDemand.getOrPut(did) { mutableSetOf() })
+    }
+
+    // Resolve requested_qty per demand from the Demands table. When demand_ids
+    // is given, restrict the query; otherwise fetch only for demands we saw.
+    val demandsToLookUp = if (demandIdFilter.isNotEmpty()) demandIdFilter else seenDemands
+    val requestedByDemand: Map<String, Double> = if (demandsToLookUp.isEmpty()) emptyMap() else transaction {
+        Demands.selectAll()
+            .where { (Demands.caseId eq caseId) and (Demands.demandId inList demandsToLookUp.toList()) }
+            .associate { it[Demands.demandId] to it[Demands.quantity] }
+    }
+
+    // Effective demand set: with a filter, include even demands not in pegging
+    // (status will be `no_pegging_entry`). Without a filter, only demands the
+    // planner processed.
+    val effectiveDemands: List<String> = (if (demandIdFilter.isNotEmpty()) demandIdFilter else seenDemands)
+        .sortedByDescending { consumedByDemand[it] ?: 0.0 }
+
+    val totalConsumed = effectiveDemands.sumOf { consumedByDemand[it] ?: 0.0 }
+    val drewCount = effectiveDemands.count { (consumedByDemand[it] ?: 0.0) > 1e-9 }
+
+    fun classify(did: String): Pair<String, String> {
+        val consumed = consumedByDemand[did] ?: 0.0
+        if (consumed > 1e-9) {
+            return "drew_at_leaf" to "consumed $consumed of $productId@$locationId at this leaf"
+        }
+        if (did !in seenDemands) {
+            return "no_pegging_entry" to "demand has no pegging entry in run #$runId (planner did not process it — verify demand_id and run)"
+        }
+        val locs = visitedByDemand[did].orEmpty()
+        if (locationId in locs) {
+            return "walks_leaf_drew_zero" to
+                "walk reaches $productId@$locationId but drew 0 — share filtered by consolidation/priority/override; check get_leaf_competition.members for the precise cause"
+        }
+        if (locs.isNotEmpty()) {
+            return "walks_other_location" to
+                "demand walks $productId at ${locs.sorted().joinToString(",")} (not at $locationId) — consumed elsewhere; per-demand total of $productId requires get_demand_pegging on this demand"
+        }
+        return "doesnt_walk_product" to
+            "demand's walk does not visit $productId at any location — different recipe alternative was chosen upstream"
+    }
+
+    val rowsJson = JsonArray(effectiveDemands.map { did ->
+        val consumed = consumedByDemand[did] ?: 0.0
+        val (status, reason) = classify(did)
+        val visited = visitedByDemand[did].orEmpty()
+        buildJsonObject {
+            put("demand_id", JsonPrimitive(did))
+            put("requested_qty", JsonPrimitive(requestedByDemand[did] ?: 0.0))
+            put("consumed_qty", JsonPrimitive(consumed))
+            put("share_of_total_consumed_pct", JsonPrimitive(
+                if (totalConsumed > 1e-9) consumed * 100.0 / totalConsumed else 0.0
+            ))
+            put("status", JsonPrimitive(status))
+            put("reason", JsonPrimitive(reason))
+            if (visited.isNotEmpty()) {
+                put("walks_locations", JsonArray(visited.sorted().map { JsonPrimitive(it) }))
+            }
+        }
+    })
+
+    val payload = buildJsonObject {
+        put("run_id", JsonPrimitive(runId))
+        put("product_id", JsonPrimitive(productId))
+        put("location_id", JsonPrimitive(locationId))
+        put("total_consumed_at_leaf", JsonPrimitive(totalConsumed))
+        put("demand_count", JsonPrimitive(effectiveDemands.size))
+        put("drew_count", JsonPrimitive(drewCount))
+        put("by_demand", rowsJson)
+        put("note", JsonPrimitive(
+            "consumed_qty is the demand's draw at THIS (pid, lid) leaf only. For demands " +
+                "with status=walks_other_location the demand consumed $productId at a different " +
+                "location; for status=doesnt_walk_product the demand uses a different material " +
+                "branch entirely. For per-demand totals of $productId across the whole pegging " +
+                "tree, call get_demand_pegging."
+        ))
+    }
+
+    val summaryEn = "$productId@$locationId across ${effectiveDemands.size} demand(s) " +
+        "in run #$runId — $drewCount drew (total ${totalConsumed.toLong()})"
+    val summaryZh = "$productId@$locationId 在 ${effectiveDemands.size} 个需求中（运行 #$runId）" +
+        " — $drewCount 个抽取（共 ${totalConsumed.toLong()}）"
+    return ToolResult(
+        summary = loc(summaryEn, summaryZh, locale),
+        payload = payload,
+    )
 }
 
 // ── L1 dataset-feasibility tools ────────────────────────────────────────────
@@ -4043,12 +4359,14 @@ private suspend fun dispatchTool(
         "get_product_methods" -> Pair(toolGetProductMethods(caseId, args, locale), workingConfig)
         "get_product_supply" -> Pair(toolGetProductSupply(caseId, args, locale), workingConfig)
         "get_leaf_competition" -> Pair(toolGetLeafCompetition(caseId, args, locale), workingConfig)
+        "get_component_allocation_by_demand" -> Pair(toolGetComponentAllocationByDemand(caseId, args, locale), workingConfig)
         "get_bom_tree" -> Pair(toolGetBomTree(caseId, args, locale), workingConfig)
         "find_move_path" -> Pair(toolFindMovePath(caseId, args, locale), workingConfig)
         "trace_demand_to_supply" -> Pair(toolTraceDemandToSupply(caseId, args, locale), workingConfig)
         "compare_runs" -> Pair(toolCompareRuns(caseId, args, locale), workingConfig)
         "explain_method_choice" -> Pair(toolExplainMethodChoice(caseId, args, locale), workingConfig)
         "recommend_config" -> Pair(toolRecommendConfig(caseId, args, locale), workingConfig)
+        "narrate_tradeoff" -> Pair(toolNarrateTradeoff(caseId, args, locale), workingConfig)
         "query_design_docs" -> Pair(toolQueryDesignDocs(args, locale), workingConfig)
         "get_run_config" -> Pair(toolGetRunConfig(caseId, args, locale), workingConfig)
         "recheck_soundness" -> Pair(toolRecheckSoundness(caseId, args, locale), workingConfig)

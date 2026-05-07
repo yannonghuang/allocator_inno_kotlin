@@ -176,6 +176,25 @@ system prompt every turn. The agent decides what's worth persisting
 (durable user preferences, recurring goals, decisions). Scope is per-case
 in v1; per-user / global scope reserved for future.
 
+#### Reserved memory keys (L3 workflow)
+
+The following keys form the **L3 knowledge profile** — carry them across turns
+when they're set; current-turn explicit constraints override memory defaults.
+
+| Key | Value type | Purpose | Example |
+|---|---|---|---|
+| `objective_primary` | string (enum) | Default objective when user doesn't restate one. | `"best_fill"` \| `"best_fairness"` \| `"least_purchase"` \| `"most_inventory_use"` \| `"earliest_commit"` \| `"fewest_starvation"` |
+| `objective_soft_constraints` | `[{kpi: string, qualifier: string}]` | "Reasonable" / "strict" thresholds for multi-objective queries — carried across turns unless user relaxes. | `[{"kpi": "gini", "qualifier": "≤0.20"}, {"kpi": "fill_rate_pct", "qualifier": "≥15"}]` |
+| `hard_constraints` | `[{kpi: string, op: string, value: number}]` | Always applied to `recommend_config` and `suggest_next_batch` calls. | `[{"kpi": "purchase_allowed", "op": "eq", "value": 0}]` |
+| `purchase_default` | bool | Shorthand for `hard_constraints` on purchase_allowed. | `false` (disable purchase by default) |
+| `consolidation_preference` | string | Shorthand for `hard_constraints` on allocation_mode. | `"fair"` \| `"proportional"` \| `"priority_first"` |
+| `last_recommendation` | object | Closes the run-completion loop: stores the signature, KPIs, and timestamp of the most recent headline recommendation, then updated with actual_kpis when the run completes. | `{"plan_run_id": 4827, "signature": "base64_...", "predicted_kpis": {"fill_rate_pct": 22, ...}, "recommended_at": "2026-05-07T14:32:00Z", "actual_kpis": {"fill_rate_pct": 23, ...}}` |
+
+**Write logic**: agent writes these keys when user clarifies a preference
+("I always want to minimize purchase") or after a recommendation is made.
+**Read logic**: agent always checks these keys at turn start and carries
+forward unless current-turn intent explicitly overrides.
+
 ## Operational knowledge — tool catalog
 
 Organized by knowledge layer (see "Knowledge layers" section above).
@@ -200,7 +219,8 @@ Organized by knowledge layer (see "Knowledge layers" section above).
 | `compare_runs(run_a_id, run_b_id)` | "Compare run A vs B". Returns config_diff (paths that differ), kpi_delta (b−a on the standard KPI set), soundness_delta, and `signature_match` (true ⇒ environmental noise, not config effect). Pure data — articulate the mechanism story yourself. |
 | `explain_method_choice(run_id, product_id, location_id, demand_id?)` | "Why was method X picked over Y at node N (product P @ location L)?" AND "how do I admit method Y?". Walks the FULL pegging tree (bypasses `get_demand_pegging`'s pruner). Returns matching WO(s) with `method_choice_explanation` + parent demand context, AND **every method at the site classified by `status` (chosen / lower_preference / beyond_max_methods / purchase_disabled / failed_cascade_probe / score_lower / unknown_not_chosen) + `presumed_reason` + `would_admit_if` hint**, AND the run's `method_selection` config, AND `override_levers` listing the seven supply-side override paths. Symmetric to `get_leaf_competition`'s `members` enrichment — same recipe applied to method selection. |
 | `get_run_config(run_id)` | "What config did run X use?". MUST-HAVE before A/B comparison; `compare_runs` already wraps this. |
-| `get_leaf_competition(run_id, product_id, location_id)` | **Demand-side root-cause story + zero-share members.** Two views: (1) `competitors` — demands that drew > 0 with `leaf_draw_qty` + `share_pct` (the 根因 story). (2) `members` — every demand whose BOM contains this product, drawers AND zero-share candidates, each tagged with `share_status` (drew_full / drew_partial / walk_at_other_location / walk_avoids_product / priority_filtered / share_starved_under_shortage / outside_bucket / override_blocked / zero_share) + `presumed_reason`. Use the `members` view for "why was demand D eliminated and how do I re-assign shares to it?". Returns `override_levers` listing the four override paths (manual_override.component_split, allocation_mode change, period_days change, demand.priority change). **Critical:** `leaf_draw_qty` is the demand's draw at THIS leaf only — NOT its overall allocation of the product. For `walk_at_other_location` / `walk_avoids_product` the field is `null` (demand consumes the product elsewhere or via a different recipe); reading it as "0 allocated" is wrong. For per-demand totals across the whole pegging tree, call `get_demand_pegging` and sum. |
+| `get_leaf_competition(run_id, product_id, location_id)` | **Demand-side root-cause story + zero-share members.** Two views: (1) `competitors` — demands that drew > 0 with `leaf_draw_qty` + `share_pct` (the 根因 story). (2) `members` — every demand whose BOM contains this product, drawers AND zero-share candidates, each tagged with `share_status` (drew_full / drew_partial / walk_at_other_location / walk_avoids_product / priority_filtered / share_starved_under_shortage / outside_bucket / override_blocked / zero_share) + `presumed_reason`. Use the `members` view for "why was demand D eliminated and how do I re-assign shares to it?". Returns `override_levers` listing the four override paths (manual_override.component_split, allocation_mode change, period_days change, demand.priority change). **Note:** for "how much P@L did each demand get?" (allocation TABLE across demands), prefer `get_component_allocation_by_demand` — same data, demand-centric framing, status field instead of leaf-side null/0 ambiguity. |
+| `get_component_allocation_by_demand(run_id, product_id, location_id, demand_ids?)` | **Per-demand allocation table for a (pid, lid) leaf.** Canonical answer to "how much P@L did each demand get?" / "物料 P@L 在这些需求中的分配情况". Returns one row per demand with `consumed_qty` (draw at THIS leaf), `requested_qty`, `share_of_total_consumed_pct`, and explicit `status` (drew_at_leaf / walks_leaf_drew_zero / walks_other_location / doesnt_walk_product / no_pegging_entry) so the agent never reads a 0 as "overall elimination". Optional `demand_ids` filter scopes to specific demands. For a demand's TOTAL consumption of the product across all leaves, call `get_demand_pegging` on that demand and sum. |
 | `get_soundness_summary(run_id)` | Rule-level rollup of soundness violations. Use INSTEAD of walking each demand's pegging. |
 | `recheck_soundness(run_id, deep_check?)` | A soundness rule has shipped *since* run X — apply the current ruleset retroactively. |
 
