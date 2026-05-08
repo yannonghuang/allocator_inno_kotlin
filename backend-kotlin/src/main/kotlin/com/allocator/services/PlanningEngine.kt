@@ -3413,15 +3413,46 @@ private fun fixTimingFromPegging(
 
     val mutableWos: List<MutableMap<String, Any?>> = workOrders.map { it.toMutableMap() }
 
-    // Index lot rows by their wo_group_id.  One id per planMethodSlot decision;
-    // multi-lot WOs put N rows under one id and we shift the whole group by the
-    // same delta to preserve intra-group lot sequencing (lot N+1 starts when
-    // lot N ends).  The pegging-tree WO node carries the same id, so the
-    // lookup is exact — no (pid, lid, start_time) heuristics needed.
+    // OR-merge: when a demand is fulfilled by multiple WO alternatives
+    // (waterfall split, marked by children_relation="or" or simply >1 WO
+    // children of a demand), the alternatives are merged into a single
+    // logical wo_group for sequencing.  We pick one of the alternatives'
+    // wo_group_ids as the canonical id and remap the others to it.  Each
+    // alternative's lots still shift independently (preserving its own
+    // lot N+1.start = lot N.end chain), but they all see the OR-group's
+    // unified set of children when computing the shift target.
+    val canonOf = mutableMapOf<String, String>()
+    @Suppress("UNCHECKED_CAST")
+    fun detectOrGroups(node: Map<String, Any?>, depth: Int) {
+        if (depth > 60) return
+        val children = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
+        if ((node["type"] as? String) == "demand") {
+            val woGids = children
+                .filter { it["type"] == "work_order" && it["failed"] != true }
+                .mapNotNull { it["wo_group_id"] as? String }
+                .distinct()
+            if (woGids.size > 1) {
+                val canon = woGids.first()
+                for (gid in woGids) canonOf[gid] = canon
+            }
+        }
+        for (c in children) detectOrGroups(c, depth + 1)
+    }
+    for (entry in peggingTrees) {
+        @Suppress("UNCHECKED_CAST")
+        val tree = entry["tree"] as? Map<String, Any?> ?: continue
+        detectOrGroups(tree, 0)
+    }
+    fun canonical(gid: String): String = canonOf[gid] ?: gid
+
+    // Index lot rows by their CANONICAL wo_group_id.  Lots from OR-alternatives
+    // share a canonical id and live in the same bucket; intra-alternative lot
+    // chains are recovered at shift time by re-grouping on the original
+    // wo_group_id within the bucket.
     val lotsByGroup = mutableMapOf<String, MutableList<MutableMap<String, Any?>>>()
     for (wo in mutableWos) {
         val gid = wo["wo_group_id"] as? String ?: continue
-        lotsByGroup.getOrPut(gid) { mutableListOf() }.add(wo)
+        lotsByGroup.getOrPut(canonical(gid)) { mutableListOf() }.add(wo)
     }
 
     fun headStart(gid: String): LocalDate? =
@@ -3429,9 +3460,8 @@ private fun fixTimingFromPegging(
     fun tailEnd(gid: String): LocalDate? =
         lotsByGroup[gid]?.mapNotNull { parseDate(it["end_time"] as? String) }?.maxOrNull()
 
-    // Build the parent → children DAG by walking each pegging tree.  Each WO
-    // node carries its own wo_group_id; a parent edge is added whenever the
-    // recursion crosses parent_wo → demand → child_wo.
+    // Build the parent → children DAG using canonical ids, so a child push
+    // from any predecessor of any OR-alternative reaches the merged group.
     val parentsOf = mutableMapOf<String, MutableSet<String>>()
     val hasChild = mutableSetOf<String>()
     val allGroups = mutableSetOf<String>()
@@ -3447,12 +3477,13 @@ private fun fixTimingFromPegging(
                 // participate in sequencing constraints.
                 if (node["failed"] == true) return
                 val gid = node["wo_group_id"] as? String ?: return
-                allGroups.add(gid)
-                if (currentParent != null && currentParent != gid) {
-                    parentsOf.getOrPut(gid) { mutableSetOf() }.add(currentParent)
+                val cgid = canonical(gid)
+                allGroups.add(cgid)
+                if (currentParent != null && currentParent != cgid) {
+                    parentsOf.getOrPut(cgid) { mutableSetOf() }.add(currentParent)
                     hasChild.add(currentParent)
                 }
-                for (c in nodeChildren) walk(c, currentParent = gid, depth + 1)
+                for (c in nodeChildren) walk(c, currentParent = cgid, depth + 1)
             }
             else -> {  // "demand" or null — pass through, keep currentParent
                 for (c in nodeChildren) walk(c, currentParent, depth + 1)
@@ -3483,33 +3514,41 @@ private fun fixTimingFromPegging(
         val childEnd = tailEnd(childGid) ?: return
         for (parentGid in parentsOf[childGid] ?: emptySet()) {
             val parentLots = lotsByGroup[parentGid] ?: continue
-            val parentHead = headStart(parentGid) ?: continue
-            if (childEnd > parentHead) {
-                val shiftDays = childEnd.toEpochDay() - parentHead.toEpochDay()
-                // Shift every lot in this group by the same delta so intra-group
-                // lot sequencing (lot N+1 starts when lot N ends) is preserved.
-                for (lot in parentLots) {
+            // Re-group lots by their original wo_group_id to recover the
+            // per-alternative lot chains.  Each alternative shifts independently
+            // (so its intra-alternative lot sequencing is preserved), but they
+            // all see the same childEnd target — so the early alternative gets
+            // pulled forward to align with the merged group's predecessor end,
+            // while alternatives already at/after the target are untouched.
+            val byAlt = parentLots.groupBy { it["wo_group_id"] as? String ?: "" }
+            var anyShift = false
+            for ((altGid, altLots) in byAlt) {
+                val altHead = altLots.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull() ?: continue
+                if (childEnd <= altHead) continue
+                val shiftDays = childEnd.toEpochDay() - altHead.toEpochDay()
+                for (lot in altLots) {
                     val ls = parseDate(lot["start_time"] as? String)
                     val le = parseDate(lot["end_time"] as? String)
                     if (ls != null) lot["start_time"] = formatDate(ls.plusDays(shiftDays))
                     if (le != null) lot["end_time"] = formatDate(le.plusDays(shiftDays))
                 }
+                anyShift = true
                 shiftCount++
-                val first = parentLots.first()
-                log.info("fixTiming: {}@{} group={} shifted +{} days (head: {} → {}, lots={}) driven by child group={} end={}",
-                    first["product_id"], first["location_id"], parentGid, shiftDays,
-                    formatDate(parentHead), formatDate(parentHead.plusDays(shiftDays)),
-                    parentLots.size,
+                val first = altLots.first()
+                log.info("fixTiming: {}@{} alt={} (canon={}) shifted +{} days (alt_head: {} → {}, lots={}) driven by child canon={} end={}",
+                    first["product_id"], first["location_id"], altGid, parentGid, shiftDays,
+                    formatDate(altHead), formatDate(altHead.plusDays(shiftDays)),
+                    altLots.size,
                     childGid, formatDate(childEnd))
-                pushUp(parentGid, depth + 1)
             }
+            if (anyShift) pushUp(parentGid, depth + 1)
         }
     }
 
     for (leaf in leaves) pushUp(leaf, depth = 0)
 
-    log.info("fixTimingFromPegging: lot_groups={} pegging_trees={} dag_groups={} leaves={} shifts_applied={}",
-        lotsByGroup.size, peggingTrees.size, allGroups.size, leaves.size, shiftCount)
+    log.info("fixTimingFromPegging: lot_groups={} pegging_trees={} dag_groups={} or_remapped={} leaves={} shifts_applied={}",
+        lotsByGroup.size, peggingTrees.size, allGroups.size, canonOf.size, leaves.size, shiftCount)
 
     // Targeted diagnostic for F35__688@VIRTUAL@make under demand 688_F35_2024_07_VIRTUAL.
     // Dumps:
