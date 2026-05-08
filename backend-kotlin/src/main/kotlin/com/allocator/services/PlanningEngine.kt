@@ -3454,6 +3454,7 @@ private fun fixTimingFromPegging(
     // node's start_time, and start_times are upper-bounded by the latest leaf
     // end_time plus the lead-time chain.  The depth guard handles any residual
     // cycles prunePhantomLoops missed.
+    var shiftCount = 0
     fun pushUp(childKey: WoKey, depth: Int) {
         if (depth > 200) return
         val childWo = woByKey[childKey] ?: return
@@ -3466,15 +3467,20 @@ private fun fixTimingFromPegging(
                 val shiftDays = childEnd.toEpochDay() - parentStart.toEpochDay()
                 parentWo["start_time"] = formatDate(childEnd)
                 if (parentEnd != null) parentWo["end_time"] = formatDate(parentEnd.plusDays(shiftDays))
-                log.debug("fixTiming: {}@{} shifted +{} days → {} .. {}",
+                shiftCount++
+                log.info("fixTiming: {}@{} shifted +{} days → {} .. {} (driven by child {}@{} end={})",
                     parentKey.pid, parentKey.lid, shiftDays,
-                    parentWo["start_time"], parentWo["end_time"])
+                    parentWo["start_time"], parentWo["end_time"],
+                    childKey.pid, childKey.lid, childWo["end_time"])
                 pushUp(parentKey, depth + 1)
             }
         }
     }
 
     for (leaf in leaves) pushUp(leaf, depth = 0)
+
+    log.info("fixTimingFromPegging: woByKey={} pegging_trees={} dag_nodes={} leaves={} shifts_applied={}",
+        woByKey.size, peggingTrees.size, allWos.size, leaves.size, shiftCount)
 
     return mutableWos
 }
