@@ -1550,11 +1550,15 @@ internal fun planMethodSlot(
 
     // 5) Timing + work orders
     val startDt = computeStartDt(reqDt, leadDays, commitTimes)
-    val (wos, lotCount, lastEnd, lotSizeVal) = buildWorkOrders(productId, productionLocation, achievableParentQty, leadDays, startDt, m, demandId, data, overrideActive)
+    val woResult = buildWorkOrders(productId, productionLocation, achievableParentQty, leadDays, startDt, m, demandId, data, overrideActive)
+    val wos = woResult.wos
+    val lotCount = woResult.lotCount
+    val lastEnd = woResult.lastEnd
+    val lotSizeVal = woResult.lotSizeVal
     val methodType = m["type"] as? String ?: ""
     val woChildren = if (methodType == "purchase") listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to roundQty(achievableParentQty), "children" to emptyList<Any>()))
                      else childPeggingNodes
-    val methodPeggingNode = buildWoNode(productId, productionLocation, achievableParentQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodChoiceExplanation, variantExplanation, woChildrenRelation, woChildren, overrideActive)
+    val methodPeggingNode = buildWoNode(productId, productionLocation, achievableParentQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodChoiceExplanation, variantExplanation, woChildrenRelation, woChildren, overrideActive, woGroupId = woResult.woGroupId)
 
     return MethodSlotResult(
         achievableQty = achievableParentQty,
@@ -2320,7 +2324,16 @@ private data class WorkOrderResult(
     val lotCount: Int,
     val lastEnd: LocalDate?,
     val lotSizeVal: Double,
+    val woGroupId: String,
 )
+
+// Process-wide unique-id source for WO groups.  One id per `planMethodSlot`
+// decision; shared by every lot row emitted by `buildWorkOrders` for that
+// decision and stamped onto the matching pegging-tree WO node by `buildWoNode`.
+// Used by `fixTimingFromPegging` to match pegging nodes to their lot rows
+// without depending on (pid, lid, start_time) heuristics.
+private val woGroupIdSeq = java.util.concurrent.atomic.AtomicLong(0)
+private fun nextWoGroupId(): String = "wog${woGroupIdSeq.incrementAndGet()}"
 
 internal fun leadDaysForMethod(m: Map<String, Any?>): Double = when (m["type"]) {
     "make" -> (m["lead_time"] as? Number)?.toDouble() ?: 0.0
@@ -2353,6 +2366,7 @@ private fun buildWorkOrders(
     val lotSize = max(1e-9, lotSizeVal)
     val prodArea = getProdArea(productId, productionLocation, data)
     val methodType = m["type"] as? String ?: ""
+    val woGroupId = nextWoGroupId()
     val wos = mutableListOf<Map<String, Any?>>()
     var left = qty
     var lotStart: LocalDate? = startDt
@@ -2372,13 +2386,14 @@ private fun buildWorkOrders(
             "demand_id" to demandId,
             "prod_area" to prodArea,
             "override_active" to overrideActive,
+            "wo_group_id" to woGroupId,
         ))
         lastEnd = lotEnd
         left -= lotQty
         lotCount++
         lotStart = if (left > 1e-9) lotEnd else null
     }
-    return WorkOrderResult(wos, lotCount, lastEnd, lotSizeVal)
+    return WorkOrderResult(wos, lotCount, lastEnd, lotSizeVal, woGroupId)
 }
 
 private fun buildWoNode(
@@ -2397,6 +2412,7 @@ private fun buildWoNode(
     woChildren: List<Map<String, Any?>>,
     overrideActive: Boolean = false,
     failed: Boolean = false,
+    woGroupId: String? = null,
 ): Map<String, Any?> = buildMap {
     put("type", "work_order")
     put("product_id", productId)
@@ -2413,6 +2429,7 @@ private fun buildWoNode(
     put("max_lot_size", lotSizeVal)
     put("override_active", overrideActive)
     put("children", woChildren)
+    if (woGroupId != null) put("wo_group_id", woGroupId)
     // Marker for the AND-bottleneck blocked branch: this WO is a debug snapshot
     // of "what would have happened" — its subtree shows first-pass takes that
     // were rolled back by inventory.clear()/inventory.addAll(snap) at the
@@ -3388,8 +3405,6 @@ internal fun verifySupplyCap(
  * once start_time has been mutated.  Leaf-driven push reaches every
  * ancestor regardless of which tree it sits in.
  */
-private data class WoKey(val pid: String, val lid: String, val origStart: String)
-
 private fun fixTimingFromPegging(
     workOrders: List<Map<String, Any?>>,
     peggingTrees: List<Map<String, Any?>>,
@@ -3398,38 +3413,46 @@ private fun fixTimingFromPegging(
 
     val mutableWos: List<MutableMap<String, Any?>> = workOrders.map { it.toMutableMap() }
 
-    // Canonical key uses the ORIGINAL start_time as it appears in the WO list and
-    // pegging tree nodes; this is what the pegging-tree walk will see.  WO start_time
-    // gets mutated as we shift, but the index key never changes.
-    val woByKey = mutableMapOf<WoKey, MutableMap<String, Any?>>()
+    // Index lot rows by their wo_group_id.  One id per planMethodSlot decision;
+    // multi-lot WOs put N rows under one id and we shift the whole group by the
+    // same delta to preserve intra-group lot sequencing (lot N+1 starts when
+    // lot N ends).  The pegging-tree WO node carries the same id, so the
+    // lookup is exact — no (pid, lid, start_time) heuristics needed.
+    val lotsByGroup = mutableMapOf<String, MutableList<MutableMap<String, Any?>>>()
     for (wo in mutableWos) {
-        val pid = wo["product_id"] as? String ?: continue
-        val lid = wo["location_id"] as? String ?: continue
-        val st = wo["start_time"] as? String ?: continue
-        woByKey[WoKey(pid, lid, st)] = wo
+        val gid = wo["wo_group_id"] as? String ?: continue
+        lotsByGroup.getOrPut(gid) { mutableListOf() }.add(wo)
     }
 
-    // Build the parent → children DAG by walking each pegging tree.
-    val parentsOf = mutableMapOf<WoKey, MutableSet<WoKey>>()
-    val hasChild = mutableSetOf<WoKey>()
-    val allWos = mutableSetOf<WoKey>()
+    fun headStart(gid: String): LocalDate? =
+        lotsByGroup[gid]?.mapNotNull { parseDate(it["start_time"] as? String) }?.minOrNull()
+    fun tailEnd(gid: String): LocalDate? =
+        lotsByGroup[gid]?.mapNotNull { parseDate(it["end_time"] as? String) }?.maxOrNull()
+
+    // Build the parent → children DAG by walking each pegging tree.  Each WO
+    // node carries its own wo_group_id; a parent edge is added whenever the
+    // recursion crosses parent_wo → demand → child_wo.
+    val parentsOf = mutableMapOf<String, MutableSet<String>>()
+    val hasChild = mutableSetOf<String>()
+    val allGroups = mutableSetOf<String>()
 
     @Suppress("UNCHECKED_CAST")
-    fun walk(node: Map<String, Any?>, currentParent: WoKey?, depth: Int) {
+    fun walk(node: Map<String, Any?>, currentParent: String?, depth: Int) {
         if (depth > 60) return
         val nodeChildren = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
         when (node["type"] as? String) {
             "work_order" -> {
-                val pid = node["product_id"] as? String ?: return
-                val lid = (node["location_id"] as? String) ?: ""
-                val st = node["start_time"] as? String ?: return
-                val key = WoKey(pid, lid, st)
-                allWos.add(key)
-                if (currentParent != null) {
-                    parentsOf.getOrPut(key) { mutableSetOf() }.add(currentParent)
+                // Skip blocked/failed pegging WOs — they have a wo_group_id but no
+                // matching lot rows in the work-order list, and they should not
+                // participate in sequencing constraints.
+                if (node["failed"] == true) return
+                val gid = node["wo_group_id"] as? String ?: return
+                allGroups.add(gid)
+                if (currentParent != null && currentParent != gid) {
+                    parentsOf.getOrPut(gid) { mutableSetOf() }.add(currentParent)
                     hasChild.add(currentParent)
                 }
-                for (c in nodeChildren) walk(c, currentParent = key, depth + 1)
+                for (c in nodeChildren) walk(c, currentParent = gid, depth + 1)
             }
             else -> {  // "demand" or null — pass through, keep currentParent
                 for (c in nodeChildren) walk(c, currentParent, depth + 1)
@@ -3442,10 +3465,10 @@ private fun fixTimingFromPegging(
         walk(tree, currentParent = null, depth = 0)
     }
 
-    // Leaves: WOs that exist in pegging but have no WO descendants
-    val leaves = allWos.filter { it !in hasChild }
+    // Leaves: WO groups that exist in pegging but have no WO-group descendants.
+    val leaves = allGroups.filter { it !in hasChild }
 
-    // Push child.end_time up to all parents; when a parent shifts, recurse.
+    // Push child end_time up to all parents; when a parent shifts, recurse.
     //
     // Intentionally NO visited set: when two siblings share a parent, the parent
     // must be re-evaluated against each sibling's end_time (a visited check would
@@ -3455,32 +3478,38 @@ private fun fixTimingFromPegging(
     // end_time plus the lead-time chain.  The depth guard handles any residual
     // cycles prunePhantomLoops missed.
     var shiftCount = 0
-    fun pushUp(childKey: WoKey, depth: Int) {
+    fun pushUp(childGid: String, depth: Int) {
         if (depth > 200) return
-        val childWo = woByKey[childKey] ?: return
-        val childEnd = parseDate(childWo["end_time"] as? String) ?: return
-        for (parentKey in parentsOf[childKey] ?: emptySet()) {
-            val parentWo = woByKey[parentKey] ?: continue
-            val parentStart = parseDate(parentWo["start_time"] as? String) ?: continue
-            if (childEnd > parentStart) {
-                val parentEnd = parseDate(parentWo["end_time"] as? String)
-                val shiftDays = childEnd.toEpochDay() - parentStart.toEpochDay()
-                parentWo["start_time"] = formatDate(childEnd)
-                if (parentEnd != null) parentWo["end_time"] = formatDate(parentEnd.plusDays(shiftDays))
+        val childEnd = tailEnd(childGid) ?: return
+        for (parentGid in parentsOf[childGid] ?: emptySet()) {
+            val parentLots = lotsByGroup[parentGid] ?: continue
+            val parentHead = headStart(parentGid) ?: continue
+            if (childEnd > parentHead) {
+                val shiftDays = childEnd.toEpochDay() - parentHead.toEpochDay()
+                // Shift every lot in this group by the same delta so intra-group
+                // lot sequencing (lot N+1 starts when lot N ends) is preserved.
+                for (lot in parentLots) {
+                    val ls = parseDate(lot["start_time"] as? String)
+                    val le = parseDate(lot["end_time"] as? String)
+                    if (ls != null) lot["start_time"] = formatDate(ls.plusDays(shiftDays))
+                    if (le != null) lot["end_time"] = formatDate(le.plusDays(shiftDays))
+                }
                 shiftCount++
-                log.info("fixTiming: {}@{} shifted +{} days → {} .. {} (driven by child {}@{} end={})",
-                    parentKey.pid, parentKey.lid, shiftDays,
-                    parentWo["start_time"], parentWo["end_time"],
-                    childKey.pid, childKey.lid, childWo["end_time"])
-                pushUp(parentKey, depth + 1)
+                val first = parentLots.first()
+                log.info("fixTiming: {}@{} group={} shifted +{} days (head: {} → {}, lots={}) driven by child group={} end={}",
+                    first["product_id"], first["location_id"], parentGid, shiftDays,
+                    formatDate(parentHead), formatDate(parentHead.plusDays(shiftDays)),
+                    parentLots.size,
+                    childGid, formatDate(childEnd))
+                pushUp(parentGid, depth + 1)
             }
         }
     }
 
     for (leaf in leaves) pushUp(leaf, depth = 0)
 
-    log.info("fixTimingFromPegging: woByKey={} pegging_trees={} dag_nodes={} leaves={} shifts_applied={}",
-        woByKey.size, peggingTrees.size, allWos.size, leaves.size, shiftCount)
+    log.info("fixTimingFromPegging: lot_groups={} pegging_trees={} dag_groups={} leaves={} shifts_applied={}",
+        lotsByGroup.size, peggingTrees.size, allGroups.size, leaves.size, shiftCount)
 
     return mutableWos
 }
