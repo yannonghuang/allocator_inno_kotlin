@@ -3534,12 +3534,14 @@ private fun fixTimingFromPegging(
                 }
                 anyShift = true
                 shiftCount++
-                val first = altLots.first()
-                log.info("fixTiming: {}@{} alt={} (canon={}) shifted +{} days (alt_head: {} → {}, lots={}) driven by child canon={} end={}",
-                    first["product_id"], first["location_id"], altGid, parentGid, shiftDays,
-                    formatDate(altHead), formatDate(altHead.plusDays(shiftDays)),
-                    altLots.size,
-                    childGid, formatDate(childEnd))
+                if (log.isDebugEnabled) {
+                    val first = altLots.first()
+                    log.debug("fixTiming: {}@{} alt={} (canon={}) shifted +{} days (alt_head: {} → {}, lots={}) driven by child canon={} end={}",
+                        first["product_id"], first["location_id"], altGid, parentGid, shiftDays,
+                        formatDate(altHead), formatDate(altHead.plusDays(shiftDays)),
+                        altLots.size,
+                        childGid, formatDate(childEnd))
+                }
             }
             if (anyShift) pushUp(parentGid, depth + 1)
         }
@@ -3555,71 +3557,6 @@ private fun fixTimingFromPegging(
 
     log.info("fixTimingFromPegging: lot_groups={} pegging_trees={} dag_groups={} or_remapped={} leaves={} shifts_applied={}",
         lotsByGroup.size, peggingTrees.size, allGroups.size, canonOf.size, leaves.size, shiftCount)
-
-    // Targeted diagnostic for F35__688@VIRTUAL@make under demand 688_F35_2024_07_VIRTUAL.
-    // Dumps:
-    //  (a) the matching WO lot rows from the work-order list
-    //  (b) the matching WO group's DAG children with their end_times
-    //  (c) the full pegging-tree shape for that demand, so we can see whether
-    //      the move WOs we expect to be predecessors are actually structured
-    //      as descendants of the F35 make node.
-    val targetDemand = "688_F35_2024_07_VIRTUAL"
-    val targetPid = "F35__688"
-    val targetLid = "VIRTUAL"
-    val targetMethod = "make"
-    val childrenOf = mutableMapOf<String, MutableSet<String>>()
-    for ((child, parents) in parentsOf) for (p in parents) childrenOf.getOrPut(p) { mutableSetOf() }.add(child)
-    for ((gid, lots) in lotsByGroup) {
-        val first = lots.first()
-        if (first["product_id"] != targetPid) continue
-        if (first["location_id"] != targetLid) continue
-        if (first["method"] != targetMethod) continue
-        val starts = lots.mapNotNull { parseDate(it["start_time"] as? String) }
-        val ends = lots.mapNotNull { parseDate(it["end_time"] as? String) }
-        log.info("DEBUG F35 group: gid={} pid={}@{} method={} demand_id={} lots={} head={} tail={}",
-            gid, first["product_id"], first["location_id"], first["method"], first["demand_id"],
-            lots.size, formatDate(starts.minOrNull()), formatDate(ends.maxOrNull()))
-        log.info("DEBUG F35 parents_in_dag={}", parentsOf[gid] ?: emptySet<String>())
-        for (cgid in childrenOf[gid] ?: emptySet()) {
-            val clots = lotsByGroup[cgid]
-            val cf = clots?.firstOrNull()
-            val cstarts = clots?.mapNotNull { parseDate(it["start_time"] as? String) }
-            val cends = clots?.mapNotNull { parseDate(it["end_time"] as? String) }
-            log.info("DEBUG F35 child: gid={} pid={}@{} method={} head={} tail={} (lots_in_index={})",
-                cgid, cf?.get("product_id"), cf?.get("location_id"), cf?.get("method"),
-                formatDate(cstarts?.minOrNull()), formatDate(cends?.maxOrNull()),
-                clots?.size ?: 0)
-        }
-    }
-
-    // (c) Dump the pegging tree for the F35 demand so we can see its actual
-    //     shape (WO node types, the wo_group_id present on each, hierarchy).
-    @Suppress("UNCHECKED_CAST")
-    fun dumpTree(node: Map<String, Any?>, indent: Int) {
-        if (indent > 30) return
-        val pad = "  ".repeat(indent)
-        when (node["type"] as? String) {
-            "work_order" -> log.info("{}WO {}@{} method={} gid={} failed={} start={} end={}",
-                pad, node["product_id"], node["location_id"], node["method"],
-                node["wo_group_id"], node["failed"], node["start_time"], node["end_time"])
-            "demand" -> log.info("{}D {}@{} req_due={} commit={}",
-                pad, node["product_id"], node["location_id"],
-                node["request_due_time"], node["commit_time"])
-            else -> log.info("{}{} pid={} lid={}", pad, node["type"], node["product_id"], node["location_id"])
-        }
-        val children = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
-        for (c in children) dumpTree(c, indent + 1)
-    }
-    for (entry in peggingTrees) {
-        val did = entry["demand_id"]?.toString() ?: ""
-        @Suppress("UNCHECKED_CAST")
-        val members = (entry["consolidated_demand_ids"] as? List<String>) ?: emptyList()
-        if (did != targetDemand && targetDemand !in members) continue
-        log.info("=== F35 pegging tree (demand_id={} consolidated_members={}) ===", did, members)
-        @Suppress("UNCHECKED_CAST")
-        val tree = entry["tree"] as? Map<String, Any?> ?: continue
-        dumpTree(tree, 0)
-    }
 
     return mutableWos
 }
