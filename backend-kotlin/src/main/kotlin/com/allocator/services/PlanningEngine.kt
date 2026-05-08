@@ -3511,5 +3511,33 @@ private fun fixTimingFromPegging(
     log.info("fixTimingFromPegging: lot_groups={} pegging_trees={} dag_groups={} leaves={} shifts_applied={}",
         lotsByGroup.size, peggingTrees.size, allGroups.size, leaves.size, shiftCount)
 
+    // Targeted diagnostic for F35__688.  Dumps its own WO group (start/end),
+    // its DAG children with their end_times, and its DAG parents (should be
+    // empty if it's at the top of a demand tree).  Lets us confirm that
+    // child end_times really aren't past F35__688's start_time, vs. the DAG
+    // not capturing the relationship at all.
+    val childrenOf = mutableMapOf<String, MutableSet<String>>()
+    for ((child, parents) in parentsOf) for (p in parents) childrenOf.getOrPut(p) { mutableSetOf() }.add(child)
+    for ((gid, lots) in lotsByGroup) {
+        val first = lots.first()
+        if (first["product_id"] != "F35__688") continue
+        val starts = lots.mapNotNull { parseDate(it["start_time"] as? String) }
+        val ends = lots.mapNotNull { parseDate(it["end_time"] as? String) }
+        log.info("DEBUG F35: gid={} pid={} lid={} method={} demand_id={} lots={} head={} tail={}",
+            gid, first["product_id"], first["location_id"], first["method"], first["demand_id"],
+            lots.size, formatDate(starts.minOrNull()), formatDate(ends.maxOrNull()))
+        log.info("DEBUG F35: parents_of_F35={}", parentsOf[gid] ?: emptySet<String>())
+        for (cgid in childrenOf[gid] ?: emptySet()) {
+            val clots = lotsByGroup[cgid]
+            val cf = clots?.firstOrNull()
+            val cstarts = clots?.mapNotNull { parseDate(it["start_time"] as? String) }
+            val cends = clots?.mapNotNull { parseDate(it["end_time"] as? String) }
+            log.info("DEBUG F35 child: gid={} pid={} lid={} method={} head={} tail={} (in_lotsByGroup={})",
+                cgid, cf?.get("product_id"), cf?.get("location_id"), cf?.get("method"),
+                formatDate(cstarts?.minOrNull()), formatDate(cends?.maxOrNull()),
+                clots != null)
+        }
+    }
+
     return mutableWos
 }
