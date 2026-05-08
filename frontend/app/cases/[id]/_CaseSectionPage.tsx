@@ -2556,12 +2556,69 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return { parentMap, childMap };
   }, [planResult]);
 
-  // 4-part WO keys for a row, considering multi-demand consolidation.
-  const woRowPegKeys = useCallback((r: WoEnrichedRow): string[] => {
-    const ids = (r._demand_ids?.length ? r._demand_ids : [r.demand_id ?? ''])
-      .filter((d): d is string => d != null);
-    return ids.map((d) => `${d}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`);
+  // ── Shared row identity / pegging-classification helpers ────────────────────
+  // These are the single source of truth for "what counts as one row in the
+  // work-order view" and "how does a row relate to the highlighted WO".
+  // The "Pegged only" filter (in the table render) AND the up/down-arrow
+  // counts (in the toolbar) both go through `peggedRowKindFor` so they cannot
+  // disagree.
+  type WoRowLike = {
+    product_id?: string;
+    location_id?: string | null;
+    method?: string | null;
+    demand_id?: string | null;
+    location_source?: string | null;
+    prod_area?: string | null;
+    _demand_ids?: string[];
+    wo_consolidation_split_details?: Array<{ demand_id?: string | null }> | null;
+  };
+
+  // 6-part key used to group lots into one logical work-order row.  Both the
+  // count walk and the table's grouping derive their row identity from this.
+  const woRowGroupKey = useCallback((r: WoRowLike): string => [
+    String(r.demand_id ?? ''),
+    String(r.product_id ?? ''),
+    String(r.location_id ?? ''),
+    String(r.method ?? ''),
+    String(r.location_source ?? ''),
+    String(r.prod_area ?? ''),
+  ].join('|'), []);
+
+  // Demand-ids associated with a row.  Enriched rows carry `_demand_ids`
+  // pre-populated; raw work_orders fall back to demand_id or
+  // wo_consolidation_split_details.
+  const woRowDemandIds = useCallback((r: WoRowLike): string[] => {
+    if (r._demand_ids && r._demand_ids.length) return r._demand_ids;
+    if (r.demand_id) return [r.demand_id];
+    return (r.wo_consolidation_split_details ?? [])
+      .map((d) => d.demand_id)
+      .filter((d): d is string => d != null && d !== '');
   }, []);
+
+  // 4-part pegging keys for a row (consolidation-aware: one key per demand_id).
+  const woRowPegKeys = useCallback((r: WoRowLike): string[] => {
+    const ids = woRowDemandIds(r);
+    return (ids.length ? ids : ['']).map((d) =>
+      `${d}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`);
+  }, [woRowDemandIds]);
+
+  // Single classifier used by both the "Pegged only" filter and the arrow
+  // counts: returns 'self' if the row is the highlighted WO itself,
+  // 'ancestor' if downstream (consumer side), 'descendant' if upstream
+  // (supplier side), or null if unrelated.
+  type PeggedRowKind = 'self' | 'ancestor' | 'descendant' | null;
+  const peggedRowKindFor = useCallback((
+    r: WoRowLike,
+    highlightRow: WoRowLike | null,
+    sets: { ancestors: Set<string>; descendants: Set<string> },
+  ): PeggedRowKind => {
+    if (!highlightRow) return null;
+    if (woRowGroupKey(r) === woRowGroupKey(highlightRow)) return 'self';
+    const keys = woRowPegKeys(r);
+    if (keys.some((k) => sets.ancestors.has(k))) return 'ancestor';
+    if (keys.some((k) => sets.descendants.has(k))) return 'descendant';
+    return null;
+  }, [woRowGroupKey, woRowPegKeys]);
 
   // Transitive ancestor / descendant sets for the highlighted WO row.
   // ancestors = downstream (consumers, closer to demand), descendants = upstream (suppliers).
@@ -2586,48 +2643,28 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return { ancestors, descendants };
   }, [woPegHighlightRow, woPegRelations, woRowPegKeys]);
 
-  // Row-level counts that mirror the "Pegged only" filter exactly, so the
-  // up/down-arrow numbers shown next to the highlighted WO match the number
-  // of rows that would be displayed under the filter (rather than the size of
-  // the abstract pegging-key set, which can over-count vs. the grouped rows).
-  // Grouping uses the same 6-part key as woRowsAll; demand_ids are derived
-  // the same way woRowPegKeys does (consolidated rows expose multiple keys).
+  // Row-level counts that mirror the "Pegged only" filter exactly: walks the
+  // raw work_orders, applies the same hide-VirtualProduct filter the table
+  // applies pre-grouping, dedupes by woRowGroupKey, and classifies each group
+  // via the shared peggedRowKindFor.  Used to display the ↓/↑ counts next to
+  // the highlighted WO.
   const woPegRowCounts = useMemo(() => {
     if (!woPegHighlightRow || !planResult) return { ancestors: 0, descendants: 0 };
     const seenGroup = new Set<string>();
-    const groups: Array<{ pid: string; lid: string; method: string; demandIds: string[] }> = [];
-    for (const r of planResult.work_orders ?? []) {
-      const groupKey = [
-        String(r.demand_id ?? ''),
-        String(r.product_id ?? ''),
-        String(r.location_id ?? ''),
-        String(r.method ?? ''),
-        String((r as { location_source?: string | null }).location_source ?? ''),
-        String((r as { prod_area?: string | null }).prod_area ?? ''),
-      ].join('|');
-      if (seenGroup.has(groupKey)) continue;
-      seenGroup.add(groupKey);
-      const splitDemandIds = ((r as { wo_consolidation_split_details?: Array<{ demand_id?: string | null }> })
-        .wo_consolidation_split_details ?? [])
-        .map((d) => d.demand_id)
-        .filter((d): d is string => d != null && d !== '');
-      const demandIds = r.demand_id ? [r.demand_id] : splitDemandIds;
-      groups.push({
-        pid: r.product_id ?? '',
-        lid: r.location_id ?? '',
-        method: r.method ?? '',
-        demandIds,
-      });
-    }
     let ancestors = 0;
     let descendants = 0;
-    for (const g of groups) {
-      const keys = (g.demandIds.length ? g.demandIds : ['']).map((d) => `${d}|${g.pid}|${g.lid}|${g.method}`);
-      if (keys.some((k) => woPegHighlightSets.ancestors.has(k))) ancestors++;
-      if (keys.some((k) => woPegHighlightSets.descendants.has(k))) descendants++;
+    for (const r of planResult.work_orders ?? []) {
+      // Mirror the table's pre-grouping filter: hide product_id starting with VirtualProduct_.
+      if (planWorkOrderHideDummyProdArea && (r.product_id ?? '').trim().startsWith('VirtualProduct_')) continue;
+      const gk = woRowGroupKey(r as WoRowLike);
+      if (seenGroup.has(gk)) continue;
+      seenGroup.add(gk);
+      const kind = peggedRowKindFor(r as WoRowLike, woPegHighlightRow, woPegHighlightSets);
+      if (kind === 'ancestor') ancestors++;
+      else if (kind === 'descendant') descendants++;
     }
     return { ancestors, descendants };
-  }, [planResult, woPegHighlightRow, woPegHighlightSets]);
+  }, [planResult, woPegHighlightRow, woPegHighlightSets, peggedRowKindFor, woRowGroupKey, planWorkOrderHideDummyProdArea]);
 
   // Clear highlight if the highlighted row no longer exists in the new plan run.
   useEffect(() => {
@@ -5537,11 +5574,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       ? woRowsAll.filter((r) => (r._shortage ?? 0) > 0.01)
                       : woRowsAll;
                     if (woPegHighlightRow && woPegFilterPeggedOnly) {
-                      const allowed = new Set<string>();
-                      woRowPegKeys(woPegHighlightRow).forEach((k) => allowed.add(k));
-                      woPegHighlightSets.ancestors.forEach((k) => allowed.add(k));
-                      woPegHighlightSets.descendants.forEach((k) => allowed.add(k));
-                      woRows = woRows.filter((r) => woRowPegKeys(r).some((k) => allowed.has(k)));
+                      // Same classifier the toolbar uses for the ↓/↑ counts —
+                      // they cannot disagree.
+                      woRows = woRows.filter((r) =>
+                        peggedRowKindFor(r, woPegHighlightRow, woPegHighlightSets) !== null);
                     }
                     const horizon = computeHorizon(woRows);
                     const woColumns: {
