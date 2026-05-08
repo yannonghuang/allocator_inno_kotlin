@@ -3446,9 +3446,16 @@ private fun fixTimingFromPegging(
     val leaves = allWos.filter { it !in hasChild }
 
     // Push child.end_time up to all parents; when a parent shifts, recurse.
-    // Per-chain visited set guards against any residual cycles prunePhantomLoops missed.
-    fun pushUp(childKey: WoKey, visited: MutableSet<WoKey>) {
-        if (!visited.add(childKey)) return
+    //
+    // Intentionally NO visited set: when two siblings share a parent, the parent
+    // must be re-evaluated against each sibling's end_time (a visited check would
+    // bail out on the second sibling and miss the larger constraint).  Termination
+    // is guaranteed on an acyclic graph because each shift strictly increases the
+    // node's start_time, and start_times are upper-bounded by the latest leaf
+    // end_time plus the lead-time chain.  The depth guard handles any residual
+    // cycles prunePhantomLoops missed.
+    fun pushUp(childKey: WoKey, depth: Int) {
+        if (depth > 200) return
         val childWo = woByKey[childKey] ?: return
         val childEnd = parseDate(childWo["end_time"] as? String) ?: return
         for (parentKey in parentsOf[childKey] ?: emptySet()) {
@@ -3462,12 +3469,12 @@ private fun fixTimingFromPegging(
                 log.debug("fixTiming: {}@{} shifted +{} days → {} .. {}",
                     parentKey.pid, parentKey.lid, shiftDays,
                     parentWo["start_time"], parentWo["end_time"])
-                pushUp(parentKey, visited)
+                pushUp(parentKey, depth + 1)
             }
         }
     }
 
-    for (leaf in leaves) pushUp(leaf, visited = mutableSetOf())
+    for (leaf in leaves) pushUp(leaf, depth = 0)
 
     return mutableWos
 }
