@@ -915,6 +915,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planWoDemandedByMultiple, setPlanWoDemandedByMultiple] = useState(false);
   const [planWoMultiSupply, setPlanWoMultiSupply] = useState(false);
   const [planWoPurchaseOnly, setPlanWoPurchaseOnly] = useState(false);
+  const [planWoMakeOnly, setPlanWoMakeOnly] = useState(false);
   const [planWoMoveOnly, setPlanWoMoveOnly] = useState(false);
   const [planWoHasOverride, setPlanWoHasOverride] = useState(false);
   const [planWoFilterDemandId, setPlanWoFilterDemandId] = useState('');
@@ -5159,6 +5160,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
                         type="checkbox"
+                        checked={planWoMakeOnly}
+                        onChange={(e) => setPlanWoMakeOnly(e.target.checked)}
+                      />
+                      <span>{tP('workOrders.filterMakeOnly')}</span>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input
+                        type="checkbox"
                         checked={planWoMoveOnly}
                         onChange={(e) => setPlanWoMoveOnly(e.target.checked)}
                       />
@@ -5304,7 +5313,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   </div>
                   {planResult.work_orders.length > 0 && (() => {
                     const workOrdersFiltered = planWorkOrderHideDummyProdArea
-                      ? planResult.work_orders.filter((r) => (r.prod_area ?? '').trim().toLowerCase() !== 'dummy')
+                      ? planResult.work_orders.filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'))
                       : planResult.work_orders;
                     const byProdArea = workOrdersFiltered.reduce<Record<string, number>>((acc, r) => {
                       const pa = (r.prod_area ?? '–') as string;
@@ -5325,7 +5334,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   })()}
                   {(() => {
                     let workOrderRows = planWorkOrderHideDummyProdArea
-                      ? planResult.work_orders.filter((r) => (r.prod_area ?? '').trim().toLowerCase() !== 'dummy')
+                      ? planResult.work_orders.filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'))
                       : planResult.work_orders;
                     // Compute the supply-backing map early so it can drive the phantom filter below
                     // and also be used by the WO expand panel later in this block.
@@ -5333,7 +5342,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     // Short-supply filter is WO-level and applied after enrichment (see below),
                     // since WO-level shortage is computed from the enriched Requested/Committed.
                     // Filters refer to work-order pegging (each WO's supplies subtree), not demand pegging.
-                    const anyPeggingFilter = planDemandRealMakeOnly || planDemandBuyOnly || planDemandRealMoveOnly || planWoDemandedByMultiple || planWoMultiSupply || planWoPurchaseOnly || planWoMoveOnly || planWoHasOverride;
+                    const anyPeggingFilter = planDemandRealMakeOnly || planDemandBuyOnly || planDemandRealMoveOnly || planWoDemandedByMultiple || planWoMultiSupply || planWoPurchaseOnly || planWoMakeOnly || planWoMoveOnly || planWoHasOverride;
                     if (anyPeggingFilter) {
                       workOrderRows = workOrderRows.filter((r) => {
                         if (planDemandRealMakeOnly && !(r.pegging_includes_real_make === true)) return false;
@@ -5342,6 +5351,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         if (planWoDemandedByMultiple && !(r.demanded_by_multiple === true)) return false;
                         if (planWoMultiSupply && !(r.multi_supply_available === true)) return false;
                         if (planWoPurchaseOnly) { const m = (r.method ?? '').toLowerCase(); if (m !== 'buy' && m !== 'purchase') return false; }
+                        if (planWoMakeOnly && (r.method ?? '').toLowerCase() !== 'make') return false;
                         if (planWoMoveOnly && (r.method ?? '').toLowerCase() !== 'move') return false;
                         if (planWoHasOverride && !woHasSavedOverride(r)) return false;
                         return true;
@@ -5425,7 +5435,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       }
                       if (!demandLabelMap.has(id)) demandLabelMap.set(id, d.product_id);
                     }
-                    const dummyHiddenCount = planResult.work_orders.filter((r) => (r.prod_area ?? '').trim().toLowerCase() === 'dummy').length;
+                    const dummyHiddenCount = planResult.work_orders.filter((r) => (r.product_id ?? '').trim().startsWith('VirtualProduct_')).length;
                     const woRowsAll: WoEnrichedRow[] = groupedRows.map((r, i) => {
                       const splitDemandIds = (r.wo_consolidation_split_details ?? [])
                         .map((d) => d.demand_id)
@@ -5753,7 +5763,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         <p style={{ fontSize: '0.8rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
                           Showing {qtyFmt(groupedRows.length)} work order{groupedRows.length !== 1 ? 's' : ''}
                           {planWorkOrderHideDummyProdArea && dummyHiddenCount > 0
-                            ? ` (${qtyFmt(dummyHiddenCount)} with PROD_AREA = dummy hidden)`
+                            ? ` (${qtyFmt(dummyHiddenCount)} with product_id = VirtualProduct_* hidden)`
                             : ''}
                           {anyPeggingFilter ? ' (filtered by work-order pegging: real make / buy / real move).' : ''}
                         </p>
