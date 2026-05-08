@@ -2586,6 +2586,49 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return { ancestors, descendants };
   }, [woPegHighlightRow, woPegRelations, woRowPegKeys]);
 
+  // Row-level counts that mirror the "Pegged only" filter exactly, so the
+  // up/down-arrow numbers shown next to the highlighted WO match the number
+  // of rows that would be displayed under the filter (rather than the size of
+  // the abstract pegging-key set, which can over-count vs. the grouped rows).
+  // Grouping uses the same 6-part key as woRowsAll; demand_ids are derived
+  // the same way woRowPegKeys does (consolidated rows expose multiple keys).
+  const woPegRowCounts = useMemo(() => {
+    if (!woPegHighlightRow || !planResult) return { ancestors: 0, descendants: 0 };
+    const seenGroup = new Set<string>();
+    const groups: Array<{ pid: string; lid: string; method: string; demandIds: string[] }> = [];
+    for (const r of planResult.work_orders ?? []) {
+      const groupKey = [
+        String(r.demand_id ?? ''),
+        String(r.product_id ?? ''),
+        String(r.location_id ?? ''),
+        String(r.method ?? ''),
+        String((r as { location_source?: string | null }).location_source ?? ''),
+        String((r as { prod_area?: string | null }).prod_area ?? ''),
+      ].join('|');
+      if (seenGroup.has(groupKey)) continue;
+      seenGroup.add(groupKey);
+      const splitDemandIds = ((r as { wo_consolidation_split_details?: Array<{ demand_id?: string | null }> })
+        .wo_consolidation_split_details ?? [])
+        .map((d) => d.demand_id)
+        .filter((d): d is string => d != null && d !== '');
+      const demandIds = r.demand_id ? [r.demand_id] : splitDemandIds;
+      groups.push({
+        pid: r.product_id ?? '',
+        lid: r.location_id ?? '',
+        method: r.method ?? '',
+        demandIds,
+      });
+    }
+    let ancestors = 0;
+    let descendants = 0;
+    for (const g of groups) {
+      const keys = (g.demandIds.length ? g.demandIds : ['']).map((d) => `${d}|${g.pid}|${g.lid}|${g.method}`);
+      if (keys.some((k) => woPegHighlightSets.ancestors.has(k))) ancestors++;
+      if (keys.some((k) => woPegHighlightSets.descendants.has(k))) descendants++;
+    }
+    return { ancestors, descendants };
+  }, [planResult, woPegHighlightRow, woPegHighlightSets]);
+
   // Clear highlight if the highlighted row no longer exists in the new plan run.
   useEffect(() => {
     if (woPegHighlightRow && planResult) {
@@ -5291,9 +5334,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           {' @ '}
                           <span style={{ color: '#e4e4e7' }}>{woPegHighlightRow.location_id}</span>
                           {' · '}
-                          <span style={{ color: '#ec4899' }}>↓ {woPegHighlightSets.ancestors.size}</span>
+                          <span style={{ color: '#ec4899' }}>↓ {woPegRowCounts.ancestors}</span>
                           {' · '}
-                          <span style={{ color: '#6366f1' }}>↑ {woPegHighlightSets.descendants.size}</span>
+                          <span style={{ color: '#6366f1' }}>↑ {woPegRowCounts.descendants}</span>
                         </span>
                         <button
                           type="button"
