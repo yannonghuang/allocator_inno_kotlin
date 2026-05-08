@@ -3361,15 +3361,35 @@ internal fun verifySupplyCap(
 }
 
 /**
- * Post-processing pass: walk every pegging tree bottom-up and enforce
+ * Post-processing pass: enforce
  *   start_time(parent WO) >= max(end_time(direct-child WOs))
+ * across the assembled work-order list.
  *
- * The forward planning pass computes child commit_times from the demand's
- * requested due-date (backward scheduling), which can place a parent WO
- * earlier than its children actually finish — especially in multi-slot
- * waterfall and consolidation paths.  This pass corrects that by reading
- * the real end_times from the assembled work-order list.
+ * The forward planning pass schedules parents from the demand's requested
+ * due-date (backward scheduling), which can place a parent WO earlier than
+ * its children actually finish — especially in multi-slot waterfall and
+ * consolidation paths.  This pass corrects that by reading the real
+ * end_times back.
+ *
+ * Algorithm — leaf-driven push (not tree walk):
+ *   1. Walk all pegging trees once to build the parent → children DAG over
+ *      WO nodes, keyed by (product_id, location_id, original_start_time).
+ *      A "child" relationship means: "parent WO has a demand child whose
+ *      child is this WO" (i.e., direct WO predecessor in the BOM).
+ *   2. Find leaves: WOs that are not anyone's parent in the DAG.
+ *   3. For each leaf, push its end_time up to every ancestor.  When a
+ *      parent shifts, the new end_time propagates further up immediately.
+ *
+ * A tree-walk variant (recurse from each demand root, fix the WO at each
+ * node) is incorrect when a WO is shared across multiple demand trees:
+ * the first tree's pass shifts it, but the parents of that WO sitting in
+ * a separate demand tree never get re-checked unless we walk THEIR tree
+ * later — and even then, the lookup by (pid, lid, original_start) breaks
+ * once start_time has been mutated.  Leaf-driven push reaches every
+ * ancestor regardless of which tree it sits in.
  */
+private data class WoKey(val pid: String, val lid: String, val origStart: String)
+
 private fun fixTimingFromPegging(
     workOrders: List<Map<String, Any?>>,
     peggingTrees: List<Map<String, Any?>>,
@@ -3378,55 +3398,76 @@ private fun fixTimingFromPegging(
 
     val mutableWos: List<MutableMap<String, Any?>> = workOrders.map { it.toMutableMap() }
 
-    // Index by (product_id, location_id) → ordered list so we can match by start_time
-    val byPidLid = mutableMapOf<Pair<String, String>, MutableList<MutableMap<String, Any?>>>()
+    // Canonical key uses the ORIGINAL start_time as it appears in the WO list and
+    // pegging tree nodes; this is what the pegging-tree walk will see.  WO start_time
+    // gets mutated as we shift, but the index key never changes.
+    val woByKey = mutableMapOf<WoKey, MutableMap<String, Any?>>()
     for (wo in mutableWos) {
         val pid = wo["product_id"] as? String ?: continue
         val lid = wo["location_id"] as? String ?: continue
-        byPidLid.getOrPut(Pair(pid, lid)) { mutableListOf() }.add(wo)
+        val st = wo["start_time"] as? String ?: continue
+        woByKey[WoKey(pid, lid, st)] = wo
     }
 
-    fun findWo(pid: String, lid: String, startTime: String?): MutableMap<String, Any?>? {
-        val bucket = byPidLid[Pair(pid, lid)] ?: return null
-        return if (startTime != null)
-            bucket.firstOrNull { (it["start_time"] as? String) == startTime } ?: bucket.firstOrNull()
-        else bucket.firstOrNull()
-    }
+    // Build the parent → children DAG by walking each pegging tree.
+    val parentsOf = mutableMapOf<WoKey, MutableSet<WoKey>>()
+    val hasChild = mutableSetOf<WoKey>()
+    val allWos = mutableSetOf<WoKey>()
 
     @Suppress("UNCHECKED_CAST")
-    fun processNode(node: Map<String, Any?>, depth: Int = 0): LocalDate? {
-        if (depth > 30) return null
-        val children = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
-        return when (node["type"] as? String) {
-            "demand", null -> children.mapNotNull { processNode(it, depth + 1) }.maxOrNull()
+    fun walk(node: Map<String, Any?>, currentParent: WoKey?, depth: Int) {
+        if (depth > 60) return
+        val nodeChildren = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
+        when (node["type"] as? String) {
             "work_order" -> {
-                // Bottom-up: process children first so their end_times are already corrected
-                val maxChildEnd = children.mapNotNull { processNode(it, depth + 1) }.maxOrNull()
-                val pid = (node["product_id"] as? String) ?: return null
+                val pid = node["product_id"] as? String ?: return
                 val lid = (node["location_id"] as? String) ?: ""
-                val wo = findWo(pid, lid, node["start_time"] as? String)
-                    ?: return parseDate(node["end_time"] as? String)
-                if (maxChildEnd != null) {
-                    val curStart = parseDate(wo["start_time"] as? String)
-                    if (curStart != null && maxChildEnd > curStart) {
-                        val shiftDays = maxChildEnd.toEpochDay() - curStart.toEpochDay()
-                        val curEnd = parseDate(wo["end_time"] as? String)
-                        wo["start_time"] = formatDate(maxChildEnd)
-                        wo["end_time"] = formatDate(curEnd?.plusDays(shiftDays))
-                        log.debug("fixTiming: {}@{} shifted +{} days → {} .. {}",
-                            pid, lid, shiftDays, wo["start_time"], wo["end_time"])
-                    }
+                val st = node["start_time"] as? String ?: return
+                val key = WoKey(pid, lid, st)
+                allWos.add(key)
+                if (currentParent != null) {
+                    parentsOf.getOrPut(key) { mutableSetOf() }.add(currentParent)
+                    hasChild.add(currentParent)
                 }
-                parseDate(wo["end_time"] as? String)
+                for (c in nodeChildren) walk(c, currentParent = key, depth + 1)
             }
-            else -> null
+            else -> {  // "demand" or null — pass through, keep currentParent
+                for (c in nodeChildren) walk(c, currentParent, depth + 1)
+            }
+        }
+    }
+    for (entry in peggingTrees) {
+        @Suppress("UNCHECKED_CAST")
+        val tree = entry["tree"] as? Map<String, Any?> ?: continue
+        walk(tree, currentParent = null, depth = 0)
+    }
+
+    // Leaves: WOs that exist in pegging but have no WO descendants
+    val leaves = allWos.filter { it !in hasChild }
+
+    // Push child.end_time up to all parents; when a parent shifts, recurse.
+    // Per-chain visited set guards against any residual cycles prunePhantomLoops missed.
+    fun pushUp(childKey: WoKey, visited: MutableSet<WoKey>) {
+        if (!visited.add(childKey)) return
+        val childWo = woByKey[childKey] ?: return
+        val childEnd = parseDate(childWo["end_time"] as? String) ?: return
+        for (parentKey in parentsOf[childKey] ?: emptySet()) {
+            val parentWo = woByKey[parentKey] ?: continue
+            val parentStart = parseDate(parentWo["start_time"] as? String) ?: continue
+            if (childEnd > parentStart) {
+                val parentEnd = parseDate(parentWo["end_time"] as? String)
+                val shiftDays = childEnd.toEpochDay() - parentStart.toEpochDay()
+                parentWo["start_time"] = formatDate(childEnd)
+                if (parentEnd != null) parentWo["end_time"] = formatDate(parentEnd.plusDays(shiftDays))
+                log.debug("fixTiming: {}@{} shifted +{} days → {} .. {}",
+                    parentKey.pid, parentKey.lid, shiftDays,
+                    parentWo["start_time"], parentWo["end_time"])
+                pushUp(parentKey, visited)
+            }
         }
     }
 
-    for (entry in peggingTrees) {
-        val tree = entry["tree"] as? Map<String, Any?> ?: continue
-        @Suppress("UNCHECKED_CAST")
-        processNode(tree as Map<String, Any?>)
-    }
+    for (leaf in leaves) pushUp(leaf, visited = mutableSetOf())
+
     return mutableWos
 }
