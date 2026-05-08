@@ -3545,7 +3545,13 @@ private fun fixTimingFromPegging(
         }
     }
 
-    for (leaf in leaves) pushUp(leaf, depth = 0)
+    // Invoke pushUp on every group, not just leaves: even when an intermediate
+    // group already satisfies its own predecessor constraint (so pushUp from
+    // below doesn't cascade through it), its TAIL is still a binding constraint
+    // on its parents.  Iterating over allGroups ensures every group's tail is
+    // propagated at least once; pushUp's recursion still handles cascading
+    // shifts when they do occur.
+    for (gid in allGroups) pushUp(gid, depth = 0)
 
     log.info("fixTimingFromPegging: lot_groups={} pegging_trees={} dag_groups={} or_remapped={} leaves={} shifts_applied={}",
         lotsByGroup.size, peggingTrees.size, allGroups.size, canonOf.size, leaves.size, shiftCount)
