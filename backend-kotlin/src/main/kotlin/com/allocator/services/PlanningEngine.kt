@@ -3313,9 +3313,10 @@ fun runPlanning(
         warnings
     }
 
+    val fixedWorkOrders = fixTimingFromPegging(consolidatedWOs + workOrders, allPegging)
     return mapOf(
         "committed_demands"      to committedDemands,
-        "work_orders"            to consolidatedWOs + workOrders,
+        "work_orders"            to fixedWorkOrders,
         "planning_pegging"       to allPegging,
         "supply_allocations"     to supplyAllocations,
         "supply_cap_violations"  to supplyCapViolations,
@@ -3357,4 +3358,75 @@ internal fun verifySupplyCap(
         }
     }
     return violations
+}
+
+/**
+ * Post-processing pass: walk every pegging tree bottom-up and enforce
+ *   start_time(parent WO) >= max(end_time(direct-child WOs))
+ *
+ * The forward planning pass computes child commit_times from the demand's
+ * requested due-date (backward scheduling), which can place a parent WO
+ * earlier than its children actually finish — especially in multi-slot
+ * waterfall and consolidation paths.  This pass corrects that by reading
+ * the real end_times from the assembled work-order list.
+ */
+private fun fixTimingFromPegging(
+    workOrders: List<Map<String, Any?>>,
+    peggingTrees: List<Map<String, Any?>>,
+): List<Map<String, Any?>> {
+    if (workOrders.isEmpty() || peggingTrees.isEmpty()) return workOrders
+
+    val mutableWos: List<MutableMap<String, Any?>> = workOrders.map { it.toMutableMap() }
+
+    // Index by (product_id, location_id) → ordered list so we can match by start_time
+    val byPidLid = mutableMapOf<Pair<String, String>, MutableList<MutableMap<String, Any?>>>()
+    for (wo in mutableWos) {
+        val pid = wo["product_id"] as? String ?: continue
+        val lid = wo["location_id"] as? String ?: continue
+        byPidLid.getOrPut(Pair(pid, lid)) { mutableListOf() }.add(wo)
+    }
+
+    fun findWo(pid: String, lid: String, startTime: String?): MutableMap<String, Any?>? {
+        val bucket = byPidLid[Pair(pid, lid)] ?: return null
+        return if (startTime != null)
+            bucket.firstOrNull { (it["start_time"] as? String) == startTime } ?: bucket.firstOrNull()
+        else bucket.firstOrNull()
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    fun processNode(node: Map<String, Any?>, depth: Int = 0): LocalDate? {
+        if (depth > 30) return null
+        val children = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
+        return when (node["type"] as? String) {
+            "demand", null -> children.mapNotNull { processNode(it, depth + 1) }.maxOrNull()
+            "work_order" -> {
+                // Bottom-up: process children first so their end_times are already corrected
+                val maxChildEnd = children.mapNotNull { processNode(it, depth + 1) }.maxOrNull()
+                val pid = (node["product_id"] as? String) ?: return null
+                val lid = (node["location_id"] as? String) ?: ""
+                val wo = findWo(pid, lid, node["start_time"] as? String)
+                    ?: return parseDate(node["end_time"] as? String)
+                if (maxChildEnd != null) {
+                    val curStart = parseDate(wo["start_time"] as? String)
+                    if (curStart != null && maxChildEnd > curStart) {
+                        val shiftDays = maxChildEnd.toEpochDay() - curStart.toEpochDay()
+                        val curEnd = parseDate(wo["end_time"] as? String)
+                        wo["start_time"] = formatDate(maxChildEnd)
+                        wo["end_time"] = formatDate(curEnd?.plusDays(shiftDays))
+                        log.debug("fixTiming: {}@{} shifted +{} days → {} .. {}",
+                            pid, lid, shiftDays, wo["start_time"], wo["end_time"])
+                    }
+                }
+                parseDate(wo["end_time"] as? String)
+            }
+            else -> null
+        }
+    }
+
+    for (entry in peggingTrees) {
+        val tree = entry["tree"] as? Map<String, Any?> ?: continue
+        @Suppress("UNCHECKED_CAST")
+        processNode(tree as Map<String, Any?>)
+    }
+    return mutableWos
 }
