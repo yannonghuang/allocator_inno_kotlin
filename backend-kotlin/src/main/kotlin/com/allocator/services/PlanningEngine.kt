@@ -3563,9 +3563,12 @@ private fun fixTimingFromPegging(
     // start/end/commit times.  The planner's forward pass writes start/end
     // onto every WO node and commit_time onto every demand node, but those
     // values predate the OR-merged push-up shifts above.  We now rewrite each
-    // tree bottom-up: WO start/end ← canonical lot times by wo_group_id;
-    // demand commit_time ← max over the (newly shifted) child end / commit
-    // times, never pulled backward.
+    // tree bottom-up: WO start/end ← post-shift lot times for THAT specific
+    // wo_group_id (lotsByGroup is keyed by canonical id, so we filter the
+    // bucket to lots matching the node's own gid); demand commit_time ← max
+    // over the (newly shifted) child end / commit times, never pulled backward.
+    var rewriteWoMatched = 0
+    var rewriteWoMissing = 0
     @Suppress("UNCHECKED_CAST")
     fun rewriteTree(node: Map<String, Any?>, depth: Int): Map<String, Any?> {
         if (depth > 60) return node
@@ -3575,13 +3578,29 @@ private fun fixTimingFromPegging(
         if (originalChildren.isNotEmpty()) updated["children"] = newChildren
         when (node["type"] as? String) {
             "work_order" -> {
-                val gid = node["wo_group_id"] as? String
-                if (gid != null) {
-                    lotsByGroup[gid]?.let { lots ->
-                        lots.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull()
+                if (node["failed"] != true) {
+                    val gid = node["wo_group_id"] as? String
+                    val ownLots = if (gid != null) {
+                        // Look up via canonical bucket, then narrow to lots whose
+                        // wo_group_id matches THIS node's gid.  Required so an
+                        // OR-alternative gets its own (post-shift) lot times,
+                        // not the union across siblings.
+                        lotsByGroup[canonOf[gid] ?: gid]
+                            ?.filter { (it["wo_group_id"] as? String) == gid }
+                            ?: emptyList()
+                    } else emptyList()
+                    if (ownLots.isNotEmpty()) {
+                        rewriteWoMatched++
+                        ownLots.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull()
                             ?.let { updated["start_time"] = formatDate(it) }
-                        lots.mapNotNull { parseDate(it["end_time"] as? String) }.maxOrNull()
+                        ownLots.mapNotNull { parseDate(it["end_time"] as? String) }.maxOrNull()
                             ?.let { updated["end_time"] = formatDate(it) }
+                    } else {
+                        rewriteWoMissing++
+                        if (log.isInfoEnabled) {
+                            log.info("rewriteTree: no lots for WO {}@{} method={} gid={} — pegging-tree timing left as-is",
+                                node["product_id"], node["location_id"], node["method"], gid)
+                        }
                     }
                 }
             }
@@ -3609,6 +3628,8 @@ private fun fixTimingFromPegging(
         val rewritten = rewriteTree(tree, 0)
         entry.toMutableMap().apply { put("tree", rewritten) }
     }
+    log.info("fixTimingFromPegging.rewriteTree: wo_nodes_updated={} wo_nodes_missing_lots={}",
+        rewriteWoMatched, rewriteWoMissing)
 
     return TimingFixResult(mutableWos, updatedPegging)
 }
