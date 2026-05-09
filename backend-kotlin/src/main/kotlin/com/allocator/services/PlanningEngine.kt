@@ -3624,9 +3624,16 @@ private fun fixTimingFromPegging(
         lotsByGroup[gid]?.mapNotNull { parseDate(it["end_time"] as? String) }?.maxOrNull()
 
     // Build the parent → children DAG by walking the (regen-stamped) trees.
+    // Also collect "leaf-time constraints": when a demand is fulfilled by a
+    // supply or purchase leaf with a future commit_time (inventory not yet
+    // available, purchase yet to arrive), the leaf's commit_time is a real
+    // predecessor constraint on the demand's parent WO — but the leaf has no
+    // wo_group_id, so the standard pushUp can't propagate it.  Record those
+    // constraints here so we can apply them as a pre-shift before pushUp runs.
     val parentsOf = mutableMapOf<String, MutableSet<String>>()
     val hasChild = mutableSetOf<String>()
     val allGroups = mutableSetOf<String>()
+    val leafConstraintByGid = mutableMapOf<String, LocalDate>()
 
     @Suppress("UNCHECKED_CAST")
     fun walk(node: Map<String, Any?>, currentParent: String?, depth: Int) {
@@ -3643,6 +3650,13 @@ private fun fixTimingFromPegging(
                 }
                 for (c in nodeChildren) walk(c, currentParent = gid, depth + 1)
             }
+            "supply", "purchase" -> {
+                if (currentParent != null) {
+                    parseDate(node["commit_time"] as? String)?.let { commit ->
+                        leafConstraintByGid.merge(currentParent, commit) { a, b -> if (b > a) b else a }
+                    }
+                }
+            }
             else -> {
                 for (c in nodeChildren) walk(c, currentParent, depth + 1)
             }
@@ -3654,6 +3668,26 @@ private fun fixTimingFromPegging(
         walk(tree, currentParent = null, depth = 0)
     }
     val leaves = allGroups.filter { it !in hasChild }
+
+    // Apply leaf-time pre-shifts: ensure each WO group's lots start no
+    // earlier than max(supply / purchase commit_time of any leaf in its
+    // demand-children sub-tree).  Standard pushUp will propagate any
+    // resulting tail-shift further up the DAG.
+    var leafConstraintShifts = 0
+    for ((gid, minStart) in leafConstraintByGid) {
+        val parentLots = lotsByGroup[gid] ?: continue
+        val byAlt = parentLots.groupBy { it["method_slot_index"] as? Int }
+        for ((_, altLots) in byAlt) {
+            val altHead = altLots.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull() ?: continue
+            if (minStart <= altHead) continue
+            val shiftDays = minStart.toEpochDay() - altHead.toEpochDay()
+            for (lot in altLots) {
+                parseDate(lot["start_time"] as? String)?.let { lot["start_time"] = formatDate(it.plusDays(shiftDays)) }
+                parseDate(lot["end_time"] as? String)?.let { lot["end_time"] = formatDate(it.plusDays(shiftDays)) }
+            }
+            leafConstraintShifts++
+        }
+    }
 
     // Push child end_time up to every parent.  Within the parent's bucket,
     // partition by method_slot_index so each alternative shifts on its own
@@ -3696,8 +3730,8 @@ private fun fixTimingFromPegging(
     // shift this iteration.
     for (gid in allGroups) pushUp(gid, depth = 0)
 
-    log.info("fixTimingFromPegging: lot_groups={} pegging_trees={} dag_groups={} leaves={} shifts_applied={}",
-        lotsByGroup.size, regenTrees.size, allGroups.size, leaves.size, shiftCount)
+    log.info("fixTimingFromPegging: lot_groups={} pegging_trees={} dag_groups={} leaves={} leaf_constraint_shifts={} shifts_applied={}",
+        lotsByGroup.size, regenTrees.size, allGroups.size, leaves.size, leafConstraintShifts, shiftCount)
 
     // ── Step 3: Write corrected timings back into the pegging trees ───────────
     // Same skip-failed discipline as regenWalk: failed=true WO nodes carry
