@@ -184,6 +184,20 @@ object MaterialEvents : Table("material_event") {
     override val primaryKey = PrimaryKey(id)
 }
 
+/** Persisted work-order schedule-change events for manual impact analysis.
+ *  Selectors (bucket + optional filters) are stored as a JSON array; one event
+ *  carries one schedule change ({@link delayDays} OR {@link delayToDate}). */
+object WoScheduleEvents : Table("wo_schedule_event") {
+    val id          = integer("id").autoIncrement()
+    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val selectorsJson = text("selectors_json")             // JSON array of WoScheduleSelector
+    val delayDays      = integer("delay_days").nullable()
+    val delayToDate    = varchar("delay_to_date", 16).nullable()  // ISO yyyy-MM-dd
+    val note           = text("note").nullable()
+    val createdAt   = timestamp("created_at").defaultExpression(CurrentTimestamp)
+    override val primaryKey = PrimaryKey(id)
+}
+
 /** Persisted planning run: config + override snapshot + result JSON so state is restorable. */
 object PlanRuns : Table("plan_run") {
     val id = integer("id").autoIncrement()
@@ -200,6 +214,10 @@ object PlanRuns : Table("plan_run") {
     val negotiationRound       = integer("negotiation_round").nullable()          // 0 = initial contingent; 1..N = counter-proposal rounds
     val parentPlanRunId        = integer("parent_plan_run_id").nullable()         // self-ref: previous round's contingent in a negotiation chain
     val supersededByPlanRunId  = integer("superseded_by_plan_run_id").nullable()  // self-ref: next round's contingent (NULL = chain tail, promotable)
+    /** Tags wo_schedule_contingent runs back to the WoScheduleEvent that drove the analysis,
+     *  enabling per-event run-history listing. ON DELETE SET NULL keeps the contingent runs
+     *  visible in plan-run history even after the user deletes the event. */
+    val woScheduleEventId      = integer("wo_schedule_event_id").references(WoScheduleEvents.id, onDelete = ReferenceOption.SET_NULL).nullable()
     val createdAt = timestamp("created_at").defaultExpression(CurrentTimestamp)
     val finishedAt = timestamp("finished_at").nullable()
     val chosenDepth = integer("chosen_depth").nullable()  // depth picked by optimal-depth search; null when search not run

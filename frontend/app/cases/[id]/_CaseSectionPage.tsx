@@ -94,6 +94,8 @@ import {
   type BootstrapCriterion,
 } from '@/lib/api';
 import { computeHorizon, ScheduleBar, ScheduleHorizonRuler } from './_workOrderSchedule';
+import { WoScheduleImpactPanel, WoScheduleQuickModal } from './_woScheduleImpact';
+import type { PlanResult } from '../../../lib/api';
 
 type SupplySuggestion = {
   id: string;
@@ -929,6 +931,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [woExplainOpen, setWoExplainOpen] = useState(false);
   const [woExplainRow, setWoExplainRow] = useState<WorkOrder | null>(null);
   const [woExplainKey, setWoExplainKey] = useState<string | null>(null);
+  const [woScheduleModalRow, setWoScheduleModalRow] = useState<WorkOrder | null>(null);
   const [supExplainOpen, setSupExplainOpen] = useState(false);
   const [supExplainRow, setSupExplainRow] = useState<PlanSupplyViewRow | null>(null);
   const [supExplainKey, setSupExplainKey] = useState<string | null>(null);
@@ -5722,6 +5725,18 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           </div>
                         );
                       }},
+                      { key: '_woschedule', label: 'Schedule', sortable: false, render: (r) => {
+                        if (!r.wo_group_id) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                        return (
+                          <button
+                            type="button"
+                            className="secondary"
+                            style={{ fontSize: '0.72rem', padding: '2px 6px' }}
+                            onClick={() => setWoScheduleModalRow(r)}
+                            title="Schedule change → impact analysis"
+                          >Schedule</button>
+                        );
+                      }},
                     ];
                     // ── Apply layout mode (data / split / timeline) ──
                     // 'data':     replace Schedule with start_time + end_time text columns; data spans full width.
@@ -7066,6 +7081,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           );
         })}
       </section>
+      )}
+      {caseSection === 'wo_schedule' && (
+        <WoScheduleImpactPanel
+          caseId={id}
+          baselinePlan={planResult as unknown as PlanResult}
+          baselinePlanRunId={currentPlanRunId ?? freshPlanRunId}
+        />
+      )}
+      {woScheduleModalRow && (
+        <WoScheduleQuickModal
+          caseId={id}
+          baselinePlanRunId={currentPlanRunId ?? freshPlanRunId}
+          wo={woScheduleModalRow}
+          onClose={() => setWoScheduleModalRow(null)}
+        />
       )}
       {/* ── Knowledge Base slide-in ────────────────────────────────────────────── */}
       {bootstrapDialogOpen && typeof document !== 'undefined' && createPortal(

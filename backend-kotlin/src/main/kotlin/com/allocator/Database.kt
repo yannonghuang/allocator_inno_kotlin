@@ -106,7 +106,7 @@ private fun createTables() {
         Cases, Boms, Customers, Locations, Products, Vendors,
         Demands, MethodBuys, MethodMakes, ProductLocations,
         Supplies, MethodMoves, AllocationRuns, AllocationActions,
-        ManualOverrides, PlanRuns, MaterialEvents, MaterialImpactAssessments,
+        ManualOverrides, PlanRuns, MaterialEvents, WoScheduleEvents, MaterialImpactAssessments,
         PlanSupplyAllocations, NegotiationWaits, PlanRunEvents, AgentMemory,
         KbRecords
     )

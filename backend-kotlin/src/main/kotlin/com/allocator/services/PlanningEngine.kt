@@ -3607,15 +3607,49 @@ private fun fixTimingFromPegging(
         return TimingFixResult(regenLots, regenTrees)
     }
 
+    return resequenceFromPegging(regenLots, regenTrees)
+}
+
+/**
+ * Sequencing pipeline (Step 2 + Step 3 of [fixTimingFromPegging]) reusable for
+ * "what-if" schedule-change scenarios that bypass Step 1 (regen).
+ *
+ * Inputs are a coherent (work_orders, pegging trees) pair where every WO has a
+ * stable `wo_group_id` and OR-alternatives share a gid distinguished by
+ * `method_slot_index` — i.e. the output of a baseline plan run that already
+ * went through `fixTimingFromPegging` once.
+ *
+ * Step 2 builds the parent→children DAG, applies leaf-time pre-shifts (supply
+ * /purchase commit_time constraints), and runs the pushUp loop so any
+ * downstream WO with a later end_time pushes its parents forward.
+ *
+ * Step 3 rewrites pegging-tree node start/end (and demand commit_time) from
+ * the post-shift lot timings.
+ */
+internal fun resequenceFromPegging(
+    workOrders: List<Map<String, Any?>>,
+    peggingTrees: List<Map<String, Any?>>,
+): TimingFixResult {
+    if (workOrders.isEmpty() || peggingTrees.isEmpty()) {
+        return TimingFixResult(workOrders, peggingTrees)
+    }
+
     // ── Step 2: Sequencing on the regenerated lots ────────────────────────────
     //
     // Key on wo_group_id directly (alternatives in an OR-group already share
     // the same gid post-regen, distinguished by method_slot_index).  Per-alt
     // shifting partitions within a bucket using method_slot_index.
 
-    // Index lots by wo_group_id (post-regen).
+    // Index lots by wo_group_id.  Lots are wrapped in a MutableMap so we can
+    // mutate start_time/end_time in place during pushUp.
+    val mutableLots: List<MutableMap<String, Any?>> = workOrders.map { wo ->
+        if (wo is MutableMap<*, *>) {
+            @Suppress("UNCHECKED_CAST")
+            wo as MutableMap<String, Any?>
+        } else wo.toMutableMap()
+    }
     val lotsByGroup = mutableMapOf<String, MutableList<MutableMap<String, Any?>>>()
-    for (wo in regenLots) {
+    for (wo in mutableLots) {
         val gid = wo["wo_group_id"] as? String ?: continue
         lotsByGroup.getOrPut(gid) { mutableListOf() }.add(wo)
     }
@@ -3662,7 +3696,7 @@ private fun fixTimingFromPegging(
             }
         }
     }
-    for (entry in regenTrees) {
+    for (entry in peggingTrees) {
         @Suppress("UNCHECKED_CAST")
         val tree = entry["tree"] as? Map<String, Any?> ?: continue
         walk(tree, currentParent = null, depth = 0)
@@ -3730,8 +3764,8 @@ private fun fixTimingFromPegging(
     // shift this iteration.
     for (gid in allGroups) pushUp(gid, depth = 0)
 
-    log.info("fixTimingFromPegging: lot_groups={} pegging_trees={} dag_groups={} leaves={} leaf_constraint_shifts={} shifts_applied={}",
-        lotsByGroup.size, regenTrees.size, allGroups.size, leaves.size, leafConstraintShifts, shiftCount)
+    log.info("resequenceFromPegging: lot_groups={} pegging_trees={} dag_groups={} leaves={} leaf_constraint_shifts={} shifts_applied={}",
+        lotsByGroup.size, peggingTrees.size, allGroups.size, leaves.size, leafConstraintShifts, shiftCount)
 
     // ── Step 3: Write corrected timings back into the pegging trees ───────────
     // Same skip-failed discipline as regenWalk: failed=true WO nodes carry
@@ -3802,25 +3836,26 @@ private fun fixTimingFromPegging(
         }
         return updated
     }
-    val finalTrees = regenTrees.map { entry ->
+    val finalTrees = peggingTrees.map { entry ->
         @Suppress("UNCHECKED_CAST")
         val tree = entry["tree"] as? Map<String, Any?> ?: return@map entry
         entry.toMutableMap().apply { put("tree", rewriteTree(tree, 0, "0")) }
     }
-    log.info("fixTimingFromPegging.rewriteTree: wo_updated={} wo_no_lots={} wo_no_gid={}",
+    log.info("resequenceFromPegging.rewriteTree: wo_updated={} wo_no_lots={} wo_no_gid={}",
         rewriteWoUpdated, rewriteWoNoLots, rewriteWoNoGid)
     if (rewriteMissSamples.isNotEmpty()) {
-        log.warn("fixTimingFromPegging.rewriteTree miss samples (first {}):", rewriteMissSamples.size)
+        log.warn("resequenceFromPegging.rewriteTree miss samples (first {}):", rewriteMissSamples.size)
         for (sample in rewriteMissSamples) log.warn("  rewrite-miss: {}", sample)
     }
 
-    return TimingFixResult(regenLots, finalTrees)
+    return TimingFixResult(mutableLots, finalTrees)
 }
 
-/** Result of [fixTimingFromPegging]: the corrected work-order list AND the
- *  pegging trees rewritten with the same canonical timings, so all downstream
- *  consumers (soundness, UI, KPIs) read a consistent view. */
-private data class TimingFixResult(
+/** Result of [fixTimingFromPegging] / [resequenceFromPegging]: the corrected
+ *  work-order list AND the pegging trees rewritten with the same canonical
+ *  timings, so all downstream consumers (soundness, UI, KPIs) read a
+ *  consistent view. */
+internal data class TimingFixResult(
     val workOrders: List<Map<String, Any?>>,
     val peggingTrees: List<Map<String, Any?>>,
 )

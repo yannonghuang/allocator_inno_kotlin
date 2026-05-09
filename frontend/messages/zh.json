@@ -61,13 +61,15 @@
     "materialImpact": "影响分析",
     "events": "事件",
     "criteria": "评估标准",
-    "allocation": "配置运算"
+    "allocation": "配置运算",
+    "woScheduleImpact": "工单排程影响"
   },
   "sections": {
     "allocation": "配置",
     "planning": "计划",
     "bomGraph": "物料清单图",
-    "material": "物料影响分析"
+    "material": "物料影响分析",
+    "woSchedule": "工单排程影响"
   },
   "allocation": {
     "runAllocation": "运行配置",
@@ -490,6 +492,110 @@
       },
       "overrideMethod": "方法",
       "overrideSplit": "拆分"
+    },
+    "woScheduleImpact": {
+      "title": "工单排程影响",
+      "description": "按物料 / 生产区 / 地点 / 方法以及可选的时间桶筛选工单，从匹配列表中勾选要延迟的工单，查看延迟对需求承诺日期的传播影响。",
+      "selector": {
+        "product": "物料",
+        "prodArea": "生产区",
+        "location": "地点",
+        "method": "方法",
+        "granularity": "粒度",
+        "bucket": "时间桶",
+        "bucketOptional": "可选",
+        "any": "(任意)",
+        "wos": "个工单"
+      },
+      "granularity": {
+        "day": "日",
+        "week": "周",
+        "month": "月",
+        "quarter": "季度"
+      },
+      "preview": {
+        "heading": "匹配 {matched} · 已选 {selected}",
+        "selectAll": "全选",
+        "deselectAll": "取消全选",
+        "noMatches": "当前过滤条件下没有匹配的工单。",
+        "col": {
+          "gid": "工单 ID",
+          "product": "物料",
+          "location": "地点",
+          "method": "方法",
+          "prodArea": "生产区",
+          "start": "开始",
+          "end": "结束",
+          "qty": "数量"
+        }
+      },
+      "bucketPreview": {
+        "label": "时间桶:",
+        "derived": "由选中工单自动派生",
+        "fromKey": "来自桶选择"
+      },
+      "change": {
+        "label": "变更",
+        "byDays": "延迟 N 天",
+        "toDate": "延迟到指定日期",
+        "daysHint": "每个选中工单后移 N 天；相对时间间隔保持不变。",
+        "toDateHint": "桶起始日锚定到该日期；shift = (日期 − bucketStart) 统一应用于每个选中工单。"
+      },
+      "note": "备注",
+      "newEvent": "+ 添加工单排程事件",
+      "submit": "分析",
+      "analyzing": "分析中…",
+      "edit": "编辑",
+      "delete": "删除",
+      "save": "保存",
+      "cancel": "取消",
+      "noEvents": "该方案尚无工单排程事件。",
+      "noBaselinePlan": "尚无基线计划运行 — 请先生成计划。",
+      "results": {
+        "heading": "受影响需求",
+        "matchedWoCount": "匹配的工单数:",
+        "impactedDemandCount": "受影响需求数:",
+        "noImpacts": "本次变更未导致任何需求延期。",
+        "col": {
+          "demandId": "需求 ID",
+          "product": "物料",
+          "customer": "客户",
+          "due": "到期日",
+          "baselineCommit": "基线承诺",
+          "contingentCommit": "情境承诺",
+          "daysDelta": "天数差",
+          "status": "状态"
+        }
+      },
+      "status": {
+        "delivery_delayed": "交付延期",
+        "newly_late_vs_due": "新增违期",
+        "no_change": "无变化"
+      },
+      "editForm": {
+        "summary": "编辑事件",
+        "selector": "条选择器",
+        "selectorsImmutable": "选择器 (工单集合 + 时间桶) 创建后不可修改。如需更改，请删除此事件并新建。",
+        "bucket": "时间桶",
+        "woGroupIds": "工单 ID",
+        "showWos": "查看工单 ID",
+        "missingFromBaseline": "({count} 个工单在当前基线中未找到)"
+      },
+      "history": {
+        "button": "历史",
+        "tooltip": "查看此事件的历次分析",
+        "heading": "运行历史",
+        "loading": "加载中…",
+        "empty": "此事件尚无历史分析记录。",
+        "count": "{count, plural, =0 {无运行记录} other {# 次运行}}",
+        "promoted": "已升格"
+      },
+      "error": {
+        "noSelection": "请从预览列表中至少勾选一个工单",
+        "noShift": "请选择非零的延迟",
+        "noBucketDates": "选中工单缺少开始/结束时间",
+        "bothSpecified": "请选择延迟天数或延迟到日期 (二选一)"
+      }
     },
     "planKpis": {
       "title": "计划关键指标",

@@ -21,6 +21,7 @@ export function Sidebar({ open, onToggle }: { open: boolean; onToggle: () => voi
   const inMaterial = !!caseId && pathname.startsWith(`/cases/${caseId}/material-impact`);
   const inEvents = inMaterial && !pathname.startsWith(`/cases/${caseId}/material-impact/criteria`);
   const inCriteria = pathname === `/cases/${caseId}/material-impact/criteria`;
+  const inWoSchedule = !!caseId && pathname.startsWith(`/cases/${caseId}/wo-schedule-impact`);
 
   const link = (active: boolean, disabled = false): React.CSSProperties => ({
     display: 'block',
@@ -128,6 +129,17 @@ export function Sidebar({ open, onToggle }: { open: boolean; onToggle: () => voi
                 {t('criteria')}
               </Link>
             </>
+          )}
+        </div>
+
+        {/* WO Schedule Impact */}
+        <div style={{ marginTop: '0.125rem' }}>
+          {caseId ? (
+            <Link href={`/cases/${caseId}/wo-schedule-impact`} style={link(inWoSchedule)}>
+              {t('woScheduleImpact')}
+            </Link>
+          ) : (
+            <span style={link(false, true)}>{t('woScheduleImpact')}</span>
           )}
         </div>
       </nav>

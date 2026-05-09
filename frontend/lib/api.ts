@@ -207,6 +207,10 @@ export type WorkOrder = {
   override_active?: boolean;
   /** True if a user override (component_split) was applied during consolidation for this WO. */
   consolidation_override_active?: boolean;
+  /** Stable canonical id assigned during planning regen — same id across all lots emitted from the same planMethodSlot decision. Used as the selector for WO schedule-impact analysis. */
+  wo_group_id?: string | null;
+  /** Within an OR-merged wo_group_id, distinguishes alternatives (0, 1, …). null/undefined for non-OR (single-alt) WOs. */
+  method_slot_index?: number | null;
 };
 
 /** Planning pegging tree node: demand (root) -> work_order -> ... -> supply | purchase (leaves). */
@@ -1245,6 +1249,170 @@ export async function analyzeMaterialImpact(
     if (body.status === 'failed') throw new Error(body.error ?? 'Re-plan job failed');
   }
   throw new Error('Material impact analysis timed out');
+}
+
+// ── WO Schedule Events ─────────────────────────────────────────────────────────
+
+/**
+ * Bulk WO schedule shift selector. UI assembles this after the user picks a
+ * concrete set of WOs from a filterable preview; the backend trusts woGroupIds
+ * verbatim. bucketStart anchors `delayToDate` math: shift = delayToDate - bucketStart.
+ */
+export type WoScheduleSelector = {
+  /** ISO yyyy-MM-dd. UI default: min(start_time) over selected WOs. */
+  bucketStart: string;
+  /** ISO yyyy-MM-dd. UI default: max(end_time) over selected WOs. */
+  bucketEnd: string;
+  /** Concrete WOs picked from the preview list. Must be non-empty. */
+  woGroupIds: string[];
+};
+
+export type WoScheduleEvent = {
+  id: number;
+  caseId: number;
+  selectors: WoScheduleSelector[];
+  delayDays: number | null;
+  delayToDate: string | null;
+  note: string | null;
+  createdAt: string;
+};
+
+export type WoImpactedDemand = {
+  demandId: string;
+  productId: string;
+  locationId: string | null;
+  customerId: string;
+  description: string | null;
+  priority: number | null;
+  requestDueTime: string | null;
+  requestedQty: number;
+  baselineCommitTime: string | null;
+  contingentCommitTime: string | null;
+  daysDelta: number;
+  status: 'delivery_delayed' | 'newly_late_vs_due' | 'no_change';
+};
+
+export type WoScheduleImpactResult = {
+  caseId: number;
+  planRunId: number | null;
+  contingentPlanRunId: number | null;
+  matchedWoCount: number;
+  delayDays: number | null;
+  delayToDate: string | null;
+  impactedDemandCount: number;
+  impacts: WoImpactedDemand[];
+  note: string | null;
+};
+
+export type WoScheduleImpactRequest = {
+  selectors: WoScheduleSelector[];
+  delayDays?: number | null;
+  delayToDate?: string | null;
+  planRunId?: number | null;
+  caseId?: number | null;
+  persist?: boolean;
+  note?: string | null;
+  /** When set, tags the resulting contingent plan run back to the saved event so
+   *  it appears in the per-event run-history endpoint. */
+  woScheduleEventId?: number | null;
+};
+
+/** A historical analysis run linked to a saved WO schedule event. */
+export type WoScheduleRun = {
+  planRunId: number;
+  baselinePlanRunId: number | null;
+  createdAt: string;
+  matchedWoCount: number;
+  impactedDemandCount: number;
+  delayDays: number | null;
+  delayToDate: string | null;
+  note: string | null;
+  status: string; // "contingent" | "success" (after promotion)
+  impacts: WoImpactedDemand[];
+};
+
+export async function listWoScheduleEvents(caseId: number): Promise<WoScheduleEvent[]> {
+  const r = await fetch(`${API}/cases/${caseId}/wo-schedule-events`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function createWoScheduleEvent(
+  caseId: number,
+  body: { selectors: WoScheduleSelector[]; delayDays?: number | null; delayToDate?: string | null; note?: string | null },
+): Promise<WoScheduleEvent> {
+  const r = await fetch(`${API}/cases/${caseId}/wo-schedule-events`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      selectors: body.selectors,
+      delayDays: body.delayDays ?? null,
+      delayToDate: body.delayToDate ?? null,
+      note: body.note ?? null,
+    }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function updateWoScheduleEvent(
+  caseId: number,
+  eventId: number,
+  body: { selectors: WoScheduleSelector[]; delayDays?: number | null; delayToDate?: string | null; note?: string | null },
+): Promise<WoScheduleEvent> {
+  const r = await fetch(`${API}/cases/${caseId}/wo-schedule-events/${eventId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      selectors: body.selectors,
+      delayDays: body.delayDays ?? null,
+      delayToDate: body.delayToDate ?? null,
+      note: body.note ?? null,
+    }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function deleteWoScheduleEvent(caseId: number, eventId: number): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/wo-schedule-events/${eventId}`, { method: 'DELETE' });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+export async function listWoScheduleRuns(caseId: number, eventId: number): Promise<WoScheduleRun[]> {
+  const r = await fetch(`${API}/cases/${caseId}/wo-schedule-events/${eventId}/runs`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function analyzeWoScheduleImpact(
+  req: WoScheduleImpactRequest,
+  onProgress?: (p: { current: number; total: number }) => void,
+): Promise<WoScheduleImpactResult> {
+  const submit = await fetch(`${API}/wo-schedule-impact`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  });
+  if (!submit.ok) throw new Error(await submit.text());
+  const { jobId } = await submit.json();
+  if (!jobId) throw new Error('No jobId returned from wo-schedule-impact');
+
+  let delay = 500;
+  const maxDelay = 2000;
+  const maxWait = 120_000; // 2 min — sequencing-only path is fast
+  const start = Date.now();
+  while (Date.now() - start < maxWait) {
+    await new Promise(res => setTimeout(res, delay));
+    delay = Math.min(delay * 2, maxDelay);
+    const poll = await fetch(`${API}/wo-schedule-impact/status/${encodeURIComponent(jobId)}`);
+    if (!poll.ok) throw new Error(`Poll failed: ${poll.status}`);
+    const body = await poll.json();
+    if (body.progress && onProgress) onProgress(body.progress as { current: number; total: number });
+    if (body.status === 'completed') return body.result as WoScheduleImpactResult;
+    if (body.status === 'failed') throw new Error(body.error ?? 'WO schedule impact job failed');
+  }
+  throw new Error('WO schedule impact analysis timed out');
 }
 
 // ── Material Impact Assessment ─────────────────────────────────────────────────
