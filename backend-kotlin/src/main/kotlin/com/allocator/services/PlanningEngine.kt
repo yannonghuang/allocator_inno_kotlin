@@ -3700,6 +3700,10 @@ private fun fixTimingFromPegging(
         lotsByGroup.size, regenTrees.size, allGroups.size, leaves.size, shiftCount)
 
     // ── Step 3: Write corrected timings back into the pegging trees ───────────
+    // Same skip-failed discipline as regenWalk: failed=true WO nodes carry
+    // first-pass diagnostic stubs whose gids were never emitted as lots.
+    // Recursing into them and trying to update timing produces ~20k spurious
+    // "no lots" hits and (worse) leaves the tree in an inconsistent state.
     var rewriteWoUpdated = 0
     var rewriteWoNoLots = 0
     var rewriteWoNoGid = 0
@@ -3707,44 +3711,49 @@ private fun fixTimingFromPegging(
     @Suppress("UNCHECKED_CAST")
     fun rewriteTree(node: Map<String, Any?>, depth: Int, path: String): Map<String, Any?> {
         if (depth > 60) return node
+        // Skip the entire subtree of any failed=true WO node.
+        if (node["type"] == "work_order" && node["failed"] == true) return node
         val originalChildren = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
         val newChildren = originalChildren.mapIndexed { i, ch -> rewriteTree(ch, depth + 1, "$path-$i") }
         val updated = node.toMutableMap()
         if (originalChildren.isNotEmpty()) updated["children"] = newChildren
         when (node["type"] as? String) {
             "work_order" -> {
-                if (node["failed"] != true) {
-                    val gid = node["wo_group_id"] as? String
-                    val altIndex = node["method_slot_index"] as? Int
-                    if (gid == null) {
-                        rewriteWoNoGid++
-                        if (rewriteMissSamples.size < 10) {
-                            rewriteMissSamples.add("no_gid: ${node["product_id"]}@${node["location_id"]}/${node["method"]} path=$path start=${node["start_time"]}")
-                        }
+                val gid = node["wo_group_id"] as? String
+                val altIndex = node["method_slot_index"] as? Int
+                if (gid == null) {
+                    rewriteWoNoGid++
+                    if (rewriteMissSamples.size < 10) {
+                        rewriteMissSamples.add("no_gid: ${node["product_id"]}@${node["location_id"]}/${node["method"]} path=$path start=${node["start_time"]}")
+                    }
+                } else {
+                    val ownLots = lotsByGroup[gid]?.filter {
+                        (it["method_slot_index"] as? Int) == altIndex
+                    } ?: emptyList()
+                    if (ownLots.isNotEmpty()) {
+                        ownLots.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull()
+                            ?.let { updated["start_time"] = formatDate(it) }
+                        ownLots.mapNotNull { parseDate(it["end_time"] as? String) }.maxOrNull()
+                            ?.let { updated["end_time"] = formatDate(it) }
+                        rewriteWoUpdated++
                     } else {
-                        val ownLots = lotsByGroup[gid]?.filter {
-                            (it["method_slot_index"] as? Int) == altIndex
-                        } ?: emptyList()
-                        if (ownLots.isNotEmpty()) {
-                            ownLots.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull()
-                                ?.let { updated["start_time"] = formatDate(it) }
-                            ownLots.mapNotNull { parseDate(it["end_time"] as? String) }.maxOrNull()
-                                ?.let { updated["end_time"] = formatDate(it) }
-                            rewriteWoUpdated++
-                        } else {
-                            rewriteWoNoLots++
-                            if (rewriteMissSamples.size < 10) {
-                                val bucketSize = lotsByGroup[gid]?.size ?: 0
-                                rewriteMissSamples.add("no_lots: ${node["product_id"]}@${node["location_id"]}/${node["method"]} gid=$gid altIdx=$altIndex bucket_size=$bucketSize path=$path start=${node["start_time"]}")
-                            }
+                        rewriteWoNoLots++
+                        if (rewriteMissSamples.size < 10) {
+                            val bucketSize = lotsByGroup[gid]?.size ?: 0
+                            rewriteMissSamples.add("no_lots: ${node["product_id"]}@${node["location_id"]}/${node["method"]} gid=$gid altIdx=$altIndex bucket_size=$bucketSize path=$path start=${node["start_time"]}")
                         }
                     }
                 }
             }
             "demand" -> {
+                // Recompute commit_time from children that ACTUALLY produced
+                // something — exclude hard-planning-failure children whose
+                // commit_time is the wishful request_time (no real
+                // fulfillment, so they don't constrain the parent's start).
                 val newCommit = newChildren.mapNotNull { ch ->
                     val r = ch["commit_reason"] as? String
                     if (r == "cycle_stopped" || r == "cycle_detected") return@mapNotNull null
+                    if (isHardPlanningFailure(r)) return@mapNotNull null
                     when (ch["type"] as? String) {
                         "work_order" -> parseDate(ch["end_time"] as? String)
                         "demand", "supply", "purchase" -> parseDate(ch["commit_time"] as? String)

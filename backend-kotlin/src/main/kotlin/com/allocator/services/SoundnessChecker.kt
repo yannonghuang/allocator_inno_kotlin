@@ -845,7 +845,15 @@ private class WalkContext(
         val commitTimes = effectiveChildren
             .filter { ch ->
                 val r = ch["commit_reason"] as? String
-                r != "cycle_stopped" && r != "cycle_detected"
+                // Cycle-stop diagnostic markers carry no real timing.
+                if (r == "cycle_stopped" || r == "cycle_detected") return@filter false
+                // Hard-planning-failure children (no_methods, depth_limit,
+                // child_failed:*, etc.) never actually produced anything;
+                // their commit_time is the planner's wishful request_time
+                // fallback — not a real predecessor constraint on the
+                // parent's start.  Exclude.
+                if (isHardPlanningFailure(r)) return@filter false
+                true
             }
             .mapNotNull { parseDateLocal(it["commit_time"]?.toString()) }
         val target = commitTimes.maxOrNull() ?: return
