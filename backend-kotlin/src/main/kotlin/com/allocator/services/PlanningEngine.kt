@@ -3568,7 +3568,8 @@ private fun fixTimingFromPegging(
     // bucket to lots matching the node's own gid); demand commit_time ← max
     // over the (newly shifted) child end / commit times, never pulled backward.
     var rewriteWoMatched = 0
-    var rewriteWoMissing = 0
+    var rewriteWoOrphanShifted = 0
+    var rewriteWoOrphanUnchanged = 0
     @Suppress("UNCHECKED_CAST")
     fun rewriteTree(node: Map<String, Any?>, depth: Int): Map<String, Any?> {
         if (depth > 60) return node
@@ -3596,10 +3597,36 @@ private fun fixTimingFromPegging(
                         ownLots.mapNotNull { parseDate(it["end_time"] as? String) }.maxOrNull()
                             ?.let { updated["end_time"] = formatDate(it) }
                     } else {
-                        rewriteWoMissing++
-                        if (log.isInfoEnabled) {
-                            log.info("rewriteTree: no lots for WO {}@{} method={} gid={} — pegging-tree timing left as-is",
-                                node["product_id"], node["location_id"], node["method"], gid)
+                        // Orphan: this pegging-tree WO node has no lot in
+                        // work_orders.  Most often this is a per-demand WO
+                        // that was replaced by consolidation — the per-demand
+                        // pegging tree was kept (for the UI) but the actual
+                        // production now flows through a consolidated WO with
+                        // a different gid.  Without lots we have no canonical
+                        // start to write back, but we can still satisfy the
+                        // predecessor-sequencing invariant by ensuring this
+                        // WO starts no earlier than its (already-rewritten)
+                        // children's commit times.  Shift forward only — never
+                        // pull a WO backward, since its original time may
+                        // already be later than the derived target.
+                        val originalStart = parseDate(node["start_time"] as? String)
+                        val derivedStart = newChildren.mapNotNull { ch ->
+                            val r = ch["commit_reason"] as? String
+                            if (r == "cycle_stopped" || r == "cycle_detected") return@mapNotNull null
+                            when (ch["type"] as? String) {
+                                "demand" -> parseDate(ch["commit_time"] as? String)
+                                else -> null
+                            }
+                        }.maxOrNull()
+                        if (originalStart != null && derivedStart != null && derivedStart > originalStart) {
+                            val shiftDays = derivedStart.toEpochDay() - originalStart.toEpochDay()
+                            updated["start_time"] = formatDate(derivedStart)
+                            parseDate(node["end_time"] as? String)?.let {
+                                updated["end_time"] = formatDate(it.plusDays(shiftDays))
+                            }
+                            rewriteWoOrphanShifted++
+                        } else {
+                            rewriteWoOrphanUnchanged++
                         }
                     }
                 }
@@ -3628,8 +3655,8 @@ private fun fixTimingFromPegging(
         val rewritten = rewriteTree(tree, 0)
         entry.toMutableMap().apply { put("tree", rewritten) }
     }
-    log.info("fixTimingFromPegging.rewriteTree: wo_nodes_updated={} wo_nodes_missing_lots={}",
-        rewriteWoMatched, rewriteWoMissing)
+    log.info("fixTimingFromPegging.rewriteTree: wo_nodes_with_lots={} orphans_shifted_via_children={} orphans_unchanged={}",
+        rewriteWoMatched, rewriteWoOrphanShifted, rewriteWoOrphanUnchanged)
 
     return TimingFixResult(mutableWos, updatedPegging)
 }
