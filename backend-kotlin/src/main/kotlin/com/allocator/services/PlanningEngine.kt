@@ -3537,8 +3537,17 @@ private fun fixTimingFromPegging(
         depth: Int,
     ): Map<String, Any?> {
         if (depth > 60) return node
-        val children = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
         val type = node["type"] as? String
+
+        // Failed=true WOs (AND-bottleneck blocked branches) carry first-pass
+        // taggedChildPeggings as diagnostic stubs.  Those embedded subtrees
+        // contain WO nodes whose lots were never propagated to the workOrders
+        // list (the slot returned wos=emptyList).  Walking into them would
+        // emit lots for those orphan first-pass WOs — keep the subtree
+        // visible in the tree but skip recursion entirely.
+        if (type == "work_order" && node["failed"] == true) return node
+
+        val children = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
 
         if (type == "demand") {
             // Detect OR-group: > 1 non-failed WO children directly under this demand.
