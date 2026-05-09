@@ -3330,11 +3330,11 @@ fun runPlanning(
         warnings
     }
 
-    val fixedWorkOrders = fixTimingFromPegging(consolidatedWOs + workOrders, allPegging)
+    val timingFix = fixTimingFromPegging(consolidatedWOs + workOrders, allPegging)
     return mapOf(
         "committed_demands"      to committedDemands,
-        "work_orders"            to fixedWorkOrders,
-        "planning_pegging"       to allPegging,
+        "work_orders"            to timingFix.workOrders,
+        "planning_pegging"       to timingFix.peggingTrees,
         "supply_allocations"     to supplyAllocations,
         "supply_cap_violations"  to supplyCapViolations,
         "override_warnings"      to overrideWarnings,
@@ -3408,8 +3408,8 @@ internal fun verifySupplyCap(
 private fun fixTimingFromPegging(
     workOrders: List<Map<String, Any?>>,
     peggingTrees: List<Map<String, Any?>>,
-): List<Map<String, Any?>> {
-    if (workOrders.isEmpty() || peggingTrees.isEmpty()) return workOrders
+): TimingFixResult {
+    if (workOrders.isEmpty() || peggingTrees.isEmpty()) return TimingFixResult(workOrders, peggingTrees)
 
     val mutableWos: List<MutableMap<String, Any?>> = workOrders.map { it.toMutableMap() }
 
@@ -3558,5 +3558,65 @@ private fun fixTimingFromPegging(
     log.info("fixTimingFromPegging: lot_groups={} pegging_trees={} dag_groups={} or_remapped={} leaves={} shifts_applied={}",
         lotsByGroup.size, peggingTrees.size, allGroups.size, canonOf.size, leaves.size, shiftCount)
 
-    return mutableWos
+    // Propagate the corrected timings back into the pegging trees so downstream
+    // consumers (soundness checker, UI panels, KPIs) see consistent
+    // start/end/commit times.  The planner's forward pass writes start/end
+    // onto every WO node and commit_time onto every demand node, but those
+    // values predate the OR-merged push-up shifts above.  We now rewrite each
+    // tree bottom-up: WO start/end ← canonical lot times by wo_group_id;
+    // demand commit_time ← max over the (newly shifted) child end / commit
+    // times, never pulled backward.
+    @Suppress("UNCHECKED_CAST")
+    fun rewriteTree(node: Map<String, Any?>, depth: Int): Map<String, Any?> {
+        if (depth > 60) return node
+        val originalChildren = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
+        val newChildren = originalChildren.map { rewriteTree(it, depth + 1) }
+        val updated = node.toMutableMap()
+        if (originalChildren.isNotEmpty()) updated["children"] = newChildren
+        when (node["type"] as? String) {
+            "work_order" -> {
+                val gid = node["wo_group_id"] as? String
+                if (gid != null) {
+                    lotsByGroup[gid]?.let { lots ->
+                        lots.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull()
+                            ?.let { updated["start_time"] = formatDate(it) }
+                        lots.mapNotNull { parseDate(it["end_time"] as? String) }.maxOrNull()
+                            ?.let { updated["end_time"] = formatDate(it) }
+                    }
+                }
+            }
+            "demand" -> {
+                val newCommit = newChildren.mapNotNull { ch ->
+                    val r = ch["commit_reason"] as? String
+                    if (r == "cycle_stopped" || r == "cycle_detected") return@mapNotNull null
+                    when (ch["type"] as? String) {
+                        "work_order" -> parseDate(ch["end_time"] as? String)
+                        "demand", "supply", "purchase" -> parseDate(ch["commit_time"] as? String)
+                        else -> null
+                    }
+                }.maxOrNull()
+                val current = parseDate(node["commit_time"] as? String)
+                if (newCommit != null && (current == null || newCommit > current)) {
+                    updated["commit_time"] = formatDate(newCommit)
+                }
+            }
+        }
+        return updated
+    }
+    val updatedPegging = peggingTrees.map { entry ->
+        @Suppress("UNCHECKED_CAST")
+        val tree = entry["tree"] as? Map<String, Any?> ?: return@map entry
+        val rewritten = rewriteTree(tree, 0)
+        entry.toMutableMap().apply { put("tree", rewritten) }
+    }
+
+    return TimingFixResult(mutableWos, updatedPegging)
 }
+
+/** Result of [fixTimingFromPegging]: the corrected work-order list AND the
+ *  pegging trees rewritten with the same canonical timings, so all downstream
+ *  consumers (soundness, UI, KPIs) read a consistent view. */
+private data class TimingFixResult(
+    val workOrders: List<Map<String, Any?>>,
+    val peggingTrees: List<Map<String, Any?>>,
+)
