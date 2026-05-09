@@ -312,6 +312,137 @@ class SoundnessCheckerTest : FunSpec({
         report.demands[0].violations.map { it.rule } shouldContain "R5_transit_time"
     }
 
+    // ── R5_predecessor_sequencing ─────────────────────────────────────────────
+
+    test("R5_predecessor_sequencing: make WO with start ≥ child commit_time is sound") {
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0,
+            children = listOf(makeWO("FG", "L1", qty = 10.0, startTime = "2024-11-15", endTime = "2024-11-15",
+                children = listOf(
+                    demandNode("D1", "X", "L1", qty = 10.0, committedQty = 10.0, commitTime = "2024-11-10",
+                        children = listOf(supplyLeaf("X", "L1", "S1", 10.0))),
+                    demandNode("D1", "Y", "L1", qty = 10.0, committedQty = 10.0, commitTime = "2024-11-15",
+                        children = listOf(supplyLeaf("Y", "L1", "S2", 10.0))),
+                ))))
+        val data = mapOf(
+            "supply" to listOf(supply("S1", "X", "L1", 100.0), supply("S2", "Y", "L1", 100.0)),
+            "method_make" to listOf(mk("FG", "L1")),
+            "bom" to listOf(bom("FG", "X"), bom("FG", "Y")),
+        )
+        val report = checkRunSoundness(planningPegging = listOf(pegEntry("D1", tree)), demands = demands, data = data)
+        report.demands[0].violations.map { it.rule } shouldNotContain "R5_predecessor_sequencing"
+    }
+
+    test("R5_predecessor_sequencing: make WO start before child commit_time flags violation") {
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0,
+            children = listOf(makeWO("FG", "L1", qty = 10.0, startTime = "2024-11-01", endTime = "2024-11-01",
+                children = listOf(demandNode("D1", "X", "L1", qty = 10.0, committedQty = 10.0,
+                    commitTime = "2024-11-15",
+                    children = listOf(supplyLeaf("X", "L1", "S1", 10.0)))))))
+        val data = mapOf(
+            "supply" to listOf(supply("S1", "X", "L1", 100.0)),
+            "method_make" to listOf(mk("FG", "L1")),
+            "bom" to listOf(bom("FG", "X")),
+        )
+        val report = checkRunSoundness(planningPegging = listOf(pegEntry("D1", tree)), demands = demands, data = data)
+        report.demands[0].violations.map { it.rule } shouldContain "R5_predecessor_sequencing"
+    }
+
+    test("R5_predecessor_sequencing: OR-group early alternative caught against sibling's later child commit") {
+        // Demand D1 has TWO alternative make WOs (waterfall split): wog-A makes 3
+        // units (small) using component X arriving 2024-11-01; wog-B makes 7 units
+        // (large) using component Y arriving 2024-11-15.  The post-processing
+        // OR-merge should have shifted wog-A to 2024-11-15 too.  Here wog-A is
+        // still at 2024-11-01 — strict per-WO check passes (≥ X's commit), but
+        // the OR-aware check flags wog-A against the union (which includes Y).
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val woA = makeWO("FG", "L1", qty = 3.0, startTime = "2024-11-01", endTime = "2024-11-01",
+            children = listOf(demandNode("D1", "X", "L1", qty = 3.0, committedQty = 3.0,
+                commitTime = "2024-11-01",
+                children = listOf(supplyLeaf("X", "L1", "S1", 3.0))))) +
+            mapOf("wo_group_id" to "wog-A")
+        val woB = makeWO("FG", "L1", qty = 7.0, startTime = "2024-11-15", endTime = "2024-11-15",
+            children = listOf(demandNode("D1", "Y", "L1", qty = 7.0, committedQty = 7.0,
+                commitTime = "2024-11-15",
+                children = listOf(supplyLeaf("Y", "L1", "S2", 7.0))))) +
+            mapOf("wo_group_id" to "wog-B")
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0,
+            children = listOf(woA, woB))
+        val data = mapOf(
+            "supply" to listOf(supply("S1", "X", "L1", 100.0), supply("S2", "Y", "L1", 100.0)),
+            "method_make" to listOf(mk("FG", "L1")),
+            "bom" to listOf(bom("FG", "X"), bom("FG", "Y")),
+        )
+        val report = checkRunSoundness(planningPegging = listOf(pegEntry("D1", tree)), demands = demands, data = data)
+        val violations = report.demands[0].violations.filter { it.rule == "R5_predecessor_sequencing" }
+        violations shouldHaveSize 1
+        // The violation is on wog-A (the early alt), not wog-B.
+        violations[0].nodePath stringShouldContain "0-0"  // first WO under root demand
+    }
+
+    test("R5_predecessor_sequencing: move WO scheduled before source-side commit_time") {
+        val demands = listOf(demand("D1", "FG", "L2", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L2", qty = 10.0, committedQty = 10.0,
+            children = listOf(moveWO("FG", "L1", "L2", qty = 10.0, startTime = "2024-11-01", endTime = "2024-11-06",
+                children = listOf(demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0,
+                    commitTime = "2024-11-15",
+                    children = listOf(supplyLeaf("FG", "L1", "S1", 10.0)))))))
+        val data = mapOf(
+            "supply" to listOf(supply("S1", "FG", "L1", 100.0)),
+            "method_move" to listOf(mv("FG", "L1", "L2", transit = 5.0)),
+        )
+        val report = checkRunSoundness(planningPegging = listOf(pegEntry("D1", tree)), demands = demands, data = data)
+        report.demands[0].violations.map { it.rule } shouldContain "R5_predecessor_sequencing"
+    }
+
+    test("R5_predecessor_sequencing: 1-day slack absorbed by timeToleranceDays") {
+        // start = commit - 1 day with default tolerance=1 → no violation.
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0,
+            children = listOf(makeWO("FG", "L1", qty = 10.0, startTime = "2024-11-09", endTime = "2024-11-09",
+                children = listOf(demandNode("D1", "X", "L1", qty = 10.0, committedQty = 10.0,
+                    commitTime = "2024-11-10",
+                    children = listOf(supplyLeaf("X", "L1", "S1", 10.0)))))))
+        val data = mapOf(
+            "supply" to listOf(supply("S1", "X", "L1", 100.0)),
+            "method_make" to listOf(mk("FG", "L1")),
+            "bom" to listOf(bom("FG", "X")),
+        )
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", tree)),
+            demands = demands,
+            data = data,
+            config = SoundnessConfig(timeToleranceDays = 1L),
+        )
+        report.demands[0].violations.map { it.rule } shouldNotContain "R5_predecessor_sequencing"
+    }
+
+    test("R5_predecessor_sequencing: cycle_stopped child excluded from target") {
+        // Only child has commit_reason=cycle_stopped (no commit_time) — should be
+        // skipped and the rule passes (no other children to set a target).
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val cycleChild = mapOf(
+            "type" to "demand",
+            "demand_id" to "D1",
+            "product_id" to "X",
+            "location_id" to "L1",
+            "quantity" to 10.0,
+            "committed_qty" to 0.0,
+            "commit_reason" to "cycle_stopped",
+            "children" to emptyList<Any>(),
+        )
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0,
+            children = listOf(makeWO("FG", "L1", qty = 10.0, startTime = "2024-11-01", endTime = "2024-11-01",
+                children = listOf(cycleChild))))
+        val data = mapOf(
+            "method_make" to listOf(mk("FG", "L1")),
+            "bom" to listOf(bom("FG", "X")),
+        )
+        val report = checkRunSoundness(planningPegging = listOf(pegEntry("D1", tree)), demands = demands, data = data)
+        report.demands[0].violations.map { it.rule } shouldNotContain "R5_predecessor_sequencing"
+    }
+
     // ── R6: variant consistency ───────────────────────────────────────────────
 
     test("R6_alt_group_inconsistent: make WO mixes children from two multi-row alt_groups") {

@@ -23,6 +23,14 @@ import kotlin.math.abs
  *      (within tolerance). At move WOs, qty is conserved.
  *   R5 time propagation — at make WOs, parent_time = max(child_times) + LEAD_TIME.
  *      At move WOs, parent_time = source_time + TRANSIT_TIME.
+ *      Three sub-rules emit independently:
+ *        R5_lead_time              — make WO duration ≥ lead_time
+ *        R5_transit_time           — move WO duration ≥ transit_time
+ *        R5_predecessor_sequencing — every WO's start_time ≥ max(child demand
+ *           commit_time).  OR-aware: when a demand has multiple WO children
+ *           (waterfall split), each alternative is checked against the union
+ *           of all alternatives' children — mirroring the planner's
+ *           `fixTimingFromPegging` post-processing pass.
  *   R6 variant consistency — children of a make WO share the same alt_group
  *      (or all have null alt_group).
  *   R7a per-demand supply leaf bound — each supply leaf references a real
@@ -409,8 +417,51 @@ private class WalkContext(
     val supplyConsumption = mutableMapOf<String, Double>()
     /** "$pid|$lid" → qty consumed via synthetic `consolidated_<pid>_<lid>` buckets. */
     val syntheticConsumption = mutableMapOf<String, Double>()
+    /**
+     * OR-group merge map for R5_predecessor_sequencing.
+     * Keyed by a WO's `wo_group_id`; value is the union of demand-typed
+     * grandchildren of all OR-sibling WOs sharing the same parent demand.
+     * Populated by [preBuildOrGroups] before the main walk.  When a WO is in
+     * the map, [validatePredecessorSequencing] uses the union as its child
+     * set (mirroring `fixTimingFromPegging`'s OR-merge in PlanningEngine.kt).
+     * WOs not in the map fall back to their own direct demand children.
+     */
+    val woUnionChildren = mutableMapOf<String, List<Map<String, Any?>>>()
+
+    /**
+     * Pre-pass: walk the pegging tree once to identify OR-groups (demand
+     * nodes with > 1 non-failed work_order children) and record, for every
+     * member WO, the union of demand grandchildren contributed by all OR
+     * siblings.  Mirrors the canonicalization in PlanningEngine.kt's
+     * `detectOrGroups` so the soundness check can verify the post-condition
+     * the planner enforces.
+     */
+    @Suppress("UNCHECKED_CAST")
+    fun preBuildOrGroups(tree: Map<String, Any?>) {
+        fun visit(node: Map<String, Any?>, depth: Int) {
+            if (depth > 60) return
+            if (node["type"] == "demand") {
+                val children = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
+                val woChildren = children.filter { it["type"] == "work_order" && it["failed"] != true }
+                if (woChildren.size > 1) {
+                    val unionDemandChildren = woChildren.flatMap { wo ->
+                        ((wo["children"] as? List<Map<String, Any?>>) ?: emptyList())
+                            .filter { it["type"] == "demand" }
+                    }
+                    for (wo in woChildren) {
+                        val gid = wo["wo_group_id"] as? String ?: continue
+                        woUnionChildren[gid] = unionDemandChildren
+                    }
+                }
+            }
+            val children = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
+            for (c in children) visit(c, depth + 1)
+        }
+        visit(tree, 0)
+    }
 
     fun walkRoot(tree: Map<String, Any?>) {
+        preBuildOrGroups(tree)
         // R1 — root must be a demand node matching the demand row.
         val type = tree["type"]?.toString()
         if (type != "demand") {
@@ -773,6 +824,51 @@ private class WalkContext(
         }
     }
 
+    /**
+     * R5_predecessor_sequencing — at every WO node W, W.start_time must be ≥
+     * max(commit_time) across W's effective child demand set.  When W is part
+     * of an OR-group (waterfall alternatives under a shared parent demand),
+     * the effective set is the union of all alternatives' demand grandchildren
+     * (matching `fixTimingFromPegging`'s OR-merge); otherwise it's W's own
+     * demand children.  Children with no commit_time, or with
+     * commit_reason ∈ {cycle_stopped, cycle_detected}, are excluded from the
+     * target so synthetic-cycle markers don't trigger false positives.
+     * `config.timeToleranceDays` slack absorbs date-truncation rounding.
+     */
+    private fun validatePredecessorSequencing(node: Map<String, Any?>, path: String) {
+        val parentStart = parseDateLocal(node["start_time"]?.toString()) ?: return
+        @Suppress("UNCHECKED_CAST")
+        val ownDemandChildren = ((node["children"] as? List<Map<String, Any?>>) ?: emptyList())
+            .filter { it["type"] == "demand" }
+        val gid = node["wo_group_id"] as? String
+        val effectiveChildren = gid?.let { woUnionChildren[it] } ?: ownDemandChildren
+        val commitTimes = effectiveChildren
+            .filter { ch ->
+                val r = ch["commit_reason"] as? String
+                // Cycle-stop diagnostic markers carry no real timing.
+                if (r == "cycle_stopped" || r == "cycle_detected") return@filter false
+                // Hard-planning-failure children (no_methods, depth_limit,
+                // child_failed:*, etc.) never actually produced anything;
+                // their commit_time is the planner's wishful request_time
+                // fallback — not a real predecessor constraint on the
+                // parent's start.  Exclude.
+                if (isHardPlanningFailure(r)) return@filter false
+                true
+            }
+            .mapNotNull { parseDateLocal(it["commit_time"]?.toString()) }
+        val target = commitTimes.maxOrNull() ?: return
+        if (parentStart.toEpochDay() + config.timeToleranceDays < target.toEpochDay()) {
+            val orSuffix = if (gid != null && woUnionChildren.containsKey(gid)) " (OR-merged group)" else ""
+            violations.add(Violation(
+                rule = "R5_predecessor_sequencing",
+                nodePath = path,
+                message = "WO start_time ($parentStart) is earlier than max child commit_time ($target)$orSuffix.",
+                expected = target.toString(),
+                actual = parentStart.toString(),
+            ))
+        }
+    }
+
     private fun validateMakeWO(node: Map<String, Any?>, path: String) {
         val pid = node["product_id"]?.toString()?.trim() ?: ""
         val lid = node["location_id"]?.toString()?.trim() ?: ""
@@ -964,6 +1060,9 @@ private class WalkContext(
                 ))
             }
         }
+
+        // R5_predecessor_sequencing — start_time ≥ max(child commit_time).
+        validatePredecessorSequencing(node, path)
     }
 
     private fun validateMoveWO(node: Map<String, Any?>, path: String) {
@@ -1029,6 +1128,9 @@ private class WalkContext(
                 ))
             }
         }
+
+        // R5_predecessor_sequencing — start_time ≥ max(source-side child commit_time).
+        validatePredecessorSequencing(node, path)
     }
 }
 
