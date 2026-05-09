@@ -3700,11 +3700,15 @@ private fun fixTimingFromPegging(
         lotsByGroup.size, regenTrees.size, allGroups.size, leaves.size, shiftCount)
 
     // ── Step 3: Write corrected timings back into the pegging trees ───────────
+    var rewriteWoUpdated = 0
+    var rewriteWoNoLots = 0
+    var rewriteWoNoGid = 0
+    val rewriteMissSamples = mutableListOf<String>()
     @Suppress("UNCHECKED_CAST")
-    fun rewriteTree(node: Map<String, Any?>, depth: Int): Map<String, Any?> {
+    fun rewriteTree(node: Map<String, Any?>, depth: Int, path: String): Map<String, Any?> {
         if (depth > 60) return node
         val originalChildren = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
-        val newChildren = originalChildren.map { rewriteTree(it, depth + 1) }
+        val newChildren = originalChildren.mapIndexed { i, ch -> rewriteTree(ch, depth + 1, "$path-$i") }
         val updated = node.toMutableMap()
         if (originalChildren.isNotEmpty()) updated["children"] = newChildren
         when (node["type"] as? String) {
@@ -3712,7 +3716,12 @@ private fun fixTimingFromPegging(
                 if (node["failed"] != true) {
                     val gid = node["wo_group_id"] as? String
                     val altIndex = node["method_slot_index"] as? Int
-                    if (gid != null) {
+                    if (gid == null) {
+                        rewriteWoNoGid++
+                        if (rewriteMissSamples.size < 10) {
+                            rewriteMissSamples.add("no_gid: ${node["product_id"]}@${node["location_id"]}/${node["method"]} path=$path start=${node["start_time"]}")
+                        }
+                    } else {
                         val ownLots = lotsByGroup[gid]?.filter {
                             (it["method_slot_index"] as? Int) == altIndex
                         } ?: emptyList()
@@ -3721,6 +3730,13 @@ private fun fixTimingFromPegging(
                                 ?.let { updated["start_time"] = formatDate(it) }
                             ownLots.mapNotNull { parseDate(it["end_time"] as? String) }.maxOrNull()
                                 ?.let { updated["end_time"] = formatDate(it) }
+                            rewriteWoUpdated++
+                        } else {
+                            rewriteWoNoLots++
+                            if (rewriteMissSamples.size < 10) {
+                                val bucketSize = lotsByGroup[gid]?.size ?: 0
+                                rewriteMissSamples.add("no_lots: ${node["product_id"]}@${node["location_id"]}/${node["method"]} gid=$gid altIdx=$altIndex bucket_size=$bucketSize path=$path start=${node["start_time"]}")
+                            }
                         }
                     }
                 }
@@ -3746,7 +3762,13 @@ private fun fixTimingFromPegging(
     val finalTrees = regenTrees.map { entry ->
         @Suppress("UNCHECKED_CAST")
         val tree = entry["tree"] as? Map<String, Any?> ?: return@map entry
-        entry.toMutableMap().apply { put("tree", rewriteTree(tree, 0)) }
+        entry.toMutableMap().apply { put("tree", rewriteTree(tree, 0, "0")) }
+    }
+    log.info("fixTimingFromPegging.rewriteTree: wo_updated={} wo_no_lots={} wo_no_gid={}",
+        rewriteWoUpdated, rewriteWoNoLots, rewriteWoNoGid)
+    if (rewriteMissSamples.isNotEmpty()) {
+        log.warn("fixTimingFromPegging.rewriteTree miss samples (first {}):", rewriteMissSamples.size)
+        for (sample in rewriteMissSamples) log.warn("  rewrite-miss: {}", sample)
     }
 
     return TimingFixResult(regenLots, finalTrees)
