@@ -1,6 +1,7 @@
 package com.allocator.api
 
 import com.allocator.*
+import com.allocator.services.buildPeggingDag
 import com.allocator.services.emitPlanRunEvent
 import com.allocator.services.resequenceFromPegging
 import io.ktor.http.*
@@ -99,6 +100,41 @@ data class WoScheduleImpactResponse(
     val impactedDemandCount: Int,
     val impacts: List<WoImpactedDemand>,
     val note: String? = null,
+    /** Closed-form max safe delay for the same selectors (front-of-bucket
+     *  displacement that leaves every demand commit_time unchanged). Populated
+     *  alongside the impact diff at no extra cost. */
+    val maxFeasibleDays: Int? = null,
+    /** Slack edges that hit the min — surfaces every binding bottleneck. */
+    val bottlenecks: List<WoAvailabilityBottleneck> = emptyList(),
+)
+
+// ── Availability DTOs ─────────────────────────────────────────────────────────
+
+@Serializable
+data class WoAvailabilityRequest(
+    val selectors: List<WoScheduleSelector>,
+    val planRunId: Int? = null,
+    val caseId: Int? = null,
+)
+
+@Serializable
+data class WoAvailabilityBottleneck(
+    /** "boundary" = parent-child edge slack; "demand_root" = demand commit constraint. */
+    val kind: String,
+    val gid: String,
+    val parentGid: String? = null,
+    val demandId: String? = null,
+    val slackDays: Int,
+)
+
+@Serializable
+data class WoAvailabilityResponse(
+    val caseId: Int,
+    val planRunId: Int?,
+    val matchedWoCount: Int,
+    val maxFeasibleDays: Int,
+    val bottlenecks: List<WoAvailabilityBottleneck>,
+    val bottleneckDemands: List<WoImpactedDemand>,
 )
 
 // ── Helpers: bucket math ──────────────────────────────────────────────────────
@@ -398,6 +434,180 @@ private fun extractCommitTimes(peggingTrees: List<Map<String, Any?>>): Map<Strin
     return out
 }
 
+// ── Availability (closed-form max-safe-delay) ─────────────────────────────────
+
+/**
+ * Closed-form availability analysis: largest N (in days, relative to each
+ * selector's `bucketStart`) such that displacing the front of the bucket by
+ * N days leaves every demand `commit_time` unchanged (strict criterion).
+ *
+ * Algorithm — for each in-set WO `c`:
+ *  - **Boundary parent-child slack**: for every parent gid `P` of `c` that is
+ *    not in the set, `slack = (P.start − c.end) + (c.start − bucketStart)`.
+ *  - **Demand-root commit slack**: when `c` is a level-1 WO child of a
+ *    demand whose tree contains an in-set WO, `slack = (MAX_END_D − c.end) +
+ *    (c.start − bucketStart)` where `MAX_END_D = max over c'.end across D's
+ *    direct WO children`.
+ *
+ * `maxFeasibleDays = max(0, min(slacks))`. When several edges hit the min,
+ * all of them are returned as bottlenecks so the user sees every binding
+ * constraint. Sub-millisecond per case — pure DAG walk. */
+internal data class AvailabilityCalc(
+    val matchedWoCount: Int,
+    val maxFeasibleDays: Int,
+    val bottlenecks: List<WoAvailabilityBottleneck>,
+)
+
+internal fun computeAvailability(
+    workOrders: List<Map<String, Any?>>,
+    peggingTrees: List<Map<String, Any?>>,
+    selectors: List<WoScheduleSelector>,
+): AvailabilityCalc {
+    val dag = buildPeggingDag(workOrders, peggingTrees)
+
+    // Index lots → (start, end) per gid. End = max(lot end), Start = min(lot start).
+    fun gidStart(gid: String): LocalDate? =
+        dag.lotsByGroup[gid]?.mapNotNull { parseIsoDateLoose(it["start_time"] as? String) }?.minOrNull()
+    fun gidEnd(gid: String): LocalDate? =
+        dag.lotsByGroup[gid]?.mapNotNull { parseIsoDateLoose(it["end_time"] as? String) }?.maxOrNull()
+
+    // Walk per selector: each selector independently constrains the global N.
+    // Take the global min across selectors. (Multi-selector shares a single
+    // delayDays parameter on the impact side, so the same applies here.)
+    var globalMin: Int = Int.MAX_VALUE
+    val allBottlenecks = mutableListOf<WoAvailabilityBottleneck>()
+    var totalMatched = 0
+
+    for (sel in selectors) {
+        val bucketStart = parseIsoDateLoose(sel.bucketStart) ?: continue
+        val bucketEnd = parseIsoDateLoose(sel.bucketEnd) ?: continue
+        val selGids = sel.woGroupIds.toHashSet()
+        if (selGids.isEmpty()) continue
+
+        // In-set gids whose at least one lot's start_time lies in the bucket window.
+        // Lots outside the window aren't displaced under the front-shift model
+        // (they're already past the maintenance period).
+        val inSet = selGids.filter { gid ->
+            (dag.lotsByGroup[gid] ?: emptyList()).any { lot ->
+                val s = parseIsoDateLoose(lot["start_time"] as? String) ?: return@any false
+                s in bucketStart..bucketEnd
+            }
+        }.toHashSet()
+        if (inSet.isEmpty()) continue
+        totalMatched += inSet.size
+
+        var selMin: Int = Int.MAX_VALUE
+        val selBottlenecks = mutableListOf<WoAvailabilityBottleneck>()
+
+        fun consider(slackDays: Int, b: WoAvailabilityBottleneck) {
+            val capped = slackDays.coerceAtLeast(0)
+            when {
+                capped < selMin -> { selMin = capped; selBottlenecks.clear(); selBottlenecks.add(b) }
+                capped == selMin -> selBottlenecks.add(b)
+            }
+        }
+
+        // (a) Boundary parent-child slacks
+        for (childGid in inSet) {
+            val cStart = gidStart(childGid) ?: continue
+            val cEnd = gidEnd(childGid) ?: continue
+            val absorption = (cStart.toEpochDay() - bucketStart.toEpochDay()).toInt()
+            for (parentGid in dag.parentsOf[childGid] ?: emptySet()) {
+                if (parentGid in inSet) continue   // in-set ancestor: no constraint
+                val pStart = gidStart(parentGid) ?: continue
+                val baselineSlack = (pStart.toEpochDay() - cEnd.toEpochDay()).toInt()
+                val maxN = baselineSlack + absorption
+                consider(maxN, WoAvailabilityBottleneck(
+                    kind = "boundary",
+                    gid = childGid,
+                    parentGid = parentGid,
+                    slackDays = maxN,
+                ))
+            }
+        }
+
+        // (b) Demand-root commit constraints
+        for ((demandId, rootChildren) in dag.demandRootChildren) {
+            if (rootChildren.intersect(inSet).isEmpty()) continue
+            val maxEnd = rootChildren
+                .mapNotNull { gidEnd(it) }
+                .maxOrNull() ?: continue
+            for (cGid in rootChildren) {
+                if (cGid !in inSet) continue
+                val cStart = gidStart(cGid) ?: continue
+                val cEnd = gidEnd(cGid) ?: continue
+                val absorption = (cStart.toEpochDay() - bucketStart.toEpochDay()).toInt()
+                val baselineSlack = (maxEnd.toEpochDay() - cEnd.toEpochDay()).toInt()
+                val maxN = baselineSlack + absorption
+                consider(maxN, WoAvailabilityBottleneck(
+                    kind = "demand_root",
+                    gid = cGid,
+                    demandId = demandId,
+                    slackDays = maxN,
+                ))
+            }
+        }
+
+        if (selMin < globalMin) {
+            globalMin = selMin
+            allBottlenecks.clear()
+            allBottlenecks.addAll(selBottlenecks)
+        } else if (selMin == globalMin) {
+            allBottlenecks.addAll(selBottlenecks)
+        }
+    }
+
+    return AvailabilityCalc(
+        matchedWoCount = totalMatched,
+        maxFeasibleDays = if (globalMin == Int.MAX_VALUE) 0 else globalMin,
+        bottlenecks = allBottlenecks,
+    )
+}
+
+/** Enrich demand-root bottlenecks with product/customer/due metadata. */
+private fun enrichBottleneckDemands(
+    caseId: Int,
+    bottlenecks: List<WoAvailabilityBottleneck>,
+    baselineCommits: Map<String, String?>,
+): List<WoImpactedDemand> {
+    val demandIds = bottlenecks.mapNotNull { it.demandId }.distinct()
+    if (demandIds.isEmpty()) return emptyList()
+    val metas: Map<String, WoMeta> = transaction {
+        Demands.selectAll()
+            .where { (Demands.caseId eq caseId) and (Demands.demandId inList demandIds) }
+            .associate { d ->
+                d[Demands.demandId] to WoMeta(
+                    demandId = d[Demands.demandId],
+                    productId = d[Demands.productId],
+                    locationId = d[Demands.locationId],
+                    customerId = d[Demands.customerId],
+                    description = d[Demands.description],
+                    priority = d[Demands.priority],
+                    requestDueTime = d[Demands.requestDueTime],
+                    requestedQty = d[Demands.quantity],
+                )
+            }
+    }
+    return bottlenecks.mapNotNull { b ->
+        val did = b.demandId ?: return@mapNotNull null
+        val m = metas[did] ?: return@mapNotNull null
+        WoImpactedDemand(
+            demandId = m.demandId,
+            productId = m.productId,
+            locationId = m.locationId,
+            customerId = m.customerId,
+            description = m.description,
+            priority = m.priority,
+            requestDueTime = m.requestDueTime,
+            requestedQty = m.requestedQty,
+            baselineCommitTime = baselineCommits[did],
+            contingentCommitTime = null,
+            daysDelta = 0,
+            status = "no_change",
+        )
+    }
+}
+
 private suspend fun runWoScheduleImpactBackground(jobId: String, req: WoScheduleImpactRequest) {
     try {
         val validationError = validateRequest(req)
@@ -563,6 +773,11 @@ private suspend fun runWoScheduleImpactBackground(jobId: String, req: WoSchedule
             }
         } else null
 
+        // ── Availability envelope (closed-form, sub-millisecond) ─────────────
+        // Compute alongside the impact diff so the UI can render the "within
+        // safe window / exceeds max safe" banner from a single Analyze call.
+        val avail = computeAvailability(baseline.workOrders, baseline.peggingTrees, req.selectors)
+
         val resp = WoScheduleImpactResponse(
             caseId = baseline.caseId,
             planRunId = baseline.planRunId,
@@ -573,6 +788,8 @@ private suspend fun runWoScheduleImpactBackground(jobId: String, req: WoSchedule
             impactedDemandCount = impactedRows.size,
             impacts = impacts,
             note = req.note,
+            maxFeasibleDays = avail.maxFeasibleDays,
+            bottlenecks = avail.bottlenecks,
         )
         woImpactJobs[jobId]?.apply {
             set("status", "completed")
@@ -655,6 +872,62 @@ fun Routing.workOrderImpactRoutes() {
                 (s == "completed" || s == "failed") &&
                     completedAt != null && completedAt.isBefore(cutoff)
             }
+        }
+
+        // ── Synchronous availability probe ───────────────────────────────────
+        // Closed-form: for the same selectors, return the largest delayDays N
+        // such that displacing the front of the bucket by N days leaves every
+        // demand commit_time unchanged. Sub-millisecond — used by the DraftForm
+        // to render a live "Max safe delay" chip as the user picks WOs.
+        post("/availability") {
+            val rawBody = call.receiveText()
+            val req = try {
+                Json.decodeFromString<WoAvailabilityRequest>(rawBody)
+            } catch (e: Exception) {
+                log.error("wo-schedule-impact/availability body parse failed: {} body={}", e.message, rawBody)
+                throw IllegalArgumentException("Invalid availability body: ${e.message}")
+            }
+            if (req.selectors.isEmpty())
+                throw IllegalArgumentException("selectors must be non-empty")
+            for (s in req.selectors) {
+                if (s.woGroupIds.isEmpty())
+                    throw IllegalArgumentException("Each selector must declare at least one woGroupId")
+                parseIsoDateLoose(s.bucketStart)
+                    ?: throw IllegalArgumentException("Selector bucketStart must be ISO yyyy-MM-dd")
+                parseIsoDateLoose(s.bucketEnd)
+                    ?: throw IllegalArgumentException("Selector bucketEnd must be ISO yyyy-MM-dd")
+            }
+
+            // Re-use the same baseline-load helper as the impact endpoint.
+            val impactReq = WoScheduleImpactRequest(
+                selectors = req.selectors,
+                delayDays = 1,                            // dummy; we don't run the impact diff
+                planRunId = req.planRunId,
+                caseId = req.caseId,
+                persist = false,
+            )
+            val baseline = loadBaseline(impactReq)
+                ?: throw NoSuchElementException(
+                    if (req.planRunId != null) "Plan run ${req.planRunId} not found or not in success state."
+                    else "No successful plan run available. Run a plan first.")
+
+            val baselineCommits = extractCommitTimes(baseline.peggingTrees)
+            val avail = computeAvailability(baseline.workOrders, baseline.peggingTrees, req.selectors)
+            val bottleneckDemands = enrichBottleneckDemands(baseline.caseId, avail.bottlenecks, baselineCommits)
+
+            log.info(
+                "wo-availability: caseId={} baseline={} matched={} maxFeasibleDays={} bottlenecks={}",
+                baseline.caseId, baseline.planRunId, avail.matchedWoCount, avail.maxFeasibleDays, avail.bottlenecks.size,
+            )
+
+            call.respond(WoAvailabilityResponse(
+                caseId = baseline.caseId,
+                planRunId = baseline.planRunId,
+                matchedWoCount = avail.matchedWoCount,
+                maxFeasibleDays = avail.maxFeasibleDays,
+                bottlenecks = avail.bottlenecks,
+                bottleneckDemands = bottleneckDemands,
+            ))
         }
     }
 }

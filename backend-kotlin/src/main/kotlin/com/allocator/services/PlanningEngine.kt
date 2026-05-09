@@ -3640,68 +3640,16 @@ internal fun resequenceFromPegging(
     // the same gid post-regen, distinguished by method_slot_index).  Per-alt
     // shifting partitions within a bucket using method_slot_index.
 
-    // Index lots by wo_group_id.  Lots are wrapped in a MutableMap so we can
-    // mutate start_time/end_time in place during pushUp.
-    val mutableLots: List<MutableMap<String, Any?>> = workOrders.map { wo ->
-        if (wo is MutableMap<*, *>) {
-            @Suppress("UNCHECKED_CAST")
-            wo as MutableMap<String, Any?>
-        } else wo.toMutableMap()
-    }
-    val lotsByGroup = mutableMapOf<String, MutableList<MutableMap<String, Any?>>>()
-    for (wo in mutableLots) {
-        val gid = wo["wo_group_id"] as? String ?: continue
-        lotsByGroup.getOrPut(gid) { mutableListOf() }.add(wo)
-    }
+    val dag = buildPeggingDag(workOrders, peggingTrees)
+    val mutableLots = dag.mutableLots
+    val lotsByGroup = dag.lotsByGroup
+    val parentsOf = dag.parentsOf
+    val allGroups = dag.allGroups
+    val leafConstraintByGid = dag.leafConstraintByGid
+    val leaves = allGroups.filter { it !in dag.hasChild }
 
     fun tailEnd(gid: String): LocalDate? =
         lotsByGroup[gid]?.mapNotNull { parseDate(it["end_time"] as? String) }?.maxOrNull()
-
-    // Build the parent → children DAG by walking the (regen-stamped) trees.
-    // Also collect "leaf-time constraints": when a demand is fulfilled by a
-    // supply or purchase leaf with a future commit_time (inventory not yet
-    // available, purchase yet to arrive), the leaf's commit_time is a real
-    // predecessor constraint on the demand's parent WO — but the leaf has no
-    // wo_group_id, so the standard pushUp can't propagate it.  Record those
-    // constraints here so we can apply them as a pre-shift before pushUp runs.
-    val parentsOf = mutableMapOf<String, MutableSet<String>>()
-    val hasChild = mutableSetOf<String>()
-    val allGroups = mutableSetOf<String>()
-    val leafConstraintByGid = mutableMapOf<String, LocalDate>()
-
-    @Suppress("UNCHECKED_CAST")
-    fun walk(node: Map<String, Any?>, currentParent: String?, depth: Int) {
-        if (depth > 60) return
-        val nodeChildren = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
-        when (node["type"] as? String) {
-            "work_order" -> {
-                if (node["failed"] == true) return
-                val gid = node["wo_group_id"] as? String ?: return
-                allGroups.add(gid)
-                if (currentParent != null && currentParent != gid) {
-                    parentsOf.getOrPut(gid) { mutableSetOf() }.add(currentParent)
-                    hasChild.add(currentParent)
-                }
-                for (c in nodeChildren) walk(c, currentParent = gid, depth + 1)
-            }
-            "supply", "purchase" -> {
-                if (currentParent != null) {
-                    parseDate(node["commit_time"] as? String)?.let { commit ->
-                        leafConstraintByGid.merge(currentParent, commit) { a, b -> if (b > a) b else a }
-                    }
-                }
-            }
-            else -> {
-                for (c in nodeChildren) walk(c, currentParent, depth + 1)
-            }
-        }
-    }
-    for (entry in peggingTrees) {
-        @Suppress("UNCHECKED_CAST")
-        val tree = entry["tree"] as? Map<String, Any?> ?: continue
-        walk(tree, currentParent = null, depth = 0)
-    }
-    val leaves = allGroups.filter { it !in hasChild }
 
     // Apply leaf-time pre-shifts: ensure each WO group's lots start no
     // earlier than max(supply / purchase commit_time of any leaf in its
@@ -3859,3 +3807,109 @@ internal data class TimingFixResult(
     val workOrders: List<Map<String, Any?>>,
     val peggingTrees: List<Map<String, Any?>>,
 )
+
+/** DAG view of a (work_orders, pegging_trees) pair, derived once and reused
+ *  by [resequenceFromPegging] and the WO-availability analysis. */
+internal data class PeggingDag(
+    /** Lots wrapped as MutableMap so sequencing can mutate start/end in place. */
+    val mutableLots: List<MutableMap<String, Any?>>,
+    /** Lots indexed by `wo_group_id`. */
+    val lotsByGroup: Map<String, List<MutableMap<String, Any?>>>,
+    /** Per-gid set of *parent* gids in the DAG (multi-parent supported). */
+    val parentsOf: Map<String, Set<String>>,
+    /** Set of gids that appear as a parent of at least one other gid. */
+    val hasChild: Set<String>,
+    /** Every gid encountered in the trees (excludes failed=true subtree gids). */
+    val allGroups: Set<String>,
+    /** Per-gid max supply/purchase commit_time for any leaf in the demand-children
+     *  subtree of that gid — used by sequencing as a pre-shift constraint. */
+    val leafConstraintByGid: Map<String, LocalDate>,
+    /** Per-demand_id, the gids of WOs that are direct (level-1) WO children of
+     *  the demand-root tree. Used by availability analysis for the demand-root
+     *  commit-stability check. */
+    val demandRootChildren: Map<String, Set<String>>,
+)
+
+/** Walk the (regen-stamped) pegging trees once and produce the DAG view used
+ *  by both [resequenceFromPegging] and the availability analysis. The walk
+ *  collects parent-child WO edges, leaf-time constraints (supply/purchase
+ *  commit_time per parent gid), and per-demand-root direct WO children. */
+internal fun buildPeggingDag(
+    workOrders: List<Map<String, Any?>>,
+    peggingTrees: List<Map<String, Any?>>,
+): PeggingDag {
+    val mutableLots: List<MutableMap<String, Any?>> = workOrders.map { wo ->
+        if (wo is MutableMap<*, *>) {
+            @Suppress("UNCHECKED_CAST")
+            wo as MutableMap<String, Any?>
+        } else wo.toMutableMap()
+    }
+    val lotsByGroup = mutableMapOf<String, MutableList<MutableMap<String, Any?>>>()
+    for (wo in mutableLots) {
+        val gid = wo["wo_group_id"] as? String ?: continue
+        lotsByGroup.getOrPut(gid) { mutableListOf() }.add(wo)
+    }
+
+    val parentsOf = mutableMapOf<String, MutableSet<String>>()
+    val hasChild = mutableSetOf<String>()
+    val allGroups = mutableSetOf<String>()
+    val leafConstraintByGid = mutableMapOf<String, LocalDate>()
+    val demandRootChildren = mutableMapOf<String, MutableSet<String>>()
+
+    @Suppress("UNCHECKED_CAST")
+    fun walk(node: Map<String, Any?>, currentParent: String?, depth: Int) {
+        if (depth > 60) return
+        val nodeChildren = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
+        when (node["type"] as? String) {
+            "work_order" -> {
+                if (node["failed"] == true) return
+                val gid = node["wo_group_id"] as? String ?: return
+                allGroups.add(gid)
+                if (currentParent != null && currentParent != gid) {
+                    parentsOf.getOrPut(gid) { mutableSetOf() }.add(currentParent)
+                    hasChild.add(currentParent)
+                }
+                for (c in nodeChildren) walk(c, currentParent = gid, depth + 1)
+            }
+            "supply", "purchase" -> {
+                if (currentParent != null) {
+                    parseDate(node["commit_time"] as? String)?.let { commit ->
+                        leafConstraintByGid.merge(currentParent, commit) { a, b -> if (b > a) b else a }
+                    }
+                }
+            }
+            else -> {
+                for (c in nodeChildren) walk(c, currentParent, depth + 1)
+            }
+        }
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    for (entry in peggingTrees) {
+        val tree = entry["tree"] as? Map<String, Any?> ?: continue
+        walk(tree, currentParent = null, depth = 0)
+
+        // Demand-root direct WO children: only the level-1 WOs under the root
+        // demand node feed the demand commit_time (deeper WOs feed via pushUp).
+        val demandId = entry["demand_id"]?.toString()?.trim() ?: continue
+        if (demandId.isBlank()) continue
+        if (tree["type"] != "demand") continue
+        val rootChildren = tree["children"] as? List<Map<String, Any?>> ?: continue
+        for (ch in rootChildren) {
+            if (ch["type"] != "work_order") continue
+            if (ch["failed"] == true) continue
+            val gid = ch["wo_group_id"] as? String ?: continue
+            demandRootChildren.getOrPut(demandId) { mutableSetOf() }.add(gid)
+        }
+    }
+
+    return PeggingDag(
+        mutableLots = mutableLots,
+        lotsByGroup = lotsByGroup,
+        parentsOf = parentsOf,
+        hasChild = hasChild,
+        allGroups = allGroups,
+        leafConstraintByGid = leafConstraintByGid,
+        demandRootChildren = demandRootChildren,
+    )
+}

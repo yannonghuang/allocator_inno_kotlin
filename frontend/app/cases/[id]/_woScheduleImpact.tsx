@@ -7,12 +7,14 @@ import {
   WoScheduleSelector,
   WoScheduleImpactResult,
   WoScheduleRun,
+  WoAvailabilityResult,
   listWoScheduleEvents,
   createWoScheduleEvent,
   updateWoScheduleEvent,
   deleteWoScheduleEvent,
   listWoScheduleRuns,
   analyzeWoScheduleImpact,
+  analyzeWoAvailability,
   PlanResult,
   WorkOrder,
 } from '../../../lib/api';
@@ -499,6 +501,8 @@ export function WoScheduleImpactPanel({
           draft={draft}
           setDraft={setDraft}
           allWos={wos}
+          caseId={caseId}
+          baselinePlanRunId={baselinePlanRunId ?? null}
           onCancel={() => { setDraft(null); setDraftError(null); }}
           onSave={handleSave}
           error={draftError}
@@ -803,11 +807,13 @@ const fieldStyle: React.CSSProperties = { display: 'flex', flexDirection: 'colum
 const inputStyle: React.CSSProperties = { background: '#27272a', border: '1px solid #3d3d40', color: '#e4e4e7', padding: '0.3rem', borderRadius: 4, fontSize: '0.85rem' };
 
 function DraftForm({
-  draft, setDraft, allWos, onCancel, onSave, error,
+  draft, setDraft, allWos, caseId, baselinePlanRunId, onCancel, onSave, error,
 }: {
   draft: DraftEvent;
   setDraft: (d: DraftEvent) => void;
   allWos: WorkOrder[];
+  caseId: number;
+  baselinePlanRunId: number | null;
   onCancel: () => void;
   onSave: () => void;
   error: string | null;
@@ -1064,6 +1070,16 @@ function DraftForm({
         </div>
       )}
 
+      {/* Max safe delay chip (closed-form availability — sub-millisecond on the server). */}
+      <AvailabilityChip
+        caseId={caseId}
+        baselinePlanRunId={baselinePlanRunId}
+        bucketPreview={bucketPreview}
+        selectedGids={draft.selectedGids}
+        currentDelayDays={draft.changeMode === 'days' ? draft.delayDays : null}
+        onUse={(n) => setDraft({ ...draft, changeMode: 'days', delayDays: n })}
+      />
+
       {/* Change row */}
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.6rem 1rem', alignItems: 'flex-end', marginBottom: '0.5rem' }}>
         <div style={fieldStyle}>
@@ -1125,13 +1141,40 @@ function DraftForm({
 
 // ── results table ─────────────────────────────────────────────────────────────
 
+function SafetyBanner({ chosen, max }: { chosen: number | null; max: number | null | undefined }) {
+  const t = useTranslations('planning.woScheduleImpact');
+  if (chosen == null || max == null) return null;
+  const within = chosen <= max;
+  return (
+    <div
+      style={{
+        fontSize: '0.78rem',
+        background: within ? 'rgba(34,197,94,0.10)' : 'rgba(248,113,113,0.10)',
+        border: `1px solid ${within ? 'rgba(34,197,94,0.4)' : 'rgba(248,113,113,0.4)'}`,
+        color: within ? '#86efac' : '#fca5a5',
+        borderRadius: 4,
+        padding: '0.4rem 0.6rem',
+        marginBottom: '0.5rem',
+      }}
+    >
+      {within
+        ? t('availability.banner.withinSafe', { chosen, max })
+        : t('availability.banner.exceedsSafe', { chosen, max, by: chosen - max })}
+    </div>
+  );
+}
+
 function ResultsTable({ result }: { result: WoScheduleImpactResult }) {
   const t = useTranslations('planning.woScheduleImpact');
   return (
     <div style={{ marginTop: '0.75rem', borderTop: '1px solid #3d3d40', paddingTop: '0.6rem' }}>
+      <SafetyBanner chosen={result.delayDays} max={result.maxFeasibleDays} />
       <div style={{ display: 'flex', gap: '1.25rem', fontSize: '0.78rem', color: '#a1a1aa', marginBottom: '0.4rem' }}>
         <span>{t('results.matchedWoCount')} <strong style={{ color: '#e4e4e7' }}>{result.matchedWoCount}</strong></span>
         <span>{t('results.impactedDemandCount')} <strong style={{ color: '#e4e4e7' }}>{result.impactedDemandCount}</strong></span>
+        {result.maxFeasibleDays != null && (
+          <span>{t('availability.chipLabel')}: <strong style={{ color: '#e4e4e7' }}>{t('availability.daysValue', { days: result.maxFeasibleDays })}</strong></span>
+        )}
       </div>
       {result.impacts.length === 0 ? (
         <p style={{ color: '#71717a', fontSize: '0.85rem' }}>{t('results.noImpacts')}</p>
@@ -1173,6 +1216,129 @@ function ResultsTable({ result }: { result: WoScheduleImpactResult }) {
 
 const th: React.CSSProperties = { padding: '0.4rem 0.5rem', borderBottom: '1px solid #3d3d40' };
 const td: React.CSSProperties = { padding: '0.35rem 0.5rem' };
+
+// ── Max-safe-delay chip (DraftForm) ──────────────────────────────────────────
+
+/** Renders the closed-form availability cap inline next to the bucket-preview
+ *  chip. Recomputes whenever the selection or bucket changes (debounced ~250ms). */
+function AvailabilityChip({
+  caseId,
+  baselinePlanRunId,
+  bucketPreview,
+  selectedGids,
+  currentDelayDays,
+  onUse,
+}: {
+  caseId: number;
+  baselinePlanRunId: number | null;
+  bucketPreview: { start: string; end: string; source: 'key' | 'derived' } | null;
+  selectedGids: Set<string>;
+  currentDelayDays: number | null;
+  onUse: (n: number) => void;
+}) {
+  const t = useTranslations('planning.woScheduleImpact');
+  const [data, setData] = React.useState<WoAvailabilityResult | null>(null);
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  // Stable token for debouncing — recompute when bucket or selection changes.
+  const gidsKey = React.useMemo(() => Array.from(selectedGids).sort().join(','), [selectedGids]);
+  const token = `${bucketPreview?.start ?? ''}|${bucketPreview?.end ?? ''}|${gidsKey}`;
+
+  React.useEffect(() => {
+    if (!bucketPreview || selectedGids.size === 0) {
+      setData(null);
+      setError(null);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const r = await analyzeWoAvailability({
+          selectors: [{
+            bucketStart: bucketPreview.start,
+            bucketEnd: bucketPreview.end,
+            woGroupIds: Array.from(selectedGids),
+          }],
+          planRunId: baselinePlanRunId,
+          caseId,
+        });
+        if (!controller.signal.aborted) setData(r);
+      } catch (e) {
+        if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
+      }
+    }, 250);
+    return () => { controller.abort(); clearTimeout(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, caseId, baselinePlanRunId]);
+
+  if (selectedGids.size === 0) {
+    return (
+      <div
+        style={{
+          fontSize: '0.78rem', color: '#71717a',
+          background: '#1c1c1f', border: '1px dashed #2d2d31', borderRadius: 4,
+          padding: '0.4rem 0.6rem', marginBottom: '0.6rem',
+        }}
+      >
+        {t('availability.chipLabel')}: <span style={{ color: '#52525b' }}>{t('availability.chipPickWos')}</span>
+      </div>
+    );
+  }
+
+  const exceeds = currentDelayDays != null && data != null && currentDelayDays > data.maxFeasibleDays;
+  const within = currentDelayDays != null && data != null && currentDelayDays <= data.maxFeasibleDays;
+
+  return (
+    <div
+      style={{
+        fontSize: '0.78rem', color: '#a1a1aa',
+        background: '#1c1c1f',
+        border: `1px solid ${exceeds ? 'rgba(248,113,113,0.5)' : within ? 'rgba(34,197,94,0.5)' : '#2d2d31'}`,
+        borderRadius: 4,
+        padding: '0.4rem 0.6rem', marginBottom: '0.6rem',
+        display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8,
+      }}
+    >
+      <span style={{ color: '#71717a' }}>{t('availability.chipLabel')}:</span>
+      {loading ? (
+        <span style={{ color: '#52525b' }}>…</span>
+      ) : error ? (
+        <span style={{ color: '#fca5a5' }}>{t('availability.error.requestFailed')}</span>
+      ) : data ? (
+        <>
+          <strong style={{ color: '#e4e4e7' }}>{t('availability.daysValue', { days: data.maxFeasibleDays })}</strong>
+          {data.bottlenecks.length > 0 && (
+            <span style={{ color: '#71717a', fontSize: '0.74rem' }}>
+              · {data.bottlenecks[0].kind === 'demand_root'
+                  ? t('availability.bottleneck.demandRoot', {
+                      demandId: data.bottlenecks[0].demandId ?? '?',
+                      days: data.bottlenecks[0].slackDays,
+                    })
+                  : t('availability.bottleneck.boundary', {
+                      gid: data.bottlenecks[0].parentGid ?? '?',
+                      days: data.bottlenecks[0].slackDays,
+                    })}
+              {data.bottlenecks.length > 1 && ` (+${data.bottlenecks.length - 1})`}
+            </span>
+          )}
+          {data.maxFeasibleDays > 0 && currentDelayDays !== data.maxFeasibleDays && (
+            <button
+              type="button"
+              className="secondary"
+              style={{ fontSize: '0.72rem', padding: '1px 8px', marginLeft: 'auto' }}
+              onClick={() => onUse(data.maxFeasibleDays)}
+            >{t('availability.chipUse')}</button>
+          )}
+        </>
+      ) : null}
+    </div>
+  );
+}
 
 // ── Per-event runs history ────────────────────────────────────────────────────
 

@@ -534,6 +534,24 @@
         "derived": "auto from selection",
         "fromKey": "from bucket"
       },
+      "availability": {
+        "chipLabel": "Max safe delay",
+        "chipUse": "Use",
+        "chipPickWos": "pick WOs to compute",
+        "daysValue": "{days, plural, =0 {0 days} one {1 day} other {# days}}",
+        "bottleneck": {
+          "boundary": "bottleneck: parent WO {gid}, slack {days}d",
+          "demandRoot": "bottleneck: demand {demandId}, slack {days}d"
+        },
+        "banner": {
+          "withinSafe": "✓ Within safe window — delay {chosen}d ≤ max safe {max}d",
+          "exceedsSafe": "⚠ Exceeds max safe by {by}d — delay {chosen}d > max safe {max}d"
+        },
+        "error": {
+          "requestFailed": "request failed",
+          "noWosMatched": "selectors matched no work orders"
+        }
+      },
       "change": {
         "label": "Change",
         "byDays": "Delay by N days",

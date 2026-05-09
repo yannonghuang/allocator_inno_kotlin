@@ -534,6 +534,24 @@
         "derived": "由选中工单自动派生",
         "fromKey": "来自桶选择"
       },
+      "availability": {
+        "chipLabel": "最大安全延迟",
+        "chipUse": "采用",
+        "chipPickWos": "请先选择工单",
+        "daysValue": "{days} 天",
+        "bottleneck": {
+          "boundary": "瓶颈: 父工单 {gid}, 余量 {days} 天",
+          "demandRoot": "瓶颈: 需求 {demandId}, 余量 {days} 天"
+        },
+        "banner": {
+          "withinSafe": "✓ 在安全范围内 — 延迟 {chosen} 天 ≤ 最大安全 {max} 天",
+          "exceedsSafe": "⚠ 超出最大安全 {by} 天 — 延迟 {chosen} 天 > 最大安全 {max} 天"
+        },
+        "error": {
+          "requestFailed": "请求失败",
+          "noWosMatched": "选择器未匹配到任何工单"
+        }
+      },
       "change": {
         "label": "变更",
         "byDays": "延迟 N 天",

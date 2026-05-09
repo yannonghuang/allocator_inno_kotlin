@@ -1292,6 +1292,15 @@ export type WoImpactedDemand = {
   status: 'delivery_delayed' | 'newly_late_vs_due' | 'no_change';
 };
 
+export type WoAvailabilityBottleneck = {
+  /** "boundary" = parent-child edge slack; "demand_root" = demand commit constraint. */
+  kind: 'boundary' | 'demand_root';
+  gid: string;
+  parentGid?: string | null;
+  demandId?: string | null;
+  slackDays: number;
+};
+
 export type WoScheduleImpactResult = {
   caseId: number;
   planRunId: number | null;
@@ -1302,6 +1311,26 @@ export type WoScheduleImpactResult = {
   impactedDemandCount: number;
   impacts: WoImpactedDemand[];
   note: string | null;
+  /** Closed-form max safe delay for the same selectors (front-of-bucket
+   *  displacement that leaves every demand commit_time unchanged). Populated
+   *  by the impact endpoint at no extra cost. */
+  maxFeasibleDays?: number | null;
+  bottlenecks?: WoAvailabilityBottleneck[];
+};
+
+export type WoAvailabilityRequest = {
+  selectors: WoScheduleSelector[];
+  planRunId?: number | null;
+  caseId?: number | null;
+};
+
+export type WoAvailabilityResult = {
+  caseId: number;
+  planRunId: number | null;
+  matchedWoCount: number;
+  maxFeasibleDays: number;
+  bottlenecks: WoAvailabilityBottleneck[];
+  bottleneckDemands: WoImpactedDemand[];
 };
 
 export type WoScheduleImpactRequest = {
@@ -1381,6 +1410,17 @@ export async function deleteWoScheduleEvent(caseId: number, eventId: number): Pr
 
 export async function listWoScheduleRuns(caseId: number, eventId: number): Promise<WoScheduleRun[]> {
   const r = await fetch(`${API}/cases/${caseId}/wo-schedule-events/${eventId}/runs`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+/** Synchronous closed-form availability probe — sub-millisecond on the backend. */
+export async function analyzeWoAvailability(req: WoAvailabilityRequest): Promise<WoAvailabilityResult> {
+  const r = await fetch(`${API}/wo-schedule-impact/availability`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }

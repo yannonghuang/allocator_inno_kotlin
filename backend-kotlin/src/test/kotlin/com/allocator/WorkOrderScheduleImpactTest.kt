@@ -1,9 +1,13 @@
 package com.allocator
 
+import com.allocator.api.WoScheduleSelector
 import com.allocator.api.bucketOf
 import com.allocator.api.bucketStartOf
+import com.allocator.api.computeAvailability
 import com.allocator.services.resequenceFromPegging
 import io.kotest.core.spec.style.FunSpec
+import io.kotest.matchers.collections.shouldContain
+import io.kotest.matchers.collections.shouldNotBeEmpty
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.comparables.shouldBeGreaterThanOrEqualTo
 import java.time.LocalDate
@@ -188,5 +192,81 @@ class WorkOrderScheduleImpactTest : FunSpec({
         val fgLot = result.workOrders.first { it["wo_group_id"] == "fg" }
         // FG must have moved to ≥ SUB.end which itself is now ≥ 2026-03-24 (start 03-15 + 9d span).
         LocalDate.parse(fgLot["start_time"] as String) shouldBeGreaterThanOrEqualTo LocalDate.of(2026, 3, 24)
+    }
+
+    // ── availability: closed-form max-safe-delay ──────────────────────────────
+
+    test("availability — boundary slack: SUB→FG, baseline slack = 1 day") {
+        val (workOrders, pegging) = buildFixture()
+        val sel = WoScheduleSelector(
+            bucketStart = "2026-03-01",
+            bucketEnd = "2026-03-10",
+            woGroupIds = listOf("sub"),
+        )
+        val result = computeAvailability(workOrders, pegging, listOf(sel))
+
+        // SUB.start (2026-03-01) = bucketStart → absorption = 0.
+        // SUB.end = 2026-03-10, FG.start = 2026-03-11 → baseline slack = 1.
+        // maxFeasibleDays = 1 + 0 = 1.
+        result.maxFeasibleDays shouldBe 1
+        result.bottlenecks.shouldNotBeEmpty()
+        result.bottlenecks.first().kind shouldBe "boundary"
+        result.bottlenecks.first().gid shouldBe "sub"
+        result.bottlenecks.first().parentGid shouldBe "fg"
+    }
+
+    test("availability — window absorption grows max-N when WO is deeper inside the bucket") {
+        // Same fixture, but pretend SUB.start = 2026-03-06 (5 days into bucket starting 2026-03-01).
+        // baseline slack stays at 1 (we'd shift SUB.end too — but we keep the window's bucketStart at 03-01).
+        val (workOrders, pegging) = buildFixture()
+        // Mutate the in-memory copy: shift SUB by 5 days forward (start 03-06, end 03-15) AND
+        // shift FG to maintain slack=1 (start 03-16, end 03-25).
+        for (lot in workOrders) {
+            when (lot["wo_group_id"]) {
+                "sub" -> { lot["start_time"] = "2026-03-06"; lot["end_time"] = "2026-03-15" }
+                "fg"  -> { lot["start_time"] = "2026-03-16"; lot["end_time"] = "2026-03-25" }
+            }
+        }
+        // Tree mirrors the lots — but the closed-form reads from lots only, so tree mismatch
+        // doesn't affect the math (parentsOf still derived from tree structure).
+
+        val sel = WoScheduleSelector(
+            bucketStart = "2026-03-01",
+            bucketEnd = "2026-03-15",
+            woGroupIds = listOf("sub"),
+        )
+        val result = computeAvailability(workOrders, pegging, listOf(sel))
+
+        // absorption = SUB.start − bucketStart = 5 days. baseline slack = 1.
+        // maxFeasibleDays = 1 + 5 = 6.
+        result.maxFeasibleDays shouldBe 6
+    }
+
+    test("availability — demand-root: FG-in-set with no sibling => slack = 0, max = absorption only") {
+        // FG is the only direct WO child of D_FG. With FG in WO_set and no sibling out-of-set,
+        // MAX_END = FG.end (binding). slack = 0. absorption = FG.start − bucketStart.
+        val (workOrders, pegging) = buildFixture()
+        val sel = WoScheduleSelector(
+            bucketStart = "2026-03-01",
+            bucketEnd = "2026-03-31",
+            woGroupIds = listOf("fg"),
+        )
+        val result = computeAvailability(workOrders, pegging, listOf(sel))
+
+        // FG.start = 2026-03-11, bucketStart = 2026-03-01 → absorption = 10. slack = 0.
+        result.maxFeasibleDays shouldBe 10
+        result.bottlenecks.map { it.kind } shouldContain "demand_root"
+    }
+
+    test("availability — empty selector returns max=0") {
+        val (workOrders, pegging) = buildFixture()
+        val sel = WoScheduleSelector(
+            bucketStart = "2026-03-01",
+            bucketEnd = "2026-03-31",
+            woGroupIds = emptyList(),
+        )
+        val result = computeAvailability(workOrders, pegging, listOf(sel))
+        result.maxFeasibleDays shouldBe 0
+        result.matchedWoCount shouldBe 0
     }
 })
