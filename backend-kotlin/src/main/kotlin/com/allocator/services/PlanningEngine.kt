@@ -1550,11 +1550,15 @@ internal fun planMethodSlot(
 
     // 5) Timing + work orders
     val startDt = computeStartDt(reqDt, leadDays, commitTimes)
-    val (wos, lotCount, lastEnd, lotSizeVal) = buildWorkOrders(productId, productionLocation, achievableParentQty, leadDays, startDt, m, demandId, data, overrideActive)
+    val woResult = buildWorkOrders(productId, productionLocation, achievableParentQty, leadDays, startDt, m, demandId, data, overrideActive)
+    val wos = woResult.wos
+    val lotCount = woResult.lotCount
+    val lastEnd = woResult.lastEnd
+    val lotSizeVal = woResult.lotSizeVal
     val methodType = m["type"] as? String ?: ""
     val woChildren = if (methodType == "purchase") listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to roundQty(achievableParentQty), "children" to emptyList<Any>()))
                      else childPeggingNodes
-    val methodPeggingNode = buildWoNode(productId, productionLocation, achievableParentQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodChoiceExplanation, variantExplanation, woChildrenRelation, woChildren, overrideActive)
+    val methodPeggingNode = buildWoNode(productId, productionLocation, achievableParentQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodChoiceExplanation, variantExplanation, woChildrenRelation, woChildren, overrideActive, woGroupId = woResult.woGroupId)
 
     return MethodSlotResult(
         achievableQty = achievableParentQty,
@@ -2320,7 +2324,16 @@ private data class WorkOrderResult(
     val lotCount: Int,
     val lastEnd: LocalDate?,
     val lotSizeVal: Double,
+    val woGroupId: String,
 )
+
+// Process-wide unique-id source for WO groups.  One id per `planMethodSlot`
+// decision; shared by every lot row emitted by `buildWorkOrders` for that
+// decision and stamped onto the matching pegging-tree WO node by `buildWoNode`.
+// Used by `fixTimingFromPegging` to match pegging nodes to their lot rows
+// without depending on (pid, lid, start_time) heuristics.
+private val woGroupIdSeq = java.util.concurrent.atomic.AtomicLong(0)
+private fun nextWoGroupId(): String = "wog${woGroupIdSeq.incrementAndGet()}"
 
 internal fun leadDaysForMethod(m: Map<String, Any?>): Double = when (m["type"]) {
     "make" -> (m["lead_time"] as? Number)?.toDouble() ?: 0.0
@@ -2353,6 +2366,7 @@ private fun buildWorkOrders(
     val lotSize = max(1e-9, lotSizeVal)
     val prodArea = getProdArea(productId, productionLocation, data)
     val methodType = m["type"] as? String ?: ""
+    val woGroupId = nextWoGroupId()
     val wos = mutableListOf<Map<String, Any?>>()
     var left = qty
     var lotStart: LocalDate? = startDt
@@ -2372,13 +2386,14 @@ private fun buildWorkOrders(
             "demand_id" to demandId,
             "prod_area" to prodArea,
             "override_active" to overrideActive,
+            "wo_group_id" to woGroupId,
         ))
         lastEnd = lotEnd
         left -= lotQty
         lotCount++
         lotStart = if (left > 1e-9) lotEnd else null
     }
-    return WorkOrderResult(wos, lotCount, lastEnd, lotSizeVal)
+    return WorkOrderResult(wos, lotCount, lastEnd, lotSizeVal, woGroupId)
 }
 
 private fun buildWoNode(
@@ -2397,6 +2412,7 @@ private fun buildWoNode(
     woChildren: List<Map<String, Any?>>,
     overrideActive: Boolean = false,
     failed: Boolean = false,
+    woGroupId: String? = null,
 ): Map<String, Any?> = buildMap {
     put("type", "work_order")
     put("product_id", productId)
@@ -2413,6 +2429,7 @@ private fun buildWoNode(
     put("max_lot_size", lotSizeVal)
     put("override_active", overrideActive)
     put("children", woChildren)
+    if (woGroupId != null) put("wo_group_id", woGroupId)
     // Marker for the AND-bottleneck blocked branch: this WO is a debug snapshot
     // of "what would have happened" — its subtree shows first-pass takes that
     // were rolled back by inventory.clear()/inventory.addAll(snap) at the
@@ -3313,9 +3330,10 @@ fun runPlanning(
         warnings
     }
 
+    val fixedWorkOrders = fixTimingFromPegging(consolidatedWOs + workOrders, allPegging)
     return mapOf(
         "committed_demands"      to committedDemands,
-        "work_orders"            to consolidatedWOs + workOrders,
+        "work_orders"            to fixedWorkOrders,
         "planning_pegging"       to allPegging,
         "supply_allocations"     to supplyAllocations,
         "supply_cap_violations"  to supplyCapViolations,
@@ -3357,4 +3375,188 @@ internal fun verifySupplyCap(
         }
     }
     return violations
+}
+
+/**
+ * Post-processing pass: enforce
+ *   start_time(parent WO) >= max(end_time(direct-child WOs))
+ * across the assembled work-order list.
+ *
+ * The forward planning pass schedules parents from the demand's requested
+ * due-date (backward scheduling), which can place a parent WO earlier than
+ * its children actually finish — especially in multi-slot waterfall and
+ * consolidation paths.  This pass corrects that by reading the real
+ * end_times back.
+ *
+ * Algorithm — leaf-driven push (not tree walk):
+ *   1. Walk all pegging trees once to build the parent → children DAG over
+ *      WO nodes, keyed by (product_id, location_id, original_start_time).
+ *      A "child" relationship means: "parent WO has a demand child whose
+ *      child is this WO" (i.e., direct WO predecessor in the BOM).
+ *   2. Find leaves: WOs that are not anyone's parent in the DAG.
+ *   3. For each leaf, push its end_time up to every ancestor.  When a
+ *      parent shifts, the new end_time propagates further up immediately.
+ *
+ * A tree-walk variant (recurse from each demand root, fix the WO at each
+ * node) is incorrect when a WO is shared across multiple demand trees:
+ * the first tree's pass shifts it, but the parents of that WO sitting in
+ * a separate demand tree never get re-checked unless we walk THEIR tree
+ * later — and even then, the lookup by (pid, lid, original_start) breaks
+ * once start_time has been mutated.  Leaf-driven push reaches every
+ * ancestor regardless of which tree it sits in.
+ */
+private fun fixTimingFromPegging(
+    workOrders: List<Map<String, Any?>>,
+    peggingTrees: List<Map<String, Any?>>,
+): List<Map<String, Any?>> {
+    if (workOrders.isEmpty() || peggingTrees.isEmpty()) return workOrders
+
+    val mutableWos: List<MutableMap<String, Any?>> = workOrders.map { it.toMutableMap() }
+
+    // OR-merge: when a demand is fulfilled by multiple WO alternatives
+    // (waterfall split, marked by children_relation="or" or simply >1 WO
+    // children of a demand), the alternatives are merged into a single
+    // logical wo_group for sequencing.  We pick one of the alternatives'
+    // wo_group_ids as the canonical id and remap the others to it.  Each
+    // alternative's lots still shift independently (preserving its own
+    // lot N+1.start = lot N.end chain), but they all see the OR-group's
+    // unified set of children when computing the shift target.
+    val canonOf = mutableMapOf<String, String>()
+    @Suppress("UNCHECKED_CAST")
+    fun detectOrGroups(node: Map<String, Any?>, depth: Int) {
+        if (depth > 60) return
+        val children = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
+        if ((node["type"] as? String) == "demand") {
+            val woGids = children
+                .filter { it["type"] == "work_order" && it["failed"] != true }
+                .mapNotNull { it["wo_group_id"] as? String }
+                .distinct()
+            if (woGids.size > 1) {
+                val canon = woGids.first()
+                for (gid in woGids) canonOf[gid] = canon
+            }
+        }
+        for (c in children) detectOrGroups(c, depth + 1)
+    }
+    for (entry in peggingTrees) {
+        @Suppress("UNCHECKED_CAST")
+        val tree = entry["tree"] as? Map<String, Any?> ?: continue
+        detectOrGroups(tree, 0)
+    }
+    fun canonical(gid: String): String = canonOf[gid] ?: gid
+
+    // Index lot rows by their CANONICAL wo_group_id.  Lots from OR-alternatives
+    // share a canonical id and live in the same bucket; intra-alternative lot
+    // chains are recovered at shift time by re-grouping on the original
+    // wo_group_id within the bucket.
+    val lotsByGroup = mutableMapOf<String, MutableList<MutableMap<String, Any?>>>()
+    for (wo in mutableWos) {
+        val gid = wo["wo_group_id"] as? String ?: continue
+        lotsByGroup.getOrPut(canonical(gid)) { mutableListOf() }.add(wo)
+    }
+
+    fun headStart(gid: String): LocalDate? =
+        lotsByGroup[gid]?.mapNotNull { parseDate(it["start_time"] as? String) }?.minOrNull()
+    fun tailEnd(gid: String): LocalDate? =
+        lotsByGroup[gid]?.mapNotNull { parseDate(it["end_time"] as? String) }?.maxOrNull()
+
+    // Build the parent → children DAG using canonical ids, so a child push
+    // from any predecessor of any OR-alternative reaches the merged group.
+    val parentsOf = mutableMapOf<String, MutableSet<String>>()
+    val hasChild = mutableSetOf<String>()
+    val allGroups = mutableSetOf<String>()
+
+    @Suppress("UNCHECKED_CAST")
+    fun walk(node: Map<String, Any?>, currentParent: String?, depth: Int) {
+        if (depth > 60) return
+        val nodeChildren = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
+        when (node["type"] as? String) {
+            "work_order" -> {
+                // Skip blocked/failed pegging WOs — they have a wo_group_id but no
+                // matching lot rows in the work-order list, and they should not
+                // participate in sequencing constraints.
+                if (node["failed"] == true) return
+                val gid = node["wo_group_id"] as? String ?: return
+                val cgid = canonical(gid)
+                allGroups.add(cgid)
+                if (currentParent != null && currentParent != cgid) {
+                    parentsOf.getOrPut(cgid) { mutableSetOf() }.add(currentParent)
+                    hasChild.add(currentParent)
+                }
+                for (c in nodeChildren) walk(c, currentParent = cgid, depth + 1)
+            }
+            else -> {  // "demand" or null — pass through, keep currentParent
+                for (c in nodeChildren) walk(c, currentParent, depth + 1)
+            }
+        }
+    }
+    for (entry in peggingTrees) {
+        @Suppress("UNCHECKED_CAST")
+        val tree = entry["tree"] as? Map<String, Any?> ?: continue
+        walk(tree, currentParent = null, depth = 0)
+    }
+
+    // Leaves: WO groups that exist in pegging but have no WO-group descendants.
+    val leaves = allGroups.filter { it !in hasChild }
+
+    // Push child end_time up to all parents; when a parent shifts, recurse.
+    //
+    // Intentionally NO visited set: when two siblings share a parent, the parent
+    // must be re-evaluated against each sibling's end_time (a visited check would
+    // bail out on the second sibling and miss the larger constraint).  Termination
+    // is guaranteed on an acyclic graph because each shift strictly increases the
+    // node's start_time, and start_times are upper-bounded by the latest leaf
+    // end_time plus the lead-time chain.  The depth guard handles any residual
+    // cycles prunePhantomLoops missed.
+    var shiftCount = 0
+    fun pushUp(childGid: String, depth: Int) {
+        if (depth > 200) return
+        val childEnd = tailEnd(childGid) ?: return
+        for (parentGid in parentsOf[childGid] ?: emptySet()) {
+            val parentLots = lotsByGroup[parentGid] ?: continue
+            // Re-group lots by their original wo_group_id to recover the
+            // per-alternative lot chains.  Each alternative shifts independently
+            // (so its intra-alternative lot sequencing is preserved), but they
+            // all see the same childEnd target — so the early alternative gets
+            // pulled forward to align with the merged group's predecessor end,
+            // while alternatives already at/after the target are untouched.
+            val byAlt = parentLots.groupBy { it["wo_group_id"] as? String ?: "" }
+            var anyShift = false
+            for ((altGid, altLots) in byAlt) {
+                val altHead = altLots.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull() ?: continue
+                if (childEnd <= altHead) continue
+                val shiftDays = childEnd.toEpochDay() - altHead.toEpochDay()
+                for (lot in altLots) {
+                    val ls = parseDate(lot["start_time"] as? String)
+                    val le = parseDate(lot["end_time"] as? String)
+                    if (ls != null) lot["start_time"] = formatDate(ls.plusDays(shiftDays))
+                    if (le != null) lot["end_time"] = formatDate(le.plusDays(shiftDays))
+                }
+                anyShift = true
+                shiftCount++
+                if (log.isDebugEnabled) {
+                    val first = altLots.first()
+                    log.debug("fixTiming: {}@{} alt={} (canon={}) shifted +{} days (alt_head: {} → {}, lots={}) driven by child canon={} end={}",
+                        first["product_id"], first["location_id"], altGid, parentGid, shiftDays,
+                        formatDate(altHead), formatDate(altHead.plusDays(shiftDays)),
+                        altLots.size,
+                        childGid, formatDate(childEnd))
+                }
+            }
+            if (anyShift) pushUp(parentGid, depth + 1)
+        }
+    }
+
+    // Invoke pushUp on every group, not just leaves: even when an intermediate
+    // group already satisfies its own predecessor constraint (so pushUp from
+    // below doesn't cascade through it), its TAIL is still a binding constraint
+    // on its parents.  Iterating over allGroups ensures every group's tail is
+    // propagated at least once; pushUp's recursion still handles cascading
+    // shifts when they do occur.
+    for (gid in allGroups) pushUp(gid, depth = 0)
+
+    log.info("fixTimingFromPegging: lot_groups={} pegging_trees={} dag_groups={} or_remapped={} leaves={} shifts_applied={}",
+        lotsByGroup.size, peggingTrees.size, allGroups.size, canonOf.size, leaves.size, shiftCount)
+
+    return mutableWos
 }

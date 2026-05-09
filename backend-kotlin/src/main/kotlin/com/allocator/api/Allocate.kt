@@ -607,18 +607,26 @@ fun Routing.allocateRoutes() {
                     ?.mapNotNull { (it as? Map<*, *>)?.get("type")?.toString() } ?: emptyList()
                 log.warn("[WO pegging] First tree root type={} children types={}", firstTree?.get("type"), childTypes)
             }
-            val found = matchingEntries
-                .firstNotNullOfOrNull { entry -> entry["tree"]?.let { findWoNode(it, productId, locationId, method) } }
-            if (found == null && matchingEntries.isNotEmpty()) {
+            // Collect every matching WO node across all matching trees.  When a
+            // demand is fulfilled by multiple OR-alternative slots (waterfall),
+            // each alternative is a separate work_order node; merging them into
+            // a single synthetic node lets the user see ALL predecessors across
+            // alternatives, not just the first slot's narrow subtree.
+            val allMatches = matchingEntries.flatMap { entry ->
+                findAllWoNodes(entry["tree"], productId, locationId, method)
+            }
+            if (allMatches.isEmpty() && matchingEntries.isNotEmpty()) {
                 val allWoKeys = matchingEntries.flatMap { entry -> collectAllWoKeys(entry["tree"]) }
                 log.warn("[WO pegging] Tree found for demand={} but WO {}@{}/{} not in it. All WO keys in tree: {}", demandId, productId, locationId, method, allWoKeys)
             }
-            found ?: throw NoSuchElementException("Work order ($productId @ $locationId / $method) not found in any pegging tree for demand $demandId")
+            mergeAlternativeWoNodes(allMatches)
+                ?: throw NoSuchElementException("Work order ($productId @ $locationId / $method) not found in any pegging tree for demand $demandId")
         } else {
             // Consolidated WO: search all trees where demand_id is null/blank
-            planningPegging
+            val allMatches = planningPegging
                 .filter { (it["demand_id"]?.toString() ?: "").isBlank() }
-                .firstNotNullOfOrNull { entry -> entry["tree"]?.let { findWoNode(it, productId, locationId, method) } }
+                .flatMap { entry -> findAllWoNodes(entry["tree"], productId, locationId, method) }
+            mergeAlternativeWoNodes(allMatches)
                 ?: throw NoSuchElementException("Work order ($productId @ $locationId / $method) not found in any consolidated pegging tree")
         }
 
@@ -1442,6 +1450,68 @@ private fun findWoNode(tree: Any?, productId: String, locationId: String, method
         findWoNode(ch, productId, locationId, method)?.let { return it }
     }
     return null
+}
+
+/**
+ * Like [findWoNode], but collects every matching work_order node in the tree.
+ * When a (productId, locationId, method) is fulfilled by multiple OR-alternative
+ * slots (waterfall split), each alternative is its own work_order node in the
+ * pegging tree — and each only sees its own slice of the BOM.  Returning all
+ * matches lets the caller present the user with the full set of predecessors
+ * across alternatives, not just the first slot's narrow view.
+ *
+ * Does NOT recurse into a matched node's own children, so we don't double-count
+ * a WO that happens to also appear deeper in another's subtree.
+ */
+@Suppress("UNCHECKED_CAST")
+private fun findAllWoNodes(
+    tree: Any?,
+    productId: String,
+    locationId: String,
+    method: String,
+): List<Map<String, Any?>> {
+    val out = mutableListOf<Map<String, Any?>>()
+    fun visit(t: Any?) {
+        val node = t as? Map<String, Any?> ?: return
+        if (node["type"] == "work_order" &&
+            (node["product_id"] as? String ?: "").trim() == productId &&
+            (node["location_id"] as? String ?: "").trim() == locationId &&
+            (node["method"] as? String ?: "").trim() == method) {
+            out.add(node)
+            return  // don't descend into a matched node's own dependency subtree
+        }
+        for (ch in (node["children"] as? List<*> ?: emptyList<Any?>())) visit(ch)
+    }
+    visit(tree)
+    return out
+}
+
+/**
+ * Synthesize a single work_order node from multiple OR-alternative matches.
+ * Quantity is summed, start_time = earliest, end_time = latest, children are
+ * concatenated (each alternative's BOM components shown side by side).  The
+ * `merged_alternatives` field tags the count so the UI can label it as a
+ * combined view.  Returns the single node unchanged when only one alternative
+ * exists.
+ */
+private fun mergeAlternativeWoNodes(nodes: List<Map<String, Any?>>): Map<String, Any?>? {
+    if (nodes.isEmpty()) return null
+    if (nodes.size == 1) return nodes.first()
+    val first = nodes.first()
+    val totalQty = nodes.sumOf { ((it["quantity"] as? Number)?.toDouble()) ?: 0.0 }
+    val starts = nodes.mapNotNull { it["start_time"] as? String }.filter { it.isNotBlank() }
+    val ends = nodes.mapNotNull { it["end_time"] as? String }.filter { it.isNotBlank() }
+    val totalLots = nodes.sumOf { ((it["lot_count"] as? Number)?.toInt()) ?: 0 }
+    @Suppress("UNCHECKED_CAST")
+    val mergedChildren = nodes.flatMap { (it["children"] as? List<Map<String, Any?>>) ?: emptyList() }
+    return first.toMutableMap().apply {
+        put("quantity", roundQty(totalQty))
+        if (starts.isNotEmpty()) put("start_time", starts.min())  // ISO date strings sort chronologically
+        if (ends.isNotEmpty()) put("end_time", ends.max())
+        put("lot_count", if (totalLots > 0) totalLots else null)
+        put("children", mergedChildren)
+        put("merged_alternatives", nodes.size)
+    }
 }
 
 /** Collect all work_order nodes from the pegging tree as "pid@lid/method" strings — for debugging. */
