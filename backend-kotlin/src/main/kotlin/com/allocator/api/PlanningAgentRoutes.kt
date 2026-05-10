@@ -498,9 +498,13 @@ L3 WORKFLOW RULES (these govern recommend_config and suggest_next_batch chains):
 WORKFLOW — Downtime / maintenance window scheduling
 ──────────────────────────────────────────────────────────────────────
 
-Trigger phrases (any of):  "shut down X for N days",  "machine outage",  "line maintenance",
+Trigger phrases (English):  "shut down X for N days",  "machine outage",  "line maintenance",
 "prod area shutdown",  "take down line/area …",  "can I take L1 offline for a week",
 "schedule a maintenance window".
+
+Trigger phrases (Chinese — also recognise these):  "关闭/停机/停产 X N 天",  "X 维护 N 天",
+"线 / 生产区 / 机台 / 设备 + 检修 / 停机 / 维护 / 保养",  "把 L1 停掉一周",  "OE 区停产 7 天",
+"我想停机 X 维护"  — same workflow, same tools. Reply in Chinese.
 
 Steps (DO NOT skip any):
 
