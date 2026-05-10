@@ -526,8 +526,13 @@ Steps (DO NOT skip any):
      bucketStart = today; mention this assumption in your reply.
 
   3. **Identify the WO set** with find_wos(prod_area=…, start_after=bucketStart,
-     start_before=bucketStart + 90 days, limit=200). The 90-day horizon avoids
-     pulling in WOs from a year out. Pull wo_group_id values from the result.
+     limit=500). DO NOT pass `start_before` — the impact pipeline shifts every
+     lot of the selected gids whose start_time ≥ bucketStart with no upper
+     bound, so capping start_before in find_wos would undercount what actually
+     gets shifted (the preview wouldn't match the real result). Pull the
+     wo_group_id values from the result and **remember them for the rest of
+     this conversation turn** — every subsequent analyze_* call must use the
+     SAME gid list. Do not re-call find_wos with different filters mid-analysis.
 
   4. **Get the safety envelope**: analyze_wo_availability(selectors=[{
      bucketStart, woGroupIds=[…all matched gids…]}]). Read max_feasible_days +
@@ -539,6 +544,8 @@ Steps (DO NOT skip any):
      - N > max_feasible_days  → Run analyze_wo_schedule_impact(delay_days=N,
        persist=true). Surface impacted_demand_count, top 3-5 impacted demands
        (demandId, customer, daysDelta), and the contingent_plan_run_id.
+       **Capture the contingent_plan_run_id explicitly** — you'll need it in
+       step 7 if the user accepts.
 
   6. **Suggest options** when N exceeds max-safe (always present at least 2):
      a. "Reduce shutdown to max_feasible_days days" — pure safe envelope.
@@ -546,9 +553,16 @@ Steps (DO NOT skip any):
      c. "Accept the impact" — confirm with user, then promote_plan_run on the
         contingent run to amend the plan. Never auto-promote.
 
-  7. **Confirmation gate**: NEVER call promote_plan_run without an explicit user
-     "yes, promote" / "go ahead and amend" / equivalent. If the user only says
-     "interesting" or doesn't acknowledge the destructive nature, ask first.
+  7. **On user acceptance of option (c)** — directly call
+     promote_plan_run(plan_run_id=<the contingent_plan_run_id from step 5>).
+     DO NOT re-run find_wos / analyze_wo_availability / analyze_wo_schedule_impact
+     — the contingent run is already saved with the correct WO set; re-running
+     could pick a different WO set and a different contingent. Just promote.
+
+  8. **Confirmation gate**: NEVER call promote_plan_run without an explicit user
+     "yes, promote" / "go ahead and amend" / "我选择 C" / "接受" / equivalent.
+     If the user only says "interesting" or doesn't acknowledge the destructive
+     nature, ask first.
 
 Example A — within safe window:
   User: "Can I take down line L1 for a week without breaking anything?"
@@ -561,14 +575,20 @@ Example B — exceeds safe window:
   User: "I want to shut down the OE prod area for about 7 days, please analyze
   impacts, suggest options, and possibly amend the plan."
   Steps: list_prod_areas → resolve "OE" (might be "OE_ASSY"; ask if ambiguous)
-  → find_wos(prod_area=<resolved>, start_after=<today>) → analyze_wo_availability
-  → if max_feasible_days < 7 (say 3): analyze_wo_schedule_impact(delay_days=7,
-  persist=true). Reply with: "OE shutdown of 7d will delay 12 demand commits
-  (top 3: D_42 +4d for ACME, D_18 +4d for FOO, D_7 +3d for BAR). Max safe is
-  3d. Options: (a) reduce to 3d (no demand impact); (b) shift the start date
-  by 5d to 2026-05-15 — let me re-check; (c) accept the impact and promote
-  contingent plan run #N as the new baseline. Which one?" — then on user's
-  confirmation, promote_plan_run(plan_run_id=N).
+  → find_wos(prod_area=<resolved>, start_after=<today>, limit=500) → REMEMBER
+  the gid list → analyze_wo_availability(selectors=[{bucketStart=<today>,
+  woGroupIds=<remembered>}]) → if max_feasible_days < 7 (say 3):
+  analyze_wo_schedule_impact(selectors=[{bucketStart=<today>,
+  woGroupIds=<remembered>}], delay_days=7, persist=true) → CAPTURE the
+  contingent_plan_run_id (e.g. 142). Reply with: "OE shutdown of 7d will
+  delay 12 demand commits (top 3: D_42 +4d for ACME, D_18 +4d for FOO,
+  D_7 +3d for BAR). Max safe is 3d. Options: (a) reduce to 3d (no demand
+  impact); (b) shift the start date by 5d to 2026-05-15 — let me re-check;
+  (c) accept the impact and promote contingent plan run #142 as the new
+  baseline. Which one?"
+  When user says "I choose C" / "我选择 C" / "yes, promote" → call
+  promote_plan_run(plan_run_id=142). DO NOT re-run find_wos or impact —
+  the contingent is already saved.
 """
 
 // ── Tool registry ────────────────────────────────────────────────────────────
