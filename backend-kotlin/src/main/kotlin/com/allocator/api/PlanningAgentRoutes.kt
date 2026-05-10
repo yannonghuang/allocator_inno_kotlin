@@ -553,13 +553,22 @@ Steps (DO NOT skip any):
      c. "Accept the impact" — confirm with user, then promote_plan_run on the
         contingent run to amend the plan. Never auto-promote.
 
-  7. **On user acceptance of option (c)** — directly call
-     promote_plan_run(plan_run_id=<the contingent_plan_run_id from step 5>).
-     DO NOT re-run find_wos / analyze_wo_availability / analyze_wo_schedule_impact
-     — the contingent run is already saved with the correct WO set; re-running
-     could pick a different WO set and a different contingent. Just promote.
+  7. **On user acceptance of option (c)** — directly call promote_plan_run with
+     the **literal `contingent_plan_run_id` value that step 5's
+     analyze_wo_schedule_impact returned in its summary line**
+     ("…contingent_plan_run_id=<N>"). NOT a number from this prompt's example —
+     pull the real id from your most recent tool-result trace. DO NOT re-run
+     find_wos / analyze_wo_availability / analyze_wo_schedule_impact — the
+     contingent run is already saved with the correct WO set; re-running could
+     pick a different WO set and a different contingent.
 
-  8. **Confirmation gate**: NEVER call promote_plan_run without an explicit user
+  8. **If promote_plan_run fails** ("not_found", "wrong_status", "superseded"):
+     STOP. Do NOT recover by re-running the impact analysis. Report the failure
+     to the user verbatim and ask them how to proceed (likely you used the
+     wrong id — re-read step 5's summary and find the correct
+     contingent_plan_run_id).
+
+  9. **Confirmation gate**: NEVER call promote_plan_run without an explicit user
      "yes, promote" / "go ahead and amend" / "我选择 C" / "接受" / equivalent.
      If the user only says "interesting" or doesn't acknowledge the destructive
      nature, ask first.
@@ -571,24 +580,31 @@ Example A — within safe window:
   woGroupIds=[…]}]) → if max_feasible_days ≥ 7, reply "Yes — max safe is 14d,
   your 7d is well inside. Want me to record the scenario?"
 
-Example B — exceeds safe window:
+Example B — exceeds safe window (use «PLACEHOLDER» tokens — never copy literal
+numbers from this example into real tool calls; pull the real values from
+your tool-result trace):
+
   User: "I want to shut down the OE prod area for about 7 days, please analyze
   impacts, suggest options, and possibly amend the plan."
-  Steps: list_prod_areas → resolve "OE" (might be "OE_ASSY"; ask if ambiguous)
-  → find_wos(prod_area=<resolved>, start_after=<today>, limit=500) → REMEMBER
-  the gid list → analyze_wo_availability(selectors=[{bucketStart=<today>,
-  woGroupIds=<remembered>}]) → if max_feasible_days < 7 (say 3):
-  analyze_wo_schedule_impact(selectors=[{bucketStart=<today>,
-  woGroupIds=<remembered>}], delay_days=7, persist=true) → CAPTURE the
-  contingent_plan_run_id (e.g. 142). Reply with: "OE shutdown of 7d will
-  delay 12 demand commits (top 3: D_42 +4d for ACME, D_18 +4d for FOO,
-  D_7 +3d for BAR). Max safe is 3d. Options: (a) reduce to 3d (no demand
-  impact); (b) shift the start date by 5d to 2026-05-15 — let me re-check;
-  (c) accept the impact and promote contingent plan run #142 as the new
-  baseline. Which one?"
+  Steps:
+    list_prod_areas → resolve "OE" (might be "OE_ASSY"; ask if ambiguous).
+    find_wos(prod_area=«resolved», start_after=«today», limit=500) →
+       REMEMBER the gid list as «GIDS».
+    analyze_wo_availability(selectors=[{bucketStart=«today», woGroupIds=«GIDS»}])
+       → max_feasible_days = «MAX_SAFE».
+    if «MAX_SAFE» < 7:
+        analyze_wo_schedule_impact(selectors=[{bucketStart=«today»,
+            woGroupIds=«GIDS»}], delay_days=7, persist=true) →
+            the tool's summary line ends with
+            "…contingent_plan_run_id=«CONTINGENT_ID»". CAPTURE «CONTINGENT_ID».
+    Reply with options listing «MAX_SAFE» and the impacted demands; tell the
+    user option (c) is "promote contingent plan run #«CONTINGENT_ID»".
   When user says "I choose C" / "我选择 C" / "yes, promote" → call
-  promote_plan_run(plan_run_id=142). DO NOT re-run find_wos or impact —
-  the contingent is already saved.
+    promote_plan_run(plan_run_id=«CONTINGENT_ID») — using the actual integer
+    you captured, NOT a literal from this example. DO NOT re-run find_wos
+    or impact analysis — the contingent is already saved.
+  If promote fails: report the error to the user; do not recover by
+    re-running analysis.
 """
 
 // ── Tool registry ────────────────────────────────────────────────────────────
@@ -4931,12 +4947,18 @@ private fun toolAnalyzeWoScheduleImpact(caseId: Int, args: JsonObject, locale: S
             val resp = r.response
             val withinSafe = (resp.delayDays != null && resp.maxFeasibleDays != null &&
                 resp.delayDays <= resp.maxFeasibleDays)
+            // Surface contingent_plan_run_id in the summary so the LLM sees the
+            // actual id (and won't fall back to a literal from the few-shot
+            // example in the system prompt) when it later calls promote_plan_run.
+            val contingentSuffix = resp.contingentPlanRunId?.let { ", contingent_plan_run_id=$it" } ?: ""
             ToolResult(
                 summary = loc(
                     "impact: ${resp.matchedWoCount} WO shifted, ${resp.impactedDemandCount} demand(s) delayed; " +
-                        "max safe ${resp.maxFeasibleDays}d (${if (withinSafe) "within" else "exceeds"})",
+                        "max safe ${resp.maxFeasibleDays}d (${if (withinSafe) "within" else "exceeds"})" +
+                        contingentSuffix,
                     "影响：${resp.matchedWoCount} 个工单后移，${resp.impactedDemandCount} 个需求延迟；" +
-                        "最大安全 ${resp.maxFeasibleDays} 天 (${if (withinSafe) "安全范围内" else "超出"})",
+                        "最大安全 ${resp.maxFeasibleDays} 天 (${if (withinSafe) "安全范围内" else "超出"})" +
+                        contingentSuffix,
                     locale,
                 ),
                 payload = Json.encodeToJsonElement(WoScheduleImpactResponse.serializer(), resp),
