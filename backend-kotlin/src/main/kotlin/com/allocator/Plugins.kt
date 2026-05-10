@@ -9,6 +9,8 @@ import com.allocator.api.overrideRoutes
 import com.allocator.api.peggingRoutes
 import com.allocator.api.materialImpactRoutes
 import com.allocator.api.materialEventRoutes
+import com.allocator.api.workOrderImpactRoutes
+import com.allocator.api.woScheduleEventRoutes
 import com.allocator.api.negotiationRoutes
 import com.allocator.api.planRunRoutes
 import com.allocator.api.planningAgentRoutes
@@ -85,6 +87,11 @@ fun Application.configurePlugins() {
 }
 
 fun Application.configureRouting() {
+    // Match request paths whether or not the client appended a trailing slash.
+    // Next.js's trailingSlash: true config can rewrite some DELETE/POST URLs
+    // with a trailing slash; without this, those would 404/405 instead of
+    // hitting the corresponding route declared without a trailing slash.
+    install(IgnoreTrailingSlash)
     routing {
         get("/health") {
             call.respond(mapOf("status" to "ok"))
@@ -98,6 +105,8 @@ fun Application.configureRouting() {
         bomGraphRoutes()
         materialImpactRoutes()
         materialEventRoutes()
+        workOrderImpactRoutes()
+        woScheduleEventRoutes()
         assessmentRoutes()
         planRunRoutes()
         negotiationRoutes()
