@@ -547,11 +547,12 @@ Steps (DO NOT skip any):
        **Capture the contingent_plan_run_id explicitly** — you'll need it in
        step 7 if the user accepts.
 
-  6. **Suggest options** when N exceeds max-safe (always present at least 2):
-     a. "Reduce shutdown to max_feasible_days days" — pure safe envelope.
-     b. "Try a different start date" — shift bucketStart later (re-run availability).
-     c. "Accept the impact" — confirm with user, then promote_plan_run on the
-        contingent run to amend the plan. Never auto-promote.
+  6. **Suggest options** when N exceeds max-safe — ALWAYS present exactly these
+     three, NUMBERED 1/2/3 (so user replies of "3" / "三" / "我选择 3" are
+     unambiguously interpretable):
+       1. "Reduce shutdown to max_feasible_days days" — pure safe envelope.
+       2. "Try a different start date" — shift bucketStart later (re-run availability).
+       3. "Accept the impact and amend the plan" — promote the contingent.
 
   7. **On user acceptance of option (c)** — directly call promote_plan_run with
      the **literal `contingent_plan_run_id` value that step 5's
@@ -568,10 +569,32 @@ Steps (DO NOT skip any):
      wrong id — re-read step 5's summary and find the correct
      contingent_plan_run_id).
 
-  9. **Confirmation gate**: NEVER call promote_plan_run without an explicit user
-     "yes, promote" / "go ahead and amend" / "我选择 C" / "接受" / equivalent.
-     If the user only says "interesting" or doesn't acknowledge the destructive
-     nature, ask first.
+  9. **Confirmation gate / option-3 pattern matching**: NEVER call promote_plan_run
+     without an explicit user acceptance. After you've offered the three
+     numbered options in step 6 and you're awaiting the choice, treat ANY of
+     these as "user picked option 3 (accept the impact)" and respond by calling
+     promote_plan_run with the captured contingent_plan_run_id from step 5:
+       - English: "3" / "three" / "option 3" / "(c)" / "C" / "yes" / "yes, promote" /
+         "go ahead" / "amend" / "accept the impact" / "promote".
+       - Chinese: "3" / "三" / "③" / "选项 3" / "第三个" / "我选择 3" / "选择 3" /
+         "我选 3" / "接受" / "确认" / "采用" / "升格".
+     Number "1" / "一" / "第一个" → option 1 (reduce shutdown). Number "2" /
+     "二" / "第二个" → option 2 (different start date). DO NOT re-run any
+     analysis to "verify" — the option choice is unambiguous.
+
+  10. **HARD STOP — never call analyze_wo_schedule_impact twice in one turn.**
+      If you've already called analyze_wo_schedule_impact in this conversation
+      turn AND the user's most recent message is a numeric option choice
+      (1/2/3, 一/二/三, A/B/C, etc.), DO NOT call analyze_wo_schedule_impact
+      again. The legal next action depends on the option:
+        Option 1 → analyze_wo_availability is fine (re-check the safe envelope
+                   they accepted), or just acknowledge in prose.
+        Option 2 → analyze_wo_availability with the new bucketStart (re-check
+                   if the new date is safe). Single call, then reply.
+        Option 3 → promote_plan_run(plan_run_id=<captured contingent_plan_run_id>).
+                   That's it. No availability, no impact.
+      If you find yourself "wanting to verify" — STOP. The contingent plan run
+      from step 5 is already saved and authoritative.
 
 Example A — within safe window:
   User: "Can I take down line L1 for a week without breaking anything?"
@@ -597,12 +620,14 @@ your tool-result trace):
             woGroupIds=«GIDS»}], delay_days=7, persist=true) →
             the tool's summary line ends with
             "…contingent_plan_run_id=«CONTINGENT_ID»". CAPTURE «CONTINGENT_ID».
-    Reply with options listing «MAX_SAFE» and the impacted demands; tell the
-    user option (c) is "promote contingent plan run #«CONTINGENT_ID»".
-  When user says "I choose C" / "我选择 C" / "yes, promote" → call
-    promote_plan_run(plan_run_id=«CONTINGENT_ID») — using the actual integer
-    you captured, NOT a literal from this example. DO NOT re-run find_wos
-    or impact analysis — the contingent is already saved.
+    Reply with the three NUMBERED options (1, 2, 3) listing «MAX_SAFE» and
+    the impacted demands; tell the user option 3 is "accept the impact and
+    promote contingent plan run #«CONTINGENT_ID» as the new baseline".
+  When user picks option 3 — by ANY form, e.g. "3" / "三" / "我选择 3" /
+    "选择3" / "我选3" / "我选择C" / "yes, promote" / "接受" / "确认" /
+    "go ahead" — IMMEDIATELY call promote_plan_run(plan_run_id=«CONTINGENT_ID»)
+    using the actual integer you captured, NOT a literal from this example.
+    DO NOT re-run find_wos or analyze_wo_*. The contingent is already saved.
   If promote fails: report the error to the user; do not recover by
     re-running analysis.
 """
