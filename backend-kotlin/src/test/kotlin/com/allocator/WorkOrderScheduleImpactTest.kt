@@ -196,23 +196,22 @@ class WorkOrderScheduleImpactTest : FunSpec({
 
     // ── availability: closed-form max-safe-delay ──────────────────────────────
 
-    test("availability — boundary slack: SUB→FG, baseline slack = 1 day") {
+    test("availability — path walk: SUB→FG→D_FG yields cumulative slack = 1") {
         val (workOrders, pegging) = buildFixture()
         val sel = WoScheduleSelector(
             bucketStart = "2026-03-01",
-            bucketEnd = "2026-03-10",
             woGroupIds = listOf("sub"),
         )
         val result = computeAvailability(workOrders, pegging, listOf(sel))
 
-        // SUB.start (2026-03-01) = bucketStart → absorption = 0.
-        // SUB.end = 2026-03-10, FG.start = 2026-03-11 → baseline slack = 1.
-        // maxFeasibleDays = 1 + 0 = 1.
+        // Path: SUB (in-set, absorption=0) → FG (out-of-set, edge slack=1) → D_FG.
+        // FG is the only level-1 WO child of D_FG, so MAX_END_D = FG.end → demand
+        // slack at FG = 0. Cumulative: 0 (absorption) + 1 (boundary) + 0 (demand) = 1.
+        // Bottleneck reports the level-1 WO (FG) at the demand-root level.
         result.maxFeasibleDays shouldBe 1
         result.bottlenecks.shouldNotBeEmpty()
-        result.bottlenecks.first().kind shouldBe "boundary"
-        result.bottlenecks.first().gid shouldBe "sub"
-        result.bottlenecks.first().parentGid shouldBe "fg"
+        result.bottlenecks.first().kind shouldBe "demand_root"
+        result.bottlenecks.first().gid shouldBe "fg"
     }
 
     test("availability — window absorption grows max-N when WO is deeper inside the bucket") {
@@ -232,7 +231,6 @@ class WorkOrderScheduleImpactTest : FunSpec({
 
         val sel = WoScheduleSelector(
             bucketStart = "2026-03-01",
-            bucketEnd = "2026-03-15",
             woGroupIds = listOf("sub"),
         )
         val result = computeAvailability(workOrders, pegging, listOf(sel))
@@ -248,7 +246,6 @@ class WorkOrderScheduleImpactTest : FunSpec({
         val (workOrders, pegging) = buildFixture()
         val sel = WoScheduleSelector(
             bucketStart = "2026-03-01",
-            bucketEnd = "2026-03-31",
             woGroupIds = listOf("fg"),
         )
         val result = computeAvailability(workOrders, pegging, listOf(sel))
@@ -262,11 +259,93 @@ class WorkOrderScheduleImpactTest : FunSpec({
         val (workOrders, pegging) = buildFixture()
         val sel = WoScheduleSelector(
             bucketStart = "2026-03-01",
-            bucketEnd = "2026-03-31",
             woGroupIds = emptyList(),
         )
         val result = computeAvailability(workOrders, pegging, listOf(sel))
         result.maxFeasibleDays shouldBe 0
         result.matchedWoCount shouldBe 0
+    }
+
+    test("availability — non-binding parent at demand level: slack inherited from sibling") {
+        // Regression for: a 0-slack boundary edge does not always force max-safe=0.
+        // The shift propagates to the parent, but if the parent has a later-ending
+        // sibling at the demand-root level, the demand commit is unchanged until
+        // the sibling's end is exceeded.
+        //
+        // Fixture:
+        //   D_FG demand
+        //     WO_FG (out-of-set, gid=fg, end=2026-03-10)            ← non-binding
+        //       └─ D_SUB → WO_SUB (in-set, gid=sub, end=2026-03-05) ← shifts by N
+        //     WO_FG2 (out-of-set, gid=fg2, end=2026-03-15)          ← later sibling, binding
+        //
+        //   bucketStart = WO_SUB.start = 2026-03-01.
+        //   Boundary slack (FG.start − SUB.end): 5 − 5 = 0  (FG is tight on SUB)
+        //   Demand slack at FG (MAX_END − FG.end): 15 − 10 = 5
+        //   Cumulative max-safe: 0 (absorption) + 0 (boundary) + 5 (demand) = 5.
+        //
+        // The OLD code's (a) boundary path reported 0 here, ignoring that FG
+        // wasn't binding at the demand level — the impact pipeline confirmed
+        // no demand actually shifts at small N.
+        val woSub = mutableMapOf<String, Any?>(
+            "product_id" to "SUB", "location_id" to "L1",
+            "quantity" to 10.0, "method" to "make",
+            "start_time" to "2026-03-01", "end_time" to "2026-03-05",
+            "wo_group_id" to "sub",
+        )
+        val woFg = mutableMapOf<String, Any?>(
+            "product_id" to "FG", "location_id" to "L1",
+            "quantity" to 10.0, "method" to "make",
+            "start_time" to "2026-03-05", "end_time" to "2026-03-10",
+            "wo_group_id" to "fg",
+        )
+        val woFg2 = mutableMapOf<String, Any?>(
+            "product_id" to "FG2", "location_id" to "L1",
+            "quantity" to 5.0, "method" to "make",
+            "start_time" to "2026-03-08", "end_time" to "2026-03-15",
+            "wo_group_id" to "fg2",
+        )
+        val workOrders: MutableList<MutableMap<String, Any?>> = mutableListOf(woSub, woFg, woFg2)
+
+        val subWoNode = mapOf<String, Any?>(
+            "type" to "work_order", "wo_group_id" to "sub", "failed" to false,
+            "product_id" to "SUB", "location_id" to "L1", "method" to "make",
+            "start_time" to "2026-03-01", "end_time" to "2026-03-05",
+            "children" to emptyList<Map<String, Any?>>(),
+        )
+        val subDemand = mapOf<String, Any?>(
+            "type" to "demand", "commit_time" to "2026-03-05",
+            "children" to listOf(subWoNode),
+        )
+        val fgWoNode = mapOf<String, Any?>(
+            "type" to "work_order", "wo_group_id" to "fg", "failed" to false,
+            "product_id" to "FG", "location_id" to "L1", "method" to "make",
+            "start_time" to "2026-03-05", "end_time" to "2026-03-10",
+            "children" to listOf(subDemand),
+        )
+        val fg2WoNode = mapOf<String, Any?>(
+            "type" to "work_order", "wo_group_id" to "fg2", "failed" to false,
+            "product_id" to "FG2", "location_id" to "L1", "method" to "make",
+            "start_time" to "2026-03-08", "end_time" to "2026-03-15",
+            "children" to emptyList<Map<String, Any?>>(),
+        )
+        val fgRoot = mapOf<String, Any?>(
+            "type" to "demand", "commit_time" to "2026-03-15",
+            "children" to listOf(fgWoNode, fg2WoNode),
+        )
+        val pegging: MutableList<MutableMap<String, Any?>> = mutableListOf(
+            mutableMapOf<String, Any?>("demand_id" to "D_FG", "tree" to fgRoot),
+        )
+
+        val sel = WoScheduleSelector(
+            bucketStart = "2026-03-01",
+            woGroupIds = listOf("sub"),
+        )
+        val result = computeAvailability(workOrders, pegging, listOf(sel))
+
+        // Bug pre-fix returned 0 here. Correct value is 5.
+        result.maxFeasibleDays shouldBe 5
+        result.bottlenecks.first().kind shouldBe "demand_root"
+        result.bottlenecks.first().gid shouldBe "fg"
+        result.bottlenecks.first().demandId shouldBe "D_FG"
     }
 })

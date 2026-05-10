@@ -530,9 +530,11 @@
         }
       },
       "bucketPreview": {
-        "label": "Time bucket:",
-        "derived": "auto from selection",
-        "fromKey": "from bucket"
+        "label": "Start time:",
+        "reset": "Reset",
+        "resetTooltip": "Restore start time to min(selected WO start times)",
+        "manuallyEdited": "manually edited",
+        "pickWosFirst": "(pick WOs to fill defaults)"
       },
       "availability": {
         "chipLabel": "Max safe delay",
@@ -586,9 +588,10 @@
         }
       },
       "status": {
+        "delayed": "Delayed",
+        "no_change": "No change",
         "delivery_delayed": "Delayed",
-        "newly_late_vs_due": "Newly late vs due",
-        "no_change": "No change"
+        "newly_late_vs_due": "Delayed"
       },
       "editForm": {
         "summary": "Editing event",

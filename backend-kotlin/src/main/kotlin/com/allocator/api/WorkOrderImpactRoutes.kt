@@ -36,21 +36,20 @@ private const val WO_JOB_TTL_SECONDS = 600L
 /**
  * One bulk shift descriptor. The UI assembles this after the user has picked
  * a concrete set of WOs from a filterable preview list — so the backend
- * doesn't re-do the filtering. `bucketStart`/`bucketEnd` define the time
- * window the shift is anchored to:
- *   - For `delayDays N`, the window is informational (shift = N for every
- *     WO in `woGroupIds`).
- *   - For `delayToDate D`, the shift is `D - bucketStart` (uniform across
- *     all matched WOs, preserving their relative spacing).
+ * doesn't re-do the filtering. `bucketStart` is the maintenance-window start
+ * date, used as:
+ *   - For `delayDays N`, the front of the bucket displaces by N days (lots
+ *     before `bucketStart` are unaffected; selected lots get the uniform N
+ *     shift on the impact path).
+ *   - For `delayToDate D`, the shift is `D - bucketStart`, applied uniformly
+ *     across selected WOs.
  *
- * The UI may either let the user pick a granularity+bucket (week/month/…)
- * or derive `bucketStart = min(start_time)` / `bucketEnd = max(end_time)`
- * across the chosen WOs. Either way, the backend sees explicit ISO dates.
+ * The UI defaults `bucketStart = min(selected WO start_time)` and lets the
+ * user override via a calendar input.
  */
 @Serializable
 data class WoScheduleSelector(
     val bucketStart: String,                    // ISO yyyy-MM-dd, REQUIRED
-    val bucketEnd: String,                      // ISO yyyy-MM-dd, REQUIRED
     /** Concrete WO group ids the user picked from the preview list. REQUIRED, non-empty. */
     val woGroupIds: List<String> = emptyList(),
 )
@@ -85,7 +84,12 @@ data class WoImpactedDemand(
     val contingentCommitTime: String?,
     /** ChronoUnit.DAYS.between(baseline, contingent). 0 if either is null. */
     val daysDelta: Int,
-    /** "delivery_delayed" | "newly_late_vs_due" | "no_change" */
+    /** Binary outcome derived from the baseline vs contingent commit times:
+     *  "delayed" when contingent_commit > baseline_commit, else "no_change".
+     *  (request_due_time is informational context only — it does not enter
+     *  the classification, since whether the demand was on-time at baseline
+     *  is the planner's pre-existing condition, not something the schedule
+     *  change produced.) */
     val status: String,
 )
 
@@ -272,20 +276,16 @@ private fun validateRequest(req: WoScheduleImpactRequest): String? {
     for (s in req.selectors) {
         if (s.woGroupIds.isEmpty())
             return "Each selector must declare at least one woGroupId"
-        val start = parseIsoDateLoose(s.bucketStart)
+        parseIsoDateLoose(s.bucketStart)
             ?: return "Selector bucketStart must be ISO yyyy-MM-dd, got '${s.bucketStart}'"
-        val end = parseIsoDateLoose(s.bucketEnd)
-            ?: return "Selector bucketEnd must be ISO yyyy-MM-dd, got '${s.bucketEnd}'"
-        if (end < start) return "Selector bucketEnd must be ≥ bucketStart"
     }
     return null
 }
 
 /**
  * For each selector, match every WO whose `wo_group_id` ∈ `selector.woGroupIds`
- * AND whose start_time falls in `[bucketStart, bucketEnd]`. The window check
- * is defensive — the UI should already have filtered to in-window WOs before
- * picking the gids — but it guards against stale baseline shifts.
+ * AND whose start_time is at or after `bucketStart` (lots that finish before
+ * the maintenance starts aren't disturbed by the shift).
  *
  * Returns (lot → forward-shift days) and the set of matched gids. Lots use
  * object identity from the input list so the caller can mutate them in place.
@@ -302,7 +302,6 @@ private fun computeShifts(
 
     for (sel in selectors) {
         val bucketStart = parseIsoDateLoose(sel.bucketStart) ?: continue
-        val bucketEnd = parseIsoDateLoose(sel.bucketEnd) ?: continue
         val selGids = sel.woGroupIds.toHashSet()
         if (selGids.isEmpty()) continue
 
@@ -318,7 +317,7 @@ private fun computeShifts(
             if (gid !in selGids) continue
             val startStr = wo["start_time"] as? String ?: continue
             val startDt = parseIsoDateLoose(startStr) ?: continue
-            if (startDt < bucketStart || startDt > bucketEnd) continue
+            if (startDt < bucketStart) continue
 
             // Forward-only: take max shift across selectors.
             val prior = lotShift[wo] ?: 0L
@@ -471,6 +470,20 @@ internal fun computeAvailability(
     fun gidEnd(gid: String): LocalDate? =
         dag.lotsByGroup[gid]?.mapNotNull { parseIsoDateLoose(it["end_time"] as? String) }?.maxOrNull()
 
+    // Pre-compute the demand-root data we'll need during the path walk.
+    val maxEndByDemand: Map<String, LocalDate> = dag.demandRootChildren.entries
+        .mapNotNull { (did, children) ->
+            val maxEnd = children.mapNotNull { gidEnd(it) }.maxOrNull() ?: return@mapNotNull null
+            did to maxEnd
+        }.toMap()
+    val demandsForGid: Map<String, Set<String>> = run {
+        val out = mutableMapOf<String, MutableSet<String>>()
+        for ((did, children) in dag.demandRootChildren) {
+            for (gid in children) out.getOrPut(gid) { mutableSetOf() }.add(did)
+        }
+        out
+    }
+
     // Walk per selector: each selector independently constrains the global N.
     // Take the global min across selectors. (Multi-selector shares a single
     // delayDays parameter on the impact side, so the same applies here.)
@@ -480,17 +493,16 @@ internal fun computeAvailability(
 
     for (sel in selectors) {
         val bucketStart = parseIsoDateLoose(sel.bucketStart) ?: continue
-        val bucketEnd = parseIsoDateLoose(sel.bucketEnd) ?: continue
         val selGids = sel.woGroupIds.toHashSet()
         if (selGids.isEmpty()) continue
 
-        // In-set gids whose at least one lot's start_time lies in the bucket window.
-        // Lots outside the window aren't displaced under the front-shift model
-        // (they're already past the maintenance period).
+        // In-set gids whose at least one lot's start_time is at or after
+        // bucketStart. Lots before bucketStart aren't disturbed by the
+        // front-shift, so they don't contribute to availability bottlenecks.
         val inSet = selGids.filter { gid ->
             (dag.lotsByGroup[gid] ?: emptyList()).any { lot ->
                 val s = parseIsoDateLoose(lot["start_time"] as? String) ?: return@any false
-                s in bucketStart..bucketEnd
+                s >= bucketStart
             }
         }.toHashSet()
         if (inSet.isEmpty()) continue
@@ -507,44 +519,58 @@ internal fun computeAvailability(
             }
         }
 
-        // (a) Boundary parent-child slacks
-        for (childGid in inSet) {
-            val cStart = gidStart(childGid) ?: continue
-            val cEnd = gidEnd(childGid) ?: continue
-            val absorption = (cStart.toEpochDay() - bucketStart.toEpochDay()).toInt()
-            for (parentGid in dag.parentsOf[childGid] ?: emptySet()) {
-                if (parentGid in inSet) continue   // in-set ancestor: no constraint
-                val pStart = gidStart(parentGid) ?: continue
-                val baselineSlack = (pStart.toEpochDay() - cEnd.toEpochDay()).toInt()
-                val maxN = baselineSlack + absorption
-                consider(maxN, WoAvailabilityBottleneck(
-                    kind = "boundary",
-                    gid = childGid,
-                    parentGid = parentGid,
-                    slackDays = maxN,
-                ))
-            }
-        }
+        // ── Path walk: from each in-set WO X, BFS upward through the DAG via
+        // out-of-set parents only (in-set ancestors shift uniformly so they
+        // contribute no slack). At each visited node, if it is a level-1 WO
+        // child of any demand-root D, that yields a constraint:
+        //
+        //     N_max ≤ cumulative_path_slack + (MAX_END_D − cur.end)
+        //
+        // Boundary edges alone aren't constraints — only the demand-level
+        // commit constraint at the *top* of the path is. cumulative_path_slack
+        // = absorption_X (= X.start − bucketStart) plus sum of edge slacks
+        // (parent.start − child.end) along the chain. Dijkstra-style dedup on
+        // gid → smallest cum keeps complexity bounded.
+        for (xGid in inSet) {
+            val xStart = gidStart(xGid) ?: continue
+            val absorption = (xStart.toEpochDay() - bucketStart.toEpochDay())
 
-        // (b) Demand-root commit constraints
-        for ((demandId, rootChildren) in dag.demandRootChildren) {
-            if (rootChildren.intersect(inSet).isEmpty()) continue
-            val maxEnd = rootChildren
-                .mapNotNull { gidEnd(it) }
-                .maxOrNull() ?: continue
-            for (cGid in rootChildren) {
-                if (cGid !in inSet) continue
-                val cStart = gidStart(cGid) ?: continue
-                val cEnd = gidEnd(cGid) ?: continue
-                val absorption = (cStart.toEpochDay() - bucketStart.toEpochDay()).toInt()
-                val baselineSlack = (maxEnd.toEpochDay() - cEnd.toEpochDay()).toInt()
-                val maxN = baselineSlack + absorption
-                consider(maxN, WoAvailabilityBottleneck(
-                    kind = "demand_root",
-                    gid = cGid,
-                    demandId = demandId,
-                    slackDays = maxN,
-                ))
+            val visited = mutableMapOf<String, Long>()           // gid → smallest cum reached
+            data class Walk(val gid: String, val cum: Long)
+            val queue: ArrayDeque<Walk> = ArrayDeque()
+            queue.addLast(Walk(xGid, absorption))
+
+            var hops = 0
+            val maxHops = 5000
+            while (queue.isNotEmpty() && hops < maxHops) {
+                hops++
+                val s = queue.removeFirst()
+                val prevCum = visited[s.gid]
+                if (prevCum != null && prevCum <= s.cum) continue
+                visited[s.gid] = s.cum
+
+                val curEnd = gidEnd(s.gid) ?: continue
+
+                // Demand-root commit constraint at this node (when cur is a
+                // level-1 WO child of one or more demand-roots).
+                demandsForGid[s.gid]?.forEach { demandId ->
+                    val maxEnd = maxEndByDemand[demandId] ?: return@forEach
+                    val finalSlack = (s.cum + (maxEnd.toEpochDay() - curEnd.toEpochDay())).toInt()
+                    consider(finalSlack, WoAvailabilityBottleneck(
+                        kind = "demand_root",
+                        gid = s.gid,
+                        demandId = demandId,
+                        slackDays = finalSlack.coerceAtLeast(0),
+                    ))
+                }
+
+                // Recurse to out-of-set parents.
+                for (parentGid in dag.parentsOf[s.gid] ?: emptySet()) {
+                    if (parentGid in inSet) continue
+                    val pStart = gidStart(parentGid) ?: continue
+                    val edgeSlack = pStart.toEpochDay() - curEnd.toEpochDay()
+                    queue.addLast(Walk(parentGid, s.cum + edgeSlack))
+                }
             }
         }
 
@@ -703,14 +729,12 @@ private suspend fun runWoScheduleImpactBackground(jobId: String, req: WoSchedule
             impactedRows.mapNotNull { (did, t) ->
                 val (b, c, delta) = t
                 val m = metas[did] ?: return@mapNotNull null
-                val bD = parseIsoDateLoose(b)
-                val cD = parseIsoDateLoose(c)
-                val dueD = parseIsoDateLoose(m.requestDueTime)
-                val status = when {
-                    delta <= 0 -> "no_change"
-                    bD != null && cD != null && dueD != null && bD <= dueD && cD > dueD -> "newly_late_vs_due"
-                    else -> "delivery_delayed"
-                }
+                // Binary outcome based on the schedule change itself: did the
+                // contingent commit move relative to the baseline commit?
+                // request_due_time is informational context only — whether the
+                // demand was already late at baseline is a pre-existing
+                // planner condition, not something the schedule change produced.
+                val status = if (delta > 0) "delayed" else "no_change"
                 WoImpactedDemand(
                     demandId = m.demandId,
                     productId = m.productId,
@@ -743,7 +767,6 @@ private suspend fun runWoScheduleImpactBackground(jobId: String, req: WoSchedule
                     for (sel in req.selectors) {
                         add(buildJsonObject {
                             put("bucketStart", sel.bucketStart)
-                            put("bucketEnd", sel.bucketEnd)
                             put("woGroupIds", buildJsonArray { sel.woGroupIds.forEach { add(it) } })
                         })
                     }
@@ -894,8 +917,6 @@ fun Routing.workOrderImpactRoutes() {
                     throw IllegalArgumentException("Each selector must declare at least one woGroupId")
                 parseIsoDateLoose(s.bucketStart)
                     ?: throw IllegalArgumentException("Selector bucketStart must be ISO yyyy-MM-dd")
-                parseIsoDateLoose(s.bucketEnd)
-                    ?: throw IllegalArgumentException("Selector bucketEnd must be ISO yyyy-MM-dd")
             }
 
             // Re-use the same baseline-load helper as the impact endpoint.

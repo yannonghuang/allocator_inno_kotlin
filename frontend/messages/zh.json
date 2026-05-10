@@ -530,9 +530,11 @@
         }
       },
       "bucketPreview": {
-        "label": "时间桶:",
-        "derived": "由选中工单自动派生",
-        "fromKey": "来自桶选择"
+        "label": "起始时间:",
+        "reset": "重置",
+        "resetTooltip": "恢复为当前选中工单的最早起始时间",
+        "manuallyEdited": "已手动修改",
+        "pickWosFirst": "(请先选择工单以填充默认值)"
       },
       "availability": {
         "chipLabel": "最大安全延迟",
@@ -586,9 +588,10 @@
         }
       },
       "status": {
-        "delivery_delayed": "交付延期",
-        "newly_late_vs_due": "新增违期",
-        "no_change": "无变化"
+        "delayed": "延期",
+        "no_change": "无变化",
+        "delivery_delayed": "延期",
+        "newly_late_vs_due": "延期"
       },
       "editForm": {
         "summary": "编辑事件",

@@ -1261,8 +1261,6 @@ export async function analyzeMaterialImpact(
 export type WoScheduleSelector = {
   /** ISO yyyy-MM-dd. UI default: min(start_time) over selected WOs. */
   bucketStart: string;
-  /** ISO yyyy-MM-dd. UI default: max(end_time) over selected WOs. */
-  bucketEnd: string;
   /** Concrete WOs picked from the preview list. Must be non-empty. */
   woGroupIds: string[];
 };
@@ -1289,7 +1287,7 @@ export type WoImpactedDemand = {
   baselineCommitTime: string | null;
   contingentCommitTime: string | null;
   daysDelta: number;
-  status: 'delivery_delayed' | 'newly_late_vs_due' | 'no_change';
+  status: 'delayed' | 'no_change';
 };
 
 export type WoAvailabilityBottleneck = {

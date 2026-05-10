@@ -103,16 +103,6 @@ function formatIsoDate(d: Date): string {
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 }
 
-function bucketsForWorkOrders(wos: WorkOrder[], granularity: Granularity): string[] {
-  const set = new Set<string>();
-  for (const wo of wos) {
-    const d = parseIsoDate(wo.start_time);
-    if (!d) continue;
-    set.add(bucketOfDate(d, granularity));
-  }
-  return Array.from(set).sort();
-}
-
 // ── presentation helpers ─────────────────────────────────────────────────────
 
 function fmtDate(s: string | null | undefined): string {
@@ -121,16 +111,13 @@ function fmtDate(s: string | null | undefined): string {
 }
 
 const STATUS_COLOR: Record<string, string> = {
-  delivery_delayed: '#fbbf24',
-  newly_late_vs_due: '#f87171',
-  no_change: '#a1a1aa',
+  delayed:   '#fbbf24',   // amber — contingent commit > baseline commit
+  no_change: '#a1a1aa',   // grey  — no movement (availability bottleneck rows only)
 };
 
 // ── filtering: UI-side ───────────────────────────────────────────────────────
 
 type Filter = {
-  granularity: Granularity;
-  bucketKey: string;       // '' = unset (derive)
   productId: string;
   prodArea: string;
   locationId: string;
@@ -139,8 +126,6 @@ type Filter = {
 
 function emptyFilter(): Filter {
   return {
-    granularity: 'week',
-    bucketKey: '',
     productId: '',
     prodArea: '',
     locationId: '',
@@ -155,8 +140,6 @@ function isVirtualProduct(productId: string | null | undefined): boolean {
 }
 
 function applyFilter(wos: WorkOrder[], f: Filter): WorkOrder[] {
-  let bucketRange: { start: Date; end: Date } | null = null;
-  if (f.bucketKey) bucketRange = bucketRangeFromKey(f.bucketKey, f.granularity);
   return wos.filter(w => {
     if (!w.wo_group_id) return false;
     if (isVirtualProduct(w.product_id)) return false;
@@ -164,11 +147,6 @@ function applyFilter(wos: WorkOrder[], f: Filter): WorkOrder[] {
     if (f.prodArea && (w.prod_area ?? '') !== f.prodArea) return false;
     if (f.locationId && w.location_id !== f.locationId) return false;
     if (f.method && (w.method ?? '') !== f.method) return false;
-    if (bucketRange) {
-      const start = parseIsoDate(w.start_time);
-      if (!start) return false;
-      if (start < bucketRange.start || start > bucketRange.end) return false;
-    }
     return true;
   });
 }
@@ -229,25 +207,15 @@ function aggregateByWoGroup(lots: WorkOrder[]): WoSummary[] {
   });
 }
 
-/** Default bucketStart/end derived from selected WOs:
- *    bucketStart = min(start_time), bucketEnd = max(end_time).
- *  Falls back to today/today if the list is empty. Accepts any row shape
- *  with `start_time`/`end_time` strings (lot rows or aggregated WoSummary). */
-function deriveBucketDates(wos: { start_time: string | null; end_time: string | null }[]): { start: string; end: string } {
+/** Default bucketStart derived from selected WOs: min(start_time).
+ *  Falls back to today if the list is empty. */
+function deriveBucketStart(wos: { start_time: string | null }[]): string {
   let minD: Date | null = null;
-  let maxD: Date | null = null;
   for (const w of wos) {
     const s = parseIsoDate(w.start_time);
-    const e = parseIsoDate(w.end_time);
     if (s && (!minD || s < minD)) minD = s;
-    if (e && (!maxD || e > maxD)) maxD = e;
-    if (s && (!maxD || s > maxD)) maxD = s;
   }
-  const today = new Date();
-  return {
-    start: minD ? formatIsoDate(minD) : formatIsoDate(today),
-    end: maxD ? formatIsoDate(maxD) : formatIsoDate(today),
-  };
+  return minD ? formatIsoDate(minD) : formatIsoDate(new Date());
 }
 
 // ── component ────────────────────────────────────────────────────────────────
@@ -255,6 +223,9 @@ function deriveBucketDates(wos: { start_time: string | null; end_time: string | 
 type DraftEvent = {
   filter: Filter;
   selectedGids: Set<string>;
+  /** When non-empty, overrides the start time derived from the selected WOs.
+   *  Cleared by the Reset button, which restores the auto-derived value. */
+  manualBucketStart: string;
   changeMode: 'days' | 'date';
   delayDays: number;
   delayToDate: string;
@@ -265,6 +236,7 @@ function emptyDraft(): DraftEvent {
   return {
     filter: emptyFilter(),
     selectedGids: new Set(),
+    manualBucketStart: '',
     changeMode: 'days',
     delayDays: 7,
     delayToDate: '',
@@ -272,23 +244,26 @@ function emptyDraft(): DraftEvent {
   };
 }
 
+/** Compute the effective bucketStart sent to the backend. Manual override wins;
+ *  otherwise we derive min(start_time) from the selected WOs. */
+function computeEffectiveStart(
+  d: DraftEvent,
+  pickedWos: WorkOrder[],
+): { start: string; manuallyEdited: boolean } | null {
+  const hasOverride = d.manualBucketStart !== '';
+  const derived = pickedWos.length > 0 ? deriveBucketStart(pickedWos) : null;
+  if (!derived && !hasOverride) return null;
+  const start = hasOverride ? d.manualBucketStart : (derived as string);
+  return { start, manuallyEdited: hasOverride };
+}
+
 function buildSelectorFromDraft(d: DraftEvent, wos: WorkOrder[]): WoScheduleSelector | null {
   const gids = Array.from(d.selectedGids);
   if (gids.length === 0) return null;
   const picked = wos.filter(w => w.wo_group_id && d.selectedGids.has(w.wo_group_id));
-  let start: string;
-  let end: string;
-  if (d.filter.bucketKey) {
-    const r = bucketRangeFromKey(d.filter.bucketKey, d.filter.granularity);
-    if (!r) return null;
-    start = formatIsoDate(r.start);
-    end = formatIsoDate(r.end);
-  } else {
-    const derived = deriveBucketDates(picked);
-    start = derived.start;
-    end = derived.end;
-  }
-  return { bucketStart: start, bucketEnd: end, woGroupIds: gids };
+  const eff = computeEffectiveStart(d, picked);
+  if (!eff) return null;
+  return { bucketStart: eff.start, woGroupIds: gids };
 }
 
 /** Edit-mode draft (only delay + note are editable on a saved event;
@@ -555,7 +530,7 @@ export function WoScheduleImpactPanel({
                         <strong style={{ color: '#e4e4e7', fontSize: '0.85rem' }}>#{ev.id}</strong>
                         {ev.selectors.map((s, i) => (
                           <span key={i} style={{ background: '#27272a', color: '#a1a1aa', borderRadius: 4, padding: '2px 7px', fontSize: '0.74rem' }}>
-                            {s.bucketStart}…{s.bucketEnd} · {s.woGroupIds.length} {t('selector.wos')}
+                            {s.bucketStart} · {s.woGroupIds.length} {t('selector.wos')}
                           </span>
                         ))}
                         <span style={{ background: ev.delayDays != null ? '#7c3aed' : '#0ea5e9', color: '#fff', borderRadius: 6, padding: '2px 7px', fontSize: '0.75rem' }}>
@@ -707,8 +682,6 @@ function EditEventForm({
                 <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
                   <span style={{ color: '#71717a' }}>{t('editForm.bucket')}:</span>
                   <code style={{ color: '#e4e4e7' }}>{s.bucketStart}</code>
-                  <span>→</span>
-                  <code style={{ color: '#e4e4e7' }}>{s.bucketEnd}</code>
                   <span style={{ marginLeft: 8, color: '#71717a' }}>·</span>
                   <span style={{ color: '#71717a' }}>{t('editForm.woGroupIds')}:</span>
                   <span style={{ color: '#e4e4e7' }}>{s.woGroupIds.length}</span>
@@ -839,11 +812,6 @@ function DraftForm({
     for (const w of realWos) s.add(w.location_id);
     return Array.from(s).sort();
   }, [realWos]);
-  const bucketKeys = React.useMemo(
-    () => bucketsForWorkOrders(realWos, draft.filter.granularity),
-    [realWos, draft.filter.granularity],
-  );
-
   // Live filtered + aggregated list. `applyFilter` returns lot-level rows; we
   // then collapse by wo_group_id so the preview shows one row per WO.
   const matching = React.useMemo(
@@ -864,19 +832,23 @@ function DraftForm({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [matching]);
 
-  // Live bucket preview: shows which (bucketStart, bucketEnd) will be sent to the backend.
-  // - If user picked a bucket key, use that bucket's range.
-  // - Else derive from min(start)/max(end) of currently-selected WOs.
-  const bucketPreview = React.useMemo<{ start: string; end: string; source: 'key' | 'derived' } | null>(() => {
-    if (draft.filter.bucketKey) {
-      const r = bucketRangeFromKey(draft.filter.bucketKey, draft.filter.granularity);
-      if (r) return { start: formatIsoDate(r.start), end: formatIsoDate(r.end), source: 'key' };
-    }
+  // Default start time derived from the user-picked WOs: min(start_time).
+  // Pre-fills the editable input; user can override, and Reset clears the
+  // override to fall back to the derived default.
+  const derivedStart = React.useMemo<string | null>(() => {
     if (draft.selectedGids.size === 0) return null;
     const picked = matching.filter(w => w.wo_group_id && draft.selectedGids.has(w.wo_group_id));
-    const d = deriveBucketDates(picked);
-    return { start: d.start, end: d.end, source: 'derived' };
-  }, [draft.filter.bucketKey, draft.filter.granularity, draft.selectedGids, matching]);
+    if (picked.length === 0) return null;
+    return deriveBucketStart(picked);
+  }, [draft.selectedGids, matching]);
+
+  const startPreview = React.useMemo<{ start: string; manuallyEdited: boolean } | null>(() => {
+    const hasManualStart = draft.manualBucketStart !== '';
+    if (!derivedStart && !hasManualStart) return null;
+    const start = hasManualStart ? draft.manualBucketStart : (derivedStart ?? '');
+    if (!start) return null;
+    return { start, manuallyEdited: hasManualStart };
+  }, [derivedStart, draft.manualBucketStart]);
 
   const allSelected = matching.length > 0 && matching.every(w => w.wo_group_id && draft.selectedGids.has(w.wo_group_id));
 
@@ -935,26 +907,6 @@ function DraftForm({
             <option value="make">make</option>
             <option value="move">move</option>
             <option value="buy">buy</option>
-          </select>
-        </div>
-        <div style={fieldStyle}>
-          <label style={labelStyle}>{t('selector.granularity')}</label>
-          <select
-            style={inputStyle}
-            value={draft.filter.granularity}
-            onChange={e => setFilter({ granularity: e.target.value as Granularity, bucketKey: '' })}
-          >
-            <option value="day">{t('granularity.day')}</option>
-            <option value="week">{t('granularity.week')}</option>
-            <option value="month">{t('granularity.month')}</option>
-            <option value="quarter">{t('granularity.quarter')}</option>
-          </select>
-        </div>
-        <div style={fieldStyle}>
-          <label style={labelStyle}>{t('selector.bucket')} <span style={{ color: '#71717a' }}>({t('selector.bucketOptional')})</span></label>
-          <select style={inputStyle} value={draft.filter.bucketKey} onChange={e => setFilter({ bucketKey: e.target.value })}>
-            <option value="">{t('selector.any')}</option>
-            {bucketKeys.map(b => <option key={b} value={b}>{b}</option>)}
           </select>
         </div>
       </div>
@@ -1035,46 +987,64 @@ function DraftForm({
         )}
       </div>
 
-      {/* Bucket preview — what (bucketStart, bucketEnd) will be sent to the backend */}
-      {bucketPreview && (
-        <div
-          style={{
-            fontSize: '0.78rem',
-            color: '#a1a1aa',
-            background: '#1c1c1f',
-            border: '1px solid #2d2d31',
-            borderRadius: 4,
-            padding: '0.4rem 0.6rem',
-            marginBottom: '0.6rem',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 8,
-          }}
-        >
-          <span style={{ color: '#71717a' }}>{t('bucketPreview.label')}</span>
-          <code style={{ color: '#e4e4e7' }}>{bucketPreview.start}</code>
-          <span>→</span>
-          <code style={{ color: '#e4e4e7' }}>{bucketPreview.end}</code>
+      {/* Editable bucket — start and end dates with a reset button.
+          Defaults: start = min(selected.start_time), end = max(selected.end_time).
+          User can override either via calendar; Reset clears both overrides
+          and falls back to the derived defaults.  Max-safe-delay reacts to the
+          start date in real time. */}
+      <div
+        style={{
+          fontSize: '0.78rem',
+          color: '#a1a1aa',
+          background: '#1c1c1f',
+          border: '1px solid #2d2d31',
+          borderRadius: 4,
+          padding: '0.4rem 0.6rem',
+          marginBottom: '0.6rem',
+          display: 'flex',
+          alignItems: 'center',
+          flexWrap: 'wrap',
+          gap: 12,
+        }}
+      >
+        <span style={{ color: '#71717a' }}>{t('bucketPreview.label')}</span>
+        <input
+          type="date"
+          value={draft.manualBucketStart || derivedStart || ''}
+          onChange={e => setDraft({ ...draft, manualBucketStart: e.target.value })}
+          disabled={derivedStart == null && draft.manualBucketStart === ''}
+          style={{ ...inputStyle, padding: '2px 4px', fontSize: '0.78rem' }}
+        />
+        <button
+          type="button"
+          className="secondary"
+          style={{ fontSize: '0.74rem', padding: '2px 8px' }}
+          onClick={() => setDraft({ ...draft, manualBucketStart: '' })}
+          disabled={draft.manualBucketStart === ''}
+          title={t('bucketPreview.resetTooltip')}
+        >{t('bucketPreview.reset')}</button>
+        {startPreview?.manuallyEdited && (
           <span
             style={{
               fontSize: '0.7rem',
               padding: '1px 6px',
               borderRadius: 10,
-              background: bucketPreview.source === 'derived' ? 'rgba(167,139,250,0.18)' : 'rgba(56,189,248,0.18)',
-              color: bucketPreview.source === 'derived' ? '#c4b5fd' : '#7dd3fc',
-              border: `1px solid ${bucketPreview.source === 'derived' ? 'rgba(167,139,250,0.4)' : 'rgba(56,189,248,0.4)'}`,
+              background: 'rgba(56,189,248,0.18)',
+              color: '#7dd3fc',
+              border: '1px solid rgba(56,189,248,0.4)',
             }}
-          >
-            {bucketPreview.source === 'derived' ? t('bucketPreview.derived') : t('bucketPreview.fromKey')}
-          </span>
-        </div>
-      )}
+          >{t('bucketPreview.manuallyEdited')}</span>
+        )}
+        {startPreview === null && draft.selectedGids.size === 0 && (
+          <span style={{ color: '#52525b', fontSize: '0.74rem' }}>{t('bucketPreview.pickWosFirst')}</span>
+        )}
+      </div>
 
       {/* Max safe delay chip (closed-form availability — sub-millisecond on the server). */}
       <AvailabilityChip
         caseId={caseId}
         baselinePlanRunId={baselinePlanRunId}
-        bucketPreview={bucketPreview}
+        bucketStart={startPreview?.start ?? null}
         selectedGids={draft.selectedGids}
         currentDelayDays={draft.changeMode === 'days' ? draft.delayDays : null}
         onUse={(n) => setDraft({ ...draft, changeMode: 'days', delayDays: n })}
@@ -1203,7 +1173,7 @@ function ResultsTable({ result }: { result: WoScheduleImpactResult }) {
                 <td style={td}>{fmtDate(d.contingentCommitTime)}</td>
                 <td style={{ ...td, textAlign: 'right', color: d.daysDelta > 0 ? '#fbbf24' : '#a1a1aa' }}>{d.daysDelta}</td>
                 <td style={{ ...td, color: STATUS_COLOR[d.status] ?? '#a1a1aa' }}>
-                  {t(`status.${d.status}` as 'status.delivery_delayed' | 'status.newly_late_vs_due' | 'status.no_change')}
+                  {t(`status.${d.status}` as 'status.delayed' | 'status.no_change')}
                 </td>
               </tr>
             ))}
@@ -1224,14 +1194,14 @@ const td: React.CSSProperties = { padding: '0.35rem 0.5rem' };
 function AvailabilityChip({
   caseId,
   baselinePlanRunId,
-  bucketPreview,
+  bucketStart,
   selectedGids,
   currentDelayDays,
   onUse,
 }: {
   caseId: number;
   baselinePlanRunId: number | null;
-  bucketPreview: { start: string; end: string; source: 'key' | 'derived' } | null;
+  bucketStart: string | null;
   selectedGids: Set<string>;
   currentDelayDays: number | null;
   onUse: (n: number) => void;
@@ -1241,12 +1211,12 @@ function AvailabilityChip({
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
-  // Stable token for debouncing — recompute when bucket or selection changes.
+  // Stable token for debouncing — recompute when start time or selection changes.
   const gidsKey = React.useMemo(() => Array.from(selectedGids).sort().join(','), [selectedGids]);
-  const token = `${bucketPreview?.start ?? ''}|${bucketPreview?.end ?? ''}|${gidsKey}`;
+  const token = `${bucketStart ?? ''}|${gidsKey}`;
 
   React.useEffect(() => {
-    if (!bucketPreview || selectedGids.size === 0) {
+    if (!bucketStart || selectedGids.size === 0) {
       setData(null);
       setError(null);
       return;
@@ -1258,8 +1228,7 @@ function AvailabilityChip({
       try {
         const r = await analyzeWoAvailability({
           selectors: [{
-            bucketStart: bucketPreview.start,
-            bucketEnd: bucketPreview.end,
+            bucketStart,
             woGroupIds: Array.from(selectedGids),
           }],
           planRunId: baselinePlanRunId,
@@ -1426,8 +1395,8 @@ function RunsHistory({ runs, loading }: { runs: WoScheduleRun[]; loading: boolea
 
 /**
  * Lightweight modal opened from the per-WO row action in the work-orders table.
- * Pre-fills woGroupIds with the row's gid and bucketStart/bucketEnd with the
- * row's start/end. User picks delayDays or delayToDate and clicks Analyze.
+ * Pre-fills woGroupIds with the row's gid and bucketStart with the row's start.
+ * User picks delayDays or delayToDate and clicks Analyze.
  */
 export function WoScheduleQuickModal({
   caseId,
@@ -1442,7 +1411,6 @@ export function WoScheduleQuickModal({
 }) {
   const t = useTranslations('planning.woScheduleImpact');
   const startStr = (wo.start_time ?? '').slice(0, 10);
-  const endStr = (wo.end_time ?? wo.start_time ?? '').slice(0, 10);
   const [changeMode, setChangeMode] = React.useState<'days' | 'date'>('days');
   const [delayDays, setDelayDays] = React.useState(7);
   const [delayToDate, setDelayToDate] = React.useState('');
@@ -1455,7 +1423,7 @@ export function WoScheduleQuickModal({
       setError('Missing wo_group_id on selected row');
       return;
     }
-    if (!startStr || !endStr) {
+    if (!startStr) {
       setError(t('error.noBucketDates'));
       return;
     }
@@ -1473,7 +1441,6 @@ export function WoScheduleQuickModal({
       const r = await analyzeWoScheduleImpact({
         selectors: [{
           bucketStart: startStr,
-          bucketEnd: endStr,
           woGroupIds: [wo.wo_group_id],
         }],
         delayDays: changeMode === 'days' ? delayDays : null,
@@ -1511,7 +1478,7 @@ export function WoScheduleQuickModal({
           <button type="button" className="secondary" onClick={onClose}>✕</button>
         </div>
         <div style={{ fontSize: '0.8rem', color: '#a1a1aa', marginBottom: '0.75rem' }}>
-          {wo.product_id}@{wo.location_id} ({wo.method}) · wo_group_id=<strong>{wo.wo_group_id ?? '?'}</strong> · {startStr}…{endStr}
+          {wo.product_id}@{wo.location_id} ({wo.method}) · wo_group_id=<strong>{wo.wo_group_id ?? '?'}</strong> · start {startStr}
         </div>
 
         <div style={{ display: 'flex', gap: '0.75rem', marginBottom: '0.6rem' }}>
