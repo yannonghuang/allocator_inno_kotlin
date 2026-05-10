@@ -11,6 +11,8 @@ import com.allocator.MethodMoves
 import com.allocator.PlanRuns
 import com.allocator.Products
 import com.allocator.Supplies
+import com.allocator.WoScheduleEvents
+import com.allocator.services.emitPlanRunEvent
 import org.jetbrains.exposed.sql.SortOrder
 import org.jetbrains.exposed.sql.max
 import com.allocator.services.CaseBootstrap
@@ -31,6 +33,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -490,6 +493,78 @@ L3 WORKFLOW RULES (these govern recommend_config and suggest_next_batch chains):
     before mentioning it. (b) Any rationale for "why this config" MUST cite either a
     plan_run_id from KB evidence or a query_design_docs quote — never both, never neither.
     No self-authored mechanism stories ("this will help because…"); always ground in evidence.
+
+──────────────────────────────────────────────────────────────────────
+WORKFLOW — Downtime / maintenance window scheduling
+──────────────────────────────────────────────────────────────────────
+
+Trigger phrases (any of):  "shut down X for N days",  "machine outage",  "line maintenance",
+"prod area shutdown",  "take down line/area …",  "can I take L1 offline for a week",
+"schedule a maintenance window".
+
+Steps (DO NOT skip any):
+
+  1. **Ground the user's term**. Never trust free-form labels verbatim.
+     - For prod_area phrases ("OE", "assy line", "FAB"): call list_prod_areas.
+       If exactly one match, use it. If multiple plausible matches (substring,
+       prefix), ask the user which one. If none match, ask for clarification —
+       don't guess.
+     - For locations ("L1", "building 2", "plant A"): call list_locations.
+     - For products: call get_product_methods or query find_wos with product_id.
+
+  2. **Resolve the date**. Use <current_date> in the system prompt to convert
+     relative phrases into ISO yyyy-MM-dd:
+       "starting Monday"      → next Monday after today.
+       "in 2 weeks"           → today + 14 days.
+       "starting mid-July"    → 2026-07-15.
+       "next quarter"         → first day of next calendar quarter.
+     If date is fully omitted ("can I shut down OE for 7 days"), default
+     bucketStart = today; mention this assumption in your reply.
+
+  3. **Identify the WO set** with find_wos(prod_area=…, start_after=bucketStart,
+     start_before=bucketStart + 90 days, limit=200). The 90-day horizon avoids
+     pulling in WOs from a year out. Pull wo_group_id values from the result.
+
+  4. **Get the safety envelope**: analyze_wo_availability(selectors=[{
+     bucketStart, woGroupIds=[…all matched gids…]}]). Read max_feasible_days +
+     bottlenecks.
+
+  5. **Decide the response shape based on N vs max_feasible_days**:
+     - N ≤ max_feasible_days  → Safe. Optionally offer create_wo_schedule_event
+       to record the scenario; no impact run needed.
+     - N > max_feasible_days  → Run analyze_wo_schedule_impact(delay_days=N,
+       persist=true). Surface impacted_demand_count, top 3-5 impacted demands
+       (demandId, customer, daysDelta), and the contingent_plan_run_id.
+
+  6. **Suggest options** when N exceeds max-safe (always present at least 2):
+     a. "Reduce shutdown to max_feasible_days days" — pure safe envelope.
+     b. "Try a different start date" — shift bucketStart later (re-run availability).
+     c. "Accept the impact" — confirm with user, then promote_plan_run on the
+        contingent run to amend the plan. Never auto-promote.
+
+  7. **Confirmation gate**: NEVER call promote_plan_run without an explicit user
+     "yes, promote" / "go ahead and amend" / equivalent. If the user only says
+     "interesting" or doesn't acknowledge the destructive nature, ask first.
+
+Example A — within safe window:
+  User: "Can I take down line L1 for a week without breaking anything?"
+  Steps: list_locations → confirm L1 exists → find_wos(location_id=L1,
+  start_after=<today>) → analyze_wo_availability(selectors=[{bucketStart=<today>,
+  woGroupIds=[…]}]) → if max_feasible_days ≥ 7, reply "Yes — max safe is 14d,
+  your 7d is well inside. Want me to record the scenario?"
+
+Example B — exceeds safe window:
+  User: "I want to shut down the OE prod area for about 7 days, please analyze
+  impacts, suggest options, and possibly amend the plan."
+  Steps: list_prod_areas → resolve "OE" (might be "OE_ASSY"; ask if ambiguous)
+  → find_wos(prod_area=<resolved>, start_after=<today>) → analyze_wo_availability
+  → if max_feasible_days < 7 (say 3): analyze_wo_schedule_impact(delay_days=7,
+  persist=true). Reply with: "OE shutdown of 7d will delay 12 demand commits
+  (top 3: D_42 +4d for ACME, D_18 +4d for FOO, D_7 +3d for BAR). Max safe is
+  3d. Options: (a) reduce to 3d (no demand impact); (b) shift the start date
+  by 5d to 2026-05-15 — let me re-check; (c) accept the impact and promote
+  contingent plan run #N as the new baseline. Which one?" — then on user's
+  confirmation, promote_plan_run(plan_run_id=N).
 """
 
 // ── Tool registry ────────────────────────────────────────────────────────────
@@ -506,7 +581,7 @@ private fun emptyParams(): JsonObject = buildJsonObject {
     put("required", buildJsonArray { })
 }
 
-private val TOOLS: List<LlmTool> = listOf(
+internal val TOOLS: List<LlmTool> = listOf(
     tool(
         "read_current_config",
         "Returns the working planning config for this conversation (most-recent saved or in-flight).",
@@ -1155,6 +1230,170 @@ private val TOOLS: List<LlmTool> = listOf(
                 putJsonObject("value") { put("description", "Any JSON value.") }
             }
             put("required", buildJsonArray { add("key"); add("value") })
+        },
+    ),
+
+    // ── WO schedule-change / maintenance-window tools ────────────────────────
+    tool(
+        "list_prod_areas",
+        "Return distinct prod_area values present in the case's baseline plan. Use BEFORE find_wos / " +
+            "analyze_wo_schedule_impact when the user uses a free-form term (e.g. 'OE', 'assy line') " +
+            "to ground it against the actual values. Returns count of WOs and a few sample products per area.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("plan_run_id") {
+                    put("type", "integer")
+                    put("description", "Plan run id; defaults to the latest success run for the case.")
+                }
+            }
+            put("required", buildJsonArray { })
+        },
+    ),
+    tool(
+        "list_locations",
+        "Return distinct location_id values present in the case's baseline plan, with WO counts. " +
+            "Use to ground free-form location terms (e.g. 'L1', 'building 2') against actual values.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("plan_run_id") {
+                    put("type", "integer")
+                    put("description", "Plan run id; defaults to the latest success run for the case.")
+                }
+            }
+            put("required", buildJsonArray { })
+        },
+    ),
+    tool(
+        "find_wos",
+        "List work orders matching the given filters, aggregated one row per wo_group_id. Use to " +
+            "identify candidates for a maintenance/downtime scenario before calling " +
+            "analyze_wo_availability / analyze_wo_schedule_impact. Filters AND together; omit any to " +
+            "match all. Returns up to `limit` rows (default 50, max 500).",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("prod_area")  { put("type", "string"); put("description", "Exact prod_area match.") }
+                putJsonObject("location_id"){ put("type", "string"); put("description", "Exact location_id match.") }
+                putJsonObject("product_id") { put("type", "string"); put("description", "Exact product_id match.") }
+                putJsonObject("method")     { put("type", "string"); put("description", "make / move / buy.") }
+                putJsonObject("start_after") {
+                    put("type", "string")
+                    put("description", "ISO yyyy-MM-dd. Include WOs whose start_time ≥ this date.")
+                }
+                putJsonObject("start_before") {
+                    put("type", "string")
+                    put("description", "ISO yyyy-MM-dd. Include WOs whose start_time ≤ this date.")
+                }
+                putJsonObject("plan_run_id") { put("type", "integer") }
+                putJsonObject("limit")       { put("type", "integer"); put("description", "Default 50, max 500.") }
+            }
+            put("required", buildJsonArray { })
+        },
+    ),
+    tool(
+        "analyze_wo_availability",
+        "Closed-form max-safe-delay probe. For the given selectors, returns the largest N such that " +
+            "displacing the front of the bucket by N days leaves every demand commit_time unchanged. " +
+            "STRICT criterion (any commit shift = unsafe). Sub-millisecond. Returns max_feasible_days, " +
+            "binding bottlenecks, and bottleneck demand details.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("selectors") {
+                    put("type", "array")
+                    put("description", "List of {bucketStart: ISO yyyy-MM-dd, woGroupIds: [string]}. Typically one entry.")
+                    putJsonObject("items") {
+                        put("type", "object")
+                        putJsonObject("properties") {
+                            putJsonObject("bucketStart") { put("type", "string") }
+                            putJsonObject("woGroupIds") {
+                                put("type", "array")
+                                putJsonObject("items") { put("type", "string") }
+                            }
+                        }
+                        put("required", buildJsonArray { add("bucketStart"); add("woGroupIds") })
+                    }
+                }
+                putJsonObject("plan_run_id") { put("type", "integer") }
+            }
+            put("required", buildJsonArray { add("selectors") })
+        },
+    ),
+    tool(
+        "analyze_wo_schedule_impact",
+        "Run the full impact analysis: shift the matched WOs by delay_days (or to delay_to_date) and " +
+            "report which demand commit_times move. Synchronous (~ sub-second to a few seconds). When " +
+            "persist=true, creates a contingent plan run and returns its id (use promote_plan_run later " +
+            "if the user accepts). Response also includes max_feasible_days for context.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("selectors") {
+                    put("type", "array")
+                    putJsonObject("items") {
+                        put("type", "object")
+                        putJsonObject("properties") {
+                            putJsonObject("bucketStart") { put("type", "string") }
+                            putJsonObject("woGroupIds") {
+                                put("type", "array")
+                                putJsonObject("items") { put("type", "string") }
+                            }
+                        }
+                        put("required", buildJsonArray { add("bucketStart"); add("woGroupIds") })
+                    }
+                }
+                putJsonObject("delay_days") { put("type", "integer"); put("description", "Mutually exclusive with delay_to_date.") }
+                putJsonObject("delay_to_date") { put("type", "string"); put("description", "ISO yyyy-MM-dd.") }
+                putJsonObject("plan_run_id") { put("type", "integer") }
+                putJsonObject("persist") {
+                    put("type", "boolean")
+                    put("description", "Default true. When true, the contingent run is saved (promotable).")
+                }
+                putJsonObject("note") { put("type", "string") }
+            }
+            put("required", buildJsonArray { add("selectors") })
+        },
+    ),
+    tool(
+        "create_wo_schedule_event",
+        "Persist a WO schedule-change event so it shows up on the WO Schedule Impact page for later " +
+            "review/replay. Selectors + delay match analyze_wo_schedule_impact. Returns the event id.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("selectors") {
+                    put("type", "array")
+                    putJsonObject("items") {
+                        put("type", "object")
+                        putJsonObject("properties") {
+                            putJsonObject("bucketStart") { put("type", "string") }
+                            putJsonObject("woGroupIds") {
+                                put("type", "array")
+                                putJsonObject("items") { put("type", "string") }
+                            }
+                        }
+                        put("required", buildJsonArray { add("bucketStart"); add("woGroupIds") })
+                    }
+                }
+                putJsonObject("delay_days")    { put("type", "integer") }
+                putJsonObject("delay_to_date") { put("type", "string") }
+                putJsonObject("note")          { put("type", "string") }
+            }
+            put("required", buildJsonArray { add("selectors") })
+        },
+    ),
+    tool(
+        "promote_plan_run",
+        "Promote a contingent plan run to status='success' — making it the active baseline. ALWAYS " +
+            "confirm with the user before calling this; never auto-promote. Idempotent on already-promoted runs.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("plan_run_id") { put("type", "integer") }
+            }
+            put("required", buildJsonArray { add("plan_run_id") })
         },
     ),
 )
@@ -4258,6 +4497,12 @@ private suspend fun runAgentLoop(
         append("\n<active_run_id>")
         append(activeRunId?.toString() ?: "(none)")
         append("</active_run_id>")
+        // Today's date — used to resolve relative phrases ("next Monday",
+        // "in 2 weeks", "starting mid-July") into the ISO yyyy-MM-dd form
+        // the schedule-change tools require.
+        append("\n<current_date>")
+        append(java.time.LocalDate.now().toString())
+        append("</current_date>")
     }
 
     val convo = mutableListOf<LlmAgentMessage>()
@@ -4373,7 +4618,423 @@ private suspend fun dispatchTool(
         "get_soundness_summary" -> Pair(toolGetSoundnessSummary(caseId, args, locale), workingConfig)
         "read_memory" -> Pair(toolReadMemory(caseId, locale), workingConfig)
         "write_memory" -> Pair(toolWriteMemory(caseId, args, locale), workingConfig)
+        "list_prod_areas" -> Pair(toolListProdAreas(caseId, args, locale), workingConfig)
+        "list_locations" -> Pair(toolListLocations(caseId, args, locale), workingConfig)
+        "find_wos" -> Pair(toolFindWos(caseId, args, locale), workingConfig)
+        "analyze_wo_availability" -> Pair(toolAnalyzeWoAvailability(caseId, args, locale), workingConfig)
+        "analyze_wo_schedule_impact" -> Pair(toolAnalyzeWoScheduleImpact(caseId, args, locale), workingConfig)
+        "create_wo_schedule_event" -> Pair(toolCreateWoScheduleEvent(caseId, args, locale), workingConfig)
+        "promote_plan_run" -> Pair(toolPromotePlanRun(caseId, args, locale), workingConfig)
         else -> Pair(toolError("unknown tool: ${call.name}", locale), workingConfig)
+    }
+}
+
+// ── WO schedule-change / maintenance-window tool handlers ───────────────────
+
+/** Pull the work-orders list out of a baseline plan-run result. Returns null
+ *  if no baseline exists or the result is empty. */
+@Suppress("UNCHECKED_CAST")
+private fun loadBaselineWorkOrders(caseId: Int, planRunId: Int?): List<Map<String, Any?>>? {
+    val result = loadPlanResultFromDb(caseId, planRunId) ?: return null
+    return (result["work_orders"] as? List<Map<String, Any?>>)
+}
+
+/** True if the WO is a synthetic VirtualProduct_* placeholder (planner-internal,
+ *  not an actual shop-floor work order — same filter the UI applies). */
+private fun isVirtualProductWo(wo: Map<String, Any?>): Boolean {
+    val pid = wo["product_id"] as? String ?: return false
+    return pid.startsWith("VirtualProduct_")
+}
+
+private fun toolListProdAreas(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val planRunId = args["plan_run_id"]?.jsonPrimitive?.intOrNull
+    val wos = loadBaselineWorkOrders(caseId, planRunId)
+        ?: return ToolResult(
+            summary = loc("no baseline plan run; run plan first", "尚无基线计划，请先生成计划", locale),
+            payload = buildJsonObject { put("error", "no_baseline") },
+        )
+    val byArea = wos.asSequence()
+        .filter { !isVirtualProductWo(it) }
+        .filter { it["wo_group_id"] != null }
+        .groupBy { (it["prod_area"] as? String) ?: "" }
+    val rows = byArea.entries
+        .filter { it.key.isNotBlank() }
+        .map { (area, list) ->
+            val gids = list.mapNotNull { it["wo_group_id"] as? String }.toSet()
+            val sampleProducts = list.mapNotNull { it["product_id"] as? String }
+                .toSet().sorted().take(5)
+            Triple(area, gids.size, sampleProducts)
+        }
+        .sortedByDescending { it.second }
+    return ToolResult(
+        summary = loc("${rows.size} prod_area(s)", "${rows.size} 个生产区", locale),
+        payload = buildJsonObject {
+            put("count", rows.size)
+            put("prod_areas", buildJsonArray {
+                rows.forEach { (area, woCount, samples) ->
+                    add(buildJsonObject {
+                        put("prod_area", area)
+                        put("wo_count", woCount)
+                        put("sample_products", buildJsonArray { samples.forEach { add(it) } })
+                    })
+                }
+            })
+        },
+    )
+}
+
+private fun toolListLocations(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val planRunId = args["plan_run_id"]?.jsonPrimitive?.intOrNull
+    val wos = loadBaselineWorkOrders(caseId, planRunId)
+        ?: return ToolResult(
+            summary = loc("no baseline plan run; run plan first", "尚无基线计划，请先生成计划", locale),
+            payload = buildJsonObject { put("error", "no_baseline") },
+        )
+    val byLoc = wos.asSequence()
+        .filter { !isVirtualProductWo(it) }
+        .filter { it["wo_group_id"] != null }
+        .groupBy { (it["location_id"] as? String) ?: "" }
+    val rows = byLoc.entries
+        .filter { it.key.isNotBlank() }
+        .map { (loc, list) ->
+            val gids = list.mapNotNull { it["wo_group_id"] as? String }.toSet()
+            loc to gids.size
+        }
+        .sortedByDescending { it.second }
+    return ToolResult(
+        summary = loc("${rows.size} location(s)", "${rows.size} 个地点", locale),
+        payload = buildJsonObject {
+            put("count", rows.size)
+            put("locations", buildJsonArray {
+                rows.forEach { (locId, woCount) ->
+                    add(buildJsonObject {
+                        put("location_id", locId)
+                        put("wo_count", woCount)
+                    })
+                }
+            })
+        },
+    )
+}
+
+private fun toolFindWos(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val planRunId = args["plan_run_id"]?.jsonPrimitive?.intOrNull
+    val prodArea = args["prod_area"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+    val locationId = args["location_id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+    val productId = args["product_id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+    val method = args["method"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+    val startAfter = args["start_after"]?.jsonPrimitive?.contentOrNull?.let {
+        runCatching { java.time.LocalDate.parse(it) }.getOrNull()
+    }
+    val startBefore = args["start_before"]?.jsonPrimitive?.contentOrNull?.let {
+        runCatching { java.time.LocalDate.parse(it) }.getOrNull()
+    }
+    val limit = (args["limit"]?.jsonPrimitive?.intOrNull ?: 50).coerceIn(1, 500)
+
+    val wos = loadBaselineWorkOrders(caseId, planRunId)
+        ?: return ToolResult(
+            summary = loc("no baseline plan run; run plan first", "尚无基线计划，请先生成计划", locale),
+            payload = buildJsonObject { put("error", "no_baseline") },
+        )
+
+    fun parseStart(wo: Map<String, Any?>): java.time.LocalDate? {
+        val s = (wo["start_time"] as? String)?.take(10) ?: return null
+        return runCatching { java.time.LocalDate.parse(s) }.getOrNull()
+    }
+
+    val filtered = wos.asSequence()
+        .filter { !isVirtualProductWo(it) && it["wo_group_id"] != null }
+        .filter { prodArea == null || it["prod_area"] == prodArea }
+        .filter { locationId == null || it["location_id"] == locationId }
+        .filter { productId == null || it["product_id"] == productId }
+        .filter { method == null || it["method"] == method }
+        .filter {
+            val s = parseStart(it) ?: return@filter false
+            (startAfter == null || s >= startAfter) && (startBefore == null || s <= startBefore)
+        }
+        .toList()
+
+    // Aggregate one row per wo_group_id: min(start), max(end), sum(qty), lot_count.
+    data class Agg(
+        var product: String, var location: String, var method: String, var prodArea: String?,
+        var demandId: String?, var minStart: String?, var maxEnd: String?, var qty: Double, var lotCount: Int,
+    )
+    val byGid = LinkedHashMap<String, Agg>()
+    for (w in filtered) {
+        val gid = w["wo_group_id"] as? String ?: continue
+        val ex = byGid[gid]
+        val start = w["start_time"] as? String
+        val end = w["end_time"] as? String
+        val q = (w["quantity"] as? Number)?.toDouble() ?: 0.0
+        if (ex == null) {
+            byGid[gid] = Agg(
+                product = (w["product_id"] as? String) ?: "",
+                location = (w["location_id"] as? String) ?: "",
+                method = (w["method"] as? String) ?: "",
+                prodArea = w["prod_area"] as? String,
+                demandId = w["demand_id"] as? String,
+                minStart = start,
+                maxEnd = end,
+                qty = q,
+                lotCount = 1,
+            )
+        } else {
+            if (start != null && (ex.minStart == null || start < ex.minStart!!)) ex.minStart = start
+            if (end != null && (ex.maxEnd == null || end > ex.maxEnd!!)) ex.maxEnd = end
+            ex.qty += q
+            ex.lotCount += 1
+        }
+    }
+    val ordered = byGid.entries.sortedBy { it.value.minStart ?: "" }.take(limit)
+
+    return ToolResult(
+        summary = loc(
+            "${ordered.size} matching WO(s) (${byGid.size} unique gids; ${filtered.size} lots)",
+            "匹配 ${ordered.size} 个工单 (${byGid.size} 个唯一 gid，${filtered.size} 条 lot)",
+            locale,
+        ),
+        payload = buildJsonObject {
+            put("count", ordered.size)
+            put("total_unique_gids", byGid.size)
+            put("total_lots", filtered.size)
+            put("truncated", byGid.size > ordered.size)
+            put("wos", buildJsonArray {
+                ordered.forEach { (gid, a) ->
+                    add(buildJsonObject {
+                        put("wo_group_id", gid)
+                        put("product_id", a.product)
+                        put("location_id", a.location)
+                        put("method", a.method)
+                        a.prodArea?.let { put("prod_area", it) }
+                        a.demandId?.let { put("demand_id", it) }
+                        a.minStart?.let { put("start_time", it) }
+                        a.maxEnd?.let { put("end_time", it) }
+                        put("quantity", a.qty)
+                        put("lot_count", a.lotCount)
+                    })
+                }
+            })
+        },
+    )
+}
+
+/** Parse a JSON list of {bucketStart, woGroupIds} into the kotlinx-serializable
+ *  WoScheduleSelector list. Returns null if the shape is wrong. */
+internal fun parseSelectorsArg(args: JsonObject): List<WoScheduleSelector>? {
+    val arr = args["selectors"] as? JsonArray ?: return null
+    return arr.mapNotNull { el ->
+        val obj = el as? JsonObject ?: return@mapNotNull null
+        val bucketStart = obj["bucketStart"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+        val gids = (obj["woGroupIds"] as? JsonArray)?.mapNotNull { it.jsonPrimitive.contentOrNull }
+            ?: return@mapNotNull null
+        WoScheduleSelector(bucketStart = bucketStart, woGroupIds = gids)
+    }
+}
+
+private fun toolAnalyzeWoAvailability(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val selectors = parseSelectorsArg(args)
+    if (selectors.isNullOrEmpty()) return ToolResult(
+        summary = loc("invalid selectors", "选择器格式错误", locale),
+        payload = buildJsonObject { put("error", "invalid_selectors") },
+    )
+    val planRunId = args["plan_run_id"]?.jsonPrimitive?.intOrNull
+    val req = WoScheduleImpactRequest(
+        selectors = selectors, delayDays = 1, planRunId = planRunId, caseId = caseId, persist = false,
+    )
+    val baseline = loadBaseline(req) ?: return ToolResult(
+        summary = loc("no baseline plan run", "尚无基线计划", locale),
+        payload = buildJsonObject { put("error", "no_baseline") },
+    )
+    val avail = computeAvailability(baseline.workOrders, baseline.peggingTrees, selectors)
+    val baselineCommits = extractCommitTimes(baseline.peggingTrees)
+    val bottleneckDemands = enrichBottleneckDemands(baseline.caseId, avail.bottlenecks, baselineCommits)
+    val bottlenecksJson = Json.encodeToJsonElement(
+        kotlinx.serialization.builtins.ListSerializer(WoAvailabilityBottleneck.serializer()),
+        avail.bottlenecks,
+    )
+    val bottleneckDemandsJson = Json.encodeToJsonElement(
+        kotlinx.serialization.builtins.ListSerializer(WoImpactedDemand.serializer()),
+        bottleneckDemands,
+    )
+    return ToolResult(
+        summary = loc(
+            "max safe ${avail.maxFeasibleDays}d (matched ${avail.matchedWoCount} WO, " +
+                "${bottleneckDemands.size} bottleneck demand(s))",
+            "最大安全延迟 ${avail.maxFeasibleDays} 天 (匹配 ${avail.matchedWoCount} 个工单，" +
+                "${bottleneckDemands.size} 个瓶颈需求)",
+            locale,
+        ),
+        payload = buildJsonObject {
+            put("max_feasible_days", avail.maxFeasibleDays)
+            put("matched_wo_count", avail.matchedWoCount)
+            put("bottlenecks", bottlenecksJson)
+            put("bottleneck_demands", bottleneckDemandsJson)
+            put("plan_run_id", baseline.planRunId)
+        },
+    )
+}
+
+private fun toolAnalyzeWoScheduleImpact(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val selectors = parseSelectorsArg(args)
+    if (selectors.isNullOrEmpty()) return ToolResult(
+        summary = loc("invalid selectors", "选择器格式错误", locale),
+        payload = buildJsonObject { put("error", "invalid_selectors") },
+    )
+    val delayDays = args["delay_days"]?.jsonPrimitive?.intOrNull
+    val delayToDate = args["delay_to_date"]?.jsonPrimitive?.contentOrNull
+    if (delayDays == null && delayToDate.isNullOrBlank()) return ToolResult(
+        summary = loc("delay_days or delay_to_date required", "需指定 delay_days 或 delay_to_date", locale),
+        payload = buildJsonObject { put("error", "no_delay") },
+    )
+    val planRunId = args["plan_run_id"]?.jsonPrimitive?.intOrNull
+    val persist = args["persist"]?.jsonPrimitive?.booleanOrNull ?: true
+    val note = args["note"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+    val req = WoScheduleImpactRequest(
+        selectors = selectors,
+        delayDays = delayDays,
+        delayToDate = delayToDate,
+        planRunId = planRunId,
+        caseId = caseId,
+        persist = persist,
+        note = note,
+    )
+    return when (val r = runWoScheduleImpactInline(req)) {
+        is WoImpactResult.Failed -> ToolResult(
+            summary = loc("impact analysis failed: ${r.reason}", "影响分析失败：${r.reason}", locale),
+            payload = buildJsonObject { put("error", r.reason) },
+        )
+        is WoImpactResult.Ok -> {
+            val resp = r.response
+            val withinSafe = (resp.delayDays != null && resp.maxFeasibleDays != null &&
+                resp.delayDays <= resp.maxFeasibleDays)
+            ToolResult(
+                summary = loc(
+                    "impact: ${resp.matchedWoCount} WO shifted, ${resp.impactedDemandCount} demand(s) delayed; " +
+                        "max safe ${resp.maxFeasibleDays}d (${if (withinSafe) "within" else "exceeds"})",
+                    "影响：${resp.matchedWoCount} 个工单后移，${resp.impactedDemandCount} 个需求延迟；" +
+                        "最大安全 ${resp.maxFeasibleDays} 天 (${if (withinSafe) "安全范围内" else "超出"})",
+                    locale,
+                ),
+                payload = Json.encodeToJsonElement(WoScheduleImpactResponse.serializer(), resp),
+            )
+        }
+    }
+}
+
+private fun toolCreateWoScheduleEvent(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val selectors = parseSelectorsArg(args)
+    if (selectors.isNullOrEmpty()) return ToolResult(
+        summary = loc("invalid selectors", "选择器格式错误", locale),
+        payload = buildJsonObject { put("error", "invalid_selectors") },
+    )
+    val delayDays = args["delay_days"]?.jsonPrimitive?.intOrNull
+    val delayToDate = args["delay_to_date"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+    val note = args["note"]?.jsonPrimitive?.contentOrNull?.trim()
+    if (delayDays == null && delayToDate == null) return ToolResult(
+        summary = loc("delay_days or delay_to_date required", "需指定 delay_days 或 delay_to_date", locale),
+        payload = buildJsonObject { put("error", "no_delay") },
+    )
+    val selectorsJsonStr = Json.encodeToString(
+        kotlinx.serialization.builtins.ListSerializer(WoScheduleSelector.serializer()),
+        selectors,
+    )
+    val newId = transaction {
+        WoScheduleEvents.insert {
+            it[WoScheduleEvents.caseId] = caseId
+            it[WoScheduleEvents.selectorsJson] = selectorsJsonStr
+            it[WoScheduleEvents.delayDays] = delayDays
+            it[WoScheduleEvents.delayToDate] = delayToDate
+            it[WoScheduleEvents.note] = note
+        }[WoScheduleEvents.id]
+    }
+    return ToolResult(
+        summary = loc("event #$newId created", "已创建事件 #$newId", locale),
+        payload = buildJsonObject {
+            put("event_id", newId)
+            put("case_id", caseId)
+        },
+    )
+}
+
+private fun toolPromotePlanRun(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val planRunId = args["plan_run_id"]?.jsonPrimitive?.intOrNull
+        ?: return ToolResult(
+            summary = loc("plan_run_id required", "需指定 plan_run_id", locale),
+            payload = buildJsonObject { put("error", "missing_plan_run_id") },
+        )
+    val outcome: String = transaction {
+        val row = PlanRuns.selectAll()
+            .where { (PlanRuns.id eq planRunId) and (PlanRuns.caseId eq caseId) }
+            .firstOrNull() ?: return@transaction "not_found"
+        val status = row[PlanRuns.status]
+        val supersededBy = row[PlanRuns.supersededByPlanRunId]
+        when {
+            status == "success" -> "already_promoted"
+            status == "contingent" && supersededBy != null -> "superseded:$supersededBy"
+            status == "contingent" -> {
+                PlanRuns.update({ PlanRuns.id eq planRunId }) { it[PlanRuns.status] = "success" }
+                emitPlanRunEvent(caseId, planRunId, "promoted", buildJsonObject {
+                    put("from_status", JsonPrimitive("contingent"))
+                    put("to_status", JsonPrimitive("success"))
+                    put("source", JsonPrimitive("planning_agent"))
+                })
+                "promoted"
+            }
+            else -> "wrong_status:$status"
+        }
+    }
+    return when {
+        outcome == "promoted" -> ToolResult(
+            summary = loc("plan run #$planRunId promoted to success", "计划运行 #$planRunId 已升格为正式", locale),
+            payload = buildJsonObject {
+                put("plan_run_id", planRunId)
+                put("new_status", "success")
+            },
+        )
+        outcome == "already_promoted" -> ToolResult(
+            summary = loc("plan run #$planRunId is already at success (no-op)", "计划运行 #$planRunId 已是正式状态 (无需操作)", locale),
+            payload = buildJsonObject {
+                put("plan_run_id", planRunId)
+                put("new_status", "success")
+                put("noop", true)
+            },
+        )
+        outcome.startsWith("superseded:") -> {
+            val later = outcome.removePrefix("superseded:")
+            ToolResult(
+                summary = loc(
+                    "plan run #$planRunId is superseded by #$later — promote that one instead",
+                    "计划运行 #$planRunId 已被 #$later 取代，请升格后者",
+                    locale,
+                ),
+                payload = buildJsonObject {
+                    put("error", "superseded")
+                    put("superseded_by_plan_run_id", later.toIntOrNull())
+                },
+            )
+        }
+        outcome == "not_found" -> ToolResult(
+            summary = loc("plan run #$planRunId not found for case $caseId", "案例 $caseId 找不到计划运行 #$planRunId", locale),
+            payload = buildJsonObject { put("error", "not_found") },
+        )
+        outcome.startsWith("wrong_status:") -> {
+            val st = outcome.removePrefix("wrong_status:")
+            ToolResult(
+                summary = loc(
+                    "plan run #$planRunId has status='$st' — only contingent runs can be promoted",
+                    "计划运行 #$planRunId 状态为 '$st'，仅 contingent 状态可升格",
+                    locale,
+                ),
+                payload = buildJsonObject {
+                    put("error", "wrong_status")
+                    put("status", st)
+                },
+            )
+        }
+        else -> ToolResult(
+            summary = loc("unexpected outcome: $outcome", "意外结果：$outcome", locale),
+            payload = buildJsonObject { put("error", outcome) },
+        )
     }
 }
 

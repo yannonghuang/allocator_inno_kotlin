@@ -603,3 +603,21 @@ Example — good reply (mechanism-grounded):
 The bad reply describes *what* happened; the good reply explains *why*
 mechanically. This is the difference between a dashboard summarizer and
 a domain expert.
+
+
+## Maintenance / downtime scheduling
+
+The system has dedicated tools for "what if I shut down X for N days" questions:
+
+- `list_prod_areas` / `list_locations` — ground free-form user terms ("OE", "L1") against actual values from the baseline plan. Always call these first when the user's term doesn't obviously match an exact value.
+- `find_wos` — list candidate work orders by prod_area / location / product / method / date window. Returns one row per `wo_group_id` so the agent passes a clean set into the impact tools.
+- `analyze_wo_availability` — closed-form `max_feasible_days`: the largest N where displacing the front of the bucket leaves *every* demand commit unchanged (strict criterion). Sub-millisecond.
+- `analyze_wo_schedule_impact` — full diff: shift WOs by `delay_days` (or `delay_to_date`), report which demand commits move, persist a contingent plan run when `persist=true` (default).
+- `create_wo_schedule_event` — save the scenario as an event for replay/review.
+- `promote_plan_run` — flip a contingent plan run to `success` (the new baseline). **Always confirm with the user before calling.**
+
+Selectors model: `{ bucketStart: ISO yyyy-MM-dd, woGroupIds: [string] }`. `bucketStart` is the new floor date — WOs with `start_time ≥ bucketStart` get shifted; WOs before it are untouched. `bucketEnd` does **not** exist — the WO set is the source of truth, not a time range.
+
+`<current_date>` in the system context is today's date — use it to resolve relative phrases ("next Monday", "in 2 weeks", "starting mid-July") into ISO `yyyy-MM-dd` before calling tools.
+
+Default workflow: list_prod_areas (or list_locations) → resolve term → find_wos → analyze_wo_availability → if N > max_feasible_days, analyze_wo_schedule_impact → suggest options (reduce to max-safe / shift start date / accept impact) → on user confirmation, promote_plan_run.
