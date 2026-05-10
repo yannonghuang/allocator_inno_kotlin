@@ -64,6 +64,66 @@ import java.util.UUID
 
 private val log = LoggerFactory.getLogger("com.allocator.PlanningAgentRoutes")
 
+// ── Pending maintenance-decision cache (prompt-context memory) ───────────────
+//
+// Background: when analyze_wo_schedule_impact persists a contingent plan run
+// and the user accepts on the next turn, the LLM was emitting promote_plan_run
+// with the wrong plan_run_id — it pulled the integer from <active_run_id> in
+// the system prompt instead of the contingent_plan_run_id from the prior
+// tool-result trace. Two valid integers in context, no clear pointer to which
+// one to use → wrong-args tool emission.
+//
+// Fix: after a contingent is created we stash its id here (per-case, TTL'd),
+// and the next agent-loop invocation injects a <pending_maintenance_decision>
+// block into the system prompt that names the id explicitly. The workflow
+// rules already say "use the contingent_plan_run_id from step 5"; this makes
+// that id structurally available alongside <active_run_id> with a distinct
+// label so the model can't conflate them.
+//
+// The LLM is still in charge of choosing tools and emitting calls — this
+// cache is pure prompt-context memory, not a deterministic short-circuit.
+//
+// Cache is cleared when promote_plan_run is called with the matching id (so
+// the pending offer doesn't linger after it's accepted). Auto-expires after
+// PENDING_MAINTENANCE_TTL_MIN minutes if the user walks away.
+internal data class PendingMaintenanceDecision(
+    val contingentPlanRunId: Int,
+    val maxFeasibleDays: Int?,
+    val capturedAt: java.time.Instant,
+)
+private val pendingMaintenance = java.util.concurrent.ConcurrentHashMap<Int, PendingMaintenanceDecision>()
+private const val PENDING_MAINTENANCE_TTL_MIN = 30L
+
+internal fun rememberPendingMaintenance(caseId: Int, contingentPlanRunId: Int, maxFeasibleDays: Int?) {
+    pendingMaintenance[caseId] = PendingMaintenanceDecision(
+        contingentPlanRunId = contingentPlanRunId,
+        maxFeasibleDays = maxFeasibleDays,
+        capturedAt = java.time.Instant.now(),
+    )
+    sweepPendingMaintenance()
+}
+
+internal fun loadPendingMaintenance(caseId: Int): PendingMaintenanceDecision? {
+    val p = pendingMaintenance[caseId] ?: return null
+    val ageMin = java.time.temporal.ChronoUnit.MINUTES.between(p.capturedAt, java.time.Instant.now())
+    if (ageMin > PENDING_MAINTENANCE_TTL_MIN) {
+        pendingMaintenance.remove(caseId)
+        return null
+    }
+    return p
+}
+
+internal fun clearPendingMaintenance(caseId: Int) {
+    pendingMaintenance.remove(caseId)
+}
+
+private fun sweepPendingMaintenance() {
+    val now = java.time.Instant.now()
+    pendingMaintenance.entries.removeIf { (_, p) ->
+        java.time.temporal.ChronoUnit.MINUTES.between(p.capturedAt, now) > PENDING_MAINTENANCE_TTL_MIN
+    }
+}
+
 // ── Wire contract ────────────────────────────────────────────────────────────
 //
 //   POST /cases/{caseId}/planning-agent
@@ -554,11 +614,15 @@ Steps (DO NOT skip any):
        2. "Try a different start date" — shift bucketStart later (re-run availability).
        3. "Accept the impact and amend the plan" — promote the contingent.
 
-  7. **On user acceptance of option (c)** — directly call promote_plan_run with
-     the **literal `contingent_plan_run_id` value that step 5's
-     analyze_wo_schedule_impact returned in its summary line**
-     ("…contingent_plan_run_id=<N>"). NOT a number from this prompt's example —
-     pull the real id from your most recent tool-result trace. DO NOT re-run
+  7. **On user acceptance of option (c)** — directly call promote_plan_run.
+     The `plan_run_id` argument MUST come from the
+     `<pending_maintenance_decision>` block in the system prompt context (the
+     `contingent_plan_run_id=N` line). Do **NOT** use `<active_run_id>` or
+     `<viewing_run_id>` — those are baseline ids unrelated to the contingent
+     and using them is a no-op (active run is already at status="success") that
+     silently fails. Do **NOT** copy a number from this prompt's example.
+     If `<pending_maintenance_decision>` is absent, the offer has expired or
+     was already accepted — ask the user instead of guessing. DO NOT re-run
      find_wos / analyze_wo_availability / analyze_wo_schedule_impact — the
      contingent run is already saved with the correct WO set; re-running could
      pick a different WO set and a different contingent.
@@ -625,9 +689,14 @@ your tool-result trace):
     promote contingent plan run #«CONTINGENT_ID» as the new baseline".
   When user picks option 3 — by ANY form, e.g. "3" / "三" / "我选择 3" /
     "选择3" / "我选3" / "我选择C" / "yes, promote" / "接受" / "确认" /
-    "go ahead" — IMMEDIATELY call promote_plan_run(plan_run_id=«CONTINGENT_ID»)
-    using the actual integer you captured, NOT a literal from this example.
+    "go ahead" — IMMEDIATELY call
+    promote_plan_run(plan_run_id=<contingent_plan_run_id from
+    <pending_maintenance_decision>>). The id comes from the
+    <pending_maintenance_decision> block in the system prompt — NOT from
+    <active_run_id>, NOT from <viewing_run_id>, NOT from this example.
     DO NOT re-run find_wos or analyze_wo_*. The contingent is already saved.
+  If <pending_maintenance_decision> is missing in the prompt, the offer has
+    expired or was already accepted — ask the user.
   If promote fails: report the error to the user; do not recover by
     re-running analysis.
 """
@@ -4568,6 +4637,25 @@ private suspend fun runAgentLoop(
         append("\n<current_date>")
         append(java.time.LocalDate.now().toString())
         append("</current_date>")
+        // Pending maintenance-decision context: when a prior turn ran
+        // analyze_wo_schedule_impact and produced a contingent plan run that
+        // hasn't been promoted yet, the contingent_plan_run_id is named here
+        // so the LLM uses THIS id (not <active_run_id>) for promote_plan_run
+        // when the user accepts. Cleared on successful promote of the matching
+        // id; otherwise auto-expires after PENDING_MAINTENANCE_TTL_MIN minutes.
+        val pendingForPrompt = loadPendingMaintenance(caseId)
+        if (pendingForPrompt != null) {
+            append("\n\n<pending_maintenance_decision>")
+            append("\n  contingent_plan_run_id=").append(pendingForPrompt.contingentPlanRunId)
+            pendingForPrompt.maxFeasibleDays?.let {
+                append("\n  max_feasible_days=").append(it)
+            }
+            append("\n  captured_at=").append(pendingForPrompt.capturedAt.toString())
+            append("\n  hint=When the user accepts option 3 of a maintenance offer (\"3\", \"三\", \"接受\", \"我选择 3\", \"yes, promote\", etc.), call promote_plan_run(plan_run_id=")
+            append(pendingForPrompt.contingentPlanRunId)
+            append("). Do NOT use <active_run_id> or <viewing_run_id> for this — they are unrelated baseline plan ids.")
+            append("\n</pending_maintenance_decision>")
+        }
     }
 
     val convo = mutableListOf<LlmAgentMessage>()
@@ -4972,6 +5060,13 @@ private fun toolAnalyzeWoScheduleImpact(caseId: Int, args: JsonObject, locale: S
             val resp = r.response
             val withinSafe = (resp.delayDays != null && resp.maxFeasibleDays != null &&
                 resp.delayDays <= resp.maxFeasibleDays)
+            // Stash the contingent_plan_run_id so the next agent-loop invocation
+            // injects it as a labeled block in the system prompt (see the
+            // PendingMaintenanceDecision docs). Only persisted runs produce an
+            // id worth promoting later.
+            if (resp.contingentPlanRunId != null) {
+                rememberPendingMaintenance(caseId, resp.contingentPlanRunId, resp.maxFeasibleDays)
+            }
             // Surface contingent_plan_run_id in the summary so the LLM sees the
             // actual id (and won't fall back to a literal from the few-shot
             // example in the system prompt) when it later calls promote_plan_run.
@@ -5033,6 +5128,13 @@ private fun toolPromotePlanRun(caseId: Int, args: JsonObject, locale: String): T
             summary = loc("plan_run_id required", "需指定 plan_run_id", locale),
             payload = buildJsonObject { put("error", "missing_plan_run_id") },
         )
+    // If the agent passed the id of the pending maintenance contingent (or
+    // promotes any run after a maintenance offer), clear the cache so the
+    // <pending_maintenance_decision> block disappears from the next turn's
+    // prompt and we don't re-offer / re-trigger a promotion. We only clear
+    // when the id matches the cached one — promoting an unrelated run shouldn't
+    // wipe a still-pending maintenance offer.
+    val pending = loadPendingMaintenance(caseId)
     val outcome: String = transaction {
         val row = PlanRuns.selectAll()
             .where { (PlanRuns.id eq planRunId) and (PlanRuns.caseId eq caseId) }
@@ -5053,6 +5155,9 @@ private fun toolPromotePlanRun(caseId: Int, args: JsonObject, locale: String): T
             }
             else -> "wrong_status:$status"
         }
+    }
+    if (outcome == "promoted" && pending?.contingentPlanRunId == planRunId) {
+        clearPendingMaintenance(caseId)
     }
     return when {
         outcome == "promoted" -> ToolResult(

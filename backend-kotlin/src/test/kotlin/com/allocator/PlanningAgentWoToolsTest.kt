@@ -1,7 +1,10 @@
 package com.allocator
 
 import com.allocator.api.TOOLS
+import com.allocator.api.clearPendingMaintenance
+import com.allocator.api.loadPendingMaintenance
 import com.allocator.api.parseSelectorsArg
+import com.allocator.api.rememberPendingMaintenance
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.collections.shouldContain
 import io.kotest.matchers.collections.shouldContainAll
@@ -96,5 +99,44 @@ class PlanningAgentWoToolsTest : FunSpec({
         val sels = parseSelectorsArg(args)
         sels shouldNotBe null
         sels!!.isEmpty() shouldBe true
+    }
+
+    // ── PendingMaintenanceDecision cache lifecycle ───────────────────────────
+
+    test("pending maintenance — round-trip remember + load") {
+        val caseId = 990001
+        clearPendingMaintenance(caseId)
+        loadPendingMaintenance(caseId) shouldBe null
+
+        rememberPendingMaintenance(caseId, contingentPlanRunId = 612, maxFeasibleDays = 5)
+        val loaded = loadPendingMaintenance(caseId)
+        loaded shouldNotBe null
+        loaded!!.contingentPlanRunId shouldBe 612
+        loaded.maxFeasibleDays shouldBe 5
+
+        clearPendingMaintenance(caseId)
+        loadPendingMaintenance(caseId) shouldBe null
+    }
+
+    test("pending maintenance — overwrite on second remember") {
+        val caseId = 990002
+        clearPendingMaintenance(caseId)
+        rememberPendingMaintenance(caseId, contingentPlanRunId = 100, maxFeasibleDays = 3)
+        rememberPendingMaintenance(caseId, contingentPlanRunId = 200, maxFeasibleDays = 7)
+        loadPendingMaintenance(caseId)!!.contingentPlanRunId shouldBe 200
+        clearPendingMaintenance(caseId)
+    }
+
+    test("pending maintenance — independent per case") {
+        clearPendingMaintenance(990003)
+        clearPendingMaintenance(990004)
+        rememberPendingMaintenance(990003, contingentPlanRunId = 111, maxFeasibleDays = null)
+        rememberPendingMaintenance(990004, contingentPlanRunId = 222, maxFeasibleDays = null)
+        loadPendingMaintenance(990003)!!.contingentPlanRunId shouldBe 111
+        loadPendingMaintenance(990004)!!.contingentPlanRunId shouldBe 222
+        clearPendingMaintenance(990003)
+        loadPendingMaintenance(990003) shouldBe null
+        loadPendingMaintenance(990004)!!.contingentPlanRunId shouldBe 222
+        clearPendingMaintenance(990004)
     }
 })
