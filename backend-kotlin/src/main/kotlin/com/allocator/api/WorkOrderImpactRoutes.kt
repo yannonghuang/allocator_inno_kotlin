@@ -210,7 +210,7 @@ private fun resultToJson(v: Any?): JsonElement = when (v) {
 
 // ── Background job ────────────────────────────────────────────────────────────
 
-private data class BaselineLoad(
+internal data class BaselineLoad(
     val caseId: Int,
     val planRunId: Int,
     val workOrders: List<Map<String, Any?>>,
@@ -231,7 +231,7 @@ private data class WoMeta(
 )
 
 @Suppress("UNCHECKED_CAST")
-private fun loadBaseline(req: WoScheduleImpactRequest): BaselineLoad? = transaction {
+internal fun loadBaseline(req: WoScheduleImpactRequest): BaselineLoad? = transaction {
     val baselineRow = if (req.planRunId != null) {
         val cond: Op<Boolean> = (PlanRuns.id eq req.planRunId) and (PlanRuns.status eq "success")
         val finalCond = if (req.caseId != null) cond and (PlanRuns.caseId eq req.caseId) else cond
@@ -417,7 +417,7 @@ private fun applyShifts(
 
 /** Pull baseline commit_time from each demand-root tree. */
 @Suppress("UNCHECKED_CAST")
-private fun extractCommitTimes(peggingTrees: List<Map<String, Any?>>): Map<String, String?> {
+internal fun extractCommitTimes(peggingTrees: List<Map<String, Any?>>): Map<String, String?> {
     val out = mutableMapOf<String, String?>()
     for (entry in peggingTrees) {
         val demandId = entry["demand_id"]?.toString()?.trim() ?: continue
@@ -591,7 +591,7 @@ internal fun computeAvailability(
 }
 
 /** Enrich demand-root bottlenecks with product/customer/due metadata. */
-private fun enrichBottleneckDemands(
+internal fun enrichBottleneckDemands(
     caseId: Int,
     bottlenecks: List<WoAvailabilityBottleneck>,
     baselineCommits: Map<String, String?>,
@@ -634,190 +634,175 @@ private fun enrichBottleneckDemands(
     }
 }
 
+/** Sealed result for the inline impact pipeline so callers (HTTP background
+ *  runner + planning agent's tool layer) get typed errors instead of stringly-
+ *  typed exceptions. */
+internal sealed class WoImpactResult {
+    data class Ok(val response: WoScheduleImpactResponse) : WoImpactResult()
+    data class Failed(val reason: String) : WoImpactResult()
+}
+
+/** Synchronous core of the WO schedule-impact analysis. Used by:
+ *  - the existing async job (`runWoScheduleImpactBackground`), as a thin wrapper.
+ *  - the planning agent's `analyze_wo_schedule_impact` tool (no async needed
+ *    because the inline pipeline is sequencing-only and runs sub-second).
+ *
+ *  `jobId` is recorded on persisted contingent plan-run rows for traceability.
+ *  Pass an empty string when there's no calling job (purely informational). */
+internal fun runWoScheduleImpactInline(req: WoScheduleImpactRequest, jobId: String = ""): WoImpactResult {
+    val validationError = validateRequest(req)
+    if (validationError != null) return WoImpactResult.Failed(validationError)
+
+    val baseline = loadBaseline(req)
+        ?: return WoImpactResult.Failed(
+            if (req.planRunId != null) "Plan run ${req.planRunId} not found or not in success state."
+            else "No successful plan run available. Run a plan first."
+        )
+
+    val delayToDate = req.delayToDate?.let { parseIsoDateLoose(it) }
+    val (lotShift, matchedGids) = computeShifts(
+        baseline.workOrders, req.selectors, req.delayDays, delayToDate,
+    )
+
+    if (lotShift.isEmpty()) {
+        return WoImpactResult.Failed("No work orders matched the selectors / shift was zero")
+    }
+
+    log.info(
+        "wo-schedule-impact: jobId={} caseId={} baseline={} matched_lots={} matched_gids={} delayDays={} delayToDate={}",
+        jobId, baseline.caseId, baseline.planRunId, lotShift.size, matchedGids.size,
+        req.delayDays, req.delayToDate,
+    )
+
+    val (mutatedLots, mutatedTrees) = applyShifts(baseline.workOrders, baseline.peggingTrees, lotShift)
+    val sequenced = resequenceFromPegging(mutatedLots, mutatedTrees)
+
+    // ── Diff ─────────────────────────────────────────────────────────────
+    val baselineCommits = extractCommitTimes(baseline.peggingTrees)
+    val contingentCommits = extractCommitTimes(sequenced.peggingTrees)
+    val allDemandIds = (baselineCommits.keys + contingentCommits.keys).toSet()
+
+    val impactedRows = mutableListOf<Pair<String, Triple<String?, String?, Int>>>()
+    // (demandId, baselineCommit, contingentCommit, daysDelta)
+    for (did in allDemandIds) {
+        val b = baselineCommits[did]
+        val c = contingentCommits[did]
+        val bD = parseIsoDateLoose(b)
+        val cD = parseIsoDateLoose(c)
+        val delta = if (bD != null && cD != null) ChronoUnit.DAYS.between(bD, cD).toInt() else 0
+        if (delta > 0) impactedRows.add(did to Triple(b, c, delta))
+    }
+
+    val contingentResultMap: Map<String, Any> = baseline.resultMap.toMutableMap().apply {
+        put("work_orders", sequenced.workOrders)
+        put("planning_pegging", sequenced.peggingTrees)
+    }
+
+    // ── Build impacts list (mirrors material-impact's enrichment).
+    val impacts: List<WoImpactedDemand> = if (impactedRows.isNotEmpty()) {
+        val demandIds = impactedRows.map { it.first }
+        val metas: Map<String, WoMeta> = transaction {
+            Demands.selectAll()
+                .where { (Demands.caseId eq baseline.caseId) and (Demands.demandId inList demandIds) }
+                .associate { d ->
+                    d[Demands.demandId] to WoMeta(
+                        demandId = d[Demands.demandId],
+                        productId = d[Demands.productId],
+                        locationId = d[Demands.locationId],
+                        customerId = d[Demands.customerId],
+                        description = d[Demands.description],
+                        priority = d[Demands.priority],
+                        requestDueTime = d[Demands.requestDueTime],
+                        requestedQty = d[Demands.quantity],
+                    )
+                }
+        }
+        impactedRows.mapNotNull { (did, t) ->
+            val (b, c, delta) = t
+            val m = metas[did] ?: return@mapNotNull null
+            val status = if (delta > 0) "delayed" else "no_change"
+            WoImpactedDemand(
+                demandId = m.demandId, productId = m.productId, locationId = m.locationId,
+                customerId = m.customerId, description = m.description, priority = m.priority,
+                requestDueTime = m.requestDueTime, requestedQty = m.requestedQty,
+                baselineCommitTime = b, contingentCommitTime = c, daysDelta = delta, status = status,
+            )
+        }.sortedByDescending { it.daysDelta }
+    } else emptyList()
+
+    // ── Persist contingent plan run (if requested) ───────────────────────
+    val contingentPlanRunId: Int? = if (req.persist) {
+        val metadataJson = buildJsonObject {
+            put("type", "wo_schedule_contingent")
+            if (req.delayDays != null) put("delayDays", req.delayDays)
+            if (req.delayToDate != null) put("delayToDate", req.delayToDate)
+            put("baselinePlanRunId", baseline.planRunId)
+            put("matchedWoCount", lotShift.size)
+            put("impactedDemandCount", impactedRows.size)
+            req.note?.let { put("note", it) }
+            req.woScheduleEventId?.let { put("woScheduleEventId", it) }
+            put("selectors", buildJsonArray {
+                for (sel in req.selectors) {
+                    add(buildJsonObject {
+                        put("bucketStart", sel.bucketStart)
+                        put("woGroupIds", buildJsonArray { sel.woGroupIds.forEach { add(it) } })
+                    })
+                }
+            })
+            put("impacts", Json.encodeToJsonElement(impacts))
+        }.toString()
+        val contingentResultJson = runCatching { resultToJson(contingentResultMap).toString() }.getOrNull()
+        transaction {
+            val planRunId = PlanRuns.insert {
+                it[PlanRuns.caseId] = baseline.caseId
+                it[PlanRuns.jobId] = jobId.ifBlank { null }
+                it[PlanRuns.status] = "contingent"
+                it[PlanRuns.config] = baseline.configJson
+                it[PlanRuns.result] = contingentResultJson
+                it[PlanRuns.metadata] = metadataJson
+                if (req.woScheduleEventId != null) it[PlanRuns.woScheduleEventId] = req.woScheduleEventId
+            }[PlanRuns.id]
+            emitPlanRunEvent(baseline.caseId, planRunId, "created", buildJsonObject {
+                put("source", "wo_schedule_impact")
+                put("baseline_plan_run_id", JsonPrimitive(baseline.planRunId))
+                put("matched_wo_count", JsonPrimitive(lotShift.size))
+                if (req.woScheduleEventId != null) put("wo_schedule_event_id", JsonPrimitive(req.woScheduleEventId))
+            })
+            planRunId
+        }
+    } else null
+
+    // ── Availability envelope (closed-form, sub-millisecond) ─────────────
+    val avail = computeAvailability(baseline.workOrders, baseline.peggingTrees, req.selectors)
+
+    return WoImpactResult.Ok(WoScheduleImpactResponse(
+        caseId = baseline.caseId,
+        planRunId = baseline.planRunId,
+        contingentPlanRunId = contingentPlanRunId,
+        matchedWoCount = lotShift.size,
+        delayDays = req.delayDays,
+        delayToDate = req.delayToDate,
+        impactedDemandCount = impactedRows.size,
+        impacts = impacts,
+        note = req.note,
+        maxFeasibleDays = avail.maxFeasibleDays,
+        bottlenecks = avail.bottlenecks,
+    ))
+}
+
 private suspend fun runWoScheduleImpactBackground(jobId: String, req: WoScheduleImpactRequest) {
     try {
-        val validationError = validateRequest(req)
-        if (validationError != null) {
-            woImpactJobs[jobId]?.apply {
-                set("status", "failed")
-                set("error", validationError)
+        when (val r = runWoScheduleImpactInline(req, jobId)) {
+            is WoImpactResult.Ok -> woImpactJobs[jobId]?.apply {
+                set("status", "completed")
+                set("result", Json.encodeToJsonElement(r.response))
                 set("completedAt", Instant.now())
             }
-            return
-        }
-
-        val baseline = loadBaseline(req)
-        if (baseline == null) {
-            val note = if (req.planRunId != null)
-                "Plan run ${req.planRunId} not found or not in success state."
-            else
-                "No successful plan run available. Run a plan first."
-            woImpactJobs[jobId]?.apply {
+            is WoImpactResult.Failed -> woImpactJobs[jobId]?.apply {
                 set("status", "failed")
-                set("error", note)
+                set("error", r.reason)
                 set("completedAt", Instant.now())
             }
-            return
-        }
-
-        val delayToDate = req.delayToDate?.let { parseIsoDateLoose(it) }
-        val (lotShift, matchedGids) = computeShifts(
-            baseline.workOrders, req.selectors, req.delayDays, delayToDate,
-        )
-
-        if (lotShift.isEmpty()) {
-            woImpactJobs[jobId]?.apply {
-                set("status", "failed")
-                set("error", "No work orders matched the selectors / shift was zero")
-                set("completedAt", Instant.now())
-            }
-            return
-        }
-
-        log.info(
-            "wo-schedule-impact: jobId={} caseId={} baseline={} matched_lots={} matched_gids={} delayDays={} delayToDate={}",
-            jobId, baseline.caseId, baseline.planRunId, lotShift.size, matchedGids.size,
-            req.delayDays, req.delayToDate,
-        )
-
-        val (mutatedLots, mutatedTrees) = applyShifts(baseline.workOrders, baseline.peggingTrees, lotShift)
-        val sequenced = resequenceFromPegging(mutatedLots, mutatedTrees)
-
-        // ── Diff ─────────────────────────────────────────────────────────────
-        val baselineCommits = extractCommitTimes(baseline.peggingTrees)
-        val contingentCommits = extractCommitTimes(sequenced.peggingTrees)
-        val allDemandIds = (baselineCommits.keys + contingentCommits.keys).toSet()
-
-        val impactedRows = mutableListOf<Pair<String, Triple<String?, String?, Int>>>()
-        // (demandId, baselineCommit, contingentCommit, daysDelta)
-        for (did in allDemandIds) {
-            val b = baselineCommits[did]
-            val c = contingentCommits[did]
-            val bD = parseIsoDateLoose(b)
-            val cD = parseIsoDateLoose(c)
-            val delta = if (bD != null && cD != null) ChronoUnit.DAYS.between(bD, cD).toInt() else 0
-            if (delta > 0) impactedRows.add(did to Triple(b, c, delta))
-        }
-
-        val contingentResultMap: Map<String, Any> = baseline.resultMap.toMutableMap().apply {
-            put("work_orders", sequenced.workOrders)
-            put("planning_pegging", sequenced.peggingTrees)
-        }
-
-        // ── Build impacts list (mirrors material-impact's enrichment).
-        // Built BEFORE persistence so the impacts can be cached in metadata for
-        // fast per-event run-history rendering without re-deriving from the full
-        // baseline+contingent diff on every list call.
-        val impacts: List<WoImpactedDemand> = if (impactedRows.isNotEmpty()) {
-            val demandIds = impactedRows.map { it.first }
-            val metas: Map<String, WoMeta> = transaction {
-                Demands.selectAll()
-                    .where { (Demands.caseId eq baseline.caseId) and (Demands.demandId inList demandIds) }
-                    .associate { d ->
-                        d[Demands.demandId] to WoMeta(
-                            demandId = d[Demands.demandId],
-                            productId = d[Demands.productId],
-                            locationId = d[Demands.locationId],
-                            customerId = d[Demands.customerId],
-                            description = d[Demands.description],
-                            priority = d[Demands.priority],
-                            requestDueTime = d[Demands.requestDueTime],
-                            requestedQty = d[Demands.quantity],
-                        )
-                    }
-            }
-            impactedRows.mapNotNull { (did, t) ->
-                val (b, c, delta) = t
-                val m = metas[did] ?: return@mapNotNull null
-                // Binary outcome based on the schedule change itself: did the
-                // contingent commit move relative to the baseline commit?
-                // request_due_time is informational context only — whether the
-                // demand was already late at baseline is a pre-existing
-                // planner condition, not something the schedule change produced.
-                val status = if (delta > 0) "delayed" else "no_change"
-                WoImpactedDemand(
-                    demandId = m.demandId,
-                    productId = m.productId,
-                    locationId = m.locationId,
-                    customerId = m.customerId,
-                    description = m.description,
-                    priority = m.priority,
-                    requestDueTime = m.requestDueTime,
-                    requestedQty = m.requestedQty,
-                    baselineCommitTime = b,
-                    contingentCommitTime = c,
-                    daysDelta = delta,
-                    status = status,
-                )
-            }.sortedByDescending { it.daysDelta }
-        } else emptyList()
-
-        // ── Persist contingent plan run (if requested) ───────────────────────
-        val contingentPlanRunId: Int? = if (req.persist) {
-            val metadataJson = buildJsonObject {
-                put("type", "wo_schedule_contingent")
-                if (req.delayDays != null) put("delayDays", req.delayDays)
-                if (req.delayToDate != null) put("delayToDate", req.delayToDate)
-                put("baselinePlanRunId", baseline.planRunId)
-                put("matchedWoCount", lotShift.size)
-                put("impactedDemandCount", impactedRows.size)
-                req.note?.let { put("note", it) }
-                req.woScheduleEventId?.let { put("woScheduleEventId", it) }
-                put("selectors", buildJsonArray {
-                    for (sel in req.selectors) {
-                        add(buildJsonObject {
-                            put("bucketStart", sel.bucketStart)
-                            put("woGroupIds", buildJsonArray { sel.woGroupIds.forEach { add(it) } })
-                        })
-                    }
-                })
-                // Cache the per-demand impacts so the per-event run-history endpoint
-                // can return them without re-deriving from the full plan result.
-                put("impacts", Json.encodeToJsonElement(impacts))
-            }.toString()
-            val contingentResultJson = runCatching { resultToJson(contingentResultMap).toString() }.getOrNull()
-            transaction {
-                val planRunId = PlanRuns.insert {
-                    it[PlanRuns.caseId] = baseline.caseId
-                    it[PlanRuns.jobId] = jobId
-                    it[PlanRuns.status] = "contingent"
-                    it[PlanRuns.config] = baseline.configJson
-                    it[PlanRuns.result] = contingentResultJson
-                    it[PlanRuns.metadata] = metadataJson
-                    if (req.woScheduleEventId != null) it[PlanRuns.woScheduleEventId] = req.woScheduleEventId
-                }[PlanRuns.id]
-                emitPlanRunEvent(baseline.caseId, planRunId, "created", buildJsonObject {
-                    put("source", "wo_schedule_impact")
-                    put("baseline_plan_run_id", JsonPrimitive(baseline.planRunId))
-                    put("matched_wo_count", JsonPrimitive(lotShift.size))
-                    if (req.woScheduleEventId != null) put("wo_schedule_event_id", JsonPrimitive(req.woScheduleEventId))
-                })
-                planRunId
-            }
-        } else null
-
-        // ── Availability envelope (closed-form, sub-millisecond) ─────────────
-        // Compute alongside the impact diff so the UI can render the "within
-        // safe window / exceeds max safe" banner from a single Analyze call.
-        val avail = computeAvailability(baseline.workOrders, baseline.peggingTrees, req.selectors)
-
-        val resp = WoScheduleImpactResponse(
-            caseId = baseline.caseId,
-            planRunId = baseline.planRunId,
-            contingentPlanRunId = contingentPlanRunId,
-            matchedWoCount = lotShift.size,
-            delayDays = req.delayDays,
-            delayToDate = req.delayToDate,
-            impactedDemandCount = impactedRows.size,
-            impacts = impacts,
-            note = req.note,
-            maxFeasibleDays = avail.maxFeasibleDays,
-            bottlenecks = avail.bottlenecks,
-        )
-        woImpactJobs[jobId]?.apply {
-            set("status", "completed")
-            set("result", Json.encodeToJsonElement(resp))
-            set("completedAt", Instant.now())
         }
     } catch (e: Exception) {
         log.error("wo-schedule-impact job $jobId failed: ${e.message}", e)
