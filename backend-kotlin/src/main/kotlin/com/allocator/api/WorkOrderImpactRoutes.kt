@@ -1,6 +1,7 @@
 package com.allocator.api
 
 import com.allocator.*
+import com.allocator.services.PeggingDag
 import com.allocator.services.buildPeggingDag
 import com.allocator.services.emitPlanRunEvent
 import com.allocator.services.resequenceFromPegging
@@ -37,12 +38,17 @@ private const val WO_JOB_TTL_SECONDS = 600L
  * One bulk shift descriptor. The UI assembles this after the user has picked
  * a concrete set of WOs from a filterable preview list — so the backend
  * doesn't re-do the filtering. `bucketStart` is the maintenance-window start
- * date, used as:
- *   - For `delayDays N`, the front of the bucket displaces by N days (lots
- *     before `bucketStart` are unaffected; selected lots get the uniform N
- *     shift on the impact path).
- *   - For `delayToDate D`, the shift is `D - bucketStart`, applied uniformly
- *     across selected WOs.
+ * date. Shift semantics is **per-gid atomic front-shift**: the window blocks
+ * the interval `[bucketStart, windowEnd)` where `windowEnd = bucketStart +
+ * delayDays` (or `delayToDate`). For each selected WO group:
+ *   - Compute `gidStart_postBucket = min(lot.start across lots with
+ *     start >= bucketStart)`.
+ *   - If `gidStart_postBucket < windowEnd`, the gid overlaps the window.
+ *     All post-bucket lots of the gid shift forward by
+ *     `windowEnd - gidStart_postBucket` (uniformly — the gid moves as a
+ *     batch). In-flight lots (`start < bucketStart`) are not shifted.
+ *   - If `gidStart_postBucket >= windowEnd`, the gid is past the block;
+ *     leave it alone.
  *
  * The UI defaults `bucketStart = min(selected WO start_time)` and lets the
  * user override via a calendar input.
@@ -305,23 +311,48 @@ private fun computeShifts(
         val selGids = sel.woGroupIds.toHashSet()
         if (selGids.isEmpty()) continue
 
-        val shift: Long = when {
-            delayDays != null -> delayDays.toLong()
-            delayToDate != null -> ChronoUnit.DAYS.between(bucketStart, delayToDate)
-            else -> 0L
+        // Front-shift, **per-gid atomic** semantic: the maintenance window
+        // blocks the interval [bucketStart, windowEnd). A WO group's shift is
+        //   shift_gid = windowEnd - gidStart_postBucket
+        // where gidStart_postBucket = min(lot.start across lots with
+        // start >= bucketStart). The whole gid (all post-bucket lots) moves
+        // uniformly by shift_gid, so an OR-group's alts and a multi-lot gid
+        // stay coherent as a batch — matching how pushUp re-aligns per-alt.
+        //
+        // A gid whose earliest post-bucket lot already starts at or after
+        // windowEnd is past the block — left alone (shift_gid=0). This is
+        // what makes "maintenance from a date strictly later than the user's
+        // ask" safe when the entire WO group sits past windowEnd.
+        //
+        // computeAvailability's closed-form uses the same `absorption =
+        // gidStart - bucketStart` model, so under this rule the closed-form
+        // mfd and the simulation impactedDemandCount agree.
+        val windowEnd: LocalDate = when {
+            delayDays != null -> bucketStart.plusDays(delayDays.toLong())
+            delayToDate != null -> delayToDate
+            else -> continue
         }
-        if (shift == 0L) continue
+        if (!windowEnd.isAfter(bucketStart)) continue
 
+        val postBucketLotsByGid = HashMap<String, MutableList<Map<String, Any?>>>()
         for (wo in workOrders) {
             val gid = wo["wo_group_id"] as? String ?: continue
             if (gid !in selGids) continue
-            val startStr = wo["start_time"] as? String ?: continue
-            val startDt = parseIsoDateLoose(startStr) ?: continue
+            val startDt = parseIsoDateLoose(wo["start_time"] as? String) ?: continue
             if (startDt < bucketStart) continue
+            postBucketLotsByGid.getOrPut(gid) { mutableListOf() }.add(wo)
+        }
 
-            // Forward-only: take max shift across selectors.
-            val prior = lotShift[wo] ?: 0L
-            if (shift > prior) lotShift[wo] = shift
+        for ((gid, lots) in postBucketLotsByGid) {
+            val gidStart = lots.mapNotNull { parseIsoDateLoose(it["start_time"] as? String) }.minOrNull() ?: continue
+            if (!gidStart.isBefore(windowEnd)) continue
+            val shift = ChronoUnit.DAYS.between(gidStart, windowEnd)
+            if (shift <= 0L) continue
+            for (wo in lots) {
+                // Forward-only: take max shift across selectors.
+                val prior = lotShift[wo] ?: 0L
+                if (shift > prior) lotShift[wo] = shift
+            }
             matchedGids.add(gid)
         }
     }
@@ -590,6 +621,77 @@ internal fun computeAvailability(
     )
 }
 
+/** Diagnostic dump: fired only when [computeAvailability]'s closed-form mfd
+ *  says a schedule is safe but [runWoScheduleImpactInline]'s simulation finds
+ *  impacted demands at that same shift. Logs:
+ *   1. summary line (mfd vs actual shift vs impacted-demand count),
+ *   2. per impacted demand: level-1 WO children with baseline_end vs
+ *      sequenced_end and the per-child end delta — shows which child shifted
+ *      and pushed the demand commit,
+ *   3. per in-set WO: xStart, absorption (= xStart - bucketStart), xEnd —
+ *      the closed-form's per-WO "free shift" credit, useful to confirm
+ *      whether absorption is responsible for the over-optimism.
+ *
+ *  Sub-millisecond per fire (re-walks two DAGs once); zero cost when no
+ *  discrepancy. Intended for case-172-style triage of the mfd-vs-impacts gap.
+ */
+internal fun dumpAvailabilityDiscrepancy(
+    baselineWos: List<Map<String, Any?>>,
+    baselineTrees: List<Map<String, Any?>>,
+    sequencedWos: List<Map<String, Any?>>,
+    sequencedTrees: List<Map<String, Any?>>,
+    selectors: List<WoScheduleSelector>,
+    matchedGids: Set<String>,
+    shiftApplied: Int,
+    mfd: Int,
+    impactedRows: List<Pair<String, Triple<String?, String?, Int>>>,
+) {
+    log.warn(
+        "availability-discrepancy: mfd={} >= shift_applied={} but simulation impacted_demands={} matched_gids={}",
+        mfd, shiftApplied, impactedRows.size, matchedGids.size,
+    )
+
+    val baselineDag = buildPeggingDag(baselineWos, baselineTrees)
+    val sequencedDag = buildPeggingDag(sequencedWos, sequencedTrees)
+
+    fun maxEnd(dag: PeggingDag, gid: String): LocalDate? =
+        dag.lotsByGroup[gid]?.mapNotNull { parseIsoDateLoose(it["end_time"] as? String) }?.maxOrNull()
+    fun minStart(dag: PeggingDag, gid: String): LocalDate? =
+        dag.lotsByGroup[gid]?.mapNotNull { parseIsoDateLoose(it["start_time"] as? String) }?.minOrNull()
+
+    for ((did, t) in impactedRows) {
+        val (b, c, delta) = t
+        log.warn("  demand={} delta=+{}d baselineCommit={} contingentCommit={}", did, delta, b, c)
+        val children = (baselineDag.demandRootChildren[did] ?: emptySet()) +
+                       (sequencedDag.demandRootChildren[did] ?: emptySet())
+        for (gid in children) {
+            val bEnd = maxEnd(baselineDag, gid)
+            val sEnd = maxEnd(sequencedDag, gid)
+            val endDelta = if (bEnd != null && sEnd != null)
+                ChronoUnit.DAYS.between(bEnd, sEnd).toInt() else null
+            log.warn(
+                "    level1_child gid={} in_matched={} baseline_end={} sequenced_end={} delta={}d",
+                gid, gid in matchedGids, bEnd, sEnd, endDelta,
+            )
+        }
+    }
+
+    for (sel in selectors) {
+        val bucketStart = parseIsoDateLoose(sel.bucketStart) ?: continue
+        val selGids = sel.woGroupIds.toHashSet()
+        for (xGid in selGids) {
+            if (xGid !in matchedGids) continue
+            val xStart = minStart(baselineDag, xGid) ?: continue
+            val xEnd = maxEnd(baselineDag, xGid)
+            val absorption = ChronoUnit.DAYS.between(bucketStart, xStart).toInt()
+            log.warn(
+                "  inset_wo gid={} xStart={} xEnd={} bucketStart={} absorption={}d (closed-form per-WO credit)",
+                xGid, xStart, xEnd, bucketStart, absorption,
+            )
+        }
+    }
+}
+
 /** Enrich demand-root bottlenecks with product/customer/due metadata. */
 internal fun enrichBottleneckDemands(
     caseId: Int,
@@ -775,6 +877,18 @@ internal fun runWoScheduleImpactInline(req: WoScheduleImpactRequest, jobId: Stri
     // ── Availability envelope (closed-form, sub-millisecond) ─────────────
     val avail = computeAvailability(baseline.workOrders, baseline.peggingTrees, req.selectors)
 
+    // ── Diagnostic: closed-form mfd disagrees with simulation impact count.
+    // Fires only on the bug signature; cheap when there's no discrepancy.
+    val maxShiftApplied = lotShift.values.maxOrNull()?.toInt() ?: 0
+    if (impactedRows.isNotEmpty() && maxShiftApplied > 0 && avail.maxFeasibleDays >= maxShiftApplied) {
+        dumpAvailabilityDiscrepancy(
+            baseline.workOrders, baseline.peggingTrees,
+            sequenced.workOrders, sequenced.peggingTrees,
+            req.selectors, matchedGids, maxShiftApplied,
+            avail.maxFeasibleDays, impactedRows,
+        )
+    }
+
     return WoImpactResult.Ok(WoScheduleImpactResponse(
         caseId = baseline.caseId,
         planRunId = baseline.planRunId,
@@ -935,8 +1049,389 @@ fun Routing.workOrderImpactRoutes() {
                 bottleneckDemands = bottleneckDemands,
             ))
         }
+
+        // ── Execute a safe maintenance plan in one shot ───────────────────────
+        // Caller asserts the window is safe (delay_days within maxFeasibleDays).
+        // Endpoint runs availability check → impact (persist=true) → promote in
+        // one HTTP call, so the scheduling agent's Branch A collapses from a
+        // 5-step orchestration to a single tool call.
+        // Returns 409 unsafe if availability check fails (caller should fall
+        // back to the options branch).
+        post("/execute-safe") {
+            val rawBody = call.receiveText()
+            val req = try {
+                Json.decodeFromString<ExecuteSafeRequest>(rawBody)
+            } catch (e: Exception) {
+                log.error("execute-safe body parse failed: {} body={}", e.message, rawBody)
+                throw IllegalArgumentException("Invalid execute-safe body: ${e.message}")
+            }
+            if (req.prodArea.isBlank())
+                throw IllegalArgumentException("prodArea is required")
+            if (req.delayDays <= 0)
+                throw IllegalArgumentException("delayDays must be > 0")
+            val bucketStart = parseIsoDateLoose(req.bucketStart)
+                ?: throw IllegalArgumentException("bucketStart must be ISO yyyy-MM-dd")
+
+            // Resolve case/run (status="success" filter applies)
+            when (val r = resolveActiveCaseAndRun(req.caseId, req.planRunId)) {
+                is ResolveResult.Err -> {
+                    call.respond(r.status, ResolveError(r.error, r.reason))
+                    return@post
+                }
+                is ResolveResult.Ok -> {
+                    val resolved = r.ids
+
+                    val tmpReq = WoScheduleImpactRequest(
+                        selectors = listOf(WoScheduleSelector(bucketStart = req.bucketStart, woGroupIds = listOf("_probe"))),
+                        delayDays = 1, planRunId = resolved.planRunId, caseId = resolved.caseId, persist = false,
+                    )
+                    val baseline = loadBaseline(tmpReq)
+                        ?: throw NoSuchElementException("Plan run ${resolved.planRunId} not found or not in success state.")
+
+                    fun woStart(wo: Map<String, Any?>): LocalDate? {
+                        val s = (wo["start_time"] as? String)?.take(10) ?: return null
+                        return runCatching { LocalDate.parse(s) }.getOrNull()
+                    }
+                    val matching = baseline.workOrders.filter { wo ->
+                        !isVirtualProductWo(wo) &&
+                            wo["wo_group_id"] != null &&
+                            (wo["prod_area"] as? String) == req.prodArea &&
+                            (woStart(wo)?.let { !it.isBefore(bucketStart) } == true)
+                    }
+                    if (matching.isEmpty()) {
+                        call.respond(HttpStatusCode.NotFound, buildJsonObject {
+                            put("error", "no_wos_match")
+                            put("reason", "no WOs in prod_area=${req.prodArea} starting on or after ${req.bucketStart}")
+                        })
+                        return@post
+                    }
+                    val gids = matching.mapNotNull { it["wo_group_id"] as? String }.toSet().toList()
+                    val selectors = listOf(WoScheduleSelector(bucketStart = req.bucketStart, woGroupIds = gids))
+
+                    val avail = computeAvailability(baseline.workOrders, baseline.peggingTrees, selectors)
+                    if (avail.maxFeasibleDays < req.delayDays) {
+                        log.info(
+                            "execute-safe: unsafe — caseId={} prodArea={} delayDays={} maxFeasibleDays={}",
+                            resolved.caseId, req.prodArea, req.delayDays, avail.maxFeasibleDays,
+                        )
+                        call.respond(HttpStatusCode.Conflict, buildJsonObject {
+                            put("error", "unsafe")
+                            put("reason", "delayDays=${req.delayDays} exceeds maxFeasibleDays=${avail.maxFeasibleDays}; use options branch")
+                            put("maxFeasibleDays", avail.maxFeasibleDays)
+                            put("matchedWoCount", avail.matchedWoCount)
+                        })
+                        return@post
+                    }
+
+                    val impactReq = WoScheduleImpactRequest(
+                        selectors = selectors,
+                        delayDays = req.delayDays,
+                        planRunId = resolved.planRunId,
+                        caseId = resolved.caseId,
+                        persist = true,
+                        note = req.note,
+                    )
+                    val impactResult = runWoScheduleImpactInline(impactReq)
+                    if (impactResult is WoImpactResult.Failed) {
+                        call.respond(HttpStatusCode.InternalServerError, buildJsonObject {
+                            put("error", "impact_failed")
+                            put("reason", impactResult.reason)
+                        })
+                        return@post
+                    }
+                    val response = (impactResult as WoImpactResult.Ok).response
+
+                    if (response.impactedDemandCount != 0) {
+                        // Contingent was created but is unsafe → must not be left orphan.
+                        // Every generated contingent ends either promoted or deleted.
+                        val orphanCprId = response.contingentPlanRunId
+                        if (orphanCprId != null) {
+                            transaction {
+                                PlanRuns.deleteWhere {
+                                    (PlanRuns.id eq orphanCprId) and (PlanRuns.caseId eq resolved.caseId)
+                                }
+                            }
+                            log.info(
+                                "execute-safe: deleted orphan contingent {} (impactedDemandCount={})",
+                                orphanCprId, response.impactedDemandCount,
+                            )
+                        }
+                        call.respond(HttpStatusCode.Conflict, buildJsonObject {
+                            put("error", "unexpected_impact")
+                            put("reason", "availability said safe but impact shows ${response.impactedDemandCount} impacted demands; contingent deleted")
+                            put("impactedDemandCount", response.impactedDemandCount)
+                        })
+                        return@post
+                    }
+                    val cprId = response.contingentPlanRunId
+                        ?: throw IllegalStateException("persist=true but no contingentPlanRunId in result")
+
+                    // Promote the contingent run to status="success"
+                    transaction {
+                        val row = PlanRuns.selectAll()
+                            .where { (PlanRuns.id eq cprId) and (PlanRuns.caseId eq resolved.caseId) }
+                            .firstOrNull()
+                            ?: throw NoSuchElementException("PlanRun $cprId not found for case ${resolved.caseId}")
+                        val status = row[PlanRuns.status]
+                        when (status) {
+                            "contingent" -> {
+                                PlanRuns.update({ PlanRuns.id eq cprId }) { it[PlanRuns.status] = "success" }
+                                emitPlanRunEvent(resolved.caseId, cprId, "promoted", buildJsonObject {
+                                    put("from_status", JsonPrimitive("contingent"))
+                                    put("to_status", JsonPrimitive("success"))
+                                    put("source", JsonPrimitive("execute-safe"))
+                                })
+                            }
+                            "success" -> { /* already promoted — idempotent */ }
+                            else -> throw IllegalStateException("Just-created run has status=$status; expected contingent")
+                        }
+                    }
+
+                    log.info(
+                        "execute-safe: caseId={} baseline={} contingent={} prodArea={} bucketStart={} delayDays={} → committed",
+                        resolved.caseId, resolved.planRunId, cprId, req.prodArea, req.bucketStart, req.delayDays,
+                    )
+                    call.respond(buildJsonObject {
+                        put("caseId", resolved.caseId)
+                        put("baselinePlanRunId", resolved.planRunId)
+                        put("contingentPlanRunId", cprId)
+                        put("bucketStart", req.bucketStart)
+                        put("delayDays", req.delayDays)
+                        put("prodArea", req.prodArea)
+                        put("matchedWoCount", avail.matchedWoCount)
+                        put("maxFeasibleDays", avail.maxFeasibleDays)
+                        put("impactedDemandCount", 0)
+                        put("promoted", true)
+                        put("status", "success")
+                    })
+                }
+            }
+        }
+
+        // ── Earliest safe maintenance start (Option B optimizer) ──────────────
+        // Given a prod_area, delayDays, and a starting search date, find the
+        // earliest bucketStart at which simulation shows zero impact. Iterates
+        // server-side over wo.start_time+1 boundary dates with verification.
+        // Algorithm lives in findEarliestSafeStartInline so both this HTTP
+        // endpoint and the planning-agent tool can reuse it.
+        post("/earliest-safe-start") {
+            val rawBody = call.receiveText()
+            val req = try {
+                Json.decodeFromString<EarliestSafeStartRequest>(rawBody)
+            } catch (e: Exception) {
+                log.error("earliest-safe-start body parse failed: {} body={}", e.message, rawBody)
+                throw IllegalArgumentException("Invalid earliest-safe-start body: ${e.message}")
+            }
+            when (val result = findEarliestSafeStartInline(req)) {
+                is EarliestSafeStartResult.Ok -> call.respond(result.response)
+                is EarliestSafeStartResult.NotFound -> {
+                    call.respond(HttpStatusCode.NotFound, buildJsonObject {
+                        put("error", "no_safe_start_within_horizon")
+                        put("reason", "scanned ${result.iterations} of ${result.candidatesScanned} candidate dates; none produced zero-impact simulation")
+                        put("lastBottleneckGid", result.lastBottleneckGid)
+                        put("lastBottleneckEnd", result.lastBottleneckEnd)
+                        put("lastMaxFeasibleDays", result.lastMaxFeasibleDays)
+                        put("iterations", result.iterations)
+                    })
+                }
+                is EarliestSafeStartResult.BadRequest -> throw IllegalArgumentException(result.reason)
+                is EarliestSafeStartResult.NoBaseline -> throw NoSuchElementException(result.reason)
+            }
+        }
     }
 }
+
+/** Sealed result for the earliest-safe-start algorithm, used by both the HTTP
+ *  endpoint (`POST /wo-schedule-impact/earliest-safe-start`) and the planning
+ *  agent's `find_earliest_safe_start` tool. */
+internal sealed class EarliestSafeStartResult {
+    data class Ok(val response: EarliestSafeStartResponse) : EarliestSafeStartResult()
+    data class NotFound(
+        val lastBottleneckGid: String?,
+        val lastBottleneckEnd: String?,
+        val lastMaxFeasibleDays: Int,
+        val iterations: Int,
+        val candidatesScanned: Int,
+    ) : EarliestSafeStartResult()
+    data class BadRequest(val reason: String) : EarliestSafeStartResult()
+    data class NoBaseline(val reason: String) : EarliestSafeStartResult()
+}
+
+@Suppress("UNCHECKED_CAST")
+internal fun findEarliestSafeStartInline(req: EarliestSafeStartRequest): EarliestSafeStartResult {
+    if (req.prodArea.isBlank()) return EarliestSafeStartResult.BadRequest("prodArea is required")
+    if (req.delayDays <= 0) return EarliestSafeStartResult.BadRequest("delayDays must be > 0")
+    val afterDate = parseIsoDateLoose(req.afterDate)
+        ?: return EarliestSafeStartResult.BadRequest("afterDate must be ISO yyyy-MM-dd")
+    val maxIterations = (req.maxIterations ?: 50).coerceIn(1, 200)
+
+    val impactReq = WoScheduleImpactRequest(
+        selectors = listOf(WoScheduleSelector(bucketStart = req.afterDate, woGroupIds = listOf("_probe"))),
+        delayDays = 1,
+        planRunId = req.planRunId,
+        caseId = req.caseId,
+        persist = false,
+    )
+    val baseline = loadBaseline(impactReq)
+        ?: return EarliestSafeStartResult.NoBaseline(
+            if (req.planRunId != null) "Plan run ${req.planRunId} not found or not in success state."
+            else "No successful plan run available. Run a plan first."
+        )
+
+    fun parseDateLoose(wo: Map<String, Any?>, field: String): LocalDate? {
+        val s = (wo[field] as? String)?.take(10) ?: return null
+        return runCatching { LocalDate.parse(s) }.getOrNull()
+    }
+    val prodAreaWos = baseline.workOrders.filter { wo ->
+        !isVirtualProductWo(wo) &&
+            wo["wo_group_id"] != null &&
+            (wo["prod_area"] as? String) == req.prodArea
+    }
+
+    val candidateSet = sortedSetOf<LocalDate>(afterDate)
+    for (wo in prodAreaWos) {
+        val s = parseDateLoose(wo, "start_time") ?: continue
+        val boundary = s.plusDays(1)
+        if (!boundary.isBefore(afterDate)) candidateSet.add(boundary)
+    }
+    val candidates = candidateSet.toList()
+    log.info(
+        "earliest-safe-start: caseId={} baseline={} prodArea={} delayDays={} candidates={} cap={}",
+        baseline.caseId, baseline.planRunId, req.prodArea, req.delayDays, candidates.size, maxIterations,
+    )
+
+    var lastBottleneckGid: String? = null
+    var lastBottleneckEnd: LocalDate? = null
+    var lastMfd: Int = -1
+    var iterations = 0
+    var skipped = 0
+    var prevGidSet: Set<String>? = null
+
+    for (candidateStart in candidates) {
+        if (iterations >= maxIterations) break
+
+        val matching = prodAreaWos.filter { wo ->
+            val s = parseDateLoose(wo, "start_time") ?: return@filter false
+            !s.isBefore(candidateStart)
+        }
+        if (matching.isEmpty()) {
+            log.info("earliest-safe-start: caseId={} → trivial empty at {} (iter={})", baseline.caseId, candidateStart, iterations)
+            return EarliestSafeStartResult.Ok(EarliestSafeStartResponse(
+                caseId = baseline.caseId,
+                planRunId = baseline.planRunId,
+                earliestSafeStart = candidateStart.toString(),
+                bottleneckGid = lastBottleneckGid,
+                bottleneckEnd = lastBottleneckEnd?.toString(),
+                maxFeasibleDaysAtStart = req.delayDays,
+                iterations = iterations,
+            ))
+        }
+
+        val gidSet = matching.mapNotNull { it["wo_group_id"] as? String }.toSet()
+        if (gidSet == prevGidSet) { skipped++; continue }
+        prevGidSet = gidSet
+        val selectors = listOf(WoScheduleSelector(
+            bucketStart = candidateStart.toString(),
+            woGroupIds = gidSet.toList(),
+        ))
+
+        val verifyResult = runWoScheduleImpactInline(WoScheduleImpactRequest(
+            selectors = selectors,
+            delayDays = req.delayDays,
+            planRunId = baseline.planRunId,
+            caseId = baseline.caseId,
+            persist = false,
+        ))
+        val isZeroImpact = when (verifyResult) {
+            is WoImpactResult.Ok -> verifyResult.response.impactedDemandCount == 0
+            is WoImpactResult.Failed -> verifyResult.reason.contains("No work orders matched")
+        }
+        if (isZeroImpact) {
+            val mfd = (verifyResult as? WoImpactResult.Ok)?.response?.maxFeasibleDays ?: req.delayDays
+            log.info(
+                "earliest-safe-start: caseId={} → {} (mfd={}, iter={}, verified)",
+                baseline.caseId, candidateStart, mfd, iterations,
+            )
+            return EarliestSafeStartResult.Ok(EarliestSafeStartResponse(
+                caseId = baseline.caseId,
+                planRunId = baseline.planRunId,
+                earliestSafeStart = candidateStart.toString(),
+                bottleneckGid = lastBottleneckGid,
+                bottleneckEnd = lastBottleneckEnd?.toString(),
+                maxFeasibleDaysAtStart = mfd,
+                iterations = iterations,
+            ))
+        }
+
+        val avail = computeAvailability(baseline.workOrders, baseline.peggingTrees, selectors)
+        lastMfd = avail.maxFeasibleDays
+        val bottleneck = avail.bottlenecks.minByOrNull { it.slackDays }
+        if (bottleneck != null) {
+            val bnEnd = matching
+                .firstOrNull { (it["wo_group_id"] as? String) == bottleneck.gid }
+                ?.let { parseDateLoose(it, "end_time") }
+            if (bnEnd != null) { lastBottleneckGid = bottleneck.gid; lastBottleneckEnd = bnEnd }
+        }
+        log.info(
+            "earliest-safe-start: caseId={} candidate={} impacts={} mfd={} → next",
+            baseline.caseId, candidateStart,
+            (verifyResult as? WoImpactResult.Ok)?.response?.impactedDemandCount ?: "?",
+            avail.maxFeasibleDays,
+        )
+        iterations++
+    }
+
+    log.warn(
+        "earliest-safe-start: exhausted (caseId={} prodArea={} delayDays={} iter={} skipped={} candidates={})",
+        baseline.caseId, req.prodArea, req.delayDays, iterations, skipped, candidates.size,
+    )
+    return EarliestSafeStartResult.NotFound(
+        lastBottleneckGid = lastBottleneckGid,
+        lastBottleneckEnd = lastBottleneckEnd?.toString(),
+        lastMaxFeasibleDays = lastMfd,
+        iterations = iterations,
+        candidatesScanned = candidates.size,
+    )
+}
+
+@Serializable
+data class ExecuteSafeRequest(
+    val caseId: Int? = null,
+    val planRunId: Int? = null,
+    val prodArea: String,
+    /** ISO yyyy-MM-dd; the maintenance window start. */
+    val bucketStart: String,
+    val delayDays: Int,
+    val note: String? = null,
+)
+
+@Serializable
+data class EarliestSafeStartRequest(
+    val caseId: Int? = null,
+    val planRunId: Int? = null,
+    val prodArea: String,
+    val delayDays: Int,
+    /** ISO yyyy-MM-dd; the earliest date the search may suggest. Typically the
+     *  user's originally requested bucket_start so Option B is "no earlier than this". */
+    val afterDate: String,
+    /** Max candidate-dates scanned (default 50, cap 200). The endpoint now
+     *  does a chronological scan over every wo.start_time+1 boundary date
+     *  (with simulation verification per candidate) rather than the forward-
+     *  jump heuristic, so the cap protects against runaway plans with
+     *  thousands of WOs. */
+    val maxIterations: Int? = null,
+)
+
+@Serializable
+data class EarliestSafeStartResponse(
+    val caseId: Int,
+    val planRunId: Int,
+    val earliestSafeStart: String,
+    val bottleneckGid: String?,
+    val bottleneckEnd: String?,
+    val maxFeasibleDaysAtStart: Int,
+    val iterations: Int,
+)
 
 // ── WO schedule event CRUD ────────────────────────────────────────────────────
 
@@ -1137,6 +1632,74 @@ fun Routing.woScheduleEventRoutes() {
                     }
             }
             call.respond(runs)
+        }
+    }
+}
+
+// ── WO query routes for external agents (e.g. schub-openclaw scheduling agent) ──
+// Thin HTTP wrappers over the helpers in PlanningAgentRoutes.kt that the
+// internal planning-agent uses to populate its tool calls. Exposing them here
+// lets the schub-openclaw mcp-server invoke list_prod_areas / list_locations /
+// find_wos via stable HTTP without going through the agent loop.
+
+fun Routing.workOrderQueryRoutes() {
+    route("/cases/{case_id}") {
+
+        // GET /cases/{case_id}/wo-prod-areas?planRunId=N&locale=en
+        get("/wo-prod-areas") {
+            val caseId = call.parameters["case_id"]?.toIntOrNull()
+                ?: throw IllegalArgumentException("Invalid case_id")
+            val planRunId = call.request.queryParameters["planRunId"]?.toIntOrNull()
+            val locale = call.request.queryParameters["locale"] ?: "en"
+            val args = buildJsonObject {
+                planRunId?.let { put("plan_run_id", it) }
+            }
+            val res = toolListProdAreas(caseId, args, locale)
+            call.respond(buildJsonObject {
+                put("summary", res.summary)
+                val payload = res.payload as? JsonObject ?: buildJsonObject { }
+                payload.forEach { (k, v) -> put(k, v) }
+            })
+        }
+
+        // GET /cases/{case_id}/wo-locations?planRunId=N&locale=en
+        get("/wo-locations") {
+            val caseId = call.parameters["case_id"]?.toIntOrNull()
+                ?: throw IllegalArgumentException("Invalid case_id")
+            val planRunId = call.request.queryParameters["planRunId"]?.toIntOrNull()
+            val locale = call.request.queryParameters["locale"] ?: "en"
+            val args = buildJsonObject {
+                planRunId?.let { put("plan_run_id", it) }
+            }
+            val res = toolListLocations(caseId, args, locale)
+            call.respond(buildJsonObject {
+                put("summary", res.summary)
+                val payload = res.payload as? JsonObject ?: buildJsonObject { }
+                payload.forEach { (k, v) -> put(k, v) }
+            })
+        }
+
+        // POST /cases/{case_id}/wo-find
+        // Body shape mirrors toolFindWos args (snake_case): {plan_run_id?, prod_area?,
+        // location_id?, product_id?, method?, start_after?, start_before?, limit?, locale?}
+        post("/wo-find") {
+            val caseId = call.parameters["case_id"]?.toIntOrNull()
+                ?: throw IllegalArgumentException("Invalid case_id")
+            val rawBody = call.receiveText().ifBlank { "{}" }
+            val body = try {
+                Json.parseToJsonElement(rawBody) as? JsonObject
+                    ?: throw IllegalArgumentException("wo-find body must be a JSON object")
+            } catch (e: Exception) {
+                log.error("wo-find body parse failed: {} body={}", e.message, rawBody)
+                throw IllegalArgumentException("Invalid wo-find body: ${e.message}")
+            }
+            val locale = body["locale"]?.jsonPrimitive?.contentOrNull ?: "en"
+            val res = toolFindWos(caseId, body, locale)
+            call.respond(buildJsonObject {
+                put("summary", res.summary)
+                val payload = res.payload as? JsonObject ?: buildJsonObject { }
+                payload.forEach { (k, v) -> put(k, v) }
+            })
         }
     }
 }

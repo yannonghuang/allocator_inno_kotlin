@@ -18,6 +18,9 @@ object Cases : Table("cases") {
     // User-pinned active plan run; null => resolver falls back to latest success.
     // ON DELETE SET NULL so deleting the pinned run reverts the case to the default resolver.
     val designatedActivePlanRunId = integer("designated_active_plan_run_id").nullable()
+    /** User-controlled active flag used by /resolve. Multiple rows may be active; latest id wins.
+     *  When no row is active, /resolve falls back to the latest case by id. */
+    val active = bool("active").default(false)
     override val primaryKey = PrimaryKey(id)
 }
 
@@ -228,6 +231,9 @@ object PlanRuns : Table("plan_run") {
     val soundnessReport = text("soundness_report").nullable()
     /** When the most recent soundness check finished; null when never run. */
     val soundnessCheckedAt = timestamp("soundness_checked_at").nullable()
+    /** User-controlled active flag used by /resolve. Multiple rows may be active; latest id wins.
+     *  When no row is active for a case, /resolve falls back to the latest run by id within that case. */
+    val active = bool("active").default(false)
     override val primaryKey = PrimaryKey(id)
 }
 
