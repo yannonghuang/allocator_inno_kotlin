@@ -128,7 +128,10 @@ private fun defaultModelForProvider(provider: String): String = when (provider) 
     config.llmProvider -> config.assessmentModel
     "openai" -> "gpt-4o-mini"
     "anthropic" -> "claude-haiku-4-5-20251001"
-    else -> "openclaw"
+    // openclaw gateway forwards model ids through to its configured provider. The gateway's
+    // agent default is "anthropic/claude-sonnet-4-6" (openclaw.json.template), so we use the
+    // same id here — pickable also via ASSESSMENT_MODEL=anthropic/<id>.
+    else -> "anthropic/claude-sonnet-4-6"
 }
 
 private suspend fun openClawChat(
@@ -226,10 +229,12 @@ private suspend fun anthropicChat(
 
 // ── Tool-use API (OpenAI function-calling) ──────────────────────────────────
 //
-// Phase 1 of the planning agent: OpenAI Chat Completions with `tools` + the
-// `tool_calls` round-trip. Anthropic and OpenClaw stubs throw — agents pin
-// to "openai" provider just like /material-impact-assessment and
-// /planning-copilot do.
+// Sends an OpenAI-shaped chat-completions request with `tools` and consumes
+// the `tool_calls` round-trip. Supports two providers:
+//   - "openai"   → api.openai.com directly (legacy path; requires OPENAI_API_KEY)
+//   - "openclaw" → ${OPENCLAW_URL}/v1/chat/completions (OpenAI-compatible
+//                  proxy; ultimately Anthropic-backed per OpenClaw config)
+// Anthropic-direct is a stub — set LLM_PROVIDER=openclaw to reach Claude.
 
 /** A function-callable tool advertised to the model. `parameters` is JSON Schema. */
 data class LlmTool(
@@ -272,7 +277,13 @@ data class LlmToolResponse(
  * runs the agent loop: append tool results as `role=tool` messages and call
  * again until `toolCalls.isEmpty()`.
  *
- * Phase 1 supports OpenAI only (the planning agent pins `provider="openai"`).
+ * Provider dispatch:
+ *   - openai   → api.openai.com directly with OPENAI_API_KEY.
+ *   - openclaw → OpenClaw gateway at OPENCLAW_URL/v1/chat/completions with
+ *                OPENCLAW_TOKEN. The gateway is OpenAI-compatible and (per
+ *                openclaw.json.template) forwards to Anthropic by default.
+ *   - anthropic→ Not implemented; throws LlmNotConfiguredException.
+ *                Use 'openclaw' to reach Claude.
  */
 suspend fun llmChatWithTools(
     systemPrompt: String? = null,
@@ -284,89 +295,134 @@ suspend fun llmChatWithTools(
     provider: String? = null,
 ): LlmToolResponse {
     val effectiveProvider = (provider ?: config.llmProvider).lowercase()
-    if (effectiveProvider != "openai") {
-        throw LlmNotConfiguredException(
-            "llmChatWithTools is OpenAI-only in Phase 1 (got provider=$effectiveProvider). " +
-                "Pin the call site with provider=\"openai\".",
+    val resolvedModel = model ?: defaultModelForProvider(effectiveProvider)
+    val body = buildOpenAiChatCompletionsBody(
+        systemPrompt = systemPrompt,
+        messages = messages,
+        tools = tools,
+        model = resolvedModel,
+        maxTokens = maxTokens,
+        temperature = temperature,
+    )
+    return when (effectiveProvider) {
+        "openai" -> {
+            val apiKey = config.openAiApiKey
+                ?: throw LlmNotConfiguredException("OPENAI_API_KEY is not configured")
+            postChatCompletionsAndParse(
+                url = "https://api.openai.com/v1/chat/completions",
+                authHeaderValue = "Bearer $apiKey",
+                body = body,
+                providerLabel = "OpenAI",
+            )
+        }
+        "openclaw" -> {
+            val token = config.openClawToken
+                ?: throw LlmNotConfiguredException("OPENCLAW_TOKEN is not configured")
+            postChatCompletionsAndParse(
+                url = "${config.openClawUrl}/v1/chat/completions",
+                authHeaderValue = "Bearer $token",
+                body = body,
+                providerLabel = "OpenClaw",
+            )
+        }
+        "anthropic" -> throw LlmNotConfiguredException(
+            "llmChatWithTools(anthropic) is not implemented — use LLM_PROVIDER=openclaw to reach Claude via the gateway.",
+        )
+        else -> throw LlmNotConfiguredException(
+            "llmChatWithTools: unknown provider '$effectiveProvider'. Supported: openai, openclaw.",
         )
     }
-    val resolvedModel = model ?: defaultModelForProvider("openai")
-    val apiKey = config.openAiApiKey
-        ?: throw LlmNotConfiguredException("OPENAI_API_KEY is not configured")
+}
 
-    val body = buildJsonObject {
-        put("model", resolvedModel)
-        put("max_tokens", maxTokens)
-        put("temperature", temperature)
-        // Build messages array with optional tool_calls / tool_call_id fields.
-        put("messages", buildJsonArray {
-            if (!systemPrompt.isNullOrBlank()) {
-                add(buildJsonObject {
-                    put("role", "system")
-                    put("content", systemPrompt)
-                })
-            }
-            messages.forEach { m ->
-                add(buildJsonObject {
-                    put("role", m.role)
-                    // OpenAI requires `content` field even when null for tool-call assistant messages.
-                    put("content", m.content?.let { JsonPrimitive(it) } ?: JsonPrimitive(null as String?))
-                    m.toolCallId?.let { put("tool_call_id", it) }
-                    m.toolCalls?.takeIf { it.isNotEmpty() }?.let { calls ->
-                        put("tool_calls", buildJsonArray {
-                            calls.forEach { c ->
-                                add(buildJsonObject {
-                                    put("id", c.id)
-                                    put("type", "function")
-                                    putJsonObject("function") {
-                                        put("name", c.name)
-                                        put("arguments", c.arguments)
-                                    }
-                                })
-                            }
-                        })
-                    }
-                })
-            }
-        })
-        // Advertise tools.
-        put("tools", buildJsonArray {
-            tools.forEach { t ->
-                add(buildJsonObject {
-                    put("type", "function")
-                    putJsonObject("function") {
-                        put("name", t.name)
-                        put("description", t.description)
-                        put("parameters", t.parameters)
-                    }
-                })
-            }
-        })
-        put("tool_choice", "auto")
-    }
+/** Build the OpenAI-shaped chat-completions request body (with tools + tool_calls round-trip).
+ *  Reused for both the openai-direct and openclaw-gateway branches since OpenClaw speaks the
+ *  same wire format. */
+private fun buildOpenAiChatCompletionsBody(
+    systemPrompt: String?,
+    messages: List<LlmAgentMessage>,
+    tools: List<LlmTool>,
+    model: String,
+    maxTokens: Int,
+    temperature: Double,
+): JsonObject = buildJsonObject {
+    put("model", model)
+    put("max_tokens", maxTokens)
+    put("temperature", temperature)
+    put("messages", buildJsonArray {
+        if (!systemPrompt.isNullOrBlank()) {
+            add(buildJsonObject {
+                put("role", "system")
+                put("content", systemPrompt)
+            })
+        }
+        messages.forEach { m ->
+            add(buildJsonObject {
+                put("role", m.role)
+                // OpenAI requires `content` field even when null for tool-call assistant messages.
+                put("content", m.content?.let { JsonPrimitive(it) } ?: JsonPrimitive(null as String?))
+                m.toolCallId?.let { put("tool_call_id", it) }
+                m.toolCalls?.takeIf { it.isNotEmpty() }?.let { calls ->
+                    put("tool_calls", buildJsonArray {
+                        calls.forEach { c ->
+                            add(buildJsonObject {
+                                put("id", c.id)
+                                put("type", "function")
+                                putJsonObject("function") {
+                                    put("name", c.name)
+                                    put("arguments", c.arguments)
+                                }
+                            })
+                        }
+                    })
+                }
+            })
+        }
+    })
+    put("tools", buildJsonArray {
+        tools.forEach { t ->
+            add(buildJsonObject {
+                put("type", "function")
+                putJsonObject("function") {
+                    put("name", t.name)
+                    put("description", t.description)
+                    put("parameters", t.parameters)
+                }
+            })
+        }
+    })
+    put("tool_choice", "auto")
+}
 
+/** POST an OpenAI-compatible chat-completions body and parse the (text, toolCalls) response.
+ *  Used by both the openai and openclaw branches. */
+private suspend fun postChatCompletionsAndParse(
+    url: String,
+    authHeaderValue: String,
+    body: JsonObject,
+    providerLabel: String,
+): LlmToolResponse {
     val resp = try {
-        llmHttpClient.post("https://api.openai.com/v1/chat/completions") {
-            header("Authorization", "Bearer $apiKey")
+        llmHttpClient.post(url) {
+            header("Authorization", authHeaderValue)
             contentType(ContentType.Application.Json)
             setBody(body)
         }
     } catch (e: java.nio.channels.UnresolvedAddressException) {
-        throw IllegalStateException("OpenAI host unresolved", e)
+        throw IllegalStateException("$providerLabel host unresolved", e)
     } catch (e: java.net.ConnectException) {
-        throw IllegalStateException("OpenAI connection refused: ${e.message}", e)
+        throw IllegalStateException("$providerLabel connection refused: ${e.message}", e)
     }
 
     if (!resp.status.isSuccess()) {
-        throw IllegalStateException("OpenAI API error ${resp.status.value}: ${resp.bodyAsText()}")
+        throw IllegalStateException("$providerLabel API error ${resp.status.value}: ${resp.bodyAsText()}")
     }
 
     val json = resp.body<JsonElement>().jsonObjectOrNull()
-        ?: throw IllegalStateException("OpenAI response was not a JSON object")
+        ?: throw IllegalStateException("$providerLabel response was not a JSON object")
     val choices = (json["choices"] as? kotlinx.serialization.json.JsonArray)
-        ?: throw IllegalStateException("OpenAI response missing 'choices' array")
+        ?: throw IllegalStateException("$providerLabel response missing 'choices' array")
     val message = (choices.firstOrNull() as? JsonObject)?.get("message") as? JsonObject
-        ?: throw IllegalStateException("OpenAI response missing message in first choice")
+        ?: throw IllegalStateException("$providerLabel response missing message in first choice")
 
     val text = (message["content"] as? JsonPrimitive)?.let {
         if (it.isString) it.content else null

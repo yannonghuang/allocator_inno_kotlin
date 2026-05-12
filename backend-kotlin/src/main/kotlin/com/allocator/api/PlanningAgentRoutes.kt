@@ -4942,7 +4942,9 @@ private suspend fun runAgentLoop(
             // fields each). 1024 truncated those mid-row.
             maxTokens = 4096,
             temperature = 0.2,
-            provider = "openai",
+            // Provider defaults to config.llmProvider (LLM_PROVIDER env, =openclaw
+            // in production) so the planning agent rides the same OpenClaw → Anthropic
+            // path used by /material-impact-assessment and /planning-copilot.
         )
 
         // No tool calls → final reply.
