@@ -340,6 +340,92 @@ function formatElapsedMs(ms: number): string {
   return `${Math.floor(ms / 60000)}m ${Math.round((ms % 60000) / 1000)}s`;
 }
 
+// commit - request, in whole days. Both inputs may be null (unfulfilled demand or
+// missing request date); returns null in that case so the cell renders as "—" and
+// the "Late delivery" filter doesn't pick the row up.
+function computeLatenessDays(requestDueTime: string | null | undefined, revisedTime: string | null | undefined): number | null {
+  if (!requestDueTime || !revisedTime) return null;
+  const req = new Date(requestDueTime.slice(0, 10));
+  const rev = new Date(revisedTime.slice(0, 10));
+  if (Number.isNaN(req.getTime()) || Number.isNaN(rev.getTime())) return null;
+  return Math.round((rev.getTime() - req.getTime()) / 86_400_000);
+}
+
+// Inline markdown renderer for the planning-agent chat panel. Handles:
+//   1. GFM-style pipe tables (header row + `|---|---|` separator + body rows)
+//   2. `**bold**` spans
+// Everything else is rendered as pre-wrap text. Mirrors the scheduling-agent
+// renderer (schub-openclaw Agent.tsx) so the same Markdown produced by Kotlin
+// renders identically in both UIs. We hand-roll this to avoid pulling in
+// react-markdown + remark-gfm for two features.
+function renderCopilotInline(text: string, keyPrefix: string): React.ReactNode {
+  // Split on **bold** spans, keep the markers in the result so we can detect them.
+  const parts = text.split(/(\*\*[^*\n]+\*\*)/g);
+  return parts.map((p, i) => (
+    p.startsWith('**') && p.endsWith('**') && p.length >= 4
+      ? <strong key={`${keyPrefix}-b${i}`}>{p.slice(2, -2)}</strong>
+      : <React.Fragment key={`${keyPrefix}-t${i}`}>{p}</React.Fragment>
+  ));
+}
+
+function renderCopilotText(text: string): React.ReactNode[] {
+  const lines = text.split('\n');
+  const out: React.ReactNode[] = [];
+  let bufStart = 0;
+  let i = 0;
+  const isPipeRow = (s: string) => /^\s*\|.+\|\s*$/.test(s);
+  const isSep = (s: string) => /^\s*\|[-:\s|]+\|\s*$/.test(s);
+  const flushText = (untilExclusive: number) => {
+    if (untilExclusive <= bufStart) return;
+    const chunk = lines.slice(bufStart, untilExclusive).join('\n');
+    if (chunk.length > 0) {
+      out.push(
+        <span key={`p${bufStart}`} style={{ whiteSpace: 'pre-wrap' }}>
+          {renderCopilotInline(chunk, `p${bufStart}`)}
+        </span>
+      );
+    }
+  };
+  while (i < lines.length) {
+    if (i + 1 < lines.length && isPipeRow(lines[i]) && isSep(lines[i + 1])) {
+      flushText(i);
+      const header = lines[i].trim().slice(1, -1).split('|').map((s) => s.trim());
+      let j = i + 2;
+      const body: string[][] = [];
+      while (j < lines.length && isPipeRow(lines[j]) && !isSep(lines[j])) {
+        body.push(lines[j].trim().slice(1, -1).split('|').map((s) => s.trim()));
+        j++;
+      }
+      out.push(
+        <table key={`tbl${i}`} style={{ borderCollapse: 'collapse', margin: '0.4rem 0', fontSize: '0.85rem' }}>
+          <thead>
+            <tr>{header.map((h, hi) => (
+              <th key={hi} style={{ textAlign: 'left', padding: '0.25rem 0.9rem 0.25rem 0', color: '#a1a1aa', fontWeight: 600, borderBottom: '1px solid #3d3d40' }}>
+                {renderCopilotInline(h, `th${i}-${hi}`)}
+              </th>
+            ))}</tr>
+          </thead>
+          <tbody>
+            {body.map((row, ri) => (
+              <tr key={ri}>{row.map((c, ci) => (
+                <td key={ci} style={{ padding: '0.2rem 0.9rem 0.2rem 0', verticalAlign: 'top' }}>
+                  {renderCopilotInline(c, `td${i}-${ri}-${ci}`)}
+                </td>
+              ))}</tr>
+            ))}
+          </tbody>
+        </table>
+      );
+      i = j;
+      bufStart = j;
+    } else {
+      i++;
+    }
+  }
+  flushText(lines.length);
+  return out;
+}
+
 function parseApiError(raw: unknown): string {
   const s = raw instanceof Error ? raw.message : String(raw ?? 'Unknown error');
   try {
@@ -758,6 +844,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [runDetail, setRunDetail] = useState<{ run: RunType; actions: unknown[]; feasible_demands: FeasibleDemand[] } | null>(null);
   const [feasibleDemands, setFeasibleDemands] = useState<FeasibleDemand[] | null>(null);
   const [demandsLoadError, setDemandsLoadError] = useState<string | null>(null);
+  const [demandLateOnly, setDemandLateOnly] = useState(false);
   const [overrides, setOverrides] = useState<OverrideType[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -907,6 +994,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planDemandBuyOnly, setPlanDemandBuyOnly] = useState(false);
   const [planDemandRealMoveOnly, setPlanDemandRealMoveOnly] = useState(false);
   const [planDemandAlternativesOnly, setPlanDemandAlternativesOnly] = useState(false);
+  const [planDemandLateOnly, setPlanDemandLateOnly] = useState(false);
   const [planDemandSupplyFilter, setPlanDemandSupplyFilter] = useState('');
   const [supplyFilterInput, setSupplyFilterInput] = useState('');
   const [supplyFilterSuggestions, setSupplyFilterSuggestions] = useState<SupplySuggestion[]>([]);
@@ -1194,206 +1282,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const bootstrapResizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [bootstrapResizing, setBootstrapResizing] = useState(false);
 
-  /** Rule-based intent: map user message to config updates and a reply for method selection and consolidation. */
-  function parseCopilotIntent(message: string, currentConfig: PlanningConfig): { reply: string; configUpdate?: PlanningConfig } {
-    const t = message.trim().toLowerCase();
-    const ms = currentConfig.method_selection ?? {};
-    const cs = currentConfig.consolidation ?? {};
-
-    if (!t) return { reply: tP('copilot.replies.empty') };
-
-    // Accept both English and Chinese triggers.
-    if (/show|current|what('s| is)? (my )?config|settings|config|显示配置|当前配置|查看配置/.test(t)) {
-      const methodMode = ms.multiple === true ? tP('copilot.equalSplit') : ms.elaborate === true ? tP('copilot.oneByScore') : tP('copilot.oneByPreference');
-      const methodDepth = ms.elaborate === true ? (ms.depth ?? 1) : null;
-      const purchaseMode = currentConfig.purchase_allowed === false ? tP('copilot.disabled') : tP('copilot.allowed');
-      const splitLabel = cs.allocation_mode === 'proportional'
-        ? tP('copilot.splitProportional')
-        : cs.allocation_mode === 'priority_first'
-          ? tP('copilot.splitPriorityFirst')
-          : tP('copilot.splitFair');
-      const consolidationMode = cs.enabled
-        ? tP('copilot.consolidationOnDetail', { days: cs.period_days ?? 0, split: splitLabel })
-        : tP('copilot.off');
-      const methodLine = methodDepth != null
-        ? tP('copilot.replies.showConfigMethodDepth', { methodMode, depth: methodDepth })
-        : tP('copilot.replies.showConfigMethod', { methodMode });
-      return { reply: tP('copilot.replies.showConfig', { methodLine, purchaseMode, consolidationMode }) };
-    }
-
-    // Explicit "max methods N" / "最多方法 N" → set the waterfall cap.
-    const maxMethodsMatch = t.match(/max\s*methods?\s*(?:=|:|to)?\s*(\d+)|最多方法\s*[:=]?\s*(\d+)|方法上限\s*[:=]?\s*(\d+)/);
-    if (maxMethodsMatch) {
-      const n = Math.max(1, Math.min(4, parseInt(maxMethodsMatch[1] ?? maxMethodsMatch[2] ?? maxMethodsMatch[3] ?? '2', 10)));
-      return {
-        reply: tP('copilot.replies.methodMaxMethods', { n }),
-        configUpdate: { method_selection: { ...ms, max_methods: n } },
-      };
-    }
-    // Legacy "equal split" / "split across methods" intent — under waterfall the
-    // closest behavior is max_methods=2 (use the best, fall back to the next when short).
-    if (/equal.?split.?method|split.?method.?equal|split across method|multiple method|use all method|方法等量拆分|等量拆分方法|跨方法拆分/.test(t)) {
-      return {
-        reply: tP('copilot.replies.methodMaxMethods', { n: 2 }),
-        configUpdate: { method_selection: { ...ms, max_methods: 2 } },
-      };
-    }
-
-    const bomDepthMatch = t.match(/max(?:imum)?\s*bom\s*depth\s*(?:=|:|to)?\s*(\d+)|make[- ]fallback\s*depth\s*(?:=|:|to)?\s*(\d+)|最大\s*BOM\s*深度\s*[:=]?\s*(\d+)|BOM\s*深度\s*[:=]?\s*(\d+)/);
-    if (bomDepthMatch) {
-      const d = Math.max(1, Math.min(10, parseInt(bomDepthMatch[1] ?? bomDepthMatch[2] ?? bomDepthMatch[3] ?? bomDepthMatch[4] ?? '3', 10)));
-      return {
-        reply: tP('copilot.replies.methodMaxBomDepth', { depth: d }),
-        configUpdate: { method_selection: { ...ms, max_bom_depth: d } },
-      };
-    }
-
-    const depthMatch = t.match(/(?:method\s+)?depth\s*(?:=|:|to)?\s*(\d+)|方法深度\s*[:=]?\s*(\d+)|深度\s*[:=]?\s*(\d+)/);
-    if (depthMatch) {
-      const d = Math.max(1, Math.min(500, parseInt(depthMatch[1] ?? depthMatch[2] ?? depthMatch[3] ?? '1', 10)));
-      return {
-        reply: tP('copilot.replies.methodDepth', { depth: d }),
-        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false, depth: d } },
-      };
-    }
-
-    if (/elaborate method|simulate method|score method|method by score|精细方法|方法评分|按评分选方法/.test(t)) {
-      return {
-        reply: tP('copilot.replies.methodElaborate'),
-        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false } },
-      };
-    }
-
-    if (/by preference|prefer method|cascade method|preferred method|one by preference|按偏好|偏好方法|级联方法/.test(t)) {
-      return {
-        reply: tP('copilot.replies.methodPreference'),
-        configUpdate: { method_selection: { ...ms, multiple: false, elaborate: false } },
-      };
-    }
-
-    if (/earliest (commit|delivery|ship)|fastest (commit|delivery|ship)|soonest (commit|delivery|ship)|prioriti[sz]e (commit|delivery|ship)|最早交付|最快交付|优先交付|按交付/.test(t)) {
-      return {
-        reply: tP('copilot.replies.methodWeightCommit'),
-        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false, score_weights: { commit_time: 1, inventory_consumed: 0, purchase: 0 } } },
-      };
-    }
-
-    if (/prefer inventor(y|ies)|use (existing )?inventor(y|ies)|favou?r inventor(y|ies)|consume inventor(y|ies)|existing stock|maximi[sz]e inventor(y|ies)|优先库存|使用库存|消耗库存|最多库存/.test(t)) {
-      return {
-        reply: tP('copilot.replies.methodWeightInventory'),
-        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false, score_weights: { commit_time: 0, inventory_consumed: 1, purchase: 0 } } },
-      };
-    }
-
-    if (/minim(al|i[sz]e) (additional )?purchase|minim(al|i[sz]e) (additional )?buy|least purchase|least buy|fewest purchase|avoid purchase|最少采购|最小采购|减少采购|最少购买/.test(t)) {
-      return {
-        reply: tP('copilot.replies.methodWeightPurchase'),
-        configUpdate: { method_selection: { ...ms, elaborate: true, multiple: false, score_weights: { commit_time: 0, inventory_consumed: 0, purchase: 1 } } },
-      };
-    }
-
-    if (/no purchase|disable purchase|disallow purchase|no buy|exclude buy|without purchase|禁用采购|不采购|不允许采购/.test(t)) {
-      return {
-        reply: tP('copilot.replies.purchaseOff'),
-        configUpdate: { purchase_allowed: false },
-      };
-    }
-
-    if (/allow purchase|enable purchase|purchase allowed|include buy|with purchase|允许采购|启用采购|开启采购/.test(t)) {
-      return {
-        reply: tP('copilot.replies.purchaseOn'),
-        configUpdate: { purchase_allowed: true },
-      };
-    }
-
-    if (/enable consolidat|turn on consolidat|consolidate demand|group demand|shared.?component|启用合并|开启合并|合并需求|共享组件/.test(t)) {
-      const modeLabel = cs.allocation_mode === 'proportional'
-        ? tP('copilot.replies.consolidationOnModeProportional')
-        : cs.allocation_mode === 'priority_first'
-          ? tP('copilot.replies.consolidationOnModePriority')
-          : tP('copilot.replies.consolidationOnModeFair');
-      return {
-        reply: tP('copilot.replies.consolidationOn', { days: cs.period_days ?? 0, mode: modeLabel }),
-        configUpdate: { consolidation: { ...cs, enabled: true } },
-      };
-    }
-
-    if (/disable consolidat|turn off consolidat|no consolidat|禁用合并|关闭合并|不合并/.test(t)) {
-      return {
-        reply: tP('copilot.replies.consolidationOff'),
-        configUpdate: { consolidation: { ...cs, enabled: false } },
-      };
-    }
-
-    const periodMatch = t.match(/(\d+)\s*(?:-\s*)?day(?:s)?\s*(?:bucket|period|window)/);
-    const zhPeriodMatch = t.match(/(\d+)\s*天(?:桶|窗口|周期)?/);
-    if (periodMatch || zhPeriodMatch || /bucket.*(\d+)|period.*(\d+)|时间桶.*(\d+)/.test(t)) {
-      const m2 = t.match(/(\d+)/);
-      const days = Math.max(1, Math.min(365, parseInt(periodMatch?.[1] ?? zhPeriodMatch?.[1] ?? m2?.[1] ?? '365', 10)));
-      return {
-        reply: tP('copilot.replies.periodBucket', { days, plural: days === 1 ? '' : 's' }),
-        configUpdate: { consolidation: { ...cs, period_days: days } },
-      };
-    }
-
-    if (/proportional|split by (qty|quantity|share)|by share|按比例|按数量|按份额/.test(t)) {
-      return {
-        reply: tP('copilot.replies.splitProportional'),
-        configUpdate: { consolidation: { ...cs, allocation_mode: 'proportional' } },
-      };
-    }
-
-    if (/priority.?first|fill highest priority|by priority|priority order|优先级优先|按优先级|优先级顺序/.test(t)) {
-      return {
-        reply: tP('copilot.replies.splitPriority'),
-        configUpdate: { consolidation: { ...cs, allocation_mode: 'priority_first' } },
-      };
-    }
-
-    if (/\bfair\b|hybrid split|no one starved|公平|混合拆分/.test(t)) {
-      return {
-        reply: tP('copilot.replies.splitFair'),
-        configUpdate: { consolidation: { ...cs, allocation_mode: 'fair' } },
-      };
-    }
-
-    // Post-plan UI toggles.
-    if (/(?:analyz|analys)e?\s*criticality|criticality\s*(?:on|enable|analysis)|enable\s*criticality|启用关键度|做关键度|开启关键度|开启临界|做临界/.test(t)) {
-      return {
-        reply: tP('copilot.replies.criticalityOn'),
-        configUpdate: { analyze_criticality: true },
-      };
-    }
-    if (/(?:no|skip|disable|turn off)\s*criticality|criticality\s*off|关闭关键度|不做关键度|停用关键度|不分析关键度|关闭临界/.test(t)) {
-      return {
-        reply: tP('copilot.replies.criticalityOff'),
-        configUpdate: { analyze_criticality: false },
-      };
-    }
-    if (/(?:check|validate|verify|run)\s*soundness|soundness\s*(?:check\s*)?(?:on|enable)|enable\s*soundness|开启完整性|校验完整性|做合理性|检查合理性|开启校验/.test(t)) {
-      return {
-        reply: tP('copilot.replies.soundnessOn'),
-        configUpdate: { check_soundness: true },
-      };
-    }
-    if (/(?:no|skip|disable|turn off)\s*soundness|soundness\s*off|关闭完整性|不做合理性|跳过校验|不校验/.test(t)) {
-      return {
-        reply: tP('copilot.replies.soundnessOff'),
-        configUpdate: { check_soundness: false },
-      };
-    }
-
-    if (/reset|default|clear|重置|默认|清除/.test(t)) {
-      return {
-        reply: tP('copilot.replies.reset'),
-        configUpdate: { method_selection: { multiple: false, elaborate: false, depth: 1, max_methods: 2, max_bom_depth: 3, score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 } }, purchase_allowed: false, consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' }, analyze_criticality: false, check_soundness: true },
-      };
-    }
-
-    return {
-      reply: tP('copilot.replies.help'),
-    };
-  }
 
   useEffect(() => {
     copilotMessagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -4335,18 +4223,32 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     </>
                   );
                 })()}
-                <SortFilterTable<FeasibleDemand & { suggested_revision?: string }>
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', marginBottom: '0.5rem', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={demandLateOnly}
+                    onChange={(e) => setDemandLateOnly(e.target.checked)}
+                  />
+                  <span>{tA('demandView.lateOnly')}</span>
+                </label>
+                <SortFilterTable<FeasibleDemand & { suggested_revision?: string; lateness_days: number | null }>
                 idKey="demand_id"
-                rows={feasibleDemands.map((f) => ({
-                  ...f,
-                  suggested_revision: f.suggested_revision ?? (f.status === 'fulfilled'
-                    ? tA('demandView.fulfilled')
-                    : f.allocated_qty > 0
-                      ? `${tA('demandView.reduceTo')} ${f.allocated_qty}`
-                      : tA('demandView.unfulfilled')),
-                }))}
+                rows={feasibleDemands
+                  .map((f) => ({
+                    ...f,
+                    suggested_revision: f.suggested_revision ?? (f.status === 'fulfilled'
+                      ? tA('demandView.fulfilled')
+                      : f.allocated_qty > 0
+                        ? `${tA('demandView.reduceTo')} ${f.allocated_qty}`
+                        : tA('demandView.unfulfilled')),
+                    lateness_days: computeLatenessDays(f.request_due_time, f.revised_time),
+                  }))
+                  .filter((r) => !demandLateOnly || (r.lateness_days != null && r.lateness_days > 0))}
                 rowId={(r) => `demand-${r.demand_id}`}
                 onRowClick={handleDemandPeggingClick}
+                rowStyle={(r) => (r.lateness_days != null && r.lateness_days > 0)
+                  ? { background: 'rgba(248, 113, 113, 0.08)' }
+                  : undefined}
                 filterKeys={['demand_id', 'customer', 'customer_id', 'product_id', 'status', 'suggested_revision', 'request_due_time', 'revised_time', 'fulfillment_rate']}
                 defaultSortKey="fulfillment_rate"
                 columns={[
@@ -4354,6 +4256,18 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   { key: 'customer', label: tA('demandView.columns.customer'), sortable: true, render: (r) => r.customer ?? r.customer_id ?? '–' },
                   { key: 'request_due_time', label: tA('demandView.columns.time'), sortable: true, render: (r) => r.request_due_time ?? '–' },
                   { key: 'revised_time', label: tA('demandView.columns.revisedTime'), sortable: true, render: (r) => r.revised_time ?? '–' },
+                  {
+                    key: 'lateness_days',
+                    label: tA('demandView.columns.lateness'),
+                    sortable: true,
+                    sortValue: (r, dir) => r.lateness_days ?? (dir === 'asc' ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY),
+                    render: (r) => {
+                      if (r.lateness_days == null) return '–';
+                      if (r.lateness_days > 0) return <span style={{ color: '#f87171', fontWeight: 600 }}>+{r.lateness_days}d</span>;
+                      if (r.lateness_days < 0) return <span style={{ color: '#34d399' }}>{r.lateness_days}d</span>;
+                      return '0d';
+                    },
+                  },
                   { key: 'product_id', label: tA('demandView.columns.product'), sortable: true },
                   { key: 'requested_qty', label: tA('demandView.columns.requested'), sortable: true },
                   { key: 'allocated_qty', label: tA('demandView.columns.allocated'), sortable: true },
@@ -4918,6 +4832,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       />
                       <span>{tP('committedDemands.filterAlternativesOnly')}</span>
                     </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input
+                        type="checkbox"
+                        checked={planDemandLateOnly}
+                        onChange={(e) => setPlanDemandLateOnly(e.target.checked)}
+                      />
+                      <span>{tP('committedDemands.filterLateOnly')}</span>
+                    </label>
                     {planDemandRealMakeOnly && (
                       <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>
                         {bomRealPairs === null
@@ -5062,6 +4984,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         return peggingTreeHasAlternatives(entry.tree);
                       });
                     }
+                    if (planDemandLateOnly) {
+                      list = list.filter((r) => {
+                        const days = computeLatenessDays(r.request_time, r.commit_time);
+                        return days != null && days > 0;
+                      });
+                    }
                     if (planDemandSupplyFilter.trim()) {
                       // Use the same criterion as the Supply View's "Pegged Demands" column:
                       // a demand matches iff it actually consumed from this supply_id (per
@@ -5137,6 +5065,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                 : { background: 'rgba(56,189,248,0.22)', outline: '2px solid #38bdf8' };
                             }
                             if (r.is_failed) return { background: 'rgba(248,113,113,0.08)', outline: '1px solid rgba(248,113,113,0.3)' };
+                            // Late delivery: amber tint (distinct from the red used for failed).
+                            const latenessDays = computeLatenessDays(r.request_time, r.commit_time);
+                            if (latenessDays != null && latenessDays > 0) {
+                              return { background: 'rgba(251,146,60,0.08)' };
+                            }
                             return undefined;
                           }}
                           columns={[
@@ -5156,6 +5089,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             }},
                             { key: 'request_time', label: tP('committedDemands.columns.requestTime'), sortable: true, render: (r) => r.request_time ?? '–' },
                             { key: 'commit_time', label: tP('committedDemands.columns.commitTime'), sortable: true, render: (r) => r.commit_time ?? '–' },
+                            {
+                              key: 'lateness',
+                              label: tP('committedDemands.columns.lateness'),
+                              sortable: true,
+                              sortValue: (r, dir) => {
+                                const v = computeLatenessDays(r.request_time, r.commit_time);
+                                return v ?? (dir === 'asc' ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY);
+                              },
+                              render: (r) => {
+                                const v = computeLatenessDays(r.request_time, r.commit_time);
+                                if (v == null) return '–';
+                                if (v > 0) return <span style={{ color: '#fb923c', fontWeight: 600 }}>+{v}d</span>;
+                                if (v < 0) return <span style={{ color: '#34d399' }}>{v}d</span>;
+                                return '0d';
+                              },
+                            },
                             { key: 'commit_reason', label: tP('committedDemands.columns.commitReason'), sortable: true, render: (r) => {
                               if (!r.commit_reason) return <span style={{ color: '#52525b' }}>–</span>;
                               const { label, tooltip } = formatCommitReason(r.commit_reason, planningConfig.purchase_allowed !== false);
@@ -9049,7 +8998,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               {copilotMessages.map((m, i) => (
                 <div key={i} style={{ marginBottom: '0.75rem' }}>
                   <span style={{ fontWeight: 600, color: m.role === 'user' ? '#a78bfa' : '#67e8f9', fontSize: '0.8rem' }}>{m.role === 'user' ? tP('copilot.roleUser') : tP('copilot.roleCopilot')}: </span>
-                  <span style={{ whiteSpace: 'pre-wrap', fontSize: '0.875rem' }}>{m.text.replace(/\*\*(.*?)\*\*/g, '$1')}</span>
+                  <span style={{ fontSize: '0.875rem' }}>{renderCopilotText(m.text)}</span>
                   {m.role === 'assistant' && m.steps && m.steps.length > 0 && (
                     <div style={{ marginTop: '0.4rem', marginLeft: '0.75rem', borderLeft: '2px solid #3d3d40', paddingLeft: '0.75rem' }}>
                       {m.steps.map((s, si) => (
@@ -9125,26 +9074,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     setCopilotPendingJobId(res.pending_job_id);
                   }
                 } catch (err) {
-                  // Agent failed (timeout, 5xx, network). Try the local
-                  // config-intent parser for offline command shapes
-                  // ("max methods 2", "禁用采购", "show config"); if that
-                  // doesn't match, surface the actual error rather than
-                  // routing through the copilot, whose catch-all
-                  // "我不太理解" hid real failures behind a config-help
-                  // message even when the user asked a domain question.
-                  const { reply, configUpdate } = parseCopilotIntent(text, planningConfig);
-                  if (configUpdate) {
-                    setPlanningConfig((prev) => ({
-                      ...prev,
-                      ...configUpdate,
-                      method_selection: configUpdate.method_selection ? { ...prev.method_selection, ...configUpdate.method_selection } : prev.method_selection,
-                      consolidation: configUpdate.consolidation ? { ...prev.consolidation, ...configUpdate.consolidation } : prev.consolidation,
-                    }));
-                    setCopilotMessages((prev) => [...prev, { role: 'assistant', text: reply }]);
-                  } else {
-                    const msg = err instanceof Error ? err.message : String(err);
-                    setCopilotMessages((prev) => [...prev, { role: 'assistant', text: msg }]);
-                  }
+                  // Agent failed (timeout, 5xx, network). Surface the actual
+                  // error to the user. We used to fall back to a rule-based
+                  // config-intent parser here, but it misfired on legitimate
+                  // domain queries (e.g. "shutdown for 7天" → matched "X天"
+                  // → "set consolidation bucket to 7 days"), confusing the
+                  // user. The LLM agent is the single source of truth now.
+                  const msg = err instanceof Error ? err.message : String(err);
+                  setCopilotMessages((prev) => [...prev, { role: 'assistant', text: msg }]);
                 } finally {
                   setCopilotLoading(false);
                 }

@@ -11,6 +11,8 @@ import com.allocator.api.materialImpactRoutes
 import com.allocator.api.materialEventRoutes
 import com.allocator.api.workOrderImpactRoutes
 import com.allocator.api.woScheduleEventRoutes
+import com.allocator.api.workOrderQueryRoutes
+import com.allocator.api.resolveRoutes
 import com.allocator.api.negotiationRoutes
 import com.allocator.api.planRunRoutes
 import com.allocator.api.planningAgentRoutes
@@ -107,6 +109,8 @@ fun Application.configureRouting() {
         materialEventRoutes()
         workOrderImpactRoutes()
         woScheduleEventRoutes()
+        workOrderQueryRoutes()
+        resolveRoutes()
         assessmentRoutes()
         planRunRoutes()
         negotiationRoutes()

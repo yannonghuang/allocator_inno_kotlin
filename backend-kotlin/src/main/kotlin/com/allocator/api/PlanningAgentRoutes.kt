@@ -29,8 +29,12 @@ import io.ktor.server.request.receive
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Routing
 import io.ktor.server.routing.post
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -54,6 +58,7 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.and
+import org.jetbrains.exposed.sql.deleteWhere
 import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.kotlin.datetime.CurrentTimestamp
 import org.jetbrains.exposed.sql.selectAll
@@ -87,18 +92,53 @@ private val log = LoggerFactory.getLogger("com.allocator.PlanningAgentRoutes")
 // the pending offer doesn't linger after it's accepted). Auto-expires after
 // PENDING_MAINTENANCE_TTL_MIN minutes if the user walks away.
 internal data class PendingMaintenanceDecision(
+    /** Option C's contingent — the original-window, accept-impact plan run.
+     *  Kept named `contingentPlanRunId` for backwards compatibility with
+     *  earlier callers; semantically this is the option-3 CPR id. */
     val contingentPlanRunId: Int,
     val maxFeasibleDays: Int?,
     val capturedAt: java.time.Instant,
+    val prodArea: String? = null,
+    val bucketStart: String? = null,
+    val originalDelayDays: Int? = null,
+    val woGroupIds: List<String>? = null,
+    val alternateStartDate: String? = null,
+    /** Option A's contingent — shortened to maxFeasibleDays, no demand impact.
+     *  Populated when the assessment flow generates it; null otherwise. */
+    val optionACprId: Int? = null,
+    /** Option B's contingent — deferred to alternateStartDate, no demand impact. */
+    val optionBCprId: Int? = null,
 )
 private val pendingMaintenance = java.util.concurrent.ConcurrentHashMap<Int, PendingMaintenanceDecision>()
 private const val PENDING_MAINTENANCE_TTL_MIN = 30L
 
-internal fun rememberPendingMaintenance(caseId: Int, contingentPlanRunId: Int, maxFeasibleDays: Int?) {
+internal fun rememberPendingMaintenance(
+    caseId: Int,
+    contingentPlanRunId: Int,
+    maxFeasibleDays: Int?,
+    prodArea: String? = null,
+    bucketStart: String? = null,
+    originalDelayDays: Int? = null,
+    woGroupIds: List<String>? = null,
+    alternateStartDate: String? = null,
+    optionACprId: Int? = null,
+    optionBCprId: Int? = null,
+) {
+    // If a prior entry exists for this case, preserve fields the new caller
+    // didn't supply — lets find_earliest_safe_start enrich the cache later
+    // without losing context populated by analyze_wo_schedule_impact.
+    val prior = pendingMaintenance[caseId]
     pendingMaintenance[caseId] = PendingMaintenanceDecision(
         contingentPlanRunId = contingentPlanRunId,
-        maxFeasibleDays = maxFeasibleDays,
+        maxFeasibleDays = maxFeasibleDays ?: prior?.maxFeasibleDays,
         capturedAt = java.time.Instant.now(),
+        prodArea = prodArea ?: prior?.prodArea,
+        bucketStart = bucketStart ?: prior?.bucketStart,
+        originalDelayDays = originalDelayDays ?: prior?.originalDelayDays,
+        woGroupIds = woGroupIds ?: prior?.woGroupIds,
+        alternateStartDate = alternateStartDate ?: prior?.alternateStartDate,
+        optionACprId = optionACprId ?: prior?.optionACprId,
+        optionBCprId = optionBCprId ?: prior?.optionBCprId,
     )
     sweepPendingMaintenance()
 }
@@ -122,6 +162,29 @@ private fun sweepPendingMaintenance() {
     pendingMaintenance.entries.removeIf { (_, p) ->
         java.time.temporal.ChronoUnit.MINUTES.between(p.capturedAt, now) > PENDING_MAINTENANCE_TTL_MIN
     }
+}
+
+// Heuristic: does the user message clearly pick option 1 or option 2 of a
+// just-presented maintenance offer? Option 3 (accept impact) is intentionally
+// NOT matched — auto-deleting a contingent the user wanted to promote would be
+// destructive. False negatives are fine (the cache TTL cleans up eventually);
+// the goal is a tight match for the "1/2/一/二/方案1/option 2" reply shapes.
+private val OPTION_1_OR_2_PATTERN = Regex(
+    "(?iu)" +
+    """(?:^|[^\d])(?:option\s*[12]\b|opt\s*[12]\b|\([ab]\)|方案\s*[12一二]|""" +
+    """选项\s*[12一二]|第[一二]个|我选\s*[12一二]|选\s*[12一二]|""" +
+    """^[12一二①②]\s*$|[①②])"""
+)
+private val OPTION_3_PATTERN = Regex(
+    "(?iu)" +
+    """(?:option\s*3\b|opt\s*3\b|\(c\)|方案\s*[3三]|选项\s*[3三]|第三个|我选\s*[3三]|""" +
+    """选\s*[3三]|^[3三③]\s*$|③|accept|promote|approve|接受|确认|采用|升格)"""
+)
+
+internal fun looksLikeOption1Or2Pick(message: String): Boolean {
+    if (message.isBlank()) return false
+    if (OPTION_3_PATTERN.containsMatchIn(message)) return false
+    return OPTION_1_OR_2_PATTERN.containsMatchIn(message)
 }
 
 // ── Wire contract ────────────────────────────────────────────────────────────
@@ -259,29 +322,40 @@ private val DESIGN_DOC_INDEX: List<DesignDocParagraph> by lazy {
 private const val SYSTEM_PROMPT_INTRO = """You are the Planning Agent — a domain expert for this supply-chain planning system.
 
 Your jobs:
-  1. Configure planning parameters from the user's natural-language goals.
-  2. Run plans on the user's behalf.
-  3. Explain the planner's decisions when asked.
+  1. Run plans on the user's behalf (run_plan_async).
+  2. Explain the planner's decisions and surface KPIs, pegging, soundness.
+  3. Handle shutdown / maintenance window scheduling (WO impact analysis).
+  4. Answer demand / supply / BOM lookup questions.
 
-Always classify the user's primary intent into one of three buckets (multiple may apply):
+You do NOT modify planning config (consolidation, method_selection, score_weights,
+etc.). Config changes go through the plan-form UI, not through you. If the user
+asks to change those, redirect them to the form rather than attempting the change.
 
-  PURCHASE intent — user wants to see how current supplies fulfill demand without buying more.
-    Typical phrases: "analyze material bottlenecks", "what can we deliver today", "before we buy".
-    Action: call update_config with { "purchase_allowed": false }, then run_plan_async, then
-    summarize fill_rate_pct and the top short-supplied products from get_kpis.
+**INTENT-ROUTING HARD STOP — read BEFORE doing anything else:**
+If the user's message contains ANY of these phrases (or their close paraphrases),
+the intent is **WO shutdown/maintenance scheduling**. Skip the three-bucket
+classification below and jump directly to the "Downtime / maintenance window
+scheduling" workflow further down. Specifically NEVER call `update_config`
+for these — `update_config` changes planning-engine parameters
+(consolidation/merge-bucket/method-selection), NOT maintenance schedules.
 
-  DEMAND intent — user wants fairness, no starvation, equal treatment across demands.
-    Typical phrases: "treat all demands fairly", "no one starved", "公平对待".
-    Action: call update_config with
-      { "consolidation": { "enabled": true, "allocation_mode": "fair" },
-        "method_selection": { "max_methods": 2, "mode": "preference" } }
-    and explain why this combination delivers fairness.
+  English: "shut down X for N days", "shutdown X N days", "take X offline",
+           "maintenance window", "outage", "down for N days", "production hold",
+           "stop production X for N days".
+  中文:    "关闭 X N 天", "停产 X N 天", "停机 X N 天", "X 维护 N 天",
+           "X 检修 N 天", "X 停线 N 天", "X 下线 N 天", "停掉 X 一周".
 
-  SUPPLY intent — user wants to maximize delivery / use up inventory / minimize purchase.
-    Typical phrases: "maximize delivery", "earliest commit", "use existing stock", "least purchase".
-    Action: call update_config with
-      { "method_selection": { "mode": "elaborate", "score_weights": { ... } } }
-    where score_weights matches the user's target axis (commit_time / inventory_consumed / purchase).
+Example — "从2024年7月15日关闭OE生产区7天" → "关闭 X N 天" pattern matches →
+WO scheduling workflow → list_prod_areas → find_wos → analyze_wo_availability
+→ analyze_wo_schedule_impact → find_earliest_safe_start. Do NOT call
+update_config; "7天" here is the maintenance window length, NOT a consolidation
+bucket size.
+
+Otherwise, the user's intent is one of: WO maintenance scheduling (covered above),
+plan analysis / explanation (KPIs, pegging, soundness, comparisons), or demand /
+supply lookup. Pick the tool that matches the question's data layer (see L1 / L2 /
+L3 below). This agent does NOT modify planning config — config changes go through
+the plan-form UI, not the agent.
 
 Planner knowledge (from docs/waterfall-allocation.md):
   - max_methods controls waterfall fan-out: 1 = single best method per demand;
@@ -598,21 +672,77 @@ Steps (DO NOT skip any):
      bucketStart, woGroupIds=[…all matched gids…]}]). Read max_feasible_days +
      bottlenecks.
 
-  5. **Decide the response shape based on N vs max_feasible_days**:
-     - N ≤ max_feasible_days  → Safe. Optionally offer create_wo_schedule_event
-       to record the scenario; no impact run needed.
-     - N > max_feasible_days  → Run analyze_wo_schedule_impact(delay_days=N,
-       persist=true). Surface impacted_demand_count, top 3-5 impacted demands
-       (demandId, customer, daysDelta), and the contingent_plan_run_id.
-       **Capture the contingent_plan_run_id explicitly** — you'll need it in
-       step 7 if the user accepts.
+  5. **Run the assessment via a single bundled call.**
 
-  6. **Suggest options** when N exceeds max-safe — ALWAYS present exactly these
-     three, NUMBERED 1/2/3 (so user replies of "3" / "三" / "我选择 3" are
-     unambiguously interpretable):
-       1. "Reduce shutdown to max_feasible_days days" — pure safe envelope.
-       2. "Try a different start date" — shift bucketStart later (re-run availability).
-       3. "Accept the impact and amend the plan" — promote the contingent.
+     `assess_maintenance_options(prod_area, bucket_start, delay_days)` —
+     this server-side tool does the entire pipeline atomically:
+       (a) collects WO gids in prod_area starting on/after bucket_start
+       (b) computes max_feasible_days from the availability DAG
+       (c) generates the Option C contingent (original window, persist=true)
+       (d) finds earliest_safe_start for Option B
+       (e) generates the Option A contingent (shortened, persist=true)
+       (f) generates the Option B contingent (deferred, persist=true; skipped
+           only when no safe start exists within the horizon)
+
+     All three contingent ids come back in the response payload as
+     `option_a_cpr_id`, `option_b_cpr_id`, `option_c_cpr_id`. They are also
+     cached server-side; the next turn's `<pending_maintenance_decision>`
+     block exposes them by the same names.
+
+     **Use this tool — do NOT chain find_wos / analyze_wo_availability /
+     analyze_wo_schedule_impact x3 / find_earliest_safe_start manually.** That
+     chain has a long tail of "one call got dropped under iteration pressure"
+     failure modes. The bundled tool is atomic and guarantees every option
+     has a contingent.
+
+     The response payload also carries `rendered_impacts` (pre-formatted
+     markdown table for Option 3's impacted-demand display), `max_feasible_days`,
+     `alternate_start_date`, and `bottleneck_gid` / `bottleneck_end` —
+     splice these into step 6's reply verbatim where they appear.
+
+     Branch on the payload's `impacted_demand_count`:
+       - 0 (everything fits within safe envelope) → Safe path, no option
+         message; reply that the original window has zero impact, surface
+         option_c_cpr_id, and ask the user to confirm (then promote_plan_run).
+       - >0 → present all three options (step 6).
+
+  6. **Suggest options** when N exceeds max-safe. The bundled tool returns a
+     server-rendered `terminalReply` markdown that's already correctly framed
+     (canonical labels Option A/B/C, A/B/C wording, deterministic Option B
+     handling for all three states) — the user sees that string directly, so
+     you don't need to re-render it. This step is just for understanding the
+     tool's payload structure so you can act on the user's pick in step 7+.
+
+     Option labels are CANONICAL — Option A = shorten (option_a_cpr_id),
+     Option B = defer (option_b_cpr_id), Option C = accept impact
+     (option_c_cpr_id). Labels never renumber/relabel, even if one option is
+     unavailable. Letters only — A/B/C, not 1/2/3.
+
+     Option B has THREE possible states the tool encodes via two fields:
+
+       - `option_b_cpr_id` non-null + `alternate_start_date` non-null →
+         "ok" state. A real contingent run was generated for the deferred
+         window. User-pick B → call promote_plan_run with option_b_cpr_id.
+
+       - `option_b_cpr_id` null + `alternate_start_date` non-null →
+         "no_op_at_alt_start". ESS found a valid deferred date BUT no WO
+         actually needs to shift there — the existing plan already
+         accommodates the maintenance at that date. No CPR was generated
+         because none is needed; the baseline plan is already valid. From
+         the user's perspective Option B IS still a viable pick. User-pick B
+         in this state → DO NOT promote anything; delete option_a_cpr_id and
+         option_c_cpr_id (the other two contingents) and confirm to the
+         user. There is nothing to promote; the maintenance window is
+         already supported.
+
+       - `option_b_cpr_id` null + `alternate_start_date` null →
+         "no_safe_start_within_horizon". ESS couldn't find any later safe
+         date. Option B is genuinely absent from the rendered reply. If the
+         user somehow picks B, tell them that option wasn't available and
+         ask them to pick A or C.
+
+     `impacted_demand_count > 0` always means Option C exists with a CPR;
+     `option_a_cpr_id` is present whenever `max_feasible_days > 0`.
 
   7. **On user acceptance of option (c)** — directly call promote_plan_run.
      The `plan_run_id` argument MUST come from the
@@ -633,32 +763,78 @@ Steps (DO NOT skip any):
      wrong id — re-read step 5's summary and find the correct
      contingent_plan_run_id).
 
-  9. **Confirmation gate / option-3 pattern matching**: NEVER call promote_plan_run
-     without an explicit user acceptance. After you've offered the three
-     numbered options in step 6 and you're awaiting the choice, treat ANY of
-     these as "user picked option 3 (accept the impact)" and respond by calling
-     promote_plan_run with the captured contingent_plan_run_id from step 5:
-       - English: "3" / "three" / "option 3" / "(c)" / "C" / "yes" / "yes, promote" /
-         "go ahead" / "amend" / "accept the impact" / "promote".
-       - Chinese: "3" / "三" / "③" / "选项 3" / "第三个" / "我选择 3" / "选择 3" /
-         "我选 3" / "接受" / "确认" / "采用" / "升格".
-     Number "1" / "一" / "第一个" → option 1 (reduce shutdown). Number "2" /
-     "二" / "第二个" → option 2 (different start date). DO NOT re-run any
-     analysis to "verify" — the option choice is unambiguous.
+  9. **Confirmation gate / option-C pattern matching**: NEVER call promote_plan_run
+     without an explicit user acceptance. After the assessment's options were
+     presented in step 6 and you're awaiting the user's choice, parse the
+     reply as one of A/B/C (input is permissive — accept letters OR legacy
+     numbers; output is always A/B/C):
+       - **A** triggers: English: "a" / "A" / "1" / "one" / "first" / "option A" /
+         "shorten" / "reduce". Chinese: "A" / "1" / "一" / "①" / "选项 A" /
+         "选项 1" / "缩短" / "第一个".
+       - **B** triggers: English: "b" / "B" / "2" / "two" / "option B" /
+         "defer" / "shift start". Chinese: "B" / "2" / "二" / "②" /
+         "选项 B" / "选项 2" / "推迟" / "第二个".
+       - **C** triggers: English: "c" / "C" / "3" / "three" / "option C" /
+         "(c)" / "yes" / "yes, promote" / "go ahead" / "amend" / "accept
+         the impact" / "promote". Chinese: "C" / "3" / "三" / "③" /
+         "选项 C" / "选项 3" / "第三个" / "接受" / "确认" / "采用" / "升格".
+     DO NOT re-run any analysis to "verify" — the option choice is unambiguous.
 
-  10. **HARD STOP — never call analyze_wo_schedule_impact twice in one turn.**
-      If you've already called analyze_wo_schedule_impact in this conversation
-      turn AND the user's most recent message is a numeric option choice
-      (1/2/3, 一/二/三, A/B/C, etc.), DO NOT call analyze_wo_schedule_impact
-      again. The legal next action depends on the option:
-        Option 1 → analyze_wo_availability is fine (re-check the safe envelope
-                   they accepted), or just acknowledge in prose.
-        Option 2 → analyze_wo_availability with the new bucketStart (re-check
-                   if the new date is safe). Single call, then reply.
-        Option 3 → promote_plan_run(plan_run_id=<captured contingent_plan_run_id>).
-                   That's it. No availability, no impact.
-      If you find yourself "wanting to verify" — STOP. The contingent plan run
-      from step 5 is already saved and authoritative.
+  10. **On the option-pick turn, call commit_option_pick(option_letter).** This
+      is the ONLY tool call on the resume turn. The server reads
+      `<pending_maintenance_decision>` from cache, dispatches the correct
+      action for the user's pick (A/B/C), promotes the right CPR (or, for
+      Option B in no_op_at_alt_start state, promotes nothing), deletes the
+      unchosen contingents, and returns a deterministic confirmation
+      message — all atomically. Do NOT call promote_plan_run or
+      delete_plan_run by hand on this turn — they are intentionally not
+      part of the resume flow because the LLM kept mis-picking the wrong
+      CPR id (e.g. promoting option_c_cpr_id when the user picked B).
+
+      Tool call shape:
+      ```json
+      {"option_letter": "A"}   // or "B" or "C"
+      ```
+
+      The result includes `picked_option`, `promoted_plan_run_id` (null when
+      the no_op_at_alt_start branch took the no-promote path), and
+      `deleted_unchosen`. The server's `terminalReply` is the user-facing
+      confirmation — emit it verbatim; do not add commentary like
+      "the original plan has been amended" unless the tool result actually
+      says so.
+
+      Never re-run analyze_wo_availability / assess_maintenance_options /
+      any other analysis on this turn — the cached CPRs from step 5 are
+      authoritative.
+
+  10b. **Picking from a parsed user reply** — once you've matched the user's
+       message to A/B/C via step 9's triggers, call commit_option_pick with
+       that letter. The server handles every case:
+
+       - **A** → promotes option_a_cpr_id (shorten window); deletes B+C.
+       - **B with option_b_cpr_id non-null** → promotes option_b_cpr_id
+         (deferred plan); deletes A+C.
+       - **B with option_b_cpr_id null + alternateStartDate non-null**
+         (no_op_at_alt_start) → no promotion; existing plan already
+         accommodates the deferred window; deletes A+C; confirms.
+       - **B with both null** (no_safe_start_within_horizon) → returns
+         `option_b_not_available`; relay verbatim and ask the user to pick
+         A or C.
+       - **C** → promotes option_c_cpr_id (accept impact); deletes A+B.
+
+       **Hard rule**: if commit_option_pick returns an error
+       (`plan_run_not_found`, `option_X_not_available`, etc.), STOP and
+       report it verbatim. NEVER fabricate a "promoted" outcome that didn't
+       come from the tool result, never invent new commit times, never
+       claim the plan was amended when the tool's `promoted_plan_run_id`
+       was null. The tool's `terminalReply` is the trustworthy
+       user-facing message; everything else you add is at your own risk.
+
+  11. **Contingent lifecycle.** commit_option_pick handles cleanup — the two
+      unchosen contingents are deleted as part of the same call. Don't
+      call delete_plan_run yourself on the maintenance flow.
+      `delete_plan_run` remains available for unrelated cleanup the user
+      explicitly asks for; it has no role in the option-pick resume turn.
 
 Example A — within safe window:
   User: "Can I take down line L1 for a week without breaking anything?"
@@ -720,23 +896,6 @@ internal val TOOLS: List<LlmTool> = listOf(
         "read_current_config",
         "Returns the working planning config for this conversation (most-recent saved or in-flight).",
         emptyParams(),
-    ),
-    tool(
-        "update_config",
-        "Merge a partial PlanningConfig into the working config. Only set fields you want to change. " +
-            "Returns the merged config. The agent's response will surface this to the form so the user " +
-            "sees toggles flip in sync.",
-        buildJsonObject {
-            put("type", "object")
-            putJsonObject("properties") {
-                putJsonObject("partial") {
-                    put("type", "object")
-                    put("description", "Partial PlanningConfig. Top-level keys: method_selection, " +
-                        "consolidation, purchase_allowed, analyze_criticality, check_soundness.")
-                }
-            }
-            put("required", buildJsonArray { add("partial") })
-        },
     ),
     tool(
         "run_plan_async",
@@ -1130,70 +1289,6 @@ internal val TOOLS: List<LlmTool> = listOf(
         },
     ),
     tool(
-        "recommend_config",
-        "**L3 / advising new runs.** Multi-objective router: given a target " +
-            "objective and an optional constraint, recommend a config from KB (or " +
-            "propose a novel one). Decision tree:\n" +
-            "  • `novel_only=true` → delegates to suggest_next_batch with the " +
-            "    objective mapped to a criterion. Returns up to 3 novel proposals.\n" +
-            "  • `hard_constraint` set → query KB with the constraint as filter, " +
-            "    sort by objective. Returns top-3 from the filtered set.\n" +
-            "  • `soft_constraint` set → Pareto frontier on objective × " +
-            "    soft_constraint.kpi, then knee detection (max distance from " +
-            "    utopia line). Returns the knee + 1-2 nearby points.\n" +
-            "  • Pure objective (no constraint) → Pareto with a sensible default " +
-            "    secondary axis (e.g. best_fill defaults to gini).\n" +
-            "Allowed objectives: best_fill, best_fairness, least_purchase, " +
-            "most_inventory_use, earliest_commit, fewest_starvation. Returns " +
-            "{ headline, alternates, rationale, frontier_summary, total_in_kb, " +
-            "source } where `source` ∈ {kb_pareto, kb_query, novel, ...}.",
-        buildJsonObject {
-            put("type", "object")
-            putJsonObject("properties") {
-                putJsonObject("objective") {
-                    put("type", "string")
-                    put("description", "best_fill | best_fairness | least_purchase | most_inventory_use | earliest_commit | fewest_starvation")
-                }
-                putJsonObject("soft_constraint") {
-                    put("type", "object")
-                    put("description", "{ kpi, qualifier (\"reasonable\"|\"strict\") } — anchors the secondary axis for Pareto knee detection.")
-                }
-                putJsonObject("hard_constraint") {
-                    put("type", "object")
-                    put("description", "{ kpi, op (\"<\"|\"<=\"|\">\"|\">=\"), value } — hard threshold applied as a pre-filter.")
-                }
-                putJsonObject("novel_only") {
-                    put("type", "boolean")
-                    put("description", "If true, restrict to novel single-axis variations not yet in KB.")
-                }
-            }
-            put("required", buildJsonArray { add("objective") })
-        },
-    ),
-    tool(
-        "narrate_tradeoff",
-        "**L3 / tradeoff narration.** Compare two configurations by signature and return " +
-            "structured tradeoff analysis: which knobs differ, which KPIs delta, and a " +
-            "one-line axis-of-tradeoff label. Use this whenever you need to narrate why " +
-            "recommend_config.alternates exist — never use freehand comparison. Returns " +
-            "{ differing_knobs: [{ knob, a, b }], kpi_deltas: [{ kpi, a, b, delta }], " +
-            "axis_label: string, summary: string }.",
-        buildJsonObject {
-            put("type", "object")
-            putJsonObject("properties") {
-                putJsonObject("sig_a") {
-                    put("type", "string")
-                    put("description", "First signature (canonical form, e.g. from recommend_config or KB).")
-                }
-                putJsonObject("sig_b") {
-                    put("type", "string")
-                    put("description", "Second signature (canonical form).")
-                }
-            }
-            put("required", buildJsonArray { add("sig_a"); add("sig_b") })
-        },
-    ),
-    tool(
         "query_design_docs",
         "**Cross-cutting / source-of-truth retrieval.** Substring search over the " +
             "project's design docs (DESIGN.md, waterfall-allocation.md, " +
@@ -1485,9 +1580,79 @@ internal val TOOLS: List<LlmTool> = listOf(
                     put("type", "boolean")
                     put("description", "Default true. When true, the contingent run is saved (promotable).")
                 }
+                putJsonObject("option_label") {
+                    put("type", "string")
+                    put("description",
+                        "Optional. Set to 'a' when this call corresponds to option 1 (shortened to max_feasible_days), " +
+                            "'b' when option 2 (deferred to alternate_start_date), or 'c' when option 3 (original window). " +
+                            "Used by the server to cache the resulting contingent_plan_run_id under the right slot so the " +
+                            "user's option pick can be honored with a single promote_plan_run call.")
+                }
                 putJsonObject("note") { put("type", "string") }
             }
             put("required", buildJsonArray { add("selectors") })
+        },
+    ),
+    tool(
+        "assess_maintenance_options",
+        "Server-bundled end-to-end maintenance-window assessment. Given prod_area, bucket_start, and " +
+            "delay_days, the allocator runs the FULL option pipeline in one call: (1) collect WO gids " +
+            "in the prod_area starting on/after bucket_start; (2) compute max_feasible_days from the " +
+            "availability DAG; (3) generate Option C contingent (original window, persist=true); " +
+            "(4) find earliest_safe_start for Option B; (5) generate Option A contingent (shortened to " +
+            "max_feasible_days, persist=true); (6) generate Option B contingent (deferred to " +
+            "earliest_safe_start, persist=true; skipped if no safe start within horizon). All three " +
+            "contingent ids are cached server-side so the user's option pick can be honored with a " +
+            "single promote_plan_run. PREFER THIS over manually chaining find_wos / analyze_wo_availability / " +
+            "analyze_wo_schedule_impact x3 / find_earliest_safe_start — the bundled tool is atomic and " +
+            "guarantees all three contingents exist.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("prod_area") {
+                    put("type", "string")
+                    put("description", "Prod area canonical id (use list_prod_areas to disambiguate first if unsure).")
+                }
+                putJsonObject("bucket_start") {
+                    put("type", "string")
+                    put("description", "ISO yyyy-MM-dd. The user's originally requested maintenance start date.")
+                }
+                putJsonObject("delay_days") {
+                    put("type", "integer")
+                    put("description", "Maintenance window length in days (the N the user asked for).")
+                }
+                putJsonObject("plan_run_id") { put("type", "integer") }
+            }
+            put("required", buildJsonArray { add("prod_area"); add("bucket_start"); add("delay_days") })
+        },
+    ),
+    tool(
+        "find_earliest_safe_start",
+        "Find the earliest bucketStart >= after_date at which a delay_days maintenance window on " +
+            "prod_area has ZERO impact (verified by simulation). Use this for Option 2 'try a different " +
+            "start date' when the user's requested delay exceeds max_feasible_days. Allocator iterates " +
+            "server-side over wo.start_time boundary dates with per-candidate simulation. Returns " +
+            "earliestSafeStart, bottleneckGid, bottleneckEnd, maxFeasibleDaysAtStart, iterations on " +
+            "success; or { error: 'no_safe_start_within_horizon', ... } if exhausted.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("prod_area") {
+                    put("type", "string")
+                    put("description", "Prod area canonical id (use list_prod_areas to disambiguate).")
+                }
+                putJsonObject("delay_days") {
+                    put("type", "integer")
+                    put("description", "Maintenance window length in days.")
+                }
+                putJsonObject("after_date") {
+                    put("type", "string")
+                    put("description", "ISO yyyy-MM-dd. The earliest date the search may suggest — typically the user's requested bucketStart.")
+                }
+                putJsonObject("plan_run_id") { put("type", "integer") }
+                putJsonObject("max_iterations") { put("type", "integer"); put("description", "Default 50, cap 200.") }
+            }
+            put("required", buildJsonArray { add("prod_area"); add("delay_days"); add("after_date") })
         },
     ),
     tool(
@@ -1519,9 +1684,69 @@ internal val TOOLS: List<LlmTool> = listOf(
         },
     ),
     tool(
+        "commit_option_pick",
+        "PREFERRED tool for the maintenance-window resume turn. Given the user's pick (A/B/C), the " +
+            "server reads the pending_maintenance_decision cache and dispatches the right action: " +
+            "promotes the correct option's contingent plan run, deletes the two unchosen contingents, " +
+            "and renders a deterministic confirmation message — all in one call. Handles the " +
+            "no_op_at_alt_start branch (Option B when the existing plan already accommodates the " +
+            "deferred window) correctly by deleting unchosen contingents WITHOUT promoting anything. " +
+            "Use this instead of calling promote_plan_run + delete_plan_run by hand on the resume turn — " +
+            "the prior hand-chained path mis-promoted Option C's CPR as if it were Option B's deferred " +
+            "plan and silently corrupted the active schedule.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("option_letter") {
+                    put("type", "string")
+                    put("enum", buildJsonArray { add("A"); add("B"); add("C") })
+                    put("description", "The user's pick. Must be one of A, B, or C (uppercase).")
+                }
+            }
+            put("required", buildJsonArray { add("option_letter") })
+        },
+    ),
+    tool(
         "promote_plan_run",
         "Promote a contingent plan run to status='success' — making it the active baseline. ALWAYS " +
-            "confirm with the user before calling this; never auto-promote. Idempotent on already-promoted runs.",
+            "confirm with the user before calling this; never auto-promote. Idempotent on already-promoted runs. " +
+            "For the maintenance-window option-pick resume turn, PREFER commit_option_pick(option_letter) — " +
+            "it dispatches the correct CPR and handles the no_op_at_alt_start case that promote_plan_run can't.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("plan_run_id") { put("type", "integer") }
+            }
+            put("required", buildJsonArray { add("plan_run_id") })
+        },
+    ),
+    tool(
+        "find_demands_for_product",
+        "Given a product/material id, return the list of demands whose plan chain includes work orders " +
+            "for that product. Covers BOTH cases: (a) the product IS the demand's finished good, and " +
+            "(b) the product is consumed somewhere downstream in the demand's BOM/pegging tree. Use this " +
+            "to answer 'which demands use material X' / '请列出所有使用物料X的用户需求' — a single call " +
+            "returns the answer instead of looping through trace_demand_to_supply per demand.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("product_id") {
+                    put("type", "string")
+                    put("description", "The material or finished-good id to look up.")
+                }
+                putJsonObject("plan_run_id") { put("type", "integer") }
+                putJsonObject("limit") { put("type", "integer"); put("description", "Default 50, max 500.") }
+            }
+            put("required", buildJsonArray { add("product_id") })
+        },
+    ),
+    tool(
+        "delete_plan_run",
+        "Delete an orphan plan run (status must be 'contingent', 'ready', or 'failed' — the tool " +
+            "refuses 'success' to protect the active baseline, and 'running' to avoid races). Use this " +
+            "to clean up the contingent_plan_run_id created in step 5 when the user picks Option 1 " +
+            "(reduce shutdown) or Option 2 (different date), since the contingent is no longer needed. " +
+            "Every generated contingent must end either promoted or deleted — never abandoned.",
         buildJsonObject {
             put("type", "object")
             putJsonObject("properties") {
@@ -1594,7 +1819,7 @@ private fun detectLocale(s: String): String =
     if (s.any { it in '一'..'鿿' || it in '㐀'..'䶿' }) "zh" else "en"
 
 /** Pick a localized string. Defaults to English when the locale isn't recognized. */
-private fun loc(en: String, zh: String, locale: String): String =
+internal fun loc(en: String, zh: String, locale: String): String =
     if (locale == "zh") zh else en
 
 // ── Config merge (deep merge of JsonObject) ──────────────────────────────────
@@ -1617,7 +1842,15 @@ internal fun mergeJsonObject(base: JsonObject?, patch: JsonObject): JsonObject {
 // Each tool returns (resultSummary, jsonResultForLLM). The summary is shown
 // to the user as a chat-step row; the JSON is the body the LLM sees.
 
-private data class ToolResult(val summary: String, val payload: JsonElement)
+internal data class ToolResult(
+    val summary: String,
+    val payload: JsonElement,
+    /** When set, the agent loop bypasses the final LLM rendering pass and uses
+     *  this string verbatim as the assistant reply. Use for pure-lookup tools
+     *  whose output is a definitive list/table — sending it through the LLM
+     *  just burns tokens, risks truncation, and adds no value. */
+    val terminalReply: String? = null,
+)
 
 private fun toolError(message: String, locale: String = "en"): ToolResult =
     ToolResult(
@@ -3350,6 +3583,28 @@ private fun peggingProductLocations(node: Map<String, Any?>, targetPid: String, 
     for (c in children) peggingProductLocations(c, targetPid, out)
 }
 
+/** True iff `targetPid` appears anywhere in this pegging tree on a real
+ *  node (work_order / supply / purchase / demand). Skips failed=true subtrees
+ *  (rolled back at the planner level) and synthetic `consolidated_*` supply
+ *  ids (intermediate accounting, not real consumption). Used by
+ *  `find_demands_for_product` to catch both make-chain and leaf-component
+ *  cases — previously only WO production was checked, which missed
+ *  inventory/buy leaf consumption. */
+private fun peggingTreeContainsProduct(node: Map<String, Any?>, targetPid: String): Boolean {
+    if (node["failed"] == true) return false
+    val type = node["type"] as? String
+    val supplyId = node["supply_id"] as? String
+    val isSyntheticBucket = supplyId != null && supplyId.startsWith("consolidated_")
+    if (!isSyntheticBucket) {
+        val pid = (node["product_id"] as? String)?.trim()
+        if (pid == targetPid && type != null) return true
+    }
+    @Suppress("UNCHECKED_CAST")
+    val children = node["children"] as? List<Map<String, Any?>> ?: return false
+    for (c in children) if (peggingTreeContainsProduct(c, targetPid)) return true
+    return false
+}
+
 /**
  * Walk a pegging tree and accumulate qty pulled from supply leaves at the
  * given (pid, lid). Skips `failed=true` subtrees (rolled back at the planner
@@ -4646,14 +4901,25 @@ private suspend fun runAgentLoop(
         val pendingForPrompt = loadPendingMaintenance(caseId)
         if (pendingForPrompt != null) {
             append("\n\n<pending_maintenance_decision>")
-            append("\n  contingent_plan_run_id=").append(pendingForPrompt.contingentPlanRunId)
+            append("\n  option_c_cpr_id=").append(pendingForPrompt.contingentPlanRunId)
+            pendingForPrompt.optionACprId?.let { append("\n  option_a_cpr_id=").append(it) }
+            pendingForPrompt.optionBCprId?.let { append("\n  option_b_cpr_id=").append(it) }
             pendingForPrompt.maxFeasibleDays?.let {
                 append("\n  max_feasible_days=").append(it)
             }
+            pendingForPrompt.prodArea?.let { append("\n  prod_area=").append(it) }
+            pendingForPrompt.bucketStart?.let { append("\n  original_bucket_start=").append(it) }
+            pendingForPrompt.originalDelayDays?.let { append("\n  original_delay_days=").append(it) }
+            pendingForPrompt.alternateStartDate?.let { append("\n  alternate_start_date=").append(it) }
+            pendingForPrompt.woGroupIds?.takeIf { it.isNotEmpty() }?.let { gids ->
+                append("\n  wo_group_ids=[").append(gids.joinToString(",") { "\"$it\"" }).append("]")
+            }
             append("\n  captured_at=").append(pendingForPrompt.capturedAt.toString())
-            append("\n  hint=When the user accepts option 3 of a maintenance offer (\"3\", \"三\", \"接受\", \"我选择 3\", \"yes, promote\", etc.), call promote_plan_run(plan_run_id=")
-            append(pendingForPrompt.contingentPlanRunId)
-            append("). Do NOT use <active_run_id> or <viewing_run_id> for this — they are unrelated baseline plan ids.")
+            append("\n  hint=On the user's option pick, call promote_plan_run with the cached id matching their choice:")
+            append(" option 1 → option_a_cpr_id, option 2 → option_b_cpr_id, option 3 → option_c_cpr_id.")
+            append(" Do NOT re-run analyze_wo_schedule_impact on the pick turn — the contingents were generated during the assessment.")
+            append(" Do NOT delete any of the unchosen contingents — they stay in history as a record of the assessed alternatives.")
+            append(" Do NOT use <active_run_id> or <viewing_run_id> as the contingent id — they are unrelated baseline plan ids.")
             append("\n</pending_maintenance_decision>")
         }
     }
@@ -4671,17 +4937,23 @@ private suspend fun runAgentLoop(
             systemPrompt = systemWithMemory,
             messages = convo,
             tools = TOOLS,
-            maxTokens = 1024,
+            // 4096 lets the model render long list-style replies (e.g.
+            // find_demands_for_product returning 20+ demands with full
+            // fields each). 1024 truncated those mid-row.
+            maxTokens = 4096,
             temperature = 0.2,
             provider = "openai",
         )
 
         // No tool calls → final reply.
         if (resp.toolCalls.isEmpty()) {
-            val reply = resp.text ?: "(empty reply)"
+            val rawReply = resp.text ?: "(empty reply)"
+            val (finalReply, finalSteps) = applyOption12SafetyNet(
+                caseId, userMessage, rawReply, steps, locale,
+            )
             return AgentResponse(
-                reply = reply,
-                steps = steps,
+                reply = finalReply,
+                steps = finalSteps,
                 configUpdate = workingConfig.takeIf { it != initialConfig },
                 freshRunId = freshRunId,
                 pendingJobId = pendingJobId,
@@ -4691,6 +4963,12 @@ private suspend fun runAgentLoop(
         // Append the assistant's tool-request message exactly as received, so
         // the next round-trip carries the tool_call_id<->tool_result linkage.
         convo.add(LlmAgentMessage(role = "assistant", content = resp.text, toolCalls = resp.toolCalls))
+
+        // If any tool returned a terminalReply, we'll skip the next LLM
+        // rendering pass and use it directly. Picks the LAST terminalReply
+        // produced in this iteration (concatenating multiples would be
+        // ambiguous; in practice only one such tool fires per turn).
+        var earlyTerminalReply: String? = null
 
         // Execute every tool call sequentially, append results.
         for (call in resp.toolCalls) {
@@ -4719,20 +4997,69 @@ private suspend fun runAgentLoop(
                 call.name, payloadStr.length, result.summary)
             steps.add(AgentStep(tool = call.name, args = args, resultSummary = result.summary))
             convo.add(LlmAgentMessage(role = "tool", toolCallId = call.id, content = payloadStr))
+            if (result.terminalReply != null) earlyTerminalReply = result.terminalReply
         }
         log.info("planning-agent iter={} tool_calls={} steps_total={}", iter + 1, resp.toolCalls.size, steps.size)
+
+        // Pure-lookup short-circuit: when a tool says "my output IS the
+        // reply" (terminalReply set), skip the next LLM rendering call. The
+        // tool result row is already deterministic, complete, and free of
+        // token-budget truncation — sending it back through the LLM would
+        // just re-narrate it more expensively.
+        if (earlyTerminalReply != null) {
+            val (finalReply, finalSteps) = applyOption12SafetyNet(
+                caseId, userMessage, earlyTerminalReply!!, steps, locale,
+            )
+            return AgentResponse(
+                reply = finalReply,
+                steps = finalSteps,
+                configUpdate = workingConfig.takeIf { it != initialConfig },
+                freshRunId = freshRunId,
+                pendingJobId = pendingJobId,
+            )
+        }
     }
 
     // Hit iteration cap — return whatever we have plus a guard message.
     log.warn("planning-agent hit MAX_TOOL_ITERATIONS={}", MAX_TOOL_ITERATIONS)
+    val capReply = "(I ran out of reasoning steps after $MAX_TOOL_ITERATIONS tool calls. " +
+        "Try a more specific request.)"
+    val (finalCapReply, finalCapSteps) = applyOption12SafetyNet(
+        caseId, userMessage, capReply, steps, locale,
+    )
     return AgentResponse(
-        reply = "(I ran out of reasoning steps after $MAX_TOOL_ITERATIONS tool calls. " +
-            "Try a more specific request.)",
-        steps = steps,
+        reply = finalCapReply,
+        steps = finalCapSteps,
         configUpdate = workingConfig.takeIf { it != initialConfig },
         freshRunId = freshRunId,
         pendingJobId = pendingJobId,
     )
+}
+
+// Post-loop hook for option-1/2 picks. Earlier revisions deterministically
+// deleted the orphan contingent here when the LLM failed to act. That
+// conflicts with the current policy ("every contingent stays as history;
+// the chosen option's contingent is promoted, others remain as the assessed
+// alternatives"). We now leave the cache and contingents in place — the LLM
+// is responsible for calling analyze_wo_schedule_impact with the new option
+// params and promoting the resulting CPR per step 10b. Kept as a stub so
+// callers don't need to change; logs a warning so we can spot if the LLM
+// returns without acting.
+private fun applyOption12SafetyNet(
+    caseId: Int,
+    userMessage: String,
+    reply: String,
+    steps: MutableList<AgentStep>,
+    @Suppress("UNUSED_PARAMETER") locale: String,
+): Pair<String, List<AgentStep>> {
+    val pending = loadPendingMaintenance(caseId) ?: return Pair(reply, steps)
+    if (!looksLikeOption1Or2Pick(userMessage)) return Pair(reply, steps)
+    log.warn(
+        "planning-agent option1/2 pick detected but pending contingent #{} still cached after loop — " +
+            "LLM may not have run the new impact + promote. caseId={}",
+        pending.contingentPlanRunId, caseId,
+    )
+    return Pair(reply, steps)
 }
 
 private suspend fun dispatchTool(
@@ -4744,7 +5071,6 @@ private suspend fun dispatchTool(
 ): Pair<ToolResult, JsonObject> {
     return when (call.name) {
         "read_current_config" -> Pair(toolReadCurrentConfig(workingConfig, locale), workingConfig)
-        "update_config" -> toolUpdateConfig(workingConfig, args, locale)
         "run_plan_async" -> Pair(toolRunPlanAsync(caseId, workingConfig, locale), workingConfig)
         "wait_for_plan" -> Pair(toolWaitForPlan(args, locale), workingConfig)
         "list_plan_runs" -> Pair(toolListPlanRuns(caseId, args, locale), workingConfig)
@@ -4763,8 +5089,6 @@ private suspend fun dispatchTool(
         "trace_demand_to_supply" -> Pair(toolTraceDemandToSupply(caseId, args, locale), workingConfig)
         "compare_runs" -> Pair(toolCompareRuns(caseId, args, locale), workingConfig)
         "explain_method_choice" -> Pair(toolExplainMethodChoice(caseId, args, locale), workingConfig)
-        "recommend_config" -> Pair(toolRecommendConfig(caseId, args, locale), workingConfig)
-        "narrate_tradeoff" -> Pair(toolNarrateTradeoff(caseId, args, locale), workingConfig)
         "query_design_docs" -> Pair(toolQueryDesignDocs(args, locale), workingConfig)
         "get_run_config" -> Pair(toolGetRunConfig(caseId, args, locale), workingConfig)
         "recheck_soundness" -> Pair(toolRecheckSoundness(caseId, args, locale), workingConfig)
@@ -4776,8 +5100,13 @@ private suspend fun dispatchTool(
         "find_wos" -> Pair(toolFindWos(caseId, args, locale), workingConfig)
         "analyze_wo_availability" -> Pair(toolAnalyzeWoAvailability(caseId, args, locale), workingConfig)
         "analyze_wo_schedule_impact" -> Pair(toolAnalyzeWoScheduleImpact(caseId, args, locale), workingConfig)
+        "find_earliest_safe_start" -> Pair(toolFindEarliestSafeStart(caseId, args, locale), workingConfig)
+        "assess_maintenance_options" -> Pair(toolAssessMaintenanceOptions(caseId, args, locale), workingConfig)
+        "commit_option_pick" -> Pair(toolCommitOptionPick(caseId, args, locale), workingConfig)
         "create_wo_schedule_event" -> Pair(toolCreateWoScheduleEvent(caseId, args, locale), workingConfig)
         "promote_plan_run" -> Pair(toolPromotePlanRun(caseId, args, locale), workingConfig)
+        "delete_plan_run" -> Pair(toolDeletePlanRun(caseId, args, locale), workingConfig)
+        "find_demands_for_product" -> Pair(toolFindDemandsForProduct(caseId, args, locale), workingConfig)
         else -> Pair(toolError("unknown tool: ${call.name}", locale), workingConfig)
     }
 }
@@ -4787,19 +5116,19 @@ private suspend fun dispatchTool(
 /** Pull the work-orders list out of a baseline plan-run result. Returns null
  *  if no baseline exists or the result is empty. */
 @Suppress("UNCHECKED_CAST")
-private fun loadBaselineWorkOrders(caseId: Int, planRunId: Int?): List<Map<String, Any?>>? {
+internal fun loadBaselineWorkOrders(caseId: Int, planRunId: Int?): List<Map<String, Any?>>? {
     val result = loadPlanResultFromDb(caseId, planRunId) ?: return null
     return (result["work_orders"] as? List<Map<String, Any?>>)
 }
 
 /** True if the WO is a synthetic VirtualProduct_* placeholder (planner-internal,
  *  not an actual shop-floor work order — same filter the UI applies). */
-private fun isVirtualProductWo(wo: Map<String, Any?>): Boolean {
+internal fun isVirtualProductWo(wo: Map<String, Any?>): Boolean {
     val pid = wo["product_id"] as? String ?: return false
     return pid.startsWith("VirtualProduct_")
 }
 
-private fun toolListProdAreas(caseId: Int, args: JsonObject, locale: String): ToolResult {
+internal fun toolListProdAreas(caseId: Int, args: JsonObject, locale: String): ToolResult {
     val planRunId = args["plan_run_id"]?.jsonPrimitive?.intOrNull
     val wos = loadBaselineWorkOrders(caseId, planRunId)
         ?: return ToolResult(
@@ -4836,7 +5165,7 @@ private fun toolListProdAreas(caseId: Int, args: JsonObject, locale: String): To
     )
 }
 
-private fun toolListLocations(caseId: Int, args: JsonObject, locale: String): ToolResult {
+internal fun toolListLocations(caseId: Int, args: JsonObject, locale: String): ToolResult {
     val planRunId = args["plan_run_id"]?.jsonPrimitive?.intOrNull
     val wos = loadBaselineWorkOrders(caseId, planRunId)
         ?: return ToolResult(
@@ -4870,7 +5199,7 @@ private fun toolListLocations(caseId: Int, args: JsonObject, locale: String): To
     )
 }
 
-private fun toolFindWos(caseId: Int, args: JsonObject, locale: String): ToolResult {
+internal fun toolFindWos(caseId: Int, args: JsonObject, locale: String): ToolResult {
     val planRunId = args["plan_run_id"]?.jsonPrimitive?.intOrNull
     val prodArea = args["prod_area"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
     val locationId = args["location_id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
@@ -5027,64 +5356,485 @@ private fun toolAnalyzeWoAvailability(caseId: Int, args: JsonObject, locale: Str
     )
 }
 
-private fun toolAnalyzeWoScheduleImpact(caseId: Int, args: JsonObject, locale: String): ToolResult {
-    val selectors = parseSelectorsArg(args)
-    if (selectors.isNullOrEmpty()) return ToolResult(
-        summary = loc("invalid selectors", "选择器格式错误", locale),
-        payload = buildJsonObject { put("error", "invalid_selectors") },
-    )
-    val delayDays = args["delay_days"]?.jsonPrimitive?.intOrNull
-    val delayToDate = args["delay_to_date"]?.jsonPrimitive?.contentOrNull
-    if (delayDays == null && delayToDate.isNullOrBlank()) return ToolResult(
-        summary = loc("delay_days or delay_to_date required", "需指定 delay_days 或 delay_to_date", locale),
-        payload = buildJsonObject { put("error", "no_delay") },
-    )
-    val planRunId = args["plan_run_id"]?.jsonPrimitive?.intOrNull
-    val persist = args["persist"]?.jsonPrimitive?.booleanOrNull ?: true
-    val note = args["note"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
-    val req = WoScheduleImpactRequest(
-        selectors = selectors,
-        delayDays = delayDays,
-        delayToDate = delayToDate,
-        planRunId = planRunId,
-        caseId = caseId,
-        persist = persist,
-        note = note,
-    )
-    return when (val r = runWoScheduleImpactInline(req)) {
-        is WoImpactResult.Failed -> ToolResult(
-            summary = loc("impact analysis failed: ${r.reason}", "影响分析失败：${r.reason}", locale),
-            payload = buildJsonObject { put("error", r.reason) },
-        )
-        is WoImpactResult.Ok -> {
-            val resp = r.response
-            val withinSafe = (resp.delayDays != null && resp.maxFeasibleDays != null &&
-                resp.delayDays <= resp.maxFeasibleDays)
-            // Stash the contingent_plan_run_id so the next agent-loop invocation
-            // injects it as a labeled block in the system prompt (see the
-            // PendingMaintenanceDecision docs). Only persisted runs produce an
-            // id worth promoting later.
-            if (resp.contingentPlanRunId != null) {
-                rememberPendingMaintenance(caseId, resp.contingentPlanRunId, resp.maxFeasibleDays)
-            }
-            // Surface contingent_plan_run_id in the summary so the LLM sees the
-            // actual id (and won't fall back to a literal from the few-shot
-            // example in the system prompt) when it later calls promote_plan_run.
-            val contingentSuffix = resp.contingentPlanRunId?.let { ", contingent_plan_run_id=$it" } ?: ""
-            ToolResult(
-                summary = loc(
-                    "impact: ${resp.matchedWoCount} WO shifted, ${resp.impactedDemandCount} demand(s) delayed; " +
-                        "max safe ${resp.maxFeasibleDays}d (${if (withinSafe) "within" else "exceeds"})" +
-                        contingentSuffix,
-                    "影响：${resp.matchedWoCount} 个工单后移，${resp.impactedDemandCount} 个需求延迟；" +
-                        "最大安全 ${resp.maxFeasibleDays} 天 (${if (withinSafe) "安全范围内" else "超出"})" +
-                        contingentSuffix,
-                    locale,
-                ),
-                payload = Json.encodeToJsonElement(WoScheduleImpactResponse.serializer(), resp),
-            )
+/** Strip the trailing `_VIRTUAL` suffix from synthetic virtual-demand ids for
+ *  display — the suffix is planner-internal noise. */
+private fun trimVirtualSuffix(id: String): String =
+    if (id.endsWith("_VIRTUAL")) id.removeSuffix("_VIRTUAL") else id
+
+/** Render impacted demands as a 6-column markdown table — the same shape the
+ *  scheduling-agent uses for its Option C "受影响需求" display. Returns empty
+ *  string when impacts is empty, so callers can render "(zero impact)" themselves. */
+private fun renderImpactedDemandsBullets(
+    impacts: List<WoImpactedDemand>,
+    locale: String,
+    maxShown: Int = 10,
+): String {
+    if (impacts.isEmpty()) return ""
+    // Sort by daysDelta desc (worst impact first), then priority asc.
+    val sorted = impacts.sortedWith(compareByDescending<WoImpactedDemand> { it.daysDelta }
+        .thenBy { it.priority ?: Int.MAX_VALUE })
+    val shown = sorted.take(maxShown)
+    val truncated = sorted.size > maxShown
+    return buildString {
+        append(loc(
+            "| Demand | Product | Customer | Baseline | New | Delay |\n" +
+                "|---|---|---|---|---|---:|\n",
+            "| 需求 | 产品 | 客户 | 原承诺 | 新承诺 | 延迟 |\n" +
+                "|---|---|---|---|---|---:|\n",
+            locale,
+        ))
+        shown.forEach { d ->
+            val did = trimVirtualSuffix(d.demandId).replace("|", "\\|")
+            val product = (d.description?.takeIf { it.isNotBlank() } ?: d.productId).replace("|", "\\|")
+            val cust = d.customerId.replace("|", "\\|")
+            val base = (d.baselineCommitTime ?: "—")
+            val new = (d.contingentCommitTime ?: "—")
+            val delay = if (d.daysDelta > 0) loc("+${d.daysDelta}d", "+${d.daysDelta} 天", locale) else "—"
+            append("| $did | $product | $cust | $base | $new | $delay |\n")
+        }
+        if (truncated) {
+            append(loc(
+                "\n_…and ${sorted.size - maxShown} more._\n",
+                "\n_…还有 ${sorted.size - maxShown} 条。_\n",
+                locale,
+            ))
         }
     }
+}
+
+@Suppress("UNUSED_PARAMETER")
+private fun toolAnalyzeWoScheduleImpact(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    // Guard: refuse direct LLM calls to analyze_wo_schedule_impact. Both the
+    // Branch A safe path and Branch B option assessment must go through
+    // assess_maintenance_options, which generates Option-A/B/C contingents
+    // atomically and renders the user-facing options markdown server-side.
+    // The internal Kotlin call from toolAssessMaintenanceOptions invokes
+    // runWoScheduleImpactInline directly, bypassing this dispatcher — so
+    // this guard only blocks agent-loop callers without breaking the bundled
+    // path. The "promoted wrong CPR" incident was caused by the agent
+    // calling this with persist=true (creating a single CPR for the
+    // original window with impact) and then promoting that CPR as if it
+    // were the deferred-Option-B plan.
+    return ToolResult(
+        summary = loc(
+            "analyze_wo_schedule_impact disallowed — use assess_maintenance_options instead",
+            "已禁用 analyze_wo_schedule_impact — 请改用 assess_maintenance_options",
+            locale,
+        ),
+        payload = buildJsonObject {
+            put("error", "use_assess_maintenance_options_instead")
+            put("hint", loc(
+                "analyze_wo_schedule_impact is not available to the agent loop. For BOTH Branch A (delay ≤ max_feasible_days) AND Branch B (delay > max_feasible_days, multi-option), call assess_maintenance_options instead — it atomically generates Option A/B/C contingent plan runs, renders the user-facing option markdown, and caches the three CPR ids for the next-turn promote. Calling analyze_wo_schedule_impact directly typically produces a single CPR for the original window with impact and then mislabels it as a different option on promote.",
+                "analyze_wo_schedule_impact 已不向 agent loop 开放。无论是 Branch A（delay ≤ max_feasible_days）还是 Branch B（delay > max_feasible_days，多选项），都请改用 assess_maintenance_options — 它会原子生成 Option A/B/C 的 contingent plan run，渲染用户可见的方案选择消息，并把三个 CPR ID 缓存好供下一回合 promote。直接调用 analyze_wo_schedule_impact 通常只会生成一个对应原始窗口（含影响）的 CPR，再被错误地当作其他选项 promote。",
+                locale,
+            ))
+            put("redirect_tool", "assess_maintenance_options")
+        },
+    )
+}
+
+@Suppress("UNUSED_PARAMETER")
+private fun toolFindEarliestSafeStart(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    // Guard: standalone use of find_earliest_safe_start by the planning agent
+    // is the antipattern that produced the "promoted wrong CPR" incident.
+    // The returned date is not actionable on its own — picking Option B
+    // requires a corresponding contingent plan run at the deferred bucket,
+    // which only assess_maintenance_options generates atomically. Without
+    // that CPR the agent typically falls back to promoting whatever other
+    // CPR is in scope (e.g. the original-window-with-impact run) and labels
+    // it as the deferred plan, silently corrupting the active schedule.
+    // Refuse and redirect to the bundled tool.
+    return ToolResult(
+        summary = loc(
+            "use assess_maintenance_options instead — find_earliest_safe_start is not standalone here",
+            "请改用 assess_maintenance_options — 此处不支持单独调用 find_earliest_safe_start",
+            locale,
+        ),
+        payload = buildJsonObject {
+            put("error", "use_assess_maintenance_options_instead")
+            put("hint", loc(
+                "find_earliest_safe_start is not available as a standalone tool to the planning agent. Call assess_maintenance_options with prod_area, bucket_start, and delay_days — it computes alternateStartDate internally, persists Option B's contingent at that date (or marks it as no_op_at_alt_start when the existing plan already accommodates), and returns the CPR ids for all three options atomically. A standalone earliest-safe-start date with no corresponding contingent plan run cannot be promoted.",
+                "find_earliest_safe_start 不能由 planning agent 单独调用。请用 prod_area、bucket_start、delay_days 调用 assess_maintenance_options — 它会在内部计算 alternateStartDate，原子地为选项 B 持久化对应的 contingent plan run（或在现有计划已可容纳时标记为 no_op_at_alt_start），并一次性返回所有三个选项的 CPR ID。脱离了对应 contingent plan run 的 earliest-safe-start 日期无法被升格。",
+                locale,
+            ))
+            put("redirect_tool", "assess_maintenance_options")
+        },
+    )
+}
+
+/** Bundled maintenance-options assessment. Runs the entire option pipeline
+ *  in one server-side call so the LLM doesn't have to chain 5-7 tools
+ *  reliably (gpt-4o-mini drops calls under iteration pressure, which left
+ *  the user with only 2 of 3 contingents). All three persist=true
+ *  contingents are guaranteed to exist after this returns (modulo
+ *  no_safe_start_within_horizon, which legitimately drops Option B). */
+private suspend fun toolAssessMaintenanceOptions(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val prodArea = args["prod_area"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+        ?: return ToolResult(
+            summary = loc("prod_area required", "缺少 prod_area 参数", locale),
+            payload = buildJsonObject { put("error", "prod_area required") },
+        )
+    val bucketStartStr = args["bucket_start"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+        ?: return ToolResult(
+            summary = loc("bucket_start required (ISO yyyy-MM-dd)", "缺少 bucket_start 参数（ISO 日期）", locale),
+            payload = buildJsonObject { put("error", "bucket_start required") },
+        )
+    val delayDays = args["delay_days"]?.jsonPrimitive?.intOrNull
+        ?: return ToolResult(
+            summary = loc("delay_days required (int)", "缺少 delay_days 参数（整数）", locale),
+            payload = buildJsonObject { put("error", "delay_days required" ) },
+        )
+    val planRunId = args["plan_run_id"]?.jsonPrimitive?.intOrNull
+    val bucketStartDate = runCatching { java.time.LocalDate.parse(bucketStartStr) }.getOrNull()
+        ?: return ToolResult(
+            summary = loc("bad bucket_start: $bucketStartStr", "bucket_start 日期格式错误：$bucketStartStr", locale),
+            payload = buildJsonObject { put("error", "bad_bucket_start") },
+        )
+
+    val wos = loadBaselineWorkOrders(caseId, planRunId)
+        ?: return ToolResult(
+            summary = loc("no baseline plan run; run plan first", "尚无基线计划，请先生成计划", locale),
+            payload = buildJsonObject { put("error", "no_baseline") },
+        )
+
+    // Step 1 — collect gids in this prod_area starting on/after bucket_start.
+    // Mirrors find_wos's filter without start_before (the impact pipeline shifts
+    // every later lot of these gids — no upper bound).
+    fun gidsForBucket(bucket: java.time.LocalDate): List<String> =
+        wos.asSequence()
+            .filter { !isVirtualProductWo(it) && it["wo_group_id"] != null }
+            .filter { it["prod_area"] == prodArea }
+            .filter {
+                val s = (it["start_time"] as? String)?.take(10) ?: return@filter false
+                val d = runCatching { java.time.LocalDate.parse(s) }.getOrNull() ?: return@filter false
+                d >= bucket
+            }
+            .mapNotNull { it["wo_group_id"] as? String }
+            .toSet()
+            .toList()
+
+    val gids = gidsForBucket(bucketStartDate)
+
+    if (gids.isEmpty()) return ToolResult(
+        summary = loc(
+            "no WOs match prod_area=$prodArea starting on/after $bucketStartStr",
+            "未找到 $prodArea 在 $bucketStartStr 及之后的工单",
+            locale,
+        ),
+        payload = buildJsonObject { put("error", "no_matching_wos") },
+    )
+
+    val selectors = listOf(WoScheduleSelector(bucketStart = bucketStartStr, woGroupIds = gids))
+
+    // Run impact on a worker thread so multiple calls can be dispatched in
+    // parallel via coroutineScope { async { … } }.
+    suspend fun runImpact(sels: List<WoScheduleSelector>, dd: Int, label: String):
+        Pair<WoScheduleImpactResponse?, String?> = withContext(Dispatchers.IO) {
+        val req = WoScheduleImpactRequest(
+            selectors = sels, delayDays = dd, planRunId = planRunId, caseId = caseId,
+            persist = true, note = "assess_maintenance_options option $label",
+        )
+        when (val r = runWoScheduleImpactInline(req)) {
+            is WoImpactResult.Ok -> Pair<WoScheduleImpactResponse?, String?>(r.response, null)
+            is WoImpactResult.Failed -> Pair<WoScheduleImpactResponse?, String?>(null, r.reason)
+        }
+    }
+
+    // Compute the safety envelope cheaply (sub-millisecond DAG walk) so we
+    // know max_feasible_days WITHOUT waiting on a full Option-C planner run.
+    val availReq = WoScheduleImpactRequest(
+        selectors = selectors, delayDays = delayDays,
+        planRunId = planRunId, caseId = caseId, persist = false,
+    )
+    val baseline = loadBaseline(availReq)
+        ?: return ToolResult(
+            summary = loc("no baseline plan run; run plan first", "尚无基线计划，请先生成计划", locale),
+            payload = buildJsonObject { put("error", "no_baseline") },
+        )
+    val avail = computeAvailability(baseline.workOrders, baseline.peggingTrees, selectors)
+    val maxFeasibleDays = avail.maxFeasibleDays
+
+    // Run Option A + Option C + earliest_safe_start IN PARALLEL. Each impact
+    // call is a full planner run (~30 s) — sequentialising 3 of them blew past
+    // nginx's gateway timeout. Single coroutineScope so all asyncs run
+    // concurrently (a per-async coroutineScope would block until each finishes,
+    // serialising the whole pipeline — the bug that caused the earlier 504s).
+    // Option B is launched inside the scope once earliest_safe_start resolves.
+    data class Assessed(
+        val optionA: WoScheduleImpactResponse?,
+        val errA: String?,
+        val optionB: WoScheduleImpactResponse?,
+        val errB: String?,
+        val optionC: WoScheduleImpactResponse?,
+        val errC: String?,
+        val safeResult: EarliestSafeStartResult,
+    )
+    val assessed = coroutineScope {
+        val optionADef = if (maxFeasibleDays > 0) {
+            async(Dispatchers.IO) { runImpact(selectors, maxFeasibleDays, "a") }
+        } else null
+        val optionCDef = async(Dispatchers.IO) { runImpact(selectors, delayDays, "c") }
+        val safeDef = async(Dispatchers.IO) {
+            val safeReq = EarliestSafeStartRequest(
+                caseId = caseId, planRunId = planRunId, prodArea = prodArea,
+                delayDays = delayDays, afterDate = bucketStartStr,
+            )
+            findEarliestSafeStartInline(safeReq)
+        }
+        val safeResult = safeDef.await()
+        val altStart: String? = (safeResult as? EarliestSafeStartResult.Ok)?.response?.earliestSafeStart
+        // Re-collect gids relevant to the DEFERRED bucket start. The original
+        // gids (collected at the user's bucket_start) may have all finished
+        // by the alternate date, in which case the deferred maintenance has
+        // nothing to shift in that gid set. The "maintenance window" semantic
+        // is "OE production unavailable during this period"; the impact should
+        // be evaluated against whichever WOs exist in the prod_area at the
+        // deferred date.
+        val deferredBucket = altStart?.let { runCatching { java.time.LocalDate.parse(it) }.getOrNull() }
+        val deferredGids = deferredBucket?.let { gidsForBucket(it) } ?: emptyList()
+        val optionBDef = if (altStart != null && deferredGids.isNotEmpty()) {
+            val deferredSelectors = listOf(WoScheduleSelector(bucketStart = altStart, woGroupIds = deferredGids))
+            async(Dispatchers.IO) { runImpact(deferredSelectors, delayDays, "b") }
+        } else null
+        if (altStart != null && deferredGids.isEmpty()) {
+            log.info(
+                "assess_maintenance_options: alt_start={} has no matching gids in {} — Option B truly N/A",
+                altStart, prodArea,
+            )
+        }
+        val (a, eA) = optionADef?.await() ?: Pair(null, "max_feasible_days=0")
+        val (c, eC) = optionCDef.await()
+        val (b, eB) = optionBDef?.await() ?: Pair(null, "no_safe_start_within_horizon")
+        Assessed(a, eA, b, eB, c, eC, safeResult)
+    }
+
+    val optionA = assessed.optionA
+    val errA = assessed.errA
+    val optionB = assessed.optionB
+    val errB = assessed.errB
+    val optionC = assessed.optionC
+    val errC = assessed.errC
+    val safeResult = assessed.safeResult
+
+    if (optionC == null) return ToolResult(
+        summary = loc(
+            "option C impact failed: ${errC ?: "unknown"}",
+            "Option C 影响分析失败：${errC ?: "unknown"}",
+            locale,
+        ),
+        payload = buildJsonObject { put("error", "option_c_failed"); put("reason", errC ?: "") },
+    )
+    if (optionA == null && maxFeasibleDays > 0) {
+        log.warn("planning-agent assess_maintenance_options: option A impact failed: {}", errA)
+    }
+    val alternateStart: String? = (safeResult as? EarliestSafeStartResult.Ok)?.response?.earliestSafeStart
+    val bottleneckGid: String? = (safeResult as? EarliestSafeStartResult.Ok)?.response?.bottleneckGid
+    val bottleneckEnd: String? = (safeResult as? EarliestSafeStartResult.Ok)?.response?.bottleneckEnd
+    log.info(
+        "assess_maintenance_options: caseId={} max_feasible={} alt_start={} safeResult={}",
+        caseId, maxFeasibleDays, alternateStart,
+        safeResult::class.simpleName,
+    )
+    if (optionB == null && alternateStart != null) {
+        log.warn("planning-agent assess_maintenance_options: option B impact failed: {}", errB)
+    }
+
+    // Persist the full assessment state in the cache so the option-pick turn
+    // can promote the right CPR with the server's auto-cleanup of the other two.
+    rememberPendingMaintenance(
+        caseId = caseId,
+        contingentPlanRunId = optionC.contingentPlanRunId
+            ?: 0, // unreachable when persist=true succeeded
+        maxFeasibleDays = maxFeasibleDays,
+        prodArea = prodArea,
+        bucketStart = bucketStartStr,
+        originalDelayDays = delayDays,
+        woGroupIds = gids,
+        alternateStartDate = alternateStart,
+        optionACprId = optionA?.contingentPlanRunId,
+        optionBCprId = optionB?.contingentPlanRunId,
+    )
+
+    val renderedImpacts = renderImpactedDemandsBullets(optionC.impacts, locale)
+    val renderedMessage = renderAssessmentMessage(
+        prodArea = prodArea,
+        bucketStart = bucketStartStr,
+        delayDays = delayDays,
+        maxFeasibleDays = maxFeasibleDays,
+        alternateStart = alternateStart,
+        bottleneckGid = bottleneckGid,
+        bottleneckEnd = bottleneckEnd,
+        optionACprId = optionA?.contingentPlanRunId,
+        optionBCprId = optionB?.contingentPlanRunId,
+        optionCCprId = optionC.contingentPlanRunId,
+        impactedDemandCount = optionC.impactedDemandCount,
+        renderedImpacts = renderedImpacts,
+        locale = locale,
+    )
+
+    val summary = loc(
+        "assessed: max_safe=${maxFeasibleDays}d, " +
+            "option_a_cpr=${optionA?.contingentPlanRunId ?: "skipped"}, " +
+            "option_b_cpr=${optionB?.contingentPlanRunId ?: "n/a"}, " +
+            "option_c_cpr=${optionC.contingentPlanRunId}, " +
+            "impacted_demands=${optionC.impactedDemandCount}",
+        "评估完成：安全边界 ${maxFeasibleDays} 天，" +
+            "Option A=${optionA?.contingentPlanRunId ?: "跳过"}，" +
+            "Option B=${optionB?.contingentPlanRunId ?: "无"}，" +
+            "Option C=${optionC.contingentPlanRunId}，" +
+            "影响需求 ${optionC.impactedDemandCount} 条",
+        locale,
+    )
+
+    return ToolResult(
+        summary = summary,
+        payload = buildJsonObject {
+            put("prod_area", prodArea)
+            put("bucket_start", bucketStartStr)
+            put("delay_days", delayDays)
+            put("max_feasible_days", maxFeasibleDays)
+            put("matched_wo_count", optionC.matchedWoCount)
+            put("wo_group_ids", buildJsonArray { gids.forEach { add(it) } })
+            put("alternate_start_date", alternateStart)
+            bottleneckGid?.let { put("bottleneck_gid", it) }
+            bottleneckEnd?.let { put("bottleneck_end", it) }
+            put("option_a_cpr_id", optionA?.contingentPlanRunId)
+            put("option_b_cpr_id", optionB?.contingentPlanRunId)
+            put("option_c_cpr_id", optionC.contingentPlanRunId)
+            put("impacted_demand_count", optionC.impactedDemandCount)
+            put("rendered_impacts", renderedImpacts)
+        },
+        // Short-circuit the next LLM pass entirely. The options-presentation
+        // message has been bitten too many times by the LLM fabricating
+        // unavailable options ("Option 2 不适用", "推迟开始至 2024-08-23"
+        // when alt_start was null, etc). Render it deterministically here
+        // so the user sees exactly what the tool result says.
+        terminalReply = renderedMessage,
+    )
+}
+
+/** Render the assessment message as Markdown — same format the LLM was
+ *  meant to produce, but deterministic. Skips entire Option sections when
+ *  the corresponding CPR id is null (vs prior LLM-driven version which kept
+ *  hallucinating "Option 2 不适用"). */
+private fun renderAssessmentMessage(
+    prodArea: String,
+    bucketStart: String,
+    delayDays: Int,
+    maxFeasibleDays: Int,
+    alternateStart: String?,
+    bottleneckGid: String?,
+    bottleneckEnd: String?,
+    optionACprId: Int?,
+    optionBCprId: Int?,
+    optionCCprId: Int?,
+    impactedDemandCount: Int,
+    renderedImpacts: String,
+    locale: String,
+): String = buildString {
+    // Header
+    append(loc(
+        "## Maintenance window assessment — $prodArea from $bucketStart for $delayDays days\n\n",
+        "## 维护窗口评估 — $prodArea 自 $bucketStart 起 $delayDays 天\n\n",
+        locale,
+    ))
+    append(loc(
+        "Maximum safe shutdown is **$maxFeasibleDays days**; your requested " +
+            "$delayDays-day window exceeds it and would shift **$impactedDemandCount " +
+            "demand(s)**.\n\n",
+        "最大安全关闭天数为 **$maxFeasibleDays 天**；您请求的 $delayDays 天" +
+            "超出安全边界，会推迟 **$impactedDemandCount 条需求**的承诺时间。\n\n",
+        locale,
+    ))
+    // Impacted demands table (just the rendered_impacts block — already a markdown table)
+    if (renderedImpacts.isNotBlank()) {
+        append(loc("### Impacted demands\n\n", "### 受影响需求\n\n", locale))
+        append(renderedImpacts.trim())
+        append("\n\n")
+    }
+    // Options — labels are A/B/C (letters only, no numbers). Skip omitted
+    // options; do NOT relabel C as B. Option B has three states:
+    //   - ok: optionBCprId != null AND alternateStart != null → standard
+    //         "deferred + CPR" wording.
+    //   - no_op_at_alt_start: optionBCprId == null AND alternateStart != null
+    //         → ESS found a date but no WO actually shifts there. Render
+    //         positively: existing plan already accommodates; no CPR needed.
+    //         User can still pick it (cleanup deletes A+C, no promote).
+    //   - no_safe_start_within_horizon: alternateStart == null → omit
+    //         Option B entirely.
+    append(loc("### Options\n", "### 备选方案\n", locale))
+    if (optionACprId != null) {
+        append(loc(
+            "\n**Option A** — Shorten the window to $maxFeasibleDays days. " +
+                "Demand commits unchanged; WO schedule amended within slack. " +
+                "New plan run = **#$optionACprId**.\n",
+            "\n**选项 A** — 缩短关闭时间至 $maxFeasibleDays 天。需求承诺保持不变，" +
+                "WO 排程在可用余量内调整。生成的新计划运行 = **#$optionACprId**。\n",
+            locale,
+        ))
+    }
+    if (optionBCprId != null && alternateStart != null) {
+        // "ok" — deferred Option B with a real CPR
+        val bottleneckHint = if (bottleneckGid != null && bottleneckEnd != null) {
+            loc(
+                " (gated by bottleneck WO `$bottleneckGid` finishing on $bottleneckEnd)",
+                "（瓶颈工单 `$bottleneckGid` 在 $bottleneckEnd 完成）",
+                locale,
+            )
+        } else ""
+        append(loc(
+            "\n**Option B** — Defer the start to $alternateStart$bottleneckHint. " +
+                "Demand commits unchanged; WO schedule amended for the deferred window. " +
+                "New plan run = **#$optionBCprId**.\n",
+            "\n**选项 B** — 推迟开始日期至 $alternateStart$bottleneckHint。" +
+                "需求承诺保持不变，WO 排程相应调整。生成的新计划运行 = **#$optionBCprId**。\n",
+            locale,
+        ))
+    } else if (optionBCprId == null && alternateStart != null) {
+        // "no_op_at_alt_start" — alt date exists, existing plan accommodates
+        // the maintenance there. Frame positively. No CPR to mention.
+        append(loc(
+            "\n**Option B** — Defer the start to $alternateStart " +
+                "($delayDays days, current plan already accommodates). " +
+                "$prodArea has no scheduled production in this window, so the " +
+                "maintenance can run as-is. The existing plan supports it; no " +
+                "adjustment needed.\n" +
+                "> To pick this: reply *\"Shut down $prodArea for $delayDays days from $alternateStart\"*\n",
+            "\n**选项 B** — 推迟开始日期至 $alternateStart（原 $delayDays 天，" +
+                "现行计划已可容纳）。此时段 $prodArea 区已无计划生产，" +
+                "维护事件可直接在此窗口进行，无需调整计划。\n" +
+                "> 如选此项：回复 *\"在 $alternateStart 停 $prodArea $delayDays 天\"*\n",
+            locale,
+        ))
+    }
+    // alternateStart == null → Option B omitted entirely
+    if (optionCCprId != null) {
+        append(loc(
+            "\n**Option C** — Accept the impact and amend the plan. Demand commits " +
+                "shift as listed in the impacted demands table above. " +
+                "New plan run = **#$optionCCprId**.\n",
+            "\n**选项 C** — 接受影响并修改计划。上述受影响需求按表中所示的天数推迟。" +
+                "生成的新计划运行 = **#$optionCCprId**。\n",
+            locale,
+        ))
+    }
+    val available = buildList {
+        if (optionACprId != null) add("A")
+        if (optionBCprId != null || alternateStart != null) add("B")
+        if (optionCCprId != null) add("C")
+    }
+    val availableEn = when (available.size) {
+        1 -> "**${available[0]}**"
+        2 -> "**${available[0]}** or **${available[1]}**"
+        3 -> "**${available[0]}**, **${available[1]}**, or **${available[2]}**"
+        else -> ""
+    }
+    val availableZh = available.joinToString("、") { "**$it**" }
+    append(loc(
+        "\nReply with $availableEn to confirm which option to promote.\n",
+        "\n请回复 $availableZh 以确认要升格的方案。\n",
+        locale,
+    ))
 }
 
 private fun toolCreateWoScheduleEvent(caseId: Int, args: JsonObject, locale: String): ToolResult {
@@ -5122,6 +5872,208 @@ private fun toolCreateWoScheduleEvent(caseId: Int, args: JsonObject, locale: Str
     )
 }
 
+/** Deterministic handler for the resume turn of the maintenance-window flow.
+ *  Reads pending_maintenance_decision from cache, dispatches the right action
+ *  for the user's option pick (A/B/C), and returns a localized confirmation.
+ *
+ *  Why this exists: the LLM kept conflating CPR ids on the resume turn
+ *  (e.g. promoting option_c_cpr_id when the user picked B in
+ *  no_op_at_alt_start state), silently corrupting the active schedule. Moving
+ *  the dispatch server-side makes the resume turn idempotent and impossible
+ *  to mis-promote regardless of what the LLM tries to say.
+ *
+ *  Dispatch by option_letter:
+ *    A → promote option_a_cpr_id, delete option_b_cpr_id (if non-null) and
+ *        option_c_cpr_id.
+ *    B + option_b_cpr_id non-null (ok) → promote option_b_cpr_id, delete
+ *        option_a_cpr_id and option_c_cpr_id.
+ *    B + option_b_cpr_id null + alternateStartDate non-null (no_op_at_alt_start)
+ *        → delete option_a_cpr_id and option_c_cpr_id; do NOT promote
+ *        (existing plan already accommodates the deferred maintenance).
+ *    B + both null (no_safe_start_within_horizon) → return error "Option B
+ *        was not available".
+ *    C → promote option_c_cpr_id, delete option_a_cpr_id and option_b_cpr_id
+ *        (if non-null).
+ */
+private fun toolCommitOptionPick(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val rawLetter = args["option_letter"]?.jsonPrimitive?.contentOrNull?.trim()?.uppercase()
+        ?: return ToolResult(
+            summary = loc("option_letter required (A/B/C)", "需指定 option_letter (A/B/C)", locale),
+            payload = buildJsonObject { put("error", "missing_option_letter") },
+        )
+    if (rawLetter !in setOf("A", "B", "C")) return ToolResult(
+        summary = loc("option_letter must be A, B, or C", "option_letter 必须为 A、B 或 C", locale),
+        payload = buildJsonObject { put("error", "invalid_option_letter") },
+    )
+    val pending = loadPendingMaintenance(caseId) ?: return ToolResult(
+        summary = loc(
+            "no pending maintenance decision — ask user to re-run assess_maintenance_options",
+            "无待处理的维护决策 — 请用户重新调用 assess_maintenance_options",
+            locale,
+        ),
+        payload = buildJsonObject { put("error", "no_pending_maintenance") },
+    )
+
+    val optionACpr = pending.optionACprId
+    val optionBCpr = pending.optionBCprId
+    val optionCCpr = pending.contingentPlanRunId  // legacy name; this is option C
+    val altStart = pending.alternateStartDate
+    val prodArea = pending.prodArea ?: "?"
+    val originalDelay = pending.originalDelayDays
+
+    // Helper: promote + delete-unchosen for a single picked CPR.
+    fun promoteAndCleanup(pickedCpr: Int, unchosen: List<Int>, picked: String): ToolResult {
+        // Promote the picked CPR
+        val outcome: String = transaction {
+            val row = PlanRuns.selectAll()
+                .where { (PlanRuns.id eq pickedCpr) and (PlanRuns.caseId eq caseId) }
+                .firstOrNull() ?: return@transaction "not_found"
+            val status = row[PlanRuns.status]
+            when {
+                status == "success" -> "already_promoted"
+                status == "contingent" -> {
+                    PlanRuns.update({ PlanRuns.id eq pickedCpr }) { it[PlanRuns.status] = "success" }
+                    emitPlanRunEvent(caseId, pickedCpr, "promoted", buildJsonObject {
+                        put("from_status", JsonPrimitive("contingent"))
+                        put("to_status", JsonPrimitive("success"))
+                        put("source", JsonPrimitive("planning_agent.commit_option_pick"))
+                        put("option", JsonPrimitive(picked))
+                    })
+                    "promoted"
+                }
+                else -> "wrong_status:$status"
+            }
+        }
+        if (outcome == "not_found") return ToolResult(
+            summary = loc(
+                "Option $picked's plan run #$pickedCpr was not found — cache may be stale",
+                "找不到选项 $picked 对应的计划运行 #$pickedCpr — 缓存可能已过期",
+                locale,
+            ),
+            payload = buildJsonObject { put("error", "plan_run_not_found"); put("plan_run_id", pickedCpr) },
+        )
+        if (outcome.startsWith("wrong_status:")) return ToolResult(
+            summary = loc(
+                "Option $picked's plan run #$pickedCpr has unexpected status (${outcome.removePrefix("wrong_status:")}) — cannot promote",
+                "选项 $picked 的计划运行 #$pickedCpr 状态异常 (${outcome.removePrefix("wrong_status:")}) — 无法升格",
+                locale,
+            ),
+            payload = buildJsonObject { put("error", outcome) },
+        )
+        // Delete unchosen
+        val deleted = mutableListOf<Int>()
+        for (other in unchosen) {
+            val delResult = toolDeletePlanRun(caseId, buildJsonObject { put("plan_run_id", other) }, locale)
+            val payloadObj = delResult.payload as? JsonObject
+            if (payloadObj?.get("deleted")?.jsonPrimitive?.booleanOrNull == true) deleted.add(other)
+            log.info(
+                "commit_option_pick: caseId={} picked={} promoted={} deleted_other={} result={}",
+                caseId, picked, pickedCpr, other, delResult.summary,
+            )
+        }
+        clearPendingMaintenance(caseId)
+        val cleanupSuffix = if (deleted.isNotEmpty())
+            loc(
+                "; deleted unchosen contingents " + deleted.joinToString(", ") { "#$it" },
+                "；已删除未选用的临时计划 " + deleted.joinToString("、") { "#$it" },
+                locale,
+            )
+        else ""
+        return ToolResult(
+            summary = loc(
+                "Option $picked committed: plan run #$pickedCpr promoted$cleanupSuffix",
+                "选项 $picked 已确认：计划运行 #$pickedCpr 已升格$cleanupSuffix",
+                locale,
+            ),
+            payload = buildJsonObject {
+                put("picked_option", rawLetter)
+                put("promoted_plan_run_id", pickedCpr)
+                put("deleted_unchosen", buildJsonArray { deleted.forEach { add(it) } })
+                if (outcome == "already_promoted") put("noop", true)
+            },
+            // Render the confirmation deterministically so the LLM can't
+            // rephrase the wrong narrative around it.
+            terminalReply = loc(
+                "✓ Option $picked committed — plan run #$pickedCpr is now the active plan.",
+                "✓ 选项 $picked 已确认 — 计划运行 #$pickedCpr 现为正式计划。",
+                locale,
+            ),
+        )
+    }
+
+    return when (rawLetter) {
+        "A" -> {
+            if (optionACpr == null) return ToolResult(
+                summary = loc("Option A was not available", "选项 A 不可用", locale),
+                payload = buildJsonObject { put("error", "option_a_not_available") },
+            )
+            val unchosen = listOfNotNull(optionBCpr, optionCCpr).filter { it != optionACpr }.distinct()
+            promoteAndCleanup(optionACpr, unchosen, "A")
+        }
+        "B" -> {
+            when {
+                optionBCpr != null -> {
+                    val unchosen = listOfNotNull(optionACpr, optionCCpr).filter { it != optionBCpr }.distinct()
+                    promoteAndCleanup(optionBCpr, unchosen, "B")
+                }
+                altStart != null -> {
+                    // no_op_at_alt_start: existing plan already accommodates.
+                    // Delete the two unchosen contingents and confirm — DO NOT
+                    // promote anything; the baseline plan is unchanged.
+                    val toDelete = listOfNotNull(optionACpr, optionCCpr).distinct()
+                    val deleted = mutableListOf<Int>()
+                    for (other in toDelete) {
+                        val delResult = toolDeletePlanRun(caseId, buildJsonObject { put("plan_run_id", other) }, locale)
+                        val payloadObj = delResult.payload as? JsonObject
+                        if (payloadObj?.get("deleted")?.jsonPrimitive?.booleanOrNull == true) deleted.add(other)
+                    }
+                    clearPendingMaintenance(caseId)
+                    val days = originalDelay?.toString() ?: "?"
+                    ToolResult(
+                        summary = loc(
+                            "Option B confirmed (no_op_at_alt_start): no plan change needed; deleted unchosen contingents " +
+                                deleted.joinToString(", ") { "#$it" },
+                            "选项 B 已确认 (no_op_at_alt_start): 无需变更计划；已删除未选用的临时计划 " +
+                                deleted.joinToString("、") { "#$it" },
+                            locale,
+                        ),
+                        payload = buildJsonObject {
+                            put("picked_option", "B")
+                            put("status", "no_op_at_alt_start")
+                            put("promoted_plan_run_id", JsonNull)
+                            put("deleted_unchosen", buildJsonArray { deleted.forEach { add(it) } })
+                        },
+                        terminalReply = loc(
+                            "✓ Option B confirmed — maintenance window scheduled for **$prodArea** from **$altStart** for **$days days**. The existing plan already accommodates this window; no plan change is needed and no new plan run was generated.",
+                            "✓ 选项 B 已确认 — **$prodArea** 维护窗口安排于 **$altStart** 起 **$days 天**。现行计划已可容纳此窗口，无需变更计划，也未生成新的计划运行。",
+                            locale,
+                        ),
+                    )
+                }
+                else -> ToolResult(
+                    summary = loc(
+                        "Option B was not available (no safe alternate start within horizon)",
+                        "选项 B 不可用（视野内无安全的替代开始日期）",
+                        locale,
+                    ),
+                    payload = buildJsonObject { put("error", "option_b_not_available") },
+                )
+            }
+        }
+        "C" -> {
+            // contingentPlanRunId (= optionCCpr) is non-nullable in
+            // PendingMaintenanceDecision — there's always a C contingent
+            // whenever there's a pending decision at all.
+            val unchosen = listOfNotNull(optionACpr, optionBCpr).filter { it != optionCCpr }.distinct()
+            promoteAndCleanup(optionCCpr, unchosen, "C")
+        }
+        else -> ToolResult(
+            summary = loc("unreachable", "不可达", locale),
+            payload = buildJsonObject { put("error", "unreachable") },
+        )
+    }
+}
+
 private fun toolPromotePlanRun(caseId: Int, args: JsonObject, locale: String): ToolResult {
     val planRunId = args["plan_run_id"]?.jsonPrimitive?.intOrNull
         ?: return ToolResult(
@@ -5156,17 +6108,62 @@ private fun toolPromotePlanRun(caseId: Int, args: JsonObject, locale: String): T
             else -> "wrong_status:$status"
         }
     }
-    if (outcome == "promoted" && pending?.contingentPlanRunId == planRunId) {
+    // Auto-cleanup of the unchosen maintenance contingents. When the promoted
+    // id matches ANY of the cached option CPRs (A/B/C), delete the other two
+    // cached ones — they were assessed alternatives the user didn't pick, and
+    // leaving them as 'contingent' status clutters the run-history list.
+    val autoDeleted = mutableListOf<Int>()
+    if (outcome == "promoted" && pending != null) {
+        val cachedCprs = listOfNotNull(
+            pending.optionACprId,
+            pending.optionBCprId,
+            pending.contingentPlanRunId,
+        ).distinct()
+        if (cachedCprs.contains(planRunId)) {
+            val others = cachedCprs.filter { it != planRunId }
+            for (other in others) {
+                val args2 = buildJsonObject { put("plan_run_id", other) }
+                val delResult = toolDeletePlanRun(caseId, args2, locale)
+                val payloadObj = delResult.payload as? JsonObject
+                if (payloadObj?.get("deleted")?.jsonPrimitive?.booleanOrNull == true) {
+                    autoDeleted.add(other)
+                }
+                log.info(
+                    "planning-agent auto-delete unchosen option contingent: caseId={} promoted={} other={} result={}",
+                    caseId, planRunId, other, delResult.summary,
+                )
+            }
+            clearPendingMaintenance(caseId)
+        }
+    }
+    if (outcome == "promoted" && pending?.contingentPlanRunId == planRunId && autoDeleted.isEmpty()) {
+        // Legacy path: no option CPR cluster (single contingent case).
         clearPendingMaintenance(caseId)
     }
     return when {
-        outcome == "promoted" -> ToolResult(
-            summary = loc("plan run #$planRunId promoted to success", "计划运行 #$planRunId 已升格为正式", locale),
-            payload = buildJsonObject {
-                put("plan_run_id", planRunId)
-                put("new_status", "success")
-            },
-        )
+        outcome == "promoted" -> {
+            val cleanupSuffix = if (autoDeleted.isNotEmpty())
+                loc(
+                    "; deleted unchosen contingents " + autoDeleted.joinToString(", ") { "#$it" },
+                    "；已删除未选用的临时计划 " + autoDeleted.joinToString("、") { "#$it" },
+                    locale,
+                )
+            else ""
+            ToolResult(
+                summary = loc(
+                    "plan run #$planRunId promoted to success" + cleanupSuffix,
+                    "计划运行 #$planRunId 已升格为正式" + cleanupSuffix,
+                    locale,
+                ),
+                payload = buildJsonObject {
+                    put("plan_run_id", planRunId)
+                    put("new_status", "success")
+                    if (autoDeleted.isNotEmpty()) {
+                        put("deleted_unchosen", buildJsonArray { autoDeleted.forEach { add(it) } })
+                    }
+                },
+            )
+        }
         outcome == "already_promoted" -> ToolResult(
             summary = loc("plan run #$planRunId is already at success (no-op)", "计划运行 #$planRunId 已是正式状态 (无需操作)", locale),
             payload = buildJsonObject {
@@ -5212,6 +6209,229 @@ private fun toolPromotePlanRun(caseId: Int, args: JsonObject, locale: String): T
             payload = buildJsonObject { put("error", outcome) },
         )
     }
+}
+
+private fun toolDeletePlanRun(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val planRunId = args["plan_run_id"]?.jsonPrimitive?.intOrNull
+        ?: return ToolResult(
+            summary = loc("plan_run_id required", "需指定 plan_run_id", locale),
+            payload = buildJsonObject { put("error", "missing_plan_run_id") },
+        )
+    val outcome: String = transaction {
+        val row = PlanRuns.selectAll()
+            .where { (PlanRuns.id eq planRunId) and (PlanRuns.caseId eq caseId) }
+            .firstOrNull() ?: return@transaction "not_found"
+        val status = row[PlanRuns.status]
+        // Whitelist deletable statuses. Refuse "success" (active baseline) and
+        // "running" (job in flight) outright.
+        when (status) {
+            "contingent", "ready", "failed" -> {
+                // Don't emit plan_run_event(deleted) — that table has a CASCADE
+                // FK to plan_run, so any audit row would be wiped along with
+                // the plan_run row anyway. Application log is the audit trail.
+                com.allocator.services.KbStore.markPlanRunDeleted(planRunId)
+                PlanRuns.deleteWhere {
+                    (PlanRuns.id eq planRunId) and (PlanRuns.caseId eq caseId)
+                }
+                log.info(
+                    "plan-run deleted via planning_agent: caseId={} planRunId={} prior_status={}",
+                    caseId, planRunId, status,
+                )
+                "deleted:$status"
+            }
+            else -> "wrong_status:$status"
+        }
+    }
+    // Clear pending-maintenance cache if this contingent was the one offered.
+    val pending = loadPendingMaintenance(caseId)
+    if (outcome.startsWith("deleted:") && pending?.contingentPlanRunId == planRunId) {
+        clearPendingMaintenance(caseId)
+    }
+    return when {
+        outcome.startsWith("deleted:") -> {
+            val priorStatus = outcome.removePrefix("deleted:")
+            ToolResult(
+                summary = loc(
+                    "plan run #$planRunId (status=$priorStatus) deleted",
+                    "计划运行 #$planRunId（状态 $priorStatus）已删除",
+                    locale,
+                ),
+                payload = buildJsonObject {
+                    put("plan_run_id", planRunId)
+                    put("prior_status", priorStatus)
+                    put("deleted", true)
+                },
+            )
+        }
+        outcome == "not_found" -> ToolResult(
+            summary = loc("plan run #$planRunId not found for case $caseId", "案例 $caseId 找不到计划运行 #$planRunId", locale),
+            payload = buildJsonObject { put("error", "not_found") },
+        )
+        outcome.startsWith("wrong_status:") -> {
+            val st = outcome.removePrefix("wrong_status:")
+            ToolResult(
+                summary = loc(
+                    "plan run #$planRunId has status='$st' — refused (only contingent/ready/failed can be deleted)",
+                    "计划运行 #$planRunId 状态为 '$st'，无法删除（仅 contingent/ready/failed 可删）",
+                    locale,
+                ),
+                payload = buildJsonObject {
+                    put("error", "wrong_status")
+                    put("status", st)
+                },
+            )
+        }
+        else -> ToolResult(
+            summary = loc("unexpected outcome: $outcome", "意外结果：$outcome", locale),
+            payload = buildJsonObject { put("error", outcome) },
+        )
+    }
+}
+
+private fun toolFindDemandsForProduct(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val productId = args["product_id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+        ?: return ToolResult(
+            summary = loc("product_id is required", "缺少 product_id 参数", locale),
+            payload = buildJsonObject { put("error", "product_id is required") },
+        )
+    val planRunId = args["plan_run_id"]?.jsonPrimitive?.intOrNull
+    val limit = (args["limit"]?.jsonPrimitive?.intOrNull ?: 50).coerceIn(1, 500)
+
+    val result = loadPlanResultFromDb(caseId, planRunId)
+        ?: return ToolResult(
+            summary = loc("no baseline plan run; run plan first", "尚无基线计划，请先生成计划", locale),
+            payload = buildJsonObject { put("error", "no_baseline") },
+        )
+
+    // Walk planning_pegging — the demand-centric pegging trees. This catches
+    // BOTH (a) `productId` appearing as a make/sub-make WO inside the chain
+    // AND (b) leaf-component consumption (supply/purchase nodes carrying
+    // `product_id == productId` directly). The old work-orders-only filter
+    // missed case (b) — leaf materials that the demand consumed from
+    // inventory or via purchase had no make-WO produced for them.
+    @Suppress("UNCHECKED_CAST")
+    val planningPegging = (result["planning_pegging"] as? List<Map<String, Any?>>) ?: emptyList()
+    val matchingDemandIds = mutableSetOf<String>()
+    for (entry in planningPegging) {
+        @Suppress("UNCHECKED_CAST")
+        val tree = entry["tree"] as? Map<String, Any?> ?: continue
+        if (!peggingTreeContainsProduct(tree, productId)) continue
+        val entryDemandId = entry["demand_id"] as? String
+        if (!entryDemandId.isNullOrBlank()) {
+            matchingDemandIds.add(entryDemandId)
+        } else {
+            // Multi-demand consolidated entry (no single demand_id) — credit
+            // every demand that shares this consolidation group. Matches the
+            // Supply View's `peggedDemandCount` behavior.
+            @Suppress("UNCHECKED_CAST")
+            val members = entry["consolidated_demand_ids"] as? List<String> ?: emptyList()
+            for (m in members) if (m.isNotBlank()) matchingDemandIds.add(m)
+        }
+    }
+
+    if (matchingDemandIds.isEmpty()) {
+        return ToolResult(
+            summary = loc(
+                "no demands found whose chain uses '$productId'",
+                "未找到使用物料 '$productId' 的用户需求",
+                locale,
+            ),
+            payload = buildJsonObject {
+                put("product_id", productId)
+                put("count", 0)
+                put("demands", buildJsonArray { })
+            },
+        )
+    }
+
+    // Look up demand details from the Demands table.
+    val rows = transaction {
+        Demands.selectAll()
+            .where { (Demands.caseId eq caseId) and (Demands.demandId inList matchingDemandIds) }
+            .map { row ->
+                mapOf(
+                    "demand_id" to row[Demands.demandId],
+                    "product_id" to row[Demands.productId],
+                    "customer_id" to row[Demands.customerId],
+                    "location_id" to row[Demands.locationId],
+                    "request_due_time" to row[Demands.requestDueTime],
+                    "quantity" to row[Demands.quantity],
+                    "priority" to row[Demands.priority],
+                    "description" to row[Demands.description],
+                )
+            }
+            .sortedWith(compareBy(
+                { (it["priority"] as? Int) ?: Int.MAX_VALUE },
+                { it["request_due_time"] as? String ?: "" },
+            ))
+    }
+    val truncated = rows.size > limit
+    val ordered = if (truncated) rows.take(limit) else rows
+
+    // Pre-render the reply in Kotlin and return it as the terminal reply, so
+    // the agent loop can skip the final LLM rendering pass. Style matches the
+    // scheduling-agent's option-C "受影响需求" table — a clean 6-column
+    // markdown table the chat renderer aligns nicely on screen.
+    val rendered = buildString {
+        append(loc(
+            "**${rows.size} demand(s) use material `$productId`**",
+            "**${rows.size} 条用户需求使用物料 `$productId`**",
+            locale,
+        ))
+        if (truncated) {
+            append(loc(" — showing first $limit:\n\n", " — 显示前 $limit 条：\n\n", locale))
+        } else {
+            append(loc(":\n\n", "：\n\n", locale))
+        }
+        append(loc(
+            "| Demand | Product | Customer | Due | Qty | Prio |\n" +
+                "|---|---|---|---|---:|---:|\n",
+            "| 需求 | 产品 | 客户 | 到期 | 数量 | 优先级 |\n" +
+                "|---|---|---|---|---:|---:|\n",
+            locale,
+        ))
+        ordered.forEach { d ->
+            val did = trimVirtualSuffix((d["demand_id"] as? String).orEmpty()).replace("|", "\\|")
+            val pid = (d["product_id"] as? String).orEmpty()
+            val desc = (d["description"] as? String).orEmpty()
+            val product = (desc.takeIf { it.isNotBlank() } ?: pid).replace("|", "\\|")
+            val cid = (d["customer_id"] as? String).orEmpty().replace("|", "\\|")
+            val due = (d["request_due_time"] as? String).orEmpty()
+            val qty = ((d["quantity"] as? Number)?.toDouble() ?: 0.0)
+            val qtyStr = if (qty == qty.toLong().toDouble()) qty.toLong().toString()
+                else String.format("%,.2f", qty)
+            val prio = (d["priority"] as? Int)?.toString() ?: ""
+            append("| $did | $product | $cid | $due | $qtyStr | $prio |\n")
+        }
+    }
+
+    return ToolResult(
+        summary = loc(
+            "${rows.size} demand(s) use product '$productId'" + if (truncated) " (showing first $limit)" else "",
+            "${rows.size} 条用户需求使用物料 '$productId'" + if (truncated) "（显示前 $limit 条）" else "",
+            locale,
+        ),
+        payload = buildJsonObject {
+            put("product_id", productId)
+            put("count", rows.size)
+            put("truncated", truncated)
+            put("demands", buildJsonArray {
+                ordered.forEach { d ->
+                    add(buildJsonObject {
+                        put("demand_id", d["demand_id"] as? String)
+                        put("product_id", d["product_id"] as? String)
+                        put("customer_id", d["customer_id"] as? String)
+                        (d["location_id"] as? String)?.let { put("location_id", it) }
+                        (d["request_due_time"] as? String)?.let { put("request_due_time", it) }
+                        put("quantity", (d["quantity"] as? Number)?.toDouble() ?: 0.0)
+                        (d["priority"] as? Int)?.let { put("priority", it) }
+                        (d["description"] as? String)?.let { put("description", it) }
+                    })
+                }
+            })
+        },
+        terminalReply = rendered,
+    )
 }
 
 // ── Route ────────────────────────────────────────────────────────────────────
