@@ -1,0 +1,4 @@
+BORA_ID,RESOURCE_ID,RESOURCE_RATE
+oe-bora,oe-machine1,1
+oe-bora,oe-machine2,5
+oe-bora,oe-crew,20
