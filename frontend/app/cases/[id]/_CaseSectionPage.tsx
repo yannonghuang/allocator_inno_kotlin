@@ -1024,6 +1024,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [supExplainRow, setSupExplainRow] = useState<PlanSupplyViewRow | null>(null);
   const [supExplainKey, setSupExplainKey] = useState<string | null>(null);
   const [woPeggingRowKey, setWoPeggingRowKey] = useState<string | null>(null);
+  // When a node is selected inside the open pegging tree, this stores the
+  // pathKey (for tree-row highlight) and the parsed product|location pair
+  // (for matching back to the WO table row(s) so the user sees which WO row
+  // corresponds to the tree element they picked). Cleared on pegging close.
+  const [peggingSelectedPathKey, setPeggingSelectedPathKey] = useState<string | null>(null);
+  const [peggingSelectedProductLoc, setPeggingSelectedProductLoc] = useState<{ product: string; location: string } | null>(null);
   const [bomRealPairs, setBomRealPairs] = useState<[string, string][] | null>(null);
   const [realMoveTriples, setRealMoveTriples] = useState<[string, string, string][] | null>(null);
   const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
@@ -1867,6 +1873,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [explanationLoading, setExplanationLoading] = useState(false);
   const [explanationData, setExplanationData] = useState<AllocationExplanation | null>(null);
   const [peggingOpen, setPeggingOpen] = useState(false);
+  // Clear any tree-row selection (and its WO-row cross-highlight) whenever
+  // the pegging panel closes — every close path funnels through
+  // setPeggingOpen(false), so this useEffect avoids patching each one.
+  useEffect(() => {
+    if (!peggingOpen) {
+      setPeggingSelectedPathKey(null);
+      setPeggingSelectedProductLoc(null);
+    }
+  }, [peggingOpen]);
   const [peggingLoading, setPeggingLoading] = useState(false);
   const [peggingTitle, setPeggingTitle] = useState('');
   const [peggingData, setPeggingData] = useState<{ direction: string; nodes: { id: string; label: string; type: string }[]; edges: { from: string; to: string; qty: number }[]; critical_path?: { path: string[] }; critical_paths_by_demand?: { component_key?: string; paths_by_demand: { demand_id: string; path: string[] }[] }; demand_id?: string; demand_root_id?: string; demand_allocated_qty?: number; demand_requested_qty?: number } | null>(null);
@@ -3192,6 +3207,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     setPeggingExpanded(new Set());
     setPeggingExpandingNodeId(null);
     setPeggingChildrenAllowedFor(new Set());
+    setPeggingSelectedPathKey(null);
+    setPeggingSelectedProductLoc(null);
     const timeoutId = setTimeout(() => {
       setPeggingLoading(false);
       setPeggingData(null);
@@ -3229,6 +3246,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     setPeggingExpanded(new Set());
     setPeggingExpandingNodeId(null);
     setPeggingChildrenAllowedFor(new Set());
+    setPeggingSelectedPathKey(null);
+    setPeggingSelectedProductLoc(null);
     const timeoutId = setTimeout(() => {
       setPeggingLoading(false);
       setPeggingData(null);
@@ -5754,6 +5773,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
                       if (woExplainKey === k) return { background: 'rgba(167,139,250,0.15)', outline: '1px solid rgba(167,139,250,0.4)' };
                       if (woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
+                      // Amber tint for rows whose product@location matches the
+                      // currently-selected node inside the open pegging tree.
+                      // Distinct from the sky-blue root-WO highlight above; if
+                      // the user clicks the tree root the root highlight wins.
+                      if (peggingSelectedProductLoc
+                        && r.product_id === peggingSelectedProductLoc.product
+                        && r.location_id === peggingSelectedProductLoc.location) {
+                        return { background: 'rgba(251,191,36,0.12)', outline: '1px solid rgba(251,191,36,0.4)' };
+                      }
                       // Pegging-graph highlight (driven by woPegHighlightRow / bar click or Show button).
                       if (woPegHighlightRow) {
                         const isSelf = r === woPegHighlightRow
@@ -5994,6 +6022,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
                               if (woExplainKey === k) return { background: 'rgba(167,139,250,0.15)', outline: '1px solid rgba(167,139,250,0.4)' };
                               if (woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
+                              // Amber tint for rows whose product@location matches the
+                              // currently-selected node inside the open pegging tree
+                              // (distinct from the sky-blue root-WO highlight above).
+                              if (peggingSelectedProductLoc
+                                && r.product_id === peggingSelectedProductLoc.product
+                                && r.location_id === peggingSelectedProductLoc.location) {
+                                return { background: 'rgba(251,191,36,0.12)', outline: '1px solid rgba(251,191,36,0.4)' };
+                              }
                               if (!r.override_active && !r.consolidation_override_active && woHasSavedOverride(r)) return { borderLeft: '3px solid #b45309' };
                               return undefined;
                             }}
@@ -10314,6 +10350,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 servedDemandIds={peggingData.direction === 'supply-to-demand' && peggingData.critical_paths_by_demand?.paths_by_demand
                   ? peggingData.critical_paths_by_demand.paths_by_demand.filter((p: { path?: string[] }) => p.path?.length).map((p: { demand_id: string }) => p.demand_id)
                   : []}
+                selectedKey={peggingSelectedPathKey}
+                onSelect={(pathKey, nodeId) => {
+                  setPeggingSelectedPathKey(pathKey);
+                  // Node id is "product|location" or "product|location|period";
+                  // parse the first two segments to drive the WO-row match in
+                  // woRowStyle below. Period-bearing ids (inventory nodes)
+                  // still map back to the same product@location.
+                  const parts = nodeId.split('|');
+                  const product = parts[0] ?? '';
+                  const location = parts[1] ?? '';
+                  if (product && location) {
+                    setPeggingSelectedProductLoc({ product, location });
+                  } else {
+                    setPeggingSelectedProductLoc(null);
+                  }
+                }}
               />
             )}
             {!peggingLoading && !peggingData && <p style={{ color: '#a1a1aa' }}>Could not load pegging.</p>}

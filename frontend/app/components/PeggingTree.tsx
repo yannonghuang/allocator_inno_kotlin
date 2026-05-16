@@ -27,6 +27,13 @@ type Props = {
   childrenAllowedFor: Set<string>;
   direction?: string;
   servedDemandIds?: string[];
+  /** Path key of the currently-selected tree row (for highlight). */
+  selectedKey?: string | null;
+  /** Called when a row is clicked. Click also toggles expansion via onExpand;
+   *  this callback is separate so the caller can also track selection (e.g.
+   *  to cross-highlight a matching row in another view). nodeId is the raw
+   *  graph node id (e.g. "product|location" or "product|location|period"). */
+  onSelect?: (pathKey: string, nodeId: string) => void;
 };
 
 function PeggingNodeRow({
@@ -40,6 +47,7 @@ function PeggingNodeRow({
   childrenAllowedFor,
   direction,
   ancestorIds = new Set<string>(),
+  selectedKey,
   t,
 }: {
   graph: PeggingGraph;
@@ -52,6 +60,7 @@ function PeggingNodeRow({
   childrenAllowedFor: Set<string>;
   direction?: string;
   ancestorIds?: Set<string>;
+  selectedKey?: string | null;
   t: ReturnType<typeof useTranslations>;
 }) {
   const { nodeById, pathSet, getChildren } = graph;
@@ -129,6 +138,7 @@ function PeggingNodeRow({
   const showChildren = hasChildren && isExpanded && childrenAllowed;
   const ancestorIdsForChildren = new Set([...Array.from(ancestorIds), nodeId]);
 
+  const isSelected = selectedKey === pathKey;
   const rowStyle: React.CSSProperties = {
     cursor: 'pointer',
     padding: '6px 8px',
@@ -136,7 +146,11 @@ function PeggingNodeRow({
     marginTop: 4,
     border: 'none',
     borderRadius: 4,
-    background: 'transparent',
+    // Amber tint when this row is the user-selected tree node — paired with
+    // the amber WO-row highlight in _CaseSectionPage's woRowStyle so the
+    // cross-highlight is visually consistent.
+    background: isSelected ? 'rgba(251,191,36,0.18)' : 'transparent',
+    boxShadow: isSelected ? 'inset 2px 0 0 #f59e0b' : undefined,
     color: 'inherit',
     fontSize: 'inherit',
     font: 'inherit',
@@ -189,6 +203,7 @@ function PeggingNodeRow({
                   childrenAllowedFor={childrenAllowedFor}
                   direction={direction}
                   ancestorIds={ancestorIdsForChildren}
+                  selectedKey={selectedKey}
                   t={t}
                 />
               </div>
@@ -207,6 +222,8 @@ export function PeggingTree({
   childrenAllowedFor,
   direction,
   servedDemandIds = [],
+  selectedKey,
+  onSelect,
 }: Props) {
   const t = useTranslations('pegging');
   const { rootId, nodes, edges, getChildren } = graph;
@@ -221,6 +238,13 @@ export function PeggingTree({
     const childCountStr = el.getAttribute('data-pegging-child-count');
     const childCount = childCountStr != null ? parseInt(childCountStr, 10) : undefined;
     onExpand(pathKey, !isExpanded, childCount != null && childCount > 0 ? childCount : undefined);
+    // Track selection in parallel with expansion. The nodeId is the last
+    // segment of the pathKey (separator PATH_KEY_SEP). Selection lets the
+    // caller cross-highlight (e.g. the matching WO row in the parent view).
+    if (onSelect) {
+      const nodeId = pathKey.split(PATH_KEY_SEP).pop() ?? pathKey;
+      onSelect(pathKey, nodeId);
+    }
   };
 
   return (
@@ -247,6 +271,7 @@ export function PeggingTree({
               onExpand={onExpand}
               childrenAllowedFor={childrenAllowedFor}
               direction={direction}
+              selectedKey={selectedKey}
               t={t}
             />
           </div>
