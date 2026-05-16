@@ -115,6 +115,38 @@ object ProductLocations : Table("productlocation") {
     override val primaryKey = PrimaryKey(id)
 }
 
+object Operations : Table("operation") {
+    val id = integer("id").autoIncrement()
+    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val operationId = varchar("operation_id", 255)
+    val prodArea = varchar("prod_area", 255)
+    val uph = double("uph")
+    val yieldFactor = double("yield_factor")
+    val borId = varchar("bor_id", 255)
+    val processTime = integer("process_time")
+    val preProcessTime = integer("pre_process_time")
+    val postProcessTime = integer("post_process_time")
+    override val primaryKey = PrimaryKey(id)
+}
+
+object Bors : Table("bor") {
+    val id = integer("id").autoIncrement()
+    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val borId = varchar("bor_id", 255)
+    val resourceId = varchar("resource_id", 255)
+    val resourceRate = double("resource_rate")
+    override val primaryKey = PrimaryKey(id)
+}
+
+object Resources : Table("resource") {
+    val id = integer("id").autoIncrement()
+    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val resourceId = varchar("resource_id", 255)
+    val locationId = varchar("location_id", 255)
+    val size = double("size")
+    override val primaryKey = PrimaryKey(id)
+}
+
 object Supplies : Table("supply") {
     val id = integer("id").autoIncrement()
     val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)

@@ -13,7 +13,7 @@ import java.nio.file.Path
 private val log = LoggerFactory.getLogger("com.allocator.CsvImportService")
 
 /**
- * Parses 11 CSV tables and bulk-inserts them for a given case_id.
+ * Parses CSV tables and bulk-inserts them for a given case_id.
  * Port of services/csv_import.py — column names are the same uppercase header names from the CSV files.
  */
 object CsvImportService {
@@ -29,6 +29,9 @@ object CsvImportService {
             "method_buy.csv" to ::importMethodBuy,
             "method_make.csv" to ::importMethodMake,
             "productlocation.csv" to ::importProductLocation,
+            "operation.csv" to ::importOperation,
+            "bor.csv" to ::importBor,
+            "resource.csv" to ::importResource,
             "supply.csv" to ::importSupply,
             "method_move.csv" to ::importMethodMove,
         )
@@ -171,6 +174,41 @@ object CsvImportService {
             this[ProductLocations.locationId] = r["LOCATION_ID"] ?: ""
             this[ProductLocations.maxLotSize] = r["MAX_LOT_SIZE"].toDoubleOrNullSafe()
             this[ProductLocations.prodArea] = r["PROD_AREA"]?.takeIf { it.isNotBlank() }
+        }
+    }
+
+    private fun importOperation(caseId: Int, rows: List<Map<String, String>>) {
+        Operations.deleteWhere { Operations.caseId eq caseId }
+        Operations.batchInsert(rows) { r ->
+            this[Operations.caseId] = caseId
+            this[Operations.operationId] = r["OPERATION_ID"] ?: ""
+            this[Operations.prodArea] = r["PROD_AREA"] ?: ""
+            this[Operations.uph] = r["UPH"].toDoubleOrNullSafe() ?: 0.0
+            this[Operations.yieldFactor] = r["YIELD_FACTOR"].toDoubleOrNullSafe() ?: 1.0
+            this[Operations.borId] = r["BOR_ID"] ?: ""
+            this[Operations.processTime] = r["PROCESS_TIME"].toIntOrNullSafe() ?: 0
+            this[Operations.preProcessTime] = r["PRE_PROCESS_TIME"].toIntOrNullSafe() ?: 0
+            this[Operations.postProcessTime] = r["POST_PROCESS_TIME"].toIntOrNullSafe() ?: 0
+        }
+    }
+
+    private fun importBor(caseId: Int, rows: List<Map<String, String>>) {
+        Bors.deleteWhere { Bors.caseId eq caseId }
+        Bors.batchInsert(rows) { r ->
+            this[Bors.caseId] = caseId
+            this[Bors.borId] = r["BOR_ID"] ?: ""
+            this[Bors.resourceId] = r["RESOURCE_ID"] ?: ""
+            this[Bors.resourceRate] = r["RESOURCE_RATE"].toDoubleOrNullSafe() ?: 0.0
+        }
+    }
+
+    private fun importResource(caseId: Int, rows: List<Map<String, String>>) {
+        Resources.deleteWhere { Resources.caseId eq caseId }
+        Resources.batchInsert(rows) { r ->
+            this[Resources.caseId] = caseId
+            this[Resources.resourceId] = r["RESOURCE_ID"] ?: ""
+            this[Resources.locationId] = r["LOCATION_ID"] ?: ""
+            this[Resources.size] = r["SIZE"].toDoubleOrNullSafe() ?: 0.0
         }
     }
 
