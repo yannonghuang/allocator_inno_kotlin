@@ -444,6 +444,37 @@ export async function getMovesWithTransit(caseId: number): Promise<{ moves: [str
   return r.json();
 }
 
+/** Per-resource utilization rows for a plan run. Each row is a (resource_id, location_id) with
+ *  daily load values aligned to `buckets` (ISO date strings) and the resource's static `size`.
+ *  `contributors` lists the work_orders that drove the load (debug/cross-highlight hook). */
+export type ResourceUtilizationRow = {
+  resource_id: string;
+  location_id: string;
+  size: number;
+  load: number[];
+  contributors?: Array<{
+    wo_group_id?: string | null;
+    product_id?: string;
+    location_id?: string;
+    quantity?: number;
+    start_time?: string;
+    end_time?: string;
+    rate?: number;
+  }>;
+};
+
+export type ResourceUtilization = {
+  horizon: { start: string; end: string };
+  buckets: string[];
+  rows: ResourceUtilizationRow[];
+};
+
+export async function getResourceUtilization(caseId: number, runId: number): Promise<ResourceUtilization> {
+  const r = await fetch(`${API}/cases/${caseId}/runs/${runId}/resource-utilization`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
 /** Fetch work-order pegging on demand: how this WO is fulfilled by its supplies (all levels). Requires a prior plan run. */
 export async function getWorkOrderPegging(
   caseId: number,

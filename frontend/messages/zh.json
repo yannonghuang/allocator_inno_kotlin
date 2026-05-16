@@ -402,7 +402,20 @@
     "tabs": {
       "committedDemands": "已承诺需求",
       "workOrders": "生产订单",
-      "supplies": "供应（{count}）"
+      "supplies": "供应（{count}）",
+      "resourceUtilization": "资源利用"
+    },
+    "resourceUtilization": {
+      "heading": "计划期内的资源利用情况",
+      "noPlanRun": "请先运行排程以查看资源利用率。",
+      "noResources": "本案例未配置任何资源。",
+      "loading": "正在加载资源利用率…",
+      "columnResource": "资源",
+      "columnLocation": "地点",
+      "columnSize": "容量",
+      "columnPeakLoad": "峰值负载",
+      "columnUtilization": "负载随时间变化",
+      "tooltipLoad": "{date}: {load} / {size}"
     },
     "committedDemands": {
       "heading": "已承诺需求",

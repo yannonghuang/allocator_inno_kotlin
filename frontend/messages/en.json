@@ -402,7 +402,20 @@
     "tabs": {
       "committedDemands": "Committed demands",
       "workOrders": "Work orders",
-      "supplies": "Supplies ({count})"
+      "supplies": "Supplies ({count})",
+      "resourceUtilization": "Resource utilization"
+    },
+    "resourceUtilization": {
+      "heading": "Resource utilization over the planning horizon",
+      "noPlanRun": "Run a plan first to see resource utilization.",
+      "noResources": "No resources are configured for this case.",
+      "loading": "Loading resource utilization…",
+      "columnResource": "Resource",
+      "columnLocation": "Location",
+      "columnSize": "Capacity",
+      "columnPeakLoad": "Peak load",
+      "columnUtilization": "Load over time",
+      "tooltipLoad": "{load} of {size} on {date}"
     },
     "committedDemands": {
       "heading": "Committed demands",

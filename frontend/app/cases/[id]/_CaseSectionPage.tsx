@@ -515,6 +515,7 @@ function splitPolicyExplanation(
 
 import { PeggingTree, pathKeyFromPath, type PeggingGraph } from '@/app/components/PeggingTree';
 import BomGraphTab from '@/app/components/BomGraphTab';
+import { ResourceUtilizationView } from '@/app/components/ResourceUtilizationView';
 import { qtyFmt } from '@/app/lib/format';
 
 // ── Assessment criteria helpers ────────────────────────────────────────────────
@@ -948,7 +949,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planWorkOrderPeggingError, setPlanWorkOrderPeggingError] = useState<string | null>(null);
   const planPeggingResizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [planPeggingResizing, setPlanPeggingResizing] = useState(false);
-  const [planResultTab, setPlanResultTab] = useState<'demands' | 'work_orders' | 'supplies'>('demands');
+  const [planResultTab, setPlanResultTab] = useState<'demands' | 'work_orders' | 'supplies' | 'resourceUtilization'>('demands');
   // ID of the plan run currently loaded in planResult; null = freshly-run (not from history)
   const [currentPlanRunId, setCurrentPlanRunId] = useState<number | null>(null);
   // DB run ID for the current fresh (unsaved) plan result; null once saved or when loading from history
@@ -4802,6 +4803,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               >
                 {tP('tabs.supplies', { count: qtyFmt(planSupplyViewRows.length) })}
               </button>
+              <button
+                type="button"
+                className={planResultTab === 'resourceUtilization' ? '' : 'secondary'}
+                onClick={() => setPlanResultTab('resourceUtilization')}
+              >
+                {tP('tabs.resourceUtilization')}
+              </button>
             </div>
             <div style={{ border: '1px solid #3d3d40', borderRadius: 6 }}>
               {planResultTab === 'demands' && (
@@ -6148,6 +6156,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       </>
                     );
                   })()}
+                </div>
+              )}
+              {planResultTab === 'resourceUtilization' && (
+                <div style={{ padding: '0.75rem 1rem' }}>
+                  <ResourceUtilizationView
+                    caseId={id}
+                    planRunId={currentPlanRunId ?? freshPlanRunId}
+                  />
                 </div>
               )}
               {planResultTab === 'supplies' && (
