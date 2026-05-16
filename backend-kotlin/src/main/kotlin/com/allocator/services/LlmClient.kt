@@ -27,6 +27,10 @@ import kotlinx.serialization.json.putJsonObject
  *                        (OpenAI-compatible; reuses OpenClaw's configured provider/credentials)
  *   anthropic          → https://api.anthropic.com/v1/messages + ANTHROPIC_API_KEY
  *   openai             → https://api.openai.com/v1/chat/completions + OPENAI_API_KEY
+ *   nanogpt            → ${NANOGPT_BASE_URL}/chat/completions + NANOGPT_API_KEY
+ *                        (OpenAI-compatible passthrough — same upstream models OpenClaw uses, but
+ *                        without the gateway's auto-injected built-in tool manifest. Used by the
+ *                        planning agent to keep its 35-tool decision space clean.)
  *
  * To switch providers, flip LLM_PROVIDER; call sites don't change.
  */
@@ -103,6 +107,7 @@ suspend fun llmChat(
         when (effectiveProvider) {
             "openai" -> openAiChat(systemPrompt, messages, maxTokens, temperature, resolvedModel)
             "anthropic" -> anthropicChat(systemPrompt, messages, maxTokens, temperature, resolvedModel)
+            "nanogpt" -> nanoGptChat(systemPrompt, messages, maxTokens, temperature, resolvedModel)
             else -> openClawChat(systemPrompt, messages, maxTokens, temperature, resolvedModel)
         }
     } catch (e: java.nio.channels.UnresolvedAddressException) {
@@ -128,6 +133,7 @@ private fun defaultModelForProvider(provider: String): String = when (provider) 
     config.llmProvider -> config.assessmentModel
     "openai" -> "gpt-4o-mini"
     "anthropic" -> "claude-haiku-4-5-20251001"
+    "nanogpt" -> "minimax/minimax-m2.7"
     // openclaw gateway forwards model ids through to its configured provider. The gateway's
     // agent default is "anthropic/claude-sonnet-4-6" (openclaw.json.template), so we use the
     // same id here — pickable also via ASSESSMENT_MODEL=anthropic/<id>.
@@ -190,6 +196,34 @@ private suspend fun openAiChat(
         ?: throw IllegalStateException("OpenAI response contained no content")
 }
 
+private suspend fun nanoGptChat(
+    systemPrompt: String?,
+    messages: List<LlmMessage>,
+    maxTokens: Int,
+    temperature: Double,
+    model: String,
+): String {
+    val apiKey = config.nanogptApiKey
+        ?: throw LlmNotConfiguredException("NANOGPT_API_KEY is not configured")
+
+    val all = buildList {
+        if (!systemPrompt.isNullOrBlank()) add(OpenAiMsg("system", systemPrompt))
+        messages.forEach { add(OpenAiMsg(it.role, it.content)) }
+    }
+
+    val resp = llmHttpClient.post("${config.nanogptBaseUrl}/chat/completions") {
+        header("Authorization", "Bearer $apiKey")
+        contentType(ContentType.Application.Json)
+        setBody(OpenAiReq(model = model, maxTokens = maxTokens, temperature = temperature, messages = all))
+    }
+
+    if (!resp.status.isSuccess()) {
+        throw IllegalStateException("NanoGPT API error ${resp.status.value}: ${resp.bodyAsText()}")
+    }
+    return resp.body<OpenAiResp>().choices.firstOrNull()?.message?.content
+        ?: throw IllegalStateException("NanoGPT response contained no content")
+}
+
 private suspend fun anthropicChat(
     systemPrompt: String?,
     messages: List<LlmMessage>,
@@ -230,10 +264,19 @@ private suspend fun anthropicChat(
 // ── Tool-use API (OpenAI function-calling) ──────────────────────────────────
 //
 // Sends an OpenAI-shaped chat-completions request with `tools` and consumes
-// the `tool_calls` round-trip. Supports two providers:
-//   - "openai"   → api.openai.com directly (legacy path; requires OPENAI_API_KEY)
+// the `tool_calls` round-trip. Supports three providers:
+//   - "openai"   → api.openai.com directly (requires OPENAI_API_KEY)
+//   - "nanogpt"  → ${NANOGPT_BASE_URL}/chat/completions (OpenAI-compatible
+//                  passthrough; same upstream models OpenClaw routes to but
+//                  without the gateway's auto-injected built-in tool manifest.
+//                  Used by the planning agent to keep its 35-tool decision
+//                  space clean. Requires NANOGPT_API_KEY.)
 //   - "openclaw" → ${OPENCLAW_URL}/v1/chat/completions (OpenAI-compatible
-//                  proxy; ultimately Anthropic-backed per OpenClaw config)
+//                  proxy; ultimately Anthropic-backed per OpenClaw config).
+//                  Note: the gateway prepends its own ~47-tool manifest to
+//                  the caller's `tools` array, so the model sees a merged
+//                  list. Fine for OpenClaw-native agents; use "nanogpt" for
+//                  external agents that own their tool list.
 // Anthropic-direct is a stub — set LLM_PROVIDER=openclaw to reach Claude.
 
 /** A function-callable tool advertised to the model. `parameters` is JSON Schema. */
@@ -315,6 +358,16 @@ suspend fun llmChatWithTools(
                 providerLabel = "OpenAI",
             )
         }
+        "nanogpt" -> {
+            val apiKey = config.nanogptApiKey
+                ?: throw LlmNotConfiguredException("NANOGPT_API_KEY is not configured")
+            postChatCompletionsAndParse(
+                url = "${config.nanogptBaseUrl}/chat/completions",
+                authHeaderValue = "Bearer $apiKey",
+                body = body,
+                providerLabel = "NanoGPT",
+            )
+        }
         "openclaw" -> {
             val token = config.openClawToken
                 ?: throw LlmNotConfiguredException("OPENCLAW_TOKEN is not configured")
@@ -329,7 +382,7 @@ suspend fun llmChatWithTools(
             "llmChatWithTools(anthropic) is not implemented — use LLM_PROVIDER=openclaw to reach Claude via the gateway.",
         )
         else -> throw LlmNotConfiguredException(
-            "llmChatWithTools: unknown provider '$effectiveProvider'. Supported: openai, openclaw.",
+            "llmChatWithTools: unknown provider '$effectiveProvider'. Supported: openai, nanogpt, openclaw.",
         )
     }
 }

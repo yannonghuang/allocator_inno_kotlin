@@ -4942,9 +4942,16 @@ private suspend fun runAgentLoop(
             // fields each). 1024 truncated those mid-row.
             maxTokens = 4096,
             temperature = 0.2,
-            // Provider defaults to config.llmProvider (LLM_PROVIDER env, =openclaw
-            // in production) so the planning agent rides the same OpenClaw → Anthropic
-            // path used by /material-impact-assessment and /planning-copilot.
+            // Pin to NanoGPT direct: the OpenClaw gateway DOES forward the
+            // caller's `tools` array (current OpenClaw build, verified 2026-05-15),
+            // but it also auto-injects ~47 built-in tools (read/write/exec,
+            // memory_*, all globally-configured MCP servers including
+            // scheduling-engine and planning_engine) — those directly overlap
+            // the planning agent's domain and confuse tool selection. NanoGPT
+            // is a thin OpenAI-shape passthrough to the same upstream models
+            // OpenClaw uses (default minimax/minimax-m2.7), so the model sees
+            // only this agent's 35 tools.
+            provider = "nanogpt",
         )
 
         // No tool calls → final reply.
@@ -6464,7 +6471,7 @@ fun Routing.planningAgentRoutes() {
             log.warn("planning-agent: LLM not configured: {}", e.message)
             call.respond(
                 HttpStatusCode.ServiceUnavailable,
-                mapOf("error" to "Planning agent requires OPENAI_API_KEY to be configured.")
+                mapOf("error" to "Planning agent requires NANOGPT_API_KEY to be configured.")
             )
             return@post
         } catch (e: Exception) {
