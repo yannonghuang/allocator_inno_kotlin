@@ -808,7 +808,7 @@ internal fun firstFeasibleMethod(
     val sorted = methods.sortedBy { (it["preference"] as? Number)?.toInt() ?: 0 }
     for (m in sorted) {
         val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
-        val leadDays = leadDaysForMethod(m)
+        val leadDays = leadDaysForMethod(m, productId, productionLocation, quantity, data)
         val failed = when (m["type"]) {
             "purchase" -> false
             "move" -> {
@@ -871,7 +871,7 @@ internal fun getPreferredMethodCascade(
 
     for (m in sorted) {
         val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
-        val leadDays = leadDaysForMethod(m)
+        val leadDays = leadDaysForMethod(m, productId, productionLocation, quantity, data)
 
         val failed = when (m["type"]) {
             "purchase" -> false
@@ -1168,7 +1168,7 @@ internal fun planMethodSlot(
 ): MethodSlotResult {
     val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
     val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
-    val leadDays = leadDaysForMethod(m)
+    val leadDays = leadDaysForMethod(m, productId, productionLocation, slotQty, data)
 
     // 3) Child materials
     var woChildrenRelation: String? = null
@@ -1388,6 +1388,7 @@ internal fun planMethodSlot(
                 taggedChildPeggings,
                 overrideActive,
                 failed = true,
+                data = data,
             )
             // Genuinely-structural classification: the AND-min bottleneck child
             // returned 0 AND its own solvedList carries a raw `no_methods` /
@@ -1558,7 +1559,7 @@ internal fun planMethodSlot(
     val methodType = m["type"] as? String ?: ""
     val woChildren = if (methodType == "purchase") listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to roundQty(achievableParentQty), "children" to emptyList<Any>()))
                      else childPeggingNodes
-    val methodPeggingNode = buildWoNode(productId, productionLocation, achievableParentQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodChoiceExplanation, variantExplanation, woChildrenRelation, woChildren, overrideActive, woGroupId = woResult.woGroupId)
+    val methodPeggingNode = buildWoNode(productId, productionLocation, achievableParentQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodChoiceExplanation, variantExplanation, woChildrenRelation, woChildren, overrideActive, woGroupId = woResult.woGroupId, data = data)
 
     return MethodSlotResult(
         achievableQty = achievableParentQty,
@@ -2335,8 +2336,21 @@ private data class WorkOrderResult(
 private val woGroupIdSeq = java.util.concurrent.atomic.AtomicLong(0)
 private fun nextWoGroupId(): String = "wog${woGroupIdSeq.incrementAndGet()}"
 
-internal fun leadDaysForMethod(m: Map<String, Any?>): Double = when (m["type"]) {
-    "make" -> (m["lead_time"] as? Number)?.toDouble() ?: 0.0
+internal fun leadDaysForMethod(
+    m: Map<String, Any?>,
+    productId: String? = null,
+    locationId: String? = null,
+    qty: Double = 0.0,
+    data: Map<String, List<Map<String, Any?>>>? = null,
+): Double = when (m["type"]) {
+    "make" -> {
+        val staticLead = (m["lead_time"] as? Number)?.toDouble() ?: 0.0
+        if (productId != null && locationId != null && data != null && qty > 0.0) {
+            OperationLookup.effectiveLeadDays(productId, locationId, qty, staticLead, data).days
+        } else {
+            staticLead
+        }
+    }
     "move" -> (m["transit_time"] as? Number)?.toDouble() ?: 0.0
     "purchase" -> (m["lead_days_supply"] as? Number)?.toDouble() ?: 0.0
     else -> 0.0
@@ -2413,6 +2427,7 @@ private fun buildWoNode(
     overrideActive: Boolean = false,
     failed: Boolean = false,
     woGroupId: String? = null,
+    data: Map<String, List<Map<String, Any?>>>? = null,
 ): Map<String, Any?> = buildMap {
     put("type", "work_order")
     put("product_id", productId)
@@ -2428,7 +2443,16 @@ private fun buildWoNode(
     put("lot_count", if (lotCount > 0) lotCount else null)
     put("max_lot_size", lotSizeVal)
     put("override_active", overrideActive)
-    put("children", woChildren)
+
+    // For make WOs with an applicable operation, prepend an operation node
+    // (with resource children) so pegging trees expose the granular UPH/BOR
+    // model alongside the BOM children. Falls through silently when no
+    // operation matches — applicability gate is identical to leadDaysForMethod.
+    val opChildren = if (methodType == "make" && data != null)
+        buildOperationChildren(productId, productionLocation, qty, data)
+    else emptyList()
+    put("children", opChildren + woChildren)
+
     if (woGroupId != null) put("wo_group_id", woGroupId)
     // Marker for the AND-bottleneck blocked branch: this WO is a debug snapshot
     // of "what would have happened" — its subtree shows first-pass takes that
@@ -2436,6 +2460,73 @@ private fun buildWoNode(
     // outer level. Soundness skips the entire subtree under failed=true to
     // tolerate the broken/partial pegging it carries.
     if (failed) put("failed", true)
+}
+
+/**
+ * For a make WO at (product, location, qty), look up the matching operation
+ * (via productlocation.prod_area) and emit a single operation node whose
+ * children are the resource nodes from the operation's BOR. Returns an empty
+ * list when the override doesn't apply (no productlocation row, no operation,
+ * empty BOR, or any required resource missing at this location) — same gate
+ * as OperationLookup.effectiveLeadDays.
+ */
+private fun buildOperationChildren(
+    productId: String,
+    locationId: String,
+    qty: Double,
+    data: Map<String, List<Map<String, Any?>>>,
+): List<Map<String, Any?>> {
+    val prodArea = (data["productlocation"] ?: return emptyList())
+        .firstOrNull {
+            (it["product_id"] as? String)?.trim() == productId &&
+            (it["location_id"] as? String)?.trim() == locationId
+        }
+        ?.get("prod_area")?.toString()?.trim()
+        ?.takeIf { it.isNotBlank() }
+        ?: return emptyList()
+
+    val op = (data["operation"] ?: return emptyList())
+        .firstOrNull { (it["prod_area"] as? String)?.trim() == prodArea }
+        ?: return emptyList()
+
+    val borId = (op["bor_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return emptyList()
+
+    val borRows = (data["bor"] ?: emptyList())
+        .filter { (it["bor_id"] as? String)?.trim() == borId }
+    if (borRows.isEmpty()) return emptyList()
+
+    val resourceRows = data["resource"] ?: emptyList()
+    val resourceChildren = borRows.mapNotNull { br ->
+        val rid = (br["resource_id"] as? String)?.trim() ?: return@mapNotNull null
+        val resRow = resourceRows.firstOrNull {
+            (it["resource_id"] as? String)?.trim() == rid &&
+            (it["location_id"] as? String)?.trim() == locationId
+        } ?: return@mapNotNull null  // applicability fails if any resource missing
+        mapOf(
+            "type" to "resource",
+            "resource_id" to rid,
+            "location_id" to locationId,
+            "resource_rate" to ((br["resource_rate"] as? Number)?.toDouble() ?: 0.0),
+            "size" to ((resRow["size"] as? Number)?.toDouble() ?: 0.0),
+            "children" to emptyList<Map<String, Any?>>(),
+        )
+    }
+    if (resourceChildren.size != borRows.size) return emptyList()
+
+    return listOf(mapOf(
+        "type" to "operation",
+        "operation_id" to (op["operation_id"] as? String)?.trim(),
+        "prod_area" to prodArea,
+        "product_id" to productId,
+        "location_id" to locationId,
+        "quantity" to roundQty(qty),
+        "uph" to (op["uph"] as? Number)?.toDouble(),
+        "yield_factor" to (op["yield_factor"] as? Number)?.toDouble(),
+        "process_time" to (op["process_time"] as? Number)?.toInt(),
+        "pre_process_time" to (op["pre_process_time"] as? Number)?.toInt(),
+        "post_process_time" to (op["post_process_time"] as? Number)?.toInt(),
+        "children" to resourceChildren,
+    ))
 }
 
 // ── Phantom-loop pruning ───────────────────────────────────────────────────────
