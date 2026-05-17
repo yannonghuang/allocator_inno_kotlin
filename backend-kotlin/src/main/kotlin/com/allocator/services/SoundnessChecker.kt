@@ -610,6 +610,11 @@ private class WalkContext(
                 // Sub-demand under a demand (cycle_stopped / depth_limit cases) — treat as terminal.
                 // No further checks; the parent's qty bound is already validated.
             }
+            "operation", "resource" -> {
+                // Visualization nodes attached to make WOs (UPH/BOR model). They
+                // carry no supply qty and aren't part of the demand-supply graph,
+                // so soundness rules don't apply — skip silently.
+            }
             else -> violations.add(Violation(
                 rule = "R0_unknown_node_type",
                 nodePath = path,
