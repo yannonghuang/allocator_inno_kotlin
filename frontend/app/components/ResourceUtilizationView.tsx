@@ -12,6 +12,7 @@ import {
   type ResourceUtilizationRow,
 } from '@/lib/api';
 import { ScheduleHorizonRuler, type Horizon, type ScheduleGranularity } from '../cases/[id]/_workOrderSchedule';
+import { PlanningPeggingTreeView } from './PlanningPeggingTreeView';
 
 type Props = {
   caseId: number;
@@ -109,6 +110,24 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
   const [woTrees, setWoTrees] = useState<Map<string, PlanningPeggingNode>>(new Map());
   const [woTreesLoading, setWoTreesLoading] = useState(false);
   const [woTreesError, setWoTreesError] = useState<string | null>(null);
+
+  // Expand state for the shared planning-pegging tree component. One set
+  // shared across both demand-pegging and WO-pegging modes — switching
+  // trees just means the user starts from "root expanded".
+  const [treeExpanded, setTreeExpanded] = useState<Set<string>>(() => new Set(['0']));
+  const toggleTreePath = useCallback((p: string) => {
+    setTreeExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(p)) next.delete(p); else next.add(p);
+      return next;
+    });
+  }, []);
+
+  // Reset expansion when we switch which tree is being viewed so stale
+  // paths from a previous tree don't carry over visually.
+  useEffect(() => {
+    setTreeExpanded(new Set(['0']));
+  }, [peggingDemandId, peggingWo]);
 
   // Slide-in width (px). Drag-resizable via a handle on its left edge.
   // Persisted to localStorage, sanitized on read to the same bounds the
@@ -467,6 +486,8 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
           woTrees={woTrees}
           woTreesLoading={woTreesLoading}
           woTreesError={woTreesError}
+          treeExpanded={treeExpanded}
+          onToggleTreePath={toggleTreePath}
           slideInWidth={slideInWidth}
           onResizeMouseDown={onSlideInResizeMouseDown}
           onClose={() => {
@@ -665,6 +686,8 @@ function BreakdownSlideIn({
   woTrees,
   woTreesLoading,
   woTreesError,
+  treeExpanded,
+  onToggleTreePath,
   slideInWidth,
   onResizeMouseDown,
   onClose,
@@ -683,6 +706,8 @@ function BreakdownSlideIn({
   woTrees: Map<string, PlanningPeggingNode>;
   woTreesLoading: boolean;
   woTreesError: string | null;
+  treeExpanded: Set<string>;
+  onToggleTreePath: (path: string) => void;
   slideInWidth: number;
   onResizeMouseDown: (e: React.MouseEvent) => void;
   onClose: () => void;
@@ -767,7 +792,14 @@ function BreakdownSlideIn({
               {!planTreesLoading && !planTreesError && !demandTree && (
                 <p style={{ color: '#a1a1aa' }}>{t('peggingNotFound', { demandId: peggingDemandId ?? '' })}</p>
               )}
-              {demandTree && <PeggingTreeView node={demandTree} depth={0} />}
+              {demandTree && (
+                <PlanningPeggingTreeView
+                  tree={demandTree}
+                  expanded={treeExpanded}
+                  onToggle={onToggleTreePath}
+                  contextDemandId={peggingDemandId}
+                />
+              )}
             </>
           )}
           {mode === 'wo_pegging' && (
@@ -789,7 +821,14 @@ function BreakdownSlideIn({
               {!woTreesLoading && !woTreesError && !woTree && (
                 <p style={{ color: '#a1a1aa' }}>{t('peggingWoNotFound')}</p>
               )}
-              {woTree && <PeggingTreeView node={woTree} depth={0} />}
+              {woTree && (
+                <PlanningPeggingTreeView
+                  tree={woTree}
+                  expanded={treeExpanded}
+                  onToggle={onToggleTreePath}
+                  contextDemandId={peggingWo?.demandId ?? null}
+                />
+              )}
             </>
           )}
         </div>
@@ -893,39 +932,3 @@ function BreakdownList({
   );
 }
 
-/** Recursive tree renderer. Indents children, color-codes by node type so
- *  the demand → work_order → supply chain is visually clear. Initially
- *  expanded all the way down — these trees are usually small enough; if
- *  not, we can wire up collapse later. */
-function PeggingTreeView({ node, depth }: { node: PlanningPeggingNode; depth: number }): JSX.Element {
-  const typeColor: Record<string, string> = {
-    demand: '#fbbf24',
-    work_order: '#60a5fa',
-    supply: '#34d399',
-    purchase: '#a78bfa',
-  };
-  const color = typeColor[node.type] ?? '#a1a1aa';
-  const label = (() => {
-    if (node.type === 'demand') return `demand ${node.demand_id ?? ''}`;
-    if (node.type === 'work_order') return `${node.method ?? 'wo'} ${node.product_id ?? ''}@${node.location_id ?? ''}`;
-    return `${node.type} ${node.product_id ?? ''}@${node.location_id ?? ''}`;
-  })();
-  const meta: string[] = [];
-  if (node.quantity != null) meta.push(`qty ${node.quantity}`);
-  if (node.start_time) meta.push(`${node.start_time}${node.end_time ? `→${node.end_time}` : ''}`);
-  if (node.commit_time) meta.push(`commit ${node.commit_time}`);
-  if (node.supply_id) meta.push(`supply ${node.supply_id}`);
-  if (node.commit_reason) meta.push(node.commit_reason);
-
-  return (
-    <div style={{ paddingLeft: depth === 0 ? 0 : 14, marginLeft: depth === 0 ? 0 : 2, borderLeft: depth === 0 ? 'none' : '1px solid #27272a' }}>
-      <div style={{ fontSize: '0.78rem', lineHeight: 1.5, padding: '2px 0' }}>
-        <span style={{ color, fontWeight: 600, fontFamily: 'monospace' }}>{label}</span>
-        {meta.length > 0 && <span style={{ color: '#a1a1aa', marginLeft: 6 }}>· {meta.join(' · ')}</span>}
-      </div>
-      {(node.children ?? []).map((child, i) => (
-        <PeggingTreeView key={i} node={child} depth={depth + 1} />
-      ))}
-    </div>
-  );
-}
