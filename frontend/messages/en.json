@@ -423,9 +423,11 @@
       "granularityDay": "Daily",
       "granularityWeek": "Weekly",
       "granularityMonth": "Monthly",
+      "granularityQuarter": "Quarterly",
       "granularityNounDay": "day",
       "granularityNounWeek": "week",
-      "granularityNounMonth": "month"
+      "granularityNounMonth": "month",
+      "granularityNounQuarter": "quarter"
     },
     "committedDemands": {
       "heading": "Committed demands",

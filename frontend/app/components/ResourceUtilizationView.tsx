@@ -1,8 +1,9 @@
 'use client';
 
 import React, { useEffect, useMemo, useState } from 'react';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { getResourceUtilization, type ResourceUtilization } from '@/lib/api';
+import { ScheduleHorizonRuler, type Horizon, type ScheduleGranularity } from '../cases/[id]/_workOrderSchedule';
 
 type Props = {
   caseId: number;
@@ -10,14 +11,18 @@ type Props = {
   planRunId: number | null;
 };
 
-type Granularity = 'day' | 'week' | 'month';
+/** Per-period rollup: start/end on the horizon (ms) plus a label for the
+ *  bar's tooltip. `index` keys back into the daily load array so peer rows
+ *  can grab their period values in the same order. */
+type Period = { startMs: number; endMs: number; label: string };
 
 export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Element {
   const t = useTranslations('planning.resourceUtilization');
+  const locale = useLocale();
   const [data, setData] = useState<ResourceUtilization | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [granularity, setGranularity] = useState<Granularity>('day');
+  const [granularity, setGranularity] = useState<ScheduleGranularity>('day');
 
   useEffect(() => {
     if (planRunId == null) {
@@ -35,7 +40,18 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
     return () => { cancelled = true; };
   }, [caseId, planRunId]);
 
-  // Peak load is granularity-independent (always max across whole horizon).
+  // Horizon for the ruler: full range from the backend response, granularity
+  // from the dropdown. Defaults to 'day' on first load.
+  const horizon: Horizon | null = useMemo(() => {
+    if (!data) return null;
+    const start = parseUtcDate(data.horizon.start);
+    const end = parseUtcDate(data.horizon.end);
+    if (!start || !end) return null;
+    return { start, end, granularity };
+  }, [data, granularity]);
+
+  // Peak load is granularity-independent — always the max across all daily
+  // buckets in the response.
   const peakLoad = useMemo(() => {
     if (!data) return new Map<number, number>();
     const m = new Map<number, number>();
@@ -43,37 +59,46 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
     return m;
   }, [data]);
 
-  // Roll up daily buckets into weekly/monthly periods. Within each period we
-  // take the MAX of the daily values — a sum would be meaningless (resources
-  // are concurrent capacity, not cumulative throughput), so the bar should
-  // show "worst day in the period" relative to size.
+  // Roll up daily buckets into the selected granularity. Within each period
+  // we keep the MAX daily value — capacity is concurrent, so the bar shows
+  // "worst day in the period" relative to size.
   const rolled = useMemo(() => {
     if (!data) return null;
-    if (granularity === 'day') {
-      return { buckets: data.buckets, loadByRow: data.rows.map((r) => r.load) };
-    }
-    const groups: number[][] = []; // bucket idx → list of source-day indices
-    const labels: string[] = [];
+    const periods: Period[] = [];
+    const dayIdxByPeriod: number[][] = [];
     let currentKey: string | null = null;
     data.buckets.forEach((iso, i) => {
+      const dayMs = parseUtcDate(iso)?.getTime() ?? 0;
       const key = periodKey(iso, granularity);
       if (key !== currentKey) {
-        groups.push([]);
-        labels.push(periodLabel(iso, granularity));
+        periods.push({
+          startMs: periodStartMs(iso, granularity),
+          endMs: periodEndMs(iso, granularity),
+          label: periodLabel(iso, granularity, locale),
+        });
+        dayIdxByPeriod.push([]);
         currentKey = key;
       }
-      groups[groups.length - 1].push(i);
+      dayIdxByPeriod[dayIdxByPeriod.length - 1].push(i);
+      // endMs stretches with each new day in the period when granularity=day
+      // would otherwise leave a 1-day rectangle; for week/month/quarter the
+      // precomputed periodEndMs already covers the whole period.
+      if (granularity === 'day') {
+        periods[periods.length - 1].endMs = dayMs + DAY_MS;
+      }
     });
     const loadByRow = data.rows.map((r) =>
-      groups.map((idxs) => idxs.reduce((mx, i) => Math.max(mx, r.load[i] ?? 0), 0)),
+      dayIdxByPeriod.map((idxs) => idxs.reduce((mx, i) => Math.max(mx, r.load[i] ?? 0), 0)),
     );
-    return { buckets: labels, loadByRow };
-  }, [data, granularity]);
+    return { periods, loadByRow };
+  }, [data, granularity, locale]);
 
   if (planRunId == null) return <p style={{ color: '#a1a1aa' }}>{t('noPlanRun')}</p>;
   if (loading) return <p style={{ color: '#a1a1aa' }}>{t('loading')}</p>;
   if (error) return <p style={{ color: '#f87171' }}>{error}</p>;
-  if (!data || data.rows.length === 0 || !rolled) return <p style={{ color: '#a1a1aa' }}>{t('noResources')}</p>;
+  if (!data || data.rows.length === 0 || !rolled || !horizon) {
+    return <p style={{ color: '#a1a1aa' }}>{t('noResources')}</p>;
+  }
 
   return (
     <div>
@@ -83,12 +108,13 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
           <span>{t('granularityLabel')}</span>
           <select
             value={granularity}
-            onChange={(e) => setGranularity(e.target.value as Granularity)}
+            onChange={(e) => setGranularity(e.target.value as ScheduleGranularity)}
             style={{ fontSize: '0.8rem', padding: '0.15rem 0.3rem', background: '#27272a', color: '#e4e4e7', border: '1px solid #52525b', borderRadius: 4 }}
           >
             <option value="day">{t('granularityDay')}</option>
             <option value="week">{t('granularityWeek')}</option>
             <option value="month">{t('granularityMonth')}</option>
+            <option value="quarter">{t('granularityQuarter')}</option>
           </select>
         </label>
       </div>
@@ -111,10 +137,10 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
                 {t('columnPeakLoad')}
               </th>
               <th
-                style={{ padding: '0.4rem 0.6rem', minWidth: 300, cursor: 'help' }}
+                style={{ padding: '0.4rem 0.6rem', minWidth: 320, width: '34%' }}
                 title={t('columnUtilizationTooltip', { granularity: granularityNoun(t, granularity) })}
               >
-                {t('columnUtilization')}
+                <ScheduleHorizonRuler horizon={horizon} locale={locale} />
               </th>
             </tr>
           </thead>
@@ -126,7 +152,13 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
                 <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7', textAlign: 'right' }}>{r.size}</td>
                 <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7', textAlign: 'right' }}>{peakLoad.get(i)?.toFixed(2) ?? '0'}</td>
                 <td style={{ padding: '0.35rem 0.6rem' }}>
-                  <LoadBar buckets={rolled.buckets} load={rolled.loadByRow[i]} size={r.size} t={t} />
+                  <LoadStrip
+                    horizon={horizon}
+                    periods={rolled.periods}
+                    load={rolled.loadByRow[i]}
+                    size={r.size}
+                    t={t}
+                  />
                 </td>
               </tr>
             ))}
@@ -137,70 +169,148 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
   );
 }
 
-function granularityNoun(t: ReturnType<typeof useTranslations>, g: Granularity): string {
+const DAY_MS = 86_400_000;
+
+function parseUtcDate(s: string): Date | null {
+  if (!s) return null;
+  const d = new Date(`${s.slice(0, 10)}T00:00:00Z`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function granularityNoun(t: ReturnType<typeof useTranslations>, g: ScheduleGranularity): string {
   if (g === 'day') return t('granularityNounDay');
   if (g === 'week') return t('granularityNounWeek');
-  return t('granularityNounMonth');
+  if (g === 'month') return t('granularityNounMonth');
+  return t('granularityNounQuarter');
 }
 
 /** Group key for a day. Buckets sharing a key roll into one period. */
-function periodKey(isoDate: string, g: Granularity): string {
-  if (g === 'month') return isoDate.slice(0, 7); // yyyy-MM
-  // ISO week: Monday-anchored. Cheap UTC math is fine — buckets are dates only.
-  const d = new Date(`${isoDate}T00:00:00Z`);
-  const dow = d.getUTCDay(); // 0 = Sun
-  const offset = (dow + 6) % 7; // Mon = 0
-  d.setUTCDate(d.getUTCDate() - offset);
-  return d.toISOString().slice(0, 10);
+function periodKey(isoDate: string, g: ScheduleGranularity): string {
+  if (g === 'month') return isoDate.slice(0, 7);
+  if (g === 'quarter') {
+    const d = parseUtcDate(isoDate)!;
+    const q = Math.floor(d.getUTCMonth() / 3);
+    return `${d.getUTCFullYear()}-Q${q + 1}`;
+  }
+  if (g === 'week') {
+    const d = parseUtcDate(isoDate)!;
+    const dow = d.getUTCDay();
+    const offset = (dow + 6) % 7; // Mon = 0
+    d.setUTCDate(d.getUTCDate() - offset);
+    return d.toISOString().slice(0, 10);
+  }
+  return isoDate;
 }
 
-/** Human-readable label for a period anchored at the given day. */
-function periodLabel(isoDate: string, g: Granularity): string {
-  if (g === 'month') return isoDate.slice(0, 7); // 2026-05
-  // For week, label with the Monday-anchored start date so the user sees the
-  // actual horizon point rather than a synthetic "Wk 19".
-  return periodKey(isoDate, g);
+/** UTC midnight of the first day in the period containing isoDate. */
+function periodStartMs(isoDate: string, g: ScheduleGranularity): number {
+  const d = parseUtcDate(isoDate)!;
+  if (g === 'month') return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
+  if (g === 'quarter') {
+    const q = Math.floor(d.getUTCMonth() / 3);
+    return Date.UTC(d.getUTCFullYear(), q * 3, 1);
+  }
+  if (g === 'week') {
+    const dow = d.getUTCDay();
+    const offset = (dow + 6) % 7;
+    return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - offset);
+  }
+  return d.getTime();
+}
+
+/** UTC midnight of the first day AFTER the period containing isoDate. */
+function periodEndMs(isoDate: string, g: ScheduleGranularity): number {
+  const d = parseUtcDate(isoDate)!;
+  if (g === 'month') return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1);
+  if (g === 'quarter') {
+    const q = Math.floor(d.getUTCMonth() / 3);
+    return Date.UTC(d.getUTCFullYear(), (q + 1) * 3, 1);
+  }
+  if (g === 'week') {
+    return periodStartMs(isoDate, g) + 7 * DAY_MS;
+  }
+  return d.getTime() + DAY_MS;
+}
+
+function periodLabel(isoDate: string, g: ScheduleGranularity, locale: string): string {
+  if (g === 'month') return isoDate.slice(0, 7);
+  if (g === 'quarter') {
+    const d = parseUtcDate(isoDate)!;
+    return `Q${Math.floor(d.getUTCMonth() / 3) + 1} ${d.getUTCFullYear()}`;
+  }
+  if (g === 'week') {
+    return new Date(periodStartMs(isoDate, g)).toISOString().slice(0, 10);
+  }
+  try {
+    return new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeZone: 'UTC' }).format(parseUtcDate(isoDate)!);
+  } catch {
+    return isoDate;
+  }
 }
 
 /**
- * Per-bucket utilization bar. Color tints reflect ratio = bucketMax / size:
- *   ≥1.0 → red (saturation/overload)
- *   ≥0.66 → dark blue
- *   ≥0.33 → mid blue
- *   >0    → light blue
- *   0     → transparent (idle)
- * Tooltip uses the bucket label (date for daily, Monday for weekly, yyyy-MM
- * for monthly) and the load value within that bucket — which is the MAX
- * across the daily values in the period, not a sum.
+ * Per-row utilization strip rendered to the same horizon as the table's
+ * ScheduleHorizonRuler header. Each period is one positioned rectangle
+ * (x/width derived from horizon coords), so monthly buckets cover an
+ * actual month of the axis instead of being squashed into equal-width
+ * cells. Tint reflects ratio = period_max / size:
+ *   ≥1.0 → red (saturation)
+ *   ≥0.66 → blue
+ *   ≥0.33 → mid-blue
+ *   >0    → light-blue
+ *   0     → transparent
  */
-function LoadBar({
-  buckets,
+function LoadStrip({
+  horizon,
+  periods,
   load,
   size,
   t,
 }: {
-  buckets: string[];
+  horizon: Horizon;
+  periods: Period[];
   load: number[];
   size: number;
   t: ReturnType<typeof useTranslations>;
 }): JSX.Element {
-  const cells = buckets.map((label, i) => {
-    const v = load[i] ?? 0;
-    const ratio = size > 0 ? v / size : 0;
-    let bg = 'transparent';
-    if (ratio > 0) {
-      if (ratio >= 1) bg = '#ef4444';
-      else if (ratio >= 0.66) bg = '#3b82f6';
-      else if (ratio >= 0.33) bg = '#60a5fa';
-      else bg = '#93c5fd';
-    }
-    return (
-      <div
-        key={label}
-        title={t('tooltipLoad', { load: v, size, date: label })}
-        style={{ flex: 1, height: 14, background: bg, marginRight: 1, borderRadius: 1 }}
-      />
-    );
-  });
-  return <div style={{ display: 'flex', alignItems: 'stretch' }}>{cells}</div>;
+  const hStart = horizon.start.getTime();
+  const hEnd = horizon.end.getTime();
+  const hSpan = Math.max(1, hEnd - hStart);
+
+  return (
+    <div style={{ minWidth: 140, width: '100%', padding: '2px 0' }}>
+      <svg width="100%" height={14} preserveAspectRatio="none" style={{ display: 'block' }}>
+        {periods.map((p, i) => {
+          const v = load[i] ?? 0;
+          const ratio = size > 0 ? v / size : 0;
+          if (ratio <= 0) return null;
+          const x = Math.max(0, ((p.startMs - hStart) / hSpan) * 100);
+          // Clamp the right edge so a period that overhangs the horizon
+          // (e.g. month containing the horizon end) doesn't render past it.
+          const w = Math.max(
+            0.3,
+            Math.min(100 - x, ((p.endMs - Math.max(hStart, p.startMs)) / hSpan) * 100),
+          );
+          let bg: string;
+          if (ratio >= 1) bg = '#ef4444';
+          else if (ratio >= 0.66) bg = '#3b82f6';
+          else if (ratio >= 0.33) bg = '#60a5fa';
+          else bg = '#93c5fd';
+          return (
+            <rect
+              key={i}
+              x={`${x}%`}
+              y={2}
+              width={`${w}%`}
+              height={10}
+              fill={bg}
+              rx={1}
+            >
+              <title>{t('tooltipLoad', { load: v, size, date: p.label })}</title>
+            </rect>
+          );
+        })}
+      </svg>
+    </div>
+  );
 }

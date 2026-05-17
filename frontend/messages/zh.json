@@ -423,9 +423,11 @@
       "granularityDay": "日",
       "granularityWeek": "周",
       "granularityMonth": "月",
+      "granularityQuarter": "季",
       "granularityNounDay": "日",
       "granularityNounWeek": "周",
-      "granularityNounMonth": "月"
+      "granularityNounMonth": "月",
+      "granularityNounQuarter": "季"
     },
     "committedDemands": {
       "heading": "已承诺需求",
