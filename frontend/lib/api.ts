@@ -492,10 +492,12 @@ export async function getResourceUtilization(caseId: number, runId: number): Pro
   return r.json();
 }
 
-/** Fetch work-order pegging on demand: how this WO is fulfilled by its supplies (all levels). Requires a prior plan run. */
+/** Fetch work-order pegging on demand: how this WO is fulfilled by its supplies (all levels). Requires a prior plan run.
+ *  `start_time` disambiguates which slot/lot to return when a (demand, product, location, method) tuple
+ *  has multiple matches (waterfall slots or multi-lot WOs). Pass the WO row's start_time. */
 export async function getWorkOrderPegging(
   caseId: number,
-  params: { demand_id: string; product_id: string; location_id: string; method: string; run_id?: number }
+  params: { demand_id: string; product_id: string; location_id: string; method: string; start_time?: string | null; run_id?: number }
 ): Promise<{ tree: PlanningPeggingNode }> {
   const sp = new URLSearchParams({
     demand_id: params.demand_id,
@@ -503,6 +505,7 @@ export async function getWorkOrderPegging(
     location_id: params.location_id,
     method: params.method,
   });
+  if (params.start_time) sp.set('start_time', params.start_time);
   if (params.run_id != null) sp.set('run_id', String(params.run_id));
   const r = await fetch(`${API}/cases/${caseId}/plan/work-order-pegging?${sp.toString()}`);
   if (!r.ok) throw new Error(await r.text());

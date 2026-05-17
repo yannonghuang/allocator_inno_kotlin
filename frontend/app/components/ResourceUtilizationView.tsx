@@ -260,6 +260,7 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
       product_id: peggingWo.productId,
       location_id: peggingWo.locationId,
       method: peggingWo.method,
+      start_time: peggingWo.startTime ?? undefined,
       run_id: planRunId,
     })
       .then((res) => { if (!cancelled) setWoTrees((prev) => new Map(prev).set(k, res.tree)); })

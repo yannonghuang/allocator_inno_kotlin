@@ -1778,7 +1778,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           const row = planPeggingContext.row as WorkOrder;
           const isConsolidated = row.demand_id == null;
           const demandPart = isConsolidated ? '' : String(woPeggingActiveDemandId ?? row.demand_id ?? '').trim();
-          return `${demandPart}|${String(row.product_id ?? '').trim()}|${String(row.location_id ?? '').trim()}|${String(row.method ?? '').trim()}`;
+          // start_time is part of the cache key — different lots (same demand/
+          // product/location/method, different start_time) get separate trees.
+          return `${demandPart}|${String(row.product_id ?? '').trim()}|${String(row.location_id ?? '').trim()}|${String(row.method ?? '').trim()}|${String(row.start_time ?? '').trim()}`;
         })()
       : null;
   useEffect(() => {
@@ -1800,7 +1802,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     setPlanWorkOrderPeggingError(null);
     setPlanWorkOrderPeggingLoading(woPeggingKey);
     if (typeof console !== 'undefined' && console.log) console.log('[WO pegging] Fetching', { caseId: id, demand_id, product_id, location_id, method });
-    getWorkOrderPegging(Number(id), { demand_id, product_id, location_id, method, ...(currentPlanRunId != null ? { run_id: currentPlanRunId } : {}) })
+    getWorkOrderPegging(Number(id), {
+      demand_id,
+      product_id,
+      location_id,
+      method,
+      start_time: row.start_time ?? undefined,
+      ...(currentPlanRunId != null ? { run_id: currentPlanRunId } : {}),
+    })
       .then((res) => {
         if (typeof console !== 'undefined' && console.log) console.log('[WO pegging] Loaded tree for', woPeggingKey);
         setPlanWorkOrderPeggingCache((prev) => ({ ...prev, [woPeggingKey]: res.tree }));

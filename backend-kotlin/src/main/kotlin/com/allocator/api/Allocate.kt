@@ -568,6 +568,10 @@ fun Routing.allocateRoutes() {
         val productId = call.request.queryParameters["product_id"]?.trim() ?: ""
         val locationId = call.request.queryParameters["location_id"]?.trim() ?: ""
         val method = call.request.queryParameters["method"]?.trim() ?: ""
+        // Optional time bucket: when (demand, product, location, method) has
+        // multiple slot matches (waterfall) or multiple lots, start_time picks
+        // the exact one the user clicked. Blank → "any" (caller didn't pass it).
+        val startTime = call.request.queryParameters["start_time"]?.trim().orEmpty()
         val runIdParam = call.request.queryParameters["run_id"]?.toIntOrNull()
         if (productId.isBlank() || locationId.isBlank() || method.isBlank()) {
             throw IllegalArgumentException("product_id, location_id, method required")
@@ -607,27 +611,28 @@ fun Routing.allocateRoutes() {
                     ?.mapNotNull { (it as? Map<*, *>)?.get("type")?.toString() } ?: emptyList()
                 log.warn("[WO pegging] First tree root type={} children types={}", firstTree?.get("type"), childTypes)
             }
-            // Collect every matching WO node across all matching trees.  When a
-            // demand is fulfilled by multiple OR-alternative slots (waterfall),
-            // each alternative is a separate work_order node; merging them into
-            // a single synthetic node lets the user see ALL predecessors across
-            // alternatives, not just the first slot's narrow subtree.
-            val allMatches = matchingEntries.flatMap { entry ->
+            // Collect every matching WO node across all matching trees, then
+            // narrow by start_time when supplied so the caller gets the exact
+            // slot/lot they clicked. Without start_time, multiple matches still
+            // collapse to the first (via mergeAlternativeWoNodes) for back-compat.
+            val rawMatches = matchingEntries.flatMap { entry ->
                 findAllWoNodes(entry["tree"], productId, locationId, method)
             }
+            val allMatches = filterByStartTime(rawMatches, startTime)
             if (allMatches.isEmpty() && matchingEntries.isNotEmpty()) {
                 val allWoKeys = matchingEntries.flatMap { entry -> collectAllWoKeys(entry["tree"]) }
-                log.warn("[WO pegging] Tree found for demand={} but WO {}@{}/{} not in it. All WO keys in tree: {}", demandId, productId, locationId, method, allWoKeys)
+                log.warn("[WO pegging] Tree found for demand={} but WO {}@{}/{} (start={}) not in it. All WO keys in tree: {}", demandId, productId, locationId, method, startTime, allWoKeys)
             }
             mergeAlternativeWoNodes(allMatches)
-                ?: throw NoSuchElementException("Work order ($productId @ $locationId / $method) not found in any pegging tree for demand $demandId")
+                ?: throw NoSuchElementException("Work order ($productId @ $locationId / $method${if (startTime.isNotBlank()) " @ $startTime" else ""}) not found in any pegging tree for demand $demandId")
         } else {
             // Consolidated WO: search all trees where demand_id is null/blank
-            val allMatches = planningPegging
+            val rawMatches = planningPegging
                 .filter { (it["demand_id"]?.toString() ?: "").isBlank() }
                 .flatMap { entry -> findAllWoNodes(entry["tree"], productId, locationId, method) }
+            val allMatches = filterByStartTime(rawMatches, startTime)
             mergeAlternativeWoNodes(allMatches)
-                ?: throw NoSuchElementException("Work order ($productId @ $locationId / $method) not found in any consolidated pegging tree")
+                ?: throw NoSuchElementException("Work order ($productId @ $locationId / $method${if (startTime.isNotBlank()) " @ $startTime" else ""}) not found in any consolidated pegging tree")
         }
 
         // Align quantity with work_orders list sum
@@ -1464,6 +1469,16 @@ private fun findWoNode(tree: Any?, productId: String, locationId: String, method
  * a WO that happens to also appear deeper in another's subtree.
  */
 @Suppress("UNCHECKED_CAST")
+/** Narrow a list of WO matches to those whose start_time bucket equals the
+ *  caller's supplied bucket. Compares the leading `yyyy-MM-dd` so the input
+ *  can be either a bare date or a full ISO timestamp. Blank `bucket` is a
+ *  no-op — returns the input list unchanged for callers that didn't pass it. */
+private fun filterByStartTime(matches: List<Map<String, Any?>>, bucket: String): List<Map<String, Any?>> {
+    if (bucket.isBlank()) return matches
+    val want = bucket.take(10)
+    return matches.filter { (it["start_time"] as? String)?.take(10) == want }
+}
+
 private fun findAllWoNodes(
     tree: Any?,
     productId: String,
