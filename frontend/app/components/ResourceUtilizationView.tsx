@@ -200,8 +200,13 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
   }, [planRunId]);
 
   useEffect(() => {
+    // Deps intentionally exclude planTrees/planTreesLoading: the setState
+    // calls inside this effect would otherwise re-trigger it, cleanup would
+    // flip `cancelled` before the fetch lands, and the loading state would
+    // stay true forever. Cache hits are handled by the closure-captured
+    // planTrees (refreshed every time peggingDemandId or planRunId changes).
     if (breakdownMode !== 'pegging' || planRunId == null) return;
-    if (planTrees.size > 0 || planTreesLoading) return;
+    if (planTrees.size > 0) return;
     let cancelled = false;
     setPlanTreesLoading(true);
     setPlanTreesError(null);
@@ -219,14 +224,15 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
       })
       .finally(() => { if (!cancelled) setPlanTreesLoading(false); });
     return () => { cancelled = true; };
-  }, [breakdownMode, caseId, planRunId, planTrees.size, planTreesLoading]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [breakdownMode, caseId, planRunId]);
 
-  // Fetch WO-scoped pegging on transition to wo_pegging mode. Cached by a
-  // composite key so re-opening the same WO is a no-op.
+  // Fetch WO-scoped pegging on transition to wo_pegging mode. Same exhaustive-
+  // deps caveat as the demand-pegging effect above — see comment there.
   useEffect(() => {
     if (breakdownMode !== 'wo_pegging' || !peggingWo || planRunId == null) return;
     const k = woCacheKey(peggingWo);
-    if (woTrees.has(k) || woTreesLoading) return;
+    if (woTrees.has(k)) return;
     let cancelled = false;
     setWoTreesLoading(true);
     setWoTreesError(null);
@@ -241,7 +247,8 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
       .catch((e: unknown) => { if (!cancelled) setWoTreesError(e instanceof Error ? e.message : String(e)); })
       .finally(() => { if (!cancelled) setWoTreesLoading(false); });
     return () => { cancelled = true; };
-  }, [breakdownMode, peggingWo, caseId, planRunId, woTrees, woTreesLoading]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [breakdownMode, peggingWo, caseId, planRunId]);
 
   // Reset the WO cache when the plan-run changes (rows from a different run
   // would point at trees that no longer exist).
