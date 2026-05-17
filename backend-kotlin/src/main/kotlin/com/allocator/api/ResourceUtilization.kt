@@ -7,6 +7,11 @@ import io.ktor.server.application.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.selectAll
@@ -32,8 +37,24 @@ fun Routing.resourceUtilizationRoutes() {
 
         val payload = computeResourceUtilization(caseId, runId)
             ?: return@get call.respond(HttpStatusCode.NotFound, mapOf("error" to "Plan run not found"))
-        call.respond(payload)
+        // kotlinx-serialization can't serialize Map<String, Any?> with mixed value
+        // types directly (each `rows` row carries String/Double/List<Double>/List<Map>).
+        // Convert the whole tree to JsonElement first — same pattern as
+        // WorkOrderImpactRoutes.resultToJson.
+        call.respond(toJsonElement(payload))
     }
+}
+
+private fun toJsonElement(v: Any?): JsonElement = when (v) {
+    null -> JsonNull
+    is JsonElement -> v
+    is Boolean -> JsonPrimitive(v)
+    is Number -> JsonPrimitive(v)
+    is String -> JsonPrimitive(v)
+    is Map<*, *> -> buildJsonObject { v.forEach { (k, vv) -> put(k.toString(), toJsonElement(vv)) } }
+    is List<*> -> buildJsonArray { v.forEach { add(toJsonElement(it)) } }
+    is DoubleArray -> buildJsonArray { v.forEach { add(JsonPrimitive(it)) } }
+    else -> JsonPrimitive(v.toString())
 }
 
 @Suppress("UNCHECKED_CAST")
