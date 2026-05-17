@@ -16,6 +16,32 @@ type Props = {
  *  can grab their period values in the same order. */
 type Period = { startMs: number; endMs: number; label: string };
 
+type ColKey = 'resource' | 'location' | 'size' | 'peak' | 'schedule';
+
+/** Drag grip painted on the right edge of every resizable header. Hover
+ *  surfaces a thin grey border so the affordance is discoverable without
+ *  cluttering the table chrome when idle. */
+function ResizeGrip({ onMouseDown, title }: { onMouseDown: (e: React.MouseEvent) => void; title: string }): JSX.Element {
+  return (
+    <div
+      onMouseDown={onMouseDown}
+      title={title}
+      style={{
+        position: 'absolute',
+        top: 0,
+        right: 0,
+        bottom: 0,
+        width: 6,
+        cursor: 'col-resize',
+        background: 'transparent',
+        borderRight: '2px solid transparent',
+      }}
+      onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.borderRight = '2px solid #52525b'; }}
+      onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.borderRight = '2px solid transparent'; }}
+    />
+  );
+}
+
 export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Element {
   const t = useTranslations('planning.resourceUtilization');
   const locale = useLocale();
@@ -23,20 +49,27 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [granularity, setGranularity] = useState<ScheduleGranularity>('day');
-  // Pixel width of the time column. Drag-resizable via the grip on the right
-  // edge of the column header. Default sized for ~3 months of weekly buckets;
-  // user can stretch it to whatever fits the horizon.
-  const [scheduleWidthPx, setScheduleWidthPx] = useState<number>(480);
-  const resizingRef = useRef<{ startX: number; startW: number } | null>(null);
+  // Pixel widths per column. All columns are drag-resizable via the grip on
+  // the right edge of each header. Schedule starts wider since it carries
+  // the horizon ruler.
+  const [colWidths, setColWidths] = useState<Record<ColKey, number>>({
+    resource: 140,
+    location: 100,
+    size: 90,
+    peak: 100,
+    schedule: 480,
+  });
+  const resizingRef = useRef<{ key: ColKey; startX: number; startW: number } | null>(null);
 
-  const onResizeMouseDown = useCallback((e: React.MouseEvent) => {
+  const onResizeMouseDown = useCallback((key: ColKey) => (e: React.MouseEvent) => {
     e.preventDefault();
-    resizingRef.current = { startX: e.clientX, startW: scheduleWidthPx };
+    resizingRef.current = { key, startX: e.clientX, startW: colWidths[key] };
     const onMove = (mv: MouseEvent) => {
       const s = resizingRef.current;
       if (!s) return;
-      const next = Math.max(200, Math.min(4000, s.startW + (mv.clientX - s.startX)));
-      setScheduleWidthPx(next);
+      const minPx = s.key === 'schedule' ? 200 : 60;
+      const next = Math.max(minPx, Math.min(4000, s.startW + (mv.clientX - s.startX)));
+      setColWidths((prev) => ({ ...prev, [s.key]: next }));
     };
     const onUp = () => {
       resizingRef.current = null;
@@ -49,7 +82,7 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
     document.body.style.userSelect = 'none';
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
-  }, [scheduleWidthPx]);
+  }, [colWidths]);
 
   useEffect(() => {
     if (planRunId == null) {
@@ -149,55 +182,45 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
         <table style={{ minWidth: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' }}>
           <thead>
             <tr style={{ borderBottom: '1px solid #3d3d40', color: '#a1a1aa', textAlign: 'left' }}>
-              <th style={{ padding: '0.4rem 0.6rem' }}>{t('columnResource')}</th>
-              <th style={{ padding: '0.4rem 0.6rem' }}>{t('columnLocation')}</th>
+              <th style={{ padding: '0.4rem 0.6rem', width: colWidths.resource, minWidth: colWidths.resource, position: 'relative' }}>
+                {t('columnResource')}
+                <ResizeGrip onMouseDown={onResizeMouseDown('resource')} title={t('resizeHandleTooltip')} />
+              </th>
+              <th style={{ padding: '0.4rem 0.6rem', width: colWidths.location, minWidth: colWidths.location, position: 'relative' }}>
+                {t('columnLocation')}
+                <ResizeGrip onMouseDown={onResizeMouseDown('location')} title={t('resizeHandleTooltip')} />
+              </th>
               <th
-                style={{ padding: '0.4rem 0.6rem', textAlign: 'right', cursor: 'help' }}
+                style={{ padding: '0.4rem 0.6rem', textAlign: 'right', cursor: 'help', width: colWidths.size, minWidth: colWidths.size, position: 'relative' }}
                 title={t('columnSizeTooltip')}
               >
                 {t('columnSize')}
+                <ResizeGrip onMouseDown={onResizeMouseDown('size')} title={t('resizeHandleTooltip')} />
               </th>
               <th
-                style={{ padding: '0.4rem 0.6rem', textAlign: 'right', cursor: 'help' }}
+                style={{ padding: '0.4rem 0.6rem', textAlign: 'right', cursor: 'help', width: colWidths.peak, minWidth: colWidths.peak, position: 'relative' }}
                 title={t('columnPeakLoadTooltip')}
               >
                 {t('columnPeakLoad')}
+                <ResizeGrip onMouseDown={onResizeMouseDown('peak')} title={t('resizeHandleTooltip')} />
               </th>
               <th
-                style={{ padding: '0.4rem 0.6rem', width: scheduleWidthPx, minWidth: scheduleWidthPx, position: 'relative' }}
+                style={{ padding: '0.4rem 0.6rem', width: colWidths.schedule, minWidth: colWidths.schedule, position: 'relative' }}
                 title={t('columnUtilizationTooltip', { granularity: granularityNoun(t, granularity) })}
               >
                 <ScheduleHorizonRuler horizon={horizon} locale={locale} />
-                {/* Drag-grip on the right edge of the time column. Mousedown
-                    captures global mousemove so the cursor doesn't have to
-                    stay inside the grip while dragging. */}
-                <div
-                  onMouseDown={onResizeMouseDown}
-                  title={t('resizeHandleTooltip')}
-                  style={{
-                    position: 'absolute',
-                    top: 0,
-                    right: 0,
-                    bottom: 0,
-                    width: 6,
-                    cursor: 'col-resize',
-                    background: 'transparent',
-                    borderRight: '2px solid transparent',
-                  }}
-                  onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.borderRight = '2px solid #52525b'; }}
-                  onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.borderRight = '2px solid transparent'; }}
-                />
+                <ResizeGrip onMouseDown={onResizeMouseDown('schedule')} title={t('resizeHandleTooltip')} />
               </th>
             </tr>
           </thead>
           <tbody>
             {data.rows.map((r, i) => (
               <tr key={`${r.resource_id}|${r.location_id}`} style={{ borderBottom: '1px solid #27272a' }}>
-                <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7' }}>{r.resource_id}</td>
-                <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7' }}>{r.location_id}</td>
-                <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7', textAlign: 'right' }}>{r.size}</td>
-                <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7', textAlign: 'right' }}>{peakLoad.get(i)?.toFixed(2) ?? '0'}</td>
-                <td style={{ padding: '0.35rem 0.6rem', width: scheduleWidthPx, minWidth: scheduleWidthPx }}>
+                <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7', width: colWidths.resource, minWidth: colWidths.resource, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.resource_id}>{r.resource_id}</td>
+                <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7', width: colWidths.location, minWidth: colWidths.location, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.location_id}>{r.location_id}</td>
+                <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7', textAlign: 'right', width: colWidths.size, minWidth: colWidths.size }}>{r.size}</td>
+                <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7', textAlign: 'right', width: colWidths.peak, minWidth: colWidths.peak }}>{peakLoad.get(i)?.toFixed(2) ?? '0'}</td>
+                <td style={{ padding: '0.35rem 0.6rem', width: colWidths.schedule, minWidth: colWidths.schedule }}>
                   <LoadStrip
                     horizon={horizon}
                     periods={rolled.periods}
