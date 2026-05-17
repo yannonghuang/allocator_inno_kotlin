@@ -454,6 +454,7 @@ export type ResourceUtilizationRow = {
   load: number[];
   contributors?: Array<{
     wo_group_id?: string | null;
+    demand_id?: string | null;
     product_id?: string;
     location_id?: string;
     quantity?: number;

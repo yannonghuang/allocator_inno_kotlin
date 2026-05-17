@@ -1,8 +1,15 @@
 'use client';
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useLocale, useTranslations } from 'next-intl';
-import { getResourceUtilization, type ResourceUtilization } from '@/lib/api';
+import {
+  getPlanRun,
+  getResourceUtilization,
+  type PlanningPeggingNode,
+  type ResourceUtilization,
+  type ResourceUtilizationRow,
+} from '@/lib/api';
 import { ScheduleHorizonRuler, type Horizon, type ScheduleGranularity } from '../cases/[id]/_workOrderSchedule';
 
 type Props = {
@@ -16,13 +23,14 @@ type Props = {
  *  can grab their period values in the same order. */
 type Period = { startMs: number; endMs: number; label: string };
 
-type ColKey = 'resource' | 'location' | 'size' | 'peak' | 'schedule';
+type ColKey = 'resource' | 'location' | 'size' | 'peak' | 'breakdown' | 'schedule';
 
 const DEFAULT_COL_WIDTHS: Record<ColKey, number> = {
   resource: 140,
   location: 100,
   size: 90,
   peak: 100,
+  breakdown: 90,
   schedule: 480,
 };
 
@@ -69,6 +77,17 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
   // values overlay in a post-mount effect.
   const [colWidths, setColWidths] = useState<Record<ColKey, number>>(DEFAULT_COL_WIDTHS);
 
+  // Breakdown slide-in: which resource is being explored, which mode is
+  // active (demand list vs single-demand pegging tree), and which demand
+  // the pegging mode is displaying. Pegging data is derived from a single
+  // plan-run fetch cached for the slide-in's lifetime.
+  const [breakdownRow, setBreakdownRow] = useState<ResourceUtilizationRow | null>(null);
+  const [breakdownMode, setBreakdownMode] = useState<'list' | 'pegging'>('list');
+  const [peggingDemandId, setPeggingDemandId] = useState<string | null>(null);
+  const [planTrees, setPlanTrees] = useState<Map<string, PlanningPeggingNode>>(new Map());
+  const [planTreesLoading, setPlanTreesLoading] = useState(false);
+  const [planTreesError, setPlanTreesError] = useState<string | null>(null);
+
   useEffect(() => {
     try {
       const raw = window.localStorage.getItem(COL_WIDTHS_STORAGE_KEY);
@@ -99,6 +118,36 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
       // Storage unavailable — drag still works for the current session.
     }
   }, [colWidths]);
+
+  // Fetch the plan-run on first transition into pegging mode and cache the
+  // demand→tree map for the slide-in's lifetime. Subsequent demand picks
+  // hit the cache. Resets when planRunId changes.
+  useEffect(() => {
+    setPlanTrees(new Map());
+    setPlanTreesError(null);
+  }, [planRunId]);
+
+  useEffect(() => {
+    if (breakdownMode !== 'pegging' || planRunId == null) return;
+    if (planTrees.size > 0 || planTreesLoading) return;
+    let cancelled = false;
+    setPlanTreesLoading(true);
+    setPlanTreesError(null);
+    getPlanRun(caseId, planRunId)
+      .then((pr) => {
+        if (cancelled) return;
+        const m = new Map<string, PlanningPeggingNode>();
+        (pr.result?.planning_pegging ?? []).forEach((entry) => {
+          if (entry.demand_id) m.set(entry.demand_id, entry.tree);
+        });
+        setPlanTrees(m);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setPlanTreesError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => { if (!cancelled) setPlanTreesLoading(false); });
+    return () => { cancelled = true; };
+  }, [breakdownMode, caseId, planRunId, planTrees.size, planTreesLoading]);
 
   const resizingRef = useRef<{ key: ColKey; startX: number; startW: number } | null>(null);
 
@@ -245,6 +294,10 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
                 {t('columnPeakLoad')}
                 <ResizeGrip onMouseDown={onResizeMouseDown('peak')} title={t('resizeHandleTooltip')} />
               </th>
+              <th style={{ padding: '0.4rem 0.6rem', width: colWidths.breakdown, minWidth: colWidths.breakdown, position: 'relative' }}>
+                {t('columnBreakdown')}
+                <ResizeGrip onMouseDown={onResizeMouseDown('breakdown')} title={t('resizeHandleTooltip')} />
+              </th>
               <th
                 style={{ padding: '0.4rem 0.6rem', width: colWidths.schedule, minWidth: colWidths.schedule, position: 'relative' }}
                 title={t('columnUtilizationTooltip', { granularity: granularityNoun(t, granularity) })}
@@ -256,11 +309,30 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
           </thead>
           <tbody>
             {data.rows.map((r, i) => (
-              <tr key={`${r.resource_id}|${r.location_id}`} style={{ borderBottom: '1px solid #27272a' }}>
+              <tr
+                key={`${r.resource_id}|${r.location_id}`}
+                style={{
+                  borderBottom: '1px solid #27272a',
+                  background: breakdownRow === r ? 'rgba(167,139,250,0.08)' : undefined,
+                }}
+              >
                 <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7', width: colWidths.resource, minWidth: colWidths.resource, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.resource_id}>{r.resource_id}</td>
                 <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7', width: colWidths.location, minWidth: colWidths.location, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.location_id}>{r.location_id}</td>
                 <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7', textAlign: 'right', width: colWidths.size, minWidth: colWidths.size }}>{r.size}</td>
                 <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7', textAlign: 'right', width: colWidths.peak, minWidth: colWidths.peak }}>{peakLoad.get(i)?.toFixed(2) ?? '0'}</td>
+                <td style={{ padding: '0.35rem 0.6rem', width: colWidths.breakdown, minWidth: colWidths.breakdown }}>
+                  {(r.contributors?.length ?? 0) > 0 ? (
+                    <button
+                      type="button"
+                      className="secondary"
+                      style={breakdownRow === r ? { background: 'rgba(167,139,250,0.25)', borderColor: '#a78bfa' } : undefined}
+                      onClick={() => {
+                        if (breakdownRow === r) { setBreakdownRow(null); setBreakdownMode('list'); setPeggingDemandId(null); }
+                        else { setBreakdownRow(r); setBreakdownMode('list'); setPeggingDemandId(null); }
+                      }}
+                    >{t('show')}</button>
+                  ) : <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>}
+                </td>
                 <td style={{ padding: '0.35rem 0.6rem', width: colWidths.schedule, minWidth: colWidths.schedule }}>
                   <LoadStrip
                     horizon={horizon}
@@ -275,6 +347,21 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
           </tbody>
         </table>
       </div>
+      {breakdownRow && typeof document !== 'undefined' && createPortal(
+        <BreakdownSlideIn
+          row={breakdownRow}
+          mode={breakdownMode}
+          peggingDemandId={peggingDemandId}
+          planTrees={planTrees}
+          planTreesLoading={planTreesLoading}
+          planTreesError={planTreesError}
+          onClose={() => { setBreakdownRow(null); setBreakdownMode('list'); setPeggingDemandId(null); }}
+          onOpenPegging={(demandId) => { setPeggingDemandId(demandId); setBreakdownMode('pegging'); }}
+          onBackToList={() => { setBreakdownMode('list'); setPeggingDemandId(null); }}
+          t={t}
+        />,
+        document.body,
+      )}
     </div>
   );
 }
@@ -421,6 +508,210 @@ function LoadStrip({
           );
         })}
       </svg>
+    </div>
+  );
+}
+
+/** Group contributors by demand_id so the list mode shows one row per
+ *  user demand, summarizing the WO contributions. Entries without a
+ *  demand_id fall under the "(unattributed)" bucket. */
+function groupContributorsByDemand(
+  contributors: NonNullable<ResourceUtilizationRow['contributors']>,
+): Array<{ demandId: string | null; totalRate: number; wos: typeof contributors }> {
+  const m = new Map<string, { demandId: string | null; totalRate: number; wos: typeof contributors }>();
+  for (const c of contributors) {
+    const key = c.demand_id ?? '__unattributed__';
+    const entry = m.get(key) ?? { demandId: c.demand_id ?? null, totalRate: 0, wos: [] };
+    entry.totalRate += c.rate ?? 0;
+    entry.wos.push(c);
+    m.set(key, entry);
+  }
+  // Stable order: real demand_ids alphabetic, unattributed last.
+  return Array.from(m.values()).sort((a, b) => {
+    if (a.demandId == null) return 1;
+    if (b.demandId == null) return -1;
+    return a.demandId.localeCompare(b.demandId);
+  });
+}
+
+function BreakdownSlideIn({
+  row,
+  mode,
+  peggingDemandId,
+  planTrees,
+  planTreesLoading,
+  planTreesError,
+  onClose,
+  onOpenPegging,
+  onBackToList,
+  t,
+}: {
+  row: ResourceUtilizationRow;
+  mode: 'list' | 'pegging';
+  peggingDemandId: string | null;
+  planTrees: Map<string, PlanningPeggingNode>;
+  planTreesLoading: boolean;
+  planTreesError: string | null;
+  onClose: () => void;
+  onOpenPegging: (demandId: string) => void;
+  onBackToList: () => void;
+  t: ReturnType<typeof useTranslations>;
+}): JSX.Element {
+  const groups = useMemo(() => groupContributorsByDemand(row.contributors ?? []), [row.contributors]);
+  const peggingTree = peggingDemandId ? planTrees.get(peggingDemandId) : null;
+
+  return (
+    <div
+      style={{ position: 'fixed', inset: 0, zIndex: 9997, display: 'flex', justifyContent: 'flex-end', pointerEvents: 'none' }}
+      role="dialog"
+      aria-label="Resource utilization breakdown"
+    >
+      <div
+        style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.4)', pointerEvents: 'auto' }}
+        onClick={onClose}
+        aria-hidden
+      />
+      <div
+        style={{
+          position: 'relative', zIndex: 10, width: 640, maxWidth: '90vw', height: '100vh',
+          display: 'flex', flexDirection: 'column', background: '#1c1c1e', color: '#e4e4e7',
+          boxShadow: '-4px 0 24px rgba(0,0,0,0.4)', pointerEvents: 'auto',
+        }}
+      >
+        <div style={{ padding: '1rem 1.25rem', borderBottom: '1px solid #3d3d40', flexShrink: 0 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.25rem' }}>
+            <h3 style={{ margin: 0, color: '#fafafa', fontSize: '1rem' }}>
+              {mode === 'list' ? t('breakdownTitle') : t('breakdownPeggingTitle', { demandId: peggingDemandId ?? '' })}
+            </h3>
+            <button
+              type="button"
+              onClick={onClose}
+              style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}
+            >{t('close')}</button>
+          </div>
+          <p style={{ margin: 0, fontSize: '0.8rem', color: '#a1a1aa' }}>
+            <strong>{row.resource_id}</strong> @ {row.location_id}
+            {' · '}{t('columnSize')}: {row.size}
+            {' · '}{t('columnPeakLoad')}: {Math.max(0, ...row.load).toFixed(2)}
+          </p>
+        </div>
+        <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
+          {mode === 'list' ? (
+            <BreakdownList groups={groups} onOpenPegging={onOpenPegging} t={t} />
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={onBackToList}
+                style={{ background: 'none', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '0.78rem', padding: 0, marginBottom: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.3rem' }}
+              >
+                ← {t('breakdownBackToList')}
+              </button>
+              {planTreesLoading && <p style={{ color: '#a1a1aa' }}>{t('peggingLoading')}</p>}
+              {planTreesError && <p style={{ color: '#f87171' }}>{planTreesError}</p>}
+              {!planTreesLoading && !planTreesError && !peggingTree && (
+                <p style={{ color: '#a1a1aa' }}>{t('peggingNotFound', { demandId: peggingDemandId ?? '' })}</p>
+              )}
+              {peggingTree && <PeggingTreeView node={peggingTree} depth={0} />}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BreakdownList({
+  groups,
+  onOpenPegging,
+  t,
+}: {
+  groups: ReturnType<typeof groupContributorsByDemand>;
+  onOpenPegging: (demandId: string) => void;
+  t: ReturnType<typeof useTranslations>;
+}): JSX.Element {
+  if (groups.length === 0) return <p style={{ color: '#a1a1aa' }}>{t('breakdownEmpty')}</p>;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+      {groups.map((g, gi) => (
+        <section key={g.demandId ?? `unattributed-${gi}`} style={{ border: '1px solid #3d3d40', borderRadius: 6, padding: '0.6rem 0.8rem' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
+            <div style={{ fontFamily: 'monospace', fontSize: '0.85rem' }}>
+              {g.demandId ?? <span style={{ color: '#71717a', fontStyle: 'italic' }}>{t('breakdownUnattributed')}</span>}
+            </div>
+            {g.demandId && (
+              <button
+                type="button"
+                className="secondary"
+                style={{ fontSize: '0.74rem', padding: '2px 8px' }}
+                onClick={() => onOpenPegging(g.demandId!)}
+              >{t('breakdownViewPegging')}</button>
+            )}
+          </div>
+          <p style={{ margin: '0 0 0.4rem', fontSize: '0.75rem', color: '#a1a1aa' }}>
+            {g.wos.length} {t('breakdownWoSuffix')} · Σ rate {g.totalRate.toFixed(2)}
+          </p>
+          <table style={{ width: '100%', fontSize: '0.74rem', borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ color: '#71717a', textAlign: 'left' }}>
+                <th style={{ paddingBottom: 2 }}>{t('breakdownColProduct')}</th>
+                <th style={{ paddingBottom: 2 }}>{t('breakdownColStart')}</th>
+                <th style={{ paddingBottom: 2 }}>{t('breakdownColEnd')}</th>
+                <th style={{ paddingBottom: 2, textAlign: 'right' }}>{t('breakdownColQty')}</th>
+                <th style={{ paddingBottom: 2, textAlign: 'right' }}>{t('breakdownColRate')}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {g.wos.map((wo, wi) => (
+                <tr key={`${wo.wo_group_id ?? ''}-${wi}`} style={{ borderTop: '1px solid #27272a' }}>
+                  <td style={{ padding: '2px 6px 2px 0', fontFamily: 'monospace' }}>{wo.product_id}</td>
+                  <td style={{ padding: '2px 6px 2px 0' }}>{wo.start_time ?? '–'}</td>
+                  <td style={{ padding: '2px 6px 2px 0' }}>{wo.end_time ?? '–'}</td>
+                  <td style={{ padding: '2px 0 2px 6px', textAlign: 'right' }}>{wo.quantity ?? '–'}</td>
+                  <td style={{ padding: '2px 0 2px 6px', textAlign: 'right' }}>{wo.rate?.toFixed(2) ?? '–'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+/** Recursive tree renderer. Indents children, color-codes by node type so
+ *  the demand → work_order → supply chain is visually clear. Initially
+ *  expanded all the way down — these trees are usually small enough; if
+ *  not, we can wire up collapse later. */
+function PeggingTreeView({ node, depth }: { node: PlanningPeggingNode; depth: number }): JSX.Element {
+  const typeColor: Record<string, string> = {
+    demand: '#fbbf24',
+    work_order: '#60a5fa',
+    supply: '#34d399',
+    purchase: '#a78bfa',
+  };
+  const color = typeColor[node.type] ?? '#a1a1aa';
+  const label = (() => {
+    if (node.type === 'demand') return `demand ${node.demand_id ?? ''}`;
+    if (node.type === 'work_order') return `${node.method ?? 'wo'} ${node.product_id ?? ''}@${node.location_id ?? ''}`;
+    return `${node.type} ${node.product_id ?? ''}@${node.location_id ?? ''}`;
+  })();
+  const meta: string[] = [];
+  if (node.quantity != null) meta.push(`qty ${node.quantity}`);
+  if (node.start_time) meta.push(`${node.start_time}${node.end_time ? `→${node.end_time}` : ''}`);
+  if (node.commit_time) meta.push(`commit ${node.commit_time}`);
+  if (node.supply_id) meta.push(`supply ${node.supply_id}`);
+  if (node.commit_reason) meta.push(node.commit_reason);
+
+  return (
+    <div style={{ paddingLeft: depth === 0 ? 0 : 14, marginLeft: depth === 0 ? 0 : 2, borderLeft: depth === 0 ? 'none' : '1px solid #27272a' }}>
+      <div style={{ fontSize: '0.78rem', lineHeight: 1.5, padding: '2px 0' }}>
+        <span style={{ color, fontWeight: 600, fontFamily: 'monospace' }}>{label}</span>
+        {meta.length > 0 && <span style={{ color: '#a1a1aa', marginLeft: 6 }}>· {meta.join(' · ')}</span>}
+      </div>
+      {(node.children ?? []).map((child, i) => (
+        <PeggingTreeView key={i} node={child} depth={depth + 1} />
+      ))}
     </div>
   );
 }

@@ -137,6 +137,7 @@ private fun computeResourceUtilization(caseId: Int, runId: Int): Map<String, Any
             if (maxDate == null || endDt > maxDate) maxDate = endDt
             contributors.getOrPut(key) { mutableListOf() }.add(mapOf(
                 "wo_group_id" to wo["wo_group_id"],
+                "demand_id" to wo["demand_id"],
                 "product_id" to productId,
                 "location_id" to locationId,
                 "quantity" to wo["quantity"],
