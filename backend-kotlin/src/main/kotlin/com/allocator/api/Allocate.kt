@@ -1493,6 +1493,11 @@ private fun findAllWoNodes(
  * `merged_alternatives` field tags the count so the UI can label it as a
  * combined view.  Returns the single node unchanged when only one alternative
  * exists.
+ *
+ * `operation` children carry the same bill-of-resources card for every slot
+ * (same operation_id → same UPH/yield/BOR), so naively concatenating them
+ * produces N visually-identical blocks. We keep only the first one per
+ * operation_id to render once at the top of the merged children.
  */
 private fun mergeAlternativeWoNodes(nodes: List<Map<String, Any?>>): Map<String, Any?>? {
     if (nodes.isEmpty()) return null
@@ -1503,7 +1508,14 @@ private fun mergeAlternativeWoNodes(nodes: List<Map<String, Any?>>): Map<String,
     val ends = nodes.mapNotNull { it["end_time"] as? String }.filter { it.isNotBlank() }
     val totalLots = nodes.sumOf { ((it["lot_count"] as? Number)?.toInt()) ?: 0 }
     @Suppress("UNCHECKED_CAST")
-    val mergedChildren = nodes.flatMap { (it["children"] as? List<Map<String, Any?>>) ?: emptyList() }
+    val rawChildren = nodes.flatMap { (it["children"] as? List<Map<String, Any?>>) ?: emptyList() }
+    // Dedupe operation nodes by operation_id; keep all other children as-is.
+    val seenOpIds = mutableSetOf<String>()
+    val mergedChildren = rawChildren.filter { child ->
+        if (child["type"] != "operation") return@filter true
+        val opId = (child["operation_id"] as? String)?.trim().orEmpty()
+        seenOpIds.add(opId)
+    }
     return first.toMutableMap().apply {
         put("quantity", roundQty(totalQty))
         if (starts.isNotEmpty()) put("start_time", starts.min())  // ISO date strings sort chronologically
