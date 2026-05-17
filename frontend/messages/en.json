@@ -445,7 +445,10 @@
       "breakdownColQty": "Qty",
       "breakdownColRate": "Rate",
       "peggingLoading": "Loading pegging tree…",
-      "peggingNotFound": "No pegging tree available for {demandId}."
+      "peggingNotFound": "No pegging tree available for {demandId}.",
+      "peggingWoNotFound": "No pegging tree available for this work order.",
+      "breakdownWoPeggingTitle": "Work order pegging — {product}@{location}",
+      "breakdownOpenWoPegging": "Open this work order's pegging tree"
     },
     "committedDemands": {
       "heading": "Committed demands",
