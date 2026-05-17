@@ -413,9 +413,19 @@
       "columnResource": "Resource",
       "columnLocation": "Location",
       "columnSize": "Capacity",
+      "columnSizeTooltip": "Available resource units at this location (resource.SIZE). Same unit as Peak load and Load over time — abstract count of concurrent slots.",
       "columnPeakLoad": "Peak load",
+      "columnPeakLoadTooltip": "Maximum concurrent consumption observed across the planning horizon, expressed in the same units as Capacity. Sum of BOR resource_rate across overlapping work orders.",
       "columnUtilization": "Load over time",
-      "tooltipLoad": "{load} of {size} on {date}"
+      "columnUtilizationTooltip": "Per-{granularity} utilization. Within each period the value shown is the peak (max) of the daily concurrent load — sums would be meaningless for concurrent capacity.",
+      "tooltipLoad": "{date}: {load} of {size}",
+      "granularityLabel": "Time scale:",
+      "granularityDay": "Daily",
+      "granularityWeek": "Weekly",
+      "granularityMonth": "Monthly",
+      "granularityNounDay": "day",
+      "granularityNounWeek": "week",
+      "granularityNounMonth": "month"
     },
     "committedDemands": {
       "heading": "Committed demands",

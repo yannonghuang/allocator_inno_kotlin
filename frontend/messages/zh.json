@@ -413,9 +413,19 @@
       "columnResource": "资源",
       "columnLocation": "地点",
       "columnSize": "容量",
+      "columnSizeTooltip": "该地点的可用资源单位数（resource.SIZE）。与“峰值负载”及“负载随时间变化”使用相同的单位——并发占用槽位的抽象计数。",
       "columnPeakLoad": "峰值负载",
+      "columnPeakLoadTooltip": "计划期内观察到的最大并发占用，与“容量”使用相同的单位。等于重叠生产订单的 BOR resource_rate 之和。",
       "columnUtilization": "负载随时间变化",
-      "tooltipLoad": "{date}: {load} / {size}"
+      "columnUtilizationTooltip": "按{granularity}聚合的利用率。每个周期内显示的是每日并发负载的峰值（最大值）——并发容量求和没有意义。",
+      "tooltipLoad": "{date}: {load} / {size}",
+      "granularityLabel": "时间粒度：",
+      "granularityDay": "日",
+      "granularityWeek": "周",
+      "granularityMonth": "月",
+      "granularityNounDay": "日",
+      "granularityNounWeek": "周",
+      "granularityNounMonth": "月"
     },
     "committedDemands": {
       "heading": "已承诺需求",
