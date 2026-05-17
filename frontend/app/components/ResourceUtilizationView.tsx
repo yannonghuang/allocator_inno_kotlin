@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocale, useTranslations } from 'next-intl';
 import { getResourceUtilization, type ResourceUtilization } from '@/lib/api';
 import { ScheduleHorizonRuler, type Horizon, type ScheduleGranularity } from '../cases/[id]/_workOrderSchedule';
@@ -23,6 +23,33 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [granularity, setGranularity] = useState<ScheduleGranularity>('day');
+  // Pixel width of the time column. Drag-resizable via the grip on the right
+  // edge of the column header. Default sized for ~3 months of weekly buckets;
+  // user can stretch it to whatever fits the horizon.
+  const [scheduleWidthPx, setScheduleWidthPx] = useState<number>(480);
+  const resizingRef = useRef<{ startX: number; startW: number } | null>(null);
+
+  const onResizeMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    resizingRef.current = { startX: e.clientX, startW: scheduleWidthPx };
+    const onMove = (mv: MouseEvent) => {
+      const s = resizingRef.current;
+      if (!s) return;
+      const next = Math.max(200, Math.min(4000, s.startW + (mv.clientX - s.startX)));
+      setScheduleWidthPx(next);
+    };
+    const onUp = () => {
+      resizingRef.current = null;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }, [scheduleWidthPx]);
 
   useEffect(() => {
     if (planRunId == null) {
@@ -119,7 +146,7 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
         </label>
       </div>
       <div style={{ overflowX: 'auto' }}>
-        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' }}>
+        <table style={{ minWidth: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' }}>
           <thead>
             <tr style={{ borderBottom: '1px solid #3d3d40', color: '#a1a1aa', textAlign: 'left' }}>
               <th style={{ padding: '0.4rem 0.6rem' }}>{t('columnResource')}</th>
@@ -137,10 +164,29 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
                 {t('columnPeakLoad')}
               </th>
               <th
-                style={{ padding: '0.4rem 0.6rem', minWidth: 320, width: '34%' }}
+                style={{ padding: '0.4rem 0.6rem', width: scheduleWidthPx, minWidth: scheduleWidthPx, position: 'relative' }}
                 title={t('columnUtilizationTooltip', { granularity: granularityNoun(t, granularity) })}
               >
                 <ScheduleHorizonRuler horizon={horizon} locale={locale} />
+                {/* Drag-grip on the right edge of the time column. Mousedown
+                    captures global mousemove so the cursor doesn't have to
+                    stay inside the grip while dragging. */}
+                <div
+                  onMouseDown={onResizeMouseDown}
+                  title={t('resizeHandleTooltip')}
+                  style={{
+                    position: 'absolute',
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                    width: 6,
+                    cursor: 'col-resize',
+                    background: 'transparent',
+                    borderRight: '2px solid transparent',
+                  }}
+                  onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.borderRight = '2px solid #52525b'; }}
+                  onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.borderRight = '2px solid transparent'; }}
+                />
               </th>
             </tr>
           </thead>
@@ -151,7 +197,7 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
                 <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7' }}>{r.location_id}</td>
                 <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7', textAlign: 'right' }}>{r.size}</td>
                 <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7', textAlign: 'right' }}>{peakLoad.get(i)?.toFixed(2) ?? '0'}</td>
-                <td style={{ padding: '0.35rem 0.6rem' }}>
+                <td style={{ padding: '0.35rem 0.6rem', width: scheduleWidthPx, minWidth: scheduleWidthPx }}>
                   <LoadStrip
                     horizon={horizon}
                     periods={rolled.periods}

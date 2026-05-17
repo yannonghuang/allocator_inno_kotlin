@@ -427,7 +427,8 @@
       "granularityNounDay": "day",
       "granularityNounWeek": "week",
       "granularityNounMonth": "month",
-      "granularityNounQuarter": "quarter"
+      "granularityNounQuarter": "quarter",
+      "resizeHandleTooltip": "Drag to resize the time column"
     },
     "committedDemands": {
       "heading": "Committed demands",
