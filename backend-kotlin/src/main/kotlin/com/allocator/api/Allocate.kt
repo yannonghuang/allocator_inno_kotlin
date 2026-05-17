@@ -1487,43 +1487,24 @@ private fun findAllWoNodes(
 }
 
 /**
- * Synthesize a single work_order node from multiple OR-alternative matches.
- * Quantity is summed, start_time = earliest, end_time = latest, children are
- * concatenated (each alternative's BOM components shown side by side).  The
- * `merged_alternatives` field tags the count so the UI can label it as a
- * combined view.  Returns the single node unchanged when only one alternative
- * exists.
+ * Pick a single work_order node from a list of waterfall-slot matches.
  *
- * `operation` children carry the same bill-of-resources card for every slot
- * (same operation_id → same UPH/yield/BOR), so naively concatenating them
- * produces N visually-identical blocks. We keep only the first one per
- * operation_id to render once at the top of the merged children.
+ * History: this used to concatenate children across slots so the user
+ * could "see all predecessors across alternatives." That produced visible
+ * duplicates — each slot's BOM has been independently consolidated by the
+ * planner already (its `children` list is the correct allocation for THAT
+ * slot's qty), so concatenating two slots produced two copies of every
+ * component at different qtys. We now just return the first matching
+ * node unchanged and tag `merged_alternatives` so the UI can hint that
+ * other slots exist.
+ *
+ * If a future caller really needs cross-slot info, fold it at the
+ * top-level WO summary (qty/lot_count), not into the children tree.
  */
 private fun mergeAlternativeWoNodes(nodes: List<Map<String, Any?>>): Map<String, Any?>? {
     if (nodes.isEmpty()) return null
     if (nodes.size == 1) return nodes.first()
-    val first = nodes.first()
-    val totalQty = nodes.sumOf { ((it["quantity"] as? Number)?.toDouble()) ?: 0.0 }
-    val starts = nodes.mapNotNull { it["start_time"] as? String }.filter { it.isNotBlank() }
-    val ends = nodes.mapNotNull { it["end_time"] as? String }.filter { it.isNotBlank() }
-    val totalLots = nodes.sumOf { ((it["lot_count"] as? Number)?.toInt()) ?: 0 }
-    @Suppress("UNCHECKED_CAST")
-    val rawChildren = nodes.flatMap { (it["children"] as? List<Map<String, Any?>>) ?: emptyList() }
-    // Dedupe operation nodes by operation_id; keep all other children as-is.
-    val seenOpIds = mutableSetOf<String>()
-    val mergedChildren = rawChildren.filter { child ->
-        if (child["type"] != "operation") return@filter true
-        val opId = (child["operation_id"] as? String)?.trim().orEmpty()
-        seenOpIds.add(opId)
-    }
-    return first.toMutableMap().apply {
-        put("quantity", roundQty(totalQty))
-        if (starts.isNotEmpty()) put("start_time", starts.min())  // ISO date strings sort chronologically
-        if (ends.isNotEmpty()) put("end_time", ends.max())
-        put("lot_count", if (totalLots > 0) totalLots else null)
-        put("children", mergedChildren)
-        put("merged_alternatives", nodes.size)
-    }
+    return nodes.first().toMutableMap().apply { put("merged_alternatives", nodes.size) }
 }
 
 /** Collect all work_order nodes from the pegging tree as "pid@lid/method" strings — for debugging. */
