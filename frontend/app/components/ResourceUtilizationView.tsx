@@ -18,6 +18,19 @@ type Period = { startMs: number; endMs: number; label: string };
 
 type ColKey = 'resource' | 'location' | 'size' | 'peak' | 'schedule';
 
+const DEFAULT_COL_WIDTHS: Record<ColKey, number> = {
+  resource: 140,
+  location: 100,
+  size: 90,
+  peak: 100,
+  schedule: 480,
+};
+
+// Bump the suffix if the schema of stored widths ever changes incompatibly
+// (e.g. ColKey added/removed); the read-side merge already tolerates partial
+// matches and out-of-range values via clamping.
+const COL_WIDTHS_STORAGE_KEY = 'allocator.resourceUtilization.colWidths.v1';
+
 /** Drag grip painted on the right edge of every resizable header. Hover
  *  surfaces a thin grey border so the affordance is discoverable without
  *  cluttering the table chrome when idle. */
@@ -51,14 +64,42 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
   const [granularity, setGranularity] = useState<ScheduleGranularity>('day');
   // Pixel widths per column. All columns are drag-resizable via the grip on
   // the right edge of each header. Schedule starts wider since it carries
-  // the horizon ruler.
-  const [colWidths, setColWidths] = useState<Record<ColKey, number>>({
-    resource: 140,
-    location: 100,
-    size: 90,
-    peak: 100,
-    schedule: 480,
-  });
+  // the horizon ruler. Persisted to localStorage so widths survive reloads.
+  // Initial render uses defaults to avoid SSR/hydration mismatch; saved
+  // values overlay in a post-mount effect.
+  const [colWidths, setColWidths] = useState<Record<ColKey, number>>(DEFAULT_COL_WIDTHS);
+
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(COL_WIDTHS_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as Partial<Record<ColKey, number>>;
+      // Sanitize: ignore non-numbers, clamp to the same bounds the drag
+      // handler enforces so a corrupted/old value can't render the table
+      // unusable.
+      const sanitized: Partial<Record<ColKey, number>> = {};
+      (Object.keys(DEFAULT_COL_WIDTHS) as ColKey[]).forEach((k) => {
+        const v = parsed[k];
+        if (typeof v !== 'number' || !Number.isFinite(v)) return;
+        const minPx = k === 'schedule' ? 200 : 60;
+        sanitized[k] = Math.max(minPx, Math.min(4000, v));
+      });
+      if (Object.keys(sanitized).length > 0) {
+        setColWidths((prev) => ({ ...prev, ...sanitized }));
+      }
+    } catch {
+      // localStorage disabled / quota / parse error — fall back to defaults.
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(COL_WIDTHS_STORAGE_KEY, JSON.stringify(colWidths));
+    } catch {
+      // Storage unavailable — drag still works for the current session.
+    }
+  }, [colWidths]);
+
   const resizingRef = useRef<{ key: ColKey; startX: number; startW: number } | null>(null);
 
   const onResizeMouseDown = useCallback((key: ColKey) => (e: React.MouseEvent) => {
