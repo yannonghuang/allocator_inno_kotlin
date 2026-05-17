@@ -213,13 +213,29 @@ export type WorkOrder = {
   method_slot_index?: number | null;
 };
 
-/** Planning pegging tree node: demand (root) -> work_order -> ... -> supply | purchase (leaves). */
+/** Planning pegging tree node: demand (root) -> work_order -> ... -> supply | purchase (leaves).
+ *  Make WOs that have an applicable operation also emit `operation` and `resource` children
+ *  carrying the bill-of-resources detail; those don't participate in supply/demand flow. */
 export type PlanningPeggingNode = {
-  type: 'demand' | 'work_order' | 'supply' | 'purchase';
+  type: 'demand' | 'work_order' | 'supply' | 'purchase' | 'operation' | 'resource';
   demand_id?: string | null;
   product_id?: string;
   location_id?: string;
   quantity?: number;
+  /** operation nodes: identifier from operation.OPERATION_ID. */
+  operation_id?: string | null;
+  /** operation nodes: BOR id; resource nodes: id of the consumed resource. */
+  resource_id?: string | null;
+  /** operation nodes: production rate fields. */
+  uph?: number | null;
+  yield_factor?: number | null;
+  process_time?: number | null;
+  pre_process_time?: number | null;
+  post_process_time?: number | null;
+  prod_area?: string | null;
+  /** resource nodes: per-unit consumption rate and the available pool size at this location. */
+  resource_rate?: number | null;
+  size?: number | null;
   request_time?: string | null;
   commit_time?: string | null;
   commit_reason?: string | null;

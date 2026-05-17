@@ -120,14 +120,29 @@ function NodeView({
   const isExpanded = expanded.has(path);
   const isDemand = node.type === 'demand';
   const isWorkOrder = node.type === 'work_order';
-  const icon = !isWorkOrder ? '▢' : '⚙';
+  const isOperation = node.type === 'operation';
+  const isResource = node.type === 'resource';
+  // Distinct glyphs per type:
+  //   ⚙ work_order, ▢ demand/supply/purchase (need/inventory),
+  //   ⚒ operation (bill-of-resources card), ◆ resource (a single resource line).
+  const icon = isWorkOrder ? '⚙'
+    : isOperation ? '⚒'
+    : isResource ? '◆'
+    : '▢';
   const typeLabel = isDemand ? 'Need'
+    : isWorkOrder ? 'Work order'
+    : isOperation ? 'Bill of resources'
+    : isResource ? 'Resource'
     : node.type === 'supply' ? 'Supply'
     : node.type === 'purchase' ? 'Purchase'
-    : 'Work order';
-  const typeColor = isDemand ? '#60a5fa' : isWorkOrder ? '#34d399' : '#a78bfa';
+    : '';
+  const typeColor = isDemand ? '#60a5fa'
+    : isWorkOrder ? '#34d399'
+    : isOperation ? '#fbbf24'   // amber — production setup
+    : isResource ? '#22d3ee'    // cyan — capacity / tooling
+    : '#a78bfa';
 
-  const label = node.type === 'demand'
+  const label = isDemand
     ? (() => {
         const reqQty = Number(node.quantity ?? 0);
         const committedRaw = (node as { committed_qty?: number | null }).committed_qty;
@@ -137,7 +152,7 @@ function NodeView({
           : qtyFmt(reqQty);
         return `${node.product_id ?? node.demand_id ?? '–'} · ${qtyLabel} @ ${node.location_id ?? '–'}${node.demand_id && node.product_id !== node.demand_id && node.demand_id !== contextDemandId ? ` (demand ${node.demand_id})` : ''}`;
       })()
-    : node.type === 'work_order'
+    : isWorkOrder
       ? (() => {
           const qty = (isRoot && workOrderRootQty != null) ? workOrderRootQty : Number(node.quantity ?? 0);
           const lotCount = (node as { lot_count?: number | null }).lot_count ?? null;
@@ -147,9 +162,36 @@ function NodeView({
             : '';
           return `${node.method} ${node.product_id} @ ${node.location_id ?? '–'} · ${qtyFmt(qty)}${node.end_time ? ` · end ${node.end_time}` : ''}${lotPart}`;
         })()
-      : node.type === 'supply'
-        ? `${node.product_id} @ ${node.location_id ?? '–'} · ${qtyFmt(Number(node.quantity ?? 0))}${node.supply_id ? ` · ${node.supply_id}` : ''}`
-        : `${node.product_id} @ ${node.location_id ?? '–'} · ${qtyFmt(Number(node.quantity ?? 0))}`;
+      : isOperation
+        ? (() => {
+            // Bill-of-resources line — show op_id, location, and the production
+            // rate fields. No qty: the operation isn't a need, it's metadata
+            // describing how the parent WO is produced.
+            const opId = node.operation_id ?? node.resource_id ?? '–';
+            const parts: string[] = [`operation ${opId} @ ${node.location_id ?? '–'}`];
+            if (node.uph != null) parts.push(`UPH ${node.uph}`);
+            if (node.yield_factor != null) parts.push(`yield ${node.yield_factor}`);
+            if (node.process_time != null || node.pre_process_time != null || node.post_process_time != null) {
+              parts.push(`pre/proc/post ${node.pre_process_time ?? 0}/${node.process_time ?? 0}/${node.post_process_time ?? 0}s`);
+            }
+            return parts.join(' · ');
+          })()
+        : isResource
+          ? (() => {
+              // Single resource line — name, per-unit rate, and the location's
+              // pool size (capacity). No date fields; this is a static load
+              // descriptor, not a time-bounded need.
+              const rid = node.resource_id ?? '–';
+              const rate = node.resource_rate;
+              const size = node.size;
+              const parts: string[] = [`${rid} @ ${node.location_id ?? '–'}`];
+              if (rate != null) parts.push(`rate ${rate}`);
+              if (size != null) parts.push(`capacity ${size}`);
+              return parts.join(' · ');
+            })()
+          : node.type === 'supply'
+            ? `${node.product_id} @ ${node.location_id ?? '–'} · ${qtyFmt(Number(node.quantity ?? 0))}${node.supply_id ? ` · ${node.supply_id}` : ''}`
+            : `${node.product_id} @ ${node.location_id ?? '–'} · ${qtyFmt(Number(node.quantity ?? 0))}`;
 
   const indentPx = 12;
   let childGroupLabel: string | null = null;
