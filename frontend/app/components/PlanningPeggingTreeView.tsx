@@ -178,15 +178,15 @@ function NodeView({
           })()
         : isResource
           ? (() => {
-              // Single resource line — name, per-unit rate, and the location's
-              // pool size (capacity). No date fields; this is a static load
-              // descriptor, not a time-bounded need.
+              // resource_rate is the per-lot consumption — the number of this
+              // resource a single lot of the parent WO occupies while it runs.
+              // The location's pool size lives on the row payload but isn't
+              // shown here; it's surfaced in the Resource utilization view
+              // (where the per-lot rates sum and bump against pool capacity).
               const rid = node.resource_id ?? '–';
               const rate = node.resource_rate;
-              const size = node.size;
               const parts: string[] = [`${rid} @ ${node.location_id ?? '–'}`];
-              if (rate != null) parts.push(`rate ${rate}`);
-              if (size != null) parts.push(`capacity ${size}`);
+              if (rate != null) parts.push(`capacity ${rate}/lot`);
               return parts.join(' · ');
             })()
           : node.type === 'supply'
