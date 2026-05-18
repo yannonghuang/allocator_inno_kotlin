@@ -83,21 +83,20 @@ class OperationLookupTest : FunSpec({
         // UPH branch (UPH > 0 → ignore pre/process/post):
         //   seconds_per_lot = (lot_qty / yield / UPH) * 3600
         //                   = (100 / 0.98 / 100) * 3600
-        //                   = 3673.469 seconds
-        //   days            ≈ 0.04252
+        //                   = 3673.469 seconds ≈ 0.0425 days
+        // The planner schedules in whole-day buckets, so we ceil to 1 day.
         result.source shouldBe "uph"
         result.operationId shouldBe "oe-operation"
-        result.days shouldBe (0.04252 plusOrMinus 1e-4)
+        result.days shouldBe 1.0
     }
 
-    test("override scales linearly with qty in the UPH branch") {
+    test("large lot under UPH spans multiple whole days") {
+        // qty 10,000 / 0.98 / 100 UPH * 3600 = 367,346.94 s ≈ 4.25 days
+        // → ceil = 5 days per lot.
         val data = fixtureDataset()
-        val small = OperationLookup.effectiveLeadDays("X", "1000", qty = 10.0, methodMakeLeadDays = 5.0, data = data)
-        val big = OperationLookup.effectiveLeadDays("X", "1000", qty = 100.0, methodMakeLeadDays = 5.0, data = data)
-        small.source shouldBe "uph"
-        big.source shouldBe "uph"
-        // qty doubles → days double, since the UPH branch is pure linear (no pre/post overhead).
-        big.days shouldBe (small.days * 10 plusOrMinus 1e-6)
+        val result = OperationLookup.effectiveLeadDays("X", "1000", qty = 10000.0, methodMakeLeadDays = 5.0, data = data)
+        result.source shouldBe "uph"
+        result.days shouldBe 5.0
     }
 
     test("UPH branch caps qty at productlocation.max_lot_size") {
@@ -110,11 +109,9 @@ class OperationLookupTest : FunSpec({
             mapOf("product_id" to "Y", "location_id" to "1000", "prod_area" to "FA", "max_lot_size" to null),
         )
         val result = OperationLookup.effectiveLeadDays("X", "1000", qty = 200.0, methodMakeLeadDays = 5.0, data = withCap)
-        // lot_qty = min(200, 50) = 50
-        // seconds = (50 / 0.98 / 100) * 3600 = 1836.735
-        // days    ≈ 0.02126
+        // lot_qty = min(200, 50) = 50; (50 / 0.98 / 100) * 3600 ≈ 0.021 days → ceil = 1.
         result.source shouldBe "uph"
-        result.days shouldBe (0.02126 plusOrMinus 1e-4)
+        result.days shouldBe 1.0
     }
 
     test("fixed pre+process+post branch kicks in when UPH is 0 or missing") {
@@ -135,9 +132,9 @@ class OperationLookupTest : FunSpec({
             ),
         )
         val result = OperationLookup.effectiveLeadDays("X", "1000", qty = 100.0, methodMakeLeadDays = 5.0, data = withoutUph)
-        // seconds_per_lot = 1800 + 3600 + 1000 = 6400; days ≈ 0.07407
+        // seconds_per_lot = 1800 + 3600 + 1000 = 6400; days ≈ 0.074 → ceil = 1.
         result.source shouldBe "uph"
-        result.days shouldBe (0.07407 plusOrMinus 1e-4)
+        result.days shouldBe 1.0
     }
 
     test("falls back when productlocation has no row for (product, location)") {
@@ -211,6 +208,6 @@ class OperationLookupTest : FunSpec({
         val result = OperationLookup.effectiveLeadDays("X", "2000", qty = 100.0, methodMakeLeadDays = 5.0, data = withX2000)
         result.source shouldBe "uph"
         // Same formula as the 1000 test — resources at 2000 also cover all of oe-bor.
-        result.days shouldBe (0.04252 plusOrMinus 1e-4)
+        result.days shouldBe 1.0
     }
 })

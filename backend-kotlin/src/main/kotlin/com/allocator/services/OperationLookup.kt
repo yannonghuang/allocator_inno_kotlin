@@ -92,8 +92,15 @@ object OperationLookup {
             else -> return fallback
         }
 
+        // Ceil to whole days. The planner schedules in day-granularity buckets
+        // (LocalDate.plusDays(Long)), so a sub-day lot must still consume one
+        // calendar day; otherwise lot_end == lot_start and SoundnessChecker's
+        // R5_lead_time (which expects end - start >= leadTime days) fires on
+        // every operation-override WO.
+        val daysExact = secondsPerLot / 86400.0
+        val days = if (daysExact > 0.0) kotlin.math.ceil(daysExact) else 0.0
         return EffectiveLead(
-            days = secondsPerLot / 86400.0,
+            days = days,
             source = "uph",
             operationId = (op["operation_id"] as? String)?.trim(),
         )
