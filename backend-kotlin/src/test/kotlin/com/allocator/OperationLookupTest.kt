@@ -80,26 +80,64 @@ class OperationLookupTest : FunSpec({
             data = data,
         )
 
-        // qty/yield = 100/0.98 = 102.04081632653...
-        // seconds = 1800 + 102.04 * 3600 + (102.04/100) * 3600 + 1000
-        //         = 1800 + 367346.939 + 3673.469 + 1000
-        //         = 373820.408 seconds
-        // days   ≈ 4.3266
+        // UPH branch (UPH > 0 → ignore pre/process/post):
+        //   seconds_per_lot = (lot_qty / yield / UPH) * 3600
+        //                   = (100 / 0.98 / 100) * 3600
+        //                   = 3673.469 seconds
+        //   days            ≈ 0.04252
         result.source shouldBe "uph"
         result.operationId shouldBe "oe-operation"
-        result.days shouldBe (4.32662 plusOrMinus 1e-4)
+        result.days shouldBe (0.04252 plusOrMinus 1e-4)
     }
 
-    test("override scales with qty (linear in adjusted qty)") {
+    test("override scales linearly with qty in the UPH branch") {
         val data = fixtureDataset()
         val small = OperationLookup.effectiveLeadDays("X", "1000", qty = 10.0, methodMakeLeadDays = 5.0, data = data)
         val big = OperationLookup.effectiveLeadDays("X", "1000", qty = 100.0, methodMakeLeadDays = 5.0, data = data)
         small.source shouldBe "uph"
         big.source shouldBe "uph"
-        // Linear part dominates pre/post → big should be ~10× the linear component
-        // larger than small (not exactly 10× because of the fixed pre/post overhead).
-        (big.days > small.days * 5) shouldBe true
-        (big.days < small.days * 11) shouldBe true
+        // qty doubles → days double, since the UPH branch is pure linear (no pre/post overhead).
+        big.days shouldBe (small.days * 10 plusOrMinus 1e-6)
+    }
+
+    test("UPH branch caps qty at productlocation.max_lot_size") {
+        // Override the fixtures so X@1000 has max_lot_size = 50; a slot qty of 200
+        // becomes a 50-piece lot.
+        val base = fixtureDataset()
+        val withCap = base.toMutableMap()
+        withCap["productlocation"] = listOf(
+            mapOf("product_id" to "X", "location_id" to "1000", "prod_area" to "OE", "max_lot_size" to 50.0),
+            mapOf("product_id" to "Y", "location_id" to "1000", "prod_area" to "FA", "max_lot_size" to null),
+        )
+        val result = OperationLookup.effectiveLeadDays("X", "1000", qty = 200.0, methodMakeLeadDays = 5.0, data = withCap)
+        // lot_qty = min(200, 50) = 50
+        // seconds = (50 / 0.98 / 100) * 3600 = 1836.735
+        // days    ≈ 0.02126
+        result.source shouldBe "uph"
+        result.days shouldBe (0.02126 plusOrMinus 1e-4)
+    }
+
+    test("fixed pre+process+post branch kicks in when UPH is 0 or missing") {
+        // Drop UPH (set to 0) so the fixed-time branch fires. Pre+process+post
+        // refer to the lot as a whole — yield/qty don't apply.
+        val base = fixtureDataset()
+        val withoutUph = base.toMutableMap()
+        withoutUph["operation"] = listOf(
+            mapOf(
+                "operation_id" to "oe-operation",
+                "prod_area" to "OE",
+                "uph" to 0.0,
+                "yield_factor" to 0.98,
+                "bor_id" to "oe-bor",
+                "process_time" to 3600,
+                "pre_process_time" to 1800,
+                "post_process_time" to 1000,
+            ),
+        )
+        val result = OperationLookup.effectiveLeadDays("X", "1000", qty = 100.0, methodMakeLeadDays = 5.0, data = withoutUph)
+        // seconds_per_lot = 1800 + 3600 + 1000 = 6400; days ≈ 0.07407
+        result.source shouldBe "uph"
+        result.days shouldBe (0.07407 plusOrMinus 1e-4)
     }
 
     test("falls back when productlocation has no row for (product, location)") {
@@ -173,6 +211,6 @@ class OperationLookupTest : FunSpec({
         val result = OperationLookup.effectiveLeadDays("X", "2000", qty = 100.0, methodMakeLeadDays = 5.0, data = withX2000)
         result.source shouldBe "uph"
         // Same formula as the 1000 test — resources at 2000 also cover all of oe-bor.
-        result.days shouldBe (4.32662 plusOrMinus 1e-4)
+        result.days shouldBe (0.04252 plusOrMinus 1e-4)
     }
 })
