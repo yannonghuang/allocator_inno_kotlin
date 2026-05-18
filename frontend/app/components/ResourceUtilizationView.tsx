@@ -436,18 +436,44 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
             </tr>
           </thead>
           <tbody>
-            {data.rows.map((r, i) => (
+            {data.rows.map((r, i) => {
+              // Single-WO parallelism cap can't see other WOs at the same
+              // location, so peak load can exceed pool size when concurrent
+              // WOs share a resource. Surface that visually: red row tint +
+              // red peak number + warning tooltip so the user knows the
+              // schedule is optimistic for this resource. Real fix is
+              // cross-WO arbitration (deferred).
+              const peak = peakLoad.get(i) ?? 0;
+              const overloaded = peak > r.size + 1e-9;
+              const bg = overloaded
+                ? 'rgba(239,68,68,0.10)'
+                : breakdownRow === r ? 'rgba(167,139,250,0.08)' : undefined;
+              return (
               <tr
                 key={`${r.resource_id}|${r.location_id}`}
                 style={{
                   borderBottom: '1px solid #27272a',
-                  background: breakdownRow === r ? 'rgba(167,139,250,0.08)' : undefined,
+                  background: bg,
                 }}
               >
                 <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7', width: colWidths.resource, minWidth: colWidths.resource, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.resource_id}>{r.resource_id}</td>
                 <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7', width: colWidths.location, minWidth: colWidths.location, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.location_id}>{r.location_id}</td>
                 <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7', textAlign: 'right', width: colWidths.size, minWidth: colWidths.size }}>{r.size}</td>
-                <td style={{ padding: '0.35rem 0.6rem', color: '#e4e4e7', textAlign: 'right', width: colWidths.peak, minWidth: colWidths.peak }}>{peakLoad.get(i)?.toFixed(2) ?? '0'}</td>
+                <td
+                  style={{
+                    padding: '0.35rem 0.6rem',
+                    color: overloaded ? '#f87171' : '#e4e4e7',
+                    fontWeight: overloaded ? 600 : undefined,
+                    textAlign: 'right',
+                    width: colWidths.peak,
+                    minWidth: colWidths.peak,
+                    cursor: overloaded ? 'help' : undefined,
+                  }}
+                  title={overloaded ? t('peakOverloadTooltip', { peak: peak.toFixed(2), size: r.size }) : undefined}
+                >
+                  {peak.toFixed(2)}
+                  {overloaded && <span style={{ marginLeft: 4 }}>⚠</span>}
+                </td>
                 <td style={{ padding: '0.35rem 0.6rem', width: colWidths.breakdown, minWidth: colWidths.breakdown }}>
                   {(r.contributors?.length ?? 0) > 0 ? (
                     <button
@@ -471,7 +497,8 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
                   />
                 </td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>

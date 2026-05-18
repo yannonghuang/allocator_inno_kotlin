@@ -448,7 +448,8 @@
       "peggingNotFound": "没有 {demandId} 的追溯树。",
       "peggingWoNotFound": "没有该工单的追溯树。",
       "breakdownWoPeggingTitle": "工单追溯 — {product}@{location}",
-      "breakdownOpenWoPegging": "打开该工单的追溯树"
+      "breakdownOpenWoPegging": "打开该工单的追溯树",
+      "peakOverloadTooltip": "峰值 {peak} 超过容量 {size}。单工单并发上限不感知同地点其他工单；跨工单仲裁尚未实施，此资源的排程偏乐观。"
     },
     "committedDemands": {
       "heading": "已承诺需求",

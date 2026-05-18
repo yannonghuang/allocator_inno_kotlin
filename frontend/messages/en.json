@@ -448,7 +448,8 @@
       "peggingNotFound": "No pegging tree available for {demandId}.",
       "peggingWoNotFound": "No pegging tree available for this work order.",
       "breakdownWoPeggingTitle": "Work order pegging — {product}@{location}",
-      "breakdownOpenWoPegging": "Open this work order's pegging tree"
+      "breakdownOpenWoPegging": "Open this work order's pegging tree",
+      "peakOverloadTooltip": "Peak {peak} exceeds capacity {size}. Single-WO parallelism doesn't see other WOs at this location; cross-WO arbitration is not yet enforced, so this schedule is optimistic for this resource."
     },
     "committedDemands": {
       "heading": "Committed demands",
