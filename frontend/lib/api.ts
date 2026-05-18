@@ -236,6 +236,13 @@ export type PlanningPeggingNode = {
   /** resource nodes: per-unit consumption rate and the available pool size at this location. */
   resource_rate?: number | null;
   size?: number | null;
+  /** Concurrent lots allowed under the operation override: min(floor(size/rate))
+   *  across BOR resources. Present on operation nodes; present on work_order
+   *  nodes when > 1 (omitted for sequential WOs to keep payload small). */
+  parallelism_cap?: number | null;
+  /** Number of sequential waves the planner uses to run lot_count lots at the
+   *  parallelism cap. Present on make work_order nodes only. */
+  wave_count?: number | null;
   request_time?: string | null;
   commit_time?: string | null;
   commit_reason?: string | null;

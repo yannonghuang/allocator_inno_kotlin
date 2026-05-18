@@ -210,4 +210,61 @@ class OperationLookupTest : FunSpec({
         // Same formula as the 1000 test — resources at 2000 also cover all of oe-bor.
         result.days shouldBe 1.0
     }
+
+    // ── parallelismCap ────────────────────────────────────────────────────────
+
+    test("parallelismCap returns min(floor(size/rate)) across BOR resources") {
+        // Default fixture: rates 1/2/20, location 1000 sizes 10/15/100.
+        // floors: 10, 7, 5 → min = 5.
+        val data = fixtureDataset()
+        OperationLookup.parallelismCap("X", "1000", data) shouldBe 5
+    }
+
+    test("parallelismCap follows the tightest resource at the location") {
+        // Override resources at 1000 so oe-machine1 is the bottleneck.
+        val base = fixtureDataset()
+        val tighter = base.toMutableMap()
+        tighter["resource"] = listOf(
+            mapOf("resource_id" to "oe-machine1", "location_id" to "1000", "size" to 2.0),
+            mapOf("resource_id" to "oe-machine2", "location_id" to "1000", "size" to 15.0),
+            mapOf("resource_id" to "crew", "location_id" to "1000", "size" to 100.0),
+        )
+        // floors: 2, 7, 5 → min = 2 (oe-machine1 is the limiter).
+        OperationLookup.parallelismCap("X", "1000", tighter) shouldBe 2
+    }
+
+    test("parallelismCap returns 0 when any rate exceeds size") {
+        val base = fixtureDataset()
+        val starved = base.toMutableMap()
+        starved["resource"] = listOf(
+            // oe-machine1 with size=0 can't fit even one lot (rate=1).
+            mapOf("resource_id" to "oe-machine1", "location_id" to "1000", "size" to 0.0),
+            mapOf("resource_id" to "oe-machine2", "location_id" to "1000", "size" to 15.0),
+            mapOf("resource_id" to "crew", "location_id" to "1000", "size" to 100.0),
+        )
+        OperationLookup.parallelismCap("X", "1000", starved) shouldBe 0
+    }
+
+    test("parallelismCap returns 0 when override doesn't apply at all") {
+        val data = fixtureDataset()
+        // Product Z has no productlocation row.
+        OperationLookup.parallelismCap("Z", "1000", data) shouldBe 0
+        // Product Y has prod_area FA but no operation matches FA.
+        OperationLookup.parallelismCap("Y", "1000", data) shouldBe 0
+    }
+
+    test("effectiveLeadDays falls back when any BOR resource has rate > size") {
+        // Same starved fixture as the parallelismCap rate>size test —
+        // effectiveLeadDays should also bail since cap would be 0.
+        val base = fixtureDataset()
+        val starved = base.toMutableMap()
+        starved["resource"] = listOf(
+            mapOf("resource_id" to "oe-machine1", "location_id" to "1000", "size" to 0.0),
+            mapOf("resource_id" to "oe-machine2", "location_id" to "1000", "size" to 15.0),
+            mapOf("resource_id" to "crew", "location_id" to "1000", "size" to 100.0),
+        )
+        val result = OperationLookup.effectiveLeadDays("X", "1000", qty = 100.0, methodMakeLeadDays = 5.0, data = starved)
+        result.source shouldBe "method_make"
+        result.days shouldBe 5.0
+    }
 })

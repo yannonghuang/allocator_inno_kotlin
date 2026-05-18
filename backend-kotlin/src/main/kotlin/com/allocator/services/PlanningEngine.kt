@@ -2381,31 +2381,50 @@ private fun buildWorkOrders(
     val prodArea = getProdArea(productId, productionLocation, data)
     val methodType = m["type"] as? String ?: ""
     val woGroupId = nextWoGroupId()
+
+    // Concurrency cap: how many lots can share a wave at this location.
+    // Only meaningful for make WOs under the operation override; move/purchase
+    // stay sequential (cap=1). cap=0 means the override doesn't apply and the
+    // caller has already supplied the static lead, so default to 1 there too.
+    val cap = if (methodType == "make")
+        OperationLookup.parallelismCap(productId, productionLocation, data).coerceAtLeast(1)
+    else 1
+
     val wos = mutableListOf<Map<String, Any?>>()
     var left = qty
-    var lotStart: LocalDate? = startDt
+    var waveStart: LocalDate? = startDt
     var lastEnd: LocalDate? = null
     var lotCount = 0
-    while (left > 1e-9 && lotStart != null) {
-        val lotQty = min(lotSize, left)
-        val lotEnd = dateAddDays(lotStart, leadDays)
-        wos.add(mapOf(
-            "product_id" to productId,
-            "location_id" to productionLocation,
-            "quantity" to roundQty(lotQty),
-            "start_time" to formatDate(lotStart),
-            "end_time" to formatDate(lotEnd),
-            "method" to methodType,
-            "location_source" to (if (methodType == "move") m["from_location_id"] else null),
-            "demand_id" to demandId,
-            "prod_area" to prodArea,
-            "override_active" to overrideActive,
-            "wo_group_id" to woGroupId,
-        ))
-        lastEnd = lotEnd
-        left -= lotQty
-        lotCount++
-        lotStart = if (left > 1e-9) lotEnd else null
+    var waveIndex = 0
+    while (left > 1e-9 && waveStart != null) {
+        val waveEnd = dateAddDays(waveStart, leadDays)
+        // Each wave runs up to `cap` lots in parallel — all share waveStart /
+        // waveEnd. Subsequent waves start at the previous wave's end (today's
+        // sequential lots become cap=1, identical to old behavior).
+        var lotsThisWave = 0
+        while (lotsThisWave < cap && left > 1e-9) {
+            val lotQty = min(lotSize, left)
+            wos.add(mapOf(
+                "product_id" to productId,
+                "location_id" to productionLocation,
+                "quantity" to roundQty(lotQty),
+                "start_time" to formatDate(waveStart),
+                "end_time" to formatDate(waveEnd),
+                "method" to methodType,
+                "location_source" to (if (methodType == "move") m["from_location_id"] else null),
+                "demand_id" to demandId,
+                "prod_area" to prodArea,
+                "override_active" to overrideActive,
+                "wo_group_id" to woGroupId,
+                "wave_index" to waveIndex,
+            ))
+            left -= lotQty
+            lotsThisWave++
+            lotCount++
+        }
+        lastEnd = waveEnd
+        waveIndex++
+        waveStart = if (left > 1e-9) waveEnd else null
     }
     return WorkOrderResult(wos, lotCount, lastEnd, lotSizeVal, woGroupId)
 }
@@ -2443,6 +2462,18 @@ private fun buildWoNode(
     put("lot_count", if (lotCount > 0) lotCount else null)
     put("max_lot_size", lotSizeVal)
     put("override_active", overrideActive)
+
+    // Wave structure for make WOs under the operation override. cap >= 1 means
+    // the WO compresses its lots into ceil(lot_count / cap) sequential waves;
+    // outside the override cap=1 and wave_count == lot_count (today's behavior).
+    val cap = if (methodType == "make" && data != null)
+        OperationLookup.parallelismCap(productId, productionLocation, data).coerceAtLeast(1)
+    else 1
+    if (cap > 1) put("parallelism_cap", cap)
+    if (lotCount > 0) {
+        val waveCount = kotlin.math.ceil(lotCount.toDouble() / cap.toDouble()).toInt()
+        if (waveCount > 0) put("wave_count", waveCount)
+    }
 
     // For make WOs with an applicable operation, prepend an operation node
     // (with resource children) so pegging trees expose the granular UPH/BOR
@@ -2513,6 +2544,11 @@ private fun buildOperationChildren(
     }
     if (resourceChildren.size != borRows.size) return emptyList()
 
+    // Concurrency cap = min(floor(size/rate)) across BOR. Pegged onto the
+    // operation node so the UI can render "up to N parallel lots" and the
+    // user can reason about how the WO span was compressed.
+    val parallelismCap = OperationLookup.parallelismCap(productId, locationId, data)
+
     return listOf(mapOf(
         "type" to "operation",
         "operation_id" to (op["operation_id"] as? String)?.trim(),
@@ -2525,6 +2561,7 @@ private fun buildOperationChildren(
         "process_time" to (op["process_time"] as? Number)?.toInt(),
         "pre_process_time" to (op["pre_process_time"] as? Number)?.toInt(),
         "post_process_time" to (op["post_process_time"] as? Number)?.toInt(),
+        "parallelism_cap" to parallelismCap,
         "children" to resourceChildren,
     ))
 }
