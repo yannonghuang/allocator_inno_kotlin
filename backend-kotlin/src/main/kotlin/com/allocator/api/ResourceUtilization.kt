@@ -95,12 +95,27 @@ private fun computeResourceUtilization(caseId: Int, runId: Int): Map<String, Any
         (pid to lid) to ((it["prod_area"] as? String)?.trim() ?: "")
     }
 
-    // First pass: walk WOs to find the horizon and accumulate (resource, location) → date → load.
-    val loadMap = mutableMapOf<Pair<String, String>, MutableMap<LocalDate, Double>>()
-    var minDate: LocalDate? = null
-    var maxDate: LocalDate? = null
-    val contributors = mutableMapOf<Pair<String, String>, MutableList<Map<String, Any?>>>()
-
+    // Aggregate work_orders by WO (wo_group_id + demand) BEFORE walking — the
+    // supply / demand / work-order views render each WO as a single block
+    // spanning all its lots, and the breakdown should match that granularity.
+    // Each WO becomes:
+    //   start = earliest lot start
+    //   end   = latest lot end
+    //   qty   = sum of lot qtys
+    // Load over time still accumulates per-lot windows (sequential lots ≈ one
+    // continuous block, so the load curve is unchanged); only the contributors
+    // list shrinks from one-row-per-lot to one-row-per-WO.
+    data class WoSummary(
+        val woGroupId: String?,
+        val demandId: String?,
+        val productId: String,
+        val locationId: String,
+        var minStart: LocalDate,
+        var maxEnd: LocalDate,
+        var totalQty: Double,
+        val lotWindows: MutableList<Pair<LocalDate, LocalDate>>,
+    )
+    val woSummaries = mutableMapOf<String, WoSummary>()
     for (wo in workOrders) {
         if ((wo["method"] as? String)?.lowercase() != "make") continue
         val productId = (wo["product_id"] as? String)?.trim() ?: continue
@@ -114,35 +129,77 @@ private fun computeResourceUtilization(caseId: Int, runId: Int): Map<String, Any
         val borId = (op["bor_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: continue
         val borRows = borsById[borId] ?: continue
         if (borRows.isEmpty()) continue
-
-        // Verify every BOR resource has a resource row at this location —
-        // identical applicability gate to the planner override.
         val allPresent = borRows.all { br ->
             val rid = (br["resource_id"] as? String)?.trim() ?: return@all false
             sizeByResLoc.containsKey(rid to locationId)
         }
         if (!allPresent) continue
 
+        // Group key: (wo_group_id, demand_id, product, location). wo_group_id
+        // alone is usually unique, but synthesize a fallback for safety.
+        val gid = (wo["wo_group_id"] as? String)?.trim().orEmpty()
+        val did = (wo["demand_id"] as? String)?.trim().orEmpty()
+        val key = "$gid|$did|$productId|$locationId"
+        val qtyAdd = (wo["quantity"] as? Number)?.toDouble() ?: 0.0
+        val existing = woSummaries[key]
+        if (existing == null) {
+            woSummaries[key] = WoSummary(
+                woGroupId = gid.takeIf { it.isNotBlank() },
+                demandId = did.takeIf { it.isNotBlank() },
+                productId = productId,
+                locationId = locationId,
+                minStart = startDt,
+                maxEnd = endDt,
+                totalQty = qtyAdd,
+                lotWindows = mutableListOf(startDt to endDt),
+            )
+        } else {
+            if (startDt < existing.minStart) existing.minStart = startDt
+            if (endDt > existing.maxEnd) existing.maxEnd = endDt
+            existing.totalQty += qtyAdd
+            existing.lotWindows.add(startDt to endDt)
+        }
+    }
+
+    val loadMap = mutableMapOf<Pair<String, String>, MutableMap<LocalDate, Double>>()
+    var minDate: LocalDate? = null
+    var maxDate: LocalDate? = null
+    val contributors = mutableMapOf<Pair<String, String>, MutableList<Map<String, Any?>>>()
+
+    for (summary in woSummaries.values) {
+        val prodArea = prodAreaByProductLoc[summary.productId to summary.locationId] ?: continue
+        val op = operationByProdArea[prodArea] ?: continue
+        val borId = (op["bor_id"] as? String)?.trim() ?: continue
+        val borRows = borsById[borId] ?: continue
         for (br in borRows) {
             val rid = (br["resource_id"] as? String)?.trim() ?: continue
             val rate = (br["resource_rate"] as? Number)?.toDouble() ?: continue
-            val key = rid to locationId
+            val key = rid to summary.locationId
             val bucket = loadMap.getOrPut(key) { mutableMapOf() }
-            var d = startDt
-            while (d <= endDt) {
-                bucket[d] = (bucket[d] ?: 0.0) + rate
-                d = d.plusDays(1)
+            // Accumulate rate over each lot's window — sequential lots inside a
+            // WO collapse to one continuous block, so this is equivalent to
+            // spanning [minStart, maxEnd] when lots are back-to-back.
+            for ((lotStart, lotEnd) in summary.lotWindows) {
+                var d = lotStart
+                while (d <= lotEnd) {
+                    bucket[d] = (bucket[d] ?: 0.0) + rate
+                    d = d.plusDays(1)
+                }
             }
-            if (minDate == null || startDt < minDate) minDate = startDt
-            if (maxDate == null || endDt > maxDate) maxDate = endDt
+            if (minDate == null || summary.minStart < minDate) minDate = summary.minStart
+            if (maxDate == null || summary.maxEnd > maxDate) maxDate = summary.maxEnd
             contributors.getOrPut(key) { mutableListOf() }.add(mapOf(
-                "wo_group_id" to wo["wo_group_id"],
-                "demand_id" to wo["demand_id"],
-                "product_id" to productId,
-                "location_id" to locationId,
-                "quantity" to wo["quantity"],
-                "start_time" to wo["start_time"],
-                "end_time" to wo["end_time"],
+                "wo_group_id" to summary.woGroupId,
+                "demand_id" to summary.demandId,
+                "product_id" to summary.productId,
+                "location_id" to summary.locationId,
+                "quantity" to summary.totalQty,
+                // start_time = WO node's start (= first lot's start) so the UI
+                // can pass it to /work-order-pegging?start_time=… and match the
+                // pegging tree's slot anchor exactly.
+                "start_time" to summary.minStart.toString(),
+                "end_time" to summary.maxEnd.toString(),
+                "lot_count" to summary.lotWindows.size,
                 "rate" to rate,
             ))
         }

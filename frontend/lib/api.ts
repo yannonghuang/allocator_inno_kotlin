@@ -476,6 +476,9 @@ export type ResourceUtilizationRow = {
     quantity?: number;
     start_time?: string;
     end_time?: string;
+    /** Number of lots collapsed into this WO row (≥1). The view groups
+     *  rows by wo_group_id so a multi-lot WO is a single row. */
+    lot_count?: number;
     rate?: number;
   }>;
 };

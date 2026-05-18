@@ -919,7 +919,12 @@ function BreakdownList({
                       )}
                     </td>
                     <td style={{ padding: '2px 6px 2px 0' }}>{wo.start_time ?? '–'}</td>
-                    <td style={{ padding: '2px 6px 2px 0' }}>{wo.end_time ?? '–'}</td>
+                    <td style={{ padding: '2px 6px 2px 0' }}>
+                      {wo.end_time ?? '–'}
+                      {wo.lot_count && wo.lot_count > 1 && (
+                        <span style={{ color: '#71717a', marginLeft: 4 }}>· {wo.lot_count} lots</span>
+                      )}
+                    </td>
                     <td style={{ padding: '2px 0 2px 6px', textAlign: 'right' }}>{wo.quantity ?? '–'}</td>
                     <td style={{ padding: '2px 0 2px 6px', textAlign: 'right' }}>{wo.rate?.toFixed(2) ?? '–'}</td>
                   </tr>
