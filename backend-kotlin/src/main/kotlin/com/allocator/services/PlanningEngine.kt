@@ -3459,6 +3459,38 @@ fun runPlanning(
     }
 
     val timingFix = fixTimingFromPegging(consolidatedWOs + workOrders, allPegging, data)
+
+    // Phase-1 cross-WO arbitration. Opt-in via planning config flag — the
+    // feature shifts WO start times when shared resources are contended, so
+    // existing baselines and KB snapshots stay unchanged until the user
+    // explicitly enables it. When pushedCount > 0 we re-run the cascade
+    // step (resequenceFromPegging) so the pushed lots propagate up the DAG
+    // and the pegging tree's WO/demand timings re-sync.
+    val enableGlobalScheduling = config?.get("enable_global_scheduling") == true
+    val finalTimings = if (enableGlobalScheduling) {
+        val mutableLots: List<MutableMap<String, Any?>> = timingFix.workOrders.map {
+            (it as? MutableMap<String, Any?>) ?: it.toMutableMap()
+        }
+        val priorityMap = (data["demand"] ?: emptyList()).mapNotNull { d ->
+            val id = (d["demand_id"] as? String)?.trim() ?: return@mapNotNull null
+            val pri = (d["priority"] as? Number)?.toInt() ?: 0
+            id to pri
+        }.toMap()
+        val dueMap = (data["demand"] ?: emptyList()).mapNotNull { d ->
+            val id = (d["demand_id"] as? String)?.trim() ?: return@mapNotNull null
+            val due = (d["request_due_time"] as? String)?.let { runCatching { java.time.LocalDate.parse(it.take(10)) }.getOrNull() }
+            id to due
+        }.toMap()
+        val pushedCount = ResourceScheduler.arbitrate(mutableLots, data, priorityMap, dueMap)
+        if (pushedCount > 0) {
+            resequenceFromPegging(mutableLots, timingFix.peggingTrees)
+        } else {
+            timingFix
+        }
+    } else {
+        timingFix
+    }
+
     return mapOf(
         "committed_demands"      to committedDemands,
         "work_orders"            to timingFix.workOrders,
