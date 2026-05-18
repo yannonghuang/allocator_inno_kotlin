@@ -3620,18 +3620,26 @@ private fun fixTimingFromPegging(
         val prodArea = getProdArea(pid, lid, data)
         val originalLot = planningGid?.let { originalLotByPlanningGid[it] }
 
-        // Per-lot duration: derived from the WO's overall span and lotCount.
-        // Matches buildWorkOrders's lot scheduling (each lot occupies
-        // leadDays, sequential).
+        // Per-wave duration: lots run in `cap`-sized waves; each wave occupies
+        // one per-lot lead. Total span = wave_count × per-lot. Falls back to
+        // sequential (cap=1, wave_count=lot_count) when parallelism_cap isn't
+        // on the node (legacy WOs or non-override methods).
+        val cap = (woNode["parallelism_cap"] as? Number)?.toInt()?.coerceAtLeast(1) ?: 1
+        val waveCount = (woNode["wave_count"] as? Number)?.toInt()
+            ?: kotlin.math.ceil(lotCount.toDouble() / cap.toDouble()).toInt().coerceAtLeast(1)
         val totalSpanDays = endDt.toEpochDay() - startDt.toEpochDay()
-        val perLotDays = if (lotCount > 0) totalSpanDays / lotCount else 0L
+        // Per-wave duration: divide span by wave count (NOT lot count).
+        // Sequential WOs collapse to the old behavior since wave_count ==
+        // lot_count when cap == 1.
+        val perWaveDays = if (waveCount > 0) totalSpanDays / waveCount else 0L
 
-        var lotStart: LocalDate = startDt
         var remaining = totalQty
-        repeat(lotCount) {
-            if (remaining <= 1e-9) return@repeat
+        for (i in 0 until lotCount) {
+            if (remaining <= 1e-9) break
             val lotQty = min(lotSize, remaining)
-            val lotEnd = lotStart.plusDays(perLotDays)
+            val waveIdx = i / cap
+            val lotStart = startDt.plusDays(waveIdx * perWaveDays)
+            val lotEnd = lotStart.plusDays(perWaveDays)
             val lot = mutableMapOf<String, Any?>(
                 "product_id" to pid,
                 "location_id" to lid,
@@ -3644,6 +3652,7 @@ private fun fixTimingFromPegging(
                 "prod_area" to prodArea,
                 "override_active" to overrideActive,
                 "wo_group_id" to finalGid,
+                "wave_index" to waveIdx,
             )
             if (methodSlotIndex != null) lot["method_slot_index"] = methodSlotIndex
             // Copy consolidation metadata from the original lot if present.
@@ -3654,7 +3663,6 @@ private fun fixTimingFromPegging(
             }
             regenLots.add(lot)
             remaining -= lotQty
-            lotStart = lotEnd
         }
     }
 
