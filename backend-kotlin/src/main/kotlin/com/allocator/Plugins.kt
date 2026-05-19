@@ -7,6 +7,7 @@ import com.allocator.api.caseRoutes
 import com.allocator.api.explanationRoutes
 import com.allocator.api.overrideRoutes
 import com.allocator.api.peggingRoutes
+import com.allocator.api.resourceUtilizationRoutes
 import com.allocator.api.materialImpactRoutes
 import com.allocator.api.materialEventRoutes
 import com.allocator.api.workOrderImpactRoutes
@@ -102,6 +103,7 @@ fun Application.configureRouting() {
         overrideRoutes()
         allocateRoutes()
         peggingRoutes()
+        resourceUtilizationRoutes()
         viewRoutes()
         explanationRoutes()
         bomGraphRoutes()

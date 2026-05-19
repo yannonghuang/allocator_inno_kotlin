@@ -105,6 +105,7 @@ private fun createTables() {
     SchemaUtils.createMissingTablesAndColumns(
         Cases, Boms, Customers, Locations, Products, Vendors,
         Demands, MethodBuys, MethodMakes, ProductLocations,
+        Operations, Bors, Resources,
         Supplies, MethodMoves, AllocationRuns, AllocationActions,
         ManualOverrides, PlanRuns, MaterialEvents, WoScheduleEvents, MaterialImpactAssessments,
         PlanSupplyAllocations, NegotiationWaits, PlanRunEvents, AgentMemory,

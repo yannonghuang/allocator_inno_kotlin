@@ -213,13 +213,29 @@ export type WorkOrder = {
   method_slot_index?: number | null;
 };
 
-/** Planning pegging tree node: demand (root) -> work_order -> ... -> supply | purchase (leaves). */
+/** Planning pegging tree node: demand (root) -> work_order -> ... -> supply | purchase (leaves).
+ *  Make WOs that have an applicable operation also emit `operation` and `resource` children
+ *  carrying the bill-of-resources detail; those don't participate in supply/demand flow. */
 export type PlanningPeggingNode = {
-  type: 'demand' | 'work_order' | 'supply' | 'purchase';
+  type: 'demand' | 'work_order' | 'supply' | 'purchase' | 'operation' | 'resource';
   demand_id?: string | null;
   product_id?: string;
   location_id?: string;
   quantity?: number;
+  /** operation nodes: identifier from operation.OPERATION_ID. */
+  operation_id?: string | null;
+  /** operation nodes: BOR id; resource nodes: id of the consumed resource. */
+  resource_id?: string | null;
+  /** operation nodes: production rate fields. */
+  uph?: number | null;
+  yield_factor?: number | null;
+  process_time?: number | null;
+  pre_process_time?: number | null;
+  post_process_time?: number | null;
+  prod_area?: string | null;
+  /** resource nodes: per-unit consumption rate and the available pool size at this location. */
+  resource_rate?: number | null;
+  size?: number | null;
   request_time?: string | null;
   commit_time?: string | null;
   commit_reason?: string | null;
@@ -444,10 +460,47 @@ export async function getMovesWithTransit(caseId: number): Promise<{ moves: [str
   return r.json();
 }
 
-/** Fetch work-order pegging on demand: how this WO is fulfilled by its supplies (all levels). Requires a prior plan run. */
+/** Per-resource utilization rows for a plan run. Each row is a (resource_id, location_id) with
+ *  daily load values aligned to `buckets` (ISO date strings) and the resource's static `size`.
+ *  `contributors` lists the work_orders that drove the load (debug/cross-highlight hook). */
+export type ResourceUtilizationRow = {
+  resource_id: string;
+  location_id: string;
+  size: number;
+  load: number[];
+  contributors?: Array<{
+    wo_group_id?: string | null;
+    demand_id?: string | null;
+    product_id?: string;
+    location_id?: string;
+    quantity?: number;
+    start_time?: string;
+    end_time?: string;
+    /** Number of lots collapsed into this WO row (≥1). The view groups
+     *  rows by wo_group_id so a multi-lot WO is a single row. */
+    lot_count?: number;
+    rate?: number;
+  }>;
+};
+
+export type ResourceUtilization = {
+  horizon: { start: string; end: string };
+  buckets: string[];
+  rows: ResourceUtilizationRow[];
+};
+
+export async function getResourceUtilization(caseId: number, runId: number): Promise<ResourceUtilization> {
+  const r = await fetch(`${API}/cases/${caseId}/runs/${runId}/resource-utilization`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+/** Fetch work-order pegging on demand: how this WO is fulfilled by its supplies (all levels). Requires a prior plan run.
+ *  `start_time` disambiguates which slot/lot to return when a (demand, product, location, method) tuple
+ *  has multiple matches (waterfall slots or multi-lot WOs). Pass the WO row's start_time. */
 export async function getWorkOrderPegging(
   caseId: number,
-  params: { demand_id: string; product_id: string; location_id: string; method: string; run_id?: number }
+  params: { demand_id: string; product_id: string; location_id: string; method: string; start_time?: string | null; run_id?: number }
 ): Promise<{ tree: PlanningPeggingNode }> {
   const sp = new URLSearchParams({
     demand_id: params.demand_id,
@@ -455,6 +508,7 @@ export async function getWorkOrderPegging(
     location_id: params.location_id,
     method: params.method,
   });
+  if (params.start_time) sp.set('start_time', params.start_time);
   if (params.run_id != null) sp.set('run_id', String(params.run_id));
   const r = await fetch(`${API}/cases/${caseId}/plan/work-order-pegging?${sp.toString()}`);
   if (!r.ok) throw new Error(await r.text());

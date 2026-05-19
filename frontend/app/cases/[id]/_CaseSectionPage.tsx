@@ -515,6 +515,8 @@ function splitPolicyExplanation(
 
 import { PeggingTree, pathKeyFromPath, type PeggingGraph } from '@/app/components/PeggingTree';
 import BomGraphTab from '@/app/components/BomGraphTab';
+import { ResourceUtilizationView } from '@/app/components/ResourceUtilizationView';
+import { PlanningPeggingTreeView } from '@/app/components/PlanningPeggingTreeView';
 import { qtyFmt } from '@/app/lib/format';
 
 // ── Assessment criteria helpers ────────────────────────────────────────────────
@@ -948,7 +950,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planWorkOrderPeggingError, setPlanWorkOrderPeggingError] = useState<string | null>(null);
   const planPeggingResizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [planPeggingResizing, setPlanPeggingResizing] = useState(false);
-  const [planResultTab, setPlanResultTab] = useState<'demands' | 'work_orders' | 'supplies'>('demands');
+  const [planResultTab, setPlanResultTab] = useState<'demands' | 'work_orders' | 'supplies' | 'resourceUtilization'>('demands');
   // ID of the plan run currently loaded in planResult; null = freshly-run (not from history)
   const [currentPlanRunId, setCurrentPlanRunId] = useState<number | null>(null);
   // DB run ID for the current fresh (unsaved) plan result; null once saved or when loading from history
@@ -1776,7 +1778,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           const row = planPeggingContext.row as WorkOrder;
           const isConsolidated = row.demand_id == null;
           const demandPart = isConsolidated ? '' : String(woPeggingActiveDemandId ?? row.demand_id ?? '').trim();
-          return `${demandPart}|${String(row.product_id ?? '').trim()}|${String(row.location_id ?? '').trim()}|${String(row.method ?? '').trim()}`;
+          // start_time is part of the cache key — different lots (same demand/
+          // product/location/method, different start_time) get separate trees.
+          return `${demandPart}|${String(row.product_id ?? '').trim()}|${String(row.location_id ?? '').trim()}|${String(row.method ?? '').trim()}|${String(row.start_time ?? '').trim()}`;
         })()
       : null;
   useEffect(() => {
@@ -1798,7 +1802,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     setPlanWorkOrderPeggingError(null);
     setPlanWorkOrderPeggingLoading(woPeggingKey);
     if (typeof console !== 'undefined' && console.log) console.log('[WO pegging] Fetching', { caseId: id, demand_id, product_id, location_id, method });
-    getWorkOrderPegging(Number(id), { demand_id, product_id, location_id, method, ...(currentPlanRunId != null ? { run_id: currentPlanRunId } : {}) })
+    getWorkOrderPegging(Number(id), {
+      demand_id,
+      product_id,
+      location_id,
+      method,
+      start_time: row.start_time ?? undefined,
+      ...(currentPlanRunId != null ? { run_id: currentPlanRunId } : {}),
+    })
       .then((res) => {
         if (typeof console !== 'undefined' && console.log) console.log('[WO pegging] Loaded tree for', woPeggingKey);
         setPlanWorkOrderPeggingCache((prev) => ({ ...prev, [woPeggingKey]: res.tree }));
@@ -4802,6 +4813,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               >
                 {tP('tabs.supplies', { count: qtyFmt(planSupplyViewRows.length) })}
               </button>
+              <button
+                type="button"
+                className={planResultTab === 'resourceUtilization' ? '' : 'secondary'}
+                onClick={() => setPlanResultTab('resourceUtilization')}
+              >
+                {tP('tabs.resourceUtilization')}
+              </button>
             </div>
             <div style={{ border: '1px solid #3d3d40', borderRadius: 6 }}>
               {planResultTab === 'demands' && (
@@ -6148,6 +6166,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       </>
                     );
                   })()}
+                </div>
+              )}
+              {planResultTab === 'resourceUtilization' && (
+                <div style={{ padding: '0.75rem 1rem' }}>
+                  <ResourceUtilizationView
+                    caseId={id}
+                    planRunId={currentPlanRunId ?? freshPlanRunId}
+                  />
                 </div>
               )}
               {planResultTab === 'supplies' && (
@@ -9694,335 +9720,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 });
               };
 
-              function renderNode(node: PlanningPeggingNode, path: string, depth: number, xlink = false) {
-                const rawChildren = node.children ?? [];
-                // A child "contributed" if it has any committed_qty (demand) or quantity (other).
-                const childContrib = (c: PlanningPeggingNode): number => {
-                  const cc = (c as { committed_qty?: number | null }).committed_qty;
-                  return Number((cc != null ? cc : c.quantity) ?? 0);
-                };
-                let childrenList = rawChildren;
-                // Blocked work_order with no `failed` marker — collapse the subtree.
-                // The slot's method_choice_explanation already names the deepest
-                // bottleneck, so an empty/legacy 0-qty subtree below would add
-                // noise without information. WOs marked `failed: true` come from
-                // the AND-bottleneck blocked branch and carry the partial pegging
-                // tree (under-allocated children, deeper child_failed cascades) —
-                // those stay expandable so operators can inspect *why* the method
-                // was blocked.
-                const isLegacyBlockedWo = node.type === 'work_order'
-                  && !node.failed
-                  && Number(node.quantity ?? 0) <= 1e-9
-                  && rawChildren.length > 0;
-                if (isLegacyBlockedWo) {
-                  childrenList = [];
-                }
-                // Fix: under OR-relation, hide siblings that contributed nothing when at
-                // least one DID contribute. OR semantics is "any one path supplies the
-                // parent" — failed alternatives are dead weight.
-                if (!isLegacyBlockedWo && node.children_relation === 'or' && childrenList.length > 1) {
-                  const contribCount = childrenList.reduce((n, c) => n + (childContrib(c) > 1e-9 ? 1 : 0), 0);
-                  if (contribCount > 0 && contribCount < childrenList.length) {
-                    childrenList = childrenList.filter((c) => childContrib(c) > 1e-9);
-                  }
-                }
-
-                // Consolidated supply nodes: find the original supply trees from non-last
-                // planning_pegging entries for the embedded demand_id.
-                // supply_id format: "consolidated_${demandId}_${productId}"
-                let consolidatedSourceTrees: PlanningPeggingNode[] = [];
-                if (!xlink && node.type === 'supply' && node.supply_id?.startsWith('consolidated_')) {
-                  const withoutPrefix = node.supply_id.slice('consolidated_'.length);
-                  const pid = node.product_id ?? '';
-                  // Strip the trailing _${productId} to recover the embedded demandId
-                  const embeddedDemandId = pid && withoutPrefix.endsWith(`_${pid}`)
-                    ? withoutPrefix.slice(0, -(pid.length + 1))
-                    : withoutPrefix;
-                  const allEntries = (planResult?.planning_pegging ?? []).filter(
-                    (e) => String(e.demand_id ?? '').trim() === embeddedDemandId
-                  );
-                  consolidatedSourceTrees = allEntries
-                    .slice(0, -1)
-                    .map((e) => e.tree)
-                    .filter((t): t is PlanningPeggingNode =>
-                      t != null && t.product_id === pid
-                    );
-                }
-
-                const hasChildren = childrenList.length > 0 || consolidatedSourceTrees.length > 0;
-                const isRoot = path === '0';
-                const expandable = hasChildren || isRoot;
-                const isExpanded = planPeggingExpanded.has(path);
-                const toggle = () => setPlanPeggingExpanded((prev) => {
-                  const next = new Set(prev);
-                  if (next.has(path)) next.delete(path);
-                  else next.add(path);
-                  return next;
-                });
-                const isDemand = node.type === 'demand';
-                const isWorkOrder = node.type === 'work_order';
-                const icon = !isWorkOrder ? '▢' : '⚙';
-                const typeLabel = isDemand ? 'Need'
-                  : node.type === 'supply' ? 'Supply'
-                  : node.type === 'purchase' ? 'Purchase'
-                  : 'Work order';
-                const typeColor = isDemand ? '#60a5fa'
-                  : isWorkOrder ? '#34d399'
-                  : '#a78bfa';
-                // When viewing work-order pegging, root node quantity must match the table row the user clicked
-                const woRowQty = planPeggingContext?.type === 'work_order' && isRoot && path === '0'
-                  ? Number((planPeggingContext.row as WorkOrder).quantity ?? 0)
-                  : null;
-                const label = node.type === 'demand'
-                  ? (() => {
-                      const reqQty = Number(node.quantity ?? 0);
-                      const committedRaw = (node as { committed_qty?: number | null }).committed_qty;
-                      const commQty = committedRaw == null ? reqQty : Number(committedRaw);
-                      const qtyLabel = commQty < reqQty - 1e-6
-                        ? `${qtyFmt(commQty)} / ${qtyFmt(reqQty)}`
-                        : qtyFmt(reqQty);
-                      return `${node.product_id ?? node.demand_id ?? '–'} · ${qtyLabel} @ ${node.location_id ?? '–'}${node.demand_id && node.product_id !== node.demand_id && node.demand_id !== contextDemandId ? ` (demand ${node.demand_id})` : ''}`;
-                    })()
-                  : node.type === 'work_order'
-                    ? (() => {
-                        const qty = woRowQty ?? Number(node.quantity ?? 0);
-                        const lotCount = (node as { lot_count?: number | null }).lot_count ?? null;
-                        const maxLotSize = (node as { max_lot_size?: number | null }).max_lot_size ?? null;
-                        const lotPart =
-                          lotCount && lotCount > 1 && maxLotSize
-                            ? ` · ${lotCount} lots of up to ${qtyFmt(Number(maxLotSize))}`
-                            : '';
-                        return `${node.method} ${node.product_id} @ ${node.location_id ?? '–'} · ${qtyFmt(qty)}${node.end_time ? ` · end ${node.end_time}` : ''}${lotPart}`;
-                      })()
-                    : node.type === 'supply'
-                      ? `${node.product_id} @ ${node.location_id ?? '–'} · ${qtyFmt(Number(node.quantity ?? 0))}${node.supply_id ? ` · ${node.supply_id}` : ''}`
-                      : `${node.product_id} @ ${node.location_id ?? '–'} · ${qtyFmt(Number(node.quantity ?? 0))}`;
-                const indentPx = 12;
-                let childGroupLabel: string | null = null;
-                let childGroupKind: 'and' | 'or' | null = null;
-                const relation = node.children_relation as 'and' | 'or' | undefined;
-                if (relation === 'or' && hasChildren && childrenList.length > 1) {
-                  childGroupKind = 'or';
-                  childGroupLabel = 'ANY of the inventories / work orders below can supply this node (OR).';
-                } else if (relation === 'and' && hasChildren && childrenList.length > 1) {
-                  childGroupKind = 'and';
-                  childGroupLabel = 'ALL of the inventories / work orders below are required together (AND).';
-                } else if (!relation && hasChildren && childrenList.length > 1) {
-                  // No explicit relation set. Default by parent type:
-                  //   - work_order children are BOM components → AND (all required).
-                  //   - demand children are independent supply paths (waterfall slots,
-                  //     inventory buckets, alternative methods) → OR. Exception:
-                  //     same-product FIFO buckets — neither AND nor OR, no label.
-                  //   - supply/purchase nodes shouldn't normally have multiple children.
-                  if (node.type === 'work_order') {
-                    childGroupKind = 'and';
-                    childGroupLabel = 'ALL of the inventories / work orders below are required together (AND).';
-                  } else if (node.type === 'demand') {
-                    const sameProductBucketsOnly = childrenList.every((c: typeof node) =>
-                      (c.type === 'supply' || c.type === 'purchase') &&
-                      c.product_id === node.product_id,
-                    );
-                    if (!sameProductBucketsOnly) {
-                      childGroupKind = 'or';
-                      childGroupLabel = 'ANY of the inventories / work orders below can supply this node (OR).';
-                    }
-                  }
-                }
-                const isActiveMatch = planPeggingMatchPath === path;
-                const isAnyMatch = planPeggingMatchPaths.includes(path);
-                const onCriticalPath = criticalPathSet.has(path);
-                // Transit nodes on the critical path lack 瓶颈/根因 badges
-                // (they're method WOs or single-OR pass-throughs between BOM
-                // components). Mark them explicitly so each row on the path
-                // is visibly tagged. Skip the root: it's the demand itself.
-                const isTransitOnPath = onCriticalPath
-                  && path !== '0'
-                  && !node.is_bottleneck
-                  && !node.is_root_bottleneck;
-                return (
-                  <div
-                    key={path}
-                    style={{ marginBottom: 4 }}
-                    ref={isActiveMatch ? ((el) => { if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' }); }) : undefined}
-                  >
-                    <button
-                      type="button"
-                      onClick={toggle}
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 6,
-                        width: '100%',
-                        textAlign: 'left',
-                        padding: '4px 6px',
-                        background: isActiveMatch
-                          ? 'rgba(250, 204, 21, 0.28)'
-                          : isAnyMatch
-                            ? 'rgba(250, 204, 21, 0.12)'
-                            : (onCriticalPath && node.is_root_bottleneck)
-                              // Root cause (kind=demand) — keep red to flag the
-                              // demand-side allocation origin distinctly.
-                              ? 'rgba(248, 113, 113, 0.12)'
-                              : (onCriticalPath && (node.is_bottleneck || isTransitOnPath))
-                                // Bottleneck (kind=supply) and transit nodes
-                                // share the gold treatment — they're all
-                                // critical-path elements with the same
-                                // remediation framing (supply-side levers).
-                                ? 'rgba(250, 204, 21, 0.08)'
-                                : depth % 2 === 0 ? 'rgba(255,255,255,0.04)' : 'transparent',
-                        border: isActiveMatch
-                          ? '1px solid #facc15'
-                          : (onCriticalPath && node.is_root_bottleneck)
-                            ? '1px solid rgba(248, 113, 113, 0.55)'
-                            : (onCriticalPath && (node.is_bottleneck || isTransitOnPath))
-                              ? '1px solid rgba(250, 204, 21, 0.55)'
-                              : 'none',
-                        borderRadius: 4,
-                        color: '#e4e4e7',
-                        cursor: expandable ? 'pointer' : 'default',
-                        fontSize: '0.85rem',
-                      }}
-                    >
-                      <span style={{ width: 14, flexShrink: 0 }}>{expandable ? (isExpanded ? '▼' : '▶') : '·'}</span>
-                      <span style={{ width: 18, flexShrink: 0, fontSize: '0.9em', color: typeColor }} title={typeLabel}>{icon}</span>
-                      <span style={{ flex: 1, color: typeColor }}>{label}</span>
-                      {/* Shortage origin = any node with `is_bottleneck` OR
-                          `is_root_bottleneck`. Both flags identify ORIGINS of
-                          shortage; once it crosses an origin, propagation up the
-                          tree is identical. The kind only matters for the FIX:
-                          • 瓶颈 (orange-red badge) = kind=supply. The BOM/inventory
-                            chain couldn't deliver — first-pass effective/needed ratio
-                            is the smallest among AND siblings, capping the parent.
-                            Fix: add method, raise supply, allow purchase.
-                          • 根因 (red badge) = kind=demand. Consolidation's fair-share
-                            split left this demand with the tightest share-vs-need ratio
-                            at this child (iter-0). Independent of supply.
-                            Fix: change priority / allocation_mode / period_days.
-                          The shared red outline on the row says "origin"; the
-                          badge color says which kind. */}
-                      {onCriticalPath && node.is_bottleneck && (
-                        <span
-                          title="瓶颈 (supply-side limiter on critical path): 此子节点的供应链(BOM/库存/子配方)无法满足需求 — 其首轮可达量与需求量之比在AND兄弟中最小,通过MIN(子份额)封顶父节点的可达量。属供应侧约束。修复方向: 增加库存、启用采购、补充方法行(method_make/move/buy)、或解除更深处配方的阻塞。"
-                          style={{
-                            fontSize: '0.7em',
-                            color: '#facc15',
-                            background: 'rgba(250, 204, 21, 0.16)',
-                            padding: '1px 6px',
-                            borderRadius: 3,
-                            flexShrink: 0,
-                          }}
-                        >瓶颈</span>
-                      )}
-                      {onCriticalPath && node.is_root_bottleneck && (
-                        <span
-                          title="根因 (demand-side allocation origin on critical path): 在iter-0合并阶段,该需求与其他需求竞争此叶子时分到的份额相对其需求量最紧 — 即同一AND层级中, 该需求的(份额/需求)比率最小。与供应是否充足无关 — 即使供应充足,本需求在此叶子上的配额最先吃紧。修复方向: 调整本需求优先级、改变 allocation_mode (fair/proportional/priority_first)、改变合并 period_days、或减少其他需求在此叶子的竞争压力。"
-                          style={{
-                            fontSize: '0.7em',
-                            color: '#fff',
-                            background: 'rgba(220, 38, 38, 0.85)',
-                            padding: '1px 6px',
-                            borderRadius: 3,
-                            flexShrink: 0,
-                            fontWeight: 700,
-                          }}
-                        >根因</span>
-                      )}
-                      {isTransitOnPath && (
-                        <span
-                          title="关键路径上的中转节点 (Critical-path transit): 此节点本身不是短缺起源 (无 瓶颈/根因 标志)，但它在从需求到起源的支配链上。"
-                          style={{
-                            fontSize: '0.7em',
-                            color: '#facc15',
-                            background: 'rgba(250, 204, 21, 0.16)',
-                            padding: '1px 6px',
-                            borderRadius: 3,
-                            flexShrink: 0,
-                          }}
-                        >★ 关键路径</span>
-                      )}
-                    </button>
-                    {node.type === 'work_order' && node.method_choice_explanation && (() => {
-                      const explanationPath = `explain-${path}`;
-                      const isExplanationOpen = planExplanationExpanded.has(explanationPath);
-                      const toggleExplanation = () => setPlanExplanationExpanded((prev) => {
-                        const next = new Set(prev);
-                        if (next.has(explanationPath)) next.delete(explanationPath);
-                        else next.add(explanationPath);
-                        return next;
-                      });
-                      return (
-                        <div style={{ marginTop: 4, marginLeft: 4, fontSize: '0.75rem', color: '#a1a1aa' }}>
-                          <button
-                            type="button"
-                            onClick={toggleExplanation}
-                            style={{
-                              display: 'flex',
-                              alignItems: 'center',
-                              gap: 4,
-                              padding: '2px 0',
-                              background: 'none',
-                              border: 'none',
-                              color: '#71717a',
-                              cursor: 'pointer',
-                              fontSize: '0.75rem',
-                            }}
-                          >
-                            {isExplanationOpen ? '▼' : '▶'}
-                            Why (method)
-                          </button>
-                          {isExplanationOpen && (
-                            <div style={{ paddingLeft: 8, borderLeft: '2px solid #3d3d40', marginTop: 2 }}>
-                              <p style={{ margin: 0, lineHeight: 1.35 }}><strong>Method:</strong> {node.method_choice_explanation}</p>
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })()}
-                    {expandable && isExpanded && (
-                      <div style={{ marginTop: 2, paddingLeft: indentPx }}>
-                        {childGroupLabel && (
-                          <div
-                            style={{
-                              marginBottom: 2,
-                              display: 'inline-flex',
-                              alignItems: 'center',
-                              gap: 4,
-                              fontSize: '0.7rem',
-                              color: childGroupKind === 'and' ? '#f97316' : '#38bdf8',
-                              backgroundColor: childGroupKind === 'and' ? 'rgba(249,115,22,0.12)' : 'rgba(56,189,248,0.12)',
-                              borderRadius: 999,
-                              padding: '1px 6px',
-                            }}
-                          >
-                            <span style={{ fontWeight: 700 }}>{childGroupKind === 'and' ? 'AND' : 'OR'}</span>
-                            <span>{childGroupLabel}</span>
-                          </div>
-                        )}
-                        {childrenList.length > 0
-                          ? childrenList.map((child, i) => renderNode(child, `${path}-${i}`, depth + 1, xlink))
-                          : consolidatedSourceTrees.length > 0
-                            ? null /* rendered below */
-                            : node.type === 'demand'
-                              ? (node.failure_explanation
-                                  ? <p style={{ margin: 0, fontSize: '0.8rem', color: '#f87171', lineHeight: 1.4 }}>{node.failure_explanation}</p>
-                                  : <p style={{ margin: 0, fontSize: '0.8rem', color: '#f87171' }}>No work orders — planning could not fulfill this demand (no method or child failed).</p>)
-                              : node.type === 'work_order'
-                                ? <p style={{ margin: 0, fontSize: '0.8rem', color: '#71717a' }}>No component breakdown (leaf work order or depth-limited).</p>
-                                : null
-                        }
-                        {consolidatedSourceTrees.length > 0 && isExpanded && (
-                          <>
-                            <div style={{ marginBottom: 3, marginTop: 2, display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: '0.7rem', color: '#fb923c', backgroundColor: 'rgba(251,146,60,0.12)', borderRadius: 999, padding: '1px 6px' }}>
-                              ↑ original supplies consumed by this consolidation
-                            </div>
-                            {consolidatedSourceTrees.map((t, i) => renderNode(t, `${path}-cs${i}`, depth + 1, true))}
-                          </>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                );
-              }
               return (
                 <>
                   <div style={{
@@ -10075,7 +9772,41 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         : `${planPeggingMatchIndex + 1} / ${planPeggingMatchPaths.length}`}
                     </span>
                   </div>
-                  <div style={{ marginTop: '0.5rem' }}>{tree ? renderNode(tree, '0', 0) : null}</div>
+                  <div style={{ marginTop: '0.5rem' }}>
+                    {tree ? (
+                      <PlanningPeggingTreeView
+                        tree={tree}
+                        expanded={planPeggingExpanded}
+                        onToggle={(p) => setPlanPeggingExpanded((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(p)) next.delete(p); else next.add(p);
+                          return next;
+                        })}
+                        matchPath={planPeggingMatchPath}
+                        matchPaths={planPeggingMatchPaths}
+                        criticalPathSet={criticalPathSet}
+                        explanationExpanded={planExplanationExpanded}
+                        onToggleExplanation={(p) => setPlanExplanationExpanded((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(p)) next.delete(p); else next.add(p);
+                          return next;
+                        })}
+                        workOrderRootQty={planPeggingContext?.type === 'work_order'
+                          ? Number((planPeggingContext.row as WorkOrder).quantity ?? 0)
+                          : null}
+                        contextDemandId={contextDemandId}
+                        consolidatedSourceResolver={(embeddedDemandId, pid) => {
+                          const allEntries = (planResult?.planning_pegging ?? []).filter(
+                            (e) => String(e.demand_id ?? '').trim() === embeddedDemandId
+                          );
+                          return allEntries
+                            .slice(0, -1)
+                            .map((e) => e.tree)
+                            .filter((t): t is PlanningPeggingNode => t != null && t.product_id === pid);
+                        }}
+                      />
+                    ) : null}
+                  </div>
                 </>
               );
             })()}

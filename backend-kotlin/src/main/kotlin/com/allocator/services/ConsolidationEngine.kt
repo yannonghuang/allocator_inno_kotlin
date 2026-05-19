@@ -416,7 +416,7 @@ private fun collectDeepNeeds(
     } else {
         methods.minByOrNull { (it["preference"] as? Number)?.toInt() ?: 0 }
     } ?: return
-    val leadDays = leadDaysForMethod(method)
+    val leadDays = leadDaysForMethod(method, productId, locationId, qty, data)
     val componentDueDate = if (dueDate != null) dueDate.minusDays(leadDays.toLong()) else null
     val nextVisited = visited + key
 

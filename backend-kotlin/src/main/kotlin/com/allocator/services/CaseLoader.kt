@@ -16,7 +16,8 @@ object CaseLoader {
     /**
      * Returns a map whose keys match case_loader.py's load_case_data() output:
      *   "bom", "customer", "demand", "location", "method_buy", "method_make",
-     *   "product", "productlocation", "supply", "method_move", "vendor", "overrides"
+     *   "product", "productlocation", "operation", "bor", "resource",
+     *   "supply", "method_move", "vendor", "overrides"
      *
      * Each value is a List<Map<String, Any?>> matching the Python dict structure.
      */
@@ -96,6 +97,35 @@ object CaseLoader {
             )
         }
 
+        val operations = Operations.selectAll().where { Operations.caseId eq caseId }.map {
+            mapOf(
+                "operation_id" to it[Operations.operationId],
+                "prod_area" to it[Operations.prodArea],
+                "uph" to it[Operations.uph],
+                "yield_factor" to it[Operations.yieldFactor],
+                "bor_id" to it[Operations.borId],
+                "process_time" to it[Operations.processTime],
+                "pre_process_time" to it[Operations.preProcessTime],
+                "post_process_time" to it[Operations.postProcessTime],
+            )
+        }
+
+        val bors = Bors.selectAll().where { Bors.caseId eq caseId }.map {
+            mapOf(
+                "bor_id" to it[Bors.borId],
+                "resource_id" to it[Bors.resourceId],
+                "resource_rate" to it[Bors.resourceRate],
+            )
+        }
+
+        val resources = Resources.selectAll().where { Resources.caseId eq caseId }.map {
+            mapOf(
+                "resource_id" to it[Resources.resourceId],
+                "location_id" to it[Resources.locationId],
+                "size" to it[Resources.size],
+            )
+        }
+
         val supplies = Supplies.selectAll().where { Supplies.caseId eq caseId }.map {
             mapOf(
                 "supply_id" to it[Supplies.supplyId],
@@ -140,6 +170,9 @@ object CaseLoader {
             "method_make" to methodMake,
             "product" to products,
             "productlocation" to productLocations,
+            "operation" to operations,
+            "bor" to bors,
+            "resource" to resources,
             "supply" to supplies,
             "method_move" to methodMove,
             "vendor" to vendors,

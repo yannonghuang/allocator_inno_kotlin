@@ -278,6 +278,7 @@ fun checkRunSoundness(
             supplyById = supplyById,
             config = config,
             overrideIndex = overrideIndex,
+            data = data,
         )
         ctx.walkRoot(tree)
 
@@ -411,6 +412,10 @@ private class WalkContext(
     val config: SoundnessConfig,
     /** Override index keyed by "$entityType|$entityKey" — see buildOverrideIndex. */
     val overrideIndex: Map<String, Map<String, Any?>>,
+    /** Full dataset — needed by R5_lead_time to consult OperationLookup
+     *  (productlocation + operation + bor + resource) instead of the static
+     *  method_make.lead_time. */
+    val data: Map<String, List<Map<String, Any?>>>,
 ) {
     val violations = mutableListOf<Violation>()
     /** supply_id → qty consumed across all leaves of this demand's tree. */
@@ -609,6 +614,11 @@ private class WalkContext(
             "demand" -> {
                 // Sub-demand under a demand (cycle_stopped / depth_limit cases) — treat as terminal.
                 // No further checks; the parent's qty bound is already validated.
+            }
+            "operation", "resource" -> {
+                // Visualization nodes attached to make WOs (UPH/BOR model). They
+                // carry no supply qty and aren't part of the demand-supply graph,
+                // so soundness rules don't apply — skip silently.
             }
             else -> violations.add(Violation(
                 rule = "R0_unknown_node_type",
@@ -1039,13 +1049,23 @@ private class WalkContext(
             }
         }
 
-        // R5: parent_time = max(child_times) + LEAD_TIME. Best-effort: pick any
-        // matching method_make's lead_time (the engine doesn't preserve which
-        // bom_id was used, so we use the minimum lead time among candidates).
-        val leadTime = matchingMakes
+        // R5: parent_time = max(child_times) + LEAD_TIME.
+        // When the WO falls under an applicable operation override (UPH/BOR),
+        // the planner used OperationLookup.effectiveLeadDays for per-lot
+        // duration — mirror that here so we don't compare against the static
+        // method_make.lead_time the planner already overrode. Fallback to the
+        // method_make minimum (existing behavior) when the override doesn't
+        // apply.
+        val staticLeadTime = matchingMakes
             .mapNotNull { (it["lead_time"] as? Number)?.toDouble() }
             .minOrNull()
             ?: 0.0
+        val woQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
+        val leadTime = if (woQty > 0.0) {
+            OperationLookup.effectiveLeadDays(pid, lid, woQty, staticLeadTime, data).days
+        } else {
+            staticLeadTime
+        }
         val startTime = parseDateLocal(node["start_time"]?.toString())
         val endTime = parseDateLocal(node["end_time"]?.toString())
         if (startTime != null && endTime != null) {

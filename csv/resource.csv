@@ -1,7 +1,11 @@
 RESOURCE_ID,LOCATION_ID,SIZE
 oe-machine1,1000,10
-oe-machine2,1000,5
-oe-crew,1000,100
+oe-machine2,1000,15
 oe-machine1,2000,10
 oe-machine2,2000,5
-oe-crew,2000,100
+ob-machine1,1000,10
+ob-machine2,1000,15
+ob-machine1,2000,10
+ob-machine2,2000,5
+crew,1000,100
+crew,2000,200
