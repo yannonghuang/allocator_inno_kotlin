@@ -453,6 +453,10 @@
       "breakdownOpenWoPegging": "Open this work order's pegging tree",
       "peakOverloadTooltip": "Peak {peak} exceeds capacity {size}. Single-WO parallelism doesn't see other WOs at this location; cross-WO arbitration is not yet enforced, so this schedule is optimistic for this resource."
     },
+    "planResult": {
+      "contentionPushed": "Resource contention: {count} WO(s) pushed later to avoid stacking on a shared resource.",
+      "contentionPushedTooltip": "Cross-WO arbitration found at least one WO whose required resources were already reserved at its original start. Those WOs were shifted to the earliest free window. Each pushed WO cascades into its parent demand's commit_time (later)."
+    },
     "committedDemands": {
       "heading": "Committed demands",
       "filterRealMake": "Only demands with pegging including a real make (non-virtual BOM link)",

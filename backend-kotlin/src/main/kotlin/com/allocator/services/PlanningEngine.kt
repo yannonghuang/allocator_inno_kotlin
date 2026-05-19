@@ -3467,6 +3467,7 @@ fun runPlanning(
     // step (resequenceFromPegging) so the pushed lots propagate up the DAG
     // and the pegging tree's WO/demand timings re-sync.
     val enableGlobalScheduling = config?.get("enable_global_scheduling") == true
+    var resourceContentionPushed = 0
     val finalTimings = if (enableGlobalScheduling) {
         val mutableLots: List<MutableMap<String, Any?>> = timingFix.workOrders.map {
             (it as? MutableMap<String, Any?>) ?: it.toMutableMap()
@@ -3481,8 +3482,8 @@ fun runPlanning(
             val due = (d["request_due_time"] as? String)?.let { runCatching { java.time.LocalDate.parse(it.take(10)) }.getOrNull() }
             id to due
         }.toMap()
-        val pushedCount = ResourceScheduler.arbitrate(mutableLots, data, priorityMap, dueMap)
-        if (pushedCount > 0) {
+        resourceContentionPushed = ResourceScheduler.arbitrate(mutableLots, data, priorityMap, dueMap)
+        if (resourceContentionPushed > 0) {
             resequenceFromPegging(mutableLots, timingFix.peggingTrees)
         } else {
             timingFix
@@ -3493,12 +3494,16 @@ fun runPlanning(
 
     return mapOf(
         "committed_demands"      to committedDemands,
-        "work_orders"            to timingFix.workOrders,
-        "planning_pegging"       to timingFix.peggingTrees,
+        "work_orders"            to finalTimings.workOrders,
+        "planning_pegging"       to finalTimings.peggingTrees,
         "supply_allocations"     to supplyAllocations,
         "supply_cap_violations"  to supplyCapViolations,
         "override_warnings"      to overrideWarnings,
         "supply_level_allocations" to supplyLevelAllocations,
+        // Number of WO groups whose start was pushed by ResourceScheduler
+        // to wait for contended resources. Zero when the feature flag is
+        // off; > 0 when global scheduling actually moved at least one WO.
+        "resource_contention_pushed_wos" to resourceContentionPushed,
     )
 }
 

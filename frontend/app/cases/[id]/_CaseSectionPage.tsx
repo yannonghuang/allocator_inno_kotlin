@@ -909,6 +909,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     supply_level_allocations?: SupplyLevelAllocation[];
     supply_summary?: { initial_total: number; consumed_total: number; consumption_rate: number | null };
     plan_kpis?: PlanKpis;
+    /** Count of WO groups pushed by ResourceScheduler.arbitrate.
+     *  0 when global scheduling is off or nothing was contended. */
+    resource_contention_pushed_wos?: number;
   } | null>(null);
   const [planLoading, setPlanLoading] = useState(false);
   const [planError, setPlanError] = useState<string | null>(null);
@@ -4807,6 +4810,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             )}
             {/* Plan KPI dashboard – always show when plan result exists; build kpis safely from backend or client */}
             <PlanKpiDashboard planResult={planResult} />
+            {(planResult.resource_contention_pushed_wos ?? 0) > 0 && (
+              <div
+                style={{
+                  marginTop: '0.4rem',
+                  padding: '0.4rem 0.6rem',
+                  background: 'rgba(250,204,21,0.08)',
+                  border: '1px solid rgba(250,204,21,0.35)',
+                  borderRadius: 6,
+                  fontSize: '0.78rem',
+                  color: '#facc15',
+                }}
+                title={tP('planResult.contentionPushedTooltip')}
+              >
+                {tP('planResult.contentionPushed', { count: planResult.resource_contention_pushed_wos ?? 0 })}
+              </div>
+            )}
             <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1.5rem', marginBottom: '0.5rem' }}>
               <button
                 type="button"

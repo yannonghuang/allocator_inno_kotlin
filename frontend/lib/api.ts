@@ -446,6 +446,10 @@ export type PlanResult = {
    *  earlier in this file (see `getPlanKpis`); pulled in here so the chat
    *  panel can read fill_rate_pct etc. when a pending plan completes. */
   plan_kpis?: PlanKpis;
+  /** Number of WO groups whose start was pushed by ResourceScheduler.arbitrate
+   *  to wait for contended resources. Zero unless enable_global_scheduling
+   *  is on AND at least one WO was actually shifted. */
+  resource_contention_pushed_wos?: number;
 };
 
 export async function runPlan(
