@@ -176,14 +176,22 @@ private fun computeResourceUtilization(caseId: Int, runId: Int): Map<String, Any
             val rate = (br["resource_rate"] as? Number)?.toDouble() ?: continue
             val key = rid to summary.locationId
             val bucket = loadMap.getOrPut(key) { mutableMapOf() }
-            // Accumulate rate over each lot's window — sequential lots inside a
-            // WO collapse to one continuous block, so this is equivalent to
-            // spanning [minStart, maxEnd] when lots are back-to-back.
+            // Accumulate rate over each lot's window. end_time is exclusive
+            // (a 1-day-lead lot has end_time = start_time + 1, occupying
+            // start_time only) — matches the planner's dateAddDays convention
+            // and ResourceScheduler.ResourceCalendar. Inclusive iteration
+            // here would double-count the boundary day and report a peak
+            // higher than the cross-WO arbitration can avoid.
             for ((lotStart, lotEnd) in summary.lotWindows) {
                 var d = lotStart
-                while (d <= lotEnd) {
+                while (d.isBefore(lotEnd)) {
                     bucket[d] = (bucket[d] ?: 0.0) + rate
                     d = d.plusDays(1)
+                }
+                // Zero-duration lot (start == end): record one day of load so
+                // an instantaneous WO still shows up on the timeline.
+                if (lotStart == lotEnd) {
+                    bucket[lotStart] = (bucket[lotStart] ?: 0.0) + rate
                 }
             }
             if (minDate == null || summary.minStart < minDate) minDate = summary.minStart
