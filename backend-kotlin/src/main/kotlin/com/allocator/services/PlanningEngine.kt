@@ -3466,7 +3466,9 @@ fun runPlanning(
     // explicitly enables it. When pushedCount > 0 we re-run the cascade
     // step (resequenceFromPegging) so the pushed lots propagate up the DAG
     // and the pegging tree's WO/demand timings re-sync.
-    val enableGlobalScheduling = config?.get("enable_global_scheduling") == true
+    // Default ON — flipped from the opt-in default after Phase A validation.
+    // Explicit false (saved configs from before the flip) still disables it.
+    val enableGlobalScheduling = config?.get("enable_global_scheduling") != false
     var resourceContentionPushed = 0
     val finalTimings = if (enableGlobalScheduling) {
         val mutableLots: List<MutableMap<String, Any?>> = timingFix.workOrders.map {

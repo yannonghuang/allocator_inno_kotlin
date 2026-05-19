@@ -1037,7 +1037,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [peggingSelectedProductLoc, setPeggingSelectedProductLoc] = useState<{ product: string; location: string } | null>(null);
   const [bomRealPairs, setBomRealPairs] = useState<[string, string][] | null>(null);
   const [realMoveTriples, setRealMoveTriples] = useState<[string, string, string][] | null>(null);
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true, enable_global_scheduling: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1190,6 +1190,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     purchase_allowed: false,
     analyze_criticality: false,
     check_soundness: true,
+    enable_global_scheduling: true,
   });
   /** Build a full PlanningConfig from baseline + a single axis-value override.
    *  Mirrors the Kotlin buildConfigForAxisValue. The axis names must match
@@ -4481,7 +4482,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             >
               <input
                 type="checkbox"
-                checked={planningConfig.enable_global_scheduling === true}
+                checked={planningConfig.enable_global_scheduling !== false}
                 onChange={(e) => setPlanningConfig((c) => ({ ...c, enable_global_scheduling: e.target.checked }))}
               />
               <span>{tP('config.enableGlobalScheduling')}</span>
