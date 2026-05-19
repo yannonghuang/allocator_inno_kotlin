@@ -4467,6 +4467,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               />
               <span>{tP('config.purchaseAllowed')}</span>
             </label>
+
+            {/* Row 4 — Cross-WO arbitration. Off by default during opt-in
+                rollout; flipping it on means concurrent WOs at the same
+                location queue against a shared resource calendar instead
+                of stacking their rates past pool size. */}
+            <label
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', marginTop: '0.45rem' }}
+              title={tP('config.enableGlobalSchedulingTooltip')}
+            >
+              <input
+                type="checkbox"
+                checked={planningConfig.enable_global_scheduling === true}
+                onChange={(e) => setPlanningConfig((c) => ({ ...c, enable_global_scheduling: e.target.checked }))}
+              />
+              <span>{tP('config.enableGlobalScheduling')}</span>
+            </label>
           </fieldset>
 
           {/* ── Group 2: Demand consolidation (sharing across demands) ── */}

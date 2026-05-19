@@ -400,6 +400,15 @@ export type PlanningConfig = {
   analyze_criticality?: boolean;
   /** When true, automatically run the soundness check (always deep) after each successful plan. Default: true. */
   check_soundness?: boolean;
+  /**
+   * Opt-in cross-WO arbitration on shared resource calendars. When false
+   * (default), each WO's parallelism is capped only by its own operation
+   * + BOR; concurrent WOs at the same location can stack rates past pool
+   * size. When true, the planner runs a post-pass that walks WOs in
+   * (priority desc, due-date asc, original-start asc) order and pushes
+   * starts later when shared resources are already reserved.
+   */
+  enable_global_scheduling?: boolean;
 };
 
 export type PlanSupplyAllocation = {
