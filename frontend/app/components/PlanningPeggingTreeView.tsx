@@ -157,10 +157,18 @@ function NodeView({
           const qty = (isRoot && workOrderRootQty != null) ? workOrderRootQty : Number(node.quantity ?? 0);
           const lotCount = (node as { lot_count?: number | null }).lot_count ?? null;
           const maxLotSize = (node as { max_lot_size?: number | null }).max_lot_size ?? null;
+          const waveCount = node.wave_count ?? null;
+          const cap = node.parallelism_cap ?? null;
           const lotPart = lotCount && lotCount > 1 && maxLotSize
             ? ` · ${lotCount} lots of up to ${qtyFmt(Number(maxLotSize))}`
             : '';
-          return `${node.method} ${node.product_id} @ ${node.location_id ?? '–'} · ${qtyFmt(qty)}${node.end_time ? ` · end ${node.end_time}` : ''}${lotPart}`;
+          // Wave annotation only when concurrency actually compresses the
+          // schedule (wave_count < lot_count). Skip for sequential WOs to
+          // keep labels tight.
+          const wavePart = waveCount && lotCount && cap && cap > 1 && waveCount < lotCount
+            ? ` · ${waveCount} wave${waveCount > 1 ? 's' : ''} of up to ${cap} parallel`
+            : '';
+          return `${node.method} ${node.product_id} @ ${node.location_id ?? '–'} · ${qtyFmt(qty)}${node.end_time ? ` · end ${node.end_time}` : ''}${lotPart}${wavePart}`;
         })()
       : isOperation
         ? (() => {
@@ -173,6 +181,12 @@ function NodeView({
             if (node.yield_factor != null) parts.push(`yield ${node.yield_factor}`);
             if (node.process_time != null || node.pre_process_time != null || node.post_process_time != null) {
               parts.push(`pre/proc/post ${node.pre_process_time ?? 0}/${node.process_time ?? 0}/${node.post_process_time ?? 0}s`);
+            }
+            // Concurrency cap = min(floor(size/rate)) across BOR resources.
+            // 0 means the override isn't actually applicable; 1 means lots
+            // run sequentially; > 1 means waves compress the schedule.
+            if (node.parallelism_cap != null && node.parallelism_cap > 0) {
+              parts.push(`up to ${node.parallelism_cap} parallel lot${node.parallelism_cap > 1 ? 's' : ''}`);
             }
             return parts.join(' · ');
           })()

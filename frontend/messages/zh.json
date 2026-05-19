@@ -299,6 +299,8 @@
       "weightPurchase": "采购",
       "weightsHint": "精细评分器对提交时间/库存消耗/采购数量的相对权重。后端会归一化，绝对值不重要，只有比例重要。",
       "purchaseAllowed": "允许采购（取消勾选以从计划中排除采购方法）",
+      "enableGlobalScheduling": "跨工单资源仲裁",
+      "enableGlobalSchedulingTooltip": "默认开启。排程器按（优先级降序、交期升序、原始开始时间升序）顺序遍历工单；若所需资源已被同地点的前序工单占用，则将当前工单推后开始。取消勾选可回到旧的单工单并发上限行为。",
       "consolidate": "合并共享组件（将同一时间窗口内的需求合并为一个生产订单，然后拆分输出）",
       "bucketDays": "窗口（天）：",
       "splitPolicy": "拆分策略：",
@@ -448,7 +450,12 @@
       "peggingNotFound": "没有 {demandId} 的追溯树。",
       "peggingWoNotFound": "没有该工单的追溯树。",
       "breakdownWoPeggingTitle": "工单追溯 — {product}@{location}",
-      "breakdownOpenWoPegging": "打开该工单的追溯树"
+      "breakdownOpenWoPegging": "打开该工单的追溯树",
+      "peakOverloadTooltip": "峰值 {peak} 超过容量 {size}。单工单并发上限不感知同地点其他工单；跨工单仲裁尚未实施，此资源的排程偏乐观。"
+    },
+    "planResult": {
+      "contentionPushed": "资源争用：{count} 个工单已推后以避免在共享资源上堆叠。",
+      "contentionPushedTooltip": "跨工单仲裁发现至少一个工单的所需资源在原定开始时已被占用，将其推迟到最早空闲窗口。每个被推后的工单都会级联影响其父需求的承诺时间。"
     },
     "committedDemands": {
       "heading": "已承诺需求",

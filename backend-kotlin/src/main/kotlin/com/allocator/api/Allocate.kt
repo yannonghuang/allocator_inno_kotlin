@@ -2388,6 +2388,11 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
 
     return buildJsonObject {
         put("purchase_allowed", c["purchase_allowed"] as? Boolean ?: true)
+        // Cross-WO arbitration flag — persist so replan + post-run reload
+        // restore the user's checkbox state. Default ON after Phase A
+        // validation; explicit false (older saved configs / opt-outs) still
+        // disables the post-pass.
+        put("enable_global_scheduling", c["enable_global_scheduling"] as? Boolean ?: true)
         putJsonObject("method_selection") {
             put("mode",      methodCfg.mode)
             put("depth",     methodCfg.depth)

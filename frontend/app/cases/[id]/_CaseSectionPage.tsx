@@ -909,6 +909,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     supply_level_allocations?: SupplyLevelAllocation[];
     supply_summary?: { initial_total: number; consumed_total: number; consumption_rate: number | null };
     plan_kpis?: PlanKpis;
+    /** Count of WO groups pushed by ResourceScheduler.arbitrate.
+     *  0 when global scheduling is off or nothing was contended. */
+    resource_contention_pushed_wos?: number;
   } | null>(null);
   const [planLoading, setPlanLoading] = useState(false);
   const [planError, setPlanError] = useState<string | null>(null);
@@ -1034,7 +1037,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [peggingSelectedProductLoc, setPeggingSelectedProductLoc] = useState<{ product: string; location: string } | null>(null);
   const [bomRealPairs, setBomRealPairs] = useState<[string, string][] | null>(null);
   const [realMoveTriples, setRealMoveTriples] = useState<[string, string, string][] | null>(null);
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true, enable_global_scheduling: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1187,6 +1190,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     purchase_allowed: false,
     analyze_criticality: false,
     check_soundness: true,
+    enable_global_scheduling: true,
   });
   /** Build a full PlanningConfig from baseline + a single axis-value override.
    *  Mirrors the Kotlin buildConfigForAxisValue. The axis names must match
@@ -4467,6 +4471,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               />
               <span>{tP('config.purchaseAllowed')}</span>
             </label>
+
+            {/* Row 4 — Cross-WO arbitration. Off by default during opt-in
+                rollout; flipping it on means concurrent WOs at the same
+                location queue against a shared resource calendar instead
+                of stacking their rates past pool size. */}
+            <label
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', marginTop: '0.45rem' }}
+              title={tP('config.enableGlobalSchedulingTooltip')}
+            >
+              <input
+                type="checkbox"
+                checked={planningConfig.enable_global_scheduling !== false}
+                onChange={(e) => setPlanningConfig((c) => ({ ...c, enable_global_scheduling: e.target.checked }))}
+              />
+              <span>{tP('config.enableGlobalScheduling')}</span>
+            </label>
           </fieldset>
 
           {/* ── Group 2: Demand consolidation (sharing across demands) ── */}
@@ -4791,6 +4811,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             )}
             {/* Plan KPI dashboard – always show when plan result exists; build kpis safely from backend or client */}
             <PlanKpiDashboard planResult={planResult} />
+            {(planResult.resource_contention_pushed_wos ?? 0) > 0 && (
+              <div
+                style={{
+                  marginTop: '0.4rem',
+                  padding: '0.4rem 0.6rem',
+                  background: 'rgba(250,204,21,0.08)',
+                  border: '1px solid rgba(250,204,21,0.35)',
+                  borderRadius: 6,
+                  fontSize: '0.78rem',
+                  color: '#facc15',
+                }}
+                title={tP('planResult.contentionPushedTooltip')}
+              >
+                {tP('planResult.contentionPushed', { count: planResult.resource_contention_pushed_wos ?? 0 })}
+              </div>
+            )}
             <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1.5rem', marginBottom: '0.5rem' }}>
               <button
                 type="button"

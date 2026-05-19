@@ -2381,31 +2381,50 @@ private fun buildWorkOrders(
     val prodArea = getProdArea(productId, productionLocation, data)
     val methodType = m["type"] as? String ?: ""
     val woGroupId = nextWoGroupId()
+
+    // Concurrency cap: how many lots can share a wave at this location.
+    // Only meaningful for make WOs under the operation override; move/purchase
+    // stay sequential (cap=1). cap=0 means the override doesn't apply and the
+    // caller has already supplied the static lead, so default to 1 there too.
+    val cap = if (methodType == "make")
+        OperationLookup.parallelismCap(productId, productionLocation, data).coerceAtLeast(1)
+    else 1
+
     val wos = mutableListOf<Map<String, Any?>>()
     var left = qty
-    var lotStart: LocalDate? = startDt
+    var waveStart: LocalDate? = startDt
     var lastEnd: LocalDate? = null
     var lotCount = 0
-    while (left > 1e-9 && lotStart != null) {
-        val lotQty = min(lotSize, left)
-        val lotEnd = dateAddDays(lotStart, leadDays)
-        wos.add(mapOf(
-            "product_id" to productId,
-            "location_id" to productionLocation,
-            "quantity" to roundQty(lotQty),
-            "start_time" to formatDate(lotStart),
-            "end_time" to formatDate(lotEnd),
-            "method" to methodType,
-            "location_source" to (if (methodType == "move") m["from_location_id"] else null),
-            "demand_id" to demandId,
-            "prod_area" to prodArea,
-            "override_active" to overrideActive,
-            "wo_group_id" to woGroupId,
-        ))
-        lastEnd = lotEnd
-        left -= lotQty
-        lotCount++
-        lotStart = if (left > 1e-9) lotEnd else null
+    var waveIndex = 0
+    while (left > 1e-9 && waveStart != null) {
+        val waveEnd = dateAddDays(waveStart, leadDays)
+        // Each wave runs up to `cap` lots in parallel — all share waveStart /
+        // waveEnd. Subsequent waves start at the previous wave's end (today's
+        // sequential lots become cap=1, identical to old behavior).
+        var lotsThisWave = 0
+        while (lotsThisWave < cap && left > 1e-9) {
+            val lotQty = min(lotSize, left)
+            wos.add(mapOf(
+                "product_id" to productId,
+                "location_id" to productionLocation,
+                "quantity" to roundQty(lotQty),
+                "start_time" to formatDate(waveStart),
+                "end_time" to formatDate(waveEnd),
+                "method" to methodType,
+                "location_source" to (if (methodType == "move") m["from_location_id"] else null),
+                "demand_id" to demandId,
+                "prod_area" to prodArea,
+                "override_active" to overrideActive,
+                "wo_group_id" to woGroupId,
+                "wave_index" to waveIndex,
+            ))
+            left -= lotQty
+            lotsThisWave++
+            lotCount++
+        }
+        lastEnd = waveEnd
+        waveIndex++
+        waveStart = if (left > 1e-9) waveEnd else null
     }
     return WorkOrderResult(wos, lotCount, lastEnd, lotSizeVal, woGroupId)
 }
@@ -2443,6 +2462,18 @@ private fun buildWoNode(
     put("lot_count", if (lotCount > 0) lotCount else null)
     put("max_lot_size", lotSizeVal)
     put("override_active", overrideActive)
+
+    // Wave structure for make WOs under the operation override. cap >= 1 means
+    // the WO compresses its lots into ceil(lot_count / cap) sequential waves;
+    // outside the override cap=1 and wave_count == lot_count (today's behavior).
+    val cap = if (methodType == "make" && data != null)
+        OperationLookup.parallelismCap(productId, productionLocation, data).coerceAtLeast(1)
+    else 1
+    if (cap > 1) put("parallelism_cap", cap)
+    if (lotCount > 0) {
+        val waveCount = kotlin.math.ceil(lotCount.toDouble() / cap.toDouble()).toInt()
+        if (waveCount > 0) put("wave_count", waveCount)
+    }
 
     // For make WOs with an applicable operation, prepend an operation node
     // (with resource children) so pegging trees expose the granular UPH/BOR
@@ -2513,6 +2544,11 @@ private fun buildOperationChildren(
     }
     if (resourceChildren.size != borRows.size) return emptyList()
 
+    // Concurrency cap = min(floor(size/rate)) across BOR. Pegged onto the
+    // operation node so the UI can render "up to N parallel lots" and the
+    // user can reason about how the WO span was compressed.
+    val parallelismCap = OperationLookup.parallelismCap(productId, locationId, data)
+
     return listOf(mapOf(
         "type" to "operation",
         "operation_id" to (op["operation_id"] as? String)?.trim(),
@@ -2525,6 +2561,7 @@ private fun buildOperationChildren(
         "process_time" to (op["process_time"] as? Number)?.toInt(),
         "pre_process_time" to (op["pre_process_time"] as? Number)?.toInt(),
         "post_process_time" to (op["post_process_time"] as? Number)?.toInt(),
+        "parallelism_cap" to parallelismCap,
         "children" to resourceChildren,
     ))
 }
@@ -3422,14 +3459,53 @@ fun runPlanning(
     }
 
     val timingFix = fixTimingFromPegging(consolidatedWOs + workOrders, allPegging, data)
+
+    // Phase-1 cross-WO arbitration. Opt-in via planning config flag — the
+    // feature shifts WO start times when shared resources are contended, so
+    // existing baselines and KB snapshots stay unchanged until the user
+    // explicitly enables it. When pushedCount > 0 we re-run the cascade
+    // step (resequenceFromPegging) so the pushed lots propagate up the DAG
+    // and the pegging tree's WO/demand timings re-sync.
+    // Default ON — flipped from the opt-in default after Phase A validation.
+    // Explicit false (saved configs from before the flip) still disables it.
+    val enableGlobalScheduling = config?.get("enable_global_scheduling") != false
+    var resourceContentionPushed = 0
+    val finalTimings = if (enableGlobalScheduling) {
+        val mutableLots: List<MutableMap<String, Any?>> = timingFix.workOrders.map {
+            (it as? MutableMap<String, Any?>) ?: it.toMutableMap()
+        }
+        val priorityMap = (data["demand"] ?: emptyList()).mapNotNull { d ->
+            val id = (d["demand_id"] as? String)?.trim() ?: return@mapNotNull null
+            val pri = (d["priority"] as? Number)?.toInt() ?: 0
+            id to pri
+        }.toMap()
+        val dueMap = (data["demand"] ?: emptyList()).mapNotNull { d ->
+            val id = (d["demand_id"] as? String)?.trim() ?: return@mapNotNull null
+            val due = (d["request_due_time"] as? String)?.let { runCatching { java.time.LocalDate.parse(it.take(10)) }.getOrNull() }
+            id to due
+        }.toMap()
+        resourceContentionPushed = ResourceScheduler.arbitrate(mutableLots, data, priorityMap, dueMap)
+        if (resourceContentionPushed > 0) {
+            resequenceFromPegging(mutableLots, timingFix.peggingTrees)
+        } else {
+            timingFix
+        }
+    } else {
+        timingFix
+    }
+
     return mapOf(
         "committed_demands"      to committedDemands,
-        "work_orders"            to timingFix.workOrders,
-        "planning_pegging"       to timingFix.peggingTrees,
+        "work_orders"            to finalTimings.workOrders,
+        "planning_pegging"       to finalTimings.peggingTrees,
         "supply_allocations"     to supplyAllocations,
         "supply_cap_violations"  to supplyCapViolations,
         "override_warnings"      to overrideWarnings,
         "supply_level_allocations" to supplyLevelAllocations,
+        // Number of WO groups whose start was pushed by ResourceScheduler
+        // to wait for contended resources. Zero when the feature flag is
+        // off; > 0 when global scheduling actually moved at least one WO.
+        "resource_contention_pushed_wos" to resourceContentionPushed,
     )
 }
 
@@ -3583,18 +3659,26 @@ private fun fixTimingFromPegging(
         val prodArea = getProdArea(pid, lid, data)
         val originalLot = planningGid?.let { originalLotByPlanningGid[it] }
 
-        // Per-lot duration: derived from the WO's overall span and lotCount.
-        // Matches buildWorkOrders's lot scheduling (each lot occupies
-        // leadDays, sequential).
+        // Per-wave duration: lots run in `cap`-sized waves; each wave occupies
+        // one per-lot lead. Total span = wave_count × per-lot. Falls back to
+        // sequential (cap=1, wave_count=lot_count) when parallelism_cap isn't
+        // on the node (legacy WOs or non-override methods).
+        val cap = (woNode["parallelism_cap"] as? Number)?.toInt()?.coerceAtLeast(1) ?: 1
+        val waveCount = (woNode["wave_count"] as? Number)?.toInt()
+            ?: kotlin.math.ceil(lotCount.toDouble() / cap.toDouble()).toInt().coerceAtLeast(1)
         val totalSpanDays = endDt.toEpochDay() - startDt.toEpochDay()
-        val perLotDays = if (lotCount > 0) totalSpanDays / lotCount else 0L
+        // Per-wave duration: divide span by wave count (NOT lot count).
+        // Sequential WOs collapse to the old behavior since wave_count ==
+        // lot_count when cap == 1.
+        val perWaveDays = if (waveCount > 0) totalSpanDays / waveCount else 0L
 
-        var lotStart: LocalDate = startDt
         var remaining = totalQty
-        repeat(lotCount) {
-            if (remaining <= 1e-9) return@repeat
+        for (i in 0 until lotCount) {
+            if (remaining <= 1e-9) break
             val lotQty = min(lotSize, remaining)
-            val lotEnd = lotStart.plusDays(perLotDays)
+            val waveIdx = i / cap
+            val lotStart = startDt.plusDays(waveIdx * perWaveDays)
+            val lotEnd = lotStart.plusDays(perWaveDays)
             val lot = mutableMapOf<String, Any?>(
                 "product_id" to pid,
                 "location_id" to lid,
@@ -3607,6 +3691,7 @@ private fun fixTimingFromPegging(
                 "prod_area" to prodArea,
                 "override_active" to overrideActive,
                 "wo_group_id" to finalGid,
+                "wave_index" to waveIdx,
             )
             if (methodSlotIndex != null) lot["method_slot_index"] = methodSlotIndex
             // Copy consolidation metadata from the original lot if present.
@@ -3617,7 +3702,6 @@ private fun fixTimingFromPegging(
             }
             regenLots.add(lot)
             remaining -= lotQty
-            lotStart = lotEnd
         }
     }
 

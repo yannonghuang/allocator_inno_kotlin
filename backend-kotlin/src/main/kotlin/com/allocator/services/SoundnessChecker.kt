@@ -1052,8 +1052,8 @@ private class WalkContext(
         // R5: parent_time = max(child_times) + LEAD_TIME.
         // When the WO falls under an applicable operation override (UPH/BOR),
         // the planner used OperationLookup.effectiveLeadDays for per-lot
-        // duration — mirror that here so we don't compare against the static
-        // method_make.lead_time the planner already overrode. Fallback to the
+        // duration and OperationLookup.parallelismCap for concurrent-lot waves,
+        // so expected total duration = wave_count * per-lot. Fall back to the
         // method_make minimum (existing behavior) when the override doesn't
         // apply.
         val staticLeadTime = matchingMakes
@@ -1061,11 +1061,19 @@ private class WalkContext(
             .minOrNull()
             ?: 0.0
         val woQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
-        val leadTime = if (woQty > 0.0) {
+        val perLotLead = if (woQty > 0.0) {
             OperationLookup.effectiveLeadDays(pid, lid, woQty, staticLeadTime, data).days
         } else {
             staticLeadTime
         }
+        // Wave compression: total span = ceil(lot_count / cap) * per-lot.
+        // Fall back to lot_count when the override is inapplicable (cap defaults
+        // to 1) — matches the old "duration ≥ per-lot lead" check exactly when
+        // lot_count == 1.
+        val lotCount = (node["lot_count"] as? Number)?.toInt()?.takeIf { it > 0 } ?: 1
+        val parallelismCap = OperationLookup.parallelismCap(pid, lid, data).coerceAtLeast(1)
+        val waveCount = kotlin.math.ceil(lotCount.toDouble() / parallelismCap.toDouble()).toInt()
+        val leadTime = perLotLead * waveCount
         val startTime = parseDateLocal(node["start_time"]?.toString())
         val endTime = parseDateLocal(node["end_time"]?.toString())
         if (startTime != null && endTime != null) {
@@ -1074,7 +1082,7 @@ private class WalkContext(
                 violations.add(Violation(
                     rule = "R5_lead_time",
                     nodePath = path,
-                    message = "Make WO duration (end - start = $duration days) shorter than lead_time ($leadTime).",
+                    message = "Make WO duration (end - start = $duration days) shorter than expected $leadTime days (= $perLotLead per-lot × $waveCount wave(s) at cap $parallelismCap).",
                     expected = leadTime,
                     actual = duration.toDouble(),
                 ))

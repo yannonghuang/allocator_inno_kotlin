@@ -236,6 +236,13 @@ export type PlanningPeggingNode = {
   /** resource nodes: per-unit consumption rate and the available pool size at this location. */
   resource_rate?: number | null;
   size?: number | null;
+  /** Concurrent lots allowed under the operation override: min(floor(size/rate))
+   *  across BOR resources. Present on operation nodes; present on work_order
+   *  nodes when > 1 (omitted for sequential WOs to keep payload small). */
+  parallelism_cap?: number | null;
+  /** Number of sequential waves the planner uses to run lot_count lots at the
+   *  parallelism cap. Present on make work_order nodes only. */
+  wave_count?: number | null;
   request_time?: string | null;
   commit_time?: string | null;
   commit_reason?: string | null;
@@ -393,6 +400,15 @@ export type PlanningConfig = {
   analyze_criticality?: boolean;
   /** When true, automatically run the soundness check (always deep) after each successful plan. Default: true. */
   check_soundness?: boolean;
+  /**
+   * Cross-WO arbitration on shared resource calendars. Default true. When
+   * false, each WO's parallelism is capped only by its own operation + BOR
+   * and concurrent WOs at the same location can stack rates past pool size.
+   * When true (default), the planner runs a post-pass that walks WOs in
+   * (priority desc, due-date asc, original-start asc) order and pushes
+   * starts later when shared resources are already reserved.
+   */
+  enable_global_scheduling?: boolean;
 };
 
 export type PlanSupplyAllocation = {
@@ -430,6 +446,10 @@ export type PlanResult = {
    *  earlier in this file (see `getPlanKpis`); pulled in here so the chat
    *  panel can read fill_rate_pct etc. when a pending plan completes. */
   plan_kpis?: PlanKpis;
+  /** Number of WO groups whose start was pushed by ResourceScheduler.arbitrate
+   *  to wait for contended resources. Zero unless enable_global_scheduling
+   *  is on AND at least one WO was actually shifted. */
+  resource_contention_pushed_wos?: number;
 };
 
 export async function runPlan(

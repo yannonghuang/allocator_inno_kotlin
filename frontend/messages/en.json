@@ -299,6 +299,8 @@
       "weightPurchase": "purchase",
       "weightsHint": "Relative weights the elaborate scorer applies to commit time / inventory consumed / purchase amount. Backend normalizes so absolute values don't matter — only the ratio.",
       "purchaseAllowed": "Purchase allowed (uncheck to exclude buy methods from planning)",
+      "enableGlobalScheduling": "Cross-WO resource arbitration",
+      "enableGlobalSchedulingTooltip": "When on (default), the planner walks WOs in (priority desc, due-date asc, start asc) order and pushes a WO's start later if its required resources are already reserved by earlier WOs at the same location. Uncheck to revert to the legacy single-WO parallelism behavior.",
       "consolidate": "Consolidate shared components (group demands within a time bucket into one work order, then split output)",
       "bucketDays": "Bucket (days):",
       "splitPolicy": "Split policy:",
@@ -448,7 +450,12 @@
       "peggingNotFound": "No pegging tree available for {demandId}.",
       "peggingWoNotFound": "No pegging tree available for this work order.",
       "breakdownWoPeggingTitle": "Work order pegging — {product}@{location}",
-      "breakdownOpenWoPegging": "Open this work order's pegging tree"
+      "breakdownOpenWoPegging": "Open this work order's pegging tree",
+      "peakOverloadTooltip": "Peak {peak} exceeds capacity {size}. Single-WO parallelism doesn't see other WOs at this location; cross-WO arbitration is not yet enforced, so this schedule is optimistic for this resource."
+    },
+    "planResult": {
+      "contentionPushed": "Resource contention: {count} WO(s) pushed later to avoid stacking on a shared resource.",
+      "contentionPushedTooltip": "Cross-WO arbitration found at least one WO whose required resources were already reserved at its original start. Those WOs were shifted to the earliest free window. Each pushed WO cascades into its parent demand's commit_time (later)."
     },
     "committedDemands": {
       "heading": "Committed demands",

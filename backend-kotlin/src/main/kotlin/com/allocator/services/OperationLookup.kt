@@ -81,6 +81,24 @@ object OperationLookup {
         }
         if (!allPresent) return fallback
 
+        // Tighten: a resource must have enough size to fit at least one lot
+        // (size >= rate). If not, the override is infeasible — fall back to
+        // the static lead so the planner doesn't emit a WO it can't staff.
+        // Same gate parallelismCap below uses; keeps the two helpers
+        // consistent so callers can rely on (effective=uph) ⇒ (cap >= 1).
+        val allFeasible = borRows.all { br ->
+            val rid = (br["resource_id"] as? String)?.trim() ?: return@all false
+            val rate = (br["resource_rate"] as? Number)?.toDouble() ?: return@all false
+            if (rate <= 0.0) return@all false
+            val resRow = resourceRows.firstOrNull {
+                (it["resource_id"] as? String)?.trim() == rid &&
+                (it["location_id"] as? String)?.trim() == locationId
+            } ?: return@all false
+            val size = (resRow["size"] as? Number)?.toDouble() ?: return@all false
+            rate <= size
+        }
+        if (!allFeasible) return fallback
+
         // Per-lot qty: max_lot_size caps it; otherwise the slot is one lot.
         val maxLotSize = (productLocationRow["max_lot_size"] as? Number)?.toDouble()?.takeIf { it > 0.0 }
         val lotQty = if (maxLotSize != null) minOf(qty, maxLotSize) else qty
@@ -104,5 +122,62 @@ object OperationLookup {
             source = "uph",
             operationId = (op["operation_id"] as? String)?.trim(),
         )
+    }
+
+    /**
+     * Maximum number of lots that can run in parallel at the given location,
+     * limited by per-lot resource consumption against the location's pool sizes.
+     *
+     *   cap = min over BOR resources of floor(resource.size / resource_rate)
+     *
+     * Returns 0 when the operation override doesn't apply at all (no
+     * productlocation row, no operation, empty BOR, missing resource at the
+     * location, rate <= 0, or rate > size). Callers treat 0 as "fall back to
+     * sequential method_make.lead_time", same shape as the existing override
+     * fallback path.
+     *
+     * Same applicability gate as effectiveLeadDays — when that returns
+     * source="uph", parallelismCap is guaranteed to be >= 1.
+     */
+    fun parallelismCap(
+        productId: String,
+        locationId: String,
+        data: Map<String, List<Map<String, Any?>>>,
+    ): Int {
+        val productLocationRow = (data["productlocation"] ?: return 0)
+            .firstOrNull {
+                (it["product_id"] as? String)?.trim() == productId &&
+                (it["location_id"] as? String)?.trim() == locationId
+            } ?: return 0
+
+        val prodArea = productLocationRow["prod_area"]?.toString()?.trim()
+            ?.takeIf { it.isNotBlank() } ?: return 0
+
+        val op = (data["operation"] ?: return 0)
+            .firstOrNull { (it["prod_area"] as? String)?.trim() == prodArea }
+            ?: return 0
+
+        val borId = (op["bor_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return 0
+
+        val borRows = (data["bor"] ?: emptyList())
+            .filter { (it["bor_id"] as? String)?.trim() == borId }
+        if (borRows.isEmpty()) return 0
+
+        val resourceRows = data["resource"] ?: emptyList()
+        var minCap = Int.MAX_VALUE
+        for (br in borRows) {
+            val rid = (br["resource_id"] as? String)?.trim() ?: return 0
+            val rate = (br["resource_rate"] as? Number)?.toDouble() ?: return 0
+            if (rate <= 0.0) return 0
+            val resRow = resourceRows.firstOrNull {
+                (it["resource_id"] as? String)?.trim() == rid &&
+                (it["location_id"] as? String)?.trim() == locationId
+            } ?: return 0
+            val size = (resRow["size"] as? Number)?.toDouble() ?: return 0
+            val cap = kotlin.math.floor(size / rate).toInt()
+            if (cap <= 0) return 0
+            if (cap < minCap) minCap = cap
+        }
+        return if (minCap == Int.MAX_VALUE) 0 else minCap
     }
 }
