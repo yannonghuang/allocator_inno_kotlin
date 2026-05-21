@@ -3,6 +3,7 @@ package com.allocator.api
 import com.allocator.*
 import com.allocator.services.CaseLoader
 import com.allocator.services.emitPlanRunEvent
+import com.allocator.services.resolveActiveRunId
 import com.allocator.services.runPlanning
 import io.ktor.http.*
 import io.ktor.server.application.*
@@ -253,11 +254,22 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
                 resultMap?.let { BaselineLookup(row[PlanRuns.id], it, row[PlanRuns.config]) }
             }
         } else {
-            // Latest persisted success run for this case.
+            // Caller did not pin a planRunId — resolve the case's current active
+            // plan (designated by the user if set, else the latest success). This
+            // matches the rule used elsewhere in the system; assessments must never
+            // run against a stale/contingent baseline just because it happens to be
+            // the most-recent-success.
             transaction {
-                val row = PlanRuns.selectAll()
+                val designatedId = Cases.selectAll()
+                    .where { Cases.id eq caseId }
+                    .singleOrNull()?.get(Cases.designatedActivePlanRunId)
+                val successIds = PlanRuns.selectAll()
                     .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
-                    .orderBy(PlanRuns.id, SortOrder.DESC)
+                    .map { it[PlanRuns.id] }
+                val activeRunId = resolveActiveRunId(designatedId, successIds)
+                    ?: return@transaction null
+                val row = PlanRuns.selectAll()
+                    .where { PlanRuns.id eq activeRunId }
                     .firstOrNull() ?: return@transaction null
                 val resultMap = row[PlanRuns.result]?.let { json ->
                     runCatching {
