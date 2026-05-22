@@ -292,6 +292,11 @@ object MaterialImpactAssessments : Table("material_impact_assessment") {
     val criteria            = text("criteria")
     val rating              = varchar("rating", 10)   // LOW | MEDIUM | HIGH
     val explanation         = text("explanation")
+    // Snapshot of impactedDemandCount at the time the assessment was rated. Cache hits
+    // compare this to the freshly-computed count and invalidate the cache row when they
+    // disagree — prevents serving stale "13 demands" text alongside a fresh "27 demands"
+    // impacts[] payload.
+    val impactedDemandCount = integer("impacted_demand_count").default(0)
     val createdAt           = timestamp("created_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 }

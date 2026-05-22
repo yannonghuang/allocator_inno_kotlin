@@ -435,6 +435,7 @@ private suspend fun handleAssessment(
             val rating: String,
             val explanation: String,
             val criteria: String,
+            val impactedDemandCount: Int,
             val createdAt: String,
         )
         val cached: CachedAssessment? = transaction {
@@ -451,6 +452,7 @@ private suspend fun handleAssessment(
                     rating = it[MaterialImpactAssessments.rating],
                     explanation = it[MaterialImpactAssessments.explanation],
                     criteria = it[MaterialImpactAssessments.criteria],
+                    impactedDemandCount = it[MaterialImpactAssessments.impactedDemandCount],
                     createdAt = it[MaterialImpactAssessments.createdAt].toString(),
                 )
             }
@@ -464,8 +466,6 @@ private suspend fun handleAssessment(
         val cachedExplanationZh = cached?.explanation?.let { containsChinese(it) }
         val languageMatches = requestedZh == null || cachedExplanationZh == null || requestedZh == cachedExplanationZh
         if (cached != null && languageMatches) {
-            log.info("assessment cache hit: id={} supplyId={} planRunId={} rating={}",
-                cached.id, idempotencySupplyId, idempotencyPlanRunId, cached.rating)
             // Prefer the caller-supplied impact; otherwise re-run impact analysis to get current demand details (cheap — no LLM).
             val impact = req.impact ?: computeMaterialImpact(MaterialImpactRequest(
                 supplyId = idempotencySupplyId,
@@ -474,21 +474,33 @@ private suspend fun handleAssessment(
                 quantityDecreaseAbs = req.quantityDecreaseAbs,
                 planRunId = idempotencyPlanRunId,
             ))
-            call.respond(
-                AssessmentResponse(
-                    id = cached.id,
-                    rating = cached.rating,
-                    explanation = cached.explanation,
-                    criteria = cached.criteria,
-                    caseId = effectiveCaseId,
-                    planRunId = impact.planRunId,
-                    supply = impact.supply,
-                    impactedDemandCount = impact.impactedDemandCount,
-                    impacts = impact.impacts,
-                    createdAt = cached.createdAt,
+            // Cache validity: the cached rating/explanation text refer to the
+            // impactedDemandCount that was current when the assessment was rated.
+            // If the freshly-computed count differs, the text would be a lie
+            // alongside the fresh impacts[] payload — fall through and re-rate.
+            if (cached.impactedDemandCount == impact.impactedDemandCount) {
+                log.info("assessment cache hit: id={} supplyId={} planRunId={} rating={} count={}",
+                    cached.id, idempotencySupplyId, idempotencyPlanRunId, cached.rating, cached.impactedDemandCount)
+                call.respond(
+                    AssessmentResponse(
+                        id = cached.id,
+                        rating = cached.rating,
+                        explanation = cached.explanation,
+                        criteria = cached.criteria,
+                        caseId = effectiveCaseId,
+                        planRunId = impact.planRunId,
+                        supply = impact.supply,
+                        impactedDemandCount = impact.impactedDemandCount,
+                        impacts = impact.impacts,
+                        createdAt = cached.createdAt,
+                    )
                 )
+                return
+            }
+            log.info(
+                "assessment cache stale: id={} cachedCount={} freshCount={} — re-rating",
+                cached.id, cached.impactedDemandCount, impact.impactedDemandCount
             )
-            return
         }
     }
 
@@ -559,6 +571,7 @@ private suspend fun handleAssessment(
             it[MaterialImpactAssessments.criteria]            = criteria
             it[MaterialImpactAssessments.rating]              = rating
             it[MaterialImpactAssessments.explanation]         = explanation
+            it[MaterialImpactAssessments.impactedDemandCount] = impact.impactedDemandCount
         }
         stmt[MaterialImpactAssessments.id]
     }
