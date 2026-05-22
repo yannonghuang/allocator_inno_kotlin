@@ -43,8 +43,13 @@ fun Routing.supplyRoutes() {
     route("/supplies") {
         get {
             val q = call.request.queryParameters["q"]?.trim() ?: ""
+            val caseId = call.request.queryParameters["caseId"]?.toIntOrNull()
             val rows = transaction {
-                Supplies.selectAll()
+                val query = if (caseId != null)
+                    Supplies.selectAll().where { Supplies.caseId eq caseId }
+                else
+                    Supplies.selectAll()
+                query
                     .orderBy(Supplies.supplyId, SortOrder.ASC)
                     .map { row ->
                         SupplySuggestion(
@@ -58,7 +63,13 @@ fun Routing.supplyRoutes() {
                         )
                     }
             }
-            val results = rows
+            // When no caseId is given, dedupe by supplyId so the typeahead doesn't
+            // show the same row N times (one per case that imported the same CSV).
+            val deduped = if (caseId == null)
+                rows.distinctBy { it.id }
+            else
+                rows
+            val results = deduped
                 .filter { q.isEmpty() || it.id.startsWith(q, ignoreCase = true) || it.productId.contains(q, ignoreCase = true) }
                 .take(20)
             call.respond(results)
