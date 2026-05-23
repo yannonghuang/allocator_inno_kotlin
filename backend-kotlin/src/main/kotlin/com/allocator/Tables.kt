@@ -297,6 +297,12 @@ object MaterialImpactAssessments : Table("material_impact_assessment") {
     // disagree — prevents serving stale "13 demands" text alongside a fresh "27 demands"
     // impacts[] payload.
     val impactedDemandCount = integer("impacted_demand_count").default(0)
+    // JSON-serialized impacts list captured at rate-time. Mode A and Mode B
+    // assessments compute fundamentally different impacts lists (pegging walk
+    // vs full re-plan diff), so on cache hit we MUST return what was actually
+    // rated against — recomputing via Mode A would yield a different list and
+    // a different count even though the parameters are identical.
+    val impactsJson         = text("impacts_json").nullable()
     val createdAt           = timestamp("created_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 }

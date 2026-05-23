@@ -9,6 +9,7 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.*
 import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.transactions.transaction
@@ -436,6 +437,7 @@ private suspend fun handleAssessment(
             val explanation: String,
             val criteria: String,
             val impactedDemandCount: Int,
+            val impactsJson: String?,
             val createdAt: String,
         )
         val cached: CachedAssessment? = transaction {
@@ -453,6 +455,7 @@ private suspend fun handleAssessment(
                     explanation = it[MaterialImpactAssessments.explanation],
                     criteria = it[MaterialImpactAssessments.criteria],
                     impactedDemandCount = it[MaterialImpactAssessments.impactedDemandCount],
+                    impactsJson = it[MaterialImpactAssessments.impactsJson],
                     createdAt = it[MaterialImpactAssessments.createdAt].toString(),
                 )
             }
@@ -466,21 +469,54 @@ private suspend fun handleAssessment(
         val cachedExplanationZh = cached?.explanation?.let { containsChinese(it) }
         val languageMatches = requestedZh == null || cachedExplanationZh == null || requestedZh == cachedExplanationZh
         if (cached != null && languageMatches) {
-            // Prefer the caller-supplied impact; otherwise re-run impact analysis to get current demand details (cheap — no LLM).
-            val impact = req.impact ?: computeMaterialImpact(MaterialImpactRequest(
-                supplyId = idempotencySupplyId,
-                deliveryDelayDays = req.deliveryDelayDays,
-                quantityDecreasePct = req.quantityDecreasePct,
-                quantityDecreaseAbs = req.quantityDecreaseAbs,
-                planRunId = idempotencyPlanRunId,
-            ))
-            // Cache validity: the cached rating/explanation text refer to the
-            // impactedDemandCount that was current when the assessment was rated.
-            // If the freshly-computed count differs, the text would be a lie
-            // alongside the fresh impacts[] payload — fall through and re-rate.
-            if (cached.impactedDemandCount == impact.impactedDemandCount) {
+            // Mode A (computeMaterialImpact, pegging-walk) and Mode B (full re-plan
+            // diff passed in via req.impact) produce *different* impacts lists for
+            // the same supply change. We must not recompute via Mode A on cache hit:
+            // the cached rating + explanation refer to a specific impacts list, and
+            // returning Mode A's numbers next to Mode B's cached explanation made
+            // the user see "13 demands" in one email and "27 demands" in the next.
+            //
+            // Prefer in order: caller-supplied impact (Mode B, freshest) → the
+            // impacts list snapshotted at rate-time → an empty list (legacy rows
+            // that pre-date this column). Re-rate only when no cached impacts and
+            // the caller didn't supply one either.
+            val cachedImpacts: List<MaterialImpactedDemand>? = cached.impactsJson?.let { raw ->
+                runCatching { Json.decodeFromString<List<MaterialImpactedDemand>>(raw) }.getOrNull()
+            }
+            val canServe = req.impact != null || cachedImpacts != null
+            if (canServe) {
+                val supply: MaterialSupplyDetail
+                val planRunIdOut: Int?
+                val impacts: List<MaterialImpactedDemand>
+                val count: Int
+                if (req.impact != null) {
+                    supply = req.impact.supply
+                    planRunIdOut = req.impact.planRunId
+                    impacts = req.impact.impacts
+                    count = req.impact.impactedDemandCount
+                } else {
+                    // Need supply detail for the response; cheap DB lookup.
+                    val supplyRow = transaction {
+                        Supplies.selectAll()
+                            .where { (Supplies.caseId eq effectiveCaseId) and (Supplies.supplyId eq idempotencySupplyId) }
+                            .firstOrNull()
+                    }
+                    supply = supplyRow?.let {
+                        MaterialSupplyDetail(
+                            supplyId = it[Supplies.supplyId],
+                            productId = it[Supplies.productId],
+                            qty = it[Supplies.qty],
+                            supplyDate = it[Supplies.supplyDate],
+                            locationId = it[Supplies.locationId],
+                            vendorId = it[Supplies.vendorId],
+                        )
+                    } ?: MaterialSupplyDetail(idempotencySupplyId, "", 0.0, null, null, null)
+                    planRunIdOut = idempotencyPlanRunId
+                    impacts = cachedImpacts!!
+                    count = cached.impactedDemandCount
+                }
                 log.info("assessment cache hit: id={} supplyId={} planRunId={} rating={} count={}",
-                    cached.id, idempotencySupplyId, idempotencyPlanRunId, cached.rating, cached.impactedDemandCount)
+                    cached.id, idempotencySupplyId, idempotencyPlanRunId, cached.rating, count)
                 call.respond(
                     AssessmentResponse(
                         id = cached.id,
@@ -488,18 +524,18 @@ private suspend fun handleAssessment(
                         explanation = cached.explanation,
                         criteria = cached.criteria,
                         caseId = effectiveCaseId,
-                        planRunId = impact.planRunId,
-                        supply = impact.supply,
-                        impactedDemandCount = impact.impactedDemandCount,
-                        impacts = impact.impacts,
+                        planRunId = planRunIdOut,
+                        supply = supply,
+                        impactedDemandCount = count,
+                        impacts = impacts,
                         createdAt = cached.createdAt,
                     )
                 )
                 return
             }
             log.info(
-                "assessment cache stale: id={} cachedCount={} freshCount={} — re-rating",
-                cached.id, cached.impactedDemandCount, impact.impactedDemandCount
+                "assessment cache row {} has no impacts snapshot and caller didn't supply impact — re-rating",
+                cached.id,
             )
         }
     }
@@ -572,6 +608,7 @@ private suspend fun handleAssessment(
             it[MaterialImpactAssessments.rating]              = rating
             it[MaterialImpactAssessments.explanation]         = explanation
             it[MaterialImpactAssessments.impactedDemandCount] = impact.impactedDemandCount
+            it[MaterialImpactAssessments.impactsJson]         = Json.encodeToString(ListSerializer(MaterialImpactedDemand.serializer()), impact.impacts)
         }
         stmt[MaterialImpactAssessments.id]
     }
