@@ -3,6 +3,7 @@ package com.allocator.api
 import com.allocator.AgentMemory
 import com.allocator.Boms
 import com.allocator.Cases
+import com.allocator.config
 import com.allocator.Demands
 import com.allocator.ManualOverrides
 import com.allocator.MethodBuys
@@ -4942,7 +4943,9 @@ private suspend fun runAgentLoop(
             // fields each). 1024 truncated those mid-row.
             maxTokens = 4096,
             temperature = 0.2,
-            // Pin to NanoGPT direct: the OpenClaw gateway DOES forward the
+            // Route through the shared allocator LLM pin (default nanogpt;
+            // controlled by ALLOCATOR_LLM_PROVIDER). Defaulting to NanoGPT
+            // direct is deliberate: the OpenClaw gateway DOES forward the
             // caller's `tools` array (current OpenClaw build, verified 2026-05-15),
             // but it also auto-injects ~47 built-in tools (read/write/exec,
             // memory_*, all globally-configured MCP servers including
@@ -4951,7 +4954,7 @@ private suspend fun runAgentLoop(
             // is a thin OpenAI-shape passthrough to the same upstream models
             // OpenClaw uses (default minimax/minimax-m2.7), so the model sees
             // only this agent's 35 tools.
-            provider = "nanogpt",
+            provider = config.allocatorLlmProvider,
         )
 
         // No tool calls → final reply.

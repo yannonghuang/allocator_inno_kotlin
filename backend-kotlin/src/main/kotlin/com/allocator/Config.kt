@@ -16,11 +16,18 @@ package com.allocator
  *               OpenClaw's built-in tool manifest. Used by the planning agent to keep its 35-tool
  *               decision space clean.
  * ASSESSMENT_MODEL overrides the default model for whichever provider is active.
+ *
+ * ALLOCATOR_LLM_PROVIDER (default nanogpt) is the shared pin used by all three
+ * allocator-internal LLM callers (assessment rating + explanation, planning
+ * copilot intent classifier, planning agent tool-use loop). It is independent
+ * of LLM_PROVIDER above, which only routes the generic llmChat default path.
+ * Flip ALLOCATOR_LLM_PROVIDER to switch every allocator LLM call site at once.
  */
 data class AppConfig(
     val databaseUrl: String,
     val csvRootPath: String,
     val llmProvider: String,
+    val allocatorLlmProvider: String,
     val openAiApiKey: String?,
     val anthropicApiKey: String?,
     val nanogptApiKey: String?,
@@ -47,6 +54,7 @@ data class AppConfig(
                     ?: "postgresql://postgres:postgres@localhost:5432/allocator",
                 csvRootPath = System.getenv("CSV_ROOT_PATH") ?: "csv",
                 llmProvider = provider,
+                allocatorLlmProvider = (System.getenv("ALLOCATOR_LLM_PROVIDER") ?: "nanogpt").lowercase(),
                 openAiApiKey = System.getenv("OPENAI_API_KEY"),
                 anthropicApiKey = System.getenv("ANTHROPIC_API_KEY"),
                 nanogptApiKey = System.getenv("NANOGPT_API_KEY"),

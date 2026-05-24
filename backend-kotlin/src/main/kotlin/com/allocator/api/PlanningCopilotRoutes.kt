@@ -1,6 +1,7 @@
 package com.allocator.api
 
 import com.allocator.Cases
+import com.allocator.config
 import com.allocator.services.LlmMessage
 import com.allocator.services.LlmNotConfiguredException
 import com.allocator.services.llmChat
@@ -147,13 +148,14 @@ private suspend fun llmParse(
     }
 
     val text = try {
-        // Pin to nanogpt regardless of global LLM_PROVIDER — see ASSESSMENT_PROVIDER
-        // in AssessmentRoutes.kt for the rationale.
+        // Route through the shared allocator LLM pin (default nanogpt; controlled
+        // by ALLOCATOR_LLM_PROVIDER). Kept distinct from the global LLM_PROVIDER
+        // so the generic llmChat default path can target a different provider.
         llmChat(
             systemPrompt = SYSTEM_PROMPT,
             messages = msgs,
             maxTokens = 500,
-            provider = "nanogpt",
+            provider = config.allocatorLlmProvider,
         ).trim()
     } catch (e: LlmNotConfiguredException) {
         log.info("Planning copilot: {}, using rule-based fallback", e.message)

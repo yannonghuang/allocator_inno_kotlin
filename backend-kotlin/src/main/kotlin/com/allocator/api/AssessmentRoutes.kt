@@ -284,18 +284,17 @@ $criteria
 """.trimIndent()
 }
 
-// Pin assessment LLM calls to nanogpt regardless of the global LLM_PROVIDER.
-// OpenClaw's /v1/chat/completions and the Claude Pro sub token both have caps/quirks
-// that surface as opaque 5xx; nanogpt's OpenAI-shape passthrough is the most reliable
-// path for short structured prompts like RATING and keeps assessment cost off the
-// direct OpenAI bill. Falls back via the global LLM_PROVIDER chain if nanogpt errors.
-private const val ASSESSMENT_PROVIDER = "nanogpt"
+// Assessment LLM calls go through whichever provider config.allocatorLlmProvider
+// selects (default nanogpt; flip ALLOCATOR_LLM_PROVIDER to switch every
+// allocator-internal LLM call site at once — assessment, planning copilot,
+// planning agent). Kept distinct from the global LLM_PROVIDER so the generic
+// llmChat default path can target a different provider if needed.
 
 private suspend fun callLlm(prompt: String): Pair<String, String> {
     val text = llmChat(
         messages = listOf(LlmMessage("user", prompt)),
         maxTokens = 512,
-        provider = ASSESSMENT_PROVIDER,
+        provider = config.allocatorLlmProvider,
     )
 
     val ratingLine = text.lines().firstOrNull { it.startsWith("RATING:") }
@@ -315,7 +314,7 @@ private suspend fun callLlmForText(prompt: String): String =
     llmChat(
         messages = listOf(LlmMessage("user", prompt)),
         maxTokens = 256,
-        provider = ASSESSMENT_PROVIDER,
+        provider = config.allocatorLlmProvider,
     ).trim()
 
 // ── Routes ────────────────────────────────────────────────────────────────────
