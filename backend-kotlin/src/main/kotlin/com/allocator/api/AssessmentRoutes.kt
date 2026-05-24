@@ -284,10 +284,12 @@ $criteria
 """.trimIndent()
 }
 
-// Pin assessment LLM calls to OpenAI regardless of the global LLM_PROVIDER. OpenClaw's
-// /v1/chat/completions and the Claude Pro sub token both have caps/quirks that surface as
-// opaque 5xx; OpenAI's API is the most reliable for short structured prompts like RATING.
-private const val ASSESSMENT_PROVIDER = "openai"
+// Pin assessment LLM calls to nanogpt regardless of the global LLM_PROVIDER.
+// OpenClaw's /v1/chat/completions and the Claude Pro sub token both have caps/quirks
+// that surface as opaque 5xx; nanogpt's OpenAI-shape passthrough is the most reliable
+// path for short structured prompts like RATING and keeps assessment cost off the
+// direct OpenAI bill. Falls back via the global LLM_PROVIDER chain if nanogpt errors.
+private const val ASSESSMENT_PROVIDER = "nanogpt"
 
 private suspend fun callLlm(prompt: String): Pair<String, String> {
     val text = llmChat(
