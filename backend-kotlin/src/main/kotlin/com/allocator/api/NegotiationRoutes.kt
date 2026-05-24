@@ -273,6 +273,30 @@ fun Routing.negotiationRoutes() {
     }
 
     /**
+     * GET /negotiation-waits/latest-unresolved
+     * Returns the most recent unresolved wait across all cases (or null).
+     * Used by the OpenClaw main agent to detect a paused subagent and forward
+     * the user's free-text chat reply to /cases/{caseId}/negotiation-reply
+     * instead of treating it as a fresh greeting — the negotiation prompt is
+     * surfaced through the OpenClaw chat, not a dedicated UI dialog, so main
+     * needs a way to discover the paused subagent without a case context.
+     */
+    get("/negotiation-waits/latest-unresolved") {
+        val view = transaction {
+            NegotiationWaits.selectAll()
+                .where { NegotiationWaits.resolvedAt.isNull() }
+                .orderBy(NegotiationWaits.id, SortOrder.DESC)
+                .firstOrNull()
+                ?.toWaitView()
+        }
+        if (view == null) {
+            call.respond(HttpStatusCode.OK, JsonNull)
+            return@get
+        }
+        call.respond(view)
+    }
+
+    /**
      * GET /cases/{caseId}/negotiation-waits
      * Returns the chronological history of waits for this case (for a chain timeline view).
      */
