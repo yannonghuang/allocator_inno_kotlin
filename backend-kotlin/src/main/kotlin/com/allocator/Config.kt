@@ -38,8 +38,13 @@ data class AppConfig(
     val openClawMaterialAgent: String,
 ) {
     companion object {
+        // Treat empty env values as unset — docker-compose's `${VAR:-}` pattern
+        // forwards an empty string when the host env lacks the var, and `?:`
+        // alone would accept the empty string and skip the fallback.
+        private fun env(name: String): String? = System.getenv(name)?.takeUnless { it.isBlank() }
+
         fun load(): AppConfig {
-            val provider = (System.getenv("LLM_PROVIDER") ?: "openclaw").lowercase()
+            val provider = (env("LLM_PROVIDER") ?: "openclaw").lowercase()
             val defaultModel = when (provider) {
                 "openai" -> "gpt-4o-mini"
                 "anthropic" -> "claude-haiku-4-5-20251001"
@@ -50,20 +55,20 @@ data class AppConfig(
                 else -> "openclaw"
             }
             return AppConfig(
-                databaseUrl = System.getenv("DATABASE_URL")
+                databaseUrl = env("DATABASE_URL")
                     ?: "postgresql://postgres:postgres@localhost:5432/allocator",
-                csvRootPath = System.getenv("CSV_ROOT_PATH") ?: "csv",
+                csvRootPath = env("CSV_ROOT_PATH") ?: "csv",
                 llmProvider = provider,
-                allocatorLlmProvider = (System.getenv("ALLOCATOR_LLM_PROVIDER") ?: "nanogpt").lowercase(),
-                openAiApiKey = System.getenv("OPENAI_API_KEY"),
-                anthropicApiKey = System.getenv("ANTHROPIC_API_KEY"),
-                nanogptApiKey = System.getenv("NANOGPT_API_KEY"),
-                nanogptBaseUrl = System.getenv("NANOGPT_BASE_URL")
+                allocatorLlmProvider = (env("ALLOCATOR_LLM_PROVIDER") ?: "nanogpt").lowercase(),
+                openAiApiKey = env("OPENAI_API_KEY"),
+                anthropicApiKey = env("ANTHROPIC_API_KEY"),
+                nanogptApiKey = env("NANOGPT_API_KEY"),
+                nanogptBaseUrl = env("NANOGPT_BASE_URL")
                     ?: "https://nano-gpt.com/api/subscription/v1",
-                assessmentModel = System.getenv("ASSESSMENT_MODEL") ?: defaultModel,
-                openClawUrl = System.getenv("OPENCLAW_URL") ?: "http://openclaw:18789",
-                openClawToken = System.getenv("OPENCLAW_TOKEN"),
-                openClawMaterialAgent = System.getenv("OPENCLAW_MATERIAL_AGENT") ?: "openclaw:material",
+                assessmentModel = env("ASSESSMENT_MODEL") ?: defaultModel,
+                openClawUrl = env("OPENCLAW_URL") ?: "http://openclaw:18789",
+                openClawToken = env("OPENCLAW_TOKEN"),
+                openClawMaterialAgent = env("OPENCLAW_MATERIAL_AGENT") ?: "openclaw:material",
             )
         }
     }
