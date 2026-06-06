@@ -72,6 +72,16 @@ data class NegotiationWaitRequest(
 )
 
 @Serializable
+data class NegotiationResolveRequest(
+    val sessionKey: String,
+    // Optional label for the resolved_action column. Defaults to
+    // "agent_resolved" — a distinct value (vs keep/abandon/counter/nl/superseded)
+    // that flags a wait the agent self-closed because the reply reached it
+    // through a channel other than /negotiation-reply.
+    val action: String? = null,
+)
+
+@Serializable
 data class NegotiationWaitView(
     val id: Int,
     val caseId: Int,
@@ -153,23 +163,7 @@ fun Routing.negotiationRoutes() {
 
         // Mark the most recent active wait for this session as resolved before dispatching
         // so the UI card disappears as soon as the reply is sent.
-        transaction {
-            val activeId = NegotiationWaits.selectAll()
-                .where {
-                    (NegotiationWaits.caseId eq caseId) and
-                        (NegotiationWaits.sessionKey eq req.sessionKey) and
-                        (NegotiationWaits.resolvedAt.isNull())
-                }
-                .orderBy(NegotiationWaits.id, SortOrder.DESC)
-                .firstOrNull()
-                ?.get(NegotiationWaits.id)
-            if (activeId != null) {
-                NegotiationWaits.update({ NegotiationWaits.id eq activeId }) {
-                    it[NegotiationWaits.resolvedAt] = Clock.System.now()
-                    it[NegotiationWaits.resolvedAction] = action
-                }
-            }
-        }
+        resolveLatestActiveWait(caseId, req.sessionKey, action)
 
         // Fire-and-forget. A material-agent turn re-runs material_engine and
         // re-rates before emitting the next trace, which can exceed any
@@ -199,6 +193,35 @@ fun Routing.negotiationRoutes() {
             put("status", "dispatched")
             put("sessionKey", req.sessionKey)
             put("action", action)
+        })
+    }
+
+    /**
+     * POST /cases/{caseId}/negotiation-waits/resolve
+     * Marks the latest unresolved wait for a sessionKey resolved WITHOUT
+     * dispatching a reply to OpenClaw. Called by the material agent at its
+     * terminal convergence points (Step 2 entry + Step 4 stop) to guarantee the
+     * wait card clears even when the negotiation reply reached the agent through
+     * a channel other than /negotiation-reply (e.g. a direct webchat message to
+     * the subagent) — that endpoint is otherwise the only writer of resolved_at,
+     * so a bypassing reply leaves the row orphaned and the case page stuck on
+     * "negotiating". Idempotent: a no-op when no active wait exists (already
+     * resolved via /negotiation-reply, superseded, or never registered).
+     */
+    post("/cases/{caseId}/negotiation-waits/resolve") {
+        val caseId = call.parameters["caseId"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid caseId")
+        val req = call.receive<NegotiationResolveRequest>()
+        val action = req.action?.lowercase() ?: "agent_resolved"
+
+        val resolvedId = resolveLatestActiveWait(caseId, req.sessionKey, action)
+        log.info(
+            "negotiation-wait resolve: caseId={} sessionKey={} action={} resolvedId={}",
+            caseId, req.sessionKey, action, resolvedId,
+        )
+        call.respond(HttpStatusCode.OK, buildJsonObject {
+            put("status", if (resolvedId != null) "resolved" else "noop")
+            resolvedId?.let { put("id", it) }
         })
     }
 
@@ -316,6 +339,31 @@ fun Routing.negotiationRoutes() {
         }
         call.respond(rows)
     }
+}
+
+/**
+ * Resolve the latest unresolved wait for (caseId, sessionKey), stamping
+ * resolved_at + resolved_action. Returns the resolved row id, or null when no
+ * active wait exists. Shared by /negotiation-reply (reply-driven resolution)
+ * and /negotiation-waits/resolve (agent-driven, no dispatch).
+ */
+private fun resolveLatestActiveWait(caseId: Int, sessionKey: String, action: String): Int? = transaction {
+    val activeId = NegotiationWaits.selectAll()
+        .where {
+            (NegotiationWaits.caseId eq caseId) and
+                (NegotiationWaits.sessionKey eq sessionKey) and
+                (NegotiationWaits.resolvedAt.isNull())
+        }
+        .orderBy(NegotiationWaits.id, SortOrder.DESC)
+        .firstOrNull()
+        ?.get(NegotiationWaits.id)
+    if (activeId != null) {
+        NegotiationWaits.update({ NegotiationWaits.id eq activeId }) {
+            it[NegotiationWaits.resolvedAt] = Clock.System.now()
+            it[NegotiationWaits.resolvedAction] = action
+        }
+    }
+    activeId
 }
 
 private fun ResultRow.toWaitView() = NegotiationWaitView(
