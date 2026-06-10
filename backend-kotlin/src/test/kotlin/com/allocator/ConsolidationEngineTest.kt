@@ -71,7 +71,8 @@ class ConsolidationEngineTest : FunSpec({
         val d1need = ComponentNeed("C", "L", LocalDate.of(2025, 1, 15), 10.0, "D1", 1, "FG1")
         val d2need = ComponentNeed("C", "L", LocalDate.of(2025, 1, 15), 40.0, "D2", 2, "FG2")
         val group  = ConsolidationGroup("C", "L", LocalDate.of(2025, 1, 9), listOf(d1need, d2need), 50.0)
-        val inv    = mutableListOf<MutableMap<String, Any?>>()
+        // Inventory-only consolidation: ample on-hand stock for C → full 50 allocatable.
+        val inv    = mutableListOf(supply("C", "L", 100.0))
         val config = ConsolidationConfig(enabled = true, periodDays = 7, allocationMode = "priority_first")
 
         val result = runConsolidation(listOf(group), inv, emptyData, config, planFn = ::simplePlanFn)
@@ -91,7 +92,7 @@ class ConsolidationEngineTest : FunSpec({
         val d1need = ComponentNeed("C", "L", LocalDate.of(2025, 1, 15), 10.0, "D1", 1, "FG1")
         val d2need = ComponentNeed("C", "L", LocalDate.of(2025, 1, 15), 40.0, "D2", 2, "FG2")
         val group  = ConsolidationGroup("C", "L", LocalDate.of(2025, 1, 9), listOf(d1need, d2need), 50.0)
-        val inv    = mutableListOf<MutableMap<String, Any?>>()
+        val inv    = mutableListOf(supply("C", "L", 100.0))
         val config = ConsolidationConfig(enabled = true, periodDays = 7, allocationMode = "priority_first")
 
         val result = runConsolidation(listOf(group), inv, emptyData, config, planFn = ::simplePlanFn)
@@ -107,10 +108,12 @@ class ConsolidationEngineTest : FunSpec({
         val d1need = ComponentNeed("C", "L", LocalDate.of(2025, 1, 15), 10.0, "D1", 1, "FG1")
         val d2need = ComponentNeed("C", "L", LocalDate.of(2025, 1, 15), 40.0, "D2", 2, "FG2")
         val group  = ConsolidationGroup("C", "L", LocalDate.of(2025, 1, 9), listOf(d1need, d2need), 50.0)
-        val inv    = mutableListOf<MutableMap<String, Any?>>()
+        // Scarcity is now modeled as limited on-hand stock (25) rather than a capped
+        // planFn: consolidation allocates only the 25 available, split proportionally.
+        val inv    = mutableListOf(supply("C", "L", 25.0))
         val config = ConsolidationConfig(enabled = true, periodDays = 7, allocationMode = "proportional")
 
-        val result = runConsolidation(listOf(group), inv, emptyData, config, planFn = cappedPlanFn(25.0))
+        val result = runConsolidation(listOf(group), inv, emptyData, config, planFn = ::simplePlanFn)
 
         // D1 → 25 * (10/50) = 5.0; D2 → 25 * (40/50) = 20.0
         result.allocation["D1"]!!["C|L"]!! shouldBe (5.0 plusOrMinus 1e-9)
@@ -123,10 +126,11 @@ class ConsolidationEngineTest : FunSpec({
         val d1need = ComponentNeed("C", "L", LocalDate.of(2025, 1, 15), 30.0, "D1", 1, "FG1")
         val d2need = ComponentNeed("C", "L", LocalDate.of(2025, 1, 15), 30.0, "D2", 2, "FG2")
         val group  = ConsolidationGroup("C", "L", LocalDate.of(2025, 1, 9), listOf(d1need, d2need), 60.0)
-        val inv    = mutableListOf<MutableMap<String, Any?>>()
+        // Scarce on-hand stock (40) split priority_first across the two demands.
+        val inv    = mutableListOf(supply("C", "L", 40.0))
         val config = ConsolidationConfig(enabled = true, periodDays = 7, allocationMode = "priority_first")
 
-        val result = runConsolidation(listOf(group), inv, emptyData, config, planFn = cappedPlanFn(40.0))
+        val result = runConsolidation(listOf(group), inv, emptyData, config, planFn = ::simplePlanFn)
 
         result.allocation["D1"]!!["C|L"]!! shouldBe (30.0 plusOrMinus 1e-9)  // full
         result.allocation["D2"]!!["C|L"]!! shouldBe (10.0 plusOrMinus 1e-9)  // only remainder
@@ -137,7 +141,7 @@ class ConsolidationEngineTest : FunSpec({
     test("Sc5: single demand group — pass-through with original demandId") {
         val d1need = ComponentNeed("C", "L", LocalDate.of(2025, 1, 15), 10.0, "D1", 1, "FG1")
         val group  = ConsolidationGroup("C", "L", LocalDate.of(2025, 1, 9), listOf(d1need), 10.0)
-        val inv    = mutableListOf<MutableMap<String, Any?>>()
+        val inv    = mutableListOf(supply("C", "L", 100.0))
         val config = ConsolidationConfig(enabled = true, periodDays = 7)
 
         val result = runConsolidation(listOf(group), inv, emptyData, config, planFn = ::simplePlanFn)
@@ -156,7 +160,7 @@ class ConsolidationEngineTest : FunSpec({
             ComponentNeed("C", "L", LocalDate.of(2025, 1, 15), 10.0, "D3", 3, "FG3"),
         )
         val group  = ConsolidationGroup("C", "L", LocalDate.of(2025, 1, 9), needs, 30.0)
-        val inv    = mutableListOf<MutableMap<String, Any?>>()
+        val inv    = mutableListOf(supply("C", "L", 100.0))
         val config = ConsolidationConfig(enabled = true, periodDays = 7, allocationMode = "priority_first")
 
         val result = runConsolidation(listOf(group), inv, emptyData, config, planFn = ::simplePlanFn)
@@ -252,12 +256,20 @@ class ConsolidationEngineTest : FunSpec({
         cfg.allocationMode shouldBe "proportional"
     }
 
+    test("Sc9c: max_iterations defaults to 1 and clamps to 1..15") {
+        parseConsolidationConfig(mapOf("consolidation" to mapOf("enabled" to true))).maxIterations shouldBe 1
+        parseConsolidationConfig(mapOf("consolidation" to mapOf("enabled" to true, "max_iterations" to 15))).maxIterations shouldBe 15
+        parseConsolidationConfig(mapOf("consolidation" to mapOf("enabled" to true, "max_iterations" to 0))).maxIterations shouldBe 1   // clamped
+        parseConsolidationConfig(mapOf("consolidation" to mapOf("enabled" to true, "max_iterations" to 99))).maxIterations shouldBe 15 // clamped
+        parseConsolidationConfig(mapOf("consolidation" to mapOf("enabled" to true, "max_iter" to 3))).maxIterations shouldBe 3        // short alias
+    }
+
     // ── Scenario 10: Non-shared component — pass-through ─────────────────────
 
     test("Sc10: single-demand group is treated as pass-through") {
         val need  = ComponentNeed("X", "L", LocalDate.of(2025, 1, 15), 5.0, "D1", 1, "FG1")
         val group = ConsolidationGroup("X", "L", LocalDate.of(2025, 1, 9), listOf(need), 5.0)
-        val inv   = mutableListOf<MutableMap<String, Any?>>()
+        val inv   = mutableListOf(supply("X", "L", 100.0))
         val config = ConsolidationConfig(enabled = true, periodDays = 7)
 
         val result = runConsolidation(listOf(group), inv, emptyData, config, planFn = ::simplePlanFn)
@@ -280,7 +292,7 @@ class ConsolidationEngineTest : FunSpec({
         groupC.needs shouldHaveSize 2
         groupX.needs shouldHaveSize 1
 
-        val inv    = mutableListOf<MutableMap<String, Any?>>()
+        val inv    = mutableListOf(supply("C", "L", 100.0), supply("X", "L", 100.0))
         val config = ConsolidationConfig(enabled = true, periodDays = 7, allocationMode = "priority_first")
         val result = runConsolidation(groups, inv, emptyData, config, planFn = ::simplePlanFn)
 
@@ -647,5 +659,37 @@ class ConsolidationEngineTest : FunSpec({
         // Gate triggered via sharper probe — no ComponentNeed for C1 even though C1 has supply.
         needs shouldHaveSize 0
         methodChoices shouldNotContainKey Triple("FG", "PLANT", "D1")
+    }
+
+    // ── Single-bucket (period_days=0) must schedule against a REAL date ──────────
+    // Regression: the grouping bucket is LocalDate.EPOCH under single-bucket
+    // consolidation, but that sentinel must not become the synthetic demand's
+    // request date — otherwise purchases anchored at 1970 underflow to 1969 once
+    // lead time is subtracted. The schedule date must be the earliest real due date.
+
+    test("Sc-epoch: single-bucket consolidated demand schedules at earliest real due date, not EPOCH") {
+        // Multi-demand group with EPOCH grouping bucket (as produced by period_days=0)
+        // but real due dates Jan 15 / Jan 20. planFn echoes reqDt into the WO end_time.
+        val n1 = ComponentNeed("C", "L", LocalDate.of(2025, 1, 20), 10.0, "D1", 1, "FG1")
+        val n2 = ComponentNeed("C", "L", LocalDate.of(2025, 1, 15), 40.0, "D2", 2, "FG2")
+        val group = ConsolidationGroup("C", "L", LocalDate.EPOCH, listOf(n1, n2), 50.0)
+        val config = ConsolidationConfig(enabled = true, periodDays = 0, allocationMode = "fair")
+
+        val result = runConsolidation(listOf(group), mutableListOf(supply("C", "L", 100.0)), emptyData, config, planFn = ::simplePlanFn)
+
+        result.consolidatedWOs shouldHaveSize 1
+        // Earliest due date among needs, NOT 1970-01-01.
+        result.consolidatedWOs[0]["end_time"] shouldBe "2025-01-15"
+    }
+
+    test("Sc-epoch: single-demand single-bucket group also avoids EPOCH scheduling") {
+        val n1 = ComponentNeed("C", "L", LocalDate.of(2025, 3, 9), 25.0, "D1", 1, "FG1")
+        val group = ConsolidationGroup("C", "L", LocalDate.EPOCH, listOf(n1), 25.0)
+        val config = ConsolidationConfig(enabled = true, periodDays = 0, allocationMode = "fair")
+
+        val result = runConsolidation(listOf(group), mutableListOf(supply("C", "L", 100.0)), emptyData, config, planFn = ::simplePlanFn)
+
+        result.consolidatedWOs shouldHaveSize 1
+        result.consolidatedWOs[0]["end_time"] shouldBe "2025-03-09"
     }
 })

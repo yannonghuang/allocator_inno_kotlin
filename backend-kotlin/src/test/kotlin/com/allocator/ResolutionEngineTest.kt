@@ -171,10 +171,11 @@ class ResolutionEngineTest : FunSpec({
         byLeaf["C2"]!! shouldBe (40.0 plusOrMinus 1e-9)
     }
 
-    test("buildResolutionGraph: OR alt_group enumerates every child (union-alt)") {
-        // FG → (C1 OR C2): same alt_group; resolution emits one path per alternative
-        // so consolidation can form merged groups at every candidate leaf. Phase 3
-        // picks the actual alt at runtime; the cap loop drives unpicked alts to zero.
+    test("buildResolutionGraph: OR alt_group splits demand across alternatives (union-alt)") {
+        // FG → (C1 OR C2): same alt_group; resolution emits one path per alternative so
+        // consolidation can form merged groups at every candidate leaf, but the demand is
+        // SPLIT across the alternatives (10 / 2 = 5 each) to match the planner's equal-split
+        // — not provisioned at full qty each (which over-allocates N× at every shared leaf).
         val data = mapOf(
             "bom" to listOf(
                 bom("FG", "C1", 1.0, altGroup = "or1"),
@@ -193,8 +194,8 @@ class ResolutionEngineTest : FunSpec({
         val graph = buildResolutionGraph(demands, data)
         graph.paths shouldHaveSize 2
         val byLeaf = graph.paths.associate { it.leaf.productId to it.leafQuantity() }
-        byLeaf["C1"]!! shouldBe (10.0 plusOrMinus 1e-9)
-        byLeaf["C2"]!! shouldBe (10.0 plusOrMinus 1e-9)
+        byLeaf["C1"]!! shouldBe (5.0 plusOrMinus 1e-9)   // 10 split across 2 alternatives
+        byLeaf["C2"]!! shouldBe (5.0 plusOrMinus 1e-9)
     }
 
     // ── Inventory-blindness ──────────────────────────────────────────────────
@@ -734,14 +735,14 @@ class ResolutionEngineTest : FunSpec({
 
         @Suppress("UNCHECKED_CAST")
         val workOrders = result["work_orders"] as List<Map<String, Any?>>
-        // Find the consolidated WO(s) at 502-2588. Multiple lots may have been emitted
-        // if lot_size constraint applies; sum across all consolidated lots.
-        val consolidatedAt2588 = workOrders.filter {
-            it["product_id"] == "502-2588" && it["location_id"] == "L1" && it["consolidated"] == true
+        // Node-level WOs (default): the 502-2588 production is per-demand purchase orders,
+        // 1:1 with the pegging skeleton. Sum them — total is right-sized to actual demand.
+        val purchasesAt2588 = workOrders.filter {
+            it["product_id"] == "502-2588" && it["location_id"] == "L1" && it["method"] == "purchase"
         }
-        val totalQty = consolidatedAt2588.sumOf { (it["quantity"] as Number).toDouble() }
-        // 5 of DA's 502-2588 budget went unused (DA consumed 5 from 500-5391 supply instead).
-        // Trim: 20 → 15.
+        val totalQty = purchasesAt2588.sumOf { (it["quantity"] as Number).toDouble() }
+        // DA consumes 5 from the 500-5391 intermediate supply, so only buys 5 of 502-2588;
+        // DB buys its full 10. Total = 15 (not the naive 20).
         totalQty shouldBe (15.0 plusOrMinus 1e-6)
     }
 
@@ -831,12 +832,13 @@ class ResolutionEngineTest : FunSpec({
 
         @Suppress("UNCHECKED_CAST")
         val workOrders = result["work_orders"] as List<Map<String, Any?>>
-        val consolidatedAtRaw = workOrders.filter {
-            it["product_id"] == "RAW" && it["location_id"] == "L1" && it["consolidated"] == true
+        // Node-level WOs: per-demand RAW purchases (no intermediate supply to absorb any),
+        // 1:1 with the pegging skeleton. Both demands buy their full 10.
+        val purchasesAtRaw = workOrders.filter {
+            it["product_id"] == "RAW" && it["location_id"] == "L1" && it["method"] == "purchase"
         }
-        // Sum across all consolidated lots at RAW.
-        val totalQty = consolidatedAtRaw.sumOf { (it["quantity"] as Number).toDouble() }
-        // No trim — total stays at full demand qty (20).
+        val totalQty = purchasesAtRaw.sumOf { (it["quantity"] as Number).toDouble() }
+        // Total stays at full demand qty (20).
         totalQty shouldBe (20.0 plusOrMinus 1e-6)
     }
 
@@ -894,13 +896,13 @@ class ResolutionEngineTest : FunSpec({
         capped.members.first { it.demandId == "DB" }.qty shouldBe (5.0 plusOrMinus 1e-9)
     }
 
-    test("runPlanning v2: cascade trim — sub-component WO is also right-sized after iteration") {
+    test("runPlanning v2: inventory-only consolidation emits no production WOs; production is per-demand") {
         // FG_A → DEEP; FG_B → DEEP; DEEP → RAW. DEEP is make-able (its make consumes RAW),
-        // RAW is purchasable. Supply: FG_A=5, DEEP=1. DA's chain stops at FG_A (inventory),
-        // so its merged-leaf budget at DEEP goes unused → phase 2 over-produces DEEP, which
-        // CASCADES into an over-sized purchase at RAW. Stage 4a alone would trim DEEP but
-        // leave RAW at 19; Stage 4b's iteration shrinks the merged-leaf qty in iter 1, which
-        // re-runs phase 2 and naturally re-sizes the RAW purchase too.
+        // RAW is purchasable. Supply: FG_A=5, DEEP=1. Under inventory-only consolidation,
+        // Pass 1 allocates only the on-hand FG_A/DEEP stock and PRODUCES nothing; DEEP make
+        // and RAW purchase are emitted per-demand by legacyCommit. (The old engine produced
+        // consolidated DEEP/RAW and cascade-trimmed the over-production; inventory-only
+        // consolidation never over-produces, so there is no cascade trim.)
         val bomRows = listOf(
             mapOf("bom_id" to "BOM_FGA",  "parent_id" to "FG_A", "child_id" to "DEEP", "rate" to 1.0, "alt_group" to null),
             mapOf("bom_id" to "BOM_FGB",  "parent_id" to "FG_B", "child_id" to "DEEP", "rate" to 1.0, "alt_group" to null),
@@ -929,9 +931,11 @@ class ResolutionEngineTest : FunSpec({
             demand("DA", "FG_A", "L1", 10.0),
             demand("DB", "FG_B", "L1", 10.0),
         )
+        // Pass 2 OFF so we test Pass-1 (inventory allocation) in isolation — Pass 2 would
+        // batch the per-demand WOs and also tag them consolidated=true, masking the signal.
         val configV2 = mapOf<String, Any?>(
             "purchase_allowed" to true,
-            "consolidation"    to mapOf("enabled" to true, "period_days" to 0, "engine" to "v2", "allocation_mode" to "fair"),
+            "consolidation"    to mapOf("enabled" to true, "period_days" to 0, "engine" to "v2", "allocation_mode" to "fair", "consolidate_wos" to false),
             "method_selection" to mapOf("multiple" to false),
             "variant_selection" to mapOf<String, Any?>(),
         )
@@ -940,18 +944,13 @@ class ResolutionEngineTest : FunSpec({
         @Suppress("UNCHECKED_CAST")
         val workOrders = result["work_orders"] as List<Map<String, Any?>>
 
-        // Iter 0 sized: DEEP make=19 (20 - 1 supply), RAW purchase=19.
-        // Iter 1 sized: DEEP make=14 (15 - 1 supply), RAW purchase=14.
-        // Stage 4a alone would trim DEEP→14 but leave RAW=19. Stage 4b cascade ⇒ both at 14.
-        val consolidatedAtDeep = workOrders.filter {
-            it["product_id"] == "DEEP" && it["location_id"] == "L1" && it["consolidated"] == true
-        }.sumOf { (it["quantity"] as Number).toDouble() }
-        val consolidatedAtRaw = workOrders.filter {
-            it["product_id"] == "RAW" && it["location_id"] == "L1" && it["consolidated"] == true
-        }.sumOf { (it["quantity"] as Number).toDouble() }
-
-        consolidatedAtDeep shouldBe (14.0 plusOrMinus 1e-6)
-        consolidatedAtRaw  shouldBe (14.0 plusOrMinus 1e-6)
+        // Consolidation produces nothing for DEEP/RAW (no consolidated production WOs).
+        val consolidatedProduction = workOrders.filter {
+            it["consolidated"] == true && (it["product_id"] == "DEEP" || it["product_id"] == "RAW")
+        }
+        consolidatedProduction.size shouldBe 0
+        // DEEP make + RAW purchase still happen — per demand, not consolidated.
+        workOrders.any { it["product_id"] == "RAW" && it["method"] == "purchase" && it["consolidated"] != true } shouldBe true
     }
 
     test("runPlanning v2: iter-0-converged scenarios produce same result as before iteration") {

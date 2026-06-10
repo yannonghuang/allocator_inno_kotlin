@@ -558,6 +558,49 @@ internal fun childMaterialsForMove(method: Map<String, Any?>, quantity: Double):
 
 // ── Method selection ───────────────────────────────────────────────────────────
 
+/**
+ * Selective-purchase whitelist: the set of buyable `product_id`s the user permits
+ * purchasing this run. Returns null when there is no restriction — config absent,
+ * not a list, or an empty/whitespace-only list — meaning *all* buy methods are
+ * admitted (the default, and the historical all-or-nothing behavior when
+ * `purchase_allowed=true`). A non-null set is a strict whitelist: any buy method
+ * whose product is not in the set is dropped.
+ */
+internal fun purchasableSet(config: Map<String, Any?>?): Set<String>? {
+    val raw = config?.get("purchasable_materials") as? List<*> ?: return null
+    val s = raw.mapNotNull { (it as? String)?.trim() }.filter { it.isNotEmpty() }.toSet()
+    return s.ifEmpty { null }
+}
+
+/**
+ * The effective buy-whitelist actually applied by the planner. The user-facing
+ * `purchasable_materials` list controls RAW-material purchases ONLY — the picker enumerates
+ * raw materials (productlocation.prod_area='raw' with a method_buy). Some buyable products
+ * are NOT raw (e.g. purchased sub-assemblies); those are out of scope and must stay
+ * admitted. So we augment the user's set with every non-raw buyable product. Consequence:
+ * selecting EVERY listed (raw) material is equivalent to an empty list — both admit all raw
+ * + all non-raw buys (i.e. "all selected ≡ none selected ≡ no restriction"). Returns null
+ * (no restriction) when the user list is empty.
+ */
+internal fun effectivePurchasableSet(
+    config: Map<String, Any?>?,
+    data: Map<String, List<Map<String, Any?>>>,
+): Set<String>? {
+    val base = purchasableSet(config) ?: return null
+    val rawIds = (data["productlocation"] ?: emptyList())
+        .filter { (it["prod_area"] as? String)?.trim() == "raw" }
+        .mapNotNull { (it["product_id"] as? String)?.trim() }
+        .toHashSet()
+    val nonRawBuyables = (data["method_buy"] ?: emptyList())
+        .mapNotNull { (it["product_id"] as? String)?.trim() }
+        .filter { it.isNotEmpty() && it !in rawIds }
+    return base + nonRawBuyables
+}
+
+/** True if a purchase method for [productId] is admitted under the current gate. */
+private fun buyAdmitted(productId: String, purchaseAllowed: Boolean, purchasable: Set<String>?): Boolean =
+    purchaseAllowed && (purchasable == null || productId.trim() in purchasable)
+
 /** Return all methods (buy/make/move) that can fulfill (product, location). */
 fun getMethods(productId: String, locationId: String, data: Map<String, List<Map<String, Any?>>>): List<Map<String, Any?>> {
     val pid = productId.trim()
@@ -633,6 +676,11 @@ internal fun maxMakeDepth(
     purchaseAllowed: Boolean,
     cache: MutableMap<Pair<String, String>, Int>,
     inProgress: MutableSet<Pair<String, String>> = mutableSetOf(),
+    // Selective-purchase whitelist (null ⇒ no restriction). A buy edge bottoms out
+    // a branch at depth 0 only if the product is actually buyable under the gate —
+    // otherwise the structural cache would admit a make-fallback path that the
+    // runtime planner then rejects, defeating the "skip wasteful recursion" purpose.
+    purchasable: Set<String>? = null,
 ): Int {
     val key = Pair(productId, locationId)
     cache[key]?.let { return it }
@@ -651,43 +699,13 @@ internal fun maxMakeDepth(
 
         if (minDepth > 0) {
             val methods = getMethods(productId, locationId, data)
-                .let { if (purchaseAllowed) it else it.filter { m -> m["type"] != "purchase" } }
+                .filter { m ->
+                    m["type"] != "purchase" ||
+                        buyAdmitted((m["product_id"] as? String) ?: productId, purchaseAllowed, purchasable)
+                }
 
             for (m in methods) {
-                val depth = when (m["type"]) {
-                    "purchase" -> 0
-                    "move" -> {
-                        val source = (m["from_location_id"] as? String)?.trim()
-                        if (source.isNullOrBlank()) Int.MAX_VALUE
-                        else maxMakeDepth(productId, source, data, purchaseAllowed, cache, inProgress)
-                    }
-                    "make" -> {
-                        val variants = variantsForMake(productId, locationId, 1.0, m, data)
-                        if (variants.isEmpty()) Int.MAX_VALUE
-                        else {
-                            // For each variant (alt_group), need max child depth.
-                            // Across variants (OR semantics for alt-groups), pick min.
-                            var minVariantDepth = Int.MAX_VALUE
-                            for ((_, childList) in variants) {
-                                var maxChildDepth = 0
-                                var allReachable = true
-                                for (c in childList) {
-                                    val cPid = (c["product_id"] as? String)?.trim() ?: continue
-                                    val cLid = (c["location_id"] as? String)?.trim() ?: locationId
-                                    val cDepth = maxMakeDepth(cPid, cLid, data, purchaseAllowed, cache, inProgress)
-                                    if (cDepth == Int.MAX_VALUE) { allReachable = false; break }
-                                    if (cDepth > maxChildDepth) maxChildDepth = cDepth
-                                }
-                                if (allReachable && maxChildDepth < minVariantDepth) minVariantDepth = maxChildDepth
-                            }
-                            if (minVariantDepth == Int.MAX_VALUE) Int.MAX_VALUE
-                            else if (productId.startsWith("VirtualProduct_")) minVariantDepth
-                            else if (minVariantDepth >= Int.MAX_VALUE - 1) Int.MAX_VALUE
-                            else 1 + minVariantDepth
-                        }
-                    }
-                    else -> Int.MAX_VALUE
-                }
+                val depth = methodStructuralDepth(productId, locationId, m, data, purchaseAllowed, cache, inProgress, purchasable)
                 if (depth < minDepth) minDepth = depth
                 if (minDepth == 0) break
             }
@@ -698,6 +716,61 @@ internal fun maxMakeDepth(
     } finally {
         inProgress.remove(key)
     }
+}
+
+/**
+ * Structural depth of fulfilling `(productId, locationId)` VIA the single method [m],
+ * sharing [maxMakeDepth]'s memoized child feasibility. `Int.MAX_VALUE` ⇒ this method's
+ * chain can't bottom out — a self-cycle (make/move X ultimately needs X again with no
+ * inventory/buy base case) or a dead-end. [inProgress] MUST already contain
+ * `(productId, locationId)` so a child that references back is detected as a cycle.
+ *
+ * Used by [maxMakeDepth] (to take the min over methods) and by `plan()`'s cycle-aware
+ * pruning, which drops infeasible methods from selection when a feasible one exists so a
+ * single-method pick (max_methods=1) won't commit to a self-cycling method and dead-end.
+ */
+internal fun methodStructuralDepth(
+    productId: String,
+    locationId: String,
+    m: Map<String, Any?>,
+    data: Map<String, List<Map<String, Any?>>>,
+    purchaseAllowed: Boolean,
+    cache: MutableMap<Pair<String, String>, Int>,
+    inProgress: MutableSet<Pair<String, String>>,
+    purchasable: Set<String>? = null,
+): Int = when (m["type"]) {
+    "purchase" -> if (buyAdmitted((m["product_id"] as? String) ?: productId, purchaseAllowed, purchasable)) 0 else Int.MAX_VALUE
+    "move" -> {
+        val source = (m["from_location_id"] as? String)?.trim()
+        if (source.isNullOrBlank()) Int.MAX_VALUE
+        else maxMakeDepth(productId, source, data, purchaseAllowed, cache, inProgress, purchasable)
+    }
+    "make" -> {
+        val variants = variantsForMake(productId, locationId, 1.0, m, data)
+        if (variants.isEmpty()) Int.MAX_VALUE
+        else {
+            // For each variant (alt_group), need max child depth.
+            // Across variants (OR semantics for alt-groups), pick min.
+            var minVariantDepth = Int.MAX_VALUE
+            for ((_, childList) in variants) {
+                var maxChildDepth = 0
+                var allReachable = true
+                for (c in childList) {
+                    val cPid = (c["product_id"] as? String)?.trim() ?: continue
+                    val cLid = (c["location_id"] as? String)?.trim() ?: locationId
+                    val cDepth = maxMakeDepth(cPid, cLid, data, purchaseAllowed, cache, inProgress, purchasable)
+                    if (cDepth == Int.MAX_VALUE) { allReachable = false; break }
+                    if (cDepth > maxChildDepth) maxChildDepth = cDepth
+                }
+                if (allReachable && maxChildDepth < minVariantDepth) minVariantDepth = maxChildDepth
+            }
+            if (minVariantDepth == Int.MAX_VALUE) Int.MAX_VALUE
+            else if (productId.startsWith("VirtualProduct_")) minVariantDepth
+            else if (minVariantDepth >= Int.MAX_VALUE - 1) Int.MAX_VALUE
+            else 1 + minVariantDepth
+        }
+    }
+    else -> Int.MAX_VALUE
 }
 
 /** Pick best method by preference (lowest number). */
@@ -1557,7 +1630,9 @@ internal fun planMethodSlot(
     val lastEnd = woResult.lastEnd
     val lotSizeVal = woResult.lotSizeVal
     val methodType = m["type"] as? String ?: ""
-    val woChildren = if (methodType == "purchase") listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to roundQty(achievableParentQty), "children" to emptyList<Any>()))
+    // Purchase leaves have no source supply record (they are new procurement),
+    // so surface the vendor as their identifier in the supply-leaf table.
+    val woChildren = if (methodType == "purchase") listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to roundQty(achievableParentQty), "vendor_id" to m["vendor_id"], "start_time" to formatDate(startDt), "end_time" to formatDate(lastEnd), "children" to emptyList<Any>()))
                      else childPeggingNodes
     val methodPeggingNode = buildWoNode(productId, productionLocation, achievableParentQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodChoiceExplanation, variantExplanation, woChildrenRelation, woChildren, overrideActive, woGroupId = woResult.woGroupId, data = data)
 
@@ -1866,8 +1941,14 @@ fun plan(
 
     // 2) Get methods
     val purchaseAllowed = config?.get("purchase_allowed") != false  // default true
+    val purchasable = effectivePurchasableSet(config, data)  // raw whitelist + non-raw buyables; null ⇒ no restriction
     val methodsRaw = getMethods(productId, locationId, data)
-    val methods = if (purchaseAllowed) methodsRaw else methodsRaw.filter { m -> m["type"] != "purchase" }
+    // Selective purchase: keep every non-buy method; admit a buy only when
+    // purchase is allowed AND (no whitelist, or this product is whitelisted).
+    val methods = methodsRaw.filter { m ->
+        m["type"] != "purchase" ||
+            buyAdmitted((m["product_id"] as? String) ?: productId, purchaseAllowed, purchasable)
+    }
     if (methods.isEmpty()) {
         // Diagnostic: surface WHY no methods were available so the pegging
         // tree carries enough context to answer "which component has no
@@ -1879,7 +1960,13 @@ fun plan(
         // Attached to the demand node as `failure_explanation` so the UI can
         // render it inline in the failed-pegging area (no awkward synthetic
         // work_order child with a fake method label).
-        val buyFiltered = !purchaseAllowed && methodsRaw.any { it["type"] == "purchase" }
+        // A buy method exists at this location but was filtered out — either by
+        // purchase_allowed=false (global) or by this product being absent from a
+        // non-empty purchasable-materials whitelist (selective).
+        val hasBuyHere = methodsRaw.any { it["type"] == "purchase" }
+        val buyFiltered = !purchaseAllowed && hasBuyHere
+        val buyNotWhitelisted = purchaseAllowed && purchasable != null && hasBuyHere &&
+            productId.trim() !in purchasable
         val otherLocsForMake = (data["method_make"] ?: emptyList())
             .filter { (it["product_id"] as? String)?.trim() == productId }
             .mapNotNull { (it["location_id"] as? String)?.trim() }
@@ -1897,13 +1984,18 @@ fun plan(
                 append(" A buy method exists at this location but is excluded because " +
                     "purchase_allowed=false; enable purchase to admit it.")
             }
+            if (buyNotWhitelisted) {
+                append(" A buy method exists at this location but $productId is not in the " +
+                    "purchasable-materials whitelist; add it (or clear the list to allow all " +
+                    "raw materials) to admit the buy.")
+            }
             if (otherLocs.isNotEmpty()) {
                 append(" The product CAN be produced at: ${otherLocs.joinToString(", ")}, " +
                     "but no method (move-to-$locationId or make-at-$locationId) is defined to " +
                     "bring it here. Add a method_move row from one of those locations to " +
                     "$locationId, or define a make recipe at $locationId.")
             }
-            if (!buyFiltered && otherLocs.isEmpty()) {
+            if (!buyFiltered && !buyNotWhitelisted && otherLocs.isEmpty()) {
                 append(" No method exists for this product at any location — " +
                     "data gap (missing method_make / method_move / method_buy rows).")
             }
@@ -1939,7 +2031,7 @@ fun plan(
     else
         overrideIndex["variant_selection|$productId|$locationId"]
     // Filter to the override-specified method if one is configured
-    val effectiveMethods = if (methodOverride != null) {
+    val overrideFilteredMethods = if (methodOverride != null) {
         val forcedType = (methodOverride["method"] ?: methodOverride["method_type"])?.toString()
         val forcedPref = (methodOverride["preference"] as? Number)?.toInt()
         methods.filter { m ->
@@ -1950,6 +2042,28 @@ fun plan(
             methods
         }
     } else methods
+
+    // ── Cycle-aware method pruning ───────────────────────────────────────────
+    // Drop methods whose chain can't structurally bottom out (a self-cycle — e.g.
+    // make/move X ultimately needs X again, with no inventory/buy base case) WHEN at
+    // least one feasible method remains. This makes single-method mode (max_methods=1)
+    // robust: without it the lowest-preference method is picked blindly, so a demand on
+    // a part that ping-pongs between two locations commits to the cyclic make/move and
+    // dead-ends (cause=cycle_stopped) instead of choosing the feasible buy/move-from-
+    // stock path. If NO method is feasible, keep them all so the genuine failure (and its
+    // diagnostic) still surfaces. Only runs when the feasibility cache is available and
+    // there's an actual choice to make.
+    val effectiveMethods = if (feasibilityCache != null && overrideFilteredMethods.size > 1) {
+        val inProgress = mutableSetOf(Pair(productId, locationId))
+        val feasible = overrideFilteredMethods.filter { mm ->
+            methodStructuralDepth(productId, locationId, mm, data, purchaseAllowed, feasibilityCache, inProgress, purchasable) < Int.MAX_VALUE
+        }
+        if (feasible.isNotEmpty() && feasible.size < overrideFilteredMethods.size) {
+            log.info("cycle-aware: {}@{} pruned {} self-cycling/dead-end method(s); {} feasible remain",
+                productId, locationId, overrideFilteredMethods.size - feasible.size, feasible.size)
+            feasible
+        } else overrideFilteredMethods
+    } else overrideFilteredMethods
 
     val elaborateAtThisLevel = shouldElaborateAtDepth(depth, methodCfg.depth)
 
@@ -1983,7 +2097,7 @@ fun plan(
         // Override-active determination for waterfall: only "did override narrow
         // the candidate set" applies, since waterfall doesn't pick a single
         // method that could "differ from auto-selection".
-        val methodOverrideActiveW = methodOverride != null && effectiveMethods.size < methods.size
+        val methodOverrideActiveW = methodOverride != null && overrideFilteredMethods.size < methods.size
         val overrideActiveW = methodOverrideActiveW || variantOverride != null
 
         val cap = methodCfg.maxMethods.coerceAtMost(ranked.size)
@@ -2082,7 +2196,7 @@ fun plan(
     // Override is active only when it actually changed the selected method vs auto-selection.
     // For elaborate mode (expensive), fall back to checking whether choices were restricted.
     val methodOverrideActive = methodOverride != null && when {
-        useElaborateMethod && elaborateAtThisLevel -> effectiveMethods.size < methods.size
+        useElaborateMethod && elaborateAtThisLevel -> overrideFilteredMethods.size < methods.size
         else -> getPreferredMethod(methods).first?.get("type")?.toString() != m?.get("type")?.toString()
     }
     val overrideActive = methodOverrideActive || variantOverride != null
@@ -2131,12 +2245,13 @@ fun plan(
     var excludedMakeDepth: Int? = null   // computed depth (Int.MAX_VALUE => structural)
     val makeAlternatives: List<Map<String, Any?>> = if (feasibilityCache != null && cachedMakeFailureReason == null) {
         val purchaseAllowedForCache = config?.get("purchase_allowed") != false
+        val purchasableForCache = effectivePurchasableSet(config, data)
         val rawMakes = effectiveMethods.filter { it["type"] == "make" && it !== m }
         rawMakes
             .filter {
                 if (productId.startsWith("VirtualProduct_")) true
                 else {
-                    val mkDepth = maxMakeDepth(productId, locationId, data, purchaseAllowedForCache, feasibilityCache)
+                    val mkDepth = maxMakeDepth(productId, locationId, data, purchaseAllowedForCache, feasibilityCache, purchasable = purchasableForCache)
                     val admitted = mkDepth <= methodCfg.maxBomDepth
                     if (!admitted && excludedMakeDepth == null) excludedMakeDepth = mkDepth
                     admitted
@@ -2163,7 +2278,14 @@ fun plan(
     var anyChildShortAccum = false
     var latestCommit: LocalDate? = null
     var lastBlockedReason: String? = null
-    for ((slotIdx, candidate) in fallbackOrder.take(cap).withIndex()) {
+    // A slot fully blocked by a self-cycle is structurally UNUSABLE (it contributes 0),
+    // not merely capacity-limited — so it does not count against max_methods. Tracking
+    // these as "cycle escapes" lets single-method mode (cap=1) fall through from a cyclic
+    // make/move to the alternative that actually breaks the loop, instead of dead-ending
+    // on cause=cycle_stopped. The total is still bounded by fallbackOrder.size.
+    var cycleEscapes = 0
+    for ((slotIdx, candidate) in fallbackOrder.withIndex()) {
+        if (slotIdx - cycleEscapes >= cap) break
         if (slotIdx > 0 && residual <= MIN_WATERFALL_RESIDUAL) break
         val labelPrefix = if (slotIdx == 0) methodChoiceExplanation
             else "Fallback slot ${slotIdx + 1}/$cap: " +
@@ -2191,6 +2313,11 @@ fun plan(
         if (attempt.blockedReason != null) {
             // Reactive fallback: try the next method on hard block.
             lastBlockedReason = attempt.blockedReason
+            // Cycle-escape: a self-cycle makes this method structurally unusable (achieved
+            // 0), so grant an extra slot to try the alternative even under a tight cap.
+            if (attempt.achievableQty <= 1e-9 && attempt.blockedReason?.contains("cycle") == true) {
+                cycleEscapes++
+            }
             // Memoize structural make failures so future demands skip the
             // doomed BOM walk. Only memo for actual make slots (slotIdx>0
             // gating into makeAlternatives), and only when the failure is
@@ -2220,7 +2347,8 @@ fun plan(
         // Move-to-move split would compound at deep multi-move sites; make
         // alternatives are gated by feasibilityCache and naturally bounded.
         val nextIdx = slotIdx + 1
-        if (nextIdx >= cap) break
+        if (nextIdx >= fallbackOrder.size) break
+        if (nextIdx - cycleEscapes >= cap) break
         if (fallbackOrder[nextIdx]["type"] != "make") break
     }
 
@@ -2382,13 +2510,21 @@ private fun buildWorkOrders(
     val methodType = m["type"] as? String ?: ""
     val woGroupId = nextWoGroupId()
 
-    // Concurrency cap: how many lots can share a wave at this location.
-    // Only meaningful for make WOs under the operation override; move/purchase
-    // stay sequential (cap=1). cap=0 means the override doesn't apply and the
-    // caller has already supplied the static lead, so default to 1 there too.
+    // Concurrency cap: how many lots may share a wave (same start/end) at this
+    // location. Subsequent waves start at the previous wave's end, so the cap
+    // controls how far the lot series marches forward in time.
+    //   • make     → resource-limited: parallelismCap lots per wave, the rest
+    //                cascade forward one lead-time per wave (capacity is real).
+    //   • purchase → no modeled cadence (cycle_days_supply is 0 across the data),
+    //                so all POs are placeable at once. A single wave keeps every
+    //                lot at (due − lead); without this a large consolidated
+    //                quantity split by max_lot_size marches decades into the
+    //                future (one lead-time per lot). [cycle_days_supply > 0 spacing
+    //                is a future enhancement.]
+    //   • move     → no modeled transport-capacity limit, so likewise concurrent.
     val cap = if (methodType == "make")
         OperationLookup.parallelismCap(productId, productionLocation, data).coerceAtLeast(1)
-    else 1
+    else Int.MAX_VALUE
 
     val wos = mutableListOf<Map<String, Any?>>()
     var left = qty
@@ -2427,6 +2563,167 @@ private fun buildWorkOrders(
         waveStart = if (left > 1e-9) waveEnd else null
     }
     return WorkOrderResult(wos, lotCount, lastEnd, lotSizeVal, woGroupId)
+}
+
+/**
+ * Derive the output work-order list directly from the final per-demand pegging trees —
+ * one flat work order per pegging WO node, carrying the node's TOTAL quantity plus
+ * `lot_count` (the per-node lot-explosion is metadata, not separate rows).
+ *
+ * This is the WO-consolidation half of the two-pass model expressed faithfully to the
+ * mental model: Pass 1 builds the per-demand pegging SKELETON (BOM explosion + alternative
+ * selection + quantities); the work orders are then the skeleton's WO nodes 1:1. Because
+ * each emitted WO carries the node's own (demand_id, product, location, method, start_time)
+ * and wo_group_id, it resolves back to exactly that pegging node — so the pegging panel,
+ * supplies expansion, and predecessor/successor drill-down all work BY CONSTRUCTION. (The
+ * old lot-level expansion produced ~5× more rows that didn't each map to a node; the
+ * cross-demand batch (consolidateWorkOrdersByTiming) collapses further but severs that
+ * per-demand linkage, so it is opt-in only.)
+ */
+private fun flattenPeggingToWorkOrders(
+    peggingTrees: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+): List<Map<String, Any?>> {
+    val out = mutableListOf<Map<String, Any?>>()
+    fun walk(node: Any?, demandId: Any?, members: List<String>?) {
+        val n = node as? Map<*, *> ?: return
+        if (n["type"] == "work_order") {
+            val pid = (n["product_id"] as? String)?.trim() ?: ""
+            val lid = (n["location_id"] as? String)?.trim() ?: ""
+            out.add(buildMap {
+                put("product_id", pid)
+                put("location_id", lid)
+                put("quantity", n["quantity"])
+                put("start_time", n["start_time"])
+                put("end_time", n["end_time"])
+                put("method", n["method"])
+                put("location_source", n["location_source"])
+                put("demand_id", demandId)
+                put("prod_area", getProdArea(pid, lid, data))
+                put("override_active", n["override_active"] ?: false)
+                put("wo_group_id", n["wo_group_id"])
+                put("lot_count", n["lot_count"])
+                put("max_lot_size", n["max_lot_size"])
+                put("wave_index", 0)
+                if (members != null) put("consolidated_demand_ids", members)
+                if (n["failed"] == true) put("failed", true)
+            })
+        }
+        (n["children"] as? List<*>)?.forEach { walk(it, demandId, members) }
+    }
+    for (entry in peggingTrees) {
+        @Suppress("UNCHECKED_CAST")
+        val members = entry["consolidated_demand_ids"] as? List<String>
+        walk(entry["tree"], entry["demand_id"], members)
+    }
+    return out
+}
+
+/**
+ * Pass 2 — work-order timing/scheduling consolidation.
+ *
+ * Batches per-demand work orders that produce/buy/move the SAME
+ * (product, location, method, source) and start within the same scheduling window
+ * into fewer, larger orders (re-lotted by max_lot_size), cutting the WO count.
+ * This is the scheduling counterpart to Pass-1 inventory allocation: Pass 1 decides
+ * WHO gets scarce stock; Pass 2 decides HOW to batch the resulting production.
+ *
+ * Operates on the final work-order list only; per-demand pegging trees are left
+ * intact for traceability. A merged order carries `consolidated=true`,
+ * `demand_id=null`, and `wo_competing_demands` (the demands it serves), reusing the
+ * existing consolidated-WO rendering. Singleton groups pass through unchanged, as do
+ * failed-WO stubs and any WO without a parseable start.
+ *
+ * Merged timing: the batch is ready by the EARLIEST member end (so it serves the
+ * soonest demand in the window), started one full lead earlier.
+ *
+ * Size: each group collapses to ONE batch order carrying the group's TOTAL quantity
+ * plus `lot_count` = ceil(total / max_lot_size) — the max-lot-size detail is metadata,
+ * not separate work orders. (Re-emitting per-lot WOs would not shrink the count, since
+ * the inputs are already one lot each: the WO count is driven by total_qty/max_lot_size.)
+ *
+ * @param windowDays scheduling bucket width; <=0 collapses the whole horizon into one
+ *   window. Conservative default is a small window (e.g. 7) so batching stays local.
+ */
+internal fun consolidateWorkOrdersByTiming(
+    workOrders: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+    windowDays: Int,
+): List<Map<String, Any?>> {
+    if (workOrders.size < 2) return workOrders
+
+    fun bucketOf(start: String?): Long {
+        val d = parseDate(start) ?: return Long.MIN_VALUE
+        return if (windowDays <= 0) 0L else Math.floorDiv(d.toEpochDay(), windowDays.toLong())
+    }
+
+    val passthrough = mutableListOf<Map<String, Any?>>()
+    val groupable = mutableListOf<Map<String, Any?>>()
+    for (wo in workOrders) {
+        if (wo["failed"] == true || parseDate(wo["start_time"] as? String) == null) passthrough.add(wo)
+        else groupable.add(wo)
+    }
+
+    val groups = groupable.groupBy {
+        listOf(
+            (it["product_id"] as? String)?.trim(),
+            (it["location_id"] as? String)?.trim(),
+            it["method"] as? String,
+            (it["location_source"] as? String)?.trim(),
+            bucketOf(it["start_time"] as? String),
+        )
+    }
+
+    val out = mutableListOf<Map<String, Any?>>()
+    out.addAll(passthrough)
+    for ((_, wos) in groups) {
+        if (wos.size == 1) { out.add(wos[0]); continue }
+        val first = wos[0]
+        val pid = (first["product_id"] as? String) ?: ""
+        val lid = (first["location_id"] as? String) ?: ""
+        val method = (first["method"] as? String) ?: ""
+        val totalQty = wos.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
+        if (totalQty <= 1e-9) { out.addAll(wos); continue }
+
+        // Ready by the earliest member end; started one full lead earlier.
+        val ends = wos.mapNotNull { parseDate(it["end_time"] as? String) }
+        val leadDays = wos.mapNotNull {
+            val s = parseDate(it["start_time"] as? String)
+            val e = parseDate(it["end_time"] as? String)
+            if (s != null && e != null) e.toEpochDay() - s.toEpochDay() else null
+        }.maxOrNull() ?: 0L
+        val mergedEnd = ends.minOrNull() ?: parseDate(first["end_time"] as? String)
+        val mergedStart = mergedEnd?.minusDays(leadDays)
+        val demands = wos.mapNotNull { it["demand_id"] as? String }.filter { it.isNotBlank() }.distinct()
+        val overrideActive = wos.any { it["override_active"] == true }
+        val lotSize = (maxLotSize(pid, lid, data)?.takeIf { it > 0 } ?: totalQty).coerceAtLeast(1e-9)
+        val lotCount = Math.ceil(totalQty / lotSize).toInt().coerceAtLeast(1)
+
+        // One batch order for the whole group. The max-lot-size detail is carried as
+        // `lot_count` metadata rather than exploding back into per-lot work orders —
+        // that is what actually shrinks the work-order count (inputs are already one
+        // lot each, so re-lotting would reproduce them).
+        out.add(mapOf(
+            "product_id" to pid,
+            "location_id" to lid,
+            "quantity" to roundQty(totalQty),
+            "start_time" to formatDate(mergedStart),
+            "end_time" to formatDate(mergedEnd),
+            "method" to method,
+            "location_source" to first["location_source"],
+            "demand_id" to null,
+            "prod_area" to first["prod_area"],
+            "override_active" to overrideActive,
+            "wo_group_id" to nextWoGroupId(),
+            "wave_index" to 0,
+            "lot_count" to lotCount,
+            "max_lot_size" to lotSize,
+            "consolidated" to true,
+            "wo_competing_demands" to demands,
+            "wo_consolidation_total_planned" to roundQty(totalQty),
+        ))
+    }
+    return out
 }
 
 private fun buildWoNode(
@@ -3028,7 +3325,10 @@ private fun runV2Iterated(
 
     val graph    = buildResolutionGraph(demands, data)
     val ancestry = BomAncestry(data["bom"] ?: emptyList())
-    val baseMerged = mergeGroups(graph, ancestry, consolidationConfig.periodDays)
+    // Pass 1 (inventory allocation) ALWAYS pools universally — bucket 0 — so scarce
+    // on-hand stock is shared fairly across every competing demand regardless of due
+    // date. (The UI "Bucket (days)" controls Pass 2 / WO batching, a separate schedule.)
+    val baseMerged = mergeGroups(graph, ancestry, periodDays = 0)
 
     var memberCaps: Map<Pair<String, String>, Map<Any?, Double>> = emptyMap()
     var lastConsolidatedWOs: List<Map<String, Any?>> = emptyList()
@@ -3056,7 +3356,21 @@ private fun runV2Iterated(
     // convergence `is_bottleneck` flag on smearing-aligned siblings.
     var iter0AllocationSnapshot: Map<Any?, Map<String, Double>>? = null
 
-    for (iter in 0 until MAX_PLANNING_ITERATIONS) {
+    // Tracks over-production across iterations for stall detection. Caps are
+    // monotone non-increasing, so the residual either keeps shrinking or hits a
+    // stable floor; when it stops shrinking the controller is at a fixed point and
+    // further iterations only reproduce the same residual — stop early then.
+    var prevTotalOver = Double.POSITIVE_INFINITY
+
+    // Pass-1 allocation passes. Default 1 (single allocation pass) — fastest, but a
+    // demand can be capped above what it draws, orphaning the slack inventory (fine
+    // when supply is ample). Set consolidation.max_iterations > 1 to re-enable the
+    // over-claim/compensate/converge loop, which reclaims orphaned allocations each
+    // pass for tighter inventory utilization (important when supply-constrained) at
+    // higher runtime. Hard-ceiling at MAX_PLANNING_ITERATIONS.
+    val maxIters = consolidationConfig.maxIterations.coerceIn(1, MAX_PLANNING_ITERATIONS)
+
+    for (iter in 0 until maxIters) {
         // Revert inventory to snapshot at the start of every iteration (incl. iter 0,
         // for symmetry — the snapshot equals current state on iter 0 so it is a no-op).
         inventory.clear()
@@ -3126,12 +3440,12 @@ private fun runV2Iterated(
         // so the UI can show "iter k/N" alongside per-demand progress. The bar
         // restarts each iter (0→N) which is the honest signal that planning is
         // iterating; convergence in iter 0 shows a single smooth 0→100%.
-        val isLastIter = iter == MAX_PLANNING_ITERATIONS - 1
+        val isLastIter = iter == maxIters - 1
         val iterCb: ((Map<String, Any?>) -> Unit)? = progressCallback?.let { cb ->
             { payload ->
                 cb(payload + mapOf(
                     "iteration" to iter + 1,
-                    "iterations_max" to MAX_PLANNING_ITERATIONS,
+                    "iterations_max" to maxIters,
                 ))
             }
         }
@@ -3160,17 +3474,39 @@ private fun runV2Iterated(
         }
 
         if (isLastIter) {
-            // Fixed-point not reached. Apply 4a single-pass trim as a safety net
-            // — only fixes the merged leaf; sub-component WOs may stay over-sized.
+            // Single allocation pass complete. Apply the 4a one-shot trim as a safety net.
             val finalWOs = consResult.consolidatedWOs.toMutableList()
             val (n, q) = reconcileOverProduction(finalWOs, inventory, budgets)
-            log.warn(
-                "v2 iter {} (max): {} qty over-production residual after fixed-point — " +
-                "fallback trimmed {} component(s), {} qty (sub-component WOs NOT cascade-trimmed)",
-                iter + 1, "%.2f".format(totalOver), n, "%.2f".format(q),
+            // `totalOver` is leftover allocation BUDGET, not real over-produced WOs: under
+            // inventory-only consolidation there are no consolidated production WOs to trim
+            // (q≈0), so a large residual here is phantom and does not affect the plan — it's
+            // the merge's variant-path provisioning that the per-demand commit didn't draw on.
+            // Only warn if the trim actually removed quantity (a genuine over-size).
+            val msg = "v2 single allocation pass: {} qty leftover allocation budget — " +
+                "reconcile trimmed {} component(s), {} qty"
+            if (q > 1e-6) log.warn(msg, "%.2f".format(totalOver), n, "%.2f".format(q))
+            else log.info(msg + " (phantom budget; no production over-size)", "%.2f".format(totalOver), n, "%.2f".format(q))
+            return V2IteratedResult(finalWOs.toList(), consResult.consolidatedPegging, commit, iter + 1, false)
+        }
+
+        // Stall detection: the residual is monotone non-increasing (caps only drop),
+        // so if it didn't shrink at all this iteration the controller has reached a
+        // stable fixed point — the leftover (typically a sub-lot-size remnant at a
+        // stocked component) can't be trimmed by iterating further; every remaining
+        // pass would reproduce it. Stop now and apply the single-pass safety trim
+        // instead of burning the rest of the iteration budget (and the minutes it
+        // costs on large runs).
+        if (totalOver >= prevTotalOver - 1e-6) {
+            val finalWOs = consResult.consolidatedWOs.toMutableList()
+            val (n, q) = reconcileOverProduction(finalWOs, inventory, budgets)
+            log.info(
+                "v2 iter {}: over-production stalled at {} qty (no improvement vs prev {}) — " +
+                "stable fixed point; stopping early, fallback trimmed {} component(s), {} qty",
+                iter + 1, "%.2f".format(totalOver), "%.2f".format(prevTotalOver), n, "%.2f".format(q),
             )
             return V2IteratedResult(finalWOs.toList(), consResult.consolidatedPegging, commit, iter + 1, false)
         }
+        prevTotalOver = totalOver
 
         // Compute next iter's caps from this iter's actual consumption. A demand's
         // cap at (pid, lid) becomes "what it actually drew from the merged leaf
@@ -3494,9 +3830,36 @@ fun runPlanning(
         timingFix
     }
 
+    // ── Pass 2 — WO consolidation + timing ────────────────────────────────────
+    // Mental model: Pass 1 builds the per-demand pegging SKELETON (BOM explosion +
+    // alternative selection + quantities); Pass 2 derives the work orders FROM it. The
+    // default WO-consolidation collapses the per-node lot-explosion into one WO per
+    // skeleton node (flattenPeggingToWorkOrders), so the output stays in sync with the
+    // per-demand pegging BY CONSTRUCTION — every WO resolves back to its node (pegging /
+    // supplies / predecessor-successor drill-down all work).
+    //
+    // Opt-in `consolidation.consolidate_wos=true` additionally batches ACROSS demands
+    // (same product/location/method/window) for a smaller schedule, at the cost of that
+    // per-demand linkage (batched orders are demand_id=null and no longer map to a single
+    // pegging node — drill-down degrades). Window = UI "Bucket (days)" (period_days);
+    // explicit wo_window_days overrides; 0 ⇒ one batch per component across the horizon.
+    @Suppress("UNCHECKED_CAST")
+    val consolidationCfg = config?.get("consolidation") as? Map<String, Any?>
+    val nodeLevelWos = flattenPeggingToWorkOrders(finalTimings.peggingTrees, data)
+    val consolidateWos = consolidationConfig.enabled && consolidationCfg?.get("consolidate_wos") == true
+    val outputWorkOrders = if (consolidateWos) {
+        val windowDays = (consolidationCfg?.get("wo_window_days") as? Number)?.toInt() ?: consolidationConfig.periodDays
+        val merged = consolidateWorkOrdersByTiming(nodeLevelWos, data, windowDays)
+        log.info("Pass 2 cross-demand WO batch (window={}d): {} → {} work orders (per-demand drill-down disabled)", windowDays, nodeLevelWos.size, merged.size)
+        merged
+    } else {
+        log.info("Pass 2 WO-consolidation: {} pegging nodes → {} node-level work orders (in sync with per-demand pegging)", nodeLevelWos.size, nodeLevelWos.size)
+        nodeLevelWos
+    }
+
     return mapOf(
         "committed_demands"      to committedDemands,
-        "work_orders"            to finalTimings.workOrders,
+        "work_orders"            to outputWorkOrders,
         "planning_pegging"       to finalTimings.peggingTrees,
         "supply_allocations"     to supplyAllocations,
         "supply_cap_violations"  to supplyCapViolations,
@@ -3671,14 +4034,20 @@ private fun fixTimingFromPegging(
         // Sequential WOs collapse to the old behavior since wave_count ==
         // lot_count when cap == 1.
         val perWaveDays = if (waveCount > 0) totalSpanDays / waveCount else 0L
+        // Purchase/move lots have no inherent serialization (no cycle/transport
+        // cadence is modeled), so every lot runs concurrently across the node's
+        // full [start,end] window — each carries the full procurement/transit lead.
+        // Only make WOs cascade across waves. Without this, dividing the (single-
+        // wave) span by lot_count corrupts the per-lot lead to near-zero.
+        val concurrent = method != "make"
 
         var remaining = totalQty
         for (i in 0 until lotCount) {
             if (remaining <= 1e-9) break
             val lotQty = min(lotSize, remaining)
-            val waveIdx = i / cap
-            val lotStart = startDt.plusDays(waveIdx * perWaveDays)
-            val lotEnd = lotStart.plusDays(perWaveDays)
+            val waveIdx = if (concurrent) 0L else (i / cap).toLong()
+            val lotStart = if (concurrent) startDt else startDt.plusDays(waveIdx * perWaveDays)
+            val lotEnd = if (concurrent) endDt else lotStart.plusDays(perWaveDays)
             val lot = mutableMapOf<String, Any?>(
                 "product_id" to pid,
                 "location_id" to lid,
@@ -3691,7 +4060,7 @@ private fun fixTimingFromPegging(
                 "prod_area" to prodArea,
                 "override_active" to overrideActive,
                 "wo_group_id" to finalGid,
-                "wave_index" to waveIdx,
+                "wave_index" to waveIdx.toInt(),
             )
             if (methodSlotIndex != null) lot["method_slot_index"] = methodSlotIndex
             // Copy consolidation metadata from the original lot if present.

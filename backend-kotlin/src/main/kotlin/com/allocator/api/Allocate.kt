@@ -228,6 +228,35 @@ fun Routing.allocateRoutes() {
         call.respond(mapOf("pairs" to pairs))
     }
 
+    // ── GET /cases/{case_id}/plan/purchasable-raw-materials ───────────────────
+    // Raw materials (productlocation.prod_area='raw') that have a method_buy.
+    // Feeds the "selective purchase" whitelist dropdown and the planning copilot's
+    // /raw picker / LLM material-condition resolution.
+    get("/cases/{case_id}/plan/purchasable-raw-materials") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        transaction {
+            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
+                ?: throw NoSuchElementException("Case not found")
+        }
+        // Build the JSON explicitly — a Map<String, Any?> with mixed value types
+        // (String description + Int lead_days) can't be serialized by kotlinx.
+        val payload = buildJsonObject {
+            putJsonArray("materials") {
+                com.allocator.services.RawMaterials.purchasable(caseId).forEach { m ->
+                    addJsonObject {
+                        put("product_id", m.productId)
+                        put("description", m.description)
+                        put("vendor_id", m.vendorId)
+                        put("lead_days_supply", m.leadDaysSupply)
+                        put("sku_pattern", m.skuPattern)
+                    }
+                }
+            }
+        }
+        call.respond(payload)
+    }
+
     // ── GET /cases/{case_id}/plan/moves-with-transit ──────────────────────────
     get("/cases/{case_id}/plan/moves-with-transit") {
         val caseId = call.parameters["case_id"]?.toIntOrNull()
@@ -997,7 +1026,18 @@ fun Routing.allocateRoutes() {
 
             val enriched = casePlanResults[caseId]
                 ?: throw NoSuchElementException("No in-memory plan result for case $caseId. Re-run plan first.")
-            val resultJson = runCatching { anyToJson(enriched).toString() }.getOrElse { null }
+            val resultJson = serializeResultOrNull(enriched)
+            if (resultJson == null) {
+                transaction {
+                    PlanRuns.update({ PlanRuns.id eq runId }) {
+                        it[PlanRuns.status] = "failed"; it[PlanRuns.error] = resultTooLargeError(enriched)
+                    }
+                }
+                call.respond(HttpStatusCode.InternalServerError, buildJsonObject {
+                    put("id", runId); put("status", "failed"); put("error", resultTooLargeError(enriched))
+                })
+                return@post
+            }
             val newConfig = runRow[PlanRuns.config]
             val newOverrideSnapshot = runRow[PlanRuns.overrideSnapshot]
 
@@ -1074,7 +1114,21 @@ fun Routing.allocateRoutes() {
 
         val enriched = casePlanResults[caseId]
             ?: throw NoSuchElementException("No in-memory plan result for case $caseId. Re-run plan first.")
-        val resultJson = runCatching { anyToJson(enriched).toString() }.getOrElse { null }
+        val resultJson = serializeResultOrNull(enriched)
+        if (resultJson == null) {
+            // Result too large to serialize (OOM). Mark the run failed with a clear
+            // reason instead of saving a `success` row with a NULL result.
+            transaction {
+                PlanRuns.update({ PlanRuns.id eq runId }) {
+                    it[PlanRuns.status] = "failed"
+                    it[PlanRuns.error] = resultTooLargeError(enriched)
+                }
+            }
+            call.respond(HttpStatusCode.InternalServerError, buildJsonObject {
+                put("id", runId); put("status", "failed"); put("error", resultTooLargeError(enriched))
+            })
+            return@post
+        }
         transaction {
             PlanRuns.update({ PlanRuns.id eq runId }) {
                 it[PlanRuns.status] = "success"
@@ -1363,6 +1417,31 @@ private fun anyToJson(v: Any?): JsonElement = when (v) {
     is Map<*, *> -> buildJsonObject { v.forEach { (k, vv) -> put(k.toString(), anyToJson(vv)) } }
     is List<*> -> buildJsonArray { v.forEach { add(anyToJson(it)) } }
     else -> JsonPrimitive(v.toString())
+}
+
+/**
+ * Serialize a plan result to a JSON string for persistence. Returns null only when
+ * serialization fails — in practice an OutOfMemoryError building the string for a very
+ * large result (tens of thousands of work orders ⇒ ~1GB JSON, which exceeds the JVM
+ * heap). `runCatching` deliberately catches Throwable so we can REPORT the failure;
+ * callers MUST treat null as a hard failure and mark the run failed rather than
+ * persisting a `success` row with a NULL result (which silently breaks downstream
+ * consumers like the soundness check — see runSoundnessCheckForRun).
+ */
+private fun serializeResultOrNull(enriched: Map<String, Any?>): String? =
+    runCatching { anyToJson(enriched).toString() }.getOrElse { e ->
+        val n = (enriched["work_orders"] as? List<*>)?.size ?: -1
+        log.error("Plan result serialization failed (${n} work_orders) — too large to persist: $e")
+        null
+    }
+
+/** Human-readable error stored on a run whose result couldn't be serialized/persisted. */
+private fun resultTooLargeError(enriched: Map<String, Any?>): String {
+    val n = (enriched["work_orders"] as? List<*>)?.size ?: -1
+    return "Plan computed successfully but its result ($n work orders) was too large to " +
+        "serialize and persist — the backend hit its memory limit building the result JSON. " +
+        "Reduce the run's size (e.g. period-based consolidation, or narrow the scope) or " +
+        "raise the backend heap, then re-run."
 }
 
 /**
@@ -2024,14 +2103,22 @@ internal suspend fun runPlanBackground(
         // by asking the agent to execute it — there's no separate "decide
         // whether to keep this run" UX in the chat. Page-driven runs default
         // to autoSave=false and use the explicit /save endpoint.
-        val resultJson = if (autoSave) runCatching { anyToJson(enriched).toString() }.getOrElse { null } else null
+        val resultJson = if (autoSave) serializeResultOrNull(enriched) else null
+        // Auto-save but serialization failed (result too large) ⇒ mark FAILED with a
+        // clear error instead of a bogus `success` row with a NULL result.
+        val serializeFailed = autoSave && resultJson == null
         transaction {
             PlanRuns.update({ PlanRuns.id eq planRunId }) {
-                it[PlanRuns.status] = if (autoSave) "success" else "ready"
+                it[PlanRuns.status] = when {
+                    serializeFailed -> "failed"
+                    autoSave -> "success"
+                    else -> "ready"
+                }
+                if (serializeFailed) it[PlanRuns.error] = resultTooLargeError(enriched)
                 it[PlanRuns.finishedAt] = kotlinx.datetime.Clock.System.now()
                 if (autoSave && resultJson != null) it[PlanRuns.result] = resultJson
             }
-            if (autoSave) {
+            if (autoSave && !serializeFailed) {
                 @Suppress("UNCHECKED_CAST")
                 val supplyAllocs = (enriched["supply_allocations"] as? List<Map<String, Any?>>).orEmpty()
                 if (supplyAllocs.isNotEmpty()) {
@@ -2173,12 +2260,14 @@ private suspend fun runOneBootstrapPreset(
     try {
         val raw = runPlanning(data, config = configMap)
         val enriched = enrichPlanResultWithData(caseId, raw, data)
-        val resultJson = runCatching { anyToJson(enriched).toString() }.getOrElse { null }
+        val resultJson = serializeResultOrNull(enriched)
+        val serializeFailed = resultJson == null
 
         transaction {
             PlanRuns.update({ PlanRuns.id eq planRunId }) {
-                it[PlanRuns.status] = "success"
-                it[PlanRuns.result] = resultJson
+                it[PlanRuns.status] = if (serializeFailed) "failed" else "success"
+                if (serializeFailed) it[PlanRuns.error] = resultTooLargeError(enriched)
+                else it[PlanRuns.result] = resultJson
                 it[PlanRuns.finishedAt] = kotlinx.datetime.Clock.System.now()
             }
             @Suppress("UNCHECKED_CAST")
@@ -2388,6 +2477,13 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
 
     return buildJsonObject {
         put("purchase_allowed", c["purchase_allowed"] as? Boolean ?: true)
+        // Selective-purchase whitelist of buyable raw-material product_ids. Empty ⇒ all
+        // raw materials are purchasable (default). Persist so the dropdown round-trips.
+        putJsonArray("purchasable_materials") {
+            (c["purchasable_materials"] as? List<*>)?.forEach { pid ->
+                (pid as? String)?.trim()?.takeIf { it.isNotEmpty() }?.let { add(it) }
+            }
+        }
         // Cross-WO arbitration flag — persist so replan + post-run reload
         // restore the user's checkbox state. Default ON after Phase A
         // validation; explicit false (older saved configs / opt-outs) still
@@ -2418,7 +2514,7 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
         putJsonObject("consolidation") {
             put("enabled",         consolidation["enabled"]      as? Boolean ?: false)
             // 0 = single-bucket sentinel (collapses every demand into LocalDate.EPOCH); legal value, do NOT clamp up to 1.
-            put("period_days",     ((consolidation["period_days"] as? Number)?.toInt() ?: 0).coerceIn(0, 365))
+            put("period_days",     ((consolidation["period_days"] as? Number)?.toInt() ?: 30).coerceIn(0, 365))
             put("allocation_mode", when (consolidation["allocation_mode"]?.toString()) {
                 "proportional"   -> "proportional"
                 "priority_first" -> "priority_first"

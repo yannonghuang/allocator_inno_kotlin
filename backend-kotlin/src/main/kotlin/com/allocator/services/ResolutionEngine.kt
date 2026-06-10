@@ -450,14 +450,18 @@ private fun walkResolution(
             val nextVisited = visited + key
             val productionLocation = (method["location_id"] as? String)?.trim() ?: locationId
             val variants = variantsForMake(productId, productionLocation, 1.0, method, data) // unit-rate walk
-            // Union-alts: each alt_group emits a path through EVERY child, not just one.
-            // Phase 3's plan() picks the actual alt at runtime based on preference scoring +
-            // supply availability. Phase 1 can't predict that pick reliably (BOM rows don't
-            // carry per-alt preference), so it provisions all alts so consolidation can form
-            // merged groups at every candidate leaf. The cap loop drives unpicked alts to
-            // zero in 1-2 iters; the picked alt retains the consolidation benefit (one merged
-            // WO per leaf instead of N standalone WOs when many demands diverge together).
+            // Each alt_group emits a path through EVERY child so consolidation can form
+            // merged groups at every candidate leaf (Phase 3's plan() picks the actual
+            // alt at runtime). But the OR-alternatives within an alt_group SHARE the
+            // demand — the planner equal-splits it across them (or picks one) — so
+            // provision requestedQty / N per alternative, not full qty each. Provisioning
+            // every alt at full over-allocates by N× at each shared leaf (the giant
+            // first-pass over-production) and forces the fixed-point iteration to claw it
+            // back; splitting right-sizes the total so a single allocation pass suffices.
+            // (Independent alt_groups are AND-combined and each carry the full rate.)
             for ((_, childList) in variants) {
+                val altCount = childList.size.coerceAtLeast(1)
+                val altQty = requestedQty / altCount
                 for (alt in childList) {
                     val cPid = (alt["product_id"]  as? String)?.trim() ?: continue
                     val cLid = (alt["location_id"] as? String)?.trim() ?: continue
@@ -475,7 +479,7 @@ private fun walkResolution(
                         demandId = demandId,
                         priority = priority,
                         dueDate = dueDate,
-                        requestedQty = requestedQty,
+                        requestedQty = altQty,
                         out = out,
                     )
                 }

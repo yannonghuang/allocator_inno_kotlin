@@ -159,8 +159,16 @@ data class ConsolidationGroup(
 /** Parsed from the "consolidation" key in the run config map. */
 data class ConsolidationConfig(
     val enabled: Boolean = false,
-    val periodDays: Int = 365,
+    val periodDays: Int = 30,
     val allocationMode: String = "fair",  // "proportional" | "priority_first" | "fair"
+    /**
+     * Max Pass-1 allocation iterations. 1 (default) = single allocation pass: fastest,
+     * but a demand can be capped above what it draws, orphaning the slack inventory
+     * (fine when supply is ample). >1 reverts to the over-claim/compensate/converge
+     * fixed-point loop that reclaims orphaned allocations each pass — tighter inventory
+     * utilization (important when supply-constrained), at higher runtime. Clamped 1..15.
+     */
+    val maxIterations: Int = 1,
 )
 
 /** Output of runConsolidation(). */
@@ -178,15 +186,19 @@ fun parseConsolidationConfig(config: Map<String, Any?>?): ConsolidationConfig {
     @Suppress("UNCHECKED_CAST")
     val m = sub as? Map<String, Any?> ?: return ConsolidationConfig()
     val enabled = m["enabled"] as? Boolean ?: false
-    val periodDays = ((m["period_days"] as? Number)?.toInt() ?: 365).coerceIn(0, 365)
+    val periodDays = ((m["period_days"] as? Number)?.toInt() ?: 30).coerceIn(0, 365)
     val allocationMode = when (m["allocation_mode"]?.toString()) {
         "proportional"   -> "proportional"
         "priority_first" -> "priority_first"
         else             -> "fair"
     }
+    // Pass-1 allocation iterations. Default 1 (single pass); >1 re-enables the
+    // converge loop (clamped to the 15 hard ceiling). Accept both "max_iterations"
+    // and the shorter "max_iter".
+    val maxIterations = ((m["max_iterations"] ?: m["max_iter"]) as? Number)?.toInt()?.coerceIn(1, 15) ?: 1
     // Note: legacy `scope=all` configs are silently coerced to leaf-only on
     // re-plan. The supply-level orchestrator was retired in 2026-05.
-    return ConsolidationConfig(enabled, periodDays, allocationMode)
+    return ConsolidationConfig(enabled, periodDays, allocationMode, maxIterations)
 }
 
 // ── Time bucketing ────────────────────────────────────────────────────────────
@@ -560,6 +572,35 @@ fun runConsolidation(
     for (group in groups) {
         val componentKey = "${group.productId}|${group.locationId}"
 
+        // `timeBucket` is the grouping KEY — under single-bucket consolidation
+        // (period_days<=0) it is LocalDate.EPOCH (1970-01-01) so every need collapses
+        // into one group. That sentinel must NOT be used as the SCHEDULING date: a
+        // purchase/make anchored at 1970 underflows to 1969 once lead time is
+        // subtracted (and then spawns a wave per cycle from 1969 to the horizon).
+        // Schedule against the earliest real due date among the consolidated needs
+        // instead; fall back to the bucket only if no need carries a date.
+        val scheduleBucket: LocalDate =
+            if (group.timeBucket == LocalDate.EPOCH)
+                (group.needs.mapNotNull { it.dueDate }.minOrNull() ?: group.timeBucket)
+            else group.timeBucket
+
+        // ── Inventory-only consolidation ─────────────────────────────────────────
+        // Consolidation ALLOCATES existing on-hand inventory across the competing
+        // demands; it never produces work orders. Cap the synthetic demand to the
+        // stock actually on hand at this (product, location) — consuming stock is not
+        // a work order, so the planFn call below emits zero WOs and only splits the
+        // inventory. Groups with no on-hand stock here are skipped: per-demand
+        // planning (legacyCommit) produces / moves whatever the stock doesn't cover
+        // (including cross-location stock, handled per-demand for now).
+        val availableInv = inventory
+            .filter {
+                (it["product_id"] as? String)?.trim() == group.productId &&
+                    (it["location_id"] as? String)?.trim() == group.locationId
+            }
+            .sumOf { (it["qty"] as? Number)?.toDouble() ?: 0.0 }
+        if (availableInv <= 1e-9) continue
+        val allocatableQty = minOf(group.totalQty, availableInv)
+
         if (group.needs.size == 1) {
             // Single-demand group — pass through with original demandId, no change in behavior.
             // If the only claimant reached this component via an OR-alternative path, leave the
@@ -573,9 +614,9 @@ fun runConsolidation(
                 "demand_id"        to need.demandId,
                 "product_id"       to group.productId,
                 "location_id"      to group.locationId,
-                "quantity"         to group.totalQty,
-                "request_due_time" to group.timeBucket.toString(),
-                "request_time"     to group.timeBucket.toString(),
+                "quantity"         to allocatableQty,
+                "request_due_time" to scheduleBucket.toString(),
+                "request_time"     to scheduleBucket.toString(),
                 "priority"         to need.priority,
             )
             val invCopy = inventory.map { b ->
@@ -588,7 +629,7 @@ fun runConsolidation(
                     "demand_tag"  to b["demand_tag"],
                 )
             }.toMutableList()
-            val (committed, wos, pegging) = planFn(syntheticDemand, invCopy, data, group.timeBucket, 500, emptySet(), planConfig, null)
+            val (committed, wos, pegging) = planFn(syntheticDemand, invCopy, data, scheduleBucket, 500, emptySet(), planConfig, null)
             // Exclude hard-failure rows (no_methods / no_preferred_method / depth_limit /
             // child_failed:*) from producedQty — those represent unmet demand, not real production.
             // Counting them as produced would inject phantom synthetic supply for products that
@@ -634,9 +675,9 @@ fun runConsolidation(
                 "demand_id"        to null,
                 "product_id"       to group.productId,
                 "location_id"      to group.locationId,
-                "quantity"         to group.totalQty,
-                "request_due_time" to group.timeBucket.toString(),
-                "request_time"     to group.timeBucket.toString(),
+                "quantity"         to allocatableQty,
+                "request_due_time" to scheduleBucket.toString(),
+                "request_time"     to scheduleBucket.toString(),
                 "priority"         to 0,
             )
             val invCopy = inventory.map { b ->
@@ -649,7 +690,7 @@ fun runConsolidation(
                     "demand_tag"  to b["demand_tag"],
                 )
             }.toMutableList()
-            val (committed, wos, pegging) = planFn(syntheticDemand, invCopy, data, group.timeBucket, 500, emptySet(), planConfig, null)
+            val (committed, wos, pegging) = planFn(syntheticDemand, invCopy, data, scheduleBucket, 500, emptySet(), planConfig, null)
             // Exclude hard-failure rows from producedQty — see passthrough branch for rationale.
             val producedQty = committed
                 .filterNot { isHardPlanningFailure(it["commit_reason"] as? String) }
