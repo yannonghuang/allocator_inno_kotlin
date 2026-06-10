@@ -113,7 +113,10 @@ private fun computeResourceUtilization(caseId: Int, runId: Int): Map<String, Any
         var minStart: LocalDate,
         var maxEnd: LocalDate,
         var totalQty: Double,
-        val lotWindows: MutableList<Pair<LocalDate, LocalDate>>,
+        // (start, end, lotCount): lotCount > 1 for Pass-2 batched WOs, which carry
+        // many concurrent lots in one row. Each lot loads the resource at `rate`, so
+        // load must be weighted by lotCount or batched WOs under-count utilization.
+        val lotWindows: MutableList<Triple<LocalDate, LocalDate, Int>>,
     )
     val woSummaries = mutableMapOf<String, WoSummary>()
     for (wo in workOrders) {
@@ -141,6 +144,9 @@ private fun computeResourceUtilization(caseId: Int, runId: Int): Map<String, Any
         val did = (wo["demand_id"] as? String)?.trim().orEmpty()
         val key = "$gid|$did|$productId|$locationId"
         val qtyAdd = (wo["quantity"] as? Number)?.toDouble() ?: 0.0
+        // Pass-2 batched WOs carry many concurrent lots in one row (lot_count > 1);
+        // plain WOs are a single lot (absent → 1).
+        val lotCnt = (wo["lot_count"] as? Number)?.toInt()?.coerceAtLeast(1) ?: 1
         val existing = woSummaries[key]
         if (existing == null) {
             woSummaries[key] = WoSummary(
@@ -151,13 +157,13 @@ private fun computeResourceUtilization(caseId: Int, runId: Int): Map<String, Any
                 minStart = startDt,
                 maxEnd = endDt,
                 totalQty = qtyAdd,
-                lotWindows = mutableListOf(startDt to endDt),
+                lotWindows = mutableListOf(Triple(startDt, endDt, lotCnt)),
             )
         } else {
             if (startDt < existing.minStart) existing.minStart = startDt
             if (endDt > existing.maxEnd) existing.maxEnd = endDt
             existing.totalQty += qtyAdd
-            existing.lotWindows.add(startDt to endDt)
+            existing.lotWindows.add(Triple(startDt, endDt, lotCnt))
         }
     }
 
@@ -182,16 +188,18 @@ private fun computeResourceUtilization(caseId: Int, runId: Int): Map<String, Any
             // and ResourceScheduler.ResourceCalendar. Inclusive iteration
             // here would double-count the boundary day and report a peak
             // higher than the cross-WO arbitration can avoid.
-            for ((lotStart, lotEnd) in summary.lotWindows) {
+            for ((lotStart, lotEnd, lotCnt) in summary.lotWindows) {
+                // `lotCnt` concurrent lots each load the resource at `rate`.
+                val lotLoad = rate * lotCnt
                 var d = lotStart
                 while (d.isBefore(lotEnd)) {
-                    bucket[d] = (bucket[d] ?: 0.0) + rate
+                    bucket[d] = (bucket[d] ?: 0.0) + lotLoad
                     d = d.plusDays(1)
                 }
                 // Zero-duration lot (start == end): record one day of load so
                 // an instantaneous WO still shows up on the timeline.
                 if (lotStart == lotEnd) {
-                    bucket[lotStart] = (bucket[lotStart] ?: 0.0) + rate
+                    bucket[lotStart] = (bucket[lotStart] ?: 0.0) + lotLoad
                 }
             }
             if (minDate == null || summary.minStart < minDate) minDate = summary.minStart
@@ -207,7 +215,7 @@ private fun computeResourceUtilization(caseId: Int, runId: Int): Map<String, Any
                 // pegging tree's slot anchor exactly.
                 "start_time" to summary.minStart.toString(),
                 "end_time" to summary.maxEnd.toString(),
-                "lot_count" to summary.lotWindows.size,
+                "lot_count" to summary.lotWindows.sumOf { it.third },
                 "rate" to rate,
             ))
         }

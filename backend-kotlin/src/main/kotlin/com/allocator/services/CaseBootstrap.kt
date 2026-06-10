@@ -76,7 +76,7 @@ private fun cfg(
     weights: Triple<Double, Double, Double>? = null,   // (commit, inventory, purchase)
     allocationMode: String = "fair",                   // "fair" | "proportional" | "priority_first"
     consolidationEnabled: Boolean = true,
-    periodDays: Int = 0,
+    periodDays: Int = 30,
     purchaseAllowed: Boolean = false,
 ): JsonObject = buildJsonObject {
     putJsonObject("method_selection") {
@@ -285,7 +285,7 @@ object CaseBootstrap {
                 }
                 "period_days" -> putJsonObject("consolidation") {
                     cs.entries.forEach { (k, v) -> if (k != "period_days") put(k, v) }
-                    put("period_days", JsonPrimitive((parsedValue as? Number)?.toInt() ?: 0))
+                    put("period_days", JsonPrimitive((parsedValue as? Number)?.toInt() ?: 30))
                 }
                 "purchase_allowed" -> put("purchase_allowed", JsonPrimitive((parsedValue as? Boolean) ?: false))
                 "mode" -> putJsonObject("method_selection") {
@@ -458,7 +458,7 @@ object CaseBootstrap {
             "max_bom_depth" -> cfg(maxBomDepth = (parsedValue as? Number)?.toInt() ?: 3)
             "allocation_mode" -> cfg(allocationMode = (parsedValue as? String) ?: "fair")
             "consolidation_enabled" -> cfg(consolidationEnabled = (parsedValue as? Boolean) ?: true)
-            "period_days" -> cfg(periodDays = (parsedValue as? Number)?.toInt() ?: 0)
+            "period_days" -> cfg(periodDays = (parsedValue as? Number)?.toInt() ?: 30)
             "purchase_allowed" -> cfg(purchaseAllowed = (parsedValue as? Boolean) ?: false)
             "mode" -> cfg(mode = (parsedValue as? String) ?: "preference")
             // Compound axis: profile name implies mode=elaborate plus the

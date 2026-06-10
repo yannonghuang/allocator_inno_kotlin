@@ -259,6 +259,8 @@ export type PlanningPeggingNode = {
   max_lot_size?: number | null;
   /** For supply nodes: the specific supply record that was consumed. */
   supply_id?: string | null;
+  /** For purchase leaves: the vendor the supply is procured from (no source supply record exists). */
+  vendor_id?: string | null;
   /** Marker on work_order nodes from the AND-bottleneck blocked branch.
    *  Indicates a debug snapshot of "what would have happened" — the
    *  subtree's child takes were rolled back at the planner level, but
@@ -382,6 +384,13 @@ export type PlanningConfig = {
   };
   /** When false, the buy/purchase method is excluded from planning. Default: true. */
   purchase_allowed?: boolean;
+  /**
+   * Selective-purchase whitelist of buyable raw-material product_ids. Only meaningful
+   * when purchase_allowed !== false. Empty/absent ⇒ all raw materials are purchasable
+   * (default). Non-empty ⇒ strict whitelist: only listed materials keep their buy
+   * method; every other product's buy method is dropped.
+   */
+  purchasable_materials?: string[];
   /** Consolidate shared component demands within a time bucket before planning. */
   consolidation?: {
     enabled?: boolean;
@@ -389,6 +398,12 @@ export type PlanningConfig = {
     period_days?: number;
     /** How to split consolidated output among competing demands. Default: fair. */
     allocation_mode?: 'priority_first' | 'proportional' | 'fair';
+    /**
+     * Max Pass-1 allocation iterations (1–15). 1 (default) = single fast pass but may
+     * orphan slack inventory; >1 re-runs the over-claim/compensate/converge loop for
+     * tighter inventory utilization (use when supply-constrained), slower.
+     */
+    max_iterations?: number;
   };
   /**
    * Post-plan UI behavior toggles. These do not affect planner output — they
@@ -476,6 +491,23 @@ export async function getBomRealPairs(caseId: number): Promise<{ pairs: [string,
 /** Move methods with TRANSIT_TIME > 0 (real moves). Each tuple: [product_id, from_location_id, to_location_id]. */
 export async function getMovesWithTransit(caseId: number): Promise<{ moves: [string, string, string][] }> {
   const r = await fetch(`${API}/cases/${caseId}/plan/moves-with-transit`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+/** A purchasable raw material: a product tagged prod_area='raw' that has a method_buy. */
+export type PurchasableRawMaterial = {
+  product_id: string;
+  description?: string | null;
+  vendor_id?: string | null;
+  lead_days_supply?: number | null;
+  sku_pattern?: string | null;
+};
+
+/** Raw materials (productlocation.prod_area='raw') that have a method_buy — feeds the
+ *  "selective purchase" whitelist dropdown and the copilot /raw picker. */
+export async function getPurchasableRawMaterials(caseId: number): Promise<{ materials: PurchasableRawMaterial[] }> {
+  const r = await fetch(`${API}/cases/${caseId}/plan/purchasable-raw-materials`);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
@@ -608,6 +640,11 @@ export type PlanningCopilotMessage = {
   steps?: PlanningAgentStep[];
   /** plan_run_id if this assistant turn ran a fresh plan (planning-agent only). */
   fresh_run_id?: number | null;
+  /** Special render mode. 'raw_picker' renders the interactive purchasable-raw-material
+   *  selector (from the `/raw` slash command) instead of plain text. */
+  kind?: 'raw_picker';
+  /** Optional pre-applied text filter for the 'raw_picker' (from `/raw <filter>`). */
+  filter?: string;
 };
 
 export type PlanningCopilotResponse = { reply: string; config_update: PlanningConfig | null };

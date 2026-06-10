@@ -4,6 +4,8 @@ import com.allocator.Cases
 import com.allocator.config
 import com.allocator.services.LlmMessage
 import com.allocator.services.LlmNotConfiguredException
+import com.allocator.services.PurchasableMaterial
+import com.allocator.services.RawMaterials
 import com.allocator.services.llmChat
 import io.ktor.http.*
 import io.ktor.server.application.*
@@ -53,7 +55,7 @@ private data class PlanningCopilotResponse(
 
 private const val SYSTEM_PROMPT = """You are a friendly planning configuration assistant. Users express their requirements in many different ways, in English or Chinese. Your job is to infer their intent from whatever wording they use—do not expect or require specific phrases. Be conversational and natural. Mirror the user's language (reply in Chinese if they wrote in Chinese).
 
-The plan config has three groups plus two post-plan UI toggles: **method_selection** (how make/move/buy methods are chosen), **purchase_allowed** (top-level boolean), **consolidation** (demand grouping / bucket settings), **analyze_criticality** (top-level boolean, post-plan auto-analysis), and **check_soundness** (top-level boolean, post-plan auto-validation). Any of these can appear in `config_update`. (BOM variants are modeled as distinct make methods, so there is no separate variant config.)
+The plan config has three groups plus two post-plan UI toggles: **method_selection** (how make/move/buy methods are chosen), **purchase_allowed** (top-level boolean) and **purchasable_materials** (top-level array — selective whitelist of buyable raw materials), **consolidation** (demand grouping / bucket settings), **analyze_criticality** (top-level boolean, post-plan auto-analysis), and **check_soundness** (top-level boolean, post-plan auto-validation). Any of these can appear in `config_update`. (BOM variants are modeled as distinct make methods, so there is no separate variant config.)
 
 Intent → config mapping (interpret any phrasing that conveys the same intent):
 
@@ -87,6 +89,25 @@ Intent → config mapping (interpret any phrasing that conveys the same intent):
 6) **Disallow / disable / forbid purchase (buy)** (e.g. "no purchase", "disable purchase", "without buy", "禁用采购", "不采购", "不允许采购")
    → purchase_allowed: false.
 
+6s) **Selective purchase — restrict WHICH raw materials may be bought.** The user can narrow or
+   widen the set of purchasable raw materials *however they phrase it* — by name/id, by attribute
+   (vendor, lead time, SKU series, description keyword), or by set algebra (everything except X).
+   A separate "Purchasable raw materials catalog" message lists the case's buyable raw materials
+   as `product_id — description — vendor — lead_days — series`; resolve the user's condition
+   against THAT catalog and emit the **complete resulting list** of product_ids:
+   → purchasable_materials: ["<id>", …], and also set purchase_allowed: true whenever the list is
+     non-empty (a whitelist implies purchasing is on).
+   Rules:
+   - "only buy X (and Y)" / "限制采购为X" / "只采购钢材" → the resolved id list.
+   - "also allow buying Z" / "再加上Z" / "add Z" → current purchasable_materials ∪ {resolved Z}.
+   - "don't buy X" / "不采购X" / "remove X" → current list minus {X}; if the current list is empty
+     (meaning "all"), return the full catalog minus {X}.
+   - "buy all raw materials" / "remove the restriction" / "采购所有原材料" / "不限制采购"
+     → purchasable_materials: [] (and purchase_allowed: true).
+   Only emit product_ids that appear in the catalog. In `reply`, name the resolved materials by
+   description so the user can confirm. This list of phrasings is NOT exhaustive — interpret any
+   equivalent intent.
+
 7) **Enable demand consolidation / group demands / share work orders across demands** (e.g. "enable consolidation", "consolidate demand", "启用合并", "开启合并", "合并需求", "共享组件")
    → consolidation: { "enabled": true }.
 
@@ -106,7 +127,7 @@ Intent → config mapping (interpret any phrasing that conveys the same intent):
     → consolidation: { "allocation_mode": "fair" }.
 
 13) **Reset / clear / default** → full defaults:
-    method_selection: { "multiple": false, "mode": "preference", "depth": 1 }, purchase_allowed: false, consolidation: { "enabled": true, "period_days": 365, "allocation_mode": "fair" }, analyze_criticality: false, check_soundness: true.
+    method_selection: { "multiple": false, "mode": "preference", "depth": 1 }, purchase_allowed: false, consolidation: { "enabled": true, "period_days": 30, "allocation_mode": "fair" }, analyze_criticality: false, check_soundness: true.
 
 14) **Enable criticality analysis after plan** (e.g. "analyze criticality", "criticality on", "open criticality", "启用关键度", "做关键度分析", "开启临界分析")
     → analyze_criticality: true. Auto-saves the run and runs criticality after each plan.
@@ -123,6 +144,7 @@ Intent → config mapping (interpret any phrasing that conveys the same intent):
 Valid config_update keys:
 - method_selection: object with optional "multiple" (bool), "mode" ("preference" | "elaborate"), "depth" (int ≥ 1), "max_methods" (int ≥ 1; default 2; waterfall cap), "max_bom_depth" (int 1..10; default 3; make-fallback admission cap), "score_weights" ({ commit_time, inventory_consumed, purchase } — numeric, backend normalizes).
 - purchase_allowed: boolean (top-level, not nested).
+- purchasable_materials: array of product_id strings (top-level). Empty ⇒ all raw materials buyable (default). Non-empty ⇒ strict whitelist; only listed raw materials may be bought. Resolve only against the supplied catalog.
 - consolidation: object with optional "enabled" (bool), "period_days" (int 0..365; 0 = single bucket), "allocation_mode" ("fair" | "proportional" | "priority_first").
 - analyze_criticality: boolean (top-level). Post-plan UI toggle, does not affect the planner itself.
 - check_soundness: boolean (top-level). Post-plan UI toggle, does not affect the planner itself.
@@ -137,9 +159,25 @@ private suspend fun llmParse(
     message: String,
     currentConfig: JsonObject,
     history: List<CopilotHistoryItem>,
+    catalog: List<PurchasableMaterial>,
 ): Pair<String, JsonObject?>? {
+    // Catalog of buyable raw materials so the model can resolve selective-purchase
+    // conditions ("only buy steel", "from vendor ACME", "the 1xx series", "all
+    // except aluminum") to concrete product_ids. Capped to bound prompt size.
+    val catalogMsg = if (catalog.isEmpty()) {
+        "Purchasable raw materials catalog: (none — this case has no buyable raw materials; " +
+            "purchase selection is unavailable)."
+    } else {
+        val rows = catalog.take(200).joinToString("\n") { m ->
+            "${m.productId} — ${m.description ?: "?"} — vendor=${m.vendorId ?: "?"} — " +
+                "lead_days=${m.leadDaysSupply ?: "?"} — series=${m.skuPattern ?: "?"}"
+        }
+        val more = if (catalog.size > 200) "\n…(${catalog.size - 200} more)" else ""
+        "Purchasable raw materials catalog (product_id — description — vendor — lead_days — series):\n$rows$more"
+    }
     val msgs = buildList<LlmMessage> {
         add(LlmMessage("user", "Current config: $currentConfig"))
+        add(LlmMessage("user", catalogMsg))
         history.takeLast(10).forEach { h ->
             val t = h.messageText()
             if (t.isNotBlank()) add(LlmMessage(h.role, t))
@@ -176,7 +214,30 @@ private suspend fun llmParse(
     val reply = parsed["reply"]?.jsonPrimitive?.contentOrNull
         ?: "I didn't quite get that. Could you rephrase?"
     val configUpdate = parsed["config_update"] as? JsonObject
-    val valid = configUpdate?.let { cu ->
+    val catalogIds = catalog.map { it.productId }.toSet()
+    val valid = configUpdate?.let { cuRaw ->
+        // Sanitize purchasable_materials: intersect with the real catalog so a
+        // hallucinated/typo'd id can never silently widen or corrupt the whitelist.
+        var cu = cuRaw
+        var pmOk = false
+        (cuRaw["purchasable_materials"] as? JsonArray)?.let { arr ->
+            val requested = arr.mapNotNull { it.jsonPrimitive.contentOrNull?.trim()?.takeIf { s -> s.isNotEmpty() } }
+            val sanitized = requested.filter { it in catalogIds }
+            when {
+                requested.isEmpty() -> pmOk = true  // explicit clear → all raw materials
+                sanitized.isNotEmpty() -> {
+                    pmOk = true
+                    if (sanitized.size != requested.size) {
+                        cu = JsonObject(cu.toMutableMap().apply {
+                            put("purchasable_materials", JsonArray(sanitized.map { JsonPrimitive(it) }))
+                        })
+                    }
+                }
+                // requested non-empty but nothing matched the catalog → drop the
+                // key so we don't accidentally apply an empty (=all) whitelist.
+                else -> cu = JsonObject(cu.toMutableMap().apply { remove("purchasable_materials") })
+            }
+        }
         val ms = cu["method_selection"] as? JsonObject
         val cs = cu["consolidation"] as? JsonObject
         val pa = cu["purchase_allowed"]?.jsonPrimitive?.booleanOrNull
@@ -187,7 +248,7 @@ private suspend fun llmParse(
         val paOk = pa != null
         val acOk = ac != null
         val scOk = sc != null
-        if (msOk || csOk || paOk || acOk || scOk) cu else null
+        if (msOk || csOk || paOk || acOk || scOk || pmOk) cu else null
     }
     return reply to valid
 }
@@ -216,12 +277,50 @@ private fun mergeConsolidation(current: JsonObject, patch: Map<String, JsonEleme
     return JsonObject(mapOf("consolidation" to JsonObject(existing)))
 }
 
-private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, JsonObject?> {
+private fun ruleBasedParse(
+    message: String,
+    current: JsonObject,
+    catalog: List<PurchasableMaterial> = emptyList(),
+): Pair<String, JsonObject?> {
     val raw = message.trim()
     val t = raw.lowercase()
     val ms = (current["method_selection"] as? JsonObject) ?: JsonObject(emptyMap())
     val cs = (current["consolidation"] as? JsonObject) ?: JsonObject(emptyMap())
     val purchaseAllowed = current["purchase_allowed"]?.jsonPrimitive?.booleanOrNull
+
+    // ── Selective purchase (no-LLM fallback) ──────────────────────────────────
+    // Full conditional/named resolution needs the LLM; the fallback handles only
+    // the two unambiguous cases: clear-the-restriction, and exact product-id
+    // tokens that literally appear in the message.
+    if (Regex("all raw|all materials|no restriction|every raw|采购所有原材料|不限制采购|所有原材料").containsMatchIn(t) ||
+        Regex("采购所有原材料|不限制采购|所有原材料").containsMatchIn(raw)
+    ) {
+        val patch = buildJsonObject {
+            put("purchase_allowed", true)
+            putJsonArray("purchasable_materials") {}
+        }
+        return bi(
+            "Cleared the purchase restriction — all raw materials are now purchasable.",
+            "已清除采购限制 — 现在可采购所有原材料。",
+            raw,
+        ) to patch
+    }
+    if (catalog.isNotEmpty()) {
+        val ids = catalog.map { it.productId }
+        val hit = ids.filter { id -> raw.contains(id) }
+        if (hit.isNotEmpty()) {
+            val patch = buildJsonObject {
+                put("purchase_allowed", true)
+                putJsonArray("purchasable_materials") { hit.forEach { add(it) } }
+            }
+            return bi(
+                "Restricting purchase to: ${hit.joinToString(", ")}. (For richer conditions like " +
+                    "by vendor or \"all except X\", configure the LLM provider.)",
+                "已将采购限制为：${hit.joinToString("、")}。（如需按供应商或「除 X 外全部」等更复杂条件，请配置 LLM。）",
+                raw,
+            ) to patch
+        }
+    }
 
     if (t.isBlank()) {
         return bi(
@@ -275,12 +374,20 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
         parts.add(if (zh) "最多方法数 $maxMethods" else "max methods $maxMethods")
         val maxBomDepth = ms["max_bom_depth"]?.jsonPrimitive?.intOrNull?.coerceIn(1, 10) ?: 3
         parts.add(if (zh) "最大 BOM 深度 $maxBomDepth" else "max BOM depth $maxBomDepth")
-        parts.add(if (purchaseAllowed == false) (if (zh) "禁用采购" else "purchase disabled") else (if (zh) "允许采购" else "purchase allowed"))
+        val whitelist = (current["purchasable_materials"] as? JsonArray)
+            ?.mapNotNull { it.jsonPrimitive.contentOrNull?.trim()?.takeIf { s -> s.isNotEmpty() } }
+            ?: emptyList()
+        parts.add(when {
+            purchaseAllowed == false -> if (zh) "禁用采购" else "purchase disabled"
+            whitelist.isNotEmpty() -> if (zh) "仅采购 ${whitelist.size} 种原材料（${whitelist.joinToString("、")}）"
+                                      else "purchase only ${whitelist.size} materials (${whitelist.joinToString(", ")})"
+            else -> if (zh) "允许采购（所有原材料）" else "purchase allowed (all raw materials)"
+        })
         val csEnabled = cs["enabled"]?.jsonPrimitive?.booleanOrNull
         if (csEnabled == false) {
             parts.add(if (zh) "合并关闭" else "consolidation off")
         } else {
-            val days = cs["period_days"]?.jsonPrimitive?.intOrNull ?: 365
+            val days = cs["period_days"]?.jsonPrimitive?.intOrNull ?: 30
             val mode = cs["allocation_mode"]?.jsonPrimitive?.contentOrNull ?: "fair"
             val modeLabel = if (zh) when (mode) {
                 "proportional" -> "按比例拆分"
@@ -456,7 +563,7 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
     if (Regex("enable consolidat|turn on consolidat|consolidate demand|group demand|shared.?component").containsMatchIn(t) ||
         Regex("启用合并|开启合并|合并需求|共享组件").containsMatchIn(raw)
     ) {
-        val days = cs["period_days"]?.jsonPrimitive?.intOrNull ?: 365
+        val days = cs["period_days"]?.jsonPrimitive?.intOrNull ?: 30
         val mode = cs["allocation_mode"]?.jsonPrimitive?.contentOrNull ?: "fair"
         val bucketLabel = if (days == 0) "single-bucket" else "$days-day bucket"
         val zhBucketLabel = if (days == 0) "单桶" else "${days}天桶"
@@ -585,15 +692,15 @@ private fun ruleBasedParse(message: String, current: JsonObject): Pair<String, J
             put("purchase_allowed", false)
             put("consolidation", buildJsonObject {
                 put("enabled", true)
-                put("period_days", 365)
+                put("period_days", 30)
                 put("allocation_mode", "fair")
             })
             put("analyze_criticality", false)
             put("check_soundness", true)
         }
         return bi(
-            "Reset to defaults: method by preference, purchase disabled, consolidation on (365-day bucket, fair split), criticality off, soundness check on.",
-            "已重置为默认：按偏好方法、禁用采购、合并开启（365 天桶，公平拆分）、关键度关闭、完整性校验开启。",
+            "Reset to defaults: method by preference, purchase disabled, consolidation on (30-day bucket, fair split), criticality off, soundness check on.",
+            "已重置为默认：按偏好方法、禁用采购、合并开启（30 天桶，公平拆分）、关键度关闭、完整性校验开启。",
             raw,
         ) to patch
     }
@@ -627,9 +734,13 @@ fun Routing.planningCopilotRoutes() {
         }
         val currentConfig = req.currentConfig ?: JsonObject(emptyMap())
         val history = req.history ?: emptyList()
+        // Buyable raw-material catalog — lets the LLM resolve selective-purchase
+        // conditions ("only buy steel", "from vendor ACME", "all except aluminum")
+        // to concrete product_ids. Also drives the rule-based fallback's id-token scan.
+        val catalog = com.allocator.services.RawMaterials.purchasable(caseId)
 
-        val (reply, configUpdate) = llmParse(message, currentConfig, history)
-            ?: ruleBasedParse(message, currentConfig)
+        val (reply, configUpdate) = llmParse(message, currentConfig, history, catalog)
+            ?: ruleBasedParse(message, currentConfig, catalog)
 
         call.respond(PlanningCopilotResponse(reply = reply, configUpdate = configUpdate))
     }

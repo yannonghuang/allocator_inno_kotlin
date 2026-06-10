@@ -1327,6 +1327,7 @@ internal val TOOLS: List<LlmTool> = listOf(
             "  • `lower_preference` — preference > chosen waterfall's max\n" +
             "  • `beyond_max_methods` — preference rank > methodCfg.max_methods\n" +
             "  • `purchase_disabled` — type=buy but purchase_allowed=false\n" +
+            "  • `purchase_not_whitelisted` — type=buy but product absent from purchasable_materials whitelist\n" +
             "  • `failed_cascade_probe` — tried but BOM probe blocked deeper (failed=true)\n" +
             "  • `score_lower` — elaborate-mode catch-all for losing alternatives\n" +
             "Plus an `override_levers` array naming the seven supply-side override paths " +
@@ -1889,7 +1890,7 @@ private fun toolUpdateConfig(
         // Step 2: no `partial` wrapper — treat the whole args as the partial,
         // but only if it has at least one recognized config top-level key.
         val configKeys = setOf(
-            "method_selection", "consolidation", "purchase_allowed",
+            "method_selection", "consolidation", "purchase_allowed", "purchasable_materials",
             "analyze_criticality", "check_soundness",
         )
         if (args.keys.any { it in configKeys }) args else null
@@ -2383,7 +2384,7 @@ private fun toolSuggestNextBatch(caseId: Int, args: JsonObject, locale: String):
                 "Each candidate is a single-knob variation off the current best, dedup'd against " +
                     "every signature in this case's KB + plan_run history. To run one, call " +
                     "update_config with `partial` set to the EXACT candidate.config object — " +
-                    "every top-level key (purchase_allowed, method_selection, variant_selection, " +
+                    "every top-level key (purchase_allowed, purchasable_materials, method_selection, variant_selection, " +
                     "consolidation, analyze_criticality, check_soundness) and every nested field " +
                     "(consolidation.period_days, consolidation.allocation_mode, method_selection.max_bom_depth, …) MUST be present. " +
                     "update_config is a deep MERGE — anything you omit silently keeps the prior " +
@@ -3327,7 +3328,7 @@ private fun toolGetLeafCompetition(caseId: Int, args: JsonObject, locale: String
     }?.let { raw -> runCatching { jsonParser.parseToJsonElement(raw).jsonObject }.getOrNull() }
     val consolidationConfig = (runConfigJson?.get("consolidation") as? JsonObject) ?: JsonObject(emptyMap())
     val allocationMode = consolidationConfig["allocation_mode"]?.jsonPrimitive?.contentOrNull ?: "fair"
-    val periodDays = consolidationConfig["period_days"]?.jsonPrimitive?.intOrNull ?: 0
+    val periodDays = consolidationConfig["period_days"]?.jsonPrimitive?.intOrNull ?: 30
     val consolidationEnabled = consolidationConfig["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
 
     // Manual overrides on supplies at this (pid, lid) — surfaces when a
@@ -4522,6 +4523,12 @@ private fun toolExplainMethodChoice(caseId: Int, args: JsonObject, locale: Strin
     } ?: JsonObject(emptyMap())
     val msConfig: JsonObject = (configJsonFull["method_selection"] as? JsonObject) ?: JsonObject(emptyMap())
     val purchaseAllowed = configJsonFull["purchase_allowed"]?.jsonPrimitive?.booleanOrNull != false
+    // Selective-purchase whitelist (empty ⇒ all raw materials buyable).
+    val purchasableMaterials: Set<String> = (configJsonFull["purchasable_materials"] as? JsonArray)
+        ?.mapNotNull { it.jsonPrimitive.contentOrNull?.trim()?.takeIf { s -> s.isNotEmpty() } }
+        ?.toSet() ?: emptySet()
+    val buyNotWhitelisted = purchaseAllowed && purchasableMaterials.isNotEmpty() &&
+        productId.trim() !in purchasableMaterials
     val mode = msConfig["mode"]?.jsonPrimitive?.contentOrNull ?: "preference"
     val maxMethods = msConfig["max_methods"]?.jsonPrimitive?.intOrNull ?: 2
 
@@ -4574,6 +4581,8 @@ private fun toolExplainMethodChoice(caseId: Int, args: JsonObject, locale: Strin
                 Triple("chosen", "selected by the planner at this site", null)
             amType == "buy" && !purchaseAllowed ->
                 Triple("purchase_disabled", "method type=buy but purchase_allowed=false on this run", "set purchase_allowed=true (or manually override method_selection)")
+            amType == "buy" && buyNotWhitelisted ->
+                Triple("purchase_not_whitelisted", "method type=buy but $productId is not in the purchasable_materials whitelist on this run", "add $productId to purchasable_materials (or clear the list to allow all raw materials)")
             key in failedCascadeKeys ->
                 Triple("failed_cascade_probe", "cascade picker tried this method but its BOM probe blocked deeper (failed=true in pegging)", "non-trivial — fix upstream inventory or methods at the deeper bottleneck (call get_demand_pegging on a relevant demand to trace)")
             // beyond_max_methods: this alt's rank (1-based) > maxMethods AND
@@ -4623,6 +4632,7 @@ private fun toolExplainMethodChoice(caseId: Int, args: JsonObject, locale: Strin
         put("max_methods", JsonPrimitive(maxMethods))
         put("max_bom_depth", JsonPrimitive(msConfig["max_bom_depth"]?.jsonPrimitive?.intOrNull ?: 3))
         put("purchase_allowed", JsonPrimitive(purchaseAllowed))
+        put("purchasable_materials", JsonArray(purchasableMaterials.sorted().map { JsonPrimitive(it) }))
         msConfig["score_weights"]?.let { put("score_weights", it) }
         put("override_levers", buildJsonArray {
             // Symmetric to get_leaf_competition's override_levers — names the
@@ -4634,6 +4644,7 @@ private fun toolExplainMethodChoice(caseId: Int, args: JsonObject, locale: Strin
             add(JsonPrimitive("change method_selection.mode (preference / elaborate) — switch the selection criterion"))
             add(JsonPrimitive("change method_selection.score_weights — re-weight commit_time / inventory_consumed / purchase (elaborate only)"))
             add(JsonPrimitive("change purchase_allowed — admit/exclude method_buy"))
+            add(JsonPrimitive("change purchasable_materials — selectively whitelist which raw materials may be bought (empty = all)"))
             add(JsonPrimitive("change preference values in method_make/move/buy CSV — re-rank globally"))
         })
     }

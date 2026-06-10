@@ -46,6 +46,8 @@ import {
   getPegging,
   getBomRealPairs,
   getMovesWithTransit,
+  getPurchasableRawMaterials,
+  type PurchasableRawMaterial,
   getWorkOrderPegging,
   type Case as CaseType,
   type AllocationRun as RunType,
@@ -424,6 +426,132 @@ function renderCopilotText(text: string): React.ReactNode[] {
   }
   flushText(lines.length);
   return out;
+}
+
+/**
+ * Searchable, multi-valued picker for the "selective purchase" whitelist. Shared by
+ * the plan-conditions config panel and the copilot `/raw` slash command. Filters on
+ * product_id / description / vendor / SKU series. An empty selection means "all raw
+ * materials are purchasable" (the default).
+ */
+function RawMaterialPicker({
+  options,
+  selected,
+  onChange,
+  initialFilter,
+  defaultCollapsed,
+  tP,
+}: {
+  options: PurchasableRawMaterial[];
+  selected: string[];
+  onChange: (next: string[]) => void;
+  initialFilter?: string;
+  defaultCollapsed?: boolean;
+  tP: (k: string) => string;
+}) {
+  const [collapsed, setCollapsed] = useState(defaultCollapsed ?? false);
+  const [filter, setFilter] = useState(initialFilter ?? '');
+  const sel = new Set(selected);
+  const f = filter.trim().toLowerCase();
+  // Wildcard-aware match: a query containing `*` is treated as a glob anchored at the
+  // start of product_id (e.g. `160-*` → every 160- series id). Otherwise substring match
+  // across id / description / vendor / sku series (the original behavior).
+  const matches = (o: PurchasableRawMaterial): boolean => {
+    if (!f) return true;
+    if (f.includes('*')) {
+      const rx = new RegExp('^' + f.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*'), 'i');
+      return rx.test(o.product_id);
+    }
+    return o.product_id.toLowerCase().includes(f) ||
+      (o.description ?? '').toLowerCase().includes(f) ||
+      (o.vendor_id ?? '').toLowerCase().includes(f) ||
+      (o.sku_pattern ?? '').toLowerCase().includes(f);
+  };
+  const shown = f ? options.filter(matches) : options;
+  const shownIds = shown.map((o) => o.product_id);
+  const toggle = (id: string) => {
+    const next = new Set(sel);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    onChange(Array.from(next));
+  };
+  const selectIds = (ids: string[]) => { const next = new Set(sel); ids.forEach((i) => next.add(i)); onChange(Array.from(next)); };
+  const deselectIds = (ids: string[]) => { const next = new Set(sel); ids.forEach((i) => next.delete(i)); onChange(Array.from(next)); };
+  const btnStyle: React.CSSProperties = { fontSize: '0.7rem', color: '#d4d4d8', background: '#27272a', border: '1px solid #3f3f46', borderRadius: 4, padding: '2px 7px', cursor: 'pointer' };
+  return (
+    <div style={{ marginTop: '0.4rem' }}>
+      {/* Toggle button — show/hide the full list; the selection count stays visible either way.
+          The ⓘ explains the (surprising) whitelist semantics: empty ≡ all selected. */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <button
+          type="button"
+          onClick={() => setCollapsed((c) => !c)}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 6, background: '#27272a', border: '1px solid #3f3f46', borderRadius: 4, padding: '3px 9px', color: '#d4d4d8', fontSize: '0.72rem', cursor: 'pointer' }}
+        >
+          <span>{collapsed ? '▸' : '▾'}</span>
+          <span>{collapsed ? tP('config.purchasableShowList') : tP('config.purchasableHideList')}</span>
+          <span style={{ color: sel.size === 0 ? '#fbbf24' : '#a1a1aa' }}>
+            {`(${sel.size} / ${options.length} ${tP('config.purchasableSelected')})`}
+            {sel.size === 0 && ` — ${tP('config.purchasableAllHint')}`}
+          </span>
+        </button>
+        <span
+          title={tP('config.purchasableSemantics')}
+          style={{ fontSize: '0.78rem', color: '#71717a', cursor: 'help', border: '1px solid #52525b', borderRadius: '50%', width: 15, height: 15, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', lineHeight: 1 }}
+        >
+          i
+        </span>
+      </div>
+      {!collapsed && (
+        <div style={{ marginTop: 4 }}>
+          <input
+            type="text"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            placeholder={tP('config.purchasableSearchPlaceholder')}
+            style={{ width: '100%', padding: '4px 8px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem', marginBottom: 4 }}
+          />
+          {/* Bulk actions. Select all / Clear always apply to the WHOLE list; the wildcard
+              pair (shown only when a filter is active) applies to the matched set — so
+              `160-*` + Deselect matching removes just that series. The two are complementary:
+              e.g. Select all, then filter 160-* → Deselect matching, filter 283-* → Deselect
+              matching ⇒ everything except those series. */}
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginBottom: 4 }}>
+            <button type="button" style={btnStyle} onClick={() => onChange(options.map((o) => o.product_id))}>
+              {tP('config.purchasableSelectAll')}
+            </button>
+            <button type="button" style={btnStyle} onClick={() => onChange([])}>
+              {tP('config.purchasableClear')}
+            </button>
+            {f && (
+              <>
+                <span style={{ color: '#52525b' }}>|</span>
+                <button type="button" style={btnStyle} onClick={() => selectIds(shownIds)}>
+                  {`${tP('config.purchasableSelectShown')} (${shown.length})`}
+                </button>
+                <button type="button" style={btnStyle} onClick={() => deselectIds(shownIds)}>
+                  {`${tP('config.purchasableDeselectShown')} (${shown.length})`}
+                </button>
+              </>
+            )}
+          </div>
+          <div style={{ maxHeight: 160, overflowY: 'auto', border: '1px solid #3f3f46', borderRadius: 4, padding: '2px 4px' }}>
+            {shown.length === 0 && (
+              <div style={{ fontSize: '0.75rem', color: '#71717a', padding: '4px' }}>{tP('config.purchasableNone')}</div>
+            )}
+            {shown.map((o) => (
+              <label key={o.product_id}
+                style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0', cursor: 'pointer', fontSize: '0.78rem' }}>
+                <input type="checkbox" checked={sel.has(o.product_id)} onChange={() => toggle(o.product_id)} />
+                <span style={{ fontFamily: 'monospace', color: '#e4e4e7' }}>{o.product_id}</span>
+                {o.description && <span style={{ color: '#a1a1aa' }}>— {o.description}</span>}
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function parseApiError(raw: unknown): string {
@@ -1037,7 +1165,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [peggingSelectedProductLoc, setPeggingSelectedProductLoc] = useState<{ product: string; location: string } | null>(null);
   const [bomRealPairs, setBomRealPairs] = useState<[string, string][] | null>(null);
   const [realMoveTriples, setRealMoveTriples] = useState<[string, string, string][] | null>(null);
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true, enable_global_scheduling: true });
+  // Buyable raw materials for the selective-purchase whitelist dropdown + copilot /raw picker.
+  const [purchasableOptions, setPurchasableOptions] = useState<PurchasableRawMaterial[]>([]);
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 30, allocation_mode: 'fair' }, purchase_allowed: false, purchasable_materials: [], analyze_criticality: false, check_soundness: true, enable_global_scheduling: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1141,7 +1271,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     }
     if (cs.allocation_mode !== 'fair') diffs.push(`allocation_mode: fair → ${cs.allocation_mode}`);
     if (cs.enabled === false) diffs.push(`consolidation: on → off`);
-    if (Number(cs.period_days) !== 0) diffs.push(`period_days: 0 → ${cs.period_days}`);
+    if (Number(cs.period_days ?? 30) !== 30) diffs.push(`period_days: 30 → ${cs.period_days}`);
     if (config.purchase_allowed === true) diffs.push(`purchase: off → on`);
     return diffs.join(' · ');
   };
@@ -1166,7 +1296,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     }
     parts.push(`alloc=${cs.allocation_mode ?? 'fair'}`);
     parts.push(`cons=${cs.enabled === false ? 'off' : 'on'}`);
-    if (Number(cs.period_days ?? 0) !== 0) parts.push(`p=${cs.period_days}`);
+    if (Number(cs.period_days ?? 30) !== 30) parts.push(`p=${cs.period_days}`);
     parts.push(`purch=${config.purchase_allowed === true ? 'on' : 'off'}`);
     return parts.join(' · ');
   };
@@ -1183,7 +1313,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     },
     consolidation: {
       enabled: true,
-      period_days: 0,
+      period_days: 30,
       allocation_mode: 'fair',
     },
     variant_selection: { multiple: true },
@@ -1651,6 +1781,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       cancelled = true;
     };
   }, [id, planResult]);
+
+  // Load the buyable raw-material catalog for the selective-purchase whitelist
+  // dropdown + copilot /raw picker. Independent of plan results so the options
+  // are ready before the first run.
+  useEffect(() => {
+    if (!id) {
+      setPurchasableOptions([]);
+      return;
+    }
+    let cancelled = false;
+    getPurchasableRawMaterials(id)
+      .then((res) => { if (!cancelled) setPurchasableOptions(res.materials ?? []); })
+      .catch(() => { if (!cancelled) setPurchasableOptions([]); });
+    return () => { cancelled = true; };
+  }, [id]);
 
   // Reset active-demand selection when the user opens pegging for a different WO
   useEffect(() => {
@@ -4472,6 +4617,28 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               <span>{tP('config.purchaseAllowed')}</span>
             </label>
 
+            {/* Row 3b — Selective purchase: when purchase is allowed, optionally
+                restrict to a whitelist of raw materials. Empty ⇒ all raw materials
+                are purchasable (default). Hidden when purchase is off. */}
+            {planningConfig.purchase_allowed !== false && (
+              <div style={{ marginTop: '0.45rem', marginLeft: '1.5rem' }}>
+                <div style={{ fontSize: '0.72rem', color: '#a1a1aa', marginBottom: 2 }}>
+                  {tP('config.purchasableMaterials')}
+                </div>
+                {purchasableOptions.length === 0 ? (
+                  <div style={{ fontSize: '0.72rem', color: '#71717a' }}>{tP('config.purchasableNone')}</div>
+                ) : (
+                  <RawMaterialPicker
+                    options={purchasableOptions}
+                    selected={planningConfig.purchasable_materials ?? []}
+                    onChange={(next) => setPlanningConfig((c) => ({ ...c, purchasable_materials: next }))}
+                    defaultCollapsed
+                    tP={tP}
+                  />
+                )}
+              </div>
+            )}
+
             {/* Row 4 — Cross-WO arbitration. Off by default during opt-in
                 rollout; flipping it on means concurrent WOs at the same
                 location queue against a shared resource calendar instead
@@ -4506,14 +4673,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 />
                 <span>{tP('config.consolidate')}</span>
               </label>
-              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}>
+              <label
+                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}
+                title={tP('config.bucketDaysTooltip')}
+              >
                 <span style={{ color: '#a1a1aa' }}>{tP('config.bucketDays')}</span>
                 <input
                   type="number"
                   min={0}
                   max={365}
                   disabled={planningConfig.consolidation?.enabled !== true}
-                  value={planningConfig.consolidation?.period_days ?? 0}
+                  value={planningConfig.consolidation?.period_days ?? 30}
                   onChange={(e) => {
                     const raw = parseInt(e.target.value, 10);
                     const v = Math.max(0, Math.min(365, Number.isNaN(raw) ? 0 : raw));
@@ -4537,6 +4707,25 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   <option value="proportional">{tP('config.proportional')}</option>
                   <option value="priority_first">{tP('config.priorityFirst')}</option>
                 </select>
+              </label>
+              <label
+                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}
+                title={tP('config.maxIterTooltip')}
+              >
+                <span style={{ color: '#a1a1aa' }}>{tP('config.maxIter')}</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={15}
+                  disabled={planningConfig.consolidation?.enabled !== true}
+                  value={planningConfig.consolidation?.max_iterations ?? 1}
+                  onChange={(e) => {
+                    const raw = parseInt(e.target.value, 10);
+                    const v = Math.max(1, Math.min(15, Number.isNaN(raw) ? 1 : raw));
+                    setPlanningConfig((c) => ({ ...c, consolidation: { ...c.consolidation, max_iterations: v } }));
+                  }}
+                  style={{ width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+                />
               </label>
             </div>
           </fieldset>
@@ -4617,7 +4806,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 },
               },
               purchase_allowed: false,
-              consolidation: { enabled: true, period_days: 0, allocation_mode: 'fair' },
+              consolidation: { enabled: true, period_days: 30, allocation_mode: 'fair' },
             })}
             title={tP('config.resetDefaultsTitle')}
             style={{ padding: '6px 12px' }}
@@ -6121,6 +6310,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                             <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem', paddingBottom: '0.15rem' }}>Type</th>
                                             <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem' }}>Supply ID</th>
                                             <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem' }}>Location</th>
+                                            <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem' }}>Start</th>
+                                            <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem' }}>End</th>
                                             <th style={{ textAlign: 'right', fontWeight: 400, paddingRight: '1.25rem' }}>Qty</th>
                                           </tr>
                                         </thead>
@@ -6130,8 +6321,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                               <td style={cellP}>
                                                 <span style={{ fontSize: '0.65rem', padding: '1px 5px', borderRadius: 6, background: 'rgba(34,197,94,0.15)', color: '#16a34a', border: '1px solid rgba(34,197,94,0.3)' }}>{s.type}</span>
                                               </td>
-                                              <td style={{ ...cellP, fontFamily: 'monospace', fontSize: '0.72rem', color: '#71717a' }}>{s.supply_id ?? '–'}</td>
+                                              <td style={{ ...cellP, fontFamily: 'monospace', fontSize: '0.72rem', color: '#71717a' }}>{s.supply_id ?? s.vendor_id ?? '–'}</td>
                                               <td style={{ ...cellP, color: '#a3a3a3' }}>{s.location_id ?? '–'}</td>
+                                              <td style={{ ...cellP, color: '#a3a3a3', fontFamily: 'monospace', fontSize: '0.72rem' }}>{s.start_time ?? '–'}</td>
+                                              <td style={{ ...cellP, color: '#a3a3a3', fontFamily: 'monospace', fontSize: '0.72rem' }}>{s.end_time ?? '–'}</td>
                                               <td style={{ textAlign: 'right', paddingRight: '1.25rem' }}>{qtyFmt(Number(s.quantity ?? 0))}</td>
                                             </tr>
                                           ))}
@@ -6162,6 +6355,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                                 <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem', paddingBottom: '0.15rem' }}>Type</th>
                                                 <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem' }}>Supply ID</th>
                                                 <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem' }}>Location</th>
+                                                <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem' }}>Start</th>
+                                                <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1.25rem' }}>End</th>
                                                 <th style={{ textAlign: 'right', fontWeight: 400, paddingRight: '1.25rem' }}>Qty</th>
                                               </>
                                             )}
@@ -6185,8 +6380,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                                   border: `1px solid ${s.type === 'purchase' ? 'rgba(16,185,129,0.3)' : 'rgba(59,130,246,0.3)'}`,
                                                 }}>{s.type}</span>
                                               </td>
-                                              <td style={{ ...cellP, fontFamily: 'monospace', fontSize: '0.72rem', color: '#71717a' }}>{s.supply_id ?? '–'}</td>
+                                              <td style={{ ...cellP, fontFamily: 'monospace', fontSize: '0.72rem', color: '#71717a' }}>{s.supply_id ?? s.vendor_id ?? '–'}</td>
                                               <td style={{ ...cellP, color: '#a3a3a3' }}>{s.location_id ?? '–'}</td>
+                                              <td style={{ ...cellP, color: '#a3a3a3', fontFamily: 'monospace', fontSize: '0.72rem' }}>{s.start_time ?? '–'}</td>
+                                              <td style={{ ...cellP, color: '#a3a3a3', fontFamily: 'monospace', fontSize: '0.72rem' }}>{s.end_time ?? '–'}</td>
                                               <td style={{ textAlign: 'right', paddingRight: '1.25rem' }}>{qtyFmt(Number(s.quantity ?? 0))}</td>
                                             </tr>
                                           ))}
@@ -7502,7 +7699,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                     <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editPeriodDays')}</span>
                                     <input type="number" min={0} max={365}
                                       disabled={cs.enabled === false}
-                                      value={Number(cs.period_days ?? 0)}
+                                      value={Number(cs.period_days ?? 30)}
                                       onChange={(e) => updateConfig((c) => {
                                         const v = (c.consolidation ?? {}) as Record<string, unknown>;
                                         v.period_days = Math.max(0, Math.min(365, parseInt(e.target.value, 10) || 0));
@@ -9077,7 +9274,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <strong>{tP('copilot.purchase')}</strong> {planningConfig.purchase_allowed === false ? tP('copilot.disabled') : tP('copilot.allowed')}.{' '}
                 <strong>{tP('copilot.consolidation')}</strong> {planningConfig.consolidation?.enabled === true
                   ? tP('copilot.consolidationOnDetail', {
-                      days: planningConfig.consolidation.period_days ?? 0,
+                      days: planningConfig.consolidation.period_days ?? 30,
                       split: planningConfig.consolidation.allocation_mode === 'proportional'
                         ? tP('copilot.splitProportional')
                         : planningConfig.consolidation.allocation_mode === 'priority_first'
@@ -9097,6 +9294,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <div key={i} style={{ marginBottom: '0.75rem' }}>
                   <span style={{ fontWeight: 600, color: m.role === 'user' ? '#a78bfa' : '#67e8f9', fontSize: '0.8rem' }}>{m.role === 'user' ? tP('copilot.roleUser') : tP('copilot.roleCopilot')}: </span>
                   <span style={{ fontSize: '0.875rem' }}>{renderCopilotText(m.text)}</span>
+                  {m.kind === 'raw_picker' && (
+                    purchasableOptions.length === 0 ? (
+                      <div style={{ fontSize: '0.78rem', color: '#71717a', marginTop: '0.3rem' }}>{tP('config.purchasableNone')}</div>
+                    ) : (
+                      <RawMaterialPicker
+                        options={purchasableOptions}
+                        selected={planningConfig.purchasable_materials ?? []}
+                        onChange={(next) => setPlanningConfig((c) => ({ ...c, purchase_allowed: true, purchasable_materials: next }))}
+                        initialFilter={m.filter}
+                        tP={tP}
+                      />
+                    )
+                  )}
                   {m.role === 'assistant' && m.steps && m.steps.length > 0 && (
                     <div style={{ marginTop: '0.4rem', marginLeft: '0.75rem', borderLeft: '2px solid #3d3d40', paddingLeft: '0.75rem' }}>
                       {m.steps.map((s, si) => (
@@ -9139,6 +9349,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 e.preventDefault();
                 const text = copilotInput.trim();
                 if (!text || copilotLoading) return;
+                // `/raw [filter]` — local slash command: render the interactive
+                // purchasable-raw-material picker inline (no backend round-trip).
+                const rawCmd = text.match(/^\/raw(?:\s+(.*))?$/i);
+                if (rawCmd) {
+                  const filter = rawCmd[1]?.trim() || undefined;
+                  setCopilotMessages((prev) => [
+                    ...prev,
+                    { role: 'user', text },
+                    { role: 'assistant', kind: 'raw_picker', filter, text: tP('config.purchasablePickerHeading') },
+                  ]);
+                  setCopilotInput('');
+                  return;
+                }
                 setCopilotMessages((prev) => [...prev, { role: 'user', text }]);
                 setCopilotInput('');
                 setCopilotLoading(true);
@@ -9150,6 +9373,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     ...cu,
                     method_selection: cu.method_selection ? { ...prev.method_selection, ...cu.method_selection } : prev.method_selection,
                     purchase_allowed: 'purchase_allowed' in cu ? cu.purchase_allowed : prev.purchase_allowed,
+                    purchasable_materials: 'purchasable_materials' in cu ? cu.purchasable_materials : prev.purchasable_materials,
                     consolidation: cu.consolidation ? { ...prev.consolidation, ...cu.consolidation } : prev.consolidation,
                   }));
                 };
