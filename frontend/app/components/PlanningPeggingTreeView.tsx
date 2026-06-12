@@ -209,9 +209,17 @@ function NodeView({
 
   const indentPx = 12;
   let childGroupLabel: string | null = null;
-  let childGroupKind: 'and' | 'or' | null = null;
+  let childGroupKind: 'and' | 'or' | 'consumers' | null = null;
   const relation = node.children_relation as 'and' | 'or' | undefined;
-  if (relation === 'or' && hasChildren && childrenList.length > 1) {
+  // Consumer breakdown: the children are demands that draw their share from THIS single
+  // consolidated order (a purchase consolidated within & across demands). They don't "supply"
+  // the node (OR) nor are co-required (AND) — they consume it. Label accordingly.
+  const isConsumerBreakdown = hasChildren && childrenList.length > 0 &&
+    childrenList.every((c) => (c as { consolidated_consumer?: boolean }).consolidated_consumer);
+  if (isConsumerBreakdown) {
+    childGroupKind = 'consumers';
+    childGroupLabel = 'required in the following demands — one consolidated order, shared across them.';
+  } else if (relation === 'or' && hasChildren && childrenList.length > 1) {
     childGroupKind = 'or';
     childGroupLabel = 'ANY of the inventories / work orders below can supply this node (OR).';
   } else if (relation === 'and' && hasChildren && childrenList.length > 1) {
@@ -329,13 +337,13 @@ function NodeView({
                 alignItems: 'center',
                 gap: 4,
                 fontSize: '0.7rem',
-                color: childGroupKind === 'and' ? '#f97316' : '#38bdf8',
-                backgroundColor: childGroupKind === 'and' ? 'rgba(249,115,22,0.12)' : 'rgba(56,189,248,0.12)',
+                color: childGroupKind === 'and' ? '#f97316' : childGroupKind === 'consumers' ? '#a78bfa' : '#38bdf8',
+                backgroundColor: childGroupKind === 'and' ? 'rgba(249,115,22,0.12)' : childGroupKind === 'consumers' ? 'rgba(167,139,250,0.12)' : 'rgba(56,189,248,0.12)',
                 borderRadius: 999,
                 padding: '1px 6px',
               }}
             >
-              <span style={{ fontWeight: 700 }}>{childGroupKind === 'and' ? 'AND' : 'OR'}</span>
+              {childGroupKind !== 'consumers' && <span style={{ fontWeight: 700 }}>{childGroupKind === 'and' ? 'AND' : 'OR'}</span>}
               <span>{childGroupLabel}</span>
             </div>
           )}

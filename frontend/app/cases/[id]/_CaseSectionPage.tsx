@@ -5881,6 +5881,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         String(r.method ?? ''),
                         String(r.location_source ?? ''),
                         String(r.prod_area ?? ''),
+                        // A cross-demand consolidated order is ALREADY one PO per window — keep each
+                        // as its own row (by wo_group_id). Without this, every window's batch (all
+                        // demand_id=null, same product/loc/method) collapses into one row whose
+                        // quantity is the sum of all windows while lots/demands stay from one batch,
+                        // so the row total no longer matches its drill-down.
+                        r.consolidated ? String(r.wo_group_id ?? '') : '',
                       ].join('|');
                       const existing = grouped.get(key);
                       const rowQty = Number(r.quantity ?? 0) || 0;
