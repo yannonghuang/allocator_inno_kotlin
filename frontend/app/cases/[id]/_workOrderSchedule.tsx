@@ -64,9 +64,18 @@ const METHOD_COLOR: Record<string, string> = {
   purchase: '#22c55e',
 };
 
-function methodColor(method: string | null | undefined): string {
+// A consolidated (cross-demand batched) WO is shown in a lighter shade of its method's base color.
+const METHOD_COLOR_CONSOLIDATED: Record<string, string> = {
+  make: '#93c5fd',
+  move: '#fcd34d',
+  buy: '#86efac',
+  purchase: '#86efac',
+};
+
+export function methodColor(method: string | null | undefined, consolidated = false): string {
   if (!method) return '#71717a';
-  return METHOD_COLOR[method.toLowerCase()] ?? '#71717a';
+  const map = consolidated ? METHOD_COLOR_CONSOLIDATED : METHOD_COLOR;
+  return map[method.toLowerCase()] ?? (consolidated ? '#a1a1aa' : '#71717a');
 }
 
 function formatDate(d: Date, locale: string): string {
@@ -86,6 +95,7 @@ export function ScheduleBar({
   onClick,
   selected,
   colorOverride,
+  consolidated,
 }: {
   start: string | null;
   end: string | null;
@@ -96,6 +106,8 @@ export function ScheduleBar({
   selected?: boolean;
   /** When set, overrides the method-derived bar color (used for pegging-graph highlighting). */
   colorOverride?: string;
+  /** Cross-demand consolidated WO → lighter shade of the method's base color. */
+  consolidated?: boolean;
 }): JSX.Element | null {
   const sd = parseIso(start);
   const ed = parseIso(end);
@@ -111,7 +123,7 @@ export function ScheduleBar({
   const xPct = ((sClamped - hStart) / hSpan) * 100;
   const wPct = ((eClamped - sClamped) / hSpan) * 100;
 
-  const color = colorOverride ?? methodColor(method);
+  const color = colorOverride ?? methodColor(method, consolidated);
   const durationDays = Math.max(0, Math.round((ed.getTime() - sd.getTime()) / DAY_MS));
   const tooltip = `${formatDate(sd, locale)} → ${formatDate(ed, locale)} (${durationDays}d)`;
 

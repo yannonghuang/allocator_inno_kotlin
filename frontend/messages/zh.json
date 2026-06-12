@@ -578,7 +578,9 @@
         "timelineTooltip": "隐藏数据列；排程占满全宽"
       },
       "overrideMethod": "方法",
-      "overrideSplit": "拆分"
+      "overrideSplit": "拆分",
+      "nComponents": "{n} 个组件",
+      "consolidatedOnly": "仅合并工单"
     },
     "woScheduleImpact": {
       "title": "工单排程影响",

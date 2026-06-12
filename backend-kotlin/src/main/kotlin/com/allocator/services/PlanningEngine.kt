@@ -2712,28 +2712,6 @@ private fun buildWorkOrders(
 }
 
 /**
- * Canonical STRUCTURAL signature of a WO node's sub-pegging — the recipe / variant / supply-
- * source choices, recursively, ignoring quantities and timings. Two work orders for the same
- * (product, location, method) may be consolidated only when these match (their downstream
- * pegging is identical), so the merged order has one well-defined predecessor chain. Failed /
- * 0-qty-make subtrees are skipped, matching the WO flatten.
- */
-private fun subtreeSignature(node: Any?): String {
-    val n = node as? Map<*, *> ?: return ""
-    if (n["failed"] == true) return ""
-    val type = n["type"]?.toString() ?: ""
-    val pid = (n["product_id"] as? String)?.trim() ?: ""
-    if (type == "supply" || type == "purchase") return "leaf:$pid"
-    if (type == "work_order" && n["method"] == "make" && ((n["quantity"] as? Number)?.toDouble() ?: 0.0) < 1e-6) return ""
-    val childSigs = (n["children"] as? List<*>)
-        ?.mapNotNull { c -> subtreeSignature(c).takeIf { it.isNotEmpty() } }
-        ?.sorted() ?: emptyList()
-    val lid = (n["location_id"] as? String)?.trim() ?: ""
-    val m = (n["method"] as? String)?.trim() ?: ""
-    return "$type:$pid@$lid/$m[${childSigs.joinToString(",")}]"
-}
-
-/**
  * Phase 3 — bottom-up COMMITMENT aggregate over a finalized pegging tree (the quantity-focused
  * pass's closing step in the mental model: top-down requests, inventory consolidation, then
  * bottom-up commitment where "least supplied child dominates"). Top-down planning commits
@@ -2899,10 +2877,6 @@ private fun flattenPeggingToWorkOrders(
                 put("max_lot_size", n["max_lot_size"])
                 put("wave_index", 0)
                 if (members != null) put("consolidated_demand_ids", members)
-                // Structural signature of this WO's sub-pegging — the cross-demand consolidation
-                // only merges WOs whose signatures match (identical downstream recipe). Internal;
-                // stripped before the work-order list is returned.
-                put("_subtree_sig", subtreeSignature(n))
             })
         }
         (n["children"] as? List<*>)?.forEach { walk(it, demandId, members) }
@@ -2956,41 +2930,42 @@ internal fun consolidateWorkOrdersByTiming(
     val passthrough = mutableListOf<Map<String, Any?>>()
     val groupable = mutableListOf<Map<String, Any?>>()
     for (wo in workOrders) {
-        // Exclude "move" from this (product-based) Pass-2 consolidation. At Pass 2 a move only
-        // models reachability from one location to another for a given product — it is not a
-        // physical order, so batching it across demands/time by product is meaningless. Each move
-        // passes through unchanged (its lots already run in parallel — see emitLotsForWo /
-        // buildWorkOrders, where method != "make" ⇒ concurrent). Real physical-move consolidation
-        // would batch on (source_location, target_location, time_bucket) ACROSS products in the
-        // work-order table — left as future work.
-        if (wo["failed"] == true || wo["method"] == "move" || parseDate(wo["start_time"] as? String) == null) passthrough.add(wo)
+        if (wo["failed"] == true || parseDate(wo["start_time"] as? String) == null) passthrough.add(wo)
         else groupable.add(wo)
     }
 
-    // Eligibility: only merge work orders that share (product, location, method, source, window)
-    // AND have an IDENTICAL sub-pegging signature (same downstream recipe / variant / source).
+    // Eligibility (WORK-ORDER-LIST summary only — never touches the per-demand pegging, so
+    // constituents need NOT have identical sub-trees). qty = sum, start = min, end = max.
+    //   • make / buy → keyed by (product, location, method, source, window): one batch per
+    //     component, since each order produces/procures a single product.
+    //   • MOVE → keyed by (source, target, window) WITHOUT product: a physical move from one
+    //     location to another in a window is a single shipment that can carry DIFFERENT
+    //     components together. The merged move WO carries a `move_components` manifest.
     val groups = groupable.groupBy {
-        listOf(
+        if (it["method"] == "move") listOf(
+            "move",
+            (it["location_source"] as? String)?.trim(),  // source
+            (it["location_id"] as? String)?.trim(),       // target
+            bucketOf(it["start_time"] as? String),
+        ) else listOf(
             (it["product_id"] as? String)?.trim(),
             (it["location_id"] as? String)?.trim(),
             it["method"] as? String,
             (it["location_source"] as? String)?.trim(),
             bucketOf(it["start_time"] as? String),
-            it["_subtree_sig"],
         )
     }
 
-    fun stripSig(m: Map<String, Any?>) = m - "_subtree_sig"
     val out = mutableListOf<Map<String, Any?>>()
-    out.addAll(passthrough.map { stripSig(it) })
+    out.addAll(passthrough)
     for ((_, wos) in groups) {
-        if (wos.size == 1) { out.add(stripSig(wos[0])); continue }
+        if (wos.size == 1) { out.add(wos[0]); continue }
         val first = wos[0]
         val pid = (first["product_id"] as? String) ?: ""
         val lid = (first["location_id"] as? String) ?: ""
         val method = (first["method"] as? String) ?: ""
         val totalQty = wos.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
-        if (totalQty <= 1e-9) { out.addAll(wos.map { stripSig(it) }); continue }
+        if (totalQty <= 1e-9) { out.addAll(wos); continue }
 
         // Merged span = [min(start), max(end)] across the constituents.
         val mergedStart = wos.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull()
@@ -3002,6 +2977,48 @@ internal fun consolidateWorkOrdersByTiming(
             .groupBy { it["demand_id"] as String }
             .map { (d, ws) -> mapOf("demand_id" to d, "allocated_qty" to roundQty(ws.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 })) }
         val overrideActive = wos.any { it["override_active"] == true }
+
+        if (method == "move") {
+            // Mixed-product shipment: source → target in this window, carrying DIFFERENT components
+            // together. There is no single product_id — the cargo is the `move_components` manifest
+            // (one entry per product). lot_count = 1 (one shipment; a move models reachability, with
+            // no per-product lotting). Pegging is untouched; per-product move nodes stay in each
+            // demand's tree, so soundness/drill-down by product still resolve there.
+            val moveComponents = wos.groupBy { (it["product_id"] as? String)?.trim() ?: "" }
+                .map { (p, ws) ->
+                    mapOf(
+                        "product_id" to p,
+                        "quantity" to roundQty(ws.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }),
+                        "demand_ids" to ws.mapNotNull { it["demand_id"] as? String }.filter { it.isNotBlank() }.distinct(),
+                    )
+                }
+                .sortedBy { (it["product_id"] as? String) ?: "" }
+            out.add(mapOf(
+                "product_id" to null,                          // mixed cargo
+                "location_id" to lid,                          // target
+                "quantity" to roundQty(totalQty),
+                "start_time" to formatDate(mergedStart),
+                "end_time" to formatDate(mergedEnd),
+                "method" to "move",
+                "location_source" to first["location_source"], // source
+                "demand_id" to null,
+                "prod_area" to null,
+                "override_active" to overrideActive,
+                "wo_group_id" to nextWoGroupId(),
+                "wave_index" to 0,
+                "lot_count" to 1,
+                "consolidated" to true,
+                "wo_competing_demands" to demands,
+                "consolidation_split_details" to splitDetails,
+                "consolidated_demand_ids" to demands,
+                "move_components" to moveComponents,
+                "wo_window_start" to formatDate(mergedStart),
+                "wo_window_end" to formatDate(wos.mapNotNull { parseDate(it["start_time"] as? String) }.maxOrNull()),
+                "wo_consolidation_total_planned" to roundQty(totalQty),
+            ))
+            continue
+        }
+
         val lotSize = (maxLotSize(pid, lid, data)?.takeIf { it > 0 } ?: totalQty).coerceAtLeast(1e-9)
         val lotCount = Math.ceil(totalQty / lotSize).toInt().coerceAtLeast(1)
 
