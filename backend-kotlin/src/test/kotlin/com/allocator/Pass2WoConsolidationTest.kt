@@ -54,6 +54,19 @@ class Pass2WoConsolidationTest : FunSpec({
         consolidateWorkOrdersByTiming(wos, data, windowDays = 30).size shouldBe 2
     }
 
+    test("moves are NOT consolidated — each passes through, per-demand, qty preserved") {
+        // A move only models reachability at Pass 2, so it must never be product-batched
+        // (real physical-move consolidation by source/target/bucket across products is future work).
+        val wos = listOf(
+            wo("RAW1", "L", "move", 200.0, "2024-05-01", "2024-05-03", "D1", source = "S"),
+            wo("RAW1", "L", "move", 300.0, "2024-05-02", "2024-05-04", "D2", source = "S"),
+        )
+        val out = consolidateWorkOrdersByTiming(wos, data, windowDays = 30)
+        out.size shouldBe 2
+        out.all { it["method"] == "move" && it["consolidated"] != true && it["demand_id"] != null } shouldBe true
+        out.sumOf { qtyOf(it) } shouldBe (500.0 plusOrMinus 1e-6)
+    }
+
     test("same product in DIFFERENT windows are NOT merged") {
         val wos = listOf(
             wo("RAW1", "L", "purchase", 100.0, "2024-05-01", "2024-06-20", "D1"),
