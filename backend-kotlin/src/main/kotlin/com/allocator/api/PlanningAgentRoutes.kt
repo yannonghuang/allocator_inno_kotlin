@@ -1890,7 +1890,7 @@ private fun toolUpdateConfig(
         // Step 2: no `partial` wrapper — treat the whole args as the partial,
         // but only if it has at least one recognized config top-level key.
         val configKeys = setOf(
-            "method_selection", "consolidation", "purchase_allowed", "purchasable_materials",
+            "method_selection", "consolidation", "purchase_allowed", "purchasable_materials", "constraints",
             "analyze_criticality", "check_soundness",
         )
         if (args.keys.any { it in configKeys }) args else null
@@ -2384,7 +2384,7 @@ private fun toolSuggestNextBatch(caseId: Int, args: JsonObject, locale: String):
                 "Each candidate is a single-knob variation off the current best, dedup'd against " +
                     "every signature in this case's KB + plan_run history. To run one, call " +
                     "update_config with `partial` set to the EXACT candidate.config object — " +
-                    "every top-level key (purchase_allowed, purchasable_materials, method_selection, variant_selection, " +
+                    "every top-level key (purchase_allowed, purchasable_materials, constraints, method_selection, variant_selection, " +
                     "consolidation, analyze_criticality, check_soundness) and every nested field " +
                     "(consolidation.period_days, consolidation.allocation_mode, method_selection.max_bom_depth, …) MUST be present. " +
                     "update_config is a deep MERGE — anything you omit silently keeps the prior " +

@@ -48,6 +48,8 @@ import {
   getMovesWithTransit,
   getPurchasableRawMaterials,
   type PurchasableRawMaterial,
+  getConstraintOptions,
+  type ConstraintOptions,
   getWorkOrderPegging,
   type Case as CaseType,
   type AllocationRun as RunType,
@@ -554,6 +556,158 @@ function RawMaterialPicker({
   );
 }
 
+type ConstraintRule = { customer: string; parent: string; location: string; child: string };
+
+/** Builder for customer-specific BOM-alternative constraints: four cascading dropdowns
+ *  (customer → parent → location → child) + Add, with a removable list of added rules. */
+/** Single-select dropdown with a type-to-filter input — for long option lists (customers,
+ *  parent products) in the constraint editor. */
+function SearchableSelect({ value, onChange, options, placeholder, disabled, width, tP }: {
+  value: string;
+  onChange: (v: string) => void;
+  options: { value: string; label: string }[];
+  placeholder: string;
+  disabled?: boolean;
+  width?: number;
+  tP: (k: string) => string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const w = width ?? 220;
+  const selectedLabel = options.find((o) => o.value === value)?.label ?? '';
+  const q = query.trim().toLowerCase();
+  const shown = q ? options.filter((o) => o.value.toLowerCase().includes(q) || o.label.toLowerCase().includes(q)) : options;
+  return (
+    <div style={{ position: 'relative', display: 'inline-block' }}>
+      <input
+        type="text"
+        disabled={disabled}
+        value={open ? query : selectedLabel}
+        placeholder={placeholder}
+        onChange={(e) => { setQuery(e.target.value); if (!open) setOpen(true); }}
+        onFocus={() => { setOpen(true); setQuery(''); }}
+        onBlur={() => setTimeout(() => setOpen(false), 120)}
+        style={{ padding: '3px 18px 3px 6px', background: disabled ? '#1f1f22' : '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.78rem', width: w }}
+      />
+      {value && !open && !disabled && (
+        <button type="button" title={tP('config.constraintRemove')} onMouseDown={(e) => { e.preventDefault(); onChange(''); }}
+          style={{ position: 'absolute', right: 4, top: 2, background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '0.85rem', lineHeight: 1, padding: 0 }}>×</button>
+      )}
+      {open && !disabled && (
+        <div style={{ position: 'absolute', zIndex: 30, top: '100%', left: 0, width: w, maxHeight: 220, overflowY: 'auto', background: '#1f1f22', border: '1px solid #3f3f46', borderRadius: 4, marginTop: 2 }}>
+          {shown.length === 0 && <div style={{ padding: '4px 6px', fontSize: '0.75rem', color: '#71717a' }}>{tP('config.constraintNoMatch')}</div>}
+          {shown.slice(0, 300).map((o) => (
+            <div key={o.value} onMouseDown={(e) => { e.preventDefault(); onChange(o.value); setOpen(false); setQuery(''); }}
+              style={{ padding: '3px 6px', fontSize: '0.78rem', color: '#e4e4e7', cursor: 'pointer', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', background: o.value === value ? '#3730a3' : 'transparent' }}>
+              {o.label}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ConstraintPicker({
+  options,
+  constraints,
+  onChange,
+  defaultCollapsed,
+  tP,
+}: {
+  options: ConstraintOptions;
+  constraints: ConstraintRule[];
+  onChange: (next: ConstraintRule[]) => void;
+  defaultCollapsed?: boolean;
+  tP: (k: string) => string;
+}) {
+  const [collapsed, setCollapsed] = useState(defaultCollapsed ?? false);
+  const [customer, setCustomer] = useState('');
+  const [parent, setParent] = useState('');
+  const [location, setLocation] = useState('*');
+  const [child, setChild] = useState('');
+
+  const parentOpt = options.parents.find((p) => p.parent === parent);
+  const locationOpts = parentOpt?.locations ?? [];
+  const childOpts = parentOpt?.children ?? [];
+  const canAdd = !!(customer && parent && child);
+
+  const selStyle: React.CSSProperties = { padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.78rem', maxWidth: 240 };
+  const btnStyle: React.CSSProperties = { fontSize: '0.7rem', color: '#d4d4d8', background: '#27272a', border: '1px solid #3f3f46', borderRadius: 4, padding: '3px 9px', cursor: 'pointer' };
+  const anyLoc = (l: string) => (l === '*' || !l ? tP('config.constraintLocationAny') : l);
+  const custLabel = (cid: string) => { const c = options.customers.find((x) => x.customer_id === cid); return c?.description ? `${cid} — ${c.description}` : cid; };
+
+  const addRule = () => {
+    if (!canAdd) return;
+    const rule: ConstraintRule = { customer, parent, location: location || '*', child };
+    if (constraints.some((r) => r.customer === rule.customer && r.parent === rule.parent && r.location === rule.location && r.child === rule.child)) return;
+    onChange([...constraints, rule]);
+    setChild('');   // keep customer/parent so the user can add sibling rules quickly
+  };
+
+  return (
+    <div style={{ marginTop: '0.4rem' }}>
+      <button type="button" onClick={() => setCollapsed((c) => !c)}
+        style={{ display: 'inline-flex', alignItems: 'center', gap: 6, background: '#27272a', border: '1px solid #3f3f46', borderRadius: 4, padding: '3px 9px', color: '#d4d4d8', fontSize: '0.72rem', cursor: 'pointer' }}>
+        <span>{collapsed ? '▸' : '▾'}</span>
+        <span>{collapsed ? tP('config.constraintShow') : tP('config.constraintHide')}</span>
+        <span style={{ color: '#a1a1aa' }}>{`(${constraints.length})`}</span>
+      </button>
+      {!collapsed && (
+        <div style={{ marginTop: 4 }}>
+          <div style={{ fontSize: '0.7rem', color: '#71717a', marginBottom: 4 }}>{tP('config.constraintHint')}</div>
+          {options.parents.length === 0 ? (
+            <div style={{ fontSize: '0.72rem', color: '#71717a' }}>{tP('config.constraintNoAlternatives')}</div>
+          ) : (
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 6 }}>
+              <SearchableSelect
+                value={customer}
+                onChange={setCustomer}
+                options={options.customers.map((c) => ({ value: c.customer_id, label: custLabel(c.customer_id) }))}
+                placeholder={`${tP('config.constraintCustomer')}…`}
+                width={220}
+                tP={tP}
+              />
+              <SearchableSelect
+                value={parent}
+                onChange={(v) => { setParent(v); setLocation('*'); setChild(''); }}
+                options={options.parents.map((p) => ({ value: p.parent, label: p.parent }))}
+                placeholder={`${tP('config.constraintParent')}…`}
+                width={260}
+                tP={tP}
+              />
+              <select value={location} onChange={(e) => setLocation(e.target.value)} disabled={!parent} style={selStyle}>
+                <option value="*">{tP('config.constraintLocationAny')}</option>
+                {locationOpts.map((l) => <option key={l} value={l}>{l}</option>)}
+              </select>
+              <select value={child} onChange={(e) => setChild(e.target.value)} disabled={!parent} style={selStyle}>
+                <option value="">{tP('config.constraintChild')}…</option>
+                {childOpts.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+              <button type="button" onClick={addRule} disabled={!canAdd} style={{ ...btnStyle, opacity: canAdd ? 1 : 0.4, cursor: canAdd ? 'pointer' : 'default' }}>{tP('config.constraintAdd')}</button>
+            </div>
+          )}
+          {constraints.length === 0 ? (
+            <div style={{ fontSize: '0.72rem', color: '#71717a' }}>{tP('config.constraintEmpty')}</div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+              {constraints.map((r, i) => (
+                <div key={`${r.customer}|${r.parent}|${r.location}|${r.child}`} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.76rem' }}>
+                  <span style={{ fontFamily: 'monospace', color: '#e4e4e7' }}>
+                    {r.customer} · {r.parent} @ {anyLoc(r.location)} ⇒ {r.child}
+                  </span>
+                  <button type="button" title={tP('config.constraintRemove')} onClick={() => onChange(constraints.filter((_, j) => j !== i))}
+                    style={{ background: 'none', border: 'none', color: '#f87171', cursor: 'pointer', fontSize: '0.95rem', lineHeight: 1, padding: 0 }}>×</button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function parseApiError(raw: unknown): string {
   const s = raw instanceof Error ? raw.message : String(raw ?? 'Unknown error');
   try {
@@ -892,13 +1046,19 @@ function buildWoMaps(pegging: PlanningPeggingEntry[]): {
   }
 
   function walk(node: PlanningPeggingNode, demandId: string | null, parentDemand: PlanningPeggingNode | null) {
+    // Skip failed=true subtrees and ~0-qty make subtrees: rolled-back / blocked branches whose
+    // purchases never happen. The backend WO flatten skips them too, so this keeps the supplies
+    // expand and the pegged-requirement totals consistent with the (real) committed quantities.
+    if ((node as { failed?: boolean }).failed) return;
+    if (node.type === 'work_order' && (node.method ?? '').toLowerCase() === 'make' && (Number(node.quantity) || 0) < 1e-6) return;
     if (node.type === 'work_order') {
       const key = `${demandId ?? ''}|${node.product_id ?? ''}|${node.location_id ?? ''}|${node.method ?? ''}`;
-      // Record the direct parent demand's quantity for this WO key.
-      // parentDemand is the demand node immediately above — for a component WO this is the
-      // component demand (qty=300), not the root FG demand (qty=600).
+      // Accumulate the direct parent demand's quantity for this WO key. The WO table groups
+      // node-level WOs by this key and SUMS their committed quantity, so Requested must sum the
+      // per-context requirements too — otherwise a component used by N sub-assemblies shows
+      // Requested = one context but Committed = all N (the "Committed > Requested" artifact).
       if (parentDemand?.type === 'demand' && parentDemand.quantity != null) {
-        if (!peggedQtyMap.has(key)) peggedQtyMap.set(key, parentDemand.quantity);
+        peggedQtyMap.set(key, (peggedQtyMap.get(key) ?? 0) + parentDemand.quantity);
       }
       const isMake = (node.method ?? '').toLowerCase() === 'make';
       if (isMake) {
@@ -1167,7 +1327,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [realMoveTriples, setRealMoveTriples] = useState<[string, string, string][] | null>(null);
   // Buyable raw materials for the selective-purchase whitelist dropdown + copilot /raw picker.
   const [purchasableOptions, setPurchasableOptions] = useState<PurchasableRawMaterial[]>([]);
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 30, allocation_mode: 'fair' }, purchase_allowed: false, purchasable_materials: [], analyze_criticality: false, check_soundness: true, enable_global_scheduling: true });
+  const [constraintOptions, setConstraintOptions] = useState<ConstraintOptions>({ customers: [], parents: [] });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 30, allocation_mode: 'fair' }, purchase_allowed: false, purchasable_materials: [], constraints: [], analyze_criticality: false, check_soundness: true, enable_global_scheduling: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1794,6 +1955,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     getPurchasableRawMaterials(id)
       .then((res) => { if (!cancelled) setPurchasableOptions(res.materials ?? []); })
       .catch(() => { if (!cancelled) setPurchasableOptions([]); });
+    getConstraintOptions(id)
+      .then((res) => { if (!cancelled) setConstraintOptions({ customers: res.customers ?? [], parents: res.parents ?? [] }); })
+      .catch(() => { if (!cancelled) setConstraintOptions({ customers: [], parents: [] }); });
     return () => { cancelled = true; };
   }, [id]);
 
@@ -1956,7 +2120,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       product_id,
       location_id,
       method,
-      start_time: row.start_time ?? undefined,
+      // Batched WO (demand_id null): forward its constituent demands and drop start_time (the
+      // merged start won't match per-demand nodes) so the endpoint aggregates the original
+      // per-demand pegging. Normal WO: pass start_time to pick the exact slot/lot.
+      ...(row.demand_id == null && (row.consolidated_demand_ids?.length ?? 0) > 0
+        ? { demand_ids: row.consolidated_demand_ids, win_start: row.wo_window_start, win_end: row.wo_window_end }
+        : { start_time: row.start_time ?? undefined }),
       ...(currentPlanRunId != null ? { run_id: currentPlanRunId } : {}),
     })
       .then((res) => {
@@ -4757,6 +4926,20 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               </label>
             </div>
           </fieldset>
+
+          {/* ── Group 4: Constraints (customer-specific BOM-alternative pins) ── */}
+          <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
+            <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              {tP('config.groupConstraints')}
+            </legend>
+            <ConstraintPicker
+              options={constraintOptions}
+              constraints={planningConfig.constraints ?? []}
+              onChange={(next) => setPlanningConfig((c) => ({ ...c, constraints: next }))}
+              defaultCollapsed
+              tP={tP}
+            />
+          </fieldset>
           <br style={{ marginTop: '0.25rem' }} />
           <button
             type="button"
@@ -4806,6 +4989,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 },
               },
               purchase_allowed: false,
+              constraints: [],
               consolidation: { enabled: true, period_days: 30, allocation_mode: 'fair' },
             })}
             title={tP('config.resetDefaultsTitle')}
@@ -5749,22 +5933,30 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       //     demand shortage is visible in the committed_demands table.
                       //   single → the demand node directly above this WO in the pegging tree.
                       //   no peg data → fall back to committed_demand requested_qty.
-                      const isSharedConsolidated = (r.wo_consolidation_split_details?.length ?? 0) > 1;
+                      // A cross-demand batched WO (consolidated=true) committed exactly its
+                      // batched quantity for its demands, so Requested = Committed (r.quantity) —
+                      // same treatment as a shared/split WO; avoids a per-context peggedQty mismatch.
+                      const isSharedConsolidated = (r.wo_consolidation_split_details?.length ?? 0) > 1 || r.consolidated === true;
                       const woKeyFull = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
                       const woKeyConsolidated = `|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
                       const peggedQty = woPeggedQtyMap.get(woKeyFull) ?? woPeggedQtyMap.get(woKeyConsolidated) ?? null;
+                      // peggedQty (now summed across this component's sub-assembly contexts,
+                      // failed subtrees excluded) is the true component-level requirement and is
+                      // directly comparable to the grouped committed quantity.
+                      const usePegged = !isSharedConsolidated && peggedQty != null;
                       const demandRequested = isSharedConsolidated
                         ? (Number(r.quantity) || 0)
-                        : peggedQty != null
+                        : usePegged
                           ? peggedQty
                           : r.demand_id
                             ? (demandRequestedMap.get(r.demand_id) ?? undefined)
                             : splitDemandIds.reduce((s, did) => s + (demandRequestedMap.get(did) ?? 0), 0) || undefined;
-                      // For shared WOs, allocated_qty already reflects post-inventory
-                      // allocation — no further inventory subtraction needed. For
-                      // non-shared WOs, subtract the demand's inventory fulfillment so
-                      // Requested reflects only what was expected from this WO.
-                      const inventoryFulfilled = isSharedConsolidated
+                      // Subtract inventory fulfillment ONLY in the FG-level fallback (where
+                      // demandRequested is a finished-good requested_qty). For shared WOs and for
+                      // component-level peggedQty, inventory is already reflected in the pegging
+                      // requirement — subtracting the FG-level number would understate Requested
+                      // (re-introducing Committed > Requested).
+                      const inventoryFulfilled = (isSharedConsolidated || usePegged)
                         ? 0
                         : r.demand_id
                           ? (demandInventoryMap.get(r.demand_id) ?? 0)
@@ -9374,6 +9566,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     method_selection: cu.method_selection ? { ...prev.method_selection, ...cu.method_selection } : prev.method_selection,
                     purchase_allowed: 'purchase_allowed' in cu ? cu.purchase_allowed : prev.purchase_allowed,
                     purchasable_materials: 'purchasable_materials' in cu ? cu.purchasable_materials : prev.purchasable_materials,
+                    constraints: 'constraints' in cu ? cu.constraints : prev.constraints,
                     consolidation: cu.consolidation ? { ...prev.consolidation, ...cu.consolidation } : prev.consolidation,
                   }));
                 };

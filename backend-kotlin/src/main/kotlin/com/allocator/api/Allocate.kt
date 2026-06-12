@@ -3,6 +3,7 @@ package com.allocator.api
 import com.allocator.*
 import com.allocator.services.CaseLoader
 import com.allocator.services.getMethods
+import com.allocator.services.parseConstraints
 import com.allocator.services.resolveMethodSelection
 import com.allocator.services.resolveVariantSelection
 import com.allocator.services.roundQty
@@ -250,6 +251,40 @@ fun Routing.allocateRoutes() {
                         put("vendor_id", m.vendorId)
                         put("lead_days_supply", m.leadDaysSupply)
                         put("sku_pattern", m.skuPattern)
+                    }
+                }
+            }
+        }
+        call.respond(payload)
+    }
+
+    // ── GET /cases/{case_id}/plan/constraint-options ──────────────────────────
+    // Options for the "Constraints" section: customers on this case's demands, and
+    // parent products that have BOM alternatives (with their make locations + the
+    // alternative children that can be pinned). Drives the 4 cascading dropdowns.
+    get("/cases/{case_id}/plan/constraint-options") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        transaction {
+            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
+                ?: throw NoSuchElementException("Case not found")
+        }
+        val opts = com.allocator.services.ConstraintOptions.forCase(caseId)
+        val payload = buildJsonObject {
+            putJsonArray("customers") {
+                opts.customers.forEach { c ->
+                    addJsonObject {
+                        put("customer_id", c.customerId)
+                        put("description", c.description)
+                    }
+                }
+            }
+            putJsonArray("parents") {
+                opts.parents.forEach { p ->
+                    addJsonObject {
+                        put("parent", p.parent)
+                        putJsonArray("locations") { p.locations.forEach { add(it) } }
+                        putJsonArray("children") { p.children.forEach { add(it) } }
                     }
                 }
             }
@@ -655,13 +690,49 @@ fun Routing.allocateRoutes() {
             mergeAlternativeWoNodes(allMatches)
                 ?: throw NoSuchElementException("Work order ($productId @ $locationId / $method${if (startTime.isNotBlank()) " @ $startTime" else ""}) not found in any pegging tree for demand $demandId")
         } else {
-            // Consolidated WO: search all trees where demand_id is null/blank
+            // Consolidated / cross-demand batched WO. The batch carries consolidated_demand_ids;
+            // the frontend forwards them as `demand_ids`. Resolve the batch back to the ORIGINAL
+            // per-demand pegging by aggregating the matching (product, location, method) WO nodes
+            // across each constituent demand's tree (plus any demand_id=blank consolidated entry),
+            // and merging them into one node. The batch's start_time is a merged value that won't
+            // match per-demand nodes, so skip the start_time filter when constituents are given.
+            val demandIds = (call.request.queryParameters["demand_ids"] ?: "")
+                .split(",").map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+            val winStart = call.request.queryParameters["win_start"]?.trim()?.takeIf { it.isNotEmpty() }
+            val winEnd = call.request.queryParameters["win_end"]?.trim()?.takeIf { it.isNotEmpty() }
             val rawMatches = planningPegging
-                .filter { (it["demand_id"]?.toString() ?: "").isBlank() }
+                .filter { e ->
+                    val ed = (e["demand_id"]?.toString() ?: "").trim()
+                    ed.isBlank() || ed in demandIds
+                }
                 .flatMap { entry -> findAllWoNodes(entry["tree"], productId, locationId, method) }
-            val allMatches = filterByStartTime(rawMatches, startTime)
-            mergeAlternativeWoNodes(allMatches)
-                ?: throw NoSuchElementException("Work order ($productId @ $locationId / $method${if (startTime.isNotBlank()) " @ $startTime" else ""}) not found in any consolidated pegging tree")
+            // Bound to the batch's original start-window so the aggregate matches THIS batch
+            // (those demands may buy the same component in other windows too).
+            val windowed = if (winStart != null && winEnd != null) rawMatches.filter { node ->
+                val s = (node["start_time"] as? String)?.trim() ?: return@filter false
+                s >= winStart && s <= winEnd
+            } else rawMatches
+            if (demandIds.isNotEmpty()) {
+                // Batched WO: return a synthetic root carrying ALL its constituent per-demand WO
+                // nodes as children, so the drill-down shows the full breakdown (which demands /
+                // contexts it merged) and the root quantity equals the batch's real quantity.
+                if (windowed.isEmpty())
+                    throw NoSuchElementException("Work order ($productId @ $locationId / $method) not found in the pegging trees of its consolidated demands")
+                val totalQty = windowed.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
+                mapOf(
+                    "type" to "work_order",
+                    "product_id" to productId,
+                    "location_id" to locationId,
+                    "method" to method,
+                    "quantity" to totalQty,
+                    "consolidated" to true,
+                    "consolidated_demand_ids" to demandIds.toList(),
+                    "children" to windowed,
+                )
+            } else {
+                mergeAlternativeWoNodes(filterByStartTime(windowed, startTime))
+                    ?: throw NoSuchElementException("Work order ($productId @ $locationId / $method) not found in any consolidated pegging tree")
+            }
         }
 
         // Align quantity with work_orders list sum
@@ -1567,6 +1638,10 @@ private fun findAllWoNodes(
     val out = mutableListOf<Map<String, Any?>>()
     fun visit(t: Any?) {
         val node = t as? Map<String, Any?> ?: return
+        // Skip failed=true subtrees (rolled-back blocked-branch snapshots): their purchases are
+        // phantom and are excluded from the work-order list, so including them here would make a
+        // batched WO's resolved pegging overstate vs the batch's real quantity.
+        if (node["failed"] == true) return
         if (node["type"] == "work_order" &&
             (node["product_id"] as? String ?: "").trim() == productId &&
             (node["location_id"] as? String ?: "").trim() == locationId &&
@@ -2482,6 +2557,18 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
         putJsonArray("purchasable_materials") {
             (c["purchasable_materials"] as? List<*>)?.forEach { pid ->
                 (pid as? String)?.trim()?.takeIf { it.isNotEmpty() }?.let { add(it) }
+            }
+        }
+        // Customer-specific BOM-alternative constraints. Persist so the UI rule list
+        // round-trips and the rule is reapplied on replan/reload.
+        putJsonArray("constraints") {
+            parseConstraints(c).forEach { k ->
+                addJsonObject {
+                    put("customer", k.customerId)
+                    put("parent", k.parent)
+                    put("location", k.location)
+                    put("child", k.child)
+                }
             }
         }
         // Cross-WO arbitration flag — persist so replan + post-run reload

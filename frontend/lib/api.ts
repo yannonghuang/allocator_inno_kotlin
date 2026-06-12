@@ -191,6 +191,14 @@ export type WorkOrder = {
   wo_explanation_method?: string | null;
   /** BOM-graph demand products that also require this component (pid|lid format). */
   wo_competing_demands?: string[];
+  /** On a cross-demand batched WO: the constituent demand_ids it was merged from — used to
+   *  trace the batch back to each demand's original pegging. */
+  consolidated_demand_ids?: string[];
+  /** True on a cross-demand batched work order. */
+  consolidated?: boolean;
+  /** On a batched WO: the original start-window of its constituents (for precise pegging trace). */
+  wo_window_start?: string | null;
+  wo_window_end?: string | null;
   /** Present on consolidated WOs: "priority_first" | "proportional". */
   wo_consolidation_split_mode?: string | null;
   /** Present on consolidated WOs: total qty planned for the merged group. */
@@ -391,6 +399,11 @@ export type PlanningConfig = {
    * method; every other product's buy method is dropped.
    */
   purchasable_materials?: string[];
+  /**
+   * Customer-specific BOM-alternative constraints. Each rule pins which child a given
+   * customer's demand must resolve to for a parent product (location empty/'*' = any).
+   */
+  constraints?: { customer: string; parent: string; location: string; child: string }[];
   /** Consolidate shared component demands within a time bucket before planning. */
   consolidation?: {
     enabled?: boolean;
@@ -512,6 +525,21 @@ export async function getPurchasableRawMaterials(caseId: number): Promise<{ mate
   return r.json();
 }
 
+/** Options for the planning "Constraints" section. */
+export type ConstraintOptions = {
+  customers: { customer_id: string; description?: string | null }[];
+  /** Parent products that have BOM alternatives, with their make locations + forceable children. */
+  parents: { parent: string; locations: string[]; children: string[] }[];
+};
+
+/** Customers (on this case's demands) + parent products with BOM alternatives — drives the
+ *  4 cascading dropdowns in the Constraints section. */
+export async function getConstraintOptions(caseId: number): Promise<ConstraintOptions> {
+  const r = await fetch(`${API}/cases/${caseId}/plan/constraint-options`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
 /** Per-resource utilization rows for a plan run. Each row is a (resource_id, location_id) with
  *  daily load values aligned to `buckets` (ISO date strings) and the resource's static `size`.
  *  `contributors` lists the work_orders that drove the load (debug/cross-highlight hook). */
@@ -552,7 +580,7 @@ export async function getResourceUtilization(caseId: number, runId: number): Pro
  *  has multiple matches (waterfall slots or multi-lot WOs). Pass the WO row's start_time. */
 export async function getWorkOrderPegging(
   caseId: number,
-  params: { demand_id: string; product_id: string; location_id: string; method: string; start_time?: string | null; run_id?: number }
+  params: { demand_id: string; product_id: string; location_id: string; method: string; start_time?: string | null; run_id?: number; demand_ids?: string[]; win_start?: string | null; win_end?: string | null }
 ): Promise<{ tree: PlanningPeggingNode }> {
   const sp = new URLSearchParams({
     demand_id: params.demand_id,
@@ -562,6 +590,11 @@ export async function getWorkOrderPegging(
   });
   if (params.start_time) sp.set('start_time', params.start_time);
   if (params.run_id != null) sp.set('run_id', String(params.run_id));
+  // For a cross-demand batched WO (demand_id blank), forward its constituent demands so the
+  // endpoint can aggregate the original per-demand pegging nodes.
+  if (params.demand_ids && params.demand_ids.length > 0) sp.set('demand_ids', params.demand_ids.join(','));
+  if (params.win_start) sp.set('win_start', params.win_start);
+  if (params.win_end) sp.set('win_end', params.win_end);
   const r = await fetch(`${API}/cases/${caseId}/plan/work-order-pegging?${sp.toString()}`);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
