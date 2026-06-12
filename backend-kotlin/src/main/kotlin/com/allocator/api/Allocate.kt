@@ -705,7 +705,12 @@ fun Routing.allocateRoutes() {
                     val ed = (e["demand_id"]?.toString() ?: "").trim()
                     ed.isBlank() || ed in demandIds
                 }
-                .flatMap { entry -> findAllWoNodes(entry["tree"], productId, locationId, method) }
+                // Tag each matched node with the demand whose tree it came from, so the batch
+                // breakdown can attribute every portion to its source demand.
+                .flatMap { entry ->
+                    val src = (entry["demand_id"]?.toString() ?: "")
+                    findAllWoNodes(entry["tree"], productId, locationId, method).map { it + ("__src_demand" to src) }
+                }
             // Bound to the batch's original start-window so the aggregate matches THIS batch
             // (those demands may buy the same component in other windows too).
             val windowed = if (winStart != null && winEnd != null) rawMatches.filter { node ->
@@ -719,6 +724,30 @@ fun Routing.allocateRoutes() {
                 if (windowed.isEmpty())
                     throw NoSuchElementException("Work order ($productId @ $locationId / $method) not found in the pegging trees of its consolidated demands")
                 val totalQty = windowed.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
+                // For PURCHASES (leaf procurement) the make pattern doesn't apply automatically:
+                // a purchase has no AND-component demand nodes to surface "which demand", so the
+                // raw breakdown is just repeated anonymous purchases. Wrap each demand's portion in
+                // a synthetic DEMAND node — exactly like a make's component demands — so the
+                // drill-down shows how the multiple demands are formulated and how the single
+                // batched PO realizes them. Makes/moves keep their natural per-demand structure.
+                val children: List<Map<String, Any?>> = if (method == "purchase") {
+                    val grouped = mutableListOf<Map<String, Any?>>()
+                    windowed.groupBy { (it["__src_demand"] as? String) ?: "" }.forEach { (did, nodes) ->
+                        val purchases = nodes.map { it - "__src_demand" }
+                        if (did.isBlank()) { grouped.addAll(purchases); return@forEach }  // unattributable → pass through
+                        val dq = nodes.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
+                        grouped.add(mapOf(
+                            "type" to "demand",
+                            "product_id" to productId,
+                            "location_id" to locationId,
+                            "demand_id" to did,
+                            "quantity" to dq,
+                            "committed_qty" to dq,
+                            "children" to purchases,
+                        ))
+                    }
+                    grouped
+                } else windowed.map { it - "__src_demand" }
                 mapOf(
                     "type" to "work_order",
                     "product_id" to productId,
@@ -732,10 +761,10 @@ fun Routing.allocateRoutes() {
                     // drill-down labels them "any one of these supplies the parent" and the
                     // critical-path walk recurses all contributors, not a single dominator.
                     "children_relation" to "or",
-                    "children" to windowed,
+                    "children" to children,
                 )
             } else {
-                mergeAlternativeWoNodes(filterByStartTime(windowed, startTime))
+                mergeAlternativeWoNodes(filterByStartTime(windowed.map { it - "__src_demand" }, startTime))
                     ?: throw NoSuchElementException("Work order ($productId @ $locationId / $method) not found in any consolidated pegging tree")
             }
         }
