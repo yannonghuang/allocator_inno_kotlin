@@ -727,6 +727,11 @@ fun Routing.allocateRoutes() {
                     "quantity" to totalQty,
                     "consolidated" to true,
                     "consolidated_demand_ids" to demandIds.toList(),
+                    // The constituents are the per-demand contributions that SUM to this batched
+                    // order — a UNION, not a co-required BOM (which would be AND). Mark OR so the
+                    // drill-down labels them "any one of these supplies the parent" and the
+                    // critical-path walk recurses all contributors, not a single dominator.
+                    "children_relation" to "or",
                     "children" to windowed,
                 )
             } else {

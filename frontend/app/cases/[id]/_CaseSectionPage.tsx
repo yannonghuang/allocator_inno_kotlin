@@ -6474,6 +6474,18 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               prev.has(key) ? next.delete(key) : next.add(key);
                               return next;
                             })}
+                            canExpandRow={(r) => {
+                              // Show the inline ▶ only when the row actually has supplies to show.
+                              // Cross-demand consolidated orders (demand_id=null) have no per-WO
+                              // supplies map entry — their breakdown is the pegging drill-down — so
+                              // their toggle would open empty; hide it.
+                              const woKey = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
+                              const consolidatedWoKey = `|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
+                              const sup = woSuppliesMap.get(woKey) ?? woSuppliesMap.get(consolidatedWoKey) ?? [];
+                              const isMake = sup.length > 0 && sup[0].type === 'demand';
+                              const direct = isMake ? (woCrossEntrySupplyMap.get(`${r.demand_id ?? ''}|${r.product_id ?? ''}`) ?? []) : [];
+                              return sup.length > 0 || direct.length > 0;
+                            }}
                             expandedRowContent={(r) => {
                               const woKey = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
                               const consolidatedWoKey = `|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;

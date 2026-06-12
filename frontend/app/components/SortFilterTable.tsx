@@ -42,6 +42,9 @@ type Props<T> = {
    * Return non-null content to show beneath the row when expanded; return null to disable the toggle for that row.
    */
   expandedRowContent?: (row: T) => React.ReactNode;
+  /** Cheap predicate deciding whether a row's toggle is shown at all. When it returns false the
+   *  ▶/▼ chevron is hidden (the row has nothing to expand) — avoids dead toggles that open empty. */
+  canExpandRow?: (row: T) => boolean;
   /** Set of row idKey values that are currently expanded. */
   expandedKeys?: Set<string>;
   /** Called when the user clicks the expand toggle on a row. */
@@ -61,6 +64,7 @@ export function SortFilterTable<T extends Record<string, unknown>>({
   stickyHeaderScrollMaxHeight = '70vh',
   filterPlaceholder = 'Filter…',
   expandedRowContent,
+  canExpandRow,
   expandedKeys,
   onToggleExpand,
 }: Props<T>) {
@@ -189,7 +193,8 @@ export function SortFilterTable<T extends Record<string, unknown>>({
           <tbody>
             {sorted.map((row, i) => {
               const rId = String(row[idKey] ?? i);
-              const isExpanded = expandedRowContent ? (expandedKeys?.has(rId) ?? false) : false;
+              const rowExpandable = !!expandedRowContent && (!canExpandRow || canExpandRow(row));
+              const isExpanded = rowExpandable ? (expandedKeys?.has(rId) ?? false) : false;
               const expandContent = isExpanded ? expandedRowContent?.(row) : null;
               return (
                 <React.Fragment key={rId}>
@@ -201,14 +206,16 @@ export function SortFilterTable<T extends Record<string, unknown>>({
                   >
                     {expandedRowContent && (
                       <td style={{ textAlign: 'center', width: '1.75rem', padding: '0 0.25rem' }}>
-                        <button
-                          type="button"
-                          onClick={(e) => { e.stopPropagation(); onToggleExpand?.(rId); }}
-                          style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#3b82f6', fontSize: '0.7rem', padding: '1px 3px', lineHeight: 1 }}
-                          title={isExpanded ? 'Collapse supplies' : 'Expand supplies'}
-                        >
-                          {isExpanded ? '▼' : '▶'}
-                        </button>
+                        {rowExpandable && (
+                          <button
+                            type="button"
+                            onClick={(e) => { e.stopPropagation(); onToggleExpand?.(rId); }}
+                            style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#3b82f6', fontSize: '0.7rem', padding: '1px 3px', lineHeight: 1 }}
+                            title={isExpanded ? 'Collapse supplies' : 'Expand supplies'}
+                          >
+                            {isExpanded ? '▼' : '▶'}
+                          </button>
+                        )}
                       </td>
                     )}
                     {columns.map((col) => (
