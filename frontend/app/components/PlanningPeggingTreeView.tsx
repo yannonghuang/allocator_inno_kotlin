@@ -362,9 +362,11 @@ function NodeView({
             : consolidatedSourceTrees.length > 0
               ? null
               : node.type === 'demand'
-                ? (node.failure_explanation
-                    ? <p style={{ margin: 0, fontSize: '0.8rem', color: '#f87171', lineHeight: 1.4 }}>{node.failure_explanation}</p>
-                    : <p style={{ margin: 0, fontSize: '0.8rem', color: '#f87171' }}>No work orders — planning could not fulfill this demand (no method or child failed).</p>)
+                ? ((node as { consolidated_consumer?: boolean }).consolidated_consumer
+                    ? <p style={{ margin: 0, fontSize: '0.78rem', color: '#71717a', fontStyle: 'italic' }}>↳ draws its share from the single consolidated order above</p>
+                    : node.failure_explanation
+                      ? <p style={{ margin: 0, fontSize: '0.8rem', color: '#f87171', lineHeight: 1.4 }}>{node.failure_explanation}</p>
+                      : <p style={{ margin: 0, fontSize: '0.8rem', color: '#f87171' }}>No work orders — planning could not fulfill this demand (no method or child failed).</p>)
                 : node.type === 'work_order'
                   ? <p style={{ margin: 0, fontSize: '0.8rem', color: '#71717a' }}>No component breakdown (leaf work order or depth-limited).</p>
                   : null

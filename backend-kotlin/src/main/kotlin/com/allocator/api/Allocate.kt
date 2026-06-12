@@ -724,31 +724,7 @@ fun Routing.allocateRoutes() {
                 if (windowed.isEmpty())
                     throw NoSuchElementException("Work order ($productId @ $locationId / $method) not found in the pegging trees of its consolidated demands")
                 val totalQty = windowed.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
-                // For PURCHASES (leaf procurement) the make pattern doesn't apply automatically:
-                // a purchase has no AND-component demand nodes to surface "which demand", so the
-                // raw breakdown is just repeated anonymous purchases. Wrap each demand's portion in
-                // a synthetic DEMAND node — exactly like a make's component demands — so the
-                // drill-down shows how the multiple demands are formulated and how the single
-                // batched PO realizes them. Makes/moves keep their natural per-demand structure.
-                val children: List<Map<String, Any?>> = if (method == "purchase") {
-                    val grouped = mutableListOf<Map<String, Any?>>()
-                    windowed.groupBy { (it["__src_demand"] as? String) ?: "" }.forEach { (did, nodes) ->
-                        val purchases = nodes.map { it - "__src_demand" }
-                        if (did.isBlank()) { grouped.addAll(purchases); return@forEach }  // unattributable → pass through
-                        val dq = nodes.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
-                        grouped.add(mapOf(
-                            "type" to "demand",
-                            "product_id" to productId,
-                            "location_id" to locationId,
-                            "demand_id" to did,
-                            "quantity" to dq,
-                            "committed_qty" to dq,
-                            "children" to purchases,
-                        ))
-                    }
-                    grouped
-                } else windowed.map { it - "__src_demand" }
-                mapOf(
+                val node = linkedMapOf<String, Any?>(
                     "type" to "work_order",
                     "product_id" to productId,
                     "location_id" to locationId,
@@ -761,8 +737,41 @@ fun Routing.allocateRoutes() {
                     // drill-down labels them "any one of these supplies the parent" and the
                     // critical-path walk recurses all contributors, not a single dominator.
                     "children_relation" to "or",
-                    "children" to children,
                 )
+                if (method == "purchase") {
+                    // A purchase consolidates within AND across demands into a SINGLE PO. The node
+                    // IS that one order (lot_count derived from the TOTAL so it minimizes # of lots,
+                    // not the sum of per-demand lots), and the children are pure per-demand consumer
+                    // attribution (which demand draws how much) — NOT repeated purchase nodes.
+                    // Count only demand-attributed (non-blank) constituents: blank-demand entries
+                    // are the inventory-consolidation trees, which duplicate/inflate the real PO.
+                    val byDemand = windowed.groupBy { (it["__src_demand"] as? String) ?: "" }.filterKeys { it.isNotBlank() }
+                    val attributed = byDemand.values.flatten()
+                    val poQty = attributed.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
+                    val maxLot = attributed.mapNotNull { (it["max_lot_size"] as? Number)?.toDouble()?.takeIf { v -> v > 0 } }.maxOrNull() ?: poQty
+                    node["quantity"] = poQty
+                    node["max_lot_size"] = maxLot
+                    node["lot_count"] = Math.ceil(poQty / maxLot.coerceAtLeast(1e-9)).toInt().coerceAtLeast(1)
+                    node["start_time"] = attributed.mapNotNull { it["start_time"] as? String }.minOrNull()
+                    node["end_time"] = attributed.mapNotNull { it["end_time"] as? String }.maxOrNull()
+                    node["children"] = byDemand.map { (did, nodes) ->
+                        mapOf(
+                            "type" to "demand",
+                            "product_id" to productId,
+                            "location_id" to locationId,
+                            "demand_id" to did,
+                            "quantity" to nodes.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 },
+                            "committed_qty" to nodes.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 },
+                            // Attribution only — this demand draws its share from the single PO
+                            // above; it has no own work order, so the tree must not render the
+                            // "no work orders" failure note.
+                            "consolidated_consumer" to true,
+                        )
+                    }
+                } else {
+                    node["children"] = windowed.map { it - "__src_demand" }
+                }
+                node
             } else {
                 mergeAlternativeWoNodes(filterByStartTime(windowed.map { it - "__src_demand" }, startTime))
                     ?: throw NoSuchElementException("Work order ($productId @ $locationId / $method) not found in any consolidated pegging tree")
@@ -780,7 +789,10 @@ fun Routing.allocateRoutes() {
         }.sumOf { (it["quantity"] as? Number ?: 0).toDouble() }
 
         val treeJson = anyToJson(woNode)
-        val finalTree = if (woQtySum > 0 && treeJson is JsonObject) {
+        // Only re-align a PER-DEMAND node to the work-order list. For the consolidated/batched case
+        // (demandId blank) the synthetic node already carries the correct windowed PO quantity;
+        // summing all demand_id=null work orders here would add up every window's batch.
+        val finalTree = if (woQtySum > 0 && demandId.isNotBlank() && treeJson is JsonObject) {
             buildJsonObject {
                 treeJson.forEach { (k, v) -> if (k == "quantity") put("quantity", roundQty(woQtySum)) else put(k, v) }
             }
