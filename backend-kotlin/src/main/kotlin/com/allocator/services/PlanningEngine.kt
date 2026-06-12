@@ -2956,7 +2956,14 @@ internal fun consolidateWorkOrdersByTiming(
     val passthrough = mutableListOf<Map<String, Any?>>()
     val groupable = mutableListOf<Map<String, Any?>>()
     for (wo in workOrders) {
-        if (wo["failed"] == true || parseDate(wo["start_time"] as? String) == null) passthrough.add(wo)
+        // Exclude "move" from this (product-based) Pass-2 consolidation. At Pass 2 a move only
+        // models reachability from one location to another for a given product — it is not a
+        // physical order, so batching it across demands/time by product is meaningless. Each move
+        // passes through unchanged (its lots already run in parallel — see emitLotsForWo /
+        // buildWorkOrders, where method != "make" ⇒ concurrent). Real physical-move consolidation
+        // would batch on (source_location, target_location, time_bucket) ACROSS products in the
+        // work-order table — left as future work.
+        if (wo["failed"] == true || wo["method"] == "move" || parseDate(wo["start_time"] as? String) == null) passthrough.add(wo)
         else groupable.add(wo)
     }
 
