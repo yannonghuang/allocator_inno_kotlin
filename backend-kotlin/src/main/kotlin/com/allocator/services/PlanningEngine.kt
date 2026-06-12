@@ -597,6 +597,60 @@ internal fun effectivePurchasableSet(
     return base + nonRawBuyables
 }
 
+/**
+ * A customer-specific BOM-alternative constraint. When a demand from [customerId] resolves
+ * [parent] as a make at a matching location, the planner is forced to pick the alternative
+ * (alt_group variant) whose children include [child] — overriding the automatic
+ * best-score/equal-split variant selection. [location] blank or "*" matches any location.
+ */
+internal data class Constraint(
+    val customerId: String,
+    val parent: String,
+    val location: String,
+    val child: String,
+)
+
+/**
+ * Parse `config.constraints` (a list of {customer, parent, location, child} rules). Tolerant:
+ * accepts `customer`/`customer_id`, `parent`/`parent_product`, `child`/`child_product`; drops
+ * rules missing customer/parent/child; returns empty when the key is absent or malformed.
+ */
+internal fun parseConstraints(config: Map<String, Any?>?): List<Constraint> {
+    val raw = config?.get("constraints") as? List<*> ?: return emptyList()
+    return raw.mapNotNull { e ->
+        val m = e as? Map<*, *> ?: return@mapNotNull null
+        fun s(vararg keys: String): String =
+            keys.firstNotNullOfOrNull { (m[it] as? String)?.trim()?.takeIf { v -> v.isNotEmpty() } } ?: ""
+        val customer = s("customer", "customer_id")
+        val parent = s("parent", "parent_product")
+        val child = s("child", "child_product")
+        val location = (m["location"] as? String)?.trim() ?: ""
+        if (customer.isEmpty() || parent.isEmpty() || child.isEmpty()) null
+        else Constraint(customer, parent, location, child)
+    }
+}
+
+/**
+ * True if the make [method] (identified by its bom_id) produces [child] for [parent] — i.e.
+ * a BOM row exists with that bom_id, parent, and child. Used to apply a customer constraint at
+ * the METHOD level: alternatives are often distinct make methods (one bom_id per child), so the
+ * planner picks among them by preference unless a constraint pins which child to produce.
+ */
+internal fun makeMethodProducesChild(
+    parent: String,
+    method: Map<String, Any?>,
+    child: String,
+    data: Map<String, List<Map<String, Any?>>>,
+): Boolean {
+    val bomId = (method["bom_id"] as? String)?.trim() ?: return false
+    val p = parent.trim(); val ch = child.trim()
+    return (data["bom"] ?: emptyList()).any { b ->
+        (b["bom_id"] as? String)?.trim() == bomId &&
+            (b["parent_id"] as? String)?.trim() == p &&
+            (b["child_id"] as? String)?.trim() == ch
+    }
+}
+
 /** True if a purchase method for [productId] is admitted under the current gate. */
 private fun buyAdmitted(productId: String, purchaseAllowed: Boolean, purchasable: Set<String>?): Boolean =
     purchaseAllowed && (purchasable == null || productId.trim() in purchasable)
@@ -1248,7 +1302,13 @@ internal fun planMethodSlot(
     val (childMaterials, variantExplanation) = when (m["type"]) {
         "make" -> {
             val rawVariants = variantsForMake(productId, productionLocation, slotQty, m, data)
-            // Apply variant_selection override: force a specific alt_group
+            // Variant selection, in precedence order:
+            //  1) explicit saved per-WO variant_selection override (force a specific alt_group);
+            //  2) else a customer-specific Constraint (force the alt whose children include the
+            //     constrained child) — config.constraints matched on demand.customer_id + parent
+            //     + (location blank/"*" or this productionLocation);
+            //  3) else all variants (automatic best-score / equal-split downstream).
+            var constraintChild: String? = null
             val variants = if (variantOverride != null) {
                 val forcedAltGroup = variantOverride["alt_group"]?.toString()
                 rawVariants.filter { (altKey, _) -> forcedAltGroup == null || altKey == forcedAltGroup }
@@ -1256,7 +1316,22 @@ internal fun planMethodSlot(
                         log.warn("variant_selection override alt_group={} for {}@{} matched nothing; using all", forcedAltGroup, productId, productionLocation)
                         rawVariants
                     }
-            } else rawVariants
+            } else {
+                val cust = demand["customer_id"]?.toString()?.trim()
+                val match = if (cust.isNullOrEmpty()) null else parseConstraints(config).firstOrNull { c ->
+                    c.customerId == cust && c.parent == productId.trim() &&
+                        (c.location.isBlank() || c.location == "*" || c.location == productionLocation.trim())
+                }
+                if (match != null) {
+                    constraintChild = match.child
+                    rawVariants.filter { (_, childList) ->
+                        childList.any { (it["product_id"] as? String)?.trim() == match.child }
+                    }.ifEmpty {
+                        log.warn("constraint customer={} parent={}@{} child={} matched no variant; using all", cust, productId, productionLocation, match.child)
+                        rawVariants
+                    }
+                } else rawVariants
+            }
             val (variantList, ve) = getPreferredVariants(variants, inventory, data, reqDt, leadDays, path, depth, slotQty,
                 multiple = if (useSingleVariant) false else null, scoreWeights = scoreWeights, topN = topN, config = config)
             val cm = variantList.flatMap { (childList, _, _) -> childList }
@@ -1266,7 +1341,11 @@ internal fun planMethodSlot(
                 // Single variant with multiple BOM children → AND group (all required).
                 woChildrenRelation = "and"
             }
-            val veAnnotated = if (variantOverride != null) "$ve [variant override active]" else ve
+            val veAnnotated = when {
+                variantOverride != null -> "$ve [variant override active]"
+                constraintChild != null -> "$ve [constraint child=$constraintChild]"
+                else -> ve
+            }
             Pair(cm, veAnnotated)
         }
         "move" -> Pair(childMaterialsForMove(m, slotQty), "")
@@ -1300,7 +1379,10 @@ internal fun planMethodSlot(
         val cReqDt = dateAddDays(reqDt, -leadDays)
         val neededQty = (c["quantity"] as? Number)?.toDouble() ?: 0.0
         val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
-            "quantity" to neededQty, "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
+            "quantity" to neededQty, "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt),
+            // Inherit the originating demand's customer so customer-specific constraints
+            // apply to sub-components, not just the finished good.
+            "customer_id" to demand["customer_id"], "customer" to demand["customer"])
         val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget)
         val effectiveQty = solvedList.sumOf { s ->
             val r = s["commit_reason"] as? String
@@ -1567,7 +1649,7 @@ internal fun planMethodSlot(
                     productId, productionLocation, demandId, slotQty, achievableParentQty, rootBottleneckKeys)
             }
 
-            // ── Second pass: restore inventory + budget and re-plan at achievable qty
+            // ── Second pass: restore inventory + budget and re-plan children at achievable qty.
             inventory.clear()
             inventory.addAll(inventorySnap)
             if (budget != null && budgetSnap != null) {
@@ -1576,6 +1658,14 @@ internal fun planMethodSlot(
             }
             val scale = achievableParentQty / slotQty
             val scaledChildren = scaleChildMaterials(childMaterials, scale)
+            // AND conservation guard. The first-pass `achievable` is the min child ratio, so on the
+            // re-plan each AND child SHOULD cover its scaled share exactly (consistent makes have
+            // zero shortfall — R4's tolerance is 1e-6). But a move-cycle (e.g. 504-1989@1000↔@2000 →
+            // cycle_stopped) or inventory that's scarcer at the smaller qty can leave a required
+            // child materially short. Emitting `achievable` then would commit the make ABOVE its
+            // children (the R4/R8 conservation break). Track any such child off its authoritative
+            // committed_qty (what soundness reads); small fractional slack is ignored.
+            var andChildShortfall = false
             for (c in scaledChildren) {
                 if (m["type"] == "make") {
                     val parentKey = productId.trim()
@@ -1586,7 +1676,8 @@ internal fun planMethodSlot(
                 }
                 val cReqDt = dateAddDays(reqDt, -leadDays)
                 val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
-                    "quantity" to c["quantity"], "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt))
+                    "quantity" to c["quantity"], "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt),
+                    "customer_id" to demand["customer_id"], "customer" to demand["customer"])
                 val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget)
                 childWos.addAll(cWos)
                 val cPid = (c["product_id"] as? String)?.trim() ?: ""
@@ -1607,6 +1698,16 @@ internal fun planMethodSlot(
                     childPeggingNodes.add(tagged)
                 }
                 solvedList.forEach { s -> parseDate(s["commit_time"] as? String)?.let { commitTimes.add(it) } }
+                // Did this AND child materially under-deliver its scaled requirement? Use its own
+                // committed_qty (the value soundness R4 checks). Threshold tolerates fractional
+                // rounding (0.5) and a 2% band; the real failures (move-cycle) deliver ~0.
+                if (m["type"] == "make") {
+                    val childCommitted = (cPegging?.get("committed_qty") as? Number)?.toDouble() ?: 0.0
+                    val scaledNeed = (c["quantity"] as? Number)?.toDouble() ?: 0.0
+                    if (scaledNeed > 1e-6 && childCommitted < scaledNeed - maxOf(0.5, scaledNeed * 0.02)) {
+                        andChildShortfall = true
+                    }
+                }
             }
 
             // Move conservation: a move WO has exactly one source-side child whose
@@ -1618,6 +1719,26 @@ internal fun planMethodSlot(
                 if (childCommit != null && childCommit < achievableParentQty - 1e-6) {
                     achievableParentQty = floor(childCommit).coerceAtLeast(0.0)
                 }
+            }
+
+            // AND conservation enforcement: a make whose required child under-delivered on the
+            // re-plan cannot actually be built at `achievable` — committing it would exceed what
+            // its children supply (R4/R8). Block it (→0) instead. Restore inventory/budget first so
+            // the siblings that DID commit are rolled back too (no orphan leaves / R7d). buildWoNode
+            // marks the 0-qty node failed → soundness skips it and the WO flatten drops it. The
+            // demand's waterfall then tries another method, or it under-fills honestly.
+            if (m["type"] == "make" && andChildShortfall) {
+                inventory.clear(); inventory.addAll(inventorySnap)
+                if (budget != null && budgetSnap != null) { budget.clear(); budget.putAll(budgetSnap) }
+                val startDt0 = computeStartDt(reqDt, leadDays, emptyList())
+                val blockedNode = buildWoNode(productId, productionLocation, 0.0, m["type"] as? String ?: "", m,
+                    startDt0, null, 0, 0.0, methodChoiceExplanation, variantExplanation, woChildrenRelation,
+                    childPeggingNodes, overrideActive, failed = true, woGroupId = null, data = data)
+                log.info("[ANDMIN-conservation-block] parent={}@{} did={} achievable={} — required AND child under-delivered on re-plan, make blocked",
+                    productId, productionLocation, demandId, achievableParentQty)
+                return MethodSlotResult(achievableQty = 0.0, wos = emptyList(), methodPeggingNode = blockedNode,
+                    latestCommit = null, anyChildShort = true,
+                    blockedReason = "child_failed:$productId@$productionLocation(and_conservation)")
             }
         }
     }
@@ -2031,6 +2152,31 @@ fun plan(
     else
         overrideIndex["variant_selection|$productId|$locationId"]
     // Filter to the override-specified method if one is configured
+    // ── Customer constraint at the METHOD level ──────────────────────────────
+    // BOM alternatives are frequently distinct make methods (one bom_id per child),
+    // chosen by preference. When a constraint matches (customer, parent, and the make
+    // method's location — blank/"*" = any), drop the make methods that DON'T produce the
+    // constrained child so the planner is forced onto the pinned route. Non-make methods
+    // are untouched; if no make method produces the child, fall back to all (warn). An
+    // explicit method_selection override takes precedence (constraint only applies below).
+    // (The within-method alt_group case is additionally narrowed in planMethodSlot.)
+    val cust = demand["customer_id"]?.toString()?.trim()
+    val constraintRules = if (methodOverride != null || cust.isNullOrEmpty()) emptyList()
+        else parseConstraints(config).filter { it.customerId == cust && it.parent == productId.trim() }
+    val constrainedMethods = if (constraintRules.isEmpty()) methods else {
+        val filtered = methods.filter { m ->
+            if (m["type"] != "make") return@filter true
+            val mLoc = (m["location_id"] as? String)?.trim() ?: locationId.trim()
+            val rule = constraintRules.firstOrNull { it.location.isBlank() || it.location == "*" || it.location == mLoc }
+            rule == null || makeMethodProducesChild(productId, m, rule.child, data)
+        }
+        if (filtered.any { it["type"] == "make" } || methods.none { it["type"] == "make" }) filtered
+        else {
+            log.warn("constraint customer={} parent={}: no make method produces the constrained child; using all", cust, productId)
+            methods
+        }
+    }
+
     val overrideFilteredMethods = if (methodOverride != null) {
         val forcedType = (methodOverride["method"] ?: methodOverride["method_type"])?.toString()
         val forcedPref = (methodOverride["preference"] as? Number)?.toInt()
@@ -2041,7 +2187,7 @@ fun plan(
             log.warn("method_selection override for {}@{} matched no methods; using all", productId, locationId)
             methods
         }
-    } else methods
+    } else constrainedMethods
 
     // ── Cycle-aware method pruning ───────────────────────────────────────────
     // Drop methods whose chain can't structurally bottom out (a self-cycle — e.g.
@@ -2566,6 +2712,142 @@ private fun buildWorkOrders(
 }
 
 /**
+ * Canonical STRUCTURAL signature of a WO node's sub-pegging — the recipe / variant / supply-
+ * source choices, recursively, ignoring quantities and timings. Two work orders for the same
+ * (product, location, method) may be consolidated only when these match (their downstream
+ * pegging is identical), so the merged order has one well-defined predecessor chain. Failed /
+ * 0-qty-make subtrees are skipped, matching the WO flatten.
+ */
+private fun subtreeSignature(node: Any?): String {
+    val n = node as? Map<*, *> ?: return ""
+    if (n["failed"] == true) return ""
+    val type = n["type"]?.toString() ?: ""
+    val pid = (n["product_id"] as? String)?.trim() ?: ""
+    if (type == "supply" || type == "purchase") return "leaf:$pid"
+    if (type == "work_order" && n["method"] == "make" && ((n["quantity"] as? Number)?.toDouble() ?: 0.0) < 1e-6) return ""
+    val childSigs = (n["children"] as? List<*>)
+        ?.mapNotNull { c -> subtreeSignature(c).takeIf { it.isNotEmpty() } }
+        ?.sorted() ?: emptyList()
+    val lid = (n["location_id"] as? String)?.trim() ?: ""
+    val m = (n["method"] as? String)?.trim() ?: ""
+    return "$type:$pid@$lid/$m[${childSigs.joinToString(",")}]"
+}
+
+/**
+ * Phase 3 — bottom-up COMMITMENT aggregate over a finalized pegging tree (the quantity-focused
+ * pass's closing step in the mental model: top-down requests, inventory consolidation, then
+ * bottom-up commitment where "least supplied child dominates"). Top-down planning commits
+ * greedily; cross-demand inventory contention can later zero a child a parent already committed
+ * against, leaving a make committed ABOVE what its children actually supply (the R4/R8 break).
+ *
+ * `reconcile(node, target)` flows the parent's `target` down, lets each subtree report what it can
+ * actually supply, takes the AND-min up ("least dominates"), and re-trims siblings to that figure
+ * so the whole subtree is conservation-consistent — make.quantity = committed = min(child/rate).
+ * It is a NO-OP for an already-consistent tree (every ask returns full, supply == target). Only
+ * trimming of existing committed flows happens — no inventory re-planning — so it can't oscillate.
+ * Returns the (rebuilt) node and the quantity it commits. A 0.5 band ignores fractional rounding.
+ */
+/** Proportionally trim a reconciled subtree by `factor` (≤1): scales quantity/committed_qty and
+ *  every descendant the same way (releasing leaf allocations). Used to re-trim a make's
+ *  over-supplied siblings down to the bottleneck — O(subtree), no re-reconcile. */
+private fun scaleSubtree(node: Map<String, Any?>, factor: Double): Map<String, Any?> {
+    if (factor >= 1.0 - 1e-9) return node
+    val f = factor.coerceIn(0.0, 1.0)
+    // EXACT scaling (no roundQty) — rounding a parent and child separately makes them disagree by
+    // up to 1 (R4_move) and can round a leaf above its supply (R7a/R7b). Conservation must be exact.
+    val nn = node.toMutableMap()
+    (node["quantity"] as? Number)?.let { nn["quantity"] = it.toDouble() * f }
+    (node["committed_qty"] as? Number)?.let { nn["committed_qty"] = it.toDouble() * f }
+    (node["children"] as? List<*>)?.let { ch ->
+        nn["children"] = ch.map { c -> (c as? Map<String, Any?>)?.let { scaleSubtree(it, f) } ?: c }
+    }
+    if (node["type"] == "work_order") {
+        val newQ = ((node["quantity"] as? Number)?.toDouble() ?: 0.0) * f
+        val hasDemandChild = (node["children"] as? List<*>)?.any { (it as? Map<*, *>)?.get("type") == "demand" } == true
+        if (newQ <= 1e-6 && hasDemandChild) nn["failed"] = true
+    }
+    return nn
+}
+
+private fun reconcile(node: Map<String, Any?>, target: Double): Pair<Map<String, Any?>, Double> {
+    if (node["failed"] == true) return node to 0.0
+    val allChildren = node["children"] as? List<*> ?: emptyList<Any?>()
+    when (node["type"]) {
+        "supply", "purchase" -> {
+            val q = (node["quantity"] as? Number)?.toDouble() ?: 0.0
+            val supplied = minOf(target, q).coerceAtLeast(0.0)
+            return (node + ("quantity" to supplied)) to supplied
+        }
+        "demand" -> {
+            // Fulfilled by children (inventory/supply leaves + production WOs) in plan order,
+            // each contributing up to the remaining shortfall. committed = what they together give.
+            var remaining = target
+            val newChildren = allChildren.map { ch ->
+                val cm = ch as? Map<String, Any?> ?: return@map ch
+                val (nc, g) = reconcile(cm, remaining.coerceAtLeast(0.0))
+                remaining -= g
+                nc
+            }
+            val committed = (target - remaining).coerceAtLeast(0.0)
+            // Collapse the request to the commitment so the reconciled tree is fully consistent
+            // (quantity == committed_qty for every internal node). The caller restores the root's
+            // original request for the requested-vs-committed display.
+            return (node + mapOf("children" to newChildren, "quantity" to committed, "committed_qty" to committed)) to committed
+        }
+        "work_order" -> {
+            val curQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
+            val want = minOf(target, curQty).coerceAtLeast(0.0)
+            val method = node["method"]
+            val demandChildren = allChildren.mapNotNull { it as? Map<String, Any?> }.filter { it["type"] == "demand" }
+            if (method == "purchase" || demandChildren.isEmpty()) {
+                // Procurement / leaf-backed WO delivers `want`; trim leaf children to it.
+                val newChildren = allChildren.map { ch -> (ch as? Map<String, Any?>)?.let { reconcile(it, want).first } ?: ch }
+                return (node + mapOf("quantity" to want, "children" to newChildren)) to want
+            }
+            fun rateOf(cd: Map<String, Any?>) = if (curQty > 1e-9) ((cd["quantity"] as? Number)?.toDouble() ?: 0.0) / curQty else 0.0
+            val rel = node["children_relation"] as? String
+            // First (and only) ask: each component for want × rate. Capture the trimmed node AND
+            // how many parents it can back (committed / rate). Reconcile each child ONCE here.
+            val firstAsk = demandChildren.map { cd ->
+                // A move is 1:1 (rate 1), so ask the source for exactly `want`. Using the stored
+                // source.quantity/curQty would be ≈1 but not exactly 1 when the two drifted apart
+                // upstream, leaving the source committed above the move (R4_move). Asking for `want`
+                // caps the source to it.
+                val r = if (method == "move") 1.0 else rateOf(cd)
+                val (nc, c) = reconcile(cd, want * r)
+                Triple(nc, r, if (r > 1e-9) c / r else Double.POSITIVE_INFINITY)
+            }
+            val rawSupply = when {
+                method == "move" -> firstAsk.firstOrNull()?.third ?: want   // single source side
+                rel == "or"      -> want                                    // OR-split handled as sum upstream
+                else             -> firstAsk.minOfOrNull { it.third } ?: want // AND make: least dominates
+            }
+            // EXACT — commit exactly the least-supplied child's contribution. (No slack band: it
+            // would leave parent=want while the child commits want−ε, breaking R4/R4_move. A
+            // genuinely-consistent tree returns rawSupply == want, so this is still a no-op there;
+            // float-noise shortfalls scale by ≈1, which scaleSubtree treats as a no-op.)
+            val supply = rawSupply.coerceIn(0.0, want)
+            // Re-trim over-supplied components down to supply × rate by PROPORTIONAL scaling of the
+            // already-reconciled subtree (no second reconcile — that would be exponential).
+            var askIdx = 0
+            val newChildren = allChildren.map { ch ->
+                val cm = ch as? Map<String, Any?> ?: return@map ch
+                if (cm["type"] != "demand") return@map cm
+                val (asked, r, _) = firstAsk[askIdx]; askIdx++
+                val askedCommitted = (asked["committed_qty"] as? Number)?.toDouble() ?: (want * r)
+                val targetT = supply * r
+                if (askedCommitted > 1e-9 && targetT < askedCommitted - 1e-9) scaleSubtree(asked, targetT / askedCommitted) else asked
+            }
+            val failed = supply <= 1e-6 && demandChildren.isNotEmpty()
+            val nn = node + mapOf("quantity" to supply, "children" to newChildren) +
+                (if (failed) mapOf("failed" to true) else emptyMap())
+            return nn to supply
+        }
+        else -> return node to ((node["quantity"] as? Number)?.toDouble() ?: 0.0)
+    }
+}
+
+/**
  * Derive the output work-order list directly from the final per-demand pegging trees —
  * one flat work order per pegging WO node, carrying the node's TOTAL quantity plus
  * `lot_count` (the per-node lot-explosion is metadata, not separate rows).
@@ -2587,6 +2869,17 @@ private fun flattenPeggingToWorkOrders(
     val out = mutableListOf<Map<String, Any?>>()
     fun walk(node: Any?, demandId: Any?, members: List<String>?) {
         val n = node as? Map<*, *> ?: return
+        // Skip failed=true subtrees entirely: these are debug snapshots of an AND-bottleneck
+        // blocked branch whose first-pass inventory takes were rolled back — the make emits ~0
+        // and the purchases/supplies beneath it never actually happen. Walking into them leaks
+        // phantom orphan purchases into work_orders (inflating Committed qty and the WO count).
+        // The pegging tree keeps these nodes for diagnostics; the WO list must not. (Soundness
+        // likewise skips failed=true subtrees.)
+        if (n["failed"] == true) return
+        // Also skip a make that produced ~0: it built nothing, so anything beneath it is an
+        // orphan (the under-consumption the soundness checker flags as R7d). Not real output.
+        if (n["type"] == "work_order" && n["method"] == "make" &&
+            ((n["quantity"] as? Number)?.toDouble() ?: 0.0) < 1e-6) return
         if (n["type"] == "work_order") {
             val pid = (n["product_id"] as? String)?.trim() ?: ""
             val lid = (n["location_id"] as? String)?.trim() ?: ""
@@ -2606,7 +2899,10 @@ private fun flattenPeggingToWorkOrders(
                 put("max_lot_size", n["max_lot_size"])
                 put("wave_index", 0)
                 if (members != null) put("consolidated_demand_ids", members)
-                if (n["failed"] == true) put("failed", true)
+                // Structural signature of this WO's sub-pegging — the cross-demand consolidation
+                // only merges WOs whose signatures match (identical downstream recipe). Internal;
+                // stripped before the work-order list is returned.
+                put("_subtree_sig", subtreeSignature(n))
             })
         }
         (n["children"] as? List<*>)?.forEach { walk(it, demandId, members) }
@@ -2664,6 +2960,8 @@ internal fun consolidateWorkOrdersByTiming(
         else groupable.add(wo)
     }
 
+    // Eligibility: only merge work orders that share (product, location, method, source, window)
+    // AND have an IDENTICAL sub-pegging signature (same downstream recipe / variant / source).
     val groups = groupable.groupBy {
         listOf(
             (it["product_id"] as? String)?.trim(),
@@ -2671,30 +2969,31 @@ internal fun consolidateWorkOrdersByTiming(
             it["method"] as? String,
             (it["location_source"] as? String)?.trim(),
             bucketOf(it["start_time"] as? String),
+            it["_subtree_sig"],
         )
     }
 
+    fun stripSig(m: Map<String, Any?>) = m - "_subtree_sig"
     val out = mutableListOf<Map<String, Any?>>()
-    out.addAll(passthrough)
+    out.addAll(passthrough.map { stripSig(it) })
     for ((_, wos) in groups) {
-        if (wos.size == 1) { out.add(wos[0]); continue }
+        if (wos.size == 1) { out.add(stripSig(wos[0])); continue }
         val first = wos[0]
         val pid = (first["product_id"] as? String) ?: ""
         val lid = (first["location_id"] as? String) ?: ""
         val method = (first["method"] as? String) ?: ""
         val totalQty = wos.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
-        if (totalQty <= 1e-9) { out.addAll(wos); continue }
+        if (totalQty <= 1e-9) { out.addAll(wos.map { stripSig(it) }); continue }
 
-        // Ready by the earliest member end; started one full lead earlier.
-        val ends = wos.mapNotNull { parseDate(it["end_time"] as? String) }
-        val leadDays = wos.mapNotNull {
-            val s = parseDate(it["start_time"] as? String)
-            val e = parseDate(it["end_time"] as? String)
-            if (s != null && e != null) e.toEpochDay() - s.toEpochDay() else null
-        }.maxOrNull() ?: 0L
-        val mergedEnd = ends.minOrNull() ?: parseDate(first["end_time"] as? String)
-        val mergedStart = mergedEnd?.minusDays(leadDays)
+        // Merged span = [min(start), max(end)] across the constituents.
+        val mergedStart = wos.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull()
+        val mergedEnd = wos.mapNotNull { parseDate(it["end_time"] as? String) }.maxOrNull()
         val demands = wos.mapNotNull { it["demand_id"] as? String }.filter { it.isNotBlank() }.distinct()
+        // Per-demand split: drives the union predecessor/successor (↓/↑) and the Requested column
+        // in the UI — woRowDemandIds reads wo_consolidation_split_details[].demand_id.
+        val splitDetails = wos.filter { (it["demand_id"] as? String)?.isNotBlank() == true }
+            .groupBy { it["demand_id"] as String }
+            .map { (d, ws) -> mapOf("demand_id" to d, "allocated_qty" to roundQty(ws.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 })) }
         val overrideActive = wos.any { it["override_active"] == true }
         val lotSize = (maxLotSize(pid, lid, data)?.takeIf { it > 0 } ?: totalQty).coerceAtLeast(1e-9)
         val lotCount = Math.ceil(totalQty / lotSize).toInt().coerceAtLeast(1)
@@ -2720,6 +3019,21 @@ internal fun consolidateWorkOrdersByTiming(
             "max_lot_size" to lotSize,
             "consolidated" to true,
             "wo_competing_demands" to demands,
+            // Per-demand split breakdown (INTERNAL key name — the API enrichment in Allocate.kt
+            // maps consolidation_split_details → wo_consolidation_split_details). The UI reads it
+            // to derive the union predecessor/successor (each demand's pegging keys feed the ↓/↑
+            // relation BFS) and to set Requested = Committed. This keeps the merged order linked
+            // to the (intact) per-demand pegging instead of becoming a dead-end.
+            "consolidation_split_details" to splitDetails,
+            // The constituent demands, so a batched order remains traceable: the pegging
+            // endpoint and the supplies/Requested maps resolve a consolidated WO back to each
+            // of these demands' per-demand pegging nodes for (product, location, method).
+            "consolidated_demand_ids" to demands,
+            // The original start-window the constituents fell in. The pegging endpoint filters
+            // the per-demand nodes to this range so the resolved/aggregated node matches THIS
+            // batch (not every window of those demands for the same component).
+            "wo_window_start" to formatDate(wos.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull()),
+            "wo_window_end" to formatDate(wos.mapNotNull { parseDate(it["start_time"] as? String) }.maxOrNull()),
             "wo_consolidation_total_planned" to roundQty(totalQty),
         ))
     }
@@ -2787,7 +3101,13 @@ private fun buildWoNode(
     // were rolled back by inventory.clear()/inventory.addAll(snap) at the
     // outer level. Soundness skips the entire subtree under failed=true to
     // tolerate the broken/partial pegging it carries.
-    if (failed) put("failed", true)
+    //
+    // Also mark failed when the WO produced ~0 yet still carries BOM children: it built
+    // nothing, so everything beneath it is a rolled-back orphan (the under-consumption the
+    // soundness checker flags as R7d). Most blocked branches are tagged at the AND-min site,
+    // but some 0-qty WOs (e.g. a blocked move) slip past it; this is the central catch-all so
+    // the failed contract is uniform (soundness + the WO flatten both skip these).
+    if (failed || (qty <= 1e-6 && woChildren.isNotEmpty())) put("failed", true)
 }
 
 /**
@@ -3830,6 +4150,52 @@ fun runPlanning(
         timingFix
     }
 
+    // ── Phase 3 — bottom-up COMMITMENT aggregate over the FINAL pegging (after the timing fix, so
+    // nothing downstream re-derives it). The closing step of the quantity pass in the mental model:
+    // a parent commits min over children of (child_commit / bom_rate) — "least supplied dominates".
+    // Top-down planning commits greedily, so cross-demand inventory contention can leave a make
+    // committed ABOVE what its children actually supply (the R4/R8 break). `reconcile` trims those
+    // (a no-op for already-consistent trees); the work orders flatten from the trimmed trees.
+    val reconciledByDemand = mutableMapOf<String, Double>()
+    val reconciledTrees = finalTimings.peggingTrees.map { entry ->
+        val tree = entry["tree"] as? Map<String, Any?> ?: return@map entry
+        val rootReq = (tree["quantity"] as? Number)?.toDouble() ?: 0.0
+        val (reconciled, after) = reconcile(tree, rootReq)
+        val did = entry["demand_id"]?.toString()?.takeIf { it.isNotBlank() }
+        // OVERWRITE (not sum): R0 compares committed_demands to the LAST pegging tree per demand
+        // (treeByDemand = peggingByDemand.mapValues { it.last() }), so when a demand has several
+        // trees we target the last one's committed_qty to match the checker exactly.
+        if (did != null) reconciledByDemand[did] = after
+        // Restore the root's original request (reconcile collapsed it to committed) so the UI keeps
+        // requested-vs-committed; committed_qty already reflects the reconciled commitment.
+        entry.toMutableMap().apply { put("tree", reconciled + ("quantity" to rootReq)) }
+    }
+    // Sync committed_demands to the reconciled roots EXACTLY (R0_committed_consistency): each
+    // demand's non-failure committed total must equal its pegging root.committed_qty. Must be
+    // exact (no roundQty) and applied for ANY delta — the reconciled root carries the precise
+    // fractional commitment (e.g. 999.7057855812216), so a rounded committed_demands would not
+    // match. Single-row demands are set directly; multi-row are scaled to the reconciled total.
+    if (reconciledByDemand.isNotEmpty()) {
+        val nonFailTotal = mutableMapOf<String, Double>()
+        val nonFailCount = mutableMapOf<String, Int>()
+        for (row in committedDemands) {
+            val did = row["demand_id"]?.toString() ?: continue
+            if (isHardPlanningFailure(row["commit_reason"] as? String)) continue
+            nonFailTotal[did] = (nonFailTotal[did] ?: 0.0) + ((row["quantity"] as? Number)?.toDouble() ?: 0.0)
+            nonFailCount[did] = (nonFailCount[did] ?: 0) + 1
+        }
+        val synced = committedDemands.map { row ->
+            val did = row["demand_id"]?.toString() ?: return@map row
+            if (isHardPlanningFailure(row["commit_reason"] as? String)) return@map row
+            val target = reconciledByDemand[did] ?: return@map row
+            if ((nonFailCount[did] ?: 0) == 1) return@map row + ("quantity" to target)  // exact
+            val cur = nonFailTotal[did] ?: 0.0
+            if (cur <= 1e-9) return@map row
+            row + ("quantity" to ((row["quantity"] as? Number)?.toDouble() ?: 0.0) * (target / cur))
+        }
+        committedDemands.clear(); committedDemands.addAll(synced)
+    }
+
     // ── Pass 2 — WO consolidation + timing ────────────────────────────────────
     // Mental model: Pass 1 builds the per-demand pegging SKELETON (BOM explosion +
     // alternative selection + quantities); Pass 2 derives the work orders FROM it. The
@@ -3838,15 +4204,17 @@ fun runPlanning(
     // per-demand pegging BY CONSTRUCTION — every WO resolves back to its node (pegging /
     // supplies / predecessor-successor drill-down all work).
     //
-    // Opt-in `consolidation.consolidate_wos=true` additionally batches ACROSS demands
-    // (same product/location/method/window) for a smaller schedule, at the cost of that
-    // per-demand linkage (batched orders are demand_id=null and no longer map to a single
-    // pegging node — drill-down degrades). Window = UI "Bucket (days)" (period_days);
-    // explicit wo_window_days overrides; 0 ⇒ one batch per component across the horizon.
+    // ON by default when consolidation is enabled (opt out with consolidate_wos=false): it
+    // batches ACROSS demands (same product/location/method/window) into fewer, larger orders —
+    // e.g. one purchase order per raw material instead of one per sub-assembly per demand. The
+    // cost is per-demand linkage: batched orders are demand_id=null and no longer map to a
+    // single pegging node, so per-WO drill-down degrades (the order still lists its competing
+    // demands). Window = UI "Bucket (days)" (period_days); explicit wo_window_days overrides;
+    // 0 ⇒ one batch per component across the horizon.
     @Suppress("UNCHECKED_CAST")
     val consolidationCfg = config?.get("consolidation") as? Map<String, Any?>
-    val nodeLevelWos = flattenPeggingToWorkOrders(finalTimings.peggingTrees, data)
-    val consolidateWos = consolidationConfig.enabled && consolidationCfg?.get("consolidate_wos") == true
+    val nodeLevelWos = flattenPeggingToWorkOrders(reconciledTrees, data)
+    val consolidateWos = consolidationConfig.enabled && consolidationCfg?.get("consolidate_wos") != false
     val outputWorkOrders = if (consolidateWos) {
         val windowDays = (consolidationCfg?.get("wo_window_days") as? Number)?.toInt() ?: consolidationConfig.periodDays
         val merged = consolidateWorkOrdersByTiming(nodeLevelWos, data, windowDays)
@@ -3860,7 +4228,7 @@ fun runPlanning(
     return mapOf(
         "committed_demands"      to committedDemands,
         "work_orders"            to outputWorkOrders,
-        "planning_pegging"       to finalTimings.peggingTrees,
+        "planning_pegging"       to reconciledTrees,
         "supply_allocations"     to supplyAllocations,
         "supply_cap_violations"  to supplyCapViolations,
         "override_warnings"      to overrideWarnings,
