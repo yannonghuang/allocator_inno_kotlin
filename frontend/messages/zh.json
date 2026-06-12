@@ -580,7 +580,9 @@
       "overrideMethod": "方法",
       "overrideSplit": "拆分",
       "nComponents": "{n} 个组件",
-      "consolidatedOnly": "仅合并工单"
+      "consolidatedOnly": "仅合并工单",
+      "tabConsolidated": "合并",
+      "tabNative": "原生（按需求）"
     },
     "woScheduleImpact": {
       "title": "工单排程影响",

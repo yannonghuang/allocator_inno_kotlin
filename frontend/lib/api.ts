@@ -196,6 +196,9 @@ export type WorkOrder = {
   consolidated_demand_ids?: string[];
   /** True on a cross-demand batched work order. */
   consolidated?: boolean;
+  /** Links a native (work_orders_native) WO to the ONE consolidated WO it rolls into, and is also
+   *  set on each consolidated WO (its own id). Native ↔ consolidated form a strict partition. */
+  consolidated_group_id?: string;
   /** On a mixed-product MOVE shipment (product_id=null): the per-component cargo manifest. */
   move_components?: { product_id: string; quantity: number; demand_ids?: string[] }[];
   /** On a batched WO: the original start-window of its constituents (for precise pegging trace). */
@@ -469,6 +472,9 @@ export type SupplyLevelAllocation = {
 export type PlanResult = {
   committed_demands: CommittedDemand[];
   work_orders: WorkOrder[];
+  /** Native per-demand work orders (pre-consolidation, 1:1 with the pegging). Shown in its own tab
+   *  — separate from `work_orders` (consolidated) so aggregates never double-count. */
+  work_orders_native?: WorkOrder[];
   planning_pegging: PlanningPeggingEntry[];
   supply_allocations?: PlanSupplyAllocation[];
   supply_level_allocations?: SupplyLevelAllocation[];

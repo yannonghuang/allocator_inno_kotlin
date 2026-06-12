@@ -2123,12 +2123,16 @@ private fun enrichPlanResultWithData(
     val bomPairs = getBomRealPairs()
     val moveTriples = getMoveTriples(caseId)
     val enrichedWos = enrichWorkOrders(workOrders, planningPegging, bomPairs, moveTriples, data)
+    @Suppress("UNCHECKED_CAST")
+    val nativeWos = result["work_orders_native"] as? List<Map<String, Any?>> ?: emptyList()
+    val enrichedNative = enrichWorkOrders(nativeWos, planningPegging, bomPairs, moveTriples, data)
     val enrichedCommitted = enrichCommittedDemands(
         result["committed_demands"].let { @Suppress("UNCHECKED_CAST") it as? List<Map<String, Any?>> ?: emptyList() },
         data
     )
     val enriched = result.toMutableMap()
     enriched["work_orders"] = enrichedWos
+    enriched["work_orders_native"] = enrichedNative
     enriched["committed_demands"] = enrichedCommitted
     val kpis = planKpis(data, enriched, bomPairs)
     enriched["plan_kpis"] = kpis
