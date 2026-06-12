@@ -10094,6 +10094,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               };
               const buildCriticalPath = (n: PlanningPeggingNode | null, path: string): void => {
                 if (!n) return;
+                // Consumer-attribution nodes (which demand draws from a consolidated PO) are not
+                // part of the demand→source supply chain, so they don't belong on the critical path.
+                if ((n as { consolidated_consumer?: boolean }).consolidated_consumer) return;
                 criticalPathSet.add(path);
                 const kids = n.children ?? [];
                 if (kids.length === 0) return;
