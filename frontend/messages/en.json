@@ -1229,7 +1229,13 @@
     "made": "made",
     "moved": "moved",
     "supply": "supply",
-    "demand": "demand"
+    "demand": "demand",
+    "relationOrSupply": "ANY of the inventories / work orders below can supply this node (OR).",
+    "relationAndRequired": "ALL of the inventories / work orders below are required together (AND).",
+    "consumerBreakdown": "required in the following demands — one consolidated order, shared across them.",
+    "consumerNote": "draws its share from the single consolidated order above",
+    "noWorkOrders": "No work orders — planning could not fulfill this demand (no method or child failed).",
+    "noComponentBreakdown": "No component breakdown (leaf work order or depth-limited)."
   },
   "runDetail": {
     "backToCase": "← Case",

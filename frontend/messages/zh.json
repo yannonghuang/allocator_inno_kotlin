@@ -1229,7 +1229,13 @@
     "made": "已制造",
     "moved": "已调拨",
     "supply": "供应",
-    "demand": "需求"
+    "demand": "需求",
+    "relationOrSupply": "以下任一库存/生产订单均可供给此节点（OR 关系）。",
+    "relationAndRequired": "以下所有库存/生产订单需同时满足（AND 关系）。",
+    "consumerBreakdown": "以下需求共同需要此单一合并订单（在各需求间分摊）。",
+    "consumerNote": "从上方的单一合并订单中分得其份额",
+    "noWorkOrders": "无生产订单 — 规划无法满足该需求（无可用方法或子项失败）。",
+    "noComponentBreakdown": "无组件明细（叶子生产订单或受深度限制）。"
   },
   "runDetail": {
     "backToCase": "← 方案",

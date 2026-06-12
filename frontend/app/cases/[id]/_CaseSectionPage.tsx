@@ -5881,6 +5881,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         String(r.method ?? ''),
                         String(r.location_source ?? ''),
                         String(r.prod_area ?? ''),
+                        // A cross-demand consolidated order is ALREADY one PO per window — keep each
+                        // as its own row (by wo_group_id). Without this, every window's batch (all
+                        // demand_id=null, same product/loc/method) collapses into one row whose
+                        // quantity is the sum of all windows while lots/demands stay from one batch,
+                        // so the row total no longer matches its drill-down.
+                        r.consolidated ? String(r.wo_group_id ?? '') : '',
                       ].join('|');
                       const existing = grouped.get(key);
                       const rowQty = Number(r.quantity ?? 0) || 0;
@@ -6474,6 +6480,18 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               prev.has(key) ? next.delete(key) : next.add(key);
                               return next;
                             })}
+                            canExpandRow={(r) => {
+                              // Show the inline ▶ only when the row actually has supplies to show.
+                              // Cross-demand consolidated orders (demand_id=null) have no per-WO
+                              // supplies map entry — their breakdown is the pegging drill-down — so
+                              // their toggle would open empty; hide it.
+                              const woKey = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
+                              const consolidatedWoKey = `|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
+                              const sup = woSuppliesMap.get(woKey) ?? woSuppliesMap.get(consolidatedWoKey) ?? [];
+                              const isMake = sup.length > 0 && sup[0].type === 'demand';
+                              const direct = isMake ? (woCrossEntrySupplyMap.get(`${r.demand_id ?? ''}|${r.product_id ?? ''}`) ?? []) : [];
+                              return sup.length > 0 || direct.length > 0;
+                            }}
                             expandedRowContent={(r) => {
                               const woKey = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
                               const consolidatedWoKey = `|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
@@ -10082,6 +10100,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               };
               const buildCriticalPath = (n: PlanningPeggingNode | null, path: string): void => {
                 if (!n) return;
+                // Consumer-attribution nodes (which demand draws from a consolidated PO) are not
+                // part of the demand→source supply chain, so they don't belong on the critical path.
+                if ((n as { consolidated_consumer?: boolean }).consolidated_consumer) return;
                 criticalPathSet.add(path);
                 const kids = n.children ?? [];
                 if (kids.length === 0) return;

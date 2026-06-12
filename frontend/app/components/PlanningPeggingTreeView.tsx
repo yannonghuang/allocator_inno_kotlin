@@ -1,6 +1,7 @@
 'use client';
 
 import React from 'react';
+import { useTranslations } from 'next-intl';
 import type { PlanningPeggingNode } from '@/lib/api';
 import { qtyFmt } from '@/app/lib/format';
 
@@ -80,6 +81,7 @@ function NodeView({
   workOrderRootQty, contextDemandId,
   consolidatedSourceResolver,
 }: NodeProps): JSX.Element {
+  const t = useTranslations('pegging');
   const rawChildren = node.children ?? [];
   const childContrib = (c: PlanningPeggingNode): number => {
     const cc = (c as { committed_qty?: number | null }).committed_qty;
@@ -209,25 +211,33 @@ function NodeView({
 
   const indentPx = 12;
   let childGroupLabel: string | null = null;
-  let childGroupKind: 'and' | 'or' | null = null;
+  let childGroupKind: 'and' | 'or' | 'consumers' | null = null;
   const relation = node.children_relation as 'and' | 'or' | undefined;
-  if (relation === 'or' && hasChildren && childrenList.length > 1) {
+  // Consumer breakdown: the children are demands that draw their share from THIS single
+  // consolidated order (a purchase consolidated within & across demands). They don't "supply"
+  // the node (OR) nor are co-required (AND) — they consume it. Label accordingly.
+  const isConsumerBreakdown = hasChildren && childrenList.length > 0 &&
+    childrenList.every((c) => (c as { consolidated_consumer?: boolean }).consolidated_consumer);
+  if (isConsumerBreakdown) {
+    childGroupKind = 'consumers';
+    childGroupLabel = t('consumerBreakdown');
+  } else if (relation === 'or' && hasChildren && childrenList.length > 1) {
     childGroupKind = 'or';
-    childGroupLabel = 'ANY of the inventories / work orders below can supply this node (OR).';
+    childGroupLabel = t('relationOrSupply');
   } else if (relation === 'and' && hasChildren && childrenList.length > 1) {
     childGroupKind = 'and';
-    childGroupLabel = 'ALL of the inventories / work orders below are required together (AND).';
+    childGroupLabel = t('relationAndRequired');
   } else if (!relation && hasChildren && childrenList.length > 1) {
     if (node.type === 'work_order') {
       childGroupKind = 'and';
-      childGroupLabel = 'ALL of the inventories / work orders below are required together (AND).';
+      childGroupLabel = t('relationAndRequired');
     } else if (node.type === 'demand') {
       const sameProductBucketsOnly = childrenList.every((c) =>
         (c.type === 'supply' || c.type === 'purchase') && c.product_id === node.product_id,
       );
       if (!sameProductBucketsOnly) {
         childGroupKind = 'or';
-        childGroupLabel = 'ANY of the inventories / work orders below can supply this node (OR).';
+        childGroupLabel = t('relationOrSupply');
       }
     }
   }
@@ -329,13 +339,13 @@ function NodeView({
                 alignItems: 'center',
                 gap: 4,
                 fontSize: '0.7rem',
-                color: childGroupKind === 'and' ? '#f97316' : '#38bdf8',
-                backgroundColor: childGroupKind === 'and' ? 'rgba(249,115,22,0.12)' : 'rgba(56,189,248,0.12)',
+                color: childGroupKind === 'and' ? '#f97316' : childGroupKind === 'consumers' ? '#a78bfa' : '#38bdf8',
+                backgroundColor: childGroupKind === 'and' ? 'rgba(249,115,22,0.12)' : childGroupKind === 'consumers' ? 'rgba(167,139,250,0.12)' : 'rgba(56,189,248,0.12)',
                 borderRadius: 999,
                 padding: '1px 6px',
               }}
             >
-              <span style={{ fontWeight: 700 }}>{childGroupKind === 'and' ? 'AND' : 'OR'}</span>
+              {childGroupKind !== 'consumers' && <span style={{ fontWeight: 700 }}>{childGroupKind === 'and' ? 'AND' : 'OR'}</span>}
               <span>{childGroupLabel}</span>
             </div>
           )}
@@ -362,11 +372,13 @@ function NodeView({
             : consolidatedSourceTrees.length > 0
               ? null
               : node.type === 'demand'
-                ? (node.failure_explanation
-                    ? <p style={{ margin: 0, fontSize: '0.8rem', color: '#f87171', lineHeight: 1.4 }}>{node.failure_explanation}</p>
-                    : <p style={{ margin: 0, fontSize: '0.8rem', color: '#f87171' }}>No work orders — planning could not fulfill this demand (no method or child failed).</p>)
+                ? ((node as { consolidated_consumer?: boolean }).consolidated_consumer
+                    ? <p style={{ margin: 0, fontSize: '0.78rem', color: '#71717a', fontStyle: 'italic' }}>↳ {t('consumerNote')}</p>
+                    : node.failure_explanation
+                      ? <p style={{ margin: 0, fontSize: '0.8rem', color: '#f87171', lineHeight: 1.4 }}>{node.failure_explanation}</p>
+                      : <p style={{ margin: 0, fontSize: '0.8rem', color: '#f87171' }}>{t('noWorkOrders')}</p>)
                 : node.type === 'work_order'
-                  ? <p style={{ margin: 0, fontSize: '0.8rem', color: '#71717a' }}>No component breakdown (leaf work order or depth-limited).</p>
+                  ? <p style={{ margin: 0, fontSize: '0.8rem', color: '#71717a' }}>{t('noComponentBreakdown')}</p>
                   : null
           }
           {consolidatedSourceTrees.length > 0 && isExpanded && (
