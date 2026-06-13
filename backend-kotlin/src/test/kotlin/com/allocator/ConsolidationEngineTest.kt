@@ -692,4 +692,72 @@ class ConsolidationEngineTest : FunSpec({
         result.consolidatedWOs shouldHaveSize 1
         result.consolidatedWOs[0]["end_time"] shouldBe "2025-03-09"
     }
+
+    // ── Conservation of mass: failed=true subtree must not deplete real inventory ──
+
+    test("applyPeggingConsumption: failed=true WO subtree leaves no ghost depletion in real inventory") {
+        // Inventory: S1 is on-hand component (what the group consolidates),
+        // S2 is a "deep raw" that only the failed exploration branch would have consumed.
+        val invS1 = mutableMapOf<String, Any?>(
+            "product_id" to "P", "location_id" to "L",
+            "supply_id" to "S1", "qty" to 100.0, "supply_date" to "2025-01-01",
+        )
+        val invS2 = mutableMapOf<String, Any?>(
+            "product_id" to "RAW", "location_id" to "L",
+            "supply_id" to "S2", "qty" to 50.0, "supply_date" to "2025-01-01",
+        )
+        val inventory = mutableListOf(invS1, invS2)
+
+        // planFn returns a pegging tree that has:
+        //   - A successful WO subtree consuming 60 units from S1
+        //   - A failed=true WO subtree consuming 40 units from S2
+        // (This mirrors AND-bottleneck diagnostics: plan() rolled back S2 consumption
+        // in invCopy, but the failed node is preserved in the tree for UI diagnostics.)
+        val peggingWithFailedBranch: Map<String, Any?> = mapOf(
+            "type" to "demand",
+            "demand_id" to "D1",
+            "children" to listOf(
+                mapOf(
+                    "type" to "work_order",
+                    "children" to listOf(
+                        mapOf("type" to "supply", "supply_id" to "S1", "quantity" to 60.0),
+                    ),
+                ),
+                mapOf(
+                    "type" to "work_order",
+                    "failed" to true,   // ← rolled-back exploration branch
+                    "children" to listOf(
+                        mapOf("type" to "supply", "supply_id" to "S2", "quantity" to 40.0),
+                    ),
+                ),
+            ),
+        )
+
+        val planFnWithFailedBranch = fun(
+            demand: Map<String, Any?>,
+            _: MutableList<MutableMap<String, Any?>>,
+            _: Map<String, List<Map<String, Any?>>>,
+            _: LocalDate?,
+            _: Int,
+            _: Set<Pair<String, String>>,
+            _: Map<String, Any?>?,
+            _: Any?,
+        ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
+            val committed = listOf(mapOf<String, Any?>(
+                "demand_id" to demand["demand_id"], "quantity" to 60.0,
+            ))
+            return Triple(committed, emptyList(), peggingWithFailedBranch)
+        }
+
+        val need = ComponentNeed("P", "L", LocalDate.of(2025, 1, 20), 60.0, "D1", 1, "FG1")
+        val group = ConsolidationGroup("P", "L", LocalDate.of(2025, 1, 20), listOf(need), 60.0)
+        val config = ConsolidationConfig(enabled = true, allocationMode = "fair")
+
+        runConsolidation(listOf(group), inventory, emptyData, config, planFn = planFnWithFailedBranch)
+
+        // Successful branch: S1 should be depleted by 60 (100 → 40).
+        (invS1["qty"] as Double) shouldBe (40.0 plusOrMinus 1e-9)
+        // Failed branch: S2 must NOT be touched — no ghost depletion.
+        (invS2["qty"] as Double) shouldBe (50.0 plusOrMinus 1e-9)
+    }
 })
