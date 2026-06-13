@@ -96,6 +96,7 @@ export function ScheduleBar({
   selected,
   colorOverride,
   consolidated,
+  segments,
 }: {
   start: string | null;
   end: string | null;
@@ -108,26 +109,31 @@ export function ScheduleBar({
   colorOverride?: string;
   /** Cross-demand consolidated WO → lighter shade of the method's base color. */
   consolidated?: boolean;
+  /** When a table row groups several work orders (e.g. a demand's July + August moves), each
+   *  constituent's [start,end] is drawn as its OWN segment so the bar shows the real (often short)
+   *  durations with the true gaps between them — instead of one solid span from min-start to
+   *  max-end. Falls back to the single [start,end] when omitted. */
+  segments?: { start: string | null; end: string | null }[];
 }): JSX.Element | null {
-  const sd = parseIso(start);
-  const ed = parseIso(end);
-  if (!sd || !ed) return null;
-
   const hStart = horizon.start.getTime();
   const hEnd = horizon.end.getTime();
   const hSpan = Math.max(1, hEnd - hStart);
 
-  const sClamped = Math.max(hStart, Math.min(hEnd, sd.getTime()));
-  const eClamped = Math.max(hStart, Math.min(hEnd, ed.getTime()));
-
-  const xPct = ((sClamped - hStart) / hSpan) * 100;
-  const wPct = ((eClamped - sClamped) / hSpan) * 100;
+  // Build the list of drawable spans: the provided segments (deduped), else the single [start,end].
+  const raw = (segments && segments.length ? segments : [{ start, end }]);
+  const seen = new Set<string>();
+  const spans = raw
+    .map((s) => ({ sd: parseIso(s.start), ed: parseIso(s.end) }))
+    .filter((s): s is { sd: Date; ed: Date } => {
+      if (!s.sd || !s.ed) return false;
+      const k = `${s.sd.getTime()}|${s.ed.getTime()}`;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+  if (spans.length === 0) return null;
 
   const color = colorOverride ?? methodColor(method, consolidated);
-  const durationDays = Math.max(0, Math.round((ed.getTime() - sd.getTime()) / DAY_MS));
-  const tooltip = `${formatDate(sd, locale)} → ${formatDate(ed, locale)} (${durationDays}d)`;
-
-  const isInstant = sd.getTime() === ed.getTime();
   const handleClick = onClick
     ? (e: React.MouseEvent) => { e.stopPropagation(); onClick(); }
     : undefined;
@@ -141,31 +147,25 @@ export function ScheduleBar({
       onClick={handleClick}
     >
       <svg width="100%" height={10} preserveAspectRatio="none" style={{ display: 'block' }}>
-        {isInstant ? (
-          <line
-            x1={`${xPct}%`}
-            x2={`${xPct}%`}
-            y1={0}
-            y2={10}
-            stroke={color}
-            strokeWidth={selected ? 3 : 2}
-          >
-            <title>{tooltip}</title>
-          </line>
-        ) : (
-          <rect
-            x={`${xPct}%`}
-            y={barY}
-            width={`${Math.max(0.4, wPct)}%`}
-            height={barHeight}
-            fill={color}
-            stroke={selected ? '#e0f2fe' : undefined}
-            strokeWidth={selected ? 1 : 0}
-            rx={1}
-          >
-            <title>{tooltip}</title>
-          </rect>
-        )}
+        {spans.map(({ sd, ed }, i) => {
+          const sClamped = Math.max(hStart, Math.min(hEnd, sd.getTime()));
+          const eClamped = Math.max(hStart, Math.min(hEnd, ed.getTime()));
+          const xPct = ((sClamped - hStart) / hSpan) * 100;
+          const wPct = ((eClamped - sClamped) / hSpan) * 100;
+          const durationDays = Math.max(0, Math.round((ed.getTime() - sd.getTime()) / DAY_MS));
+          const tooltip = `${formatDate(sd, locale)} → ${formatDate(ed, locale)} (${durationDays}d)`;
+          return sd.getTime() === ed.getTime() ? (
+            <line key={i} x1={`${xPct}%`} x2={`${xPct}%`} y1={0} y2={10}
+              stroke={color} strokeWidth={selected ? 3 : 2}>
+              <title>{tooltip}</title>
+            </line>
+          ) : (
+            <rect key={i} x={`${xPct}%`} y={barY} width={`${Math.max(0.4, wPct)}%`} height={barHeight}
+              fill={color} stroke={selected ? '#e0f2fe' : undefined} strokeWidth={selected ? 1 : 0} rx={1}>
+              <title>{tooltip}</title>
+            </rect>
+          );
+        })}
       </svg>
     </div>
   );

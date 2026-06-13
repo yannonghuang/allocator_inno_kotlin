@@ -2915,12 +2915,35 @@ private fun flattenPeggingToWorkOrders(
  * @param windowDays scheduling bucket width; <=0 collapses the whole horizon into one
  *   window. Conservative default is a small window (e.g. 7) so batching stays local.
  */
+internal data class WoConsolidation(
+    /** Merged work-order summary: consolidated batches + un-mergeable singletons + pass-throughs. */
+    val consolidated: List<Map<String, Any?>>,
+    /** The input per-demand WOs, each tagged with `consolidated_group_id` linking it to the ONE
+     *  consolidated WO it belongs to. `consolidated` and `native` form a strict partition. */
+    val native: List<Map<String, Any?>>,
+)
+
 internal fun consolidateWorkOrdersByTiming(
     workOrders: List<Map<String, Any?>>,
     data: Map<String, List<Map<String, Any?>>>,
     windowDays: Int,
-): List<Map<String, Any?>> {
-    if (workOrders.size < 2) return workOrders
+): WoConsolidation {
+    val consolidatedOut = mutableListOf<Map<String, Any?>>()
+    val nativeOut = mutableListOf<Map<String, Any?>>()
+
+    // INVARIANT: every native (input) WO is included in EXACTLY ONE consolidated WO. Each output WO
+    // and its constituent native(s) share a `consolidated_group_id`, so the two lists form a strict
+    // partition — no native is lost, and none is double-counted across the native/consolidated tabs.
+    fun emitSingleton(wo: Map<String, Any?>) {
+        val cgid = nextWoGroupId()
+        consolidatedOut.add(wo + ("consolidated_group_id" to cgid))
+        nativeOut.add(wo + ("consolidated_group_id" to cgid))
+    }
+
+    if (workOrders.size < 2) {
+        workOrders.forEach { emitSingleton(it) }
+        return WoConsolidation(consolidatedOut, nativeOut)
+    }
 
     fun bucketOf(start: String?): Long {
         val d = parseDate(start) ?: return Long.MIN_VALUE
@@ -2933,6 +2956,7 @@ internal fun consolidateWorkOrdersByTiming(
         if (wo["failed"] == true || parseDate(wo["start_time"] as? String) == null) passthrough.add(wo)
         else groupable.add(wo)
     }
+    passthrough.forEach { emitSingleton(it) }
 
     // Eligibility (WORK-ORDER-LIST summary only — never touches the per-demand pegging, so
     // constituents need NOT have identical sub-trees). qty = sum, start = min, end = max.
@@ -2956,16 +2980,16 @@ internal fun consolidateWorkOrdersByTiming(
         )
     }
 
-    val out = mutableListOf<Map<String, Any?>>()
-    out.addAll(passthrough)
     for ((_, wos) in groups) {
-        if (wos.size == 1) { out.add(wos[0]); continue }
+        if (wos.size == 1) { emitSingleton(wos[0]); continue }
         val first = wos[0]
         val pid = (first["product_id"] as? String) ?: ""
         val lid = (first["location_id"] as? String) ?: ""
         val method = (first["method"] as? String) ?: ""
         val totalQty = wos.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
-        if (totalQty <= 1e-9) { out.addAll(wos); continue }
+        if (totalQty <= 1e-9) { wos.forEach { emitSingleton(it) }; continue }
+        // This batch's id — shared with every constituent native via `consolidated_group_id`.
+        val cgid = nextWoGroupId()
 
         // Merged span = [min(start), max(end)] across the constituents.
         val mergedStart = wos.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull()
@@ -2975,7 +2999,7 @@ internal fun consolidateWorkOrdersByTiming(
         // in the UI — woRowDemandIds reads wo_consolidation_split_details[].demand_id.
         val splitDetails = wos.filter { (it["demand_id"] as? String)?.isNotBlank() == true }
             .groupBy { it["demand_id"] as String }
-            .map { (d, ws) -> mapOf("demand_id" to d, "allocated_qty" to roundQty(ws.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 })) }
+            .map { (d, ws) -> mapOf("demand_id" to d, "allocated_qty" to ws.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }) }
         val overrideActive = wos.any { it["override_active"] == true }
 
         if (method == "move") {
@@ -2988,15 +3012,15 @@ internal fun consolidateWorkOrdersByTiming(
                 .map { (p, ws) ->
                     mapOf(
                         "product_id" to p,
-                        "quantity" to roundQty(ws.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }),
+                        "quantity" to ws.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 },
                         "demand_ids" to ws.mapNotNull { it["demand_id"] as? String }.filter { it.isNotBlank() }.distinct(),
                     )
                 }
                 .sortedBy { (it["product_id"] as? String) ?: "" }
-            out.add(mapOf(
+            consolidatedOut.add(mapOf(
                 "product_id" to null,                          // mixed cargo
                 "location_id" to lid,                          // target
-                "quantity" to roundQty(totalQty),
+                "quantity" to totalQty,                        // exact sum of constituents → conserved
                 "start_time" to formatDate(mergedStart),
                 "end_time" to formatDate(mergedEnd),
                 "method" to "move",
@@ -3004,7 +3028,8 @@ internal fun consolidateWorkOrdersByTiming(
                 "demand_id" to null,
                 "prod_area" to null,
                 "override_active" to overrideActive,
-                "wo_group_id" to nextWoGroupId(),
+                "wo_group_id" to cgid,
+                "consolidated_group_id" to cgid,
                 "wave_index" to 0,
                 "lot_count" to 1,
                 "consolidated" to true,
@@ -3014,8 +3039,9 @@ internal fun consolidateWorkOrdersByTiming(
                 "move_components" to moveComponents,
                 "wo_window_start" to formatDate(mergedStart),
                 "wo_window_end" to formatDate(wos.mapNotNull { parseDate(it["start_time"] as? String) }.maxOrNull()),
-                "wo_consolidation_total_planned" to roundQty(totalQty),
+                "wo_consolidation_total_planned" to totalQty,
             ))
+            wos.forEach { nativeOut.add(it + ("consolidated_group_id" to cgid)) }
             continue
         }
 
@@ -3026,10 +3052,10 @@ internal fun consolidateWorkOrdersByTiming(
         // `lot_count` metadata rather than exploding back into per-lot work orders —
         // that is what actually shrinks the work-order count (inputs are already one
         // lot each, so re-lotting would reproduce them).
-        out.add(mapOf(
+        consolidatedOut.add(mapOf(
             "product_id" to pid,
             "location_id" to lid,
-            "quantity" to roundQty(totalQty),
+            "quantity" to totalQty,                            // exact sum of constituents → conserved
             "start_time" to formatDate(mergedStart),
             "end_time" to formatDate(mergedEnd),
             "method" to method,
@@ -3037,7 +3063,8 @@ internal fun consolidateWorkOrdersByTiming(
             "demand_id" to null,
             "prod_area" to first["prod_area"],
             "override_active" to overrideActive,
-            "wo_group_id" to nextWoGroupId(),
+            "wo_group_id" to cgid,
+            "consolidated_group_id" to cgid,
             "wave_index" to 0,
             "lot_count" to lotCount,
             "max_lot_size" to lotSize,
@@ -3058,10 +3085,11 @@ internal fun consolidateWorkOrdersByTiming(
             // batch (not every window of those demands for the same component).
             "wo_window_start" to formatDate(wos.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull()),
             "wo_window_end" to formatDate(wos.mapNotNull { parseDate(it["start_time"] as? String) }.maxOrNull()),
-            "wo_consolidation_total_planned" to roundQty(totalQty),
+            "wo_consolidation_total_planned" to totalQty,
         ))
+        wos.forEach { nativeOut.add(it + ("consolidated_group_id" to cgid)) }
     }
-    return out
+    return WoConsolidation(consolidatedOut, nativeOut)
 }
 
 private fun buildWoNode(
@@ -4239,19 +4267,28 @@ fun runPlanning(
     val consolidationCfg = config?.get("consolidation") as? Map<String, Any?>
     val nodeLevelWos = flattenPeggingToWorkOrders(reconciledTrees, data)
     val consolidateWos = consolidationConfig.enabled && consolidationCfg?.get("consolidate_wos") != false
-    val outputWorkOrders = if (consolidateWos) {
+    // consolidated.consolidated = the merged procurement view; consolidated.native = the same input
+    // per-demand WOs, each tagged with `consolidated_group_id` so every native belongs to EXACTLY ONE
+    // consolidated WO (a strict partition — no native lost, no double-count across the two tabs).
+    val consolidation = if (consolidateWos) {
         val windowDays = (consolidationCfg?.get("wo_window_days") as? Number)?.toInt() ?: consolidationConfig.periodDays
         val merged = consolidateWorkOrdersByTiming(nodeLevelWos, data, windowDays)
-        log.info("Pass 2 cross-demand WO batch (window={}d): {} → {} work orders (per-demand drill-down disabled)", windowDays, nodeLevelWos.size, merged.size)
+        log.info("Pass 2 cross-demand WO batch (window={}d): {} native → {} consolidated work orders", windowDays, nodeLevelWos.size, merged.consolidated.size)
         merged
     } else {
-        log.info("Pass 2 WO-consolidation: {} pegging nodes → {} node-level work orders (in sync with per-demand pegging)", nodeLevelWos.size, nodeLevelWos.size)
-        nodeLevelWos
+        log.info("Pass 2 WO-consolidation OFF: {} node-level work orders (1:1 with per-demand pegging)", nodeLevelWos.size)
+        WoConsolidation(nodeLevelWos, nodeLevelWos)
     }
 
     return mapOf(
         "committed_demands"      to committedDemands,
-        "work_orders"            to outputWorkOrders,
+        "work_orders"            to consolidation.consolidated,
+        // The NATIVE per-demand work orders (pre-consolidation, 1:1 with the pegging nodes), each
+        // tagged with `consolidated_group_id` → the ONE consolidated WO it rolls into. Kept separate
+        // from `work_orders` (the consolidated procurement view) so the UI shows each in its own tab —
+        // combining them would double-count any aggregate. When consolidation is off these are
+        // identical to `work_orders`.
+        "work_orders_native"     to consolidation.native,
         "planning_pegging"       to reconciledTrees,
         "supply_allocations"     to supplyAllocations,
         "supply_cap_violations"  to supplyCapViolations,

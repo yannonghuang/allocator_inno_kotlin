@@ -580,7 +580,9 @@
       "overrideMethod": "Method",
       "overrideSplit": "Split",
       "nComponents": "{n} components",
-      "consolidatedOnly": "Consolidated only"
+      "consolidatedOnly": "Consolidated only",
+      "tabConsolidated": "Consolidated",
+      "tabNative": "Native (per-demand)"
     },
     "woScheduleImpact": {
       "title": "WO Schedule Impact",

@@ -1192,6 +1192,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planResult, setPlanResult] = useState<{
     committed_demands: CommittedDemand[];
     work_orders: WorkOrder[];
+    work_orders_native?: WorkOrder[];
     planning_pegging: PlanningPeggingEntry[];
     supply_allocations?: PlanSupplyAllocation[];
     supply_level_allocations?: SupplyLevelAllocation[];
@@ -1266,6 +1267,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planSupplyHideDummy, setPlanSupplyHideDummy] = useState(true);
   const [planWorkOrderHideDummyProdArea, setPlanWorkOrderHideDummyProdArea] = useState(true);
   const [planWoConsolidatedOnly, setPlanWoConsolidatedOnly] = useState(false);
+  // Which WO list the table shows: the consolidated procurement view, or the native per-demand
+  // view (1:1 with the pegging). Kept as separate tables so aggregates never double-count.
+  const [woTableTab, setWoTableTab] = useState<'consolidated' | 'native'>('consolidated');
+  const activeWorkOrders = useMemo<WorkOrder[]>(() =>
+    woTableTab === 'native'
+      ? (planResult?.work_orders_native ?? planResult?.work_orders ?? [])
+      : (planResult?.work_orders ?? []),
+    [planResult, woTableTab]);
   // ── Assessment state ────────────────────────────────────────────────────────
   const [assessCriteria, setAssessCriteria] = useState('');
   const [assessCriteriaHigh, setAssessCriteriaHigh] = useState('');
@@ -2889,7 +2898,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     const seenGroup = new Set<string>();
     let ancestors = 0;
     let descendants = 0;
-    for (const r of planResult.work_orders ?? []) {
+    for (const r of activeWorkOrders) {
       // Mirror the table's pre-grouping filter: hide product_id starting with VirtualProduct_.
       if (planWorkOrderHideDummyProdArea && (r.product_id ?? '').trim().startsWith('VirtualProduct_')) continue;
       const gk = woRowGroupKey(r as WoRowLike);
@@ -5706,6 +5715,23 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       </datalist>
                     </label>
                   </div>
+                  {/* ── Native vs Consolidated tabs (separate tables — combining would double-count) ── */}
+                  <div style={{ display: 'flex', gap: '0.4rem', marginTop: '0.35rem', marginBottom: '0.35rem' }}>
+                    {(['consolidated', 'native'] as const).map((tab) => (
+                      <button
+                        key={tab}
+                        type="button"
+                        className={woTableTab === tab ? '' : 'secondary'}
+                        style={{ fontSize: '0.78rem', padding: '3px 12px' }}
+                        onClick={() => setWoTableTab(tab)}
+                      >
+                        {tP(tab === 'consolidated' ? 'workOrders.tabConsolidated' : 'workOrders.tabNative')}
+                        <span style={{ marginLeft: 6, opacity: 0.65, fontSize: '0.7rem' }}>
+                          {tab === 'consolidated' ? (planResult.work_orders?.length ?? 0) : (planResult.work_orders_native?.length ?? planResult.work_orders?.length ?? 0)}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
                   <div style={{ marginTop: '0.2rem', marginBottom: '0.4rem', display: 'flex', gap: '1.1rem', flexWrap: 'wrap' }}>
                     <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.72rem', color: '#71717a', cursor: 'pointer' }}>
                       <input
@@ -5716,15 +5742,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       />
                       <span>{tP('workOrders.hideDummy')}</span>
                     </label>
-                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.72rem', color: '#71717a', cursor: 'pointer' }}>
-                      <input
-                        type="checkbox"
-                        checked={planWoConsolidatedOnly}
-                        onChange={(e) => setPlanWoConsolidatedOnly(e.target.checked)}
-                        style={{ accentColor: '#71717a' }}
-                      />
-                      <span>{tP('workOrders.consolidatedOnly')}</span>
-                    </label>
+                    {woTableTab === 'consolidated' && (
+                      <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.72rem', color: '#71717a', cursor: 'pointer' }}>
+                        <input
+                          type="checkbox"
+                          checked={planWoConsolidatedOnly}
+                          onChange={(e) => setPlanWoConsolidatedOnly(e.target.checked)}
+                          style={{ accentColor: '#71717a' }}
+                        />
+                        <span>{tP('workOrders.consolidatedOnly')}</span>
+                      </label>
+                    )}
                   </div>
                   {/* ── Pivot selector ── */}
                   <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
@@ -5801,8 +5829,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   </div>
                   {planResult.work_orders.length > 0 && (() => {
                     const workOrdersFiltered = planWorkOrderHideDummyProdArea
-                      ? planResult.work_orders.filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'))
-                      : planResult.work_orders;
+                      ? activeWorkOrders.filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'))
+                      : activeWorkOrders;
                     const byProdArea = workOrdersFiltered.reduce<Record<string, number>>((acc, r) => {
                       const pa = (r.prod_area ?? '–') as string;
                       acc[pa] = (acc[pa] ?? 0) + (Number(r.quantity) || 0);
@@ -5822,8 +5850,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   })()}
                   {(() => {
                     let workOrderRows = planWorkOrderHideDummyProdArea
-                      ? planResult.work_orders.filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'))
-                      : planResult.work_orders;
+                      ? activeWorkOrders.filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'))
+                      : activeWorkOrders;
                     // Compute the supply-backing map early so it can drive the phantom filter below
                     // and also be used by the WO expand panel later in this block.
                     const { suppliesMap: woSuppliesMap, crossEntrySupplyMap: woCrossEntrySupplyMap, peggedQtyMap: woPeggedQtyMap } = buildWoMaps(planResult.planning_pegging ?? []);
@@ -5901,9 +5929,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       const existing = grouped.get(key);
                       const rowQty = Number(r.quantity ?? 0) || 0;
                       if (!existing) {
-                        grouped.set(key, { ...r, quantity: rowQty });
+                        // Track each constituent WO's span so the schedule bar can draw it as its own
+                        // segment (real short durations + true gaps) instead of one solid min→max span.
+                        grouped.set(key, { ...r, quantity: rowQty, _segments: [{ start: r.start_time ?? null, end: r.end_time ?? null }] });
                       } else {
                         existing.quantity = (Number(existing.quantity ?? 0) || 0) + rowQty;
+                        (existing._segments ??= []).push({ start: r.start_time ?? null, end: r.end_time ?? null });
                         // For time range, keep earliest start and latest end across lots
                         if (r.start_time && (!existing.start_time || r.start_time < existing.start_time)) {
                           existing.start_time = r.start_time;
@@ -5929,7 +5960,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       }
                       if (!demandLabelMap.has(id)) demandLabelMap.set(id, d.product_id);
                     }
-                    const dummyHiddenCount = planResult.work_orders.filter((r) => (r.product_id ?? '').trim().startsWith('VirtualProduct_')).length;
+                    const dummyHiddenCount = activeWorkOrders.filter((r) => (r.product_id ?? '').trim().startsWith('VirtualProduct_')).length;
                     const woRowsAll: WoEnrichedRow[] = groupedRows.map((r, i) => {
                       const splitDemandIds = (r.wo_consolidation_split_details ?? [])
                         .map((d) => d.demand_id)
@@ -5995,7 +6026,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     let woRows: WoEnrichedRow[] = planDemandShortOnly
                       ? woRowsAll.filter((r) => (r._shortage ?? 0) > 0.01)
                       : woRowsAll;
-                    if (planWoConsolidatedOnly) {
+                    if (planWoConsolidatedOnly && woTableTab === 'consolidated') {
                       woRows = woRows.filter((r) => r.consolidated === true);
                     }
                     if (woPegHighlightRow && woPegFilterPeggedOnly) {
@@ -6084,6 +6115,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               selected={isSelf}
                               colorOverride={colorOverride}
                               consolidated={r.consolidated}
+                              segments={r._segments}
                               onClick={() => setWoPegHighlightRow(isSelf ? null : r)}
                             />
                           );
