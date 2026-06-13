@@ -3584,6 +3584,8 @@ private data class V2IteratedResult(
     val commitResult: LegacyCommitResult,
     val iterations: Int,
     val converged: Boolean,
+    val producedByComponent: Map<String, Double> = emptyMap(),
+    val releasedByComponent: Map<String, Double> = emptyMap(),
 )
 
 /**
@@ -3824,6 +3826,7 @@ private fun runV2Iterated(
     var lastConsolidatedWOs: List<Map<String, Any?>> = emptyList()
     var lastConsolidatedPegging: List<Map<String, Any?>> = emptyList()
     var lastCommit = LegacyCommitResult(emptyList(), emptyList(), emptyList())
+    var lastProducedByComponent: Map<String, Double> = emptyMap()
     // Shared feasibility cache across consolidation + legacyCommit. Stable across
     // iters because it depends only on `data` and `purchase_allowed`, neither of
     // which change here. Memoizes maxMakeDepth(pid, lid) lookups; without it the
@@ -3893,6 +3896,7 @@ private fun runV2Iterated(
                 producedByComponent[componentKey] = (producedByComponent[componentKey] ?: 0.0) + qty
             }
         }
+        lastProducedByComponent = producedByComponent
         if (consolidationConfig.realPegging) {
             // CARRIER = REAL supplies. Mirror the bucket path EXACTLY — re-supply only the allocated
             // OUTPUT (pid,lid)s (deep raws stay depleted) — but restore their REAL pre-consolidation
@@ -3972,9 +3976,45 @@ private fun runV2Iterated(
         lastConsolidatedPegging = consResult.consolidatedPegging
         lastCommit = commit
 
+        // Component release: budget residuals of fully-unserved demands at this iteration.
+        // These units were allocated in Phase 1 Step 2 but never drawn in Step 3 (the demand
+        // failed for a non-C reason — AND-bottleneck, missing raw material, etc. — and plan()
+        // restored its inventory + budget via invCopy rollback). Surfaced as a hint to the
+        // checker and in the plan output; with max_iterations > 1 the convergence loop would
+        // reclaim this slack naturally.
+        val releasedByComponent = mutableMapOf<String, Double>()
+        val iterCommittedQtyByDemand = mutableMapOf<Any?, Double>()
+        for (row in commit.committedDemands) {
+            if (isHardPlanningFailure(row["commit_reason"] as? String)) continue
+            val did = row["demand_id"] ?: continue
+            iterCommittedQtyByDemand[did] = (iterCommittedQtyByDemand[did] ?: 0.0) +
+                ((row["quantity"] as? Number)?.toDouble() ?: 0.0)
+        }
+        for (d in demands) {
+            val did = d["demand_id"] ?: continue
+            if ((iterCommittedQtyByDemand[did] ?: 0.0) > 1e-9) continue  // served
+            val demBudget = budgets[did] ?: continue
+            for ((componentKey, residual) in demBudget) {
+                if (residual <= 1e-9) continue
+                releasedByComponent[componentKey] =
+                    (releasedByComponent[componentKey] ?: 0.0) + residual
+            }
+        }
+        if (releasedByComponent.isNotEmpty()) {
+            log.warn(
+                "v2 iter {}: {} component(s) with orphaned allocations ({} qty) — " +
+                "unserved demand(s) held budget they never drew; consider max_iterations > 1",
+                iter + 1, releasedByComponent.size,
+                "%.2f".format(releasedByComponent.values.sum()),
+            )
+        }
+
         if (totalOver <= 1e-9) {
             log.info("v2 iter {}: converged (no over-production)", iter + 1)
-            return V2IteratedResult(consResult.consolidatedWOs, consResult.consolidatedPegging, commit, iter + 1, true)
+            return V2IteratedResult(
+                consResult.consolidatedWOs, consResult.consolidatedPegging, commit,
+                iter + 1, true, producedByComponent, releasedByComponent,
+            )
         }
 
         if (isLastIter) {
@@ -3990,7 +4030,10 @@ private fun runV2Iterated(
                 "reconcile trimmed {} component(s), {} qty"
             if (q > 1e-6) log.warn(msg, "%.2f".format(totalOver), n, "%.2f".format(q))
             else log.info(msg + " (phantom budget; no production over-size)", "%.2f".format(totalOver), n, "%.2f".format(q))
-            return V2IteratedResult(finalWOs.toList(), consResult.consolidatedPegging, commit, iter + 1, false)
+            return V2IteratedResult(
+                finalWOs.toList(), consResult.consolidatedPegging, commit,
+                iter + 1, false, producedByComponent, releasedByComponent,
+            )
         }
 
         // Stall detection: the residual is monotone non-increasing (caps only drop),
@@ -4008,7 +4051,10 @@ private fun runV2Iterated(
                 "stable fixed point; stopping early, fallback trimmed {} component(s), {} qty",
                 iter + 1, "%.2f".format(totalOver), "%.2f".format(prevTotalOver), n, "%.2f".format(q),
             )
-            return V2IteratedResult(finalWOs.toList(), consResult.consolidatedPegging, commit, iter + 1, false)
+            return V2IteratedResult(
+                finalWOs.toList(), consResult.consolidatedPegging, commit,
+                iter + 1, false, producedByComponent, releasedByComponent,
+            )
         }
         prevTotalOver = totalOver
 
@@ -4059,7 +4105,7 @@ private fun runV2Iterated(
         )
     }
     // Unreachable: the loop always returns from inside.
-    return V2IteratedResult(lastConsolidatedWOs, lastConsolidatedPegging, lastCommit, MAX_PLANNING_ITERATIONS, false)
+    return V2IteratedResult(lastConsolidatedWOs, lastConsolidatedPegging, lastCommit, MAX_PLANNING_ITERATIONS, false, lastProducedByComponent)
 }
 
 /**
@@ -4165,6 +4211,12 @@ data class RunPlanningResult(
     val inventoryEffectiveInitial: List<Map<String, Any?>>,
     /** Inventory state AFTER all planning passes (physical supply leftover). */
     val inventoryLeftover: List<Map<String, Any?>>,
+    /**
+     * Total qty produced per merged-leaf component (pid|lid) in Phase 1 Step 2.
+     * Used by [checkRunSoundness] for the component-conservation cross-check (R7f).
+     * Empty when consolidation is disabled.
+     */
+    val producedByComponent: Map<String, Double> = emptyMap(),
 )
 
 /**
@@ -4250,6 +4302,8 @@ fun runPlanning(
     // Disabled → run phase 3 directly against real inventory; useTaggedLookup
     // is needed only for supply-split overrides (real buckets split per demand).
     val commitResult: LegacyCommitResult
+    var producedByComponent: Map<String, Double> = emptyMap()
+    var releasedByComponent: Map<String, Double> = emptyMap()
     // Empty list — retained for shape compatibility with historical consumers
     // that still read `supply_level_allocations` from enriched plan results.
     // The supply-level orchestrator (consolidation.scope="all") was retired
@@ -4262,6 +4316,8 @@ fun runPlanning(
         consolidatedWOs.addAll(iterated.consolidatedWOs)
         consolidatedPegging.addAll(iterated.consolidatedPegging)
         commitResult = iterated.commitResult
+        producedByComponent = iterated.producedByComponent
+        releasedByComponent = iterated.releasedByComponent
     } else {
         commitResult = legacyCommit(
             demands, inventory, data, config, overrideIndex,
@@ -4287,7 +4343,21 @@ fun runPlanning(
     val suppliesForCap = data["supply"] ?: emptyList()
     val supplyAllocations = extractSupplyAllocations(allPegging, suppliesForCap)
     val supplyCapViolations = verifySupplyCap(suppliesForCap, supplyAllocations)
-    val conservationViolations = verifyInventoryConservation(inventoryEffectiveInitial, inventory, supplyAllocations)
+    // R7e: physical conservation — only count pegging from served demands (committed > 0).
+    // Unserved demands have their inventory restored by plan()'s invCopy rollback; excluding
+    // their pegging avoids false violations from imperfect `failed=true` tagging.
+    val servedDemandIds: Set<String> = committedDemands
+        .filter { !isHardPlanningFailure(it["commit_reason"] as? String) }
+        .filter { ((it["quantity"] as? Number)?.toDouble() ?: 0.0) > 1e-9 }
+        .mapNotNull { it["demand_id"]?.toString() }
+        .toSet()
+    val conservationViolations = verifyInventoryConservation(
+        inventoryEffectiveInitial, inventory, supplyAllocations, servedDemandIds = servedDemandIds,
+    )
+    // R7f: component conservation — produced qty (Phase 1 Step 2) vs consumed by served demands.
+    val componentConservationViolations = if (producedByComponent.isNotEmpty())
+        verifyComponentConservation(producedByComponent, allPegging, servedDemandIds = servedDemandIds)
+    else emptyList()
 
     // Supply-split override soft-warn: any demand in an override that commits short
     // of its request is flagged as potentially impacted by the override.
@@ -4489,6 +4559,13 @@ fun runPlanning(
         "supply_allocations"     to supplyAllocations,
         "supply_cap_violations"  to supplyCapViolations,
         "conservation_violations" to conservationViolations,
+        // R7f component conservation: produced vs consumed per merged-leaf component.
+        // Non-empty when unserved demands left their Phase 1 allocation unused. Surfaced
+        // here so callers can detect budget leakage without running the full soundness checker.
+        "component_conservation_violations" to componentConservationViolations,
+        // Budget released from unserved demands; keyed by "pid|lid". Non-empty with
+        // max_iterations=1 when a demand failed AND-bottleneck after Phase 1 allocated capacity.
+        "budget_released_by_component" to releasedByComponent,
         "override_warnings"      to overrideWarnings,
         "supply_level_allocations" to supplyLevelAllocations,
         // Number of WO groups whose start was pushed by ResourceScheduler
@@ -4500,6 +4577,7 @@ fun runPlanning(
         output = output,
         inventoryEffectiveInitial = inventoryEffectiveInitial,
         inventoryLeftover = inventory.map { it.toMap() },
+        producedByComponent = producedByComponent,
     )
 }
 
@@ -4556,6 +4634,14 @@ internal fun verifyInventoryConservation(
     postPlanningInventory: List<Map<String, Any?>>,
     supplyAllocations: List<Map<String, Any?>>,
     tolerance: Double = 1e-6,
+    /**
+     * When provided, only count supply allocations from these demand IDs.
+     * Unserved demands (committed=0) have their inventory restored by plan()'s
+     * invCopy rollback, so including their pegging would over-count and produce
+     * false conservation violations. Implements the formula:
+     *   initial = leftover + pegged_to_served_demands
+     */
+    servedDemandIds: Set<String>? = null,
 ): List<String> {
     val initialBySupply = mutableMapOf<String, Double>()
     for (s in effectiveInitial) {
@@ -4572,7 +4658,10 @@ internal fun verifyInventoryConservation(
         leftoverBySupply[sid] = (leftoverBySupply[sid] ?: 0.0) + qty
     }
     val peggedBySupply = mutableMapOf<String, Double>()
-    for (a in supplyAllocations) {
+    val effectiveAllocations = if (servedDemandIds != null)
+        supplyAllocations.filter { (it["demand_id"] as? String ?: "") in servedDemandIds }
+    else supplyAllocations
+    for (a in effectiveAllocations) {
         val sid = a["supply_id"] as? String ?: continue
         if (sid.startsWith("consolidated_")) continue
         val qty = (a["qty_consumed"] as? Number)?.toDouble() ?: 0.0
@@ -4596,6 +4685,78 @@ internal fun verifyInventoryConservation(
             val msg = "supply_id %s: orphaned leftover %.4f (absent from effective initial)".format(sid, leftover)
             violations.add(msg)
             log.warn("inventory conservation violation — {}", msg)
+        }
+    }
+    return violations
+}
+
+/**
+ * R7f: component conservation check. For each merged-leaf component (pid|lid) that
+ * Phase 1 Step 2 (consolidation) produced, the total qty consumed from its synthetic
+ * `consolidated_<pid>_<lid>` supply bucket by served demands must equal the produced qty.
+ *
+ * A non-empty result means unserved demands left their Phase 1 allocation unused —
+ * that capacity was never drawn in Step 3. With max_iterations=1 this leaks; with
+ * max_iterations > 1 the convergence loop reclaims it automatically.
+ *
+ * @param producedByComponent  From [RunPlanningResult.producedByComponent] — qty allocated per
+ *        merged-leaf component in Phase 1 Step 2 (keyed by "pid|lid").
+ * @param planningPegging      All pegging entries from the plan output (consolidated + per-demand).
+ * @param servedDemandIds      When provided, only count consumption from these demand IDs.
+ *        Pass the same set used in [verifyInventoryConservation] for consistency.
+ */
+internal fun verifyComponentConservation(
+    producedByComponent: Map<String, Double>,
+    planningPegging: List<Map<String, Any?>>,
+    servedDemandIds: Set<String>? = null,
+    tolerance: Double = 1e-6,
+): List<String> {
+    if (producedByComponent.isEmpty()) return emptyList()
+
+    // Build reverse index: consolidated supply_id → component key (pid|lid)
+    val componentBySupplyId: Map<String, String> = producedByComponent.keys.associateBy { key ->
+        val parts = key.split("|", limit = 2)
+        "consolidated_${parts.getOrElse(0) { "" }}_${parts.getOrElse(1) { "" }}"
+    }
+
+    val consumedByComponent = mutableMapOf<String, Double>()
+
+    fun walk(node: Map<String, Any?>) {
+        val type = node["type"] as? String
+        if (type == "work_order" && node["failed"] == true) return
+        val supplyId = node["supply_id"] as? String
+        if ((type == "supply" || type == "purchase") && supplyId != null) {
+            val componentKey = componentBySupplyId[supplyId]
+            if (componentKey != null) {
+                val qty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
+                consumedByComponent[componentKey] = (consumedByComponent[componentKey] ?: 0.0) + qty
+            }
+        }
+        @Suppress("UNCHECKED_CAST")
+        (node["children"] as? List<Map<String, Any?>>)?.forEach { walk(it) }
+    }
+
+    for (entry in planningPegging) {
+        if (entry["consolidated"] == true || entry["passthrough"] == true) continue
+        val demandId = entry["demand_id"]?.toString() ?: continue
+        if (servedDemandIds != null && demandId !in servedDemandIds) continue
+        @Suppress("UNCHECKED_CAST")
+        val tree = entry["tree"] as? Map<String, Any?> ?: continue
+        walk(tree)
+    }
+
+    val violations = mutableListOf<String>()
+    for ((key, produced) in producedByComponent) {
+        val consumed = consumedByComponent[key] ?: 0.0
+        val orphaned = produced - consumed
+        if (orphaned > maxOf(tolerance, 1e-9 * produced)) {
+            val parts = key.split("|", limit = 2)
+            val pid = parts.getOrElse(0) { "" }
+            val lid = parts.getOrElse(1) { "" }
+            val msg = "component %s @ %s: produced %.4f but only %.4f consumed by served demands (orphaned %.4f)".format(
+                pid, lid, produced, consumed, orphaned)
+            violations.add(msg)
+            log.warn("component conservation violation — {}", msg)
         }
     }
     return violations

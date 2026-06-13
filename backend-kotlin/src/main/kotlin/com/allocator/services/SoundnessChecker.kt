@@ -109,6 +109,13 @@ data class SoundnessReport(
      * [checkRunSoundness] (e.g. DB-loaded soundness checks on historical runs).
      */
     val conservationViolations: List<String> = emptyList(),
+    /**
+     * R7f component conservation violations: Phase 1 Step 2 produced qty at a merged-leaf
+     * component exceeds what served demands actually consumed from the synthetic bucket.
+     * Indicates unserved demands left their allocation unused (budget leakage). Empty when
+     * [producedByComponent] was not passed to [checkRunSoundness].
+     */
+    val componentConservationViolations: List<String> = emptyList(),
 )
 
 /**
@@ -156,6 +163,12 @@ fun checkRunSoundness(
      * Required when [inventoryEffectiveInitial] and [inventoryLeftover] are provided.
      */
     supplyAllocations: List<Map<String, Any?>> = emptyList(),
+    /**
+     * R7f: Phase 1 Step 2 component production totals (pid|lid → qty).
+     * Pass [RunPlanningResult.producedByComponent]. Leave empty to skip the
+     * component-conservation check (e.g. when verifying a DB-loaded historical run).
+     */
+    producedByComponent: Map<String, Double> = emptyMap(),
 ): SoundnessReport {
     // Index demands by id and lookup tables for rule checks.
     val demandById: Map<String, Map<String, Any?>> = demands.associateBy { it["demand_id"]?.toString() ?: "" }
@@ -408,17 +421,36 @@ fun checkRunSoundness(
         }
     }
 
+    // Served demand IDs: demands with committed qty > 0. Used to exclude unserved demands
+    // from conservation checks — their inventory was restored by plan()'s invCopy rollback.
+    val servedDemandIds: Set<String> = committedQtyById
+        .filter { (_, qty) -> qty > 1e-9 }
+        .keys
+
     // R7e: conservation of mass — only when both inventory snapshots are provided.
     // DB-loaded soundness checks on historical runs pass empty lists and skip this.
     val conservationViolations: List<String> =
         if (inventoryEffectiveInitial.isNotEmpty() && inventoryLeftover.isNotEmpty())
-            verifyInventoryConservation(inventoryEffectiveInitial, inventoryLeftover, supplyAllocations)
+            verifyInventoryConservation(
+                inventoryEffectiveInitial, inventoryLeftover, supplyAllocations,
+                servedDemandIds = servedDemandIds.ifEmpty { null },
+            )
+        else emptyList()
+
+    // R7f: component conservation — only when producedByComponent is provided.
+    val componentConservationViolations: List<String> =
+        if (producedByComponent.isNotEmpty())
+            verifyComponentConservation(
+                producedByComponent, planningPegging,
+                servedDemandIds = servedDemandIds.ifEmpty { null },
+            )
         else emptyList()
 
     val soundCount = demandReports.count { it.sound }
     val overallSound = soundCount == demandReports.size &&
         crossViolations.isEmpty() &&
-        conservationViolations.isEmpty()
+        conservationViolations.isEmpty() &&
+        componentConservationViolations.isEmpty()
 
     return SoundnessReport(
         overallSound = overallSound,
@@ -428,6 +460,7 @@ fun checkRunSoundness(
         crossDemandViolations = crossViolations,
         deepCheck = config.deepCheck,
         conservationViolations = conservationViolations,
+        componentConservationViolations = componentConservationViolations,
     )
 }
 
