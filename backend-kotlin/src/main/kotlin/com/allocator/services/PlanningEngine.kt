@@ -4191,6 +4191,15 @@ fun runPlanning(
         for ((supplyId, caps) in supplyCapMap) {
             val buckets = inventory.filter { it["supply_id"]?.toString() == supplyId }
             if (buckets.isEmpty()) continue
+            val originalQty = buckets.sumOf { (it["qty"] as? Number)?.toDouble() ?: 0.0 }
+            val totalCaps = caps.values.sumOf { if (it > 1e-12) it else 0.0 }
+            if (totalCaps > originalQty + 1e-6) {
+                log.warn(
+                    "supply-split override: supply_id {} Σcaps {:.4f} > original_qty {:.4f} — " +
+                    "demands will compete for more than the physical supply",
+                    supplyId, totalCaps, originalQty,
+                )
+            }
             val template = buckets.first()
             val productId = template["product_id"]
             val locationId = template["location_id"]
