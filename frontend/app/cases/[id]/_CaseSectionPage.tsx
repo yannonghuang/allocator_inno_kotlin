@@ -5929,9 +5929,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       const existing = grouped.get(key);
                       const rowQty = Number(r.quantity ?? 0) || 0;
                       if (!existing) {
-                        grouped.set(key, { ...r, quantity: rowQty });
+                        // Track each constituent WO's span so the schedule bar can draw it as its own
+                        // segment (real short durations + true gaps) instead of one solid min→max span.
+                        grouped.set(key, { ...r, quantity: rowQty, _segments: [{ start: r.start_time ?? null, end: r.end_time ?? null }] });
                       } else {
                         existing.quantity = (Number(existing.quantity ?? 0) || 0) + rowQty;
+                        (existing._segments ??= []).push({ start: r.start_time ?? null, end: r.end_time ?? null });
                         // For time range, keep earliest start and latest end across lots
                         if (r.start_time && (!existing.start_time || r.start_time < existing.start_time)) {
                           existing.start_time = r.start_time;
@@ -6112,6 +6115,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               selected={isSelf}
                               colorOverride={colorOverride}
                               consolidated={r.consolidated}
+                              segments={r._segments}
                               onClick={() => setWoPegHighlightRow(isSelf ? null : r)}
                             />
                           );

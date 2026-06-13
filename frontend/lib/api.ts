@@ -199,6 +199,9 @@ export type WorkOrder = {
   /** Links a native (work_orders_native) WO to the ONE consolidated WO it rolls into, and is also
    *  set on each consolidated WO (its own id). Native ↔ consolidated form a strict partition. */
   consolidated_group_id?: string;
+  /** UI-only: when a table row groups several WOs, each constituent's [start,end] so the schedule
+   *  bar can draw one segment per real WO instead of one solid min-start→max-end span. */
+  _segments?: { start: string | null; end: string | null }[];
   /** On a mixed-product MOVE shipment (product_id=null): the per-component cargo manifest. */
   move_components?: { product_id: string; quantity: number; demand_ids?: string[] }[];
   /** On a batched WO: the original start-window of its constituents (for precise pegging trace). */
