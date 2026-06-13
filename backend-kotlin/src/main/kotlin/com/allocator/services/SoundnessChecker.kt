@@ -103,6 +103,12 @@ data class SoundnessReport(
     val crossDemandViolations: List<Violation>,
     /** True if R8 (deep check) was run. */
     val deepCheck: Boolean,
+    /**
+     * R7e conservation-of-mass violations: initial_qty ≠ leftover_qty + pegged_qty for a
+     * physical supply bucket. Empty when the inventory snapshots were not provided to
+     * [checkRunSoundness] (e.g. DB-loaded soundness checks on historical runs).
+     */
+    val conservationViolations: List<String> = emptyList(),
 )
 
 /**
@@ -134,6 +140,22 @@ fun checkRunSoundness(
     workOrders: List<Map<String, Any?>> = emptyList(),
     committedDemands: List<Map<String, Any?>> = emptyList(),
     overrideIndex: Map<String, Map<String, Any?>> = emptyMap(),
+    /**
+     * R7e: inventory snapshot taken AFTER supply-split overrides, BEFORE planning.
+     * Pass [RunPlanningResult.inventoryEffectiveInitial]. Leave empty to skip the
+     * conservation check (e.g. when verifying a DB-loaded historical run).
+     */
+    inventoryEffectiveInitial: List<Map<String, Any?>> = emptyList(),
+    /**
+     * R7e: inventory state AFTER all planning passes (physical supply leftover).
+     * Pass [RunPlanningResult.inventoryLeftover]. Leave empty to skip the check.
+     */
+    inventoryLeftover: List<Map<String, Any?>> = emptyList(),
+    /**
+     * R7e: supply allocations from the plan output (`supply_allocations` field).
+     * Required when [inventoryEffectiveInitial] and [inventoryLeftover] are provided.
+     */
+    supplyAllocations: List<Map<String, Any?>> = emptyList(),
 ): SoundnessReport {
     // Index demands by id and lookup tables for rule checks.
     val demandById: Map<String, Map<String, Any?>> = demands.associateBy { it["demand_id"]?.toString() ?: "" }
@@ -386,8 +408,17 @@ fun checkRunSoundness(
         }
     }
 
+    // R7e: conservation of mass — only when both inventory snapshots are provided.
+    // DB-loaded soundness checks on historical runs pass empty lists and skip this.
+    val conservationViolations: List<String> =
+        if (inventoryEffectiveInitial.isNotEmpty() && inventoryLeftover.isNotEmpty())
+            verifyInventoryConservation(inventoryEffectiveInitial, inventoryLeftover, supplyAllocations)
+        else emptyList()
+
     val soundCount = demandReports.count { it.sound }
-    val overallSound = soundCount == demandReports.size && crossViolations.isEmpty()
+    val overallSound = soundCount == demandReports.size &&
+        crossViolations.isEmpty() &&
+        conservationViolations.isEmpty()
 
     return SoundnessReport(
         overallSound = overallSound,
@@ -396,6 +427,7 @@ fun checkRunSoundness(
         demands = demandReports,
         crossDemandViolations = crossViolations,
         deepCheck = config.deepCheck,
+        conservationViolations = conservationViolations,
     )
 }
 

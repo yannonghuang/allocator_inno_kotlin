@@ -4149,6 +4149,25 @@ private fun legacyCommit(
 // ── Main entry point ───────────────────────────────────────────────────────────
 
 /**
+ * Richer return type for [runPlanning]. Carries the serialisable plan output plus
+ * the two internal inventory snapshots that the soundness checker needs for the
+ * conservation-of-mass check (R7e) but that are too large / too internal to
+ * include in the API response.
+ *
+ * Callers that only need the API payload use [output]. Callers that also run an
+ * inline soundness check thread [inventoryEffectiveInitial] and [inventoryLeftover]
+ * into [checkRunSoundness].
+ */
+data class RunPlanningResult(
+    /** The serialisable plan output (committed_demands, work_orders, pegging, …). */
+    val output: Map<String, Any>,
+    /** Inventory state AFTER supply-split overrides, BEFORE any planning pass. */
+    val inventoryEffectiveInitial: List<Map<String, Any?>>,
+    /** Inventory state AFTER all planning passes (physical supply leftover). */
+    val inventoryLeftover: List<Map<String, Any?>>,
+)
+
+/**
  * Plan all demands. Returns (committedDemands, workOrders, planningPegging).
  * Port of planning_engine.run_planning().
  */
@@ -4156,7 +4175,7 @@ fun runPlanning(
     data: Map<String, List<Map<String, Any?>>>,
     config: Map<String, Any?>? = null,
     progressCallback: ((Map<String, Any?>) -> Unit)? = null,
-): Map<String, Any> {
+): RunPlanningResult {
     val inventory: MutableList<MutableMap<String, Any?>> = (data["supply"] ?: emptyList()).map { s ->
         mutableMapOf(
             "product_id" to (s["product_id"] ?: ""),
@@ -4457,7 +4476,7 @@ fun runPlanning(
         )
     }
 
-    return mapOf(
+    val output: Map<String, Any> = mapOf(
         "committed_demands"      to committedDemands,
         "work_orders"            to adjustedConsolidated,
         // The NATIVE per-demand work orders (pre-consolidation, 1:1 with the pegging nodes), each
@@ -4476,6 +4495,11 @@ fun runPlanning(
         // to wait for contended resources. Zero when the feature flag is
         // off; > 0 when global scheduling actually moved at least one WO.
         "resource_contention_pushed_wos" to resourceContentionPushed,
+    )
+    return RunPlanningResult(
+        output = output,
+        inventoryEffectiveInitial = inventoryEffectiveInitial,
+        inventoryLeftover = inventory.map { it.toMap() },
     )
 }
 
