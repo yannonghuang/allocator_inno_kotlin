@@ -227,6 +227,10 @@ export type WorkOrder = {
   wo_group_id?: string | null;
   /** Within an OR-merged wo_group_id, distinguishes alternatives (0, 1, …). null/undefined for non-OR (single-alt) WOs. */
   method_slot_index?: number | null;
+  /** Native WOs only: the start_time before Pass-2b timing readjustment. Present only when the
+   *  native WO's start was pushed forward to match the consolidated batch; absent (no shift) when
+   *  this demand already had the latest start among the group. */
+  original_start_time?: string | null;
 };
 
 /** Planning pegging tree node: demand (root) -> work_order -> ... -> supply | purchase (leaves).

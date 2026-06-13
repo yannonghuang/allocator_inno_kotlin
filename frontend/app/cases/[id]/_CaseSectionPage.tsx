@@ -6157,6 +6157,44 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           );
                         },
                       },
+                      { key: 'start_time', label: tP('workOrders.columns.startTime'), sortable: true, width: '7%',
+                        render: (r) => {
+                          if (!r.start_time) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                          return <span style={{ fontSize: '0.78rem', color: '#d4d4d8' }}>{r.start_time.slice(0, 10)}</span>;
+                        },
+                      },
+                      { key: '_lead_days', label: tP('workOrders.columns.leadDays'), sortable: true, width: '5%',
+                        sortValue: (r: WoEnrichedRow) => {
+                          if (!r.start_time || !r.end_time) return 0;
+                          return Math.round((new Date(r.end_time).getTime() - new Date(r.start_time).getTime()) / 86400000);
+                        },
+                        render: (r) => {
+                          if (!r.start_time || !r.end_time) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                          const d = Math.round((new Date(r.end_time).getTime() - new Date(r.start_time).getTime()) / 86400000);
+                          return <span style={{ fontSize: '0.78rem', color: '#d4d4d8' }}>{d > 0 ? d : '–'}</span>;
+                        },
+                      },
+                      ...(woTableTab === 'native' ? [{
+                        key: '_delta_start',
+                        label: tP('workOrders.columns.deltaStart'),
+                        sortable: true,
+                        width: '5%' as const,
+                        sortValue: (r: WoEnrichedRow) => {
+                          if (!r.original_start_time || !r.start_time) return 0;
+                          return Math.round((new Date(r.start_time).getTime() - new Date(r.original_start_time).getTime()) / 86400000);
+                        },
+                        render: (r: WoEnrichedRow) => {
+                          if (!r.original_start_time || !r.start_time)
+                            return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                          const d = Math.round((new Date(r.start_time).getTime() - new Date(r.original_start_time).getTime()) / 86400000);
+                          if (d === 0) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                          return (
+                            <span style={{ fontSize: '0.78rem', fontWeight: 600, color: d > 0 ? '#f59e0b' : '#34d399' }}
+                              title={`Natural start: ${r.original_start_time.slice(0, 10)} → pushed ${d > 0 ? '+' : ''}${d}d by consolidation`}
+                            >{d > 0 ? `+${d}d` : `${d}d`}</span>
+                          );
+                        },
+                      }] : []),
                       { key: 'method', label: tP('workOrders.columns.method'), sortable: true, render: (r) => {
                         const isConsolidatedView = woTableTab === 'consolidated' || r.consolidated;
                         const c = methodColor(r.method, isConsolidatedView);
@@ -6165,7 +6203,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           ? <span style={{ color: c, background: `${c}22`, border: `1px solid ${c}66`, borderRadius: 4, padding: '0 6px', fontWeight: 600 }}>{label}</span>
                           : <span style={{ color: c }}>{label}</span>;
                       } },
-                      { key: '_demand_label', label: tP('workOrders.columns.demand'), sortable: true, render: (r) => {
+                      { key: '_demand_label', label: tP('workOrders.columns.demand'), sortable: true, width: '9%', render: (r) => {
                         const ids = r._demand_ids ?? [];
                         const label = r._demand_label;
                         if (!label) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;

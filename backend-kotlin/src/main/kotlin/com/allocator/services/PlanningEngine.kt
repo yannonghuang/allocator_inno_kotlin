@@ -4432,7 +4432,8 @@ fun runPlanning(
         val cgid = n["consolidated_group_id"] as? String ?: return@map n
         val (newStart, newEnd) = adjustedTimingByCgid[cgid] ?: return@map n
         if (newStart == n["start_time"] && newEnd == n["end_time"]) n
-        else n + mapOf("start_time" to newStart, "end_time" to newEnd)
+        else n + mapOf("start_time" to newStart, "end_time" to newEnd,
+                       "original_start_time" to n["start_time"])
     }
 
     return mapOf(
