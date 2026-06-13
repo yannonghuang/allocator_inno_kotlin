@@ -1238,6 +1238,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // remembers the supExplain row for the back link in the planPegging slide-in. Cleared
   // whenever the planPegging slide-in is closed via any path (Close button or new context).
   const [previousSupExplainRow, setPreviousSupExplainRow] = useState<PlanSupplyViewRow | null>(null);
+  const [previousWoExplainRow, setPreviousWoExplainRow] = useState<WorkOrder | null>(null);
   const [planWorkOrderPeggingLoading, setPlanWorkOrderPeggingLoading] = useState<string | null>(null);
   const [planWorkOrderPeggingError, setPlanWorkOrderPeggingError] = useState<string | null>(null);
   const planPeggingResizeRef = useRef<{ startX: number; startW: number } | null>(null);
@@ -1266,7 +1267,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planSupplyPartialOnly, setPlanSupplyPartialOnly] = useState(false);
   const [planSupplyHideDummy, setPlanSupplyHideDummy] = useState(true);
   const [planWorkOrderHideDummyProdArea, setPlanWorkOrderHideDummyProdArea] = useState(true);
-  const [planWoConsolidatedOnly, setPlanWoConsolidatedOnly] = useState(false);
   // Which WO list the table shows: the consolidated procurement view, or the native per-demand
   // view (1:1 with the pegging). Kept as separate tables so aggregates never double-count.
   const [woTableTab, setWoTableTab] = useState<'consolidated' | 'native'>('consolidated');
@@ -1275,6 +1275,44 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       ? (planResult?.work_orders_native ?? planResult?.work_orders ?? [])
       : (planResult?.work_orders ?? []),
     [planResult, woTableTab]);
+
+  // Effective WO badge counts: phantom-filtered + lot-grouped, so badge = shown + VirtualProduct_*-hidden.
+  const woTabEffectiveCounts = useMemo(() => {
+    const backedSigs = new Set<string>();
+    const collectBacked = (node: PlanningPeggingNode): void => {
+      if (node.type === 'work_order') {
+        if (collectAllSupplyLeaves(node).length > 0)
+          backedSigs.add(`${node.product_id ?? ''}|${node.location_id ?? ''}|${(node.method ?? '').toLowerCase()}`);
+        (node.children ?? []).forEach(collectBacked);
+      } else {
+        (node.children ?? []).forEach(collectBacked);
+      }
+    };
+    for (const entry of planResult?.planning_pegging ?? []) collectBacked(entry.tree);
+
+    const effectiveCount = (wos: WorkOrder[]): number => {
+      // Mirror the table's filter order: VirtualProduct_* rows are removed first (before
+      // phantom filter), so they are always counted as "hidden" — not phantom-filtered.
+      const virtualCount = wos.filter((r) => (r.product_id ?? '').trim().startsWith('VirtualProduct_')).length;
+      const nonVirtual = wos.filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'));
+      const afterPhantom = nonVirtual.filter((r) => {
+        const m = (r.method ?? '').toLowerCase();
+        return m === 'make' || backedSigs.has(`${r.product_id ?? ''}|${r.location_id ?? ''}|${m}`);
+      });
+      const keys = new Set(afterPhantom.map((r) => [
+        String(r.demand_id ?? ''), String(r.product_id ?? ''), String(r.location_id ?? ''),
+        String(r.method ?? ''), String(r.location_source ?? ''), String(r.prod_area ?? ''),
+        r.consolidated ? String(r.wo_group_id ?? '') : '',
+      ].join('|')));
+      // badge = shown (unique non-virtual groups) + hidden (all virtual rows)
+      return keys.size + virtualCount;
+    };
+
+    return {
+      consolidated: effectiveCount(planResult?.work_orders ?? []),
+      native: effectiveCount(planResult?.work_orders_native ?? planResult?.work_orders ?? []),
+    };
+  }, [planResult]);
   // ── Assessment state ────────────────────────────────────────────────────────
   const [assessCriteria, setAssessCriteria] = useState('');
   const [assessCriteriaHigh, setAssessCriteriaHigh] = useState('');
@@ -5588,8 +5626,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                   className="secondary"
                                   style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
                                   onClick={() => {
-                                    if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); }
-                                    else { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); }
+                                    if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); }
+                                    else { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); }
                                   }}
                                 >{tc('show')}</button>
                               );
@@ -5603,7 +5641,34 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               )}
               {planResultTab === 'work_orders' && (
                 <div style={{ padding: '0.75rem 1rem' }}>
-                  <h4 style={{ marginTop: 0, marginBottom: '0.5rem' }}>{tP('workOrders.heading')}</h4>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '0.75rem' }}>
+                    <h4 style={{ margin: 0 }}>{tP('workOrders.heading')}</h4>
+                    {/* ── Native vs Consolidated segment control ── */}
+                    <div style={{ display: 'flex', border: '1px solid #3f3f46', borderRadius: 6, overflow: 'hidden' }}>
+                      {(['consolidated', 'native'] as const).map((tab) => (
+                        <button
+                          key={tab}
+                          type="button"
+                          onClick={() => setWoTableTab(tab)}
+                          style={{
+                            fontSize: '0.82rem',
+                            padding: '4px 14px',
+                            borderRadius: 0,
+                            border: 'none',
+                            background: woTableTab === tab ? '#3f3f46' : 'transparent',
+                            color: woTableTab === tab ? '#f4f4f5' : '#a1a1aa',
+                            fontWeight: woTableTab === tab ? 600 : 400,
+                            cursor: 'pointer',
+                          }}
+                        >
+                          {tP(tab === 'consolidated' ? 'workOrders.tabConsolidated' : 'workOrders.tabNative')}
+                          <span style={{ marginLeft: 6, opacity: 0.65, fontSize: '0.72rem' }}>
+                            {tab === 'consolidated' ? woTabEffectiveCounts.consolidated : woTabEffectiveCounts.native}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                   <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.25rem' }}>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
@@ -5715,24 +5780,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       </datalist>
                     </label>
                   </div>
-                  {/* ── Native vs Consolidated tabs (separate tables — combining would double-count) ── */}
-                  <div style={{ display: 'flex', gap: '0.4rem', marginTop: '0.35rem', marginBottom: '0.35rem' }}>
-                    {(['consolidated', 'native'] as const).map((tab) => (
-                      <button
-                        key={tab}
-                        type="button"
-                        className={woTableTab === tab ? '' : 'secondary'}
-                        style={{ fontSize: '0.78rem', padding: '3px 12px' }}
-                        onClick={() => setWoTableTab(tab)}
-                      >
-                        {tP(tab === 'consolidated' ? 'workOrders.tabConsolidated' : 'workOrders.tabNative')}
-                        <span style={{ marginLeft: 6, opacity: 0.65, fontSize: '0.7rem' }}>
-                          {tab === 'consolidated' ? (planResult.work_orders?.length ?? 0) : (planResult.work_orders_native?.length ?? planResult.work_orders?.length ?? 0)}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                  <div style={{ marginTop: '0.2rem', marginBottom: '0.4rem', display: 'flex', gap: '1.1rem', flexWrap: 'wrap' }}>
+                  <div style={{ marginTop: '0.2rem', marginBottom: '0.4rem' }}>
                     <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.72rem', color: '#71717a', cursor: 'pointer' }}>
                       <input
                         type="checkbox"
@@ -5742,17 +5790,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       />
                       <span>{tP('workOrders.hideDummy')}</span>
                     </label>
-                    {woTableTab === 'consolidated' && (
-                      <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.72rem', color: '#71717a', cursor: 'pointer' }}>
-                        <input
-                          type="checkbox"
-                          checked={planWoConsolidatedOnly}
-                          onChange={(e) => setPlanWoConsolidatedOnly(e.target.checked)}
-                          style={{ accentColor: '#71717a' }}
-                        />
-                        <span>{tP('workOrders.consolidatedOnly')}</span>
-                      </label>
-                    )}
                   </div>
                   {/* ── Pivot selector ── */}
                   <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
@@ -5983,7 +6020,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       // A cross-demand batched WO (consolidated=true) committed exactly its
                       // batched quantity for its demands, so Requested = Committed (r.quantity) —
                       // same treatment as a shared/split WO; avoids a per-context peggedQty mismatch.
-                      const isSharedConsolidated = (r.wo_consolidation_split_details?.length ?? 0) > 1 || r.consolidated === true;
+                      // In the consolidated tab every row is a consolidated WO (singleton or multi-demand)
+                      // so treat them all identically: use r.quantity as Requested, skip peggedQty / demandRequestedMap.
+                      const isSharedConsolidated = woTableTab === 'consolidated' || (r.wo_consolidation_split_details?.length ?? 0) > 1 || r.consolidated === true;
                       const woKeyFull = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
                       const woKeyConsolidated = `|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
                       const peggedQty = woPeggedQtyMap.get(woKeyFull) ?? woPeggedQtyMap.get(woKeyConsolidated) ?? null;
@@ -6026,9 +6065,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     let woRows: WoEnrichedRow[] = planDemandShortOnly
                       ? woRowsAll.filter((r) => (r._shortage ?? 0) > 0.01)
                       : woRowsAll;
-                    if (planWoConsolidatedOnly && woTableTab === 'consolidated') {
-                      woRows = woRows.filter((r) => r.consolidated === true);
-                    }
                     if (woPegHighlightRow && woPegFilterPeggedOnly) {
                       // Same classifier the toolbar uses for the ↓/↑ counts —
                       // they cannot disagree.
@@ -6122,11 +6158,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         },
                       },
                       { key: 'method', label: tP('workOrders.columns.method'), sortable: true, render: (r) => {
-                        const c = methodColor(r.method, r.consolidated);
+                        const isConsolidatedView = woTableTab === 'consolidated' || r.consolidated;
+                        const c = methodColor(r.method, isConsolidatedView);
                         const label = r.method ?? '–';
-                        // Consolidated WOs render as a filled badge in the method's lighter shade;
-                        // singletons as plain colored text — so consolidation reads at a glance.
-                        return r.consolidated
+                        return isConsolidatedView
                           ? <span style={{ color: c, background: `${c}22`, border: `1px solid ${c}66`, borderRadius: 4, padding: '0 6px', fontWeight: 600 }}>{label}</span>
                           : <span style={{ color: c }}>{label}</span>;
                       } },
@@ -6161,8 +6196,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
                             onClick={(e) => {
                               e.stopPropagation();
-                              if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setWoPegHighlightRow(null); }
-                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setWoPegHighlightRow(r); }
+                              if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setWoPegHighlightRow(null); }
+                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setWoPegHighlightRow(r); }
                             }}
                           >{tc('show')}</button>
                         );
@@ -9059,12 +9094,33 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   For consolidated WOs the existing Consolidation split section already breaks
                   it down, so we only show this for single-demand WOs. */}
               {woExplainRow.demand_id && !(woExplainRow.wo_consolidation_split_details && woExplainRow.wo_consolidation_split_details.length > 1) && (() => {
-                const customer = (planResult?.committed_demands ?? []).find(d => d.demand_id === woExplainRow.demand_id)?.customer ?? null;
+                const demandId = woExplainRow.demand_id;
+                const demandRow = (planResult?.committed_demands ?? []).find(d => d.demand_id === demandId) ?? null;
+                const customer = demandRow?.customer ?? null;
+                const demandKey = `demand|${demandId ?? ''}|${demandRow?.product_id ?? ''}|${demandRow?.location_id ?? ''}`;
                 return (
                   <section style={{ marginBottom: '1.25rem' }}>
                     <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('woExplain.peggedDemand')}</h4>
                     <p style={{ margin: 0, fontSize: '0.875rem', lineHeight: 1.6 }}>
-                      {tP('woExplain.producesForDemand')} <strong>{woExplainRow.demand_id}</strong>
+                      {tP('woExplain.producesForDemand')}{' '}
+                      {demandRow ? (
+                        <button
+                          type="button"
+                          style={{ background: 'none', border: 'none', padding: 0, color: '#60a5fa', cursor: 'pointer', fontWeight: 700, fontSize: 'inherit', textDecoration: 'underline' }}
+                          title={tP('supExplain.openDemandPegging')}
+                          onClick={() => {
+                            setPreviousWoExplainRow(woExplainRow);
+                            setPlanPeggingContext({ type: 'demand', row: demandRow });
+                            setPlanPeggingOpen(true);
+                            setWoPeggingRowKey(demandKey);
+                            setWoExplainOpen(false);
+                            setWoExplainKey(null);
+                            setWoExplainRow(null);
+                          }}
+                        ><strong>{demandId}</strong></button>
+                      ) : (
+                        <strong>{demandId}</strong>
+                      )}
                       {customer && <> · {tP('woExplain.customerLabel')} <strong style={{ color: '#a1a1aa' }}>{customer}</strong></>}
                       {woExplainRow.quantity != null && <> · {tP('woExplain.qtyLabel')} <strong>{qtyFmt(Number(woExplainRow.quantity))}</strong></>}
                     </p>
@@ -9745,7 +9801,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         >
           <div
             style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 0, pointerEvents: 'auto' }}
-            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); }}
+            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); }}
             aria-hidden
           />
           <div
@@ -9848,9 +9904,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <button
                   type="button"
                   onClick={() => {
-                    // Restore the Breakdown slide-in for the supply we came from,
-                    // close the planPegging slide-in. This is the inverse of the
-                    // demand-id click in supExplain.
                     setSupExplainRow(previousSupExplainRow);
                     setSupExplainKey(`supply|${previousSupExplainRow.supplyId}`);
                     setSupExplainOpen(true);
@@ -9858,10 +9911,30 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     setPlanPeggingContext(null);
                     setWoPeggingRowKey(null);
                     setPreviousSupExplainRow(null);
+                    setPreviousWoExplainRow(null);
                   }}
                   style={{ background: 'none', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '0.78rem', padding: 0, display: 'flex', alignItems: 'center', gap: '0.3rem' }}
                 >
                   ← {previousSupExplainRow.supplyId}
+                </button>
+              </div>
+            )}
+            {previousWoExplainRow && (
+              <div style={{ marginBottom: '0.5rem' }}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setWoExplainRow(previousWoExplainRow);
+                    setWoExplainKey(`wo|${previousWoExplainRow.product_id ?? ''}|${previousWoExplainRow.location_id ?? ''}`);
+                    setWoExplainOpen(true);
+                    setPlanPeggingOpen(false);
+                    setPlanPeggingContext(null);
+                    setWoPeggingRowKey(null);
+                    setPreviousWoExplainRow(null);
+                  }}
+                  style={{ background: 'none', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '0.78rem', padding: 0, display: 'flex', alignItems: 'center', gap: '0.3rem' }}
+                >
+                  ← {previousWoExplainRow.product_id} @ {previousWoExplainRow.location_id}
                 </button>
               </div>
             )}
@@ -9873,7 +9946,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     ? tP('peggingPanel.titleDemand', { label: planPeggingContext.row.demand_id ?? planPeggingContext.row.product_id ?? '' })
                     : tP('peggingPanel.titleWorkOrder', { product: planPeggingContext.row.product_id ?? '', location: planPeggingContext.row.location_id ?? '' })}
               </h3>
-              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tc('close')}</button>
+              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tc('close')}</button>
             </div>
             <p style={{ margin: 0, marginBottom: '0.5rem', fontSize: '0.8rem', color: '#71717a' }}>
               {planPeggingContext.type === 'supply'
