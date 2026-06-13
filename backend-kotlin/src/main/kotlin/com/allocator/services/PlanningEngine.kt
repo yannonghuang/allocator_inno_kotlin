@@ -4209,6 +4209,9 @@ fun runPlanning(
             }
         }
     }
+    // Conservation baseline: after supply-split overrides so that demand-tagged sub-buckets
+    // (Σcaps ≤ original_qty) are the reference, not the raw input buckets.
+    val inventoryEffectiveInitial: List<Map<String, Any?>> = inventory.map { it.toMap() }
 
     // ── Phase 1 (resolve) + Phase 2 (consolidate) ────────────────────────────
     val consolidationConfig = parseConsolidationConfig(config)
@@ -4256,6 +4259,7 @@ fun runPlanning(
     val suppliesForCap = data["supply"] ?: emptyList()
     val supplyAllocations = extractSupplyAllocations(allPegging, suppliesForCap)
     val supplyCapViolations = verifySupplyCap(suppliesForCap, supplyAllocations)
+    val conservationViolations = verifyInventoryConservation(inventoryEffectiveInitial, inventory, supplyAllocations)
 
     // Supply-split override soft-warn: any demand in an override that commits short
     // of its request is flagged as potentially impacted by the override.
@@ -4456,6 +4460,7 @@ fun runPlanning(
         "planning_pegging"       to adjustedTrees,
         "supply_allocations"     to supplyAllocations,
         "supply_cap_violations"  to supplyCapViolations,
+        "conservation_violations" to conservationViolations,
         "override_warnings"      to overrideWarnings,
         "supply_level_allocations" to supplyLevelAllocations,
         // Number of WO groups whose start was pushed by ResourceScheduler
@@ -4495,6 +4500,69 @@ internal fun verifySupplyCap(
             val msg = "supply_id %s: pegged %.4f > available %.4f".format(sid, consumed, initial)
             violations.add(msg)
             log.warn("supply cap violation — {}", msg)
+        }
+    }
+    return violations
+}
+
+/**
+ * Conservation-of-mass check: for every physical supply bucket,
+ *   initial_qty == leftover_qty + pegged_qty
+ * Synthetic buckets (supply_id starts with "consolidated_") are excluded — they
+ * have no physical cap and are zero-sum within each planning pass by construction.
+ *
+ * A non-empty result indicates a ghost depletion or phantom allocation bug:
+ * inventory was consumed without a matching pegging tree entry, or vice-versa.
+ *
+ * @param effectiveInitial  Snapshot of inventory AFTER supply-split overrides, BEFORE planning.
+ * @param postPlanningInventory  Inventory state AFTER all planning passes.
+ * @param supplyAllocations  Output of [extractSupplyAllocations] — pegged qty per supply_id.
+ */
+internal fun verifyInventoryConservation(
+    effectiveInitial: List<Map<String, Any?>>,
+    postPlanningInventory: List<Map<String, Any?>>,
+    supplyAllocations: List<Map<String, Any?>>,
+    tolerance: Double = 1e-6,
+): List<String> {
+    val initialBySupply = mutableMapOf<String, Double>()
+    for (s in effectiveInitial) {
+        val sid = s["supply_id"] as? String ?: continue
+        if (sid.startsWith("consolidated_")) continue
+        val qty = (s["qty"] as? Number)?.toDouble() ?: 0.0
+        initialBySupply[sid] = (initialBySupply[sid] ?: 0.0) + qty
+    }
+    val leftoverBySupply = mutableMapOf<String, Double>()
+    for (s in postPlanningInventory) {
+        val sid = s["supply_id"] as? String ?: continue
+        if (sid.startsWith("consolidated_")) continue
+        val qty = (s["qty"] as? Number)?.toDouble() ?: 0.0
+        leftoverBySupply[sid] = (leftoverBySupply[sid] ?: 0.0) + qty
+    }
+    val peggedBySupply = mutableMapOf<String, Double>()
+    for (a in supplyAllocations) {
+        val sid = a["supply_id"] as? String ?: continue
+        if (sid.startsWith("consolidated_")) continue
+        val qty = (a["qty_consumed"] as? Number)?.toDouble() ?: 0.0
+        peggedBySupply[sid] = (peggedBySupply[sid] ?: 0.0) + qty
+    }
+    val violations = mutableListOf<String>()
+    for ((sid, initial) in initialBySupply) {
+        val leftover = leftoverBySupply[sid] ?: 0.0
+        val pegged   = peggedBySupply[sid] ?: 0.0
+        val discrepancy = kotlin.math.abs(initial - leftover - pegged)
+        if (discrepancy > maxOf(tolerance, 1e-9 * initial)) {
+            val msg = "supply_id %s: initial %.4f ≠ leftover %.4f + pegged %.4f (Δ=%.6f)".format(
+                sid, initial, leftover, pegged, discrepancy)
+            violations.add(msg)
+            log.warn("inventory conservation violation — {}", msg)
+        }
+    }
+    // Orphaned leftover: physical supply present post-planning but not in effective initial.
+    for ((sid, leftover) in leftoverBySupply) {
+        if (sid !in initialBySupply && leftover > tolerance) {
+            val msg = "supply_id %s: orphaned leftover %.4f (absent from effective initial)".format(sid, leftover)
+            violations.add(msg)
+            log.warn("inventory conservation violation — {}", msg)
         }
     }
     return violations
