@@ -578,7 +578,9 @@
         "timelineTooltip": "Hide data columns; show Schedule full width"
       },
       "overrideMethod": "Method",
-      "overrideSplit": "Split"
+      "overrideSplit": "Split",
+      "nComponents": "{n} components",
+      "consolidatedOnly": "Consolidated only"
     },
     "woScheduleImpact": {
       "title": "WO Schedule Impact",

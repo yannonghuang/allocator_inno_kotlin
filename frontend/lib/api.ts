@@ -196,6 +196,8 @@ export type WorkOrder = {
   consolidated_demand_ids?: string[];
   /** True on a cross-demand batched work order. */
   consolidated?: boolean;
+  /** On a mixed-product MOVE shipment (product_id=null): the per-component cargo manifest. */
+  move_components?: { product_id: string; quantity: number; demand_ids?: string[] }[];
   /** On a batched WO: the original start-window of its constituents (for precise pegging trace). */
   wo_window_start?: string | null;
   wo_window_end?: string | null;

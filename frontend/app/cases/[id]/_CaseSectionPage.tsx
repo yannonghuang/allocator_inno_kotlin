@@ -97,7 +97,7 @@ import {
   type BootstrapJobStatus,
   type BootstrapCriterion,
 } from '@/lib/api';
-import { computeHorizon, ScheduleBar, ScheduleHorizonRuler } from './_workOrderSchedule';
+import { computeHorizon, ScheduleBar, ScheduleHorizonRuler, methodColor } from './_workOrderSchedule';
 import { WoScheduleImpactPanel, WoScheduleQuickModal } from './_woScheduleImpact';
 import type { PlanResult } from '../../../lib/api';
 
@@ -1265,6 +1265,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planSupplyPartialOnly, setPlanSupplyPartialOnly] = useState(false);
   const [planSupplyHideDummy, setPlanSupplyHideDummy] = useState(true);
   const [planWorkOrderHideDummyProdArea, setPlanWorkOrderHideDummyProdArea] = useState(true);
+  const [planWoConsolidatedOnly, setPlanWoConsolidatedOnly] = useState(false);
   // ── Assessment state ────────────────────────────────────────────────────────
   const [assessCriteria, setAssessCriteria] = useState('');
   const [assessCriteriaHigh, setAssessCriteriaHigh] = useState('');
@@ -5705,7 +5706,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       </datalist>
                     </label>
                   </div>
-                  <div style={{ marginTop: '0.2rem', marginBottom: '0.4rem' }}>
+                  <div style={{ marginTop: '0.2rem', marginBottom: '0.4rem', display: 'flex', gap: '1.1rem', flexWrap: 'wrap' }}>
                     <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.72rem', color: '#71717a', cursor: 'pointer' }}>
                       <input
                         type="checkbox"
@@ -5714,6 +5715,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         style={{ accentColor: '#71717a' }}
                       />
                       <span>{tP('workOrders.hideDummy')}</span>
+                    </label>
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.72rem', color: '#71717a', cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={planWoConsolidatedOnly}
+                        onChange={(e) => setPlanWoConsolidatedOnly(e.target.checked)}
+                        style={{ accentColor: '#71717a' }}
+                      />
+                      <span>{tP('workOrders.consolidatedOnly')}</span>
                     </label>
                   </div>
                   {/* ── Pivot selector ── */}
@@ -5985,6 +5995,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     let woRows: WoEnrichedRow[] = planDemandShortOnly
                       ? woRowsAll.filter((r) => (r._shortage ?? 0) > 0.01)
                       : woRowsAll;
+                    if (planWoConsolidatedOnly) {
+                      woRows = woRows.filter((r) => r.consolidated === true);
+                    }
                     if (woPegHighlightRow && woPegFilterPeggedOnly) {
                       // Same classifier the toolbar uses for the ↓/↑ counts —
                       // they cannot disagree.
@@ -6001,7 +6014,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       headerRender?: () => React.ReactNode;
                       sortValue?: (r: WoEnrichedRow, dir: 'asc' | 'desc') => unknown;
                     }[] = [
-                      { key: 'product_id', label: tP('workOrders.columns.product'), sortable: true },
+                      { key: 'product_id', label: tP('workOrders.columns.product'), sortable: true, render: (r) => {
+                        // Mixed-product MOVE (one shipment carrying different components) has no single
+                        // product_id — show its move_components manifest count, with the list on hover.
+                        if (r.product_id) return r.product_id;
+                        const comps = r.move_components ?? [];
+                        if (comps.length > 0) {
+                          const list = comps.map((c) => `${c.product_id} · ${qtyFmt(Number(c.quantity ?? 0))}`).join('\n');
+                          return <span title={list} style={{ fontStyle: 'italic', color: '#a1a1aa' }}>{tP('workOrders.nComponents', { n: comps.length })}</span>;
+                        }
+                        return '–';
+                      } },
                       { key: 'location_id', label: tP('workOrders.columns.location'), sortable: true },
                       { key: '_prod_area', label: tP('workOrders.columns.prodArea'), sortable: true, render: (r) => r._prod_area || r.prod_area || '–' },
                       { key: '_requested_qty', label: tP('workOrders.columns.requested'), sortable: true, render: (r) =>
@@ -6060,12 +6083,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               locale={locale}
                               selected={isSelf}
                               colorOverride={colorOverride}
+                              consolidated={r.consolidated}
                               onClick={() => setWoPegHighlightRow(isSelf ? null : r)}
                             />
                           );
                         },
                       },
-                      { key: 'method', label: tP('workOrders.columns.method'), sortable: true, render: (r) => r.method ?? '–' },
+                      { key: 'method', label: tP('workOrders.columns.method'), sortable: true, render: (r) => {
+                        const c = methodColor(r.method, r.consolidated);
+                        const label = r.method ?? '–';
+                        // Consolidated WOs render as a filled badge in the method's lighter shade;
+                        // singletons as plain colored text — so consolidation reads at a glance.
+                        return r.consolidated
+                          ? <span style={{ color: c, background: `${c}22`, border: `1px solid ${c}66`, borderRadius: 4, padding: '0 6px', fontWeight: 600 }}>{label}</span>
+                          : <span style={{ color: c }}>{label}</span>;
+                      } },
                       { key: '_demand_label', label: tP('workOrders.columns.demand'), sortable: true, render: (r) => {
                         const ids = r._demand_ids ?? [];
                         const label = r._demand_label;

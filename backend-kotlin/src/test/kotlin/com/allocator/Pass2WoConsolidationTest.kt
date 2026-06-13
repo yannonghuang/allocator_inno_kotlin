@@ -54,17 +54,34 @@ class Pass2WoConsolidationTest : FunSpec({
         consolidateWorkOrdersByTiming(wos, data, windowDays = 30).size shouldBe 2
     }
 
-    test("moves are NOT consolidated — each passes through, per-demand, qty preserved") {
-        // A move only models reachability at Pass 2, so it must never be product-batched
-        // (real physical-move consolidation by source/target/bucket across products is future work).
+    test("moves consolidate by (source,target,window) — DIFFERENT components share one shipment") {
+        // A physical move from S→T in a window is one shipment that can carry mixed cargo, so
+        // moves are keyed WITHOUT product. The merged WO has product_id=null + a move_components
+        // manifest. (Per-product move nodes stay in each demand's pegging, untouched.)
         val wos = listOf(
-            wo("RAW1", "L", "move", 200.0, "2024-05-01", "2024-05-03", "D1", source = "S"),
-            wo("RAW1", "L", "move", 300.0, "2024-05-02", "2024-05-04", "D2", source = "S"),
+            wo("RAW1", "T", "move", 200.0, "2024-05-01", "2024-05-03", "D1", source = "S"),
+            wo("RAW2", "T", "move", 300.0, "2024-05-02", "2024-05-04", "D2", source = "S"),
         )
         val out = consolidateWorkOrdersByTiming(wos, data, windowDays = 30)
-        out.size shouldBe 2
-        out.all { it["method"] == "move" && it["consolidated"] != true && it["demand_id"] != null } shouldBe true
-        out.sumOf { qtyOf(it) } shouldBe (500.0 plusOrMinus 1e-6)
+        out.size shouldBe 1
+        val m = out[0]
+        m["method"] shouldBe "move"
+        m["product_id"] shouldBe null
+        m["location_id"] shouldBe "T"
+        m["location_source"] shouldBe "S"
+        m["consolidated"] shouldBe true
+        qtyOf(m) shouldBe (500.0 plusOrMinus 1e-6)
+        @Suppress("UNCHECKED_CAST")
+        val comps = m["move_components"] as List<Map<String, Any?>>
+        comps.map { it["product_id"] as String } shouldContainExactlyInAnyOrder listOf("RAW1", "RAW2")
+    }
+
+    test("moves with DIFFERENT (source,target) are NOT merged") {
+        val wos = listOf(
+            wo("RAW1", "T", "move", 100.0, "2024-05-01", "2024-05-03", "D1", source = "S1"),
+            wo("RAW1", "T", "move", 100.0, "2024-05-01", "2024-05-03", "D2", source = "S2"),
+        )
+        consolidateWorkOrdersByTiming(wos, data, windowDays = 30).size shouldBe 2
     }
 
     test("same product in DIFFERENT windows are NOT merged") {
