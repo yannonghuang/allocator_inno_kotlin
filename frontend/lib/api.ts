@@ -227,10 +227,14 @@ export type WorkOrder = {
   wo_group_id?: string | null;
   /** Within an OR-merged wo_group_id, distinguishes alternatives (0, 1, …). null/undefined for non-OR (single-alt) WOs. */
   method_slot_index?: number | null;
-  /** Native WOs only: the start_time before Pass-2b timing readjustment. Present only when the
-   *  native WO's start was pushed forward to match the consolidated batch; absent (no shift) when
-   *  this demand already had the latest start among the group. */
+  /** Native WOs only: per-demand natural start before Pass-2b consolidated batch timing was
+   *  applied. Always present for any WO that belongs to a consolidated group. Equal to start_time
+   *  for the "bottleneck" demand (whose natural start drove the batch forward). */
   original_start_time?: string | null;
+  /** Native WOs only: per-demand natural lead in calendar days (original_end − original_start)
+   *  before consolidation merged the group into a shared batch window. Always present alongside
+   *  original_start_time. The consolidated batch lead = end_time − start_time. */
+  original_lead_days?: number | null;
 };
 
 /** Planning pegging tree node: demand (root) -> work_order -> ... -> supply | purchase (leaves).

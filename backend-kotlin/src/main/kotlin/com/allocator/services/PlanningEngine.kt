@@ -4424,6 +4424,8 @@ fun runPlanning(
     else ReadjustResult(reconciledTrees, consolidation.consolidated)
 
     // Patch native WO timings to match the adjusted consolidated WO for each group.
+    // Preserve original per-demand start and lead before overwriting with consolidated timing so
+    // the frontend can show per-demand vs. batch-timing deltas.
     val adjustedTimingByCgid = adjustedConsolidated.associate { c ->
         (c["consolidated_group_id"] as? String ?: "") to
         Pair(c["start_time"] as? String, c["end_time"] as? String)
@@ -4431,9 +4433,15 @@ fun runPlanning(
     val adjustedNative = consolidation.native.map { n ->
         val cgid = n["consolidated_group_id"] as? String ?: return@map n
         val (newStart, newEnd) = adjustedTimingByCgid[cgid] ?: return@map n
-        if (newStart == n["start_time"] && newEnd == n["end_time"]) n
-        else n + mapOf("start_time" to newStart, "end_time" to newEnd,
-                       "original_start_time" to n["start_time"])
+        val origStart = n["start_time"] as? String
+        val origEnd   = n["end_time"]   as? String
+        val origLeadDays = parseDate(origStart)?.let { s -> parseDate(origEnd)?.let { e -> e.toEpochDay() - s.toEpochDay() } }
+        n + mapOf(
+            "start_time"         to newStart,
+            "end_time"           to newEnd,
+            "original_start_time" to origStart,
+            "original_lead_days"  to origLeadDays,
+        )
     }
 
     return mapOf(

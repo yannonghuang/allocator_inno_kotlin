@@ -1053,12 +1053,14 @@ function buildWoMaps(pegging: PlanningPeggingEntry[]): {
     if (node.type === 'work_order' && (node.method ?? '').toLowerCase() === 'make' && (Number(node.quantity) || 0) < 1e-6) return;
     if (node.type === 'work_order') {
       const key = `${demandId ?? ''}|${node.product_id ?? ''}|${node.location_id ?? ''}|${node.method ?? ''}`;
-      // Accumulate the direct parent demand's quantity for this WO key. The WO table groups
-      // node-level WOs by this key and SUMS their committed quantity, so Requested must sum the
-      // per-context requirements too — otherwise a component used by N sub-assemblies shows
-      // Requested = one context but Committed = all N (the "Committed > Requested" artifact).
-      if (parentDemand?.type === 'demand' && parentDemand.quantity != null) {
-        peggedQtyMap.set(key, (peggedQtyMap.get(key) ?? 0) + parentDemand.quantity);
+      // Accumulate this WO's own committed quantity for the key. node.quantity is the WO's
+      // specific allocation in this pegging context — it's already net of any OR-split inventory
+      // contribution. Using parentDemand.quantity here would overstate Requested when the demand
+      // is partially fulfilled by inventory (OR split): the demand qty includes the inventory
+      // share, but Requested should only reflect what this WO actually provides.
+      // For non-OR-split cases node.quantity == parentDemand.quantity, so no regression.
+      if (parentDemand?.type === 'demand' && node.quantity != null) {
+        peggedQtyMap.set(key, (peggedQtyMap.get(key) ?? 0) + node.quantity);
       }
       const isMake = (node.method ?? '').toLowerCase() === 'make';
       if (isMake) {
@@ -2151,9 +2153,20 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (planWorkOrderPeggingLoading === woPeggingKey) return;
     // Consolidated WO: always fetch with demand_id='' so backend searches consolidated trees.
     const demand_id = row.demand_id == null ? '' : String(woPeggingActiveDemandId ?? row.demand_id ?? '').trim();
-    const product_id = String(row.product_id ?? '').trim();
     const location_id = String(row.location_id ?? '').trim();
     const method = String(row.method ?? '').trim();
+    // Consolidated multi-product move WOs have product_id=null; use the first
+    // component's product_id so the backend can locate the per-demand move node.
+    const moveComps = (method === 'move' && !row.product_id) ? (row.move_components ?? []) : [];
+    if (moveComps.length > 1) {
+      // Multiple products in one shipment: no single pegging tree can represent all
+      // of them. Surface a helpful message rather than an opaque error.
+      setPlanWorkOrderPeggingError(
+        `This shipment carries ${moveComps.length} products (${moveComps.map((c) => c.product_id).join(', ')}). Open each demand's pegging individually to trace a specific product.`
+      );
+      return;
+    }
+    const product_id = String(row.product_id ?? moveComps[0]?.product_id ?? '').trim();
     if (!product_id || !location_id || !method) {
       const msg = `Missing work-order params (product_id=${product_id ? 'set' : 'empty'}, location_id=${location_id ? 'set' : 'empty'}, method=${method ? 'set' : 'empty'}).`;
       if (typeof console !== 'undefined' && console.warn) console.warn('[WO pegging]', msg);
@@ -5944,6 +5957,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     workOrderRows = workOrderRows.filter((r) => {
                       const method = (r.method ?? '').toLowerCase();
                       if (method === 'make') return true;
+                      // Consolidated move WOs carry product_id=null (mixed-product shipment).
+                      // Their constituent native moves ARE backed in the pegging tree, but
+                      // the null product_id can never match a per-product signature in
+                      // backedWoSigs — pass them through unconditionally.
+                      if (method === 'move' && r.product_id == null) return true;
                       return backedWoSigs.has(`${r.product_id ?? ''}|${r.location_id ?? ''}|${(r.method ?? '').toLowerCase()}`);
                     });
                     // Aggregate lots with the same logical WO key so the table shows total quantity per work order
@@ -6082,15 +6100,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       sortValue?: (r: WoEnrichedRow, dir: 'asc' | 'desc') => unknown;
                     }[] = [
                       { key: 'product_id', label: tP('workOrders.columns.product'), sortable: true, render: (r) => {
-                        // Mixed-product MOVE (one shipment carrying different components) has no single
-                        // product_id — show its move_components manifest count, with the list on hover.
                         if (r.product_id) return r.product_id;
                         const comps = r.move_components ?? [];
-                        if (comps.length > 0) {
-                          const list = comps.map((c) => `${c.product_id} · ${qtyFmt(Number(c.quantity ?? 0))}`).join('\n');
-                          return <span title={list} style={{ fontStyle: 'italic', color: '#a1a1aa' }}>{tP('workOrders.nComponents', { n: comps.length })}</span>;
-                        }
-                        return '–';
+                        if (comps.length === 0) return '–';
+                        // Single-product consolidated move: show the product name directly.
+                        if (comps.length === 1) return comps[0].product_id;
+                        // Multi-product shipment: show count with hover list.
+                        const list = comps.map((c) => `${c.product_id} · ${qtyFmt(Number(c.quantity ?? 0))}`).join('\n');
+                        return <span title={list} style={{ fontStyle: 'italic', color: '#a1a1aa' }}>{tP('workOrders.nComponents', { n: comps.length })}</span>;
                       } },
                       { key: 'location_id', label: tP('workOrders.columns.location'), sortable: true },
                       { key: '_prod_area', label: tP('workOrders.columns.prodArea'), sortable: true, render: (r) => r._prod_area || r.prod_area || '–' },
@@ -6157,44 +6174,58 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           );
                         },
                       },
-                      { key: 'start_time', label: tP('workOrders.columns.startTime'), sortable: true, width: '7%',
-                        render: (r) => {
-                          if (!r.start_time) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
-                          return <span style={{ fontSize: '0.78rem', color: '#d4d4d8' }}>{r.start_time.slice(0, 10)}</span>;
+                      ...(woTableTab === 'native' ? [
+                        {
+                          key: '_delta_start',
+                          label: tP('workOrders.columns.deltaStart'),
+                          sortable: true,
+                          width: '5%' as const,
+                          sortValue: (r: WoEnrichedRow) => {
+                            if (!r.original_start_time || !r.start_time) return 0;
+                            return Math.round((new Date(r.start_time).getTime() - new Date(r.original_start_time).getTime()) / 86400000);
+                          },
+                          render: (r: WoEnrichedRow) => {
+                            if (!r.original_start_time || !r.start_time)
+                              return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                            const d = Math.round((new Date(r.start_time).getTime() - new Date(r.original_start_time).getTime()) / 86400000);
+                            const tooltip = d !== 0
+                              ? tP('workOrders.columns.deltaStartTooltipShift', { date: r.original_start_time.slice(0, 10), delta: `${d > 0 ? '+' : ''}${d}d` })
+                              : tP('workOrders.columns.deltaStartTooltipNoShift', { date: r.original_start_time.slice(0, 10) });
+                            if (d === 0) return <span style={{ color: '#52525b', fontSize: '0.75rem' }} title={tooltip}>–</span>;
+                            return (
+                              <span style={{ fontSize: '0.78rem', fontWeight: 600, color: d > 0 ? '#f59e0b' : '#34d399' }}
+                                title={tooltip}
+                              >{d > 0 ? `+${d}d` : `${d}d`}</span>
+                            );
+                          },
                         },
-                      },
-                      { key: '_lead_days', label: tP('workOrders.columns.leadDays'), sortable: true, width: '5%',
-                        sortValue: (r: WoEnrichedRow) => {
-                          if (!r.start_time || !r.end_time) return 0;
-                          return Math.round((new Date(r.end_time).getTime() - new Date(r.start_time).getTime()) / 86400000);
+                        {
+                          key: '_delta_lead',
+                          label: tP('workOrders.columns.deltaLead'),
+                          sortable: true,
+                          width: '5%' as const,
+                          sortValue: (r: WoEnrichedRow) => {
+                            if (r.original_lead_days == null || !r.start_time || !r.end_time) return 0;
+                            const consLead = Math.round((new Date(r.end_time).getTime() - new Date(r.start_time).getTime()) / 86400000);
+                            return consLead - r.original_lead_days;
+                          },
+                          render: (r: WoEnrichedRow) => {
+                            if (r.original_lead_days == null || !r.start_time || !r.end_time)
+                              return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                            const consLead = Math.round((new Date(r.end_time).getTime() - new Date(r.start_time).getTime()) / 86400000);
+                            const d = consLead - r.original_lead_days;
+                            const tooltip = d !== 0
+                              ? tP('workOrders.columns.deltaLeadTooltipChange', { orig: String(r.original_lead_days), cons: String(consLead), delta: `${d > 0 ? '+' : ''}${d}d` })
+                              : tP('workOrders.columns.deltaLeadTooltipNoChange', { orig: String(r.original_lead_days), cons: String(consLead) });
+                            if (d === 0) return <span style={{ color: '#52525b', fontSize: '0.75rem' }} title={tooltip}>–</span>;
+                            return (
+                              <span style={{ fontSize: '0.78rem', fontWeight: 600, color: d > 0 ? '#f59e0b' : '#34d399' }}
+                                title={tooltip}
+                              >{d > 0 ? `+${d}d` : `${d}d`}</span>
+                            );
+                          },
                         },
-                        render: (r) => {
-                          if (!r.start_time || !r.end_time) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
-                          const d = Math.round((new Date(r.end_time).getTime() - new Date(r.start_time).getTime()) / 86400000);
-                          return <span style={{ fontSize: '0.78rem', color: '#d4d4d8' }}>{d > 0 ? d : '–'}</span>;
-                        },
-                      },
-                      ...(woTableTab === 'native' ? [{
-                        key: '_delta_start',
-                        label: tP('workOrders.columns.deltaStart'),
-                        sortable: true,
-                        width: '5%' as const,
-                        sortValue: (r: WoEnrichedRow) => {
-                          if (!r.original_start_time || !r.start_time) return 0;
-                          return Math.round((new Date(r.start_time).getTime() - new Date(r.original_start_time).getTime()) / 86400000);
-                        },
-                        render: (r: WoEnrichedRow) => {
-                          if (!r.original_start_time || !r.start_time)
-                            return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
-                          const d = Math.round((new Date(r.start_time).getTime() - new Date(r.original_start_time).getTime()) / 86400000);
-                          if (d === 0) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
-                          return (
-                            <span style={{ fontSize: '0.78rem', fontWeight: 600, color: d > 0 ? '#f59e0b' : '#34d399' }}
-                              title={`Natural start: ${r.original_start_time.slice(0, 10)} → pushed ${d > 0 ? '+' : ''}${d}d by consolidation`}
-                            >{d > 0 ? `+${d}d` : `${d}d`}</span>
-                          );
-                        },
-                      }] : []),
+                      ] : []),
                       { key: 'method', label: tP('workOrders.columns.method'), sortable: true, render: (r) => {
                         const isConsolidatedView = woTableTab === 'consolidated' || r.consolidated;
                         const c = methodColor(r.method, isConsolidatedView);
@@ -6205,14 +6236,34 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       } },
                       { key: '_demand_label', label: tP('workOrders.columns.demand'), sortable: true, width: '9%', render: (r) => {
                         const ids = r._demand_ids ?? [];
-                        const label = r._demand_label;
-                        if (!label) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
-                        if (ids.length <= 1) return <span>{label}</span>;
-                        const preview = ids.length <= 3 ? label : `${ids.slice(0, 2).join(', ')} +${ids.length - 2} more`;
+                        if (!ids.length) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                        const openDemandPegging = (did: string, e: React.MouseEvent) => {
+                          e.stopPropagation();
+                          const demandRow = planResult.committed_demands.find((d) => d.demand_id === did) ?? null;
+                          if (!demandRow) return;
+                          const demandKey = `demand|${did}|${demandRow.product_id ?? ''}|${demandRow.location_id ?? ''}`;
+                          setPreviousWoExplainRow(null);
+                          setPlanPeggingContext({ type: 'demand', row: demandRow });
+                          setPlanPeggingOpen(true);
+                          setWoPeggingRowKey(demandKey);
+                          setWoPegHighlightRow(r);
+                        };
+                        const linkStyle: React.CSSProperties = { background: 'none', border: 'none', padding: 0, color: '#60a5fa', cursor: 'pointer', textDecoration: 'underline', fontSize: 'inherit', fontFamily: 'inherit' };
+                        if (ids.length === 1) {
+                          return <button type="button" style={linkStyle} onClick={(e) => openDemandPegging(ids[0], e)}>{ids[0]}</button>;
+                        }
+                        const visible = ids.slice(0, 2);
+                        const rest = ids.length - 2;
                         return (
-                          <span title={label} style={{ cursor: 'default' }}>
-                            {preview}
-                            <span style={{ marginLeft: 5, background: '#0891b2', color: '#fff', borderRadius: 8, padding: '1px 6px', fontSize: '0.7rem', verticalAlign: 'middle' }}>
+                          <span title={ids.join('\n')} style={{ display: 'inline-flex', alignItems: 'center', gap: 2, flexWrap: 'wrap' }}>
+                            {visible.map((did, i) => (
+                              <React.Fragment key={did}>
+                                {i > 0 && <span style={{ color: '#52525b' }}>,</span>}
+                                <button type="button" style={linkStyle} onClick={(e) => openDemandPegging(did, e)}>{did}</button>
+                              </React.Fragment>
+                            ))}
+                            {rest > 0 && <span style={{ color: '#a1a1aa', fontSize: '0.72rem' }}>&nbsp;+{rest}</span>}
+                            <span style={{ marginLeft: 3, background: '#0891b2', color: '#fff', borderRadius: 8, padding: '1px 6px', fontSize: '0.7rem' }}>
                               {tP('workOrders.shared')}
                             </span>
                           </span>
@@ -6226,7 +6277,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       { key: 'location_source', label: tP('workOrders.columns.locationSource'), sortable: true, render: (r) => r.location_source ?? '–' },
                       { key: '_peg_order', label: tP('workOrders.columns.pegging'), sortable: true, render: (r) => {
                         const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
-                        const isSelected = woPeggingRowKey === k;
+                        // isPeggingActive: this WO's pegging is the direct content of the panel.
+                        const isPeggingActive = woPeggingRowKey === k;
+                        // isHighlightRow: this row is the woPegHighlightRow — it stays true even
+                        // when the panel switches to demand context (demand nav doesn't un-select the WO).
+                        const isHighlightRow = !!woPegHighlightRow
+                          && r.product_id === woPegHighlightRow.product_id
+                          && r.location_id === woPegHighlightRow.location_id
+                          && (r.method ?? '') === (woPegHighlightRow.method ?? '')
+                          && (r.demand_id ?? '') === (woPegHighlightRow.demand_id ?? '')
+                          && (r.start_time ?? '') === (woPegHighlightRow.start_time ?? '');
+                        const isSelected = isPeggingActive || isHighlightRow;
                         return (
                           <button
                             type="button"
@@ -6234,7 +6295,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
                             onClick={(e) => {
                               e.stopPropagation();
-                              if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setWoPegHighlightRow(null); }
+                              if (isPeggingActive) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setWoPegHighlightRow(null); }
                               else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setWoPegHighlightRow(r); }
                             }}
                           >{tc('show')}</button>
@@ -6284,6 +6345,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         );
                       }},
                     ];
+                    // Consolidated tab: remove per-demand action columns that don't apply
+                    // (Explain, Override, Schedule-modal).
+                    if (woTableTab === 'consolidated') {
+                      const hide = new Set(['_explain', '_override', '_woschedule']);
+                      for (let i = woColumns.length - 1; i >= 0; i--) {
+                        if (hide.has(woColumns[i].key as string)) woColumns.splice(i, 1);
+                      }
+                    }
                     // ── Apply layout mode (data / split / timeline) ──
                     // 'data':     replace Schedule with start_time + end_time text columns; data spans full width.
                     // 'split':    keep all columns (default).
@@ -6351,16 +6420,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
                       if (woExplainKey === k) return { background: 'rgba(167,139,250,0.15)', outline: '1px solid rgba(167,139,250,0.4)' };
                       if (woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
-                      // Amber tint for rows whose product@location matches the
-                      // currently-selected node inside the open pegging tree.
-                      // Distinct from the sky-blue root-WO highlight above; if
-                      // the user clicks the tree root the root highlight wins.
-                      if (peggingSelectedProductLoc
-                        && r.product_id === peggingSelectedProductLoc.product
-                        && r.location_id === peggingSelectedProductLoc.location) {
-                        return { background: 'rgba(251,191,36,0.12)', outline: '1px solid rgba(251,191,36,0.4)' };
-                      }
                       // Pegging-graph highlight (driven by woPegHighlightRow / bar click or Show button).
+                      // Checked before peggingSelectedProductLoc so the explicitly-selected row stays
+                      // blue even when a demand-pegging tree node with the same product@location is clicked.
                       if (woPegHighlightRow) {
                         const isSelf = r === woPegHighlightRow
                           || (r.product_id === woPegHighlightRow.product_id
@@ -6369,6 +6431,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             && (r.demand_id ?? '') === (woPegHighlightRow.demand_id ?? '')
                             && (r.start_time ?? '') === (woPegHighlightRow.start_time ?? ''));
                         if (isSelf) return { background: 'rgba(56,189,248,0.18)', outline: '1px solid rgba(56,189,248,0.5)' };
+                      }
+                      // Amber tint for rows whose product@location matches the
+                      // currently-selected node inside the open pegging tree.
+                      if (peggingSelectedProductLoc
+                        && r.product_id === peggingSelectedProductLoc.product
+                        && r.location_id === peggingSelectedProductLoc.location) {
+                        return { background: 'rgba(251,191,36,0.12)', outline: '1px solid rgba(251,191,36,0.4)' };
+                      }
+                      if (woPegHighlightRow) {
                         const rKeys = woRowPegKeys(r);
                         const isAncestor = rKeys.some((rk) => woPegHighlightSets.ancestors.has(rk));
                         const isDescendant = rKeys.some((rk) => woPegHighlightSets.descendants.has(rk));
@@ -9151,9 +9222,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             setPlanPeggingContext({ type: 'demand', row: demandRow });
                             setPlanPeggingOpen(true);
                             setWoPeggingRowKey(demandKey);
+                            // Keep woExplainKey/woExplainRow set so the WO row stays
+                            // highlighted (purple) while the demand pegging is open.
+                            // Cleared only when user explicitly closes/toggles the explain panel.
                             setWoExplainOpen(false);
-                            setWoExplainKey(null);
-                            setWoExplainRow(null);
                           }}
                         ><strong>{demandId}</strong></button>
                       ) : (
@@ -9227,7 +9299,27 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     <tbody>
                       {woExplainRow.wo_consolidation_split_details.map((row, i) => (
                         <tr key={i} style={{ borderTop: '1px solid #3d3d40' }}>
-                          <td style={{ padding: '0.2rem 0.4rem 0.2rem 0' }}>{row.demand_id ?? '–'}</td>
+                          <td style={{ padding: '0.2rem 0.4rem 0.2rem 0' }}>
+                            {(() => {
+                              if (!row.demand_id) return '–';
+                              const dRow = (planResult?.committed_demands ?? []).find((d) => d.demand_id === row.demand_id) ?? null;
+                              if (!dRow) return row.demand_id;
+                              const dKey = `demand|${row.demand_id}|${dRow.product_id ?? ''}|${dRow.location_id ?? ''}`;
+                              return (
+                                <button
+                                  type="button"
+                                  style={{ background: 'none', border: 'none', padding: 0, color: '#60a5fa', cursor: 'pointer', fontSize: 'inherit', fontFamily: 'inherit', textDecoration: 'underline' }}
+                                  onClick={() => {
+                                    setPreviousWoExplainRow(woExplainRow);
+                                    setPlanPeggingContext({ type: 'demand', row: dRow });
+                                    setPlanPeggingOpen(true);
+                                    setWoPeggingRowKey(dKey);
+                                    setWoExplainOpen(false);
+                                  }}
+                                >{row.demand_id}</button>
+                              );
+                            })()}
+                          </td>
                           <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', color: '#a1a1aa' }}>{row.parent_product}</td>
                           <td style={{ padding: '0.2rem 0', textAlign: 'right' }}>{row.priority}</td>
                           <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right' }}>{qtyFmt(row.requested_qty)}</td>
@@ -9962,9 +10054,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <button
                   type="button"
                   onClick={() => {
-                    setWoExplainRow(previousWoExplainRow);
-                    setWoExplainKey(`wo|${previousWoExplainRow.product_id ?? ''}|${previousWoExplainRow.location_id ?? ''}`);
-                    setWoExplainOpen(true);
+                    if (woExplainKey) {
+                      // Came from WO explain panel — reopen it.
+                      setWoExplainRow(previousWoExplainRow);
+                      setWoExplainOpen(true);
+                    }
+                    // Came from Demand column click — just close pegging panel (WO table stays).
                     setPlanPeggingOpen(false);
                     setPlanPeggingContext(null);
                     setWoPeggingRowKey(null);
@@ -9972,7 +10067,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   }}
                   style={{ background: 'none', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '0.78rem', padding: 0, display: 'flex', alignItems: 'center', gap: '0.3rem' }}
                 >
-                  ← {previousWoExplainRow.product_id} @ {previousWoExplainRow.location_id}
+                  {(() => {
+                    const p = previousWoExplainRow;
+                    const pid = p.product_id ?? p.move_components?.map((c) => c.product_id).join('+') ?? '–';
+                    return `← ${pid} @ ${p.location_id ?? '–'}`;
+                  })()}
                 </button>
               </div>
             )}
@@ -10164,11 +10263,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     .filter((d): d is string => d != null && d !== '')
                 : [];
               if (sharedDemands.length <= 1) return null;
+              // Multi-product consolidated move WOs can't show a single pegging tree —
+              // chips navigate to demand pegging for the chosen demand instead.
+              const isMultiProductMove = (row.move_components?.length ?? 0) > 1;
               const active = woPeggingActiveDemandId ?? (sharedDemands[0] ?? '');
               return (
                 <div style={{ marginBottom: '0.75rem' }}>
                   <span style={{ fontSize: '0.75rem', color: '#a1a1aa', marginRight: 6 }}>
-                    Consolidated for {sharedDemands.length} demands — viewing:
+                    Consolidated for {sharedDemands.length} demands{isMultiProductMove ? ' — click to open demand pegging:' : ' — viewing:'}
                   </span>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 4 }}>
                     {sharedDemands.map((did) => (
@@ -10176,14 +10278,27 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         key={did}
                         type="button"
                         className="secondary"
-                        title={did}
+                        title={isMultiProductMove ? `Open demand pegging for ${did}` : did}
                         style={{
                           fontSize: '0.72rem', padding: '2px 8px', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                           background: active === did ? 'rgba(167,139,250,0.18)' : undefined,
                           borderColor: active === did ? '#a78bfa' : undefined,
-                          color: active === did ? '#a78bfa' : undefined,
+                          color: isMultiProductMove ? '#60a5fa' : active === did ? '#a78bfa' : undefined,
+                          textDecoration: isMultiProductMove ? 'underline' : undefined,
                         }}
-                        onClick={() => setWoPeggingActiveDemandId(did)}
+                        onClick={() => {
+                          if (isMultiProductMove) {
+                            const demandRow = planResult?.committed_demands.find((d) => d.demand_id === did) ?? null;
+                            if (!demandRow) return;
+                            const demandKey = `demand|${did}|${demandRow.product_id ?? ''}|${demandRow.location_id ?? ''}`;
+                            setPlanPeggingContext({ type: 'demand', row: demandRow });
+                            setWoPeggingRowKey(demandKey);
+                            setPlanWorkOrderPeggingError(null);
+                            setPreviousWoExplainRow(null);
+                          } else {
+                            setWoPeggingActiveDemandId(did);
+                          }
+                        }}
                       >
                         {did}
                       </button>
