@@ -2923,6 +2923,11 @@ internal data class WoConsolidation(
     val native: List<Map<String, Any?>>,
 )
 
+internal data class ReadjustResult(
+    val peggingTrees: List<Map<String, Any?>>,
+    val consolidatedWos: List<Map<String, Any?>>,
+)
+
 internal fun consolidateWorkOrdersByTiming(
     workOrders: List<Map<String, Any?>>,
     data: Map<String, List<Map<String, Any?>>>,
@@ -3090,6 +3095,119 @@ internal fun consolidateWorkOrdersByTiming(
         wos.forEach { nativeOut.add(it + ("consolidated_group_id" to cgid)) }
     }
     return WoConsolidation(consolidatedOut, nativeOut)
+}
+
+private data class ConsolidatedWoState(var startTime: LocalDate, val leadTime: Long) {
+    val endTime: LocalDate get() = startTime.plusDays(leadTime)
+}
+
+/**
+ * Pass 2b — iterative timing readjustment.
+ *
+ * After cross-demand batching, a consolidated WO's start_time = min(native starts). If any
+ * constituent demand's WO actually starts LATER (e.g. because its upstream BOM is delayed),
+ * the batch cannot begin until that later date. This function propagates those constraints:
+ *
+ * invariant: lead_time = consolidated_wo.end_time − consolidated_wo.start_time is preserved.
+ * When start_time is pushed, end_time = new_start + lead_time.
+ *
+ * Traversal: bottom-up within each demand's pegging tree so child WO delays cascade to
+ * parent WOs in the same pass. The outer do-while iterates until no consolidated WO
+ * changes (convergence guaranteed by BOM depth).
+ */
+internal fun readjustConsolidatedWoTiming(
+    peggingTrees: List<Map<String, Any?>>,
+    woConsolidation: WoConsolidation,
+): ReadjustResult {
+    val consolidatedState = mutableMapOf<String, ConsolidatedWoState>()
+    for (c in woConsolidation.consolidated) {
+        val cgid  = c["consolidated_group_id"] as? String ?: continue
+        val start = parseDate(c["start_time"] as? String) ?: continue
+        val end   = parseDate(c["end_time"]   as? String) ?: continue
+        consolidatedState[cgid] = ConsolidatedWoState(start, end.toEpochDay() - start.toEpochDay())
+    }
+    val woGidToCgid = mutableMapOf<String, String>()
+    for (n in woConsolidation.native) {
+        val woGid = n["wo_group_id"] as? String ?: continue
+        val cgid  = n["consolidated_group_id"] as? String ?: continue
+        woGidToCgid[woGid] = cgid
+    }
+
+    var workingTrees = peggingTrees
+    var changed = false
+    val updatedEnd = mutableMapOf<String, LocalDate>()
+
+    @Suppress("UNCHECKED_CAST")
+    fun walkNode(node: Map<String, Any?>): Map<String, Any?> {
+        if (node["type"] == "work_order" && node["failed"] == true) return node
+
+        val origChildren = node["children"] as? List<Map<String, Any?>>
+        val newChildren  = origChildren?.map { walkNode(it) }
+        val origChildrenNN = origChildren ?: emptyList()
+        val childrenChanged = newChildren != null &&
+            newChildren.indices.any { i -> newChildren[i] !== origChildrenNN[i] }
+
+        if (node["type"] != "work_order") {
+            return if (childrenChanged) node.toMutableMap().also { it["children"] = newChildren }
+                   else node
+        }
+
+        val woGid = node["wo_group_id"] as? String
+        val cgid  = if (woGid != null) woGidToCgid[woGid] else null
+        val state = if (cgid != null) consolidatedState[cgid] else null
+
+        val directWoChildren = newChildren?.filter { it["type"] == "work_order" && it["failed"] != true }
+        val effectiveStart: LocalDate? = if (!directWoChildren.isNullOrEmpty()) {
+            directWoChildren.mapNotNull { child ->
+                val cGid = child["wo_group_id"] as? String
+                if (cGid != null) updatedEnd[cGid] else parseDate(child["end_time"] as? String)
+            }.maxOrNull()
+        } else {
+            parseDate(node["start_time"] as? String)
+        }
+
+        if (state != null && effectiveStart != null && effectiveStart > state.startTime) {
+            state.startTime = effectiveStart   // endTime auto-updates: startTime + leadTime
+            changed = true
+        }
+
+        val newStart = state?.startTime
+        val newEnd   = state?.endTime
+        if (woGid != null && newEnd != null) updatedEnd[woGid] = newEnd
+
+        val startChanged = newStart != null && formatDate(newStart) != node["start_time"]
+        val endChanged   = newEnd   != null && formatDate(newEnd)   != node["end_time"]
+
+        return if (startChanged || endChanged || childrenChanged) {
+            node.toMutableMap().also { m ->
+                if (startChanged)    m["start_time"] = formatDate(newStart)
+                if (endChanged)      m["end_time"]   = formatDate(newEnd)
+                if (childrenChanged) m["children"]   = newChildren
+            }
+        } else node
+    }
+
+    do {
+        changed = false
+        updatedEnd.clear()
+        @Suppress("UNCHECKED_CAST")
+        workingTrees = workingTrees.map { entry ->
+            val tree    = entry["tree"] as? Map<String, Any?> ?: return@map entry
+            val newTree = walkNode(tree)
+            if (newTree === tree) entry
+            else entry.toMutableMap().also { it["tree"] = newTree }
+        }
+    } while (changed)
+
+    val adjustedConsolidated = woConsolidation.consolidated.map { c ->
+        val cgid     = c["consolidated_group_id"] as? String ?: return@map c
+        val state    = consolidatedState[cgid] ?: return@map c
+        val newStart = formatDate(state.startTime)
+        val newEnd   = formatDate(state.endTime)
+        if (newStart == c["start_time"] && newEnd == c["end_time"]) c
+        else c.toMutableMap().also { it["start_time"] = newStart; it["end_time"] = newEnd }
+    }
+    return ReadjustResult(workingTrees, adjustedConsolidated)
 }
 
 private fun buildWoNode(
@@ -4298,16 +4416,44 @@ fun runPlanning(
         WoConsolidation(nodeLevelWos, nodeLevelWos)
     }
 
+    // Pass 2b — iterative timing readjustment: if any constituent demand's WO starts later
+    // than the consolidated batch's start_time, push the batch forward (preserving lead_time)
+    // and cascade up the BOM until convergence.
+    val (adjustedTrees, adjustedConsolidated) = if (consolidateWos)
+        readjustConsolidatedWoTiming(reconciledTrees, consolidation)
+    else ReadjustResult(reconciledTrees, consolidation.consolidated)
+
+    // Patch native WO timings to match the adjusted consolidated WO for each group.
+    // Preserve original per-demand start and lead before overwriting with consolidated timing so
+    // the frontend can show per-demand vs. batch-timing deltas.
+    val adjustedTimingByCgid = adjustedConsolidated.associate { c ->
+        (c["consolidated_group_id"] as? String ?: "") to
+        Pair(c["start_time"] as? String, c["end_time"] as? String)
+    }
+    val adjustedNative = consolidation.native.map { n ->
+        val cgid = n["consolidated_group_id"] as? String ?: return@map n
+        val (newStart, newEnd) = adjustedTimingByCgid[cgid] ?: return@map n
+        val origStart = n["start_time"] as? String
+        val origEnd   = n["end_time"]   as? String
+        val origLeadDays = parseDate(origStart)?.let { s -> parseDate(origEnd)?.let { e -> e.toEpochDay() - s.toEpochDay() } }
+        n + mapOf(
+            "start_time"         to newStart,
+            "end_time"           to newEnd,
+            "original_start_time" to origStart,
+            "original_lead_days"  to origLeadDays,
+        )
+    }
+
     return mapOf(
         "committed_demands"      to committedDemands,
-        "work_orders"            to consolidation.consolidated,
+        "work_orders"            to adjustedConsolidated,
         // The NATIVE per-demand work orders (pre-consolidation, 1:1 with the pegging nodes), each
         // tagged with `consolidated_group_id` → the ONE consolidated WO it rolls into. Kept separate
         // from `work_orders` (the consolidated procurement view) so the UI shows each in its own tab —
         // combining them would double-count any aggregate. When consolidation is off these are
         // identical to `work_orders`.
-        "work_orders_native"     to consolidation.native,
-        "planning_pegging"       to reconciledTrees,
+        "work_orders_native"     to adjustedNative,
+        "planning_pegging"       to adjustedTrees,
         "supply_allocations"     to supplyAllocations,
         "supply_cap_violations"  to supplyCapViolations,
         "override_warnings"      to overrideWarnings,
