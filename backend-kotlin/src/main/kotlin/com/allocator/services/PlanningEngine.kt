@@ -3783,16 +3783,45 @@ private fun runV2Iterated(
             val parts = componentKey.split("|", limit = 2)
             val pid = parts.getOrElse(0) { "" }
             val lid = parts.getOrElse(1) { "" }
-            val supplyDate = consResult.consolidatedWOs
-                .firstOrNull { it["product_id"] == pid && it["location_id"] == lid }
-                ?.get("end_time") as? String
-            inventory.add(mutableMapOf(
-                "product_id"  to pid,
-                "location_id" to lid,
-                "qty"         to totalQty,
-                "supply_date" to supplyDate,
-                "supply_id"   to "consolidated_${pid}_${lid}",
-            ))
+            if (consolidationConfig.realPegging) {
+                // CARRIER = REAL supplies. Consolidation just depleted the on-hand stock at (pid,lid)
+                // for its bookkeeping; re-supply per-demand planning with the SAME real lots (real
+                // supply_id, distributed across the originals, capped per lot) so the per-demand
+                // pegging resolves to real supplies — no synthetic `consolidated_*` leaf. The fair
+                // split is unchanged (still enforced by `budgets` in the phase-3 commit below).
+                var remaining = totalQty
+                for (lot in initialInventory) {
+                    if (remaining <= 1e-12) break
+                    if ((lot["product_id"] as? String)?.trim() != pid ||
+                        (lot["location_id"] as? String)?.trim() != lid) continue
+                    val cap = (lot["qty"] as? Number)?.toDouble() ?: 0.0
+                    val take = minOf(remaining, cap)
+                    if (take <= 1e-12) continue
+                    inventory.add(mutableMapOf(
+                        "product_id"  to pid,
+                        "location_id" to lid,
+                        "qty"         to take,
+                        "supply_date" to lot["supply_date"],
+                        "supply_id"   to lot["supply_id"],
+                    ))
+                    remaining -= take
+                }
+                // Inventory-only consolidation should always find real lots ≥ totalQty; warn if not.
+                if (remaining > 1e-6) log.warn(
+                    "realPegging: {} units of {}@{} had no real on-hand backing — left unsupplied",
+                    "%.1f".format(remaining), pid, lid)
+            } else {
+                val supplyDate = consResult.consolidatedWOs
+                    .firstOrNull { it["product_id"] == pid && it["location_id"] == lid }
+                    ?.get("end_time") as? String
+                inventory.add(mutableMapOf(
+                    "product_id"  to pid,
+                    "location_id" to lid,
+                    "qty"         to totalQty,
+                    "supply_date" to supplyDate,
+                    "supply_id"   to "consolidated_${pid}_${lid}",
+                ))
+            }
         }
 
         // Snapshot initial budgets before phase 3 mutates them.
@@ -4110,9 +4139,13 @@ fun runPlanning(
     workOrders.addAll(commitResult.workOrders)
     planningPegging.addAll(commitResult.planningPegging)
 
+    // With realPegging on, Pass-1 re-supplied the real lots (real supply_id) and the per-demand
+    // trees consume them directly — so the `demand_id=null` production trees would DOUBLE-claim
+    // those lots in soundness/aggregation. Drop them; per-demand trees carry the real consumption.
+    val basePegging = if (consolidationConfig.realPegging) planningPegging else (consolidatedPegging + planningPegging)
     // Prune cycle_stopped phantom loop nodes from every pegging tree before returning.
     @Suppress("UNCHECKED_CAST")
-    val allPegging = (consolidatedPegging + planningPegging).mapNotNull { entry ->
+    val allPegging = basePegging.mapNotNull { entry ->
         val tree = entry["tree"] as? Map<String, Any?> ?: return@mapNotNull null
         val pruned = prunePhantomLoops(tree, isRoot = true) ?: return@mapNotNull null
         entry.toMutableMap().apply { put("tree", pruned) }
