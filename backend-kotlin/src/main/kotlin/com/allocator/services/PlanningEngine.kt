@@ -3765,12 +3765,9 @@ private fun runV2Iterated(
                 structuralFailedMakes = structuralFailedMakes)
         }
 
-        // Emit one untagged supply per (pid, lid) for every produced component.
-        // Allocation is keyed only at the merged-leaf level — BOM-child WOs
-        // produced inside consolidation feed back through real inventory at
-        // those (pid, lid)s, but we don't add explicit synthetic supplies for
-        // them: they are consumed by the merged-leaf's own internal plan() call
-        // and the resulting qty rolls up into the merged-leaf allocation.
+        // The output components Pass-1 allocated (merged-leaf level). Deep BOM-child supplies it
+        // consumed inside its own plan() stay depleted in both paths — only these outputs are
+        // re-supplied to per-demand planning.
         val producedByComponent = mutableMapOf<String, Double>()
         for ((_, componentAllocs) in consResult.allocation) {
             for ((componentKey, qty) in componentAllocs) {
@@ -3778,21 +3775,38 @@ private fun runV2Iterated(
                 producedByComponent[componentKey] = (producedByComponent[componentKey] ?: 0.0) + qty
             }
         }
-        for ((componentKey, totalQty) in producedByComponent) {
-            if (totalQty <= 1e-12) continue
-            val parts = componentKey.split("|", limit = 2)
-            val pid = parts.getOrElse(0) { "" }
-            val lid = parts.getOrElse(1) { "" }
-            val supplyDate = consResult.consolidatedWOs
-                .firstOrNull { it["product_id"] == pid && it["location_id"] == lid }
-                ?.get("end_time") as? String
-            inventory.add(mutableMapOf(
-                "product_id"  to pid,
-                "location_id" to lid,
-                "qty"         to totalQty,
-                "supply_date" to supplyDate,
-                "supply_id"   to "consolidated_${pid}_${lid}",
-            ))
+        if (consolidationConfig.realPegging) {
+            // CARRIER = REAL supplies. Mirror the bucket path EXACTLY — re-supply only the allocated
+            // OUTPUT (pid,lid)s (deep raws stay depleted) — but restore their REAL pre-consolidation
+            // lots (real supply_id) instead of a synthetic bucket. Per-demand planning then consumes
+            // real lots capped by `budgets` → same allocation, real pegging. (Restoring the full
+            // inventory instead would let demands re-consume deep raws and drift the allocation.)
+            val allocatedPLs = producedByComponent.keys.map {
+                val p = it.split("|", limit = 2)
+                (p.getOrElse(0) { "" }.trim()) to (p.getOrElse(1) { "" }.trim())
+            }.toHashSet()
+            fun plOf(m: Map<String, Any?>) =
+                ((m["product_id"] as? String)?.trim() ?: "") to ((m["location_id"] as? String)?.trim() ?: "")
+            inventory.removeAll { plOf(it) in allocatedPLs }
+            for (b in initialInventory) if (plOf(b) in allocatedPLs) inventory.add(b.toMutableMap())
+        } else {
+            // Emit one untagged synthetic supply per (pid, lid) for every produced component.
+            for ((componentKey, totalQty) in producedByComponent) {
+                if (totalQty <= 1e-12) continue
+                val parts = componentKey.split("|", limit = 2)
+                val pid = parts.getOrElse(0) { "" }
+                val lid = parts.getOrElse(1) { "" }
+                val supplyDate = consResult.consolidatedWOs
+                    .firstOrNull { it["product_id"] == pid && it["location_id"] == lid }
+                    ?.get("end_time") as? String
+                inventory.add(mutableMapOf(
+                    "product_id"  to pid,
+                    "location_id" to lid,
+                    "qty"         to totalQty,
+                    "supply_date" to supplyDate,
+                    "supply_id"   to "consolidated_${pid}_${lid}",
+                ))
+            }
         }
 
         // Snapshot initial budgets before phase 3 mutates them.
@@ -4110,9 +4124,13 @@ fun runPlanning(
     workOrders.addAll(commitResult.workOrders)
     planningPegging.addAll(commitResult.planningPegging)
 
+    // With realPegging on, Pass-1 re-supplied the real lots (real supply_id) and the per-demand
+    // trees consume them directly — so the `demand_id=null` production trees would DOUBLE-claim
+    // those lots in soundness/aggregation. Drop them; per-demand trees carry the real consumption.
+    val basePegging = if (consolidationConfig.realPegging) planningPegging else (consolidatedPegging + planningPegging)
     // Prune cycle_stopped phantom loop nodes from every pegging tree before returning.
     @Suppress("UNCHECKED_CAST")
-    val allPegging = (consolidatedPegging + planningPegging).mapNotNull { entry ->
+    val allPegging = basePegging.mapNotNull { entry ->
         val tree = entry["tree"] as? Map<String, Any?> ?: return@mapNotNull null
         val pruned = prunePhantomLoops(tree, isRoot = true) ?: return@mapNotNull null
         entry.toMutableMap().apply { put("tree", pruned) }

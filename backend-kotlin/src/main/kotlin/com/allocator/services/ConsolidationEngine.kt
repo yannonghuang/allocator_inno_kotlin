@@ -169,6 +169,15 @@ data class ConsolidationConfig(
      * utilization (important when supply-constrained), at higher runtime. Clamped 1..15.
      */
     val maxIterations: Int = 1,
+    /**
+     * When true, Pass-1 inventory-consolidation re-supplies the depleted on-hand stock to per-demand
+     * planning using the REAL `supply_id`s (distributed across the original lots) instead of a
+     * synthetic `consolidated_<pid>_<lid>` bucket, and the `demand_id=null` production trees are
+     * dropped. The fair split is unchanged (still enforced by `budgets`) — only the CARRIER changes,
+     * so the per-demand pegging resolves to real supplies (no consolidation artifact in pegging).
+     * Default false until soak-validated. See [[no_consolidated_in_pegging]].
+     */
+    val realPegging: Boolean = false,
 )
 
 /** Output of runConsolidation(). */
@@ -196,9 +205,10 @@ fun parseConsolidationConfig(config: Map<String, Any?>?): ConsolidationConfig {
     // converge loop (clamped to the 15 hard ceiling). Accept both "max_iterations"
     // and the shorter "max_iter".
     val maxIterations = ((m["max_iterations"] ?: m["max_iter"]) as? Number)?.toInt()?.coerceIn(1, 15) ?: 1
+    val realPegging = m["real_pegging"] as? Boolean ?: false
     // Note: legacy `scope=all` configs are silently coerced to leaf-only on
     // re-plan. The supply-level orchestrator was retired in 2026-05.
-    return ConsolidationConfig(enabled, periodDays, allocationMode, maxIterations)
+    return ConsolidationConfig(enabled, periodDays, allocationMode, maxIterations, realPegging)
 }
 
 // ── Time bucketing ────────────────────────────────────────────────────────────
