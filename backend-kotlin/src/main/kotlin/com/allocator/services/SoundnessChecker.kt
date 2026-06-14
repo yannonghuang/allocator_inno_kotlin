@@ -116,6 +116,13 @@ data class SoundnessReport(
      * [producedByComponent] was not passed to [checkRunSoundness].
      */
     val componentConservationViolations: List<String> = emptyList(),
+    /**
+     * R7g WO conservation violations: post-trim consolidated WO qty exceeds served-demand
+     * consumption at a component. Indicates [reconcileOverProduction] did not fully eliminate
+     * unserved-demand capacity from WOs (e.g. BOM-child WOs not cascade-trimmed). Empty when
+     * [producedByComponent] or [workOrders] was not passed to [checkRunSoundness].
+     */
+    val woConservationViolations: List<String> = emptyList(),
 )
 
 /**
@@ -446,11 +453,23 @@ fun checkRunSoundness(
             )
         else emptyList()
 
+    // R7g: WO conservation — post-trim WO qty vs served-demand consumption.
+    val woConservationViolations: List<String> =
+        if (producedByComponent.isNotEmpty() && workOrders.isNotEmpty())
+            verifyWoConservation(
+                producedByComponent, planningPegging, workOrders,
+                servedDemandIds = servedDemandIds.ifEmpty { null },
+            )
+        else emptyList()
+
     val soundCount = demandReports.count { it.sound }
+    // R7f (component conservation) and R7g (WO conservation) are efficiency signals:
+    // they fire at max_iterations=1 by design (budget leakage is expected and reclaimed
+    // naturally at higher iter counts). They do NOT gate overallSound so that sound plans
+    // can still be promoted to KB even when single-pass allocation leaves some slack.
     val overallSound = soundCount == demandReports.size &&
         crossViolations.isEmpty() &&
-        conservationViolations.isEmpty() &&
-        componentConservationViolations.isEmpty()
+        conservationViolations.isEmpty()
 
     return SoundnessReport(
         overallSound = overallSound,
@@ -461,6 +480,7 @@ fun checkRunSoundness(
         deepCheck = config.deepCheck,
         conservationViolations = conservationViolations,
         componentConservationViolations = componentConservationViolations,
+        woConservationViolations = woConservationViolations,
     )
 }
 

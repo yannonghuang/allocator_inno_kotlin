@@ -4357,7 +4357,8 @@ fun runPlanning(
     // R7f: component conservation — produced qty (Phase 1 Step 2) vs consumed by served demands.
     val componentConservationViolations = if (producedByComponent.isNotEmpty())
         verifyComponentConservation(producedByComponent, allPegging, servedDemandIds = servedDemandIds)
-    else emptyList()
+    else emptyList<String>()
+    // R7g computed after adjustedConsolidated is available (below the timing-readjust block).
 
     // Supply-split override soft-warn: any demand in an override that commits short
     // of its request is flagged as potentially impacted by the override.
@@ -4546,6 +4547,12 @@ fun runPlanning(
         )
     }
 
+    // R7g: WO conservation — post-trim consolidated WO qty vs served-demand consumption.
+    // Uses adjustedTrees (final pegging) and adjustedConsolidated (final WO list).
+    val woConservationViolations = if (producedByComponent.isNotEmpty())
+        verifyWoConservation(producedByComponent, adjustedTrees, adjustedConsolidated, servedDemandIds = servedDemandIds)
+    else emptyList<String>()
+
     val output: Map<String, Any> = mapOf(
         "committed_demands"      to committedDemands,
         "work_orders"            to adjustedConsolidated,
@@ -4563,6 +4570,9 @@ fun runPlanning(
         // Non-empty when unserved demands left their Phase 1 allocation unused. Surfaced
         // here so callers can detect budget leakage without running the full soundness checker.
         "component_conservation_violations" to componentConservationViolations,
+        // R7g: WO qty > served-demand consumption at a consolidated component. Non-empty when
+        // reconcileOverProduction did not fully release unserved-demand capacity from WOs.
+        "wo_conservation_violations" to woConservationViolations,
         // Budget released from unserved demands; keyed by "pid|lid". Non-empty with
         // max_iterations=1 when a demand failed AND-bottleneck after Phase 1 allocated capacity.
         "budget_released_by_component" to releasedByComponent,
@@ -4757,6 +4767,92 @@ internal fun verifyComponentConservation(
                 pid, lid, produced, consumed, orphaned)
             violations.add(msg)
             log.warn("component conservation violation — {}", msg)
+        }
+    }
+    return violations
+}
+
+/**
+ * R7g: WO conservation check. For each merged-leaf component (pid|lid) that Phase 1
+ * Step 2 produced a consolidated WO for, the total WO qty at that component must not
+ * exceed what served demands actually consumed from the synthetic supply bucket.
+ *
+ * Unlike R7f which uses the pre-[reconcileOverProduction] allocation, this check uses
+ * the post-trim WO qty and verifies the trim landed correctly. A non-empty result means
+ * a consolidated WO remains over-sized after trimming — typically because
+ * [reconcileOverProduction]'s Stage-4a fallback only trims the merged leaf and does not
+ * cascade to BOM-child WOs.
+ *
+ * @param producedByComponent  From [RunPlanningResult.producedByComponent] — identifies
+ *        which (pid|lid) pairs had consolidated WOs. Only WOs at those components are checked.
+ * @param planningPegging      All pegging entries from the plan output.
+ * @param workOrders           The consolidated `work_orders` from the plan output.
+ * @param servedDemandIds      When provided, only count consumption from these demand IDs.
+ */
+internal fun verifyWoConservation(
+    producedByComponent: Map<String, Double>,
+    planningPegging: List<Map<String, Any?>>,
+    workOrders: List<Map<String, Any?>>,
+    servedDemandIds: Set<String>? = null,
+    tolerance: Double = 1e-6,
+): List<String> {
+    if (producedByComponent.isEmpty() || workOrders.isEmpty()) return emptyList()
+
+    // Reverse index: consolidated supply_id → component key (pid|lid)
+    val componentBySupplyId: Map<String, String> = producedByComponent.keys.associateBy { key ->
+        val parts = key.split("|", limit = 2)
+        "consolidated_${parts.getOrElse(0) { "" }}_${parts.getOrElse(1) { "" }}"
+    }
+
+    // Sum synthetic supply consumption per component from served demand pegging trees.
+    val consumedByComponent = mutableMapOf<String, Double>()
+
+    fun walk(node: Map<String, Any?>) {
+        val type = node["type"] as? String
+        if (type == "work_order" && node["failed"] == true) return
+        val supplyId = node["supply_id"] as? String
+        if ((type == "supply" || type == "purchase") && supplyId != null) {
+            componentBySupplyId[supplyId]?.let { key ->
+                consumedByComponent[key] = (consumedByComponent[key] ?: 0.0) +
+                    ((node["quantity"] as? Number)?.toDouble() ?: 0.0)
+            }
+        }
+        @Suppress("UNCHECKED_CAST")
+        (node["children"] as? List<Map<String, Any?>>)?.forEach { walk(it) }
+    }
+
+    for (entry in planningPegging) {
+        if (entry["consolidated"] == true || entry["passthrough"] == true) continue
+        val demandId = entry["demand_id"]?.toString() ?: continue
+        if (servedDemandIds != null && demandId !in servedDemandIds) continue
+        @Suppress("UNCHECKED_CAST")
+        val tree = entry["tree"] as? Map<String, Any?> ?: continue
+        walk(tree)
+    }
+
+    // Sum consolidated WO qty per component (only components that had consolidation).
+    val woQtyByComponent = mutableMapOf<String, Double>()
+    for (wo in workOrders) {
+        val pid = (wo["product_id"] as? String)?.trim() ?: continue
+        val lid = (wo["location_id"] as? String)?.trim() ?: continue
+        val key = "$pid|$lid"
+        if (key !in producedByComponent) continue
+        val qty = (wo["quantity"] as? Number)?.toDouble() ?: 0.0
+        woQtyByComponent[key] = (woQtyByComponent[key] ?: 0.0) + qty
+    }
+
+    val violations = mutableListOf<String>()
+    for ((key, woQty) in woQtyByComponent) {
+        val consumed = consumedByComponent[key] ?: 0.0
+        val orphaned = woQty - consumed
+        if (orphaned > maxOf(tolerance, 1e-9 * woQty)) {
+            val parts = key.split("|", limit = 2)
+            val pid = parts.getOrElse(0) { "" }
+            val lid = parts.getOrElse(1) { "" }
+            val msg = "WO %s @ %s: qty %.4f > served-demand consumption %.4f (orphaned %.4f — unserved demand WO not released)".format(
+                pid, lid, woQty, consumed, orphaned)
+            violations.add(msg)
+            log.warn("WO conservation violation — {}", msg)
         }
     }
     return violations
