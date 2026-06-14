@@ -9954,12 +9954,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               width: planPeggingPanelWidth,
               maxWidth: '90vw',
               minWidth: 320,
-              maxHeight: '100vh',
-              overflow: 'auto',
+              height: '100vh',
+              overflow: 'hidden',
               background: '#1c1c1e',
               color: '#e4e4e7',
               boxShadow: '-4px 0 24px rgba(0,0,0,0.4)',
-              padding: '1.25rem',
               pointerEvents: 'auto',
               display: 'flex',
               flexDirection: 'column',
@@ -10025,6 +10024,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 ))}
               </div>
             </div>
+            {/* Scrollable body — resize handle lives above this so it isn't clipped by overflow */}
+            <div style={{ flex: 1, overflowY: 'auto', padding: '1.25rem' }}>
             {previousPeggingContext && (
               <div style={{ marginBottom: '0.5rem' }}>
                 <button
@@ -10591,6 +10592,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 </>
               );
             })()}
+            </div>{/* end scrollable body */}
           </div>
         </div>,
         document.body
