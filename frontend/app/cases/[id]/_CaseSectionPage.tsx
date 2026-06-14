@@ -3000,8 +3000,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (!planResult?.planning_pegging) return map;
 
     const demandCustomerMap = new Map<string, string | null>();
+    const demandRequestedQtyMap = new Map<string, number>();
     for (const d of planResult.committed_demands ?? []) {
-      if (d.demand_id) demandCustomerMap.set(d.demand_id, d.customer ?? null);
+      if (d.demand_id) {
+        demandCustomerMap.set(d.demand_id, d.customer ?? null);
+        if (d.requested_qty != null) demandRequestedQtyMap.set(d.demand_id, Number(d.requested_qty));
+      }
     }
 
     function addPegging(sid: string, qty: number, demandId: string) {
@@ -3012,11 +3016,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         if (existingForDemand) {
           existingForDemand.qtyConsumed += qty;
         } else {
-          existing.demands.push({ demandId, customer: demandCustomerMap.get(demandId) ?? null, qtyConsumed: qty });
+          existing.demands.push({ demandId, customer: demandCustomerMap.get(demandId) ?? null, qtyConsumed: qty, requestedQty: demandRequestedQtyMap.get(demandId) });
         }
         existing.totalPeggedQty += qty;
       } else {
-        map.set(sid, { totalPeggedQty: qty, demands: [{ demandId, customer: demandCustomerMap.get(demandId) ?? null, qtyConsumed: qty }] });
+        map.set(sid, { totalPeggedQty: qty, demands: [{ demandId, customer: demandCustomerMap.get(demandId) ?? null, qtyConsumed: qty, requestedQty: demandRequestedQtyMap.get(demandId) }] });
       }
     }
 
@@ -9533,17 +9537,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         can see how the totals line up across paths. */}
                     <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
                       <colgroup>
-                        <col style={{ width: '28%' }} />
-                        <col style={{ width: '24%' }} />
-                        <col style={{ width: '18%' }} />
-                        <col style={{ width: '15%' }} />
-                        <col style={{ width: '15%' }} />
+                        <col style={{ width: '26%' }} />
+                        <col style={{ width: '20%' }} />
+                        <col style={{ width: '16%' }} />
+                        <col style={{ width: '13%' }} />
+                        <col style={{ width: '13%' }} />
+                        <col style={{ width: '12%' }} />
                       </colgroup>
                       <thead>
                         <tr style={{ color: '#a1a1aa', textAlign: 'left' }}>
                           <th style={{ paddingBottom: '0.2rem' }}>{tP('supExplain.peggedColDemand')}</th>
                           <th style={{ paddingBottom: '0.2rem' }}>{tP('supExplain.peggedColCustomer')}</th>
                           <th style={{ paddingBottom: '0.2rem' }}>{tP('supExplain.peggedColPath') /* 'Path' / '路径' */}</th>
+                          <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('supExplain.peggedColQtyRequest')}</th>
                           <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('supExplain.peggedColQty')}</th>
                           <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('supExplain.peggedColShare')}</th>
                         </tr>
@@ -9597,6 +9603,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                   <span style={{ color: '#a1a1aa', fontStyle: 'italic' }} title="Direct main-loop / passthrough consumption (no consolidation split)">{tP('supExplain.peggedPathDirect') /* 'direct' / '直接' */}</span>
                                 )}
                               </td>
+                              <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right', color: '#a1a1aa' }}>{d.requestedQty != null ? qtyFmt(d.requestedQty) : '–'}</td>
                               <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right' }}>{qtyFmt(Number(d.qtyConsumed))}</td>
                               <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right', color: '#a1a1aa' }}>{share.toFixed(1)}%</td>
                             </tr>
@@ -10207,6 +10214,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <tr style={{ borderBottom: '1px solid #3d3d40', color: '#a1a1aa' }}>
                         <th style={{ textAlign: 'left', padding: '4px 6px', fontWeight: 500 }}>{tP('supplyView.peggingPanel.columns.demandId')}</th>
                         <th style={{ textAlign: 'left', padding: '4px 6px', fontWeight: 500 }}>{tP('supplyView.peggingPanel.columns.customer')}</th>
+                        <th style={{ textAlign: 'right', padding: '4px 6px', fontWeight: 500 }}>{tP('supplyView.peggingPanel.columns.qtyRequested')}</th>
                         <th style={{ textAlign: 'right', padding: '4px 6px', fontWeight: 500 }}>{tP('supplyView.peggingPanel.columns.qtyConsumed')}</th>
                       </tr>
                     </thead>
@@ -10242,6 +10250,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               )}
                             </td>
                             <td style={{ padding: '4px 6px', color: '#e4e4e7' }}>{d.customer ?? '–'}</td>
+                            <td style={{ padding: '4px 6px', textAlign: 'right', color: '#a1a1aa' }}>{d.requestedQty != null ? qtyFmt(d.requestedQty) : '–'}</td>
                             <td style={{ padding: '4px 6px', textAlign: 'right', color: '#a78bfa' }}>{qtyFmt(Number(d.qtyConsumed))}</td>
                           </tr>
                           );

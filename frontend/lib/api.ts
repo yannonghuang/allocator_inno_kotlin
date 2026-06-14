@@ -1210,6 +1210,7 @@ export type PeggedDemandEntry = {
   demandId: string;
   customer: string | null;
   qtyConsumed: number;
+  requestedQty?: number;
 };
 
 /** Consolidation split context for a supply — populated only when the supply was consumed

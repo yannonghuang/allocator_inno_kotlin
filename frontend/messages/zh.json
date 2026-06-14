@@ -815,6 +815,7 @@
       "peggedColCustomer": "客户",
       "peggedColPath": "路径",
       "peggedPathDirect": "直接",
+      "peggedColQtyRequest": "请求数量",
       "peggedColQty": "消耗数量",
       "peggedColShare": "份额",
       "peggedShareNote": "份额 = 此需求消耗的数量 ÷ 此供应的总锚定数量。对于合并供应，该值与分配策略权重一致（见下方“合并拆分”）。",
@@ -1117,6 +1118,7 @@
         "columns": {
           "demandId": "需求 ID",
           "customer": "客户",
+          "qtyRequested": "请求数量",
           "qtyConsumed": "消耗数量"
         }
       },
