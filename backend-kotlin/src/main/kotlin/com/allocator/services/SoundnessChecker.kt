@@ -103,6 +103,26 @@ data class SoundnessReport(
     val crossDemandViolations: List<Violation>,
     /** True if R8 (deep check) was run. */
     val deepCheck: Boolean,
+    /**
+     * R7e conservation-of-mass violations: initial_qty ≠ leftover_qty + pegged_qty for a
+     * physical supply bucket. Empty when the inventory snapshots were not provided to
+     * [checkRunSoundness] (e.g. DB-loaded soundness checks on historical runs).
+     */
+    val conservationViolations: List<String> = emptyList(),
+    /**
+     * R7f component conservation violations: Phase 1 Step 2 produced qty at a merged-leaf
+     * component exceeds what served demands actually consumed from the synthetic bucket.
+     * Indicates unserved demands left their allocation unused (budget leakage). Empty when
+     * [producedByComponent] was not passed to [checkRunSoundness].
+     */
+    val componentConservationViolations: List<String> = emptyList(),
+    /**
+     * R7g WO conservation violations: post-trim consolidated WO qty exceeds served-demand
+     * consumption at a component. Indicates [reconcileOverProduction] did not fully eliminate
+     * unserved-demand capacity from WOs (e.g. BOM-child WOs not cascade-trimmed). Empty when
+     * [producedByComponent] or [workOrders] was not passed to [checkRunSoundness].
+     */
+    val woConservationViolations: List<String> = emptyList(),
 )
 
 /**
@@ -134,6 +154,28 @@ fun checkRunSoundness(
     workOrders: List<Map<String, Any?>> = emptyList(),
     committedDemands: List<Map<String, Any?>> = emptyList(),
     overrideIndex: Map<String, Map<String, Any?>> = emptyMap(),
+    /**
+     * R7e: inventory snapshot taken AFTER supply-split overrides, BEFORE planning.
+     * Pass [RunPlanningResult.inventoryEffectiveInitial]. Leave empty to skip the
+     * conservation check (e.g. when verifying a DB-loaded historical run).
+     */
+    inventoryEffectiveInitial: List<Map<String, Any?>> = emptyList(),
+    /**
+     * R7e: inventory state AFTER all planning passes (physical supply leftover).
+     * Pass [RunPlanningResult.inventoryLeftover]. Leave empty to skip the check.
+     */
+    inventoryLeftover: List<Map<String, Any?>> = emptyList(),
+    /**
+     * R7e: supply allocations from the plan output (`supply_allocations` field).
+     * Required when [inventoryEffectiveInitial] and [inventoryLeftover] are provided.
+     */
+    supplyAllocations: List<Map<String, Any?>> = emptyList(),
+    /**
+     * R7f: Phase 1 Step 2 component production totals (pid|lid → qty).
+     * Pass [RunPlanningResult.producedByComponent]. Leave empty to skip the
+     * component-conservation check (e.g. when verifying a DB-loaded historical run).
+     */
+    producedByComponent: Map<String, Double> = emptyMap(),
 ): SoundnessReport {
     // Index demands by id and lookup tables for rule checks.
     val demandById: Map<String, Map<String, Any?>> = demands.associateBy { it["demand_id"]?.toString() ?: "" }
@@ -386,8 +428,48 @@ fun checkRunSoundness(
         }
     }
 
+    // Served demand IDs: demands with committed qty > 0. Used to exclude unserved demands
+    // from conservation checks — their inventory was restored by plan()'s invCopy rollback.
+    val servedDemandIds: Set<String> = committedQtyById
+        .filter { (_, qty) -> qty > 1e-9 }
+        .keys
+
+    // R7e: conservation of mass — only when both inventory snapshots are provided.
+    // DB-loaded soundness checks on historical runs pass empty lists and skip this.
+    val conservationViolations: List<String> =
+        if (inventoryEffectiveInitial.isNotEmpty() && inventoryLeftover.isNotEmpty())
+            verifyInventoryConservation(
+                inventoryEffectiveInitial, inventoryLeftover, supplyAllocations,
+                servedDemandIds = servedDemandIds.ifEmpty { null },
+            )
+        else emptyList()
+
+    // R7f: component conservation — only when producedByComponent is provided.
+    val componentConservationViolations: List<String> =
+        if (producedByComponent.isNotEmpty())
+            verifyComponentConservation(
+                producedByComponent, planningPegging,
+                servedDemandIds = servedDemandIds.ifEmpty { null },
+            )
+        else emptyList()
+
+    // R7g: WO conservation — post-trim WO qty vs served-demand consumption.
+    val woConservationViolations: List<String> =
+        if (producedByComponent.isNotEmpty() && workOrders.isNotEmpty())
+            verifyWoConservation(
+                producedByComponent, planningPegging, workOrders,
+                servedDemandIds = servedDemandIds.ifEmpty { null },
+            )
+        else emptyList()
+
     val soundCount = demandReports.count { it.sound }
-    val overallSound = soundCount == demandReports.size && crossViolations.isEmpty()
+    // R7f (component conservation) and R7g (WO conservation) are efficiency signals:
+    // they fire at max_iterations=1 by design (budget leakage is expected and reclaimed
+    // naturally at higher iter counts). They do NOT gate overallSound so that sound plans
+    // can still be promoted to KB even when single-pass allocation leaves some slack.
+    val overallSound = soundCount == demandReports.size &&
+        crossViolations.isEmpty() &&
+        conservationViolations.isEmpty()
 
     return SoundnessReport(
         overallSound = overallSound,
@@ -396,6 +478,9 @@ fun checkRunSoundness(
         demands = demandReports,
         crossDemandViolations = crossViolations,
         deepCheck = config.deepCheck,
+        conservationViolations = conservationViolations,
+        componentConservationViolations = componentConservationViolations,
+        woConservationViolations = woConservationViolations,
     )
 }
 

@@ -489,7 +489,7 @@ class ResolutionEngineTest : FunSpec({
             "method_selection" to mapOf("multiple" to false),
             "variant_selection" to mapOf<String, Any?>(),
         )
-        val result = runPlanning(data + ("demand" to demands), configV2)
+        val result = runPlanning(data + ("demand" to demands), configV2).output
 
         @Suppress("UNCHECKED_CAST")
         val pegging = result["planning_pegging"] as List<Map<String, Any?>>
@@ -619,7 +619,7 @@ class ResolutionEngineTest : FunSpec({
             "method_selection" to mapOf("multiple" to false),
             "variant_selection" to mapOf<String, Any?>(),
         )
-        val result = runPlanning(data + ("demand" to demands), configV2)
+        val result = runPlanning(data + ("demand" to demands), configV2).output
 
         // Walk every pegging tree and collect every supply_id observed at supply nodes.
         @Suppress("UNCHECKED_CAST")
@@ -671,7 +671,7 @@ class ResolutionEngineTest : FunSpec({
             "method_selection" to mapOf("multiple" to false),
             "variant_selection" to mapOf<String, Any?>(),
         )
-        val result = runPlanning(data + ("demand" to demands), configV2)
+        val result = runPlanning(data + ("demand" to demands), configV2).output
 
         // Each demand gets a fair 5 of the RAW supply (no demand monopolizes via FIFO).
         @Suppress("UNCHECKED_CAST")
@@ -731,7 +731,7 @@ class ResolutionEngineTest : FunSpec({
             "method_selection" to mapOf("multiple" to false),
             "variant_selection" to mapOf<String, Any?>(),
         )
-        val result = runPlanning(data + ("demand" to demands), configV2)
+        val result = runPlanning(data + ("demand" to demands), configV2).output
 
         @Suppress("UNCHECKED_CAST")
         val workOrders = result["work_orders"] as List<Map<String, Any?>>
@@ -781,7 +781,7 @@ class ResolutionEngineTest : FunSpec({
             "method_selection" to mapOf("multiple" to false),
             "variant_selection" to mapOf<String, Any?>(),
         )
-        val result = runPlanning(data + ("demand" to demands), configV2)
+        val result = runPlanning(data + ("demand" to demands), configV2).output
 
         @Suppress("UNCHECKED_CAST")
         val committed = result["committed_demands"] as List<Map<String, Any?>>
@@ -828,7 +828,7 @@ class ResolutionEngineTest : FunSpec({
             "method_selection" to mapOf("multiple" to false),
             "variant_selection" to mapOf<String, Any?>(),
         )
-        val result = runPlanning(data + ("demand" to demands), configV2)
+        val result = runPlanning(data + ("demand" to demands), configV2).output
 
         @Suppress("UNCHECKED_CAST")
         val workOrders = result["work_orders"] as List<Map<String, Any?>>
@@ -939,7 +939,7 @@ class ResolutionEngineTest : FunSpec({
             "method_selection" to mapOf("multiple" to false),
             "variant_selection" to mapOf<String, Any?>(),
         )
-        val result = runPlanning(data + ("demand" to demands), configV2)
+        val result = runPlanning(data + ("demand" to demands), configV2).output
 
         @Suppress("UNCHECKED_CAST")
         val workOrders = result["work_orders"] as List<Map<String, Any?>>
@@ -985,7 +985,7 @@ class ResolutionEngineTest : FunSpec({
             "method_selection" to mapOf("multiple" to false),
             "variant_selection" to mapOf<String, Any?>(),
         )
-        val result = runPlanning(data + ("demand" to demands), configV2)
+        val result = runPlanning(data + ("demand" to demands), configV2).output
 
         @Suppress("UNCHECKED_CAST")
         val committed = result["committed_demands"] as List<Map<String, Any?>>

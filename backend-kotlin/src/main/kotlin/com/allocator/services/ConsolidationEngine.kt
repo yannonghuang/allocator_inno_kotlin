@@ -831,6 +831,13 @@ private fun applyPeggingConsumption(
     @Suppress("UNCHECKED_CAST")
     fun walk(node: Map<String, Any?>) {
         val type = node["type"] as? String
+        // Skip failed=true work_order subtrees — these are AND-bottleneck diagnostic
+        // snapshots of exploration branches that were rolled back (inventory restored)
+        // inside plan(). Their supply leaves were never netted from invCopy, so
+        // consuming them here would create ghost depletions in real inventory that
+        // never appear in supply_allocations (extractSupplyAllocations applies the
+        // same filter). Mirrors the failed=true guard in extractSupplyAllocations.
+        if (type == "work_order" && node["failed"] == true) return
         val supplyId = node["supply_id"] as? String
         if ((type == "supply" || type == "purchase") && !supplyId.isNullOrBlank()) {
             val qty = (node["quantity"] as? Number)?.toDouble() ?: 0.0

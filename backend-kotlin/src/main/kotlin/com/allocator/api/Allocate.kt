@@ -351,7 +351,7 @@ fun Routing.allocateRoutes() {
         }
 
         val result = runPlanning(data, config = config)
-        val enriched = enrichPlanResultWithData(caseId, result, data)
+        val enriched = enrichPlanResultWithData(caseId, result.output, data)
         casePlanResults[caseId] = enriched
         call.respond(anyToJson(enriched))
     }
@@ -2219,7 +2219,7 @@ internal suspend fun runPlanBackground(
         }
 
         val raw = runPlanning(data, config = config, progressCallback = progressCb)
-        val enriched = enrichPlanResultWithData(caseId, raw, data)
+        val enriched = enrichPlanResultWithData(caseId, raw.output, data)
         casePlanResults[caseId] = enriched
 
         // Mark run as ready (or auto-save when [autoSave] is true: write the
@@ -2384,7 +2384,7 @@ private suspend fun runOneBootstrapPreset(
 
     try {
         val raw = runPlanning(data, config = configMap)
-        val enriched = enrichPlanResultWithData(caseId, raw, data)
+        val enriched = enrichPlanResultWithData(caseId, raw.output, data)
         val resultJson = serializeResultOrNull(enriched)
         val serializeFailed = resultJson == null
 

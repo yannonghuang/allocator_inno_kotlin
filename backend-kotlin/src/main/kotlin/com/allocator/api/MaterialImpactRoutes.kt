@@ -409,7 +409,7 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
                 }
             }
             contingentResult = replanSemaphore.withPermit {
-                runPlanning(mutatedData, config = parsedConfig, progressCallback = progressCb)
+                runPlanning(mutatedData, config = parsedConfig, progressCallback = progressCb).output
             }
 
             // 6. Persist contingent plan run + material event record (only when persist=true).

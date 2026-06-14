@@ -88,7 +88,7 @@ class F28PeggingDebugTest : FunSpec({
             "variant_selection" to mapOf<String, Any?>(),
         )
 
-        val result = runPlanning(withDemands, config)
+        val result = runPlanning(withDemands, config).output
 
         @Suppress("UNCHECKED_CAST")
         val planningPegging = result["planning_pegging"] as List<Map<String, Any?>>
