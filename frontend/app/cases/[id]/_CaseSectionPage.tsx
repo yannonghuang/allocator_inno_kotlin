@@ -842,7 +842,6 @@ type WoEnrichedRow = WorkOrder & {
   _demand_label?: string;
   _demand_ids?: string[];
   _requested_qty?: number;
-  _shortage?: number;
   // demand-pivot extras
   _split_qty?: number;     // allocated_qty for this demand's slice of a shared WO
   _is_shared?: boolean;    // true if WO serves >1 demand
@@ -1308,7 +1307,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         .filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'))
         .filter((r) => {
           const m = (r.method ?? '').toLowerCase();
-          return m === 'make' || backedSigs.has(`${r.product_id ?? ''}|${r.location_id ?? ''}|${m}`);
+          // Mirror the table phantom filter exactly: make always passes; consolidated move WOs
+          // with null product_id (same-prod_area mixed-product shipments) pass unconditionally; everything else
+          // needs a pegging-backed supply signature.
+          if (m === 'make') return true;
+          if (m === 'move' && !r.product_id) return true;
+          return backedSigs.has(`${r.product_id ?? ''}|${r.location_id ?? ''}|${m}`);
         });
       const nonVirtualKeys = new Set(afterPhantom.map(woKey));
       // badge = phantom-filtered non-virtual unique + virtual unique (same dedup as table grouping)
@@ -5755,14 +5759,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
                         type="checkbox"
-                        checked={planDemandShortOnly}
-                        onChange={(e) => setPlanDemandShortOnly(e.target.checked)}
-                      />
-                      <span>{tP('committedDemands.filterShortOnly')}</span>
-                    </label>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
-                      <input
-                        type="checkbox"
                         checked={planWoHasOverride}
                         onChange={(e) => setPlanWoHasOverride(e.target.checked)}
                       />
@@ -5910,8 +5906,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     // Compute the supply-backing map early so it can drive the phantom filter below
                     // and also be used by the WO expand panel later in this block.
                     const { suppliesMap: woSuppliesMap, crossEntrySupplyMap: woCrossEntrySupplyMap, peggedQtyMap: woPeggedQtyMap } = buildWoMaps(planResult.planning_pegging ?? []);
-                    // Short-supply filter is WO-level and applied after enrichment (see below),
-                    // since WO-level shortage is computed from the enriched Requested/Committed.
                     // Filters refer to work-order pegging (each WO's supplies subtree), not demand pegging.
                     const anyPeggingFilter = planDemandRealMakeOnly || planDemandBuyOnly || planDemandRealMoveOnly || planWoDemandedByMultiple || planWoMultiSupply || planWoPurchaseOnly || planWoMakeOnly || planWoMoveOnly || planWoHasOverride;
                     if (anyPeggingFilter) {
@@ -5966,9 +5960,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       if (!planWorkOrderHideDummyProdArea && (r.product_id ?? '').trim().startsWith('VirtualProduct_')) return true;
                       const method = (r.method ?? '').toLowerCase();
                       if (method === 'make') return true;
-                      // Consolidated move WOs carry product_id=null (mixed-product shipment).
-                      // Their constituent native moves ARE backed in the pegging tree, but
-                      // the null product_id can never match a per-product signature in
+                      // Consolidated move WOs carry product_id=null (same-prod_area mixed-product
+                      // shipment). Their constituent native moves ARE backed in the pegging tree,
+                      // but the null product_id can never match a per-product signature in
                       // backedWoSigs — pass them through unconditionally.
                       if (method === 'move' && r.product_id == null) return true;
                       return backedWoSigs.has(`${r.product_id ?? ''}|${r.location_id ?? ''}|${(r.method ?? '').toLowerCase()}`);
@@ -6083,9 +6077,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           ? (demandInventoryMap.get(r.demand_id) ?? 0)
                           : splitDemandIds.reduce((s, did) => s + (demandInventoryMap.get(did) ?? 0), 0);
                       const requested = demandRequested != null ? Math.max(0, demandRequested - inventoryFulfilled) : undefined;
-                      // WO-level shortage = WO's own requested minus its committed output.
-                      const committedQty = Number(r.quantity) || 0;
-                      const shortage = requested != null ? Math.max(0, requested - committedQty) : 0;
                       return {
                         ...r,
                         _key: `wo-${i}-${r.product_id}-${r.location_id}`,
@@ -6094,12 +6085,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         _demand_label: demandLabel,
                         _demand_ids: r.demand_id ? [r.demand_id] : splitDemandIds,
                         _requested_qty: requested,
-                        _shortage: shortage > 0 ? shortage : undefined,
                       };
                     });
-                    let woRows: WoEnrichedRow[] = planDemandShortOnly
-                      ? woRowsAll.filter((r) => (r._shortage ?? 0) > 0.01)
-                      : woRowsAll;
+                    let woRows: WoEnrichedRow[] = woRowsAll;
                     if (woPegHighlightRow && woPegFilterPeggedOnly) {
                       // Same classifier the toolbar uses for the ↓/↑ counts —
                       // they cannot disagree.
@@ -6286,11 +6274,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           </span>
                         );
                       } },
-                      { key: '_shortage', label: tP('workOrders.columns.shortage'), sortable: true, render: (r) => {
-                        const s = r._shortage;
-                        if (!s) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
-                        return <span style={{ color: '#f87171' }}>{qtyFmt(Number(s))}</span>;
-                      } },
                       { key: 'location_source', label: tP('workOrders.columns.locationSource'), sortable: true, render: (r) => r.location_source ?? '–' },
                       { key: '_peg_order', label: tP('workOrders.columns.pegging'), sortable: true, render: (r) => {
                         const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
@@ -6391,12 +6374,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       if (sched) sched.width = '100%';
                     }
                     // ── Demand-pivot column set ──
-                    // • Drop _requested_qty, _shortage, _demand_label: the group header already
-                    //   shows demand-level totals, and per-WO Requested/Shortage (WO-scoped) would
-                    //   duplicate or compete with the header instead of adding signal.
+                    // • Drop _requested_qty, _demand_label: the group header already shows demand-level
+                    //   totals, and per-WO Requested (WO-scoped) would duplicate or compete with it.
                     // • Override product_id / quantity / method to handle synthetic inventory rows.
                     const woDemandColumns = woColumns
-                      .filter((col) => !['_requested_qty', '_shortage', '_demand_label'].includes(col.key as string))
+                      .filter((col) => !['_requested_qty', '_demand_label'].includes(col.key as string))
                       .map((col) => {
                         if (col.key === 'product_id') return {
                           ...col,

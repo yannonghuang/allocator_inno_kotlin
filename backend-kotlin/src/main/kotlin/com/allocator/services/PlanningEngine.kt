@@ -2967,14 +2967,17 @@ internal fun consolidateWorkOrdersByTiming(
     // constituents need NOT have identical sub-trees). qty = sum, start = min, end = max.
     //   • make / buy → keyed by (product, location, method, source, window): one batch per
     //     component, since each order produces/procures a single product.
-    //   • MOVE → keyed by (source, target, window) WITHOUT product: a physical move from one
-    //     location to another in a window is a single shipment that can carry DIFFERENT
-    //     components together. The merged move WO carries a `move_components` manifest.
+    //   • MOVE → keyed by (source, target, prod_area, window): a physical move from one
+    //     location to another in a window is a single shipment, but only components that
+    //     share the same prod_area are consolidated together — this preserves prod_area
+    //     attribution on the merged WO so pivot views align with the native breakdown.
+    //     The merged move WO still carries a `move_components` manifest.
     val groups = groupable.groupBy {
         if (it["method"] == "move") listOf(
             "move",
             (it["location_source"] as? String)?.trim(),  // source
             (it["location_id"] as? String)?.trim(),       // target
+            (it["prod_area"] as? String)?.trim(),          // same prod_area only
             bucketOf(it["start_time"] as? String),
         ) else listOf(
             (it["product_id"] as? String)?.trim(),
@@ -3008,10 +3011,11 @@ internal fun consolidateWorkOrdersByTiming(
         val overrideActive = wos.any { it["override_active"] == true }
 
         if (method == "move") {
-            // Mixed-product shipment: source → target in this window, carrying DIFFERENT components
-            // together. There is no single product_id — the cargo is the `move_components` manifest
-            // (one entry per product). lot_count = 1 (one shipment; a move models reachability, with
-            // no per-product lotting). Pegging is untouched; per-product move nodes stay in each
+            // Same-prod_area mixed-product shipment: source → target in this window, carrying
+            // DIFFERENT components together, but all belonging to the same prod_area. There is
+            // no single product_id — the cargo is the `move_components` manifest (one entry per
+            // product). lot_count = 1 (one shipment; a move models reachability, with no
+            // per-product lotting). Pegging is untouched; per-product move nodes stay in each
             // demand's tree, so soundness/drill-down by product still resolve there.
             val moveComponents = wos.groupBy { (it["product_id"] as? String)?.trim() ?: "" }
                 .map { (p, ws) ->
@@ -3023,7 +3027,7 @@ internal fun consolidateWorkOrdersByTiming(
                 }
                 .sortedBy { (it["product_id"] as? String) ?: "" }
             consolidatedOut.add(mapOf(
-                "product_id" to null,                          // mixed cargo
+                "product_id" to null,                          // mixed cargo within same prod_area
                 "location_id" to lid,                          // target
                 "quantity" to totalQty,                        // exact sum of constituents → conserved
                 "start_time" to formatDate(mergedStart),
@@ -3031,7 +3035,7 @@ internal fun consolidateWorkOrdersByTiming(
                 "method" to "move",
                 "location_source" to first["location_source"], // source
                 "demand_id" to null,
-                "prod_area" to null,
+                "prod_area" to first["prod_area"],             // shared prod_area of all constituents
                 "override_active" to overrideActive,
                 "wo_group_id" to cgid,
                 "consolidated_group_id" to cgid,
