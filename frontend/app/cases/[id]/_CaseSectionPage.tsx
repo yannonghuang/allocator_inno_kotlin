@@ -1376,6 +1376,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [supExplainRow, setSupExplainRow] = useState<PlanSupplyViewRow | null>(null);
   const [supExplainKey, setSupExplainKey] = useState<string | null>(null);
   const [woPeggingRowKey, setWoPeggingRowKey] = useState<string | null>(null);
+  // Tracks the original main-table row that opened the pegging panel. Unlike
+  // woPeggingRowKey (which changes on within-panel demand navigation), this
+  // stays fixed while the panel is open so the source row's highlight persists.
+  const [peggingAnchorKey, setPeggingAnchorKey] = useState<string | null>(null);
   // When a node is selected inside the open pegging tree, this stores the
   // pathKey (for tree-row highlight) and the parsed product|location pair
   // (for matching back to the WO table row(s) so the user sees which WO row
@@ -5574,7 +5578,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           stickyHeader
                           rowStyle={(r) => {
                             const k = `demand|${r.demand_id ?? ''}|${r.product_id}|${r.location_id}`;
-                            const isPegged = woPeggingRowKey === k;
+                            const isPegged = peggingAnchorKey === k || woPeggingRowKey === k;
                             // Pegging-selected wins over failed: when the user clicks Show on
                             // a failed demand, they need a clear visual anchor. We layer the
                             // sky-blue pegging accent ON TOP of the failed-row red wash so
@@ -5645,15 +5649,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             } },
                             { key: '_pegging', label: tP('committedDemands.columns.pegging'), sortable: false, render: (r) => {
                               const k = `demand|${r.demand_id ?? ''}|${r.product_id}|${r.location_id}`;
-                              const isSelected = woPeggingRowKey === k;
+                              const isSelected = peggingAnchorKey === k || woPeggingRowKey === k;
                               return (
                                 <button
                                   type="button"
                                   className="secondary"
                                   style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
                                   onClick={() => {
-                                    if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); }
-                                    else { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); }
+                                    if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPeggingAnchorKey(null); setSupExplainKey(null); setSupExplainRow(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); }
+                                    else { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPeggingAnchorKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); }
                                   }}
                                 >{tc('show')}</button>
                               );
@@ -6281,8 +6285,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       { key: 'location_source', label: tP('workOrders.columns.locationSource'), sortable: true, render: (r) => r.location_source ?? '–' },
                       { key: '_peg_order', label: tP('workOrders.columns.pegging'), sortable: true, render: (r) => {
                         const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
-                        // isPeggingActive: this WO's pegging is the direct content of the panel.
-                        const isPeggingActive = woPeggingRowKey === k;
+                        // isPeggingActive: this WO's pegging opened the panel (anchor) or is its direct content.
+                        const isPeggingActive = peggingAnchorKey === k || woPeggingRowKey === k;
                         // isHighlightRow: this row is the woPegHighlightRow — it stays true even
                         // when the panel switches to demand context (demand nav doesn't un-select the WO).
                         const isHighlightRow = !!woPegHighlightRow
@@ -6299,8 +6303,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
                             onClick={(e) => {
                               e.stopPropagation();
-                              if (isPeggingActive) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setWoPegHighlightRow(null); }
-                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setWoPegHighlightRow(r); }
+                              if (isPeggingActive) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPeggingAnchorKey(null); setSupExplainKey(null); setSupExplainRow(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setWoPegHighlightRow(null); }
+                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPeggingAnchorKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setWoPegHighlightRow(r); }
                             }}
                           >{tc('show')}</button>
                         );
@@ -6422,7 +6426,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       if (r._is_inventory) return { background: 'rgba(34,197,94,0.08)', color: '#16a34a', fontStyle: 'italic' as const };
                       const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
                       if (woExplainKey === k) return { background: 'rgba(167,139,250,0.15)', outline: '1px solid rgba(167,139,250,0.4)' };
-                      if (woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
+                      if (peggingAnchorKey === k || woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
                       // Pegging-graph highlight (driven by woPegHighlightRow / bar click or Show button).
                       // Checked before peggingSelectedProductLoc so the explicitly-selected row stays
                       // blue even when a demand-pegging tree node with the same product@location is clicked.
@@ -6673,7 +6677,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             rowStyle={(r) => {
                               const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
                               if (woExplainKey === k) return { background: 'rgba(167,139,250,0.15)', outline: '1px solid rgba(167,139,250,0.4)' };
-                              if (woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
+                              if (peggingAnchorKey === k || woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
                               // Amber tint for rows whose product@location matches the
                               // currently-selected node inside the open pegging tree
                               // (distinct from the sky-blue root-WO highlight above).
@@ -9586,9 +9590,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                       setPlanPeggingContext({ type: 'demand', row: demandRow });
                                       setPlanPeggingOpen(true);
                                       setWoPeggingRowKey(demandKey);
+                                      // Keep supExplainKey/supExplainRow set so the supply row stays
+                                      // highlighted while demand pegging is open. Cleared when the
+                                      // pegging panel is fully closed or on ← back.
                                       setSupExplainOpen(false);
-                                      setSupExplainKey(null);
-                                      setSupExplainRow(null);
                                     }}
                                   >{d.demandId}</button>
                                 ) : (
@@ -9937,7 +9942,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         >
           <div
             style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 0, pointerEvents: 'auto' }}
-            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); }}
+            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPeggingAnchorKey(null); setSupExplainKey(null); setSupExplainRow(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); }}
             aria-hidden
           />
           <div
@@ -10046,6 +10051,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     setPlanPeggingOpen(false);
                     setPlanPeggingContext(null);
                     setWoPeggingRowKey(null);
+                    setPeggingAnchorKey(null);
                     setPreviousSupExplainRow(null);
                     setPreviousWoExplainRow(null);
                   }}
@@ -10069,6 +10075,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     setPlanPeggingOpen(false);
                     setPlanPeggingContext(null);
                     setWoPeggingRowKey(null);
+                    setPeggingAnchorKey(null);
+                    setSupExplainKey(null);
+                    setSupExplainRow(null);
                     setPreviousWoExplainRow(null);
                   }}
                   style={{ background: 'none', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '0.78rem', padding: 0, display: 'flex', alignItems: 'center', gap: '0.3rem' }}
@@ -10089,7 +10098,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     ? tP('peggingPanel.titleDemand', { label: planPeggingContext.row.demand_id ?? planPeggingContext.row.product_id ?? '' })
                     : tP('peggingPanel.titleWorkOrder', { product: planPeggingContext.row.product_id ?? '', location: planPeggingContext.row.location_id ?? '' })}
               </h3>
-              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tc('close')}</button>
+              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPeggingAnchorKey(null); setSupExplainKey(null); setSupExplainRow(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tc('close')}</button>
             </div>
             <p style={{ margin: 0, marginBottom: '0.5rem', fontSize: '0.8rem', color: '#71717a' }}>
               {planPeggingContext.type === 'supply'
