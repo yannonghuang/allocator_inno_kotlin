@@ -1293,21 +1293,26 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     for (const entry of planResult?.planning_pegging ?? []) collectBacked(entry.tree);
 
     const effectiveCount = (wos: WorkOrder[]): number => {
-      // Mirror the table's filter order: VirtualProduct_* rows are removed first (before
-      // phantom filter), so they are always counted as "hidden" — not phantom-filtered.
-      const virtualCount = wos.filter((r) => (r.product_id ?? '').trim().startsWith('VirtualProduct_')).length;
-      const nonVirtual = wos.filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'));
-      const afterPhantom = nonVirtual.filter((r) => {
-        const m = (r.method ?? '').toLowerCase();
-        return m === 'make' || backedSigs.has(`${r.product_id ?? ''}|${r.location_id ?? ''}|${m}`);
-      });
-      const keys = new Set(afterPhantom.map((r) => [
+      // Both virtual and non-virtual counts use the same 6-field grouping key as the table
+      // so the badge reflects unique work orders, not raw lots (multiple lots of the same
+      // WO collapse into one row in the table and must be counted as one here too).
+      const woKey = (r: WorkOrder) => [
         String(r.demand_id ?? ''), String(r.product_id ?? ''), String(r.location_id ?? ''),
         String(r.method ?? ''), String(r.location_source ?? ''), String(r.prod_area ?? ''),
         r.consolidated ? String(r.wo_group_id ?? '') : '',
-      ].join('|')));
-      // badge = shown (unique non-virtual groups) + hidden (all virtual rows)
-      return keys.size + virtualCount;
+      ].join('|');
+      const virtualKeys = new Set(
+        wos.filter((r) => (r.product_id ?? '').trim().startsWith('VirtualProduct_')).map(woKey)
+      );
+      const afterPhantom = wos
+        .filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'))
+        .filter((r) => {
+          const m = (r.method ?? '').toLowerCase();
+          return m === 'make' || backedSigs.has(`${r.product_id ?? ''}|${r.location_id ?? ''}|${m}`);
+        });
+      const nonVirtualKeys = new Set(afterPhantom.map(woKey));
+      // badge = phantom-filtered non-virtual unique + virtual unique (same dedup as table grouping)
+      return nonVirtualKeys.size + virtualKeys.size;
     };
 
     return {
@@ -5955,6 +5960,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       collectBackedWos(entry.tree);
                     }
                     workOrderRows = workOrderRows.filter((r) => {
+                      // When VirtualProduct_* rows are explicitly shown (checkbox unchecked),
+                      // bypass the phantom filter — the checkbox is the sole visibility control
+                      // for these rows; phantom-filtering them would make unchecking ineffective.
+                      if (!planWorkOrderHideDummyProdArea && (r.product_id ?? '').trim().startsWith('VirtualProduct_')) return true;
                       const method = (r.method ?? '').toLowerCase();
                       if (method === 'make') return true;
                       // Consolidated move WOs carry product_id=null (mixed-product shipment).
@@ -6015,7 +6024,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       }
                       if (!demandLabelMap.has(id)) demandLabelMap.set(id, d.product_id);
                     }
-                    const dummyHiddenCount = activeWorkOrders.filter((r) => (r.product_id ?? '').trim().startsWith('VirtualProduct_')).length;
+                    const dummyHiddenCount = new Set(
+                      activeWorkOrders
+                        .filter((r) => (r.product_id ?? '').trim().startsWith('VirtualProduct_'))
+                        .map((r) => [
+                          String(r.demand_id ?? ''), String(r.product_id ?? ''), String(r.location_id ?? ''),
+                          String(r.method ?? ''), String(r.location_source ?? ''), String(r.prod_area ?? ''),
+                          r.consolidated ? String(r.wo_group_id ?? '') : '',
+                        ].join('|'))
+                    ).size;
                     const woRowsAll: WoEnrichedRow[] = groupedRows.map((r, i) => {
                       const splitDemandIds = (r.wo_consolidation_split_details ?? [])
                         .map((d) => d.demand_id)
@@ -6481,7 +6498,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     return (
                       <>
                         <p style={{ fontSize: '0.8rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
-                          Showing {qtyFmt(groupedRows.length)} work order{groupedRows.length !== 1 ? 's' : ''}
+                          Showing {qtyFmt(woRows.length)} work order{woRows.length !== 1 ? 's' : ''}
                           {planWorkOrderHideDummyProdArea && dummyHiddenCount > 0
                             ? ` (${qtyFmt(dummyHiddenCount)} with product_id = VirtualProduct_* hidden)`
                             : ''}
