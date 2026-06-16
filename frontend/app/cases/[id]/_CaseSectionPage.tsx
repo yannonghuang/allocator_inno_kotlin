@@ -9533,17 +9533,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         can see how the totals line up across paths. */}
                     <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
                       <colgroup>
-                        <col style={{ width: '28%' }} />
                         <col style={{ width: '24%' }} />
-                        <col style={{ width: '18%' }} />
-                        <col style={{ width: '15%' }} />
-                        <col style={{ width: '15%' }} />
+                        <col style={{ width: '20%' }} />
+                        <col style={{ width: '16%' }} />
+                        <col style={{ width: '13%' }} />
+                        <col style={{ width: '14%' }} />
+                        <col style={{ width: '13%' }} />
                       </colgroup>
                       <thead>
                         <tr style={{ color: '#a1a1aa', textAlign: 'left' }}>
                           <th style={{ paddingBottom: '0.2rem' }}>{tP('supExplain.peggedColDemand')}</th>
                           <th style={{ paddingBottom: '0.2rem' }}>{tP('supExplain.peggedColCustomer')}</th>
                           <th style={{ paddingBottom: '0.2rem' }}>{tP('supExplain.peggedColPath') /* 'Path' / '路径' */}</th>
+                          <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('supExplain.peggedColRequested')}</th>
                           <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('supExplain.peggedColQty')}</th>
                           <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('supExplain.peggedColShare')}</th>
                         </tr>
@@ -9597,6 +9599,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                   <span style={{ color: '#a1a1aa', fontStyle: 'italic' }} title="Direct main-loop / passthrough consumption (no consolidation split)">{tP('supExplain.peggedPathDirect') /* 'direct' / '直接' */}</span>
                                 )}
                               </td>
+                              <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right', color: '#a1a1aa' }}>{demandRow?.requested_qty != null ? qtyFmt(Number(demandRow.requested_qty)) : '–'}</td>
                               <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right' }}>{qtyFmt(Number(d.qtyConsumed))}</td>
                               <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right', color: '#a1a1aa' }}>{share.toFixed(1)}%</td>
                             </tr>

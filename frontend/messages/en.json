@@ -815,6 +815,7 @@
       "peggedColCustomer": "Customer",
       "peggedColPath": "Path",
       "peggedPathDirect": "direct",
+      "peggedColRequested": "Requested qty",
       "peggedColQty": "Qty consumed",
       "peggedColShare": "Share",
       "peggedShareNote": "Share = qty consumed by this demand ÷ total pegged qty for this supply. For consolidated supplies, this matches the allocation policy weight (see Consolidation split below).",
