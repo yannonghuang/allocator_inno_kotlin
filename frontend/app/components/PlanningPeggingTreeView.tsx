@@ -1,6 +1,6 @@
 'use client';
 
-import React from 'react';
+import React, { useRef, useEffect } from 'react';
 import { useTranslations } from 'next-intl';
 import type { PlanningPeggingNode } from '@/lib/api';
 import { qtyFmt } from '@/app/lib/format';
@@ -253,10 +253,17 @@ function NodeView({
   const explanationPath = `explain-${path}`;
   const isExplanationOpen = (explanationExpanded ?? new Set<string>()).has(explanationPath);
 
+  const nodeRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (isActiveMatch && nodeRef.current) {
+      nodeRef.current.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }, [isActiveMatch]);
+
   return (
     <div
       style={{ marginBottom: 4 }}
-      ref={isActiveMatch ? ((el) => { if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' }); }) : undefined}
+      ref={nodeRef}
     >
       <button
         type="button"

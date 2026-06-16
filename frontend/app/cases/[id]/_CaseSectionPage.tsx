@@ -9945,8 +9945,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               width: planPeggingPanelWidth,
               maxWidth: '90vw',
               minWidth: 320,
-              maxHeight: '100vh',
-              overflow: 'auto',
+              height: '100vh',
+              overflow: 'hidden',
               background: '#1c1c1e',
               color: '#e4e4e7',
               boxShadow: '-4px 0 24px rgba(0,0,0,0.4)',
@@ -10445,8 +10445,47 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 const matches: string[] = [];
                 const ancestors = new Set<string>();
                 const nodeMatches = (n: PlanningPeggingNode): boolean => {
-                  const fields = [n.product_id, n.demand_id, n.supply_id, n.location_id, n.method];
-                  return fields.some((f) => typeof f === 'string' && f.toLowerCase().includes(q));
+                  if (n.type === 'demand') {
+                    return [n.product_id, n.location_id].some(
+                      (f) => typeof f === 'string' && f.toLowerCase().includes(q)
+                    );
+                  }
+                  if (n.type === 'supply') {
+                    const pid = n.product_id;
+                    const sid = n.supply_id;
+                    if (typeof pid !== 'string' || typeof sid !== 'string') return false;
+                    // Standard lot supply_id = "pid_loc_lot" — sid starts with pid+"_".
+                    // These are detail nodes; the parent demand already covers this product
+                    // occurrence. Only consolidated/named supplies (e.g.
+                    // "consolidated_260-0141-02_2000") add a distinct occurrence.
+                    if (sid.toLowerCase().startsWith(pid.toLowerCase() + '_')) return false;
+                    return pid.toLowerCase().includes(q) || sid.toLowerCase().includes(q);
+                  }
+                  // work_order, purchase, operation, resource:
+                  // match only on location and method — NOT product_id (handled by demand
+                  // branch above) and NOT demand_id (it may embed the product_id string).
+                  return [n.location_id, n.method].some(
+                    (f) => typeof f === 'string' && f.toLowerCase().includes(q)
+                  );
+                };
+                // Mirror PlanningPeggingTreeView's child filtering so paths stay in sync.
+                const childContrib = (c: PlanningPeggingNode): number => {
+                  const cc = (c as { committed_qty?: number | null }).committed_qty;
+                  return Number((cc != null ? cc : c.quantity) ?? 0);
+                };
+                const visibleChildren = (n: PlanningPeggingNode): PlanningPeggingNode[] => {
+                  const raw = n.children ?? [];
+                  const isLegacyBlockedWo = n.type === 'work_order'
+                    && !n.failed
+                    && Number(n.quantity ?? 0) <= 1e-9
+                    && raw.length > 0;
+                  if (isLegacyBlockedWo) return [];
+                  if (n.children_relation === 'or' && raw.length > 1) {
+                    const contribCount = raw.filter(c => childContrib(c) > 1e-9).length;
+                    if (contribCount > 0 && contribCount < raw.length)
+                      return raw.filter(c => childContrib(c) > 1e-9);
+                  }
+                  return raw;
                 };
                 const walk = (n: PlanningPeggingNode, path: string, chain: string[]): void => {
                   const nextChain = [...chain, path];
@@ -10454,7 +10493,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     matches.push(path);
                     chain.forEach((p) => ancestors.add(p));
                   }
-                  (n.children ?? []).forEach((c, i) => walk(c, `${path}-${i}`, nextChain));
+                  visibleChildren(n).forEach((c, i) => walk(c, `${path}-${i}`, nextChain));
                 };
                 walk(tree, '0', []);
                 setPlanPeggingMatchPaths(matches);
@@ -10538,7 +10577,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         : `${planPeggingMatchIndex + 1} / ${planPeggingMatchPaths.length}`}
                     </span>
                   </div>
-                  <div style={{ marginTop: '0.5rem' }}>
+                  <div style={{ flex: 1, overflow: 'auto', minHeight: 0, marginTop: '0.5rem' }}>
                     {tree ? (
                       <PlanningPeggingTreeView
                         tree={tree}
