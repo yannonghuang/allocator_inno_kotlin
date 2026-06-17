@@ -115,21 +115,20 @@ internal fun runSupplyGuidedPlanning(
         "[supply-guided] request map built: {} demand rows, {} supply columns, {} cells",
         requestMatrix.byRow.size, requestMatrix.byColumn.size, requestMatrix.cellCount(),
     )
-    // ── Debug: dump request-map rows for every supply of 260-0141-02 ──────────────
-    val debugPid = "260-0141-02"
-    requestMatrix.byColumn
-        .filterKeys { it.productId == debugPid }
+    // Log contested supplies (>1 competing demand) sorted by total requested qty descending.
+    requestMatrix.byColumn.entries
+        .filter { it.value.size > 1 }
+        .sortedByDescending { e -> e.value.values.sum() }
         .forEach { (sk, demandNeeds) ->
-            log.info("[supply-guided][debug] request map for supply {}: {} competing demands", sk, demandNeeds.size)
-            demandNeeds.entries
-                .sortedByDescending { it.value }
-                .forEach { (demandId, need) ->
-                    log.info("[supply-guided][debug]   demand={} need={}", demandId, need)
-                }
+            val total = demandNeeds.values.sum()
+            val supplyQty = (data["supply"] ?: emptyList())
+                .filter { s -> s["product_id"]?.toString()?.trim() == sk.productId && s["location_id"]?.toString()?.trim() == sk.locationId }
+                .sumOf { s -> (s["qty"] as? Number)?.toDouble() ?: 0.0 }
+            log.info("[supply-guided][request] supply={}@{} supplyQty={} totalRequest={} demands={}  top={}",
+                sk.productId, sk.locationId, supplyQty.toLong(), total.toLong(), demandNeeds.size,
+                demandNeeds.entries.sortedByDescending { it.value }.take(8)
+                    .joinToString { (d, q) -> "$d:${q.toLong()}" })
         }
-    if (requestMatrix.byColumn.keys.none { it.productId == debugPid }) {
-        log.warn("[supply-guided][debug] request map has NO entries for product {}", debugPid)
-    }
 
     // ── Step 2: supply allocation ───────────────────────────────────────────────
     // Aggregate supply quantities; distribute each supply to its competing
@@ -149,20 +148,17 @@ internal fun runSupplyGuidedPlanning(
         "[supply-guided] initial allocation: {} demand rows, {} cells, mode={}",
         allocations.byRow.size, allocations.cellCount(), sgConfig.allocationMode,
     )
-    // ── Debug: dump allocation for every supply of 260-0141-02 ───────────────────
-    allocations.byColumn
-        .filterKeys { it.productId == debugPid }
+    // Log allocation for contested supplies (>1 demand received non-zero allocation).
+    allocations.byColumn.entries
+        .filter { it.value.size > 1 }
+        .sortedByDescending { e -> e.value.values.sum() }
         .forEach { (sk, demandAllocs) ->
-            log.info("[supply-guided][debug] allocation for supply {}: {} demands allocated", sk, demandAllocs.size)
-            demandAllocs.entries
-                .sortedByDescending { it.value }
-                .forEach { (demandId, qty) ->
-                    log.info("[supply-guided][debug]   demand={} allocated={}", demandId, qty)
-                }
+            val total = demandAllocs.values.sum()
+            log.info("[supply-guided][allocation] supply={}@{} totalAllocated={} demands={}  top={}",
+                sk.productId, sk.locationId, total.toLong(), demandAllocs.size,
+                demandAllocs.entries.sortedByDescending { it.value }.take(8)
+                    .joinToString { (d, q) -> "$d:${q.toLong()}" })
         }
-    if (allocations.byColumn.keys.none { it.productId == debugPid }) {
-        log.warn("[supply-guided][debug] allocation has NO entries for product {}", debugPid)
-    }
 
     // ── Build per-demand budgets from allocations ───────────────────────────────
     // plan() expects budgets keyed by "$productId|$locationId" (componentKey).
@@ -173,14 +169,6 @@ internal fun runSupplyGuidedPlanning(
         }
 
     val budgets = allocationsToBudgets(allocations)
-
-    // ── Debug: dump per-demand budgets for 260-0141-02 ───────────────────────────
-    budgets.forEach { (demandId, caps) ->
-        val debugCaps = caps.filterKeys { it.contains(debugPid) }
-        if (debugCaps.isNotEmpty()) {
-            log.info("[supply-guided][debug] budget for demand={}: {}", demandId, debugCaps)
-        }
-    }
 
     // ── Loop 2: commitment with budget caps ────────────────────────────────────
     // plan() for each demand consumes inventory up to the per-supply budget,

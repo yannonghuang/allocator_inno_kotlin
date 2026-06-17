@@ -4492,21 +4492,9 @@ fun runPlanning(
     // in 2026-05; only the leaf-level fixed-point pipeline remains.
     val supplyLevelAllocations: List<Map<String, Any?>> = emptyList()
     val supplyGuidedConfig = parseSupplyGuidedConfig(config)
-    if (consolidationConfig.enabled) {
-        val iterated = runV2Iterated(
-            demands, inventory, data, config, consolidationConfig, overrideIndex, progressCallback,
-        )
-        consolidatedWOs.addAll(iterated.consolidatedWOs)
-        consolidatedPegging.addAll(iterated.consolidatedPegging)
-        commitResult = iterated.commitResult
-        producedByComponent = iterated.producedByComponent
-        releasedByComponent = iterated.releasedByComponent
-    } else if (supplyGuidedConfig.enabled) {
-        // Supply-guided two-loop model:
-        //   Loop 1 — inventory-prioritized BOM walk → request map
-        //   Step 2 — demand-qty-proportional supply allocation → budgets
-        //   Loop 2 — plan() with budget caps + reconcile (Step 3a/3b)
-        //   Step 3c — compensation passes to GC unused budgets
+    // Supply-guided takes priority over legacy consolidation when enabled.
+    if (supplyGuidedConfig.enabled) {
+        // Two-loop model: Loop 1 (request map) → Step 2 (allocation) → Loop 2 (commit with caps).
         commitResult = runSupplyGuidedPlanning(
             demands          = demands,
             inventory        = inventory,
@@ -4515,6 +4503,15 @@ fun runPlanning(
             overrideIndex    = overrideIndex,
             progressCallback = progressCallback,
         )
+    } else if (consolidationConfig.enabled) {
+        val iterated = runV2Iterated(
+            demands, inventory, data, config, consolidationConfig, overrideIndex, progressCallback,
+        )
+        consolidatedWOs.addAll(iterated.consolidatedWOs)
+        consolidatedPegging.addAll(iterated.consolidatedPegging)
+        commitResult = iterated.commitResult
+        producedByComponent = iterated.producedByComponent
+        releasedByComponent = iterated.releasedByComponent
     } else {
         commitResult = legacyCommit(
             demands, inventory, data, config, overrideIndex,
