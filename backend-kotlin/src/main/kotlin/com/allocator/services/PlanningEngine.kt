@@ -458,8 +458,8 @@ private fun consumeFromInventory(
             val avail = (b["qty"] as? Number)?.toDouble() ?: 0.0
             if (avail <= 0) continue
             val sid = b["supply_id"]?.toString()
-            // Apply per-lot cap if present for this specific lot.
-            val lotCap = if (perLotBudget != null && sid != null) perLotBudget[sid] else null
+            // perLotBudget acts as a whitelist: a lot absent from the map gets cap 0.0 (not unlimited).
+            val lotCap = if (perLotBudget != null && sid != null) (perLotBudget[sid] ?: 0.0) else null
             val take = min(avail, if (lotCap != null) min(remaining, lotCap) else remaining)
             if (take <= 0) continue
             b["qty"] = avail - take
