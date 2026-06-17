@@ -16,7 +16,7 @@ private val log = LoggerFactory.getLogger("com.allocator.SupplyGuidedPlanning")
  *   Step 3c — GC of unused budgets via compensation passes
  */
 data class SupplyGuidedConfig(
-    val enabled: Boolean = false,
+    val enabled: Boolean = true,
     /**
      * Allocation mode for Step 2.
      *
@@ -42,7 +42,7 @@ fun parseSupplyGuidedConfig(config: Map<String, Any?>?): SupplyGuidedConfig {
     val sub = (config?.get("supply_guided") as? Map<*, *>) ?: return SupplyGuidedConfig()
     @Suppress("UNCHECKED_CAST")
     val m = sub as? Map<String, Any?> ?: return SupplyGuidedConfig()
-    val enabled = m["enabled"] as? Boolean ?: false
+    val enabled = m["enabled"] as? Boolean ?: true
     val allocationMode = when (m["allocation_mode"]?.toString()) {
         "fair"           -> "fair"
         "proportional"   -> "proportional"

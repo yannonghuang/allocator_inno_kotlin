@@ -51,7 +51,7 @@ class SupplyGuidedPlanningTest : FunSpec({
 
     test("parseSupplyGuidedConfig: defaults when key absent") {
         val cfg = parseSupplyGuidedConfig(emptyMap<String, Any?>())
-        cfg.enabled shouldBe false
+        cfg.enabled shouldBe true
         cfg.allocationMode shouldBe "demand_qty"
         cfg.maxCompensationPasses shouldBe 1
     }
@@ -293,7 +293,7 @@ class SupplyGuidedPlanningTest : FunSpec({
                 demand("D2", "FG", "L", qty = 40.0, priority = 1),
             ),
         )
-        val legacyConfig = mapOf("purchase_allowed" to false)
+        val legacyConfig = mapOf("purchase_allowed" to false, "supply_guided" to mapOf("enabled" to false))
         val result = runPlanning(data, legacyConfig)
         @Suppress("UNCHECKED_CAST")
         val committed = result.output["committed_demands"] as List<Map<String, Any?>>
