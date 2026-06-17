@@ -70,6 +70,31 @@ data class NeedsMatrix(
 fun buildNeedsMatrix(
     demands: List<Map<String, Any?>>,
     data: Map<String, List<Map<String, Any?>>>,
+): NeedsMatrix = buildNeedsMatrixImpl(demands, data, preferInventory = false)
+
+/**
+ * Build the needs matrix using an **inventory-prioritized** BOM walk.
+ *
+ * Identical to [buildNeedsMatrix] except that at each BOM node where
+ * multiple methods exist, the walker only follows methods whose immediate
+ * children are supply-bearing (present in the supply index). When no method
+ * has such children the walker falls back to all methods — the same union-all
+ * semantics as [buildNeedsMatrix].
+ *
+ * The effect: each demand's request is concentrated on BOM paths that lead to
+ * existing supply, so Phase-2 allocation gives those supplies a budget for
+ * this demand first. WO-only paths (where no inventory exists along any child)
+ * are still captured via the fallback, preserving full BOM coverage.
+ */
+fun buildInventoryAwareNeedsMatrix(
+    demands: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+): NeedsMatrix = buildNeedsMatrixImpl(demands, data, preferInventory = true)
+
+private fun buildNeedsMatrixImpl(
+    demands: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+    preferInventory: Boolean,
 ): NeedsMatrix {
     val supplyIndex: Set<SupplyKey> = (data["supply"] ?: emptyList())
         .filter { ((it["qty"] as? Number)?.toDouble() ?: 0.0) > 0 }
@@ -99,6 +124,7 @@ fun buildNeedsMatrix(
             supplyIndex = supplyIndex,
             visited = emptySet(),
             out = needs,
+            preferInventory = preferInventory,
         )
         if (needs.isNotEmpty()) {
             byRow[demandId] = needs
@@ -174,6 +200,14 @@ private fun walkBomSymbolic(
     supplyIndex: Set<SupplyKey>,
     @Suppress("UNUSED_PARAMETER") visited: Set<Pair<String, String>>,
     out: MutableMap<SupplyKey, Double>,
+    /**
+     * When true, at each BOM node where multiple methods exist, only the
+     * methods whose immediate children are supply-bearing are explored.
+     * Falls back to all methods when no method has inventory-bearing children.
+     * This concentrates requests on inventory-first paths (Step 1a of the
+     * supply-guided planning mental model).
+     */
+    preferInventory: Boolean = false,
 ) {
     val rootKey = productId to locationId
 
@@ -214,7 +248,15 @@ private fun walkBomSymbolic(
         val methods = getMethods(pid, lid, data)
         if (methods.isEmpty()) continue
 
+        // Collect per-method edges. When preferInventory is true we split into
+        // "inventory-covered" methods (any direct child is in supplyIndex) and
+        // the remaining methods, then only walk the inventory-covered subset
+        // when it is non-empty (Step 1a: inventory-first path selection).
+        val allMethodEdges   = mutableListOf<Pair<Pair<String, String>, Double>>()
+        val inventoryEdges   = mutableListOf<Pair<Pair<String, String>, Double>>()
+
         for (method in methods) {
+            val methodEdges = mutableListOf<Pair<Pair<String, String>, Double>>()
             when (method["type"]) {
                 "purchase" -> {
                     // Purchase materializes here; no children.
@@ -228,9 +270,7 @@ private fun walkBomSymbolic(
                             val cLid = (alt["location_id"] as? String)?.trim() ?: continue
                             val cRate = (alt["quantity"] as? Number)?.toDouble() ?: continue
                             if (cRate <= 0) continue
-                            val childKey = cPid to cLid
-                            outEdges.add(childKey to cRate)
-                            if (discovered.add(childKey)) toVisit.addLast(childKey)
+                            methodEdges.add((cPid to cLid) to cRate)
                         }
                     }
                 }
@@ -240,12 +280,22 @@ private fun walkBomSymbolic(
                         val cLid = (child["location_id"] as? String)?.trim() ?: continue
                         val cRate = (child["quantity"] as? Number)?.toDouble() ?: continue
                         if (cRate <= 0) continue
-                        val childKey = cPid to cLid
-                        outEdges.add(childKey to cRate)
-                        if (discovered.add(childKey)) toVisit.addLast(childKey)
+                        methodEdges.add((cPid to cLid) to cRate)
                     }
                 }
             }
+            allMethodEdges.addAll(methodEdges)
+            if (preferInventory && methodEdges.any { (ck, _) -> SupplyKey(ck.first, ck.second) in supplyIndex }) {
+                inventoryEdges.addAll(methodEdges)
+            }
+        }
+
+        // Inventory-first: only walk inventory-covered paths when any exist;
+        // otherwise fall back to all paths (union-all — same as non-guided).
+        val chosenEdges = if (preferInventory && inventoryEdges.isNotEmpty()) inventoryEdges else allMethodEdges
+        for ((childKey, rate) in chosenEdges) {
+            outEdges.add(childKey to rate)
+            if (discovered.add(childKey)) toVisit.addLast(childKey)
         }
     }
 

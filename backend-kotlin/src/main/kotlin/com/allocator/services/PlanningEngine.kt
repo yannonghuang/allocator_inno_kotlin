@@ -423,12 +423,18 @@ private fun consumeFromInventory(
     need: Double,
     preferDemandId: Any? = null,
     /**
-     * Optional hard cap on total qty consumed at this (productId, locationId) regardless of
-     * the demand's actual need. Used by Stage-3 budget-driven planning to enforce a per-demand
-     * allocation share at the merged-leaf component without polluting [inventory] with tagged
-     * synthetic buckets. `null` means unlimited (legacy behavior).
+     * Optional hard cap on total qty consumed at this (productId, locationId).
+     * Takes precedence over [perLotBudget] for the overall limit.
+     * `null` means unlimited (legacy behavior).
      */
     budgetCap: Double? = null,
+    /**
+     * Optional per-lot budget caps: supplyId → remaining qty allowed for this demand.
+     * When set, each lot is additionally capped by its own entry. The map is mutated
+     * in-place to deduct consumed amounts so the caller can track remaining budgets.
+     * Lots whose supplyId is absent from the map are uncapped at the lot level.
+     */
+    perLotBudget: MutableMap<String, Double>? = null,
 ): List<ConsumedBucket> {
     val pid = productId.trim()
     val lid = locationId.trim()
@@ -451,13 +457,20 @@ private fun consumeFromInventory(
             if (remaining <= 0) break
             val avail = (b["qty"] as? Number)?.toDouble() ?: 0.0
             if (avail <= 0) continue
-            val take = min(avail, remaining)
+            val sid = b["supply_id"]?.toString()
+            // Apply per-lot cap if present for this specific lot.
+            val lotCap = if (perLotBudget != null && sid != null) perLotBudget[sid] else null
+            val take = min(avail, if (lotCap != null) min(remaining, lotCap) else remaining)
+            if (take <= 0) continue
             b["qty"] = avail - take
             remaining -= take
+            if (perLotBudget != null && sid != null && lotCap != null) {
+                perLotBudget[sid] = (lotCap - take).coerceAtLeast(0.0)
+            }
             val sd = b["supply_date"] as? String
             val commitTime = if (sd != null) formatDate(parseDate(sd)) else null
             consumed.add(ConsumedBucket(
-                supplyId = b["supply_id"]?.toString(),
+                supplyId = sid,
                 qty = take,
                 commitTime = commitTime,
             ))
@@ -2013,11 +2026,58 @@ fun plan(
 
     // 1) Fulfill from inventory (FIFO)
     val componentKey = "$productId|$locationId"
+    // Per-lot caps: collect all budget entries whose key starts with "$pid|$lid|".
+    val perLotBudget: MutableMap<String, Double>? = budget?.let { b ->
+        val prefix = "$componentKey|"
+        val lotEntries = b.entries.filter { it.key.startsWith(prefix) }
+        if (lotEntries.isEmpty()) null
+        else lotEntries.associateTo(mutableMapOf()) { (k, v) ->
+            k.removePrefix(prefix) to v   // supplyId → remaining
+        }
+    }
+    // Aggregate cap: explicit key, or sum of per-lot entries.
+    // In non-realPegging mode all synthetic supplies share supply_id "consolidated_pid_lid" so
+    // no per-lot key ever matches inside consumeFromInventory — the aggregate cap is the only
+    // guard; perLotBudget values are reduced proportionally on write-back.
+    val totalLotBudgetBefore = perLotBudget?.values?.sum() ?: 0.0
     val budgetCap = budget?.get(componentKey)
-    val consumedBuckets = consumeFromInventory(inventory, productId, locationId, quantity, preferDemandId, budgetCap)
+        ?: perLotBudget?.values?.sum()?.takeIf { it > 1e-9 }
+    val consumedBuckets = consumeFromInventory(
+        inventory, productId, locationId, quantity, preferDemandId, budgetCap, perLotBudget,
+    )
     val taken = consumedBuckets.sumOf { it.qty }
-    if (budget != null && budgetCap != null) {
+    // Write back per-lot budget remainders.
+    if (budget != null && perLotBudget != null) {
+        val lotCapWasConsumed = (totalLotBudgetBefore - (perLotBudget.values.sum())) > 1e-9
+        if (lotCapWasConsumed) {
+            // realPegging: per-lot caps were enforced in-place by consumeFromInventory; write back.
+            for ((sid, remaining) in perLotBudget) {
+                budget["$componentKey|$sid"] = remaining
+            }
+        } else if (taken > 1e-9 && totalLotBudgetBefore > 1e-9) {
+            // non-realPegging: synthetic supply_id didn't match any lot key, so lot entries
+            // were not mutated. Proportionally reduce all lot entries to track the aggregate.
+            val consumedFraction = taken.coerceAtMost(totalLotBudgetBefore) / totalLotBudgetBefore
+            for ((sid, cap) in perLotBudget) {
+                budget["$componentKey|$sid"] = (cap * (1.0 - consumedFraction)).coerceAtLeast(0.0)
+            }
+        }
+    }
+    if (budget != null && budgetCap != null && budget.containsKey(componentKey)) {
         budget[componentKey] = (budgetCap - taken).coerceAtLeast(0.0)
+    }
+    // ── [MAP] Log draws on 260-0141-02 per lot ───────────────────────────────────
+    if (productId == "260-0141-02") {
+        consumedBuckets.forEach { cb ->
+            val lotKey = if (cb.supplyId != null) "$componentKey|${cb.supplyId}" else componentKey
+            val lotCap = budget?.get(lotKey) // remaining after deduction
+            log.info("[map][draw] demand={} lot={} taken={} budgetRemaining={}",
+                preferDemandId, cb.supplyId ?: "(agg)", cb.qty.toLong(), lotCap?.toLong() ?: "N/A")
+        }
+        if (consumedBuckets.isEmpty()) {
+            log.info("[map][draw] demand={} supply={} need={} taken=0 (no inventory or capped)",
+                preferDemandId, componentKey, quantity.toLong())
+        }
     }
     val fulfillCommitTime = consumedBuckets.firstOrNull()?.commitTime
     val demandFulfilledList = mutableListOf<Map<String, Any?>>()
@@ -3820,11 +3880,47 @@ private fun runV2Iterated(
     val initialInventory: List<Map<String, Any?>> = inventory.map { it.toMap() }
 
     val graph    = buildResolutionGraph(demands, data)
-    val ancestry = BomAncestry(data["bom"] ?: emptyList())
+    // ── [MAP] Request map: raw paths per supply column ───────────────────────────
+    // Groups every resolution path by (supplyPid, supplyLid); each entry shows which
+    // demands reach that supply and at what quantity — this is the request map.
+    run {
+        val byColumn = graph.paths.groupBy { Triple(it.leaf.productId, it.leaf.locationId, it.leaf.supplyId) }
+        val contested = byColumn.filter { (_, ps) -> ps.map { it.demandId }.toSet().size > 1 }
+        log.info("[map][request] {} supply lots total, {} contested (>1 demand)",
+            byColumn.size, contested.size)
+        contested.entries
+            .sortedWith(compareBy({ it.key.first }, { it.key.second }, { it.key.third ?: "" }))
+            .forEach { (col, paths) ->
+                val byDemand = paths.groupBy { it.demandId }
+                log.info("[map][request] supply={}@{} lot={} demands={}  qty-by-demand={}",
+                    col.first, col.second, col.third ?: "?", byDemand.size,
+                    byDemand.entries.sortedByDescending { e -> e.value.sumOf { it.leafQuantity() } }
+                        .take(10)
+                        .joinToString { (d, ps) -> "$d:${ps.sumOf { it.leafQuantity() }.toLong()}" })
+            }
+    }
+
     // Pass 1 (inventory allocation) ALWAYS pools universally — bucket 0 — so scarce
     // on-hand stock is shared fairly across every competing demand regardless of due
     // date. (The UI "Bucket (days)" controls Pass 2 / WO batching, a separate schedule.)
-    val baseMerged = mergeGroups(graph, ancestry, periodDays = 0)
+    val baseMerged = mergeGroups(graph, periodDays = 0)
+
+    // ── [MAP] Demand map: per-supply groups used by consolidation ────────────────
+    // Identical to request map — each group is the set of demands competing for that supply.
+    run {
+        val contested = baseMerged.filter { it.members.map { m -> m.demandId }.toSet().size > 1 }
+        log.info("[map][demand] {} supply lots total, {} contested (>1 demand)",
+            baseMerged.size, contested.size)
+        contested
+            .sortedWith(compareBy({ it.leafPid }, { it.leafLid }, { it.supplyId ?: "" }))
+            .forEach { g ->
+                log.info("[map][demand] supply={}@{} lot={} totalQty={} demands={}  top-demands={}",
+                    g.leafPid, g.leafLid, g.supplyId ?: "?", g.totalQty.toLong(),
+                    g.members.map { it.demandId }.toSet().size,
+                    g.members.sortedByDescending { it.qty }.take(10)
+                        .joinToString { m -> "${m.demandId}:${m.qty.toLong()}" })
+            }
+    }
 
     var memberCaps: Map<Pair<String, String>, Map<Any?, Double>> = emptyMap()
     var lastConsolidatedWOs: List<Map<String, Any?>> = emptyList()
@@ -3890,6 +3986,30 @@ private fun runV2Iterated(
                 structuralFailedMakes = structuralFailedMakes)
         }
 
+        // ── [MAP] Allocation map: per-demand per-supply allocations ─────────────────
+        // For iter=0 only — shows what each demand was promised from each supply.
+        if (iter == 0) {
+            // Group by supply column → list of (demand, qty)
+            val bySupply = mutableMapOf<String, MutableList<Pair<Any?, Double>>>()
+            for ((demandId, allocs) in consResult.allocation) {
+                for ((componentKey, qty) in allocs) {
+                    if (qty > 1e-9) bySupply.getOrPut(componentKey) { mutableListOf() }.add(demandId to qty)
+                }
+            }
+            val contested = bySupply.filter { it.value.size > 1 }
+            log.info("[map][allocation] iter=0: {} supply columns allocated, {} contested (>1 demand)",
+                bySupply.size, contested.size)
+            contested.entries
+                .sortedBy { it.key }
+                .forEach { (col, entries) ->
+                    val total = entries.sumOf { it.second }
+                    log.info("[map][allocation]   supply={} total={} demands={}  breakdown={}",
+                        col, total.toLong(), entries.size,
+                        entries.sortedByDescending { it.second }.take(10)
+                            .joinToString { (d, q) -> "$d:${q.toLong()}" })
+                }
+        }
+
         // The output components Pass-1 allocated (merged-leaf level). Deep BOM-child supplies it
         // consumed inside its own plan() stay depleted in both paths — only these outputs are
         // re-supplied to per-demand planning.
@@ -3908,7 +4028,7 @@ private fun runV2Iterated(
             // real lots capped by `budgets` → same allocation, real pegging. (Restoring the full
             // inventory instead would let demands re-consume deep raws and drift the allocation.)
             val allocatedPLs = producedByComponent.keys.map {
-                val p = it.split("|", limit = 2)
+                val p = it.split("|")
                 (p.getOrElse(0) { "" }.trim()) to (p.getOrElse(1) { "" }.trim())
             }.toHashSet()
             fun plOf(m: Map<String, Any?>) =
@@ -3916,15 +4036,28 @@ private fun runV2Iterated(
             inventory.removeAll { plOf(it) in allocatedPLs }
             for (b in initialInventory) if (plOf(b) in allocatedPLs) inventory.add(b.toMutableMap())
         } else {
-            // Emit one untagged synthetic supply per (pid, lid) for every produced component.
+            // Build a lookup of supply_date by supply_id from the pre-consolidation inventory so
+            // synthetic buckets preserve the original lot's availability date, maintaining
+            // FIFO ordering (on-hand inventory consumed before future work orders).
+            // supply_id uses "consolidated_pid_lid" (NOT the real lot id) so that demand pegging
+            // in plan() references a distinct key and doesn't double-count with the real lot's
+            // consolidation pegging tree.
+            val initialSupplyDates: Map<String, String?> = initialInventory
+                .mapNotNull { b -> (b["supply_id"] as? String)?.let { sid -> sid to b["supply_date"] as? String } }
+                .toMap()
             for ((componentKey, totalQty) in producedByComponent) {
                 if (totalQty <= 1e-12) continue
-                val parts = componentKey.split("|", limit = 2)
+                val parts = componentKey.split("|")
                 val pid = parts.getOrElse(0) { "" }
                 val lid = parts.getOrElse(1) { "" }
-                val supplyDate = consResult.consolidatedWOs
-                    .firstOrNull { it["product_id"] == pid && it["location_id"] == lid }
-                    ?.get("end_time") as? String
+                val originalSupplyId = parts.getOrElse(2) { "" }.ifBlank { null }
+                val supplyDate = if (originalSupplyId != null) {
+                    initialSupplyDates[originalSupplyId]
+                } else {
+                    consResult.consolidatedWOs
+                        .firstOrNull { it["product_id"] == pid && it["location_id"] == lid }
+                        ?.get("end_time") as? String
+                }
                 inventory.add(mutableMapOf(
                     "product_id"  to pid,
                     "location_id" to lid,
@@ -3946,6 +4079,26 @@ private fun runV2Iterated(
         }
         val budgets: Map<Any?, MutableMap<String, Double>> = consResult.allocation.mapValues { (_, allocs) ->
             allocs.mapValues { (_, q) -> q }.toMutableMap()
+        }
+
+        // ── [MAP] Budget map: per-demand caps entering plan() ────────────────────
+        // For iter=0 only. Each entry = what plan() is allowed to consume from that supply.
+        if (iter == 0) {
+            val bySupply = mutableMapOf<String, MutableList<Pair<Any?, Double>>>()
+            for ((demandId, caps) in budgets) {
+                for ((supplyKey, cap) in caps) {
+                    if (cap > 1e-9) bySupply.getOrPut(supplyKey) { mutableListOf() }.add(demandId to cap)
+                }
+            }
+            val contested = bySupply.filter { it.value.size > 1 }
+            log.info("[map][budget] iter=0: {} supplies with caps, {} contested",
+                bySupply.size, contested.size)
+            contested.entries.sortedBy { it.key }.forEach { (supplyKey, entries) ->
+                log.info("[map][budget]   supply={} capped-demands={}  caps={}",
+                    supplyKey, entries.size,
+                    entries.sortedByDescending { it.second }.take(10)
+                        .joinToString { (d, q) -> "$d:${q.toLong()}" })
+            }
         }
 
         // Phase 3 — forward progressCallback live, tagged with iteration metadata
@@ -3970,6 +4123,27 @@ private fun runV2Iterated(
             sharedStructuralFailedMakes = structuralFailedMakes,
             iter0Allocation = iter0AllocationSnapshot,
         )
+
+        // ── [MAP] Budget consumption: drawn vs cap after plan() for each demand ──
+        if (iter == 0) {
+            val bySupply = mutableMapOf<String, MutableList<Triple<Any?, Double, Double>>>() // demand, cap, drawn
+            for ((demandId, caps) in initialBudgets) {
+                val remaining = budgets[demandId] ?: emptyMap()
+                for ((supplyKey, cap) in caps) {
+                    if (cap < 1e-9) continue
+                    val drawn = cap - (remaining[supplyKey] ?: 0.0)
+                    bySupply.getOrPut(supplyKey) { mutableListOf() }.add(Triple(demandId, cap, drawn.coerceAtLeast(0.0)))
+                }
+            }
+            bySupply.filter { it.value.size > 1 }.entries.sortedBy { it.key }.forEach { (supplyKey, entries) ->
+                val totalCap   = entries.sumOf { it.second }
+                val totalDrawn = entries.sumOf { it.third }
+                log.info("[map][consumed] supply={} cap={} drawn={} unused={}  breakdown={}",
+                    supplyKey, totalCap.toLong(), totalDrawn.toLong(), (totalCap - totalDrawn).toLong(),
+                    entries.sortedByDescending { it.third }.take(10)
+                        .joinToString { (d, c, w) -> "$d:drawn=${w.toLong()}/cap=${c.toLong()}" })
+            }
+        }
 
         // Over-production: any leftover budget at the merged leaf.
         val totalOver = budgets.values.sumOf { db ->
@@ -4086,18 +4260,21 @@ private fun runV2Iterated(
         val overByComponent = mutableMapOf<String, Double>()
         for ((demandId, demandBudget) in budgets) {
             val initial = initialBudgets[demandId] ?: continue
+            val consumedByPidLid = mutableMapOf<Pair<String, String>, Double>()
             for ((componentKey, remaining) in demandBudget) {
                 val initQty = initial[componentKey] ?: continue
                 val consumed = (initQty - remaining).coerceAtLeast(0.0)
-                val parts = componentKey.split("|", limit = 2)
+                val parts = componentKey.split("|")
                 val pid = parts.getOrElse(0) { "" }
                 val lid = parts.getOrElse(1) { "" }
-                val key = Pair(pid, lid)
-                val prevCap = prevCaps[key]?.get(demandId) ?: Double.POSITIVE_INFINITY
-                newCaps.getOrPut(key) { mutableMapOf() }[demandId] = min(prevCap, consumed)
+                consumedByPidLid.merge(Pair(pid, lid), consumed, Double::plus)
                 if (remaining > 1e-9) {
                     overByComponent.merge(componentKey, remaining, Double::plus)
                 }
+            }
+            for ((key, totalConsumed) in consumedByPidLid) {
+                val prevCap = prevCaps[key]?.get(demandId) ?: Double.POSITIVE_INFINITY
+                newCaps.getOrPut(key) { mutableMapOf() }[demandId] = min(prevCap, totalConsumed)
             }
         }
         memberCaps = newCaps
@@ -4117,7 +4294,7 @@ private fun runV2Iterated(
  * phase 2 (real supplies + tagged synthetic buckets). Emits committed rows,
  * work orders, and per-demand pegging trees.
  */
-private fun legacyCommit(
+internal fun legacyCommit(
     demands: List<Map<String, Any?>>,
     inventory: MutableList<MutableMap<String, Any?>>,
     data: Map<String, List<Map<String, Any?>>>,
@@ -4303,6 +4480,7 @@ fun runPlanning(
     val consolidatedPegging = mutableListOf<Map<String, Any?>>()
 
     // Consolidation enabled → fixed-point iteration (phases 2+3+4 fused).
+    // Supply-guided enabled → two-loop model (request map → allocation → budget-commit).
     // Disabled → run phase 3 directly against real inventory; useTaggedLookup
     // is needed only for supply-split overrides (real buckets split per demand).
     val commitResult: LegacyCommitResult
@@ -4313,6 +4491,7 @@ fun runPlanning(
     // The supply-level orchestrator (consolidation.scope="all") was retired
     // in 2026-05; only the leaf-level fixed-point pipeline remains.
     val supplyLevelAllocations: List<Map<String, Any?>> = emptyList()
+    val supplyGuidedConfig = parseSupplyGuidedConfig(config)
     if (consolidationConfig.enabled) {
         val iterated = runV2Iterated(
             demands, inventory, data, config, consolidationConfig, overrideIndex, progressCallback,
@@ -4322,6 +4501,20 @@ fun runPlanning(
         commitResult = iterated.commitResult
         producedByComponent = iterated.producedByComponent
         releasedByComponent = iterated.releasedByComponent
+    } else if (supplyGuidedConfig.enabled) {
+        // Supply-guided two-loop model:
+        //   Loop 1 — inventory-prioritized BOM walk → request map
+        //   Step 2 — demand-qty-proportional supply allocation → budgets
+        //   Loop 2 — plan() with budget caps + reconcile (Step 3a/3b)
+        //   Step 3c — compensation passes to GC unused budgets
+        commitResult = runSupplyGuidedPlanning(
+            demands          = demands,
+            inventory        = inventory,
+            data             = data,
+            config           = config,
+            overrideIndex    = overrideIndex,
+            progressCallback = progressCallback,
+        )
     } else {
         commitResult = legacyCommit(
             demands, inventory, data, config, overrideIndex,

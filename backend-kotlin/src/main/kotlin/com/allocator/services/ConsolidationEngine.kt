@@ -147,13 +147,15 @@ data class ComponentNeed(
     val viaOrAlternative: Boolean = false,
 )
 
-/** A group of component needs sharing the same (productId, locationId, timeBucket). */
+/** A group of component needs sharing the same (productId, locationId, supplyId, timeBucket). */
 data class ConsolidationGroup(
     val productId: String,
     val locationId: String,
     val timeBucket: LocalDate,
     val needs: List<ComponentNeed>,
     val totalQty: Double,
+    /** Supply lot identifier — when set, this group competes only for that specific lot. */
+    val supplyId: String? = null,
 )
 
 /** Parsed from the "consolidation" key in the run config map. */
@@ -175,9 +177,9 @@ data class ConsolidationConfig(
      * synthetic `consolidated_<pid>_<lid>` bucket, and the `demand_id=null` production trees are
      * dropped. The fair split is unchanged (still enforced by `budgets`) — only the CARRIER changes,
      * so the per-demand pegging resolves to real supplies (no consolidation artifact in pegging).
-     * Default false until soak-validated. See [[no_consolidated_in_pegging]].
+     * Default true: real lots are the carriers, pegging resolves cleanly. See [[no_consolidated_in_pegging]].
      */
-    val realPegging: Boolean = false,
+    val realPegging: Boolean = true,
 )
 
 /** Output of runConsolidation(). */
@@ -205,7 +207,7 @@ fun parseConsolidationConfig(config: Map<String, Any?>?): ConsolidationConfig {
     // converge loop (clamped to the 15 hard ceiling). Accept both "max_iterations"
     // and the shorter "max_iter".
     val maxIterations = ((m["max_iterations"] ?: m["max_iter"]) as? Number)?.toInt()?.coerceIn(1, 15) ?: 1
-    val realPegging = m["real_pegging"] as? Boolean ?: false
+    val realPegging = m["real_pegging"] as? Boolean ?: true
     // Note: legacy `scope=all` configs are silently coerced to leaf-only on
     // re-plan. The supply-level orchestrator was retired in 2026-05.
     return ConsolidationConfig(enabled, periodDays, allocationMode, maxIterations, realPegging)
@@ -580,7 +582,10 @@ fun runConsolidation(
     )
 
     for (group in groups) {
-        val componentKey = "${group.productId}|${group.locationId}"
+        val componentKey = if (group.supplyId != null)
+            "${group.productId}|${group.locationId}|${group.supplyId}"
+        else
+            "${group.productId}|${group.locationId}"
 
         // `timeBucket` is the grouping KEY — under single-bucket consolidation
         // (period_days<=0) it is LocalDate.EPOCH (1970-01-01) so every need collapses
@@ -602,14 +607,39 @@ fun runConsolidation(
         // inventory. Groups with no on-hand stock here are skipped: per-demand
         // planning (legacyCommit) produces / moves whatever the stock doesn't cover
         // (including cross-location stock, handled per-demand for now).
+        // When the group is scoped to a specific supply lot, check only that lot's qty and
+        // zero out sibling lots in invCopy so planFn can't spill into them. Without this,
+        // the first per-lot group for a multi-lot location consumes all lots via planFn,
+        // depletes real inventory via applyPeggingConsumption, and leaves the remaining
+        // per-lot groups with availableInv=0 → skipped → no allocation cap → uncapped draws.
         val availableInv = inventory
             .filter {
                 (it["product_id"] as? String)?.trim() == group.productId &&
-                    (it["location_id"] as? String)?.trim() == group.locationId
+                    (it["location_id"] as? String)?.trim() == group.locationId &&
+                    (group.supplyId == null || it["supply_id"]?.toString() == group.supplyId)
             }
             .sumOf { (it["qty"] as? Number)?.toDouble() ?: 0.0 }
         if (availableInv <= 1e-9) continue
         val allocatableQty = minOf(group.totalQty, availableInv)
+
+        // Build lot-scoped inventory copy: when group.supplyId is set, zero out other lots
+        // at the same (pid, lid) so planFn only sees this lot's supply.
+        fun buildInvCopy(): MutableList<MutableMap<String, Any?>> = inventory.map { b ->
+            val lotQty: Any? = if (
+                group.supplyId != null &&
+                (b["product_id"] as? String)?.trim() == group.productId &&
+                (b["location_id"] as? String)?.trim() == group.locationId &&
+                b["supply_id"]?.toString() != group.supplyId
+            ) 0.0 else b["qty"]
+            mutableMapOf(
+                "product_id"  to b["product_id"],
+                "location_id" to b["location_id"],
+                "supply_date" to b["supply_date"],
+                "supply_id"   to b["supply_id"],
+                "qty"         to lotQty,
+                "demand_tag"  to b["demand_tag"],
+            )
+        }.toMutableList()
 
         if (group.needs.size == 1) {
             // Single-demand group — pass through with original demandId, no change in behavior.
@@ -629,16 +659,7 @@ fun runConsolidation(
                 "request_time"     to scheduleBucket.toString(),
                 "priority"         to need.priority,
             )
-            val invCopy = inventory.map { b ->
-                mutableMapOf(
-                    "product_id"  to b["product_id"],
-                    "location_id" to b["location_id"],
-                    "supply_date" to b["supply_date"],
-                    "supply_id"   to b["supply_id"],
-                    "qty"         to b["qty"],
-                    "demand_tag"  to b["demand_tag"],
-                )
-            }.toMutableList()
+            val invCopy = buildInvCopy()
             val (committed, wos, pegging) = planFn(syntheticDemand, invCopy, data, scheduleBucket, 500, emptySet(), planConfig, null)
             // Exclude hard-failure rows (no_methods / no_preferred_method / depth_limit /
             // child_failed:*) from producedQty — those represent unmet demand, not real production.
@@ -690,16 +711,7 @@ fun runConsolidation(
                 "request_time"     to scheduleBucket.toString(),
                 "priority"         to 0,
             )
-            val invCopy = inventory.map { b ->
-                mutableMapOf(
-                    "product_id"  to b["product_id"],
-                    "location_id" to b["location_id"],
-                    "supply_date" to b["supply_date"],
-                    "supply_id"   to b["supply_id"],
-                    "qty"         to b["qty"],
-                    "demand_tag"  to b["demand_tag"],
-                )
-            }.toMutableList()
+            val invCopy = buildInvCopy()
             val (committed, wos, pegging) = planFn(syntheticDemand, invCopy, data, scheduleBucket, 500, emptySet(), planConfig, null)
             // Exclude hard-failure rows from producedQty — see passthrough branch for rationale.
             val producedQty = committed
