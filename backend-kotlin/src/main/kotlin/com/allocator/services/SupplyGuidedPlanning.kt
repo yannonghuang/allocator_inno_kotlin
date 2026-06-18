@@ -146,7 +146,9 @@ internal fun runSupplyGuidedPlanning(
     // Critical-materials filter: budget caps apply only to non-purchasable materials.
     // Open-world semantics: absent from the allocation map ⇒ uncapped.
     val purchasable = effectivePurchasableSet(config, data)
-    val criticalMatrix = if (purchasable == null) NeedsMatrix(emptyMap(), emptyMap())
+    // purchasable=null means no purchase restriction is configured → treat all materials as
+    // critical (conservative, preserves pre-existing supply-guided behavior).
+    val criticalMatrix = if (purchasable == null) requestMatrix
                          else filterToCritical(requestMatrix, purchasable)
     log.info(
         "[supply-guided] critical matrix: {} supply columns (non-purchasable) of {} total",

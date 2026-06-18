@@ -924,6 +924,26 @@ private fun scoreVariant(
 private data class Quadruple<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
 
 /**
+ * Probe-based variant scorer — O(children × inventory buckets), no copies.
+ *
+ * Returns the same Quadruple shape as [scoreVariant] so callers can swap
+ * without structural changes.  `anyFailed` is optimistic (see [probeChildren]
+ * for the trade-off).  Use only for *ranking* / *cascade* paths where a
+ * wrong pick produces a suboptimal but still-correct commit result.
+ * [firstFeasibleMethod] must keep [scoreVariant] for strict consolidation
+ * correctness.
+ */
+private fun probeVariant(
+    childList: List<Map<String, Any?>>,
+    inventory: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+    planningPath: Set<Pair<String, String>>,
+): Quadruple<LocalDate?, Double, Double, Boolean> {
+    val r = probeChildren(childList, inventory, data, planningPath)
+    return Quadruple(if (r.anyFailed) null else r.maxCommitDate, r.consumed, r.purchaseQty, r.anyFailed)
+}
+
+/**
  * Return the first method (in ascending preference order) whose root BOM passes cascade's
  * feasibility probe, or null if every method fails.  Mirrors the probe inside
  * [getPreferredMethodCascade]; exposed so consolidation can skip demands whose parent can
@@ -1017,12 +1037,12 @@ internal fun getPreferredMethodCascade(
             "purchase" -> false
             "move" -> {
                 val children = childMaterialsForMove(m, quantity)
-                scoreVariant("cascade", children, inventory, data, reqDt, leadDays, planningPath, depth - 1, config).fourth
+                probeChildren(children, inventory, data, planningPath).anyFailed
             }
             "make" -> {
                 val variants = variantsForMake(productId, productionLocation, quantity, m, data)
-                variants.isEmpty() || variants.all { (altKey, childList) ->
-                    scoreVariant(altKey, childList, inventory, data, reqDt, leadDays, planningPath, depth - 1, config).fourth
+                variants.isEmpty() || variants.all { (_, childList) ->
+                    probeChildren(childList, inventory, data, planningPath).anyFailed
                 }
             }
             else -> false
@@ -1108,7 +1128,6 @@ internal fun scoreMethodsForElaborate(
     data class Raw(val method: Map<String, Any?>, val ts: Double, val consumed: Double, val purchase: Double, val failed: Boolean)
 
     val raw = methods.map { m ->
-        val invCopy = copyInventory(inventory)
         val productionLocation = (m["location_id"] ?: m["to_location_id"] ?: locationId) as? String ?: locationId
         val reqDt = parseDate(reqTimeStr) ?: requestTimeDt
         val leadDays = when (m["type"]) {
@@ -1117,17 +1136,13 @@ internal fun scoreMethodsForElaborate(
             "purchase" -> (m["lead_days_supply"] as? Number)?.toDouble() ?: 0.0
             else -> 0.0
         }
-        val cReqDt = dateAddDays(reqDt, -leadDays)
-        var maxCommit: LocalDate? = null
-        var purchaseQty = 0.0
-        var anyFailed = false
 
         val childMaterials = when (m["type"]) {
             "make" -> {
                 val variants = variantsForMake(productId, productionLocation, quantity, m, data)
                 if (variants.isEmpty()) return@map Raw(m, LATE_DATE.toEpochDay().toDouble(), 0.0, 0.0, true)
                 val (variantList, _) = getPreferredVariants(
-                    variants, invCopy, data, reqDt, leadDays, planningPath, depth - 1, quantity,
+                    variants, inventory, data, reqDt, leadDays, planningPath, depth - 1, quantity,
                     multiple = false, scoreWeights = scoreWeights, topN = null,
                     config = simConfig,
                 )
@@ -1137,41 +1152,10 @@ internal fun scoreMethodsForElaborate(
             else -> emptyList()
         }
 
-        val beforeQty = invCopy.sumOf { (it["qty"] as? Number)?.toDouble() ?: 0.0 }
-        for (c in childMaterials) {
-            val cDemand = mapOf(
-                "demand_id" to null,
-                "product_id" to c["product_id"],
-                "location_id" to c["location_id"],
-                "quantity" to c["quantity"],
-                "request_due_time" to formatDate(cReqDt),
-                "request_time" to formatDate(cReqDt),
-            )
-            val (solvedList, cWos, _) = plan(cDemand, invCopy, data, cReqDt, depth = depth - 1, planningPath = planningPath, config = simConfig)
-            for (s in solvedList) {
-                if ((s["quantity"] as? Number)?.toDouble() ?: 0.0 <= 0) continue
-                val ct = s["commit_time"] as? String
-                val reason = s["commit_reason"] as? String ?: ""
-                // cycle_stopped/cycle_detected rows are emitted at full residual qty
-                // with a `commit_time` set to the demand's request_due_time — they
-                // look like successful commits to a naive scoring loop, even though
-                // no production happened. Treat them as inert: no `maxCommit`
-                // contribution, no `anyFailed` flip. The method's *real* deliverable
-                // qty stays captured via `consumed` (inventory taken before the
-                // cycle stop) and via the non-cycle siblings in `solvedList`.
-                if (reason == "cycle_stopped" || reason == "cycle_detected") continue
-                if (ct == null || (reason.isNotBlank() && reason !in BENIGN_REASONS)) anyFailed = true
-                if (ct != null) parseDate(ct)?.let { dt -> if (maxCommit == null || dt > maxCommit) maxCommit = dt }
-            }
-            for (wo in cWos) {
-                if (wo["method"] == "purchase") purchaseQty += (wo["quantity"] as? Number)?.toDouble() ?: 0.0
-            }
-        }
-        val afterQty = invCopy.sumOf { (it["qty"] as? Number)?.toDouble() ?: 0.0 }
-        val consumed = beforeQty - afterQty
-        if (anyFailed) maxCommit = null
-        val ts = maxCommit?.toEpochDay()?.toDouble() ?: LATE_DATE.toEpochDay().toDouble()
-        Raw(m, ts, consumed, purchaseQty, anyFailed)
+        val probe = probeChildren(childMaterials, inventory, data, planningPath)
+        val ts = (if (probe.anyFailed) null else probe.maxCommitDate)
+            ?.toEpochDay()?.toDouble() ?: LATE_DATE.toEpochDay().toDouble()
+        Raw(m, ts, probe.consumed, probe.purchaseQty, probe.anyFailed)
     }
 
     val validTs = raw.filter { !it.failed }.map { it.ts }
@@ -1822,7 +1806,7 @@ fun getPreferredVariants(
 
     val needRanking = multiple == false || (topN != null && topN >= 1)
     val scored = variants.map { (altKey, childList) ->
-        val sc = scoreVariant(altKey, childList, inventory, data, reqDt, leadDays, planningPath, depth, config)
+        val sc = probeVariant(childList, inventory, data, planningPath)
         ScoredVariant(sc, altKey, childList, sc.fourth)
     }
 
