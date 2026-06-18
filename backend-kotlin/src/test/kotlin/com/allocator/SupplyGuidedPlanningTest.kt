@@ -180,6 +180,47 @@ class SupplyGuidedPlanningTest : FunSpec({
         naive.byRow["D1"]!!.containsKey(SupplyKey("R3", "L")) shouldBe true
     }
 
+    // ── C1. Simple test + simple claim (buildNeedsMatrix) ────────────────────
+
+    test("request map: demand request quantity equals demand_qty times bom_rate") {
+        // D1 needs FG@L (qty=100). FG is made from R3@L at rate 2.0. R3 has supply.
+        // Simple claim: D1's request for R3@L = 100 × 2.0 = 200.
+        val data = mkData(
+            supplies = listOf(supply("R3", "L", 500.0)),
+            methodMake = listOf(
+                mapOf("bom_id" to "BOM1", "product_id" to "FG", "location_id" to "L", "lead_time" to 0.0),
+            ),
+            bom = listOf(
+                mapOf("bom_id" to "BOM1", "parent_id" to "FG", "child_id" to "R3", "rate" to 2.0, "alt_group" to null),
+            ),
+        )
+        val matrix = buildNeedsMatrix(listOf(demand("D1", "FG", "L", qty = 100.0)), data)
+        matrix.byRow["D1"]!![SupplyKey("R3", "L")]!! shouldBe (200.0 plusOrMinus 1e-6)
+    }
+
+    test("request map: demand appears in supply column even when an alternate supply-bearing path exists") {
+        // D1 can reach R3@L via BOM_B→R2→R3, but FG also has BOM_A→R1 (R1 has supply).
+        // buildNeedsMatrix (union-all): D1 appears in BOTH R1@L and R3@L columns.
+        // This is the competing-demand correctness guarantee: no demand is excluded
+        // from a supply column it can reach via any BOM path.
+        val data = mkData(
+            supplies = listOf(supply("R1", "L", 50.0), supply("R3", "L", 50.0)),
+            methodMake = listOf(
+                mapOf("bom_id" to "BOM_A",  "product_id" to "FG", "location_id" to "L", "lead_time" to 0.0),
+                mapOf("bom_id" to "BOM_B",  "product_id" to "FG", "location_id" to "L", "lead_time" to 0.0),
+                mapOf("bom_id" to "BOM_R2", "product_id" to "R2", "location_id" to "L", "lead_time" to 0.0),
+            ),
+            bom = listOf(
+                mapOf("bom_id" to "BOM_A",  "parent_id" to "FG", "child_id" to "R1", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BOM_B",  "parent_id" to "FG", "child_id" to "R2", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BOM_R2", "parent_id" to "R2", "child_id" to "R3", "rate" to 1.0, "alt_group" to null),
+            ),
+        )
+        val matrix = buildNeedsMatrix(listOf(demand("D1", "FG", "L", qty = 100.0)), data)
+        matrix.byRow["D1"]!!.containsKey(SupplyKey("R1", "L")) shouldBe true
+        matrix.byRow["D1"]!!.containsKey(SupplyKey("R3", "L")) shouldBe true
+    }
+
     test("inventory-aware walk falls back to all paths when no direct child has supply") {
         // FG methods: BOM_A → R2 (no supply), BOM_B → R4 (no supply).
         // R2 can be made from R3 (has supply). R4 is a dead end.

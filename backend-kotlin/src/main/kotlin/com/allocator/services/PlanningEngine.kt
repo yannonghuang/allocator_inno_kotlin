@@ -2072,11 +2072,11 @@ fun plan(
             val lotKey = if (cb.supplyId != null) "$componentKey|${cb.supplyId}" else componentKey
             val lotCap = budget?.get(lotKey) // remaining after deduction
             log.info("[map][draw] demand={} lot={} taken={} budgetRemaining={}",
-                preferDemandId, cb.supplyId ?: "(agg)", cb.qty.toLong(), lotCap?.toLong() ?: "N/A")
+                demandId, cb.supplyId ?: "(agg)", cb.qty.toLong(), lotCap?.toLong() ?: "N/A")
         }
         if (consumedBuckets.isEmpty()) {
             log.info("[map][draw] demand={} supply={} need={} taken=0 (no inventory or capped)",
-                preferDemandId, componentKey, quantity.toLong())
+                demandId, componentKey, quantity.toLong())
         }
     }
     val fulfillCommitTime = consumedBuckets.firstOrNull()?.commitTime
@@ -2807,7 +2807,11 @@ private fun scaleSubtree(node: Map<String, Any?>, factor: Double): Map<String, A
     return nn
 }
 
-private fun reconcile(node: Map<String, Any?>, target: Double): Pair<Map<String, Any?>, Double> {
+private fun reconcile(
+    node: Map<String, Any?>,
+    target: Double,
+    data: Map<String, List<Map<String, Any?>>>,
+): Pair<Map<String, Any?>, Double> {
     if (node["failed"] == true) return node to 0.0
     val allChildren = node["children"] as? List<*> ?: emptyList<Any?>()
     when (node["type"]) {
@@ -2822,7 +2826,7 @@ private fun reconcile(node: Map<String, Any?>, target: Double): Pair<Map<String,
             var remaining = target
             val newChildren = allChildren.map { ch ->
                 val cm = ch as? Map<String, Any?> ?: return@map ch
-                val (nc, g) = reconcile(cm, remaining.coerceAtLeast(0.0))
+                val (nc, g) = reconcile(cm, remaining.coerceAtLeast(0.0), data)
                 remaining -= g
                 nc
             }
@@ -2839,7 +2843,7 @@ private fun reconcile(node: Map<String, Any?>, target: Double): Pair<Map<String,
             val demandChildren = allChildren.mapNotNull { it as? Map<String, Any?> }.filter { it["type"] == "demand" }
             if (method == "purchase" || demandChildren.isEmpty()) {
                 // Procurement / leaf-backed WO delivers `want`; trim leaf children to it.
-                val newChildren = allChildren.map { ch -> (ch as? Map<String, Any?>)?.let { reconcile(it, want).first } ?: ch }
+                val newChildren = allChildren.map { ch -> (ch as? Map<String, Any?>)?.let { reconcile(it, want, data).first } ?: ch }
                 return (node + mapOf("quantity" to want, "children" to newChildren)) to want
             }
             fun rateOf(cd: Map<String, Any?>) = if (curQty > 1e-9) ((cd["quantity"] as? Number)?.toDouble() ?: 0.0) / curQty else 0.0
@@ -2852,12 +2856,33 @@ private fun reconcile(node: Map<String, Any?>, target: Double): Pair<Map<String,
                 // upstream, leaving the source committed above the move (R4_move). Asking for `want`
                 // caps the source to it.
                 val r = if (method == "move") 1.0 else rateOf(cd)
-                val (nc, c) = reconcile(cd, want * r)
+                val (nc, c) = reconcile(cd, want * r, data)
                 Triple(nc, r, if (r > 1e-9) c / r else Double.POSITIVE_INFINITY)
             }
             val rawSupply = when {
                 method == "move" -> firstAsk.firstOrNull()?.third ?: want   // single source side
-                rel == "or"      -> want                                    // OR-split handled as sum upstream
+                rel == "or"      -> {
+                    // OR-split: each variant independently contributes to the parent.
+                    // The correct parent qty = Σ(c_i / BOM_rate_actual_i) — the same formula R4
+                    // soundness uses. We look up actual BOM rates from the BOM table rather than
+                    // inferring them from cd["quantity"] / curQty, because the latter encodes
+                    // BOM_rate × variantShare / achievedParentQty and is wrong when the OR WO
+                    // achieved less than slotQty (achievedQty < slotQty → rateOf is inflated →
+                    // Σ third/n undershoots by slotQty/achievedQty, causing R4 actual>>expected).
+                    val parentPid = (node["product_id"] as? String)?.trim() ?: ""
+                    val bomRows = data["bom"] ?: emptyList()
+                    val parentBomRows = bomRows.filter { (it["parent_id"] as? String)?.trim() == parentPid }
+                    val sum = firstAsk.zip(demandChildren).sumOf { (ask, cd) ->
+                        val (_, r, third) = ask
+                        val c = third * r  // committed_qty for this variant: c = (c/r) × r
+                        val childPid = (cd["product_id"] as? String)?.trim() ?: ""
+                        val actualRate = parentBomRows
+                            .firstOrNull { (it["child_id"] as? String)?.trim() == childPid }
+                            ?.let { (it["rate"] as? Number)?.toDouble() }
+                        if (actualRate != null && actualRate > 1e-9) c / actualRate else third
+                    }
+                    sum.coerceAtMost(want)
+                }
                 else             -> firstAsk.minOfOrNull { it.third } ?: want // AND make: least dominates
             }
             // EXACT — commit exactly the least-supplied child's contribution. (No slack band: it
@@ -2867,14 +2892,22 @@ private fun reconcile(node: Map<String, Any?>, target: Double): Pair<Map<String,
             val supply = rawSupply.coerceIn(0.0, want)
             // Re-trim over-supplied components down to supply × rate by PROPORTIONAL scaling of the
             // already-reconciled subtree (no second reconcile — that would be exponential).
+            // For OR WOs: skip trimming — each variant already holds its independently-reconciled
+            // commitment; re-scaling them to `supply × rateOf` would over-correct (when supply < want
+            // due to budget-cap shortfalls, targetT = supply × rateOf_i < c_i, forcing a second
+            // scale-down that under-commits what the child actually delivered).
             var askIdx = 0
             val newChildren = allChildren.map { ch ->
                 val cm = ch as? Map<String, Any?> ?: return@map ch
                 if (cm["type"] != "demand") return@map cm
                 val (asked, r, _) = firstAsk[askIdx]; askIdx++
-                val askedCommitted = (asked["committed_qty"] as? Number)?.toDouble() ?: (want * r)
-                val targetT = supply * r
-                if (askedCommitted > 1e-9 && targetT < askedCommitted - 1e-9) scaleSubtree(asked, targetT / askedCommitted) else asked
+                if (rel == "or") {
+                    asked  // keep each variant's reconciled commitment as-is
+                } else {
+                    val askedCommitted = (asked["committed_qty"] as? Number)?.toDouble() ?: (want * r)
+                    val targetT = supply * r
+                    if (askedCommitted > 1e-9 && targetT < askedCommitted - 1e-9) scaleSubtree(asked, targetT / askedCommitted) else asked
+                }
             }
             val failed = supply <= 1e-6 && demandChildren.isNotEmpty()
             val nn = node + mapOf("quantity" to supply, "children" to newChildren) +
@@ -4645,7 +4678,7 @@ fun runPlanning(
     val reconciledTrees = finalTimings.peggingTrees.map { entry ->
         val tree = entry["tree"] as? Map<String, Any?> ?: return@map entry
         val rootReq = (tree["quantity"] as? Number)?.toDouble() ?: 0.0
-        val (reconciled, after) = reconcile(tree, rootReq)
+        val (reconciled, after) = reconcile(tree, rootReq, data)
         val did = entry["demand_id"]?.toString()?.takeIf { it.isNotBlank() }
         // OVERWRITE (not sum): R0 compares committed_demands to the LAST pegging tree per demand
         // (treeByDemand = peggingByDemand.mapValues { it.last() }), so when a demand has several

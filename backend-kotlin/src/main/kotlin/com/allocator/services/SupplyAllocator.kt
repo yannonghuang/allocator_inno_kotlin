@@ -1,5 +1,7 @@
 package com.allocator.services
 
+import java.time.LocalDate
+
 /**
  * Phase 2 of supply-level consolidation — allocate each supply across
  * competing demands by the configured policy.
@@ -256,3 +258,77 @@ fun extractDemandQuantities(demands: List<Map<String, Any?>>): Map<Any?, Double>
     demands.associate { d ->
         d["demand_id"] to ((d["quantity"] as? Number)?.toDouble() ?: 0.0)
     }
+
+/**
+ * Per-lot variant of [allocateSupplies].
+ *
+ * Treats each inventory lot (identified by supply_id) as a separate allocation
+ * unit. Each demand is eligible for a lot only when its request_due_time ≥ the
+ * lot's supply_date (if either date is absent, the demand is always eligible).
+ *
+ * Returns a flat budget map — demandId → String → qty — where budget keys are:
+ *   - `"$pid|$lid|$supplyId"` — per-lot cap (consumed by [consumeFromInventory])
+ *   - `"$pid|$lid"`           — aggregate cap = sum of lot allocations
+ *
+ * This matches the format expected by [legacyCommit] / [consumeFromInventory],
+ * which already handles both key formats.
+ */
+fun allocateSuppliesPerLot(
+    matrix: NeedsMatrix,
+    supplies: List<Map<String, Any?>>,
+    demandPriorities: Map<Any?, Int>,
+    mode: String,
+    demandDates: Map<Any?, LocalDate?>,
+    demandQuantities: Map<Any?, Double> = emptyMap(),
+): MutableMap<Any?, MutableMap<String, Double>> {
+    val result = mutableMapOf<Any?, MutableMap<String, Double>>()
+
+    // Group lots by SupplyKey; skip lots without supply_id or positive qty.
+    val lotsByKey = mutableMapOf<SupplyKey, MutableList<Map<String, Any?>>>()
+    for (row in supplies) {
+        val pid = (row["product_id"] as? String)?.trim() ?: continue
+        val lid = (row["location_id"] as? String)?.trim() ?: continue
+        val qty = (row["qty"] as? Number)?.toDouble() ?: continue
+        if (pid.isBlank() || lid.isBlank() || qty <= 0) continue
+        (row["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: continue
+        lotsByKey.getOrPut(SupplyKey(pid, lid)) { mutableListOf() }.add(row)
+    }
+
+    for ((sk, demandNeeds) in matrix.byColumn) {
+        val lots = lotsByKey[sk] ?: continue
+        val aggKey = sk.toString()   // "$pid|$lid"
+
+        for (lot in lots) {
+            val supplyId = (lot["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: continue
+            val lotQty = (lot["qty"] as? Number)?.toDouble() ?: continue
+            if (lotQty <= 1e-12) continue
+            val lotDate = parseDate(lot["supply_date"] as? String)
+
+            // Filter to demands eligible for this lot by date.
+            val eligibleNeeds = demandNeeds.filter { (demandId, _) ->
+                val dd = demandDates[demandId]
+                lotDate == null || dd == null || !dd.isBefore(lotDate)
+            }
+            if (eligibleNeeds.isEmpty()) continue
+
+            val candidates = eligibleNeeds.entries.map { (demandId, needed) ->
+                AllocationCandidate(
+                    demandId = demandId,
+                    neededQty = needed,
+                    priority = demandPriorities[demandId] ?: 0,
+                    demandQty = demandQuantities[demandId] ?: 0.0,
+                )
+            }
+
+            for ((demandId, allocated) in allocate(candidates, lotQty, mode)) {
+                if (allocated <= 1e-12) continue
+                val budget = result.getOrPut(demandId) { mutableMapOf() }
+                val lotKey = "$aggKey|$supplyId"
+                budget[lotKey] = (budget[lotKey] ?: 0.0) + allocated
+                budget[aggKey]  = (budget[aggKey]  ?: 0.0) + allocated
+            }
+        }
+    }
+
+    return result
+}
