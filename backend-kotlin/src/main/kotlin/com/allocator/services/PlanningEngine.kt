@@ -1529,7 +1529,11 @@ internal fun planMethodSlot(
             else 0.0
         }
         val cTimes = solvedList.mapNotNull { s -> parseDate(s["commit_time"] as? String) }
-        childPassResults.add(ChildPassResult(c, neededQty, effectiveQty, cWos, cPegging, cTimes, solvedList))
+        // Tag gc_bom_rate on the demand node so GCEngine can scale into AND-children
+        // recursively without needing the original BOM table. Rate = child_need / parent_slotQty.
+        val bomRate = if (activeSlotQty > 1e-9) neededQty / activeSlotQty else 0.0
+        val taggedPegging = cPegging?.plus("gc_bom_rate" to bomRate)
+        childPassResults.add(ChildPassResult(c, neededQty, effectiveQty, cWos, taggedPegging, cTimes, solvedList))
     }
 
     // Blueprint mode: BOM rates produce fractional child quantities (e.g. 452.0012 from
@@ -1802,68 +1806,43 @@ internal fun planMethodSlot(
                     productId, productionLocation, demandId, slotQty, achievableParentQty, rootBottleneckKeys)
             }
 
-            // ── Second pass: restore inventory + budget and re-plan children at achievable qty.
-            restoreQtys(inventory, inventorySnap)
-            if (budget != null && budgetSnap != null) {
-                budget.clear()
-                budget.putAll(budgetSnap)
-            }
-            val scale = achievableParentQty / activeSlotQty
-            val scaledChildren = scaleChildMaterials(activeChildren, scale)
-            // AND conservation guard. The first-pass `achievable` is the min child ratio, so on the
-            // re-plan each AND child SHOULD cover its scaled share exactly (consistent makes have
-            // zero shortfall — R4's tolerance is 1e-6). But a move-cycle (e.g. 504-1989@1000↔@2000 →
-            // cycle_stopped) or inventory that's scarcer at the smaller qty can leave a required
-            // child materially short. Emitting `achievable` then would commit the make ABOVE its
-            // children (the R4/R8 conservation break). Track any such child off its authoritative
-            // committed_qty (what soundness reads); small fractional slack is ignored.
-            var andChildShortfall = false
-            for (c in scaledChildren) {
-                if (m["type"] == "make") {
-                    val parentKey = productId.trim()
-                    val childKey = (c["product_id"] as? String)?.trim() ?: ""
-                    if (Pair(parentKey, childKey) in REAL_BOM_PAIRS) {
-                        log.info("planning: real BOM partial re-plan parent={} child={} demand={} achievable={}", parentKey, childKey, demandId, achievableParentQty)
-                    }
-                }
-                val cReqDt = dateAddDays(reqDt, -leadDays)
-                val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
-                    "quantity" to c["quantity"], "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt),
-                    "customer_id" to demand["customer_id"], "customer" to demand["customer"])
-                val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint)
-                childWos.addAll(cWos)
-                val cPid = (c["product_id"] as? String)?.trim() ?: ""
-                val cLid = (c["location_id"] as? String)?.trim() ?: ""
-                val key = Pair(cPid, cLid)
-                if (cPegging != null) {
-                    // Tag the second-pass pegging with `is_bottleneck=true` for
-                    // children that were the AND-min limiter at first-pass, and
-                    // `is_root_bottleneck=true` for the genuine origin per iter-0
-                    // budget cap. The two flags differ: `is_bottleneck` covers
-                    // ALL siblings tied at the post-convergence smeared cap;
-                    // `is_root_bottleneck` covers only the leaf whose iter-0
-                    // cap-to-need ratio was the smallest (the origin that
-                    // dragged the others down via convergence).
-                    var tagged = cPegging
-                    if (key in bottleneckPegging) tagged = tagged + ("is_bottleneck" to true)
-                    if (key in rootBottleneckKeys) tagged = tagged + ("is_root_bottleneck" to true)
-                    childPeggingNodes.add(tagged)
-                }
-                solvedList.forEach { s -> parseDate(s["commit_time"] as? String)?.let { commitTimes.add(it) } }
-                // Did this AND child materially under-deliver its scaled requirement? Use its own
-                // committed_qty (the value soundness R4 checks). Threshold tolerates fractional
-                // rounding (0.5) and a 2% band; the real failures (move-cycle) deliver ~0.
-                if (m["type"] == "make") {
-                    val childCommitted = (cPegging?.get("committed_qty") as? Number)?.toDouble() ?: 0.0
-                    val scaledNeed = (c["quantity"] as? Number)?.toDouble() ?: 0.0
-                    if (scaledNeed > 1e-6 && childCommitted < scaledNeed - maxOf(0.5, scaledNeed * 0.02)) {
-                        andChildShortfall = true
-                    }
-                }
+            // ── GC: trim over-committed first-pass children, return excess to inventory ──────
+            // Replaces snapshot-restore + second-pass re-plan. For each AND-child that
+            // committed more than its achievable share (achievableParentQty * bomRate),
+            // garbageCollectPegging walks the child's pegging subtree and returns the
+            // excess inventory (and budget) in-place. Only over-committed children are
+            // touched; children that delivered at or below their share are kept as-is.
+            // Bottleneck / root-bottleneck tags from the first pass are preserved on
+            // the (now-trimmed) pegging nodes so the UI attribution is unchanged.
+            val gcScale = achievableParentQty / activeSlotQty
+            for (cr in childPassResults) {
+                val targetQty = cr.neededQty * gcScale
+                val woScale   = if (cr.effectiveQty > 1e-9) targetQty / cr.effectiveQty else 0.0
+                childWos.addAll(scaleWos(cr.wos, woScale))
+                commitTimes.addAll(cr.cTimes)
+                val peg = cr.pegging ?: continue
+                val trimmed: Map<String, Any?> = if (cr.effectiveQty > targetQty + 1e-9)
+                    garbageCollectPegging(peg, targetQty, inventory, budget)
+                else peg
+                // reconcile() derives BOM rate as child.quantity / wo.quantity. In the old second-pass
+                // world the child node was replanned at targetQty so its quantity == targetQty. In the
+                // GC world the node comes from the first pass where quantity == neededQty (the full
+                // first-pass request). Without this fix, rateOf = neededQty / achievableParentQty
+                // (e.g. 40/10 = 4.0) instead of the true BOM rate (neededQty / activeSlotQty = 1.0),
+                // causing reconcile to cut the parent commit to effectiveQty / inflatedRate = 2.5.
+                val scaled = trimmed + ("quantity" to targetQty)
+                val pid = (cr.child["product_id"] as? String)?.trim() ?: ""
+                val lid = (cr.child["location_id"] as? String)?.trim() ?: ""
+                val key = pid to lid
+                var tagged: Map<String, Any?> = scaled
+                if (key in bottleneckPegging) tagged = tagged + ("is_bottleneck" to true)
+                if (key in rootBottleneckKeys) tagged = tagged + ("is_root_bottleneck" to true)
+                childPeggingNodes.add(tagged)
             }
 
-            // Move conservation: a move WO has exactly one source-side child whose
-            // committed_qty must equal the parent qty.
+            // Move conservation safety: GC targets exactly achievableParentQty for the
+            // move-source child (bomRate=1). Correct parent if GC could not fully return
+            // (e.g. missing inventory bucket) so the WO qty never exceeds the child commit.
             if (m["type"] == "move") {
                 val childCommit = childPeggingNodes.firstOrNull()?.let {
                     (it["committed_qty"] as? Number)?.toDouble()
@@ -1871,26 +1850,6 @@ internal fun planMethodSlot(
                 if (childCommit != null && childCommit < achievableParentQty - 1e-6) {
                     achievableParentQty = floor(childCommit).coerceAtLeast(0.0)
                 }
-            }
-
-            // AND conservation enforcement: a make whose required child under-delivered on the
-            // re-plan cannot actually be built at `achievable` — committing it would exceed what
-            // its children supply (R4/R8). Block it (→0) instead. Restore inventory/budget first so
-            // the siblings that DID commit are rolled back too (no orphan leaves / R7d). buildWoNode
-            // marks the 0-qty node failed → soundness skips it and the WO flatten drops it. The
-            // demand's waterfall then tries another method, or it under-fills honestly.
-            if (m["type"] == "make" && andChildShortfall) {
-                restoreQtys(inventory, inventorySnap)
-                if (budget != null && budgetSnap != null) { budget.clear(); budget.putAll(budgetSnap) }
-                val startDt0 = computeStartDt(reqDt, leadDays, emptyList())
-                val blockedNode = buildWoNode(productId, productionLocation, 0.0, m["type"] as? String ?: "", m,
-                    startDt0, null, 0, 0.0, methodChoiceExplanation, variantExplanation, woChildrenRelation,
-                    childPeggingNodes, overrideActive, failed = true, woGroupId = null, data = data)
-                log.info("[ANDMIN-conservation-block] parent={}@{} did={} achievable={} — required AND child under-delivered on re-plan, make blocked",
-                    productId, productionLocation, demandId, achievableParentQty)
-                return MethodSlotResult(achievableQty = 0.0, wos = emptyList(), methodPeggingNode = blockedNode,
-                    latestCommit = null, anyChildShort = true,
-                    blockedReason = "child_failed:$productId@$productionLocation(and_conservation)")
             }
         }
     }
