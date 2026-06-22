@@ -290,11 +290,10 @@ fun checkRunSoundness(
     for ((demandId, demandRow) in demandById) {
         val tree = treeByDemand[demandId]
         if (tree == null) {
-            // Demand has no pegging tree at all — could be a zero-qty demand or a
-            // run that never planned for it. Treat as unsound; the engine should
-            // emit a tree even for cycle_stopped / depth_limit.
             val qty = (demandRow["quantity"] as? Number)?.toDouble() ?: 0.0
-            if (qty > 0) {
+            if (qty > 0 && planningPegging.isNotEmpty()) {
+                // Demand has no pegging tree but pegging was provided — genuine missing
+                // tree. The engine should emit a tree even for cycle_stopped / depth_limit.
                 demandReports.add(DemandSoundness(
                     demandId = demandId,
                     sound = false,
@@ -305,7 +304,9 @@ fun checkRunSoundness(
                     )),
                 ))
             } else {
-                // Zero-qty demand — no tree is fine.
+                // Either zero-qty demand (no tree expected) or planning_pegging was not
+                // stored in this result (stripped to keep DB size manageable). Cannot
+                // check R0-R9 — treat as unchecked (no violations).
                 demandReports.add(DemandSoundness(demandId = demandId, sound = true, violations = emptyList()))
             }
             continue

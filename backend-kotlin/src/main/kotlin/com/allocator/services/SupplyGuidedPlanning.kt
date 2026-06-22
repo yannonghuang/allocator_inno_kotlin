@@ -55,99 +55,65 @@ fun parseSupplyGuidedConfig(config: Map<String, Any?>?): SupplyGuidedConfig {
     return SupplyGuidedConfig(enabled, allocationMode, maxCompensationPasses)
 }
 
-// ── Orchestrator ───────────────────────────────────────────────────────────────
+// ── Allocation result ──────────────────────────────────────────────────────────
 
 /**
- * Supply-guided planning — the two-loop model.
- *
- * ## Mental model (from spec)
- *
- * **Loop 1 — top-down request decomposition** (per demand, Step 1):
- *   For each demand walk the BOM from user demand towards raw materials.
- *   At each node where multiple BOM alternatives exist, prefer alternatives
- *   whose immediate children are supply-bearing — inventory is used up before
- *   new WOs (Step 1a). Collect a request at every supply-bearing node on the
- *   chosen paths. The resulting demand × supply matrix is the *request map*.
- *   BOM rates are propagated to WO skeletons (Step 1b) — handled implicitly
- *   by plan() in Loop 2.
- *
- * **Step 2 — supply allocation** (all demands together):
- *   For each supply column, allocate its qty to competing demands per the
- *   configured policy (default: demand_qty-proportional).  Allocation formula:
- *     allocation(d, s) = qty(s) × (qty(d) / Σ_competing qty(dd))   [demand_qty]
- *   Never over-commit: each demand receives at most its requested share.
- *   Output: per-demand budget map — demand → supply → allocated qty.
- *
- * **Loop 2 — bottom-up commitment** (per demand, Step 3):
- *   Run plan() for each demand with the budget caps from Step 2.  plan() does
- *   the actual inventory consumption and WO emission; budgets cap consumption
- *   at each supply so demands don't over-draw their allocated share.
- *   Reconcile() enforces AND semantics post-commit (least-supplied dominates).
- *
- * **Step 3c — GC unused budgets**:
- *   After Loop 2, any budget that went undrawn (demand found inventory
- *   upstream and never recursed to the leaf) is redistributed to cap-bound
- *   demands via compensation passes.  Convergence is guaranteed by the
- *   monotone-non-increasing property of compensation.
- *
- * @param demands priority-sorted demand list
- * @param inventory mutable supply pool (consumed in-place during Loop 2)
- * @param data BOM, methods, supply tables
- * @param config planning run configuration
- * @param overrideIndex pre-built method/variant override index
- * @param progressCallback optional per-demand progress notification
- * @return committed demands, work orders, and per-demand pegging trees
+ * Output of [buildSupplyAllocation] — the pre-computed per-lot budget caps to
+ * hand to [legacyCommit], plus diagnostic context for post-planning tracing.
  */
-internal fun runSupplyGuidedPlanning(
+internal data class SupplyAllocationResult(
+    /** Per-demand, per-lot budget caps: demandId → lotKey → qty.  Passed directly to legacyCommit. */
+    val perLotBudgets: Map<Any?, MutableMap<String, Double>>,
+    // ── BOM graph (reused by computeAchievableQtyMaps to avoid rebuilding) ────
+    val graph: BomGraph,
+    // ── diagnostic context (needed by logSupplyGuidedTrace) ──────────────────
+    val criticalMatrix: NeedsMatrix,
+    val allocations: SupplyAllocations,
+    val supplyTotals: Map<SupplyKey, Double>,
+    val lotAllocByLot: Map<String, Map<Any?, Double>>,
+    val demandPriorities: Map<Any?, Int>,
+    val sgConfig: SupplyGuidedConfig,
+)
+
+// ── Allocation ─────────────────────────────────────────────────────────────────
+
+/**
+ * Pure allocation step: BOM reachability walk + proportional supply split.
+ * Does NOT touch inventory — no side effects on the supply pool.
+ *
+ * Produces the per-lot budget caps ([SupplyAllocationResult.perLotBudgets]) that
+ * [legacyCommit] uses to enforce each demand's entitlement during planning.
+ *
+ * @param demands all demands competing for shared supply
+ * @param data    BOM, methods, supply tables (read-only)
+ * @param config  planning config (supply_guided sub-key, purchasable_materials, …)
+ */
+internal fun buildSupplyAllocation(
     demands: List<Map<String, Any?>>,
-    inventory: MutableList<MutableMap<String, Any?>>,
     data: Map<String, List<Map<String, Any?>>>,
     config: Map<String, Any?>?,
-    overrideIndex: Map<String, Map<String, Any?>>,
-    progressCallback: ((Map<String, Any?>) -> Unit)?,
-): LegacyCommitResult {
+): SupplyAllocationResult {
     val sgConfig = parseSupplyGuidedConfig(config)
 
-    // ── Loop 1: top-down request decomposition ─────────────────────────────────
-    // Build the BOM DAG once (global BFS + Kahn's). Two rate-propagation passes:
-    //
-    //   Union-all pass — every demand that can reach a supply via ANY path gets
-    //   a request row. Used for allocation (Step 2) so that all competing demands
-    //   participate and allocation amounts are fair. The allocation is pure
-    //   arithmetic: allocation(D, S) = qty(S) × (demandQty(D) / Σ_competing qty).
-    //   This budget is then passed directly to plan() (Loop 2) so that every
-    //   demand is capped at its allocated amount for each supply regardless of
-    //   which BOM path plan() takes at runtime — preventing unlimited draw when
-    //   the initially-preferred path is exhausted by earlier demands.
+    // Step 1 — BOM reachability: for each demand find every supply it can reach.
     val graph         = buildBomGraph(demands, data)
-    val requestMatrix = propagateRates(demands, graph, inventoryAware = false)
+    val requestMatrix = buildReachabilityMatrix(demands, graph)
     log.info(
         "[supply-guided] request map built: {} demand rows, {} supply columns, {} cells",
         requestMatrix.byRow.size, requestMatrix.byColumn.size, requestMatrix.cellCount(),
     )
-    // Demands absent from the request matrix reach no supply — they draw from inventory
-    // uncapped in Loop 2. Log them so we can verify this is intentional (pure-WO paths)
-    // rather than a BOM graph gap or zero-qty anomaly.
     val unmappedDemands = demands.filter { it["demand_id"] !in requestMatrix.byRow }
     if (unmappedDemands.isNotEmpty()) {
         log.warn(
             "[supply-guided] {} demand(s) not in request map (no reachable supply path or qty<=0): {}",
             unmappedDemands.size,
-            unmappedDemands.joinToString { d ->
-                "${d["demand_id"]}(qty=${d["quantity"]})"
-            },
+            unmappedDemands.joinToString { d -> "${d["demand_id"]}(qty=${d["quantity"]})" },
         )
     }
-    // Per-demand dates for per-lot eligibility filtering.
-    val demandDates: Map<Any?, LocalDate?> = demands.associate { d ->
-        d["demand_id"] to parseDate(d["request_due_time"] as? String ?: d["request_time"] as? String)
-    }
 
-    // Critical-materials filter: budget caps apply only to non-purchasable materials.
-    // Open-world semantics: absent from the allocation map ⇒ uncapped.
-    val purchasable = effectivePurchasableSet(config, data)
-    // purchasable=null means no purchase restriction is configured → treat all materials as
-    // critical (conservative, preserves pre-existing supply-guided behavior).
+    // Critical-materials filter: caps only on non-purchasable materials.
+    // Open-world semantics: absent from allocation map ⇒ uncapped in planning.
+    val purchasable    = effectivePurchasableSet(config, data)
     val criticalMatrix = if (purchasable == null) requestMatrix
                          else filterToCritical(requestMatrix, purchasable)
     log.info(
@@ -155,50 +121,16 @@ internal fun runSupplyGuidedPlanning(
         criticalMatrix.byColumn.size, requestMatrix.byColumn.size,
     )
 
-    // Log contested critical supplies (>1 competing demand) sorted by total requested qty descending.
-    criticalMatrix.byColumn.entries
-        .filter { it.value.size > 1 }
-        .sortedByDescending { e -> e.value.values.sum() }
-        .forEach { (sk, demandNeeds) ->
-            val total = demandNeeds.values.sum()
-            val lots = (data["supply"] ?: emptyList())
-                .filter { s -> s["product_id"]?.toString()?.trim() == sk.productId && s["location_id"]?.toString()?.trim() == sk.locationId }
-            val supplyQty = lots.sumOf { s -> (s["qty"] as? Number)?.toDouble() ?: 0.0 }
-            val sorted = demandNeeds.entries.sortedByDescending { it.value }
-            // Full dump for critically scarce supplies (supply covers <1% of total request).
-            val isCritical = supplyQty > 0 && supplyQty < total * 0.01
-            log.info("[supply-guided][request] supply={}@{} supplyQty={} totalRequest={} demands={}  {}={}",
-                sk.productId, sk.locationId, supplyQty.toLong(), total.toLong(), demandNeeds.size,
-                if (isCritical) "all" else "top",
-                (if (isCritical) sorted else sorted.take(8))
-                    .joinToString { (d, q) -> "$d:${q.toLong()}" })
-            // Per-lot request breakdown for critically scarce supplies.
-            if (isCritical) {
-                for (lot in lots.sortedByDescending { (it["qty"] as? Number)?.toDouble() ?: 0.0 }) {
-                    val sid = (lot["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: continue
-                    val lotQty = (lot["qty"] as? Number)?.toDouble() ?: continue
-                    val lotDate = parseDate(lot["supply_date"] as? String)
-                    val lotDateStr = (lot["supply_date"] as? String)?.take(10) ?: "?"
-                    val eligible = demandNeeds.entries
-                        .filter { (did, _) -> lotDate == null || demandDates[did] == null || !demandDates[did]!!.isBefore(lotDate) }
-                        .sortedByDescending { it.value }
-                    log.info("[supply-guided][request-lot] supply={}@{} lot={} date={} qty={} eligible_demands={}  top={}",
-                        sk.productId, sk.locationId, sid, lotDateStr, lotQty.toLong(), eligible.size,
-                        eligible.take(8).joinToString { (d, q) -> "$d:${q.toLong()}" })
-                }
-            }
-        }
+    // Step 2 — supply allocation: split each lot proportionally among competing demands.
+    val supplyTotals     = aggregateSupplies(data["supply"] ?: emptyList())
+    val demandPriorities = extractDemandPriorities(demands)
+    val demandQuantities = extractDemandQuantities(demands)
+    val demandDates: Map<Any?, LocalDate?> = demands.associate { d ->
+        d["demand_id"] to parseDate(d["request_due_time"] as? String ?: d["request_time"] as? String)
+    }
 
-    // ── Step 2: supply allocation (per-lot) ────────────────────────────────────
-    // Allocate each inventory lot separately. Demands are eligible for a lot only
-    // when request_due_time ≥ lot supply_date, so early lots are reserved for
-    // early demands and late lots for late demands (prevents date-blind pooling).
-    val supplyTotals      = aggregateSupplies(data["supply"] ?: emptyList())
-    val demandPriorities  = extractDemandPriorities(demands)
-    val demandQuantities  = extractDemandQuantities(demands)
-
-    // Aggregate allocation kept for the compensation pass.
-    var allocations = allocateSupplies(
+    // Aggregate allocation (kept for compensation-pass diagnostics).
+    val allocations = allocateSupplies(
         matrix           = criticalMatrix,
         supplyTotals     = supplyTotals,
         demandPriorities = demandPriorities,
@@ -209,23 +141,54 @@ internal fun runSupplyGuidedPlanning(
         "[supply-guided] initial allocation: {} demand rows, {} cells, mode={}",
         allocations.byRow.size, allocations.cellCount(), sgConfig.allocationMode,
     )
-    // Log aggregate allocation for contested supplies (backward-compat view).
-    allocations.byColumn.entries
+
+    // Log contested critical supplies.
+    criticalMatrix.byColumn.entries
         .filter { it.value.size > 1 }
         .sortedByDescending { e -> e.value.values.sum() }
-        .forEach { (sk, demandAllocs) ->
-            val total = demandAllocs.values.sum()
-            val sortedAllocs = demandAllocs.entries.sortedByDescending { it.value }
-            val isCritical = sortedAllocs.lastOrNull()?.value?.let { it < 1.0 } ?: false
-            log.info("[supply-guided][allocation] supply={}@{} totalAllocated={} demands={}  {}={}",
-                sk.productId, sk.locationId, total.toLong(), demandAllocs.size,
+        .forEach { (sk, demandNeeds) ->
+            val total     = demandNeeds.values.sum()
+            val lots      = (data["supply"] ?: emptyList()).filter { s ->
+                s["product_id"]?.toString()?.trim() == sk.productId &&
+                s["location_id"]?.toString()?.trim() == sk.locationId
+            }
+            val supplyQty = lots.sumOf { s -> (s["qty"] as? Number)?.toDouble() ?: 0.0 }
+            val sorted    = demandNeeds.entries.sortedByDescending { it.value }
+            val isCritical = supplyQty > 0 && supplyQty < total * 0.01
+            log.info("[supply-guided][request] supply={}@{} supplyQty={} totalRequest={} demands={}  {}={}",
+                sk.productId, sk.locationId, supplyQty.toLong(), total.toLong(), demandNeeds.size,
                 if (isCritical) "all" else "top",
-                (if (isCritical) sortedAllocs else sortedAllocs.take(8))
-                    .joinToString { (d, q) -> "$d:${q.toLong()}" })
+                (if (isCritical) sorted else sorted.take(8)).joinToString { (d, q) -> "$d:${q.toLong()}" })
+            if (isCritical) {
+                for (lot in lots.sortedByDescending { (it["qty"] as? Number)?.toDouble() ?: 0.0 }) {
+                    val sid        = (lot["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: continue
+                    val lotQty     = (lot["qty"] as? Number)?.toDouble() ?: continue
+                    val lotDate    = parseDate(lot["supply_date"] as? String)
+                    val lotDateStr = (lot["supply_date"] as? String)?.take(10) ?: "?"
+                    val eligible   = demandNeeds.entries
+                        .filter { (did, _) ->
+                            val dd       = demandDates[did]
+                            val eligDate = if (dd != null && dd.dayOfMonth == 1) dd.plusMonths(1).minusDays(1) else dd
+                            lotDate == null || eligDate == null || !eligDate.isBefore(lotDate)
+                        }
+                        .sortedByDescending { it.value }
+                    log.info("[supply-guided][request-lot] supply={}@{} lot={} date={} qty={} eligible_demands={}  top={}",
+                        sk.productId, sk.locationId, sid, lotDateStr, lotQty.toLong(), eligible.size,
+                        eligible.take(8).joinToString { (d, q) -> "$d:${q.toLong()}" })
+                }
+            }
+            // Log aggregate allocation for this supply.
+            val demandAllocs  = allocations.byColumn[sk] ?: emptyMap()
+            val sortedAllocs  = demandAllocs.entries.sortedByDescending { it.value }
+            val allocCritical = sortedAllocs.lastOrNull()?.value?.let { it < 1.0 } ?: false
+            log.info("[supply-guided][allocation] supply={}@{} totalAllocated={} demands={}  {}={}",
+                sk.productId, sk.locationId, demandAllocs.values.sum().toLong(), demandAllocs.size,
+                if (allocCritical) "all" else "top",
+                (if (allocCritical) sortedAllocs else sortedAllocs.take(8)).joinToString { (d, q) -> "$d:${q.toLong()}" })
         }
 
-    // Per-lot budgets for Loop 2 — date-filtered so each lot is only consumable
-    // by demands whose need date is on or after the lot's supply_date.
+    // Per-lot budgets — date-filtered so each lot is only consumable by demands
+    // whose need date is on or after the lot's supply_date.
     val perLotBudgets = allocateSuppliesPerLot(
         matrix           = criticalMatrix,
         supplies         = data["supply"] ?: emptyList(),
@@ -234,75 +197,383 @@ internal fun runSupplyGuidedPlanning(
         demandDates      = demandDates,
         demandQuantities = demandQuantities,
     )
-    // Log per-lot allocation for critically scarce supplies.
-    val aggKeySet = criticalMatrix.byColumn.keys.map { it.toString() }.toSet()
-    // Invert: lotKey → demand → qty
+
+    // Build lotKey → demand → qty map for post-planning trace.
+    val aggKeySet     = criticalMatrix.byColumn.keys.map { it.toString() }.toSet()
     val lotAllocByLot = mutableMapOf<String, MutableMap<Any?, Double>>()
     for ((demandId, budgetMap) in perLotBudgets) {
         for ((key, qty) in budgetMap) {
-            if (key in aggKeySet) continue  // skip aggregate "pid|lid" entries
+            if (key in aggKeySet) continue
             lotAllocByLot.getOrPut(key) { mutableMapOf() }[demandId] = qty
         }
     }
     for ((lotKey, demandAllocs) in lotAllocByLot.entries.sortedByDescending { it.value.values.sum() }) {
-        val pipeIdx = lotKey.indexOf('|')
+        val pipeIdx  = lotKey.indexOf('|')
         val pipeIdx2 = if (pipeIdx >= 0) lotKey.indexOf('|', pipeIdx + 1) else -1
         if (pipeIdx < 0 || pipeIdx2 < 0) continue
-        val pid = lotKey.substring(0, pipeIdx)
-        val lid = lotKey.substring(pipeIdx + 1, pipeIdx2)
-        val sid = lotKey.substring(pipeIdx2 + 1)
-        val sk = SupplyKey(pid, lid)
+        val pid          = lotKey.substring(0, pipeIdx)
+        val lid          = lotKey.substring(pipeIdx + 1, pipeIdx2)
+        val sid          = lotKey.substring(pipeIdx2 + 1)
+        val sk           = SupplyKey(pid, lid)
         val totalRequest = criticalMatrix.byColumn[sk]?.values?.sum() ?: continue
-        val totalSupply = supplyTotals[sk] ?: continue
-        if (totalSupply <= 0 || totalSupply >= totalRequest * 0.01) continue  // only critical
-        // Show all competing demands (including date-blocked ones that received 0) sorted by request qty.
+        val totalSupply  = supplyTotals[sk] ?: continue
+        if (totalSupply <= 0 || totalSupply >= totalRequest * 0.01) continue
         val allCompeting = criticalMatrix.byColumn[sk]?.entries?.sortedByDescending { it.value } ?: emptyList()
         log.info("[supply-guided][allocation-lot] supply={}@{} lot={} allocated={} eligible={} of {} demands  all={}",
             pid, lid, sid, demandAllocs.values.sum().toLong(), demandAllocs.size, allCompeting.size,
             allCompeting.joinToString { (d, _) -> "$d:${(demandAllocs[d] ?: 0.0).toLong()}" })
     }
 
-    // ── Loop 2: commitment with per-lot budget caps ────────────────────────────
-    // plan() consumes inventory up to per-lot caps, emits WOs for residual.
-    val commitResult = legacyCommit(
-        demands          = demands,
-        inventory        = inventory,
-        data             = data,
-        config           = config,
-        overrideIndex    = overrideIndex,
-        useTaggedLookup  = false,
-        progressCallback = progressCallback,
-        budgets          = perLotBudgets,
-    )
+    // Diagnostic: per-lot budgets for 160-1153@1000 lots.
+    val diagLots = lotAllocByLot.entries.filter { (k, _) -> k.startsWith("160-1153|1000|") }.sortedBy { it.key }
+    if (diagLots.isEmpty()) {
+        log.info("[supply-guided][diag-160-1153-lots] no lots found in perLotBudgets for 160-1153@1000")
+    } else {
+        for ((lotKey, demandAllocs) in diagLots) {
+            log.info("[supply-guided][diag-160-1153-lots] lot={} demands={} total_alloc={}  allocs={}",
+                lotKey.substringAfterLast('|'), demandAllocs.size, demandAllocs.values.sum().toLong(),
+                demandAllocs.entries.sortedByDescending { it.value }.joinToString { (d, q) -> "$d:${q.toLong()}" })
+        }
+    }
 
-    // ── Trace: request → allocation → pegging per lot ──────────────────────────
-    // For critically scarce supplies, show the full pipeline per lot: how much each
-    // demand requested, was budgeted, and actually consumed after Loop 2.
-    val lotPeggedByLot = extractLotDrawsFromPegging(commitResult.planningPegging)
-    for ((lotKey, allocDemands) in lotAllocByLot.entries.sortedByDescending { it.value.values.sum() }) {
+    return SupplyAllocationResult(
+        perLotBudgets    = perLotBudgets,
+        graph            = graph,
+        criticalMatrix   = criticalMatrix,
+        allocations      = allocations,
+        supplyTotals     = supplyTotals,
+        lotAllocByLot    = lotAllocByLot,
+        demandPriorities = demandPriorities,
+        sgConfig         = sgConfig,
+    )
+}
+
+// ── Achievable-quantity pre-computation ────────────────────────────────────────
+
+/**
+ * For each demand, compute the maximum fillable quantity at EVERY BOM node given
+ * the per-lot budget caps from [allocation].  Returns a per-demand map of
+ * (pid to lid) → achievable qty so that [plan] can cap each node before drawing
+ * supply — eliminating the WO cascade that fires for quantities the budget can
+ * never cover.
+ *
+ * Traversal rules (per-demand BOM walk):
+ *   - Supply leaf: budget-capped if the supply is critical (has lot entries in
+ *     perLotBudgets for this demand); uncapped otherwise.
+ *   - Make method (variants = OR split, equal share): each variant handles
+ *     needed/nVariants; its components are AND-constrained (min over children).
+ *     Child qty = (needed/nVariants) * rate (per-variant, not the full-qty
+ *     value that variantsForMake returns for the aggregate demand).
+ *   - Move method: delegate to the source (pid, from_lid).
+ *   - Buy method: unlimited.
+ *   - Multiple methods at a node: OR — take the best.
+ *
+ * Returns demandId → Map<(pid to lid), achievable qty>.
+ */
+internal fun computeAchievableQtyMaps(
+    demands: List<Map<String, Any?>>,
+    allocation: SupplyAllocationResult,
+    data: Map<String, List<Map<String, Any?>>>,
+): Map<Any?, Map<Pair<String, String>, Double>> {
+    val result = mutableMapOf<Any?, Map<Pair<String, String>, Double>>()
+    for (demand in demands) {
+        val demandId = demand["demand_id"] ?: continue
+        val pid  = (demand["product_id"] as? String)?.trim() ?: continue
+        val lid  = (demand["location_id"] as? String)?.trim() ?: continue
+        val qty  = (demand["quantity"]    as? Number)?.toDouble() ?: continue
+        if (qty <= 0.0) { result[demandId] = emptyMap(); continue }
+        val nodeMap = mutableMapOf<Pair<String, String>, Double>()
+        nodeAchievableInto(pid, lid, qty, demandId, allocation, data, mutableSetOf(), nodeMap)
+        result[demandId] = nodeMap
+        val rootAq = nodeMap[pid to lid] ?: qty
+        if (rootAq < qty - 1e-9) {
+            log.info("[supply-guided][cap] demand={} qty={} achievable={} ({}) nodes={}",
+                demandId, qty.toLong(), rootAq.toLong(), "${"%.1f".format(rootAq * 100.0 / qty)}%", nodeMap.size)
+        }
+    }
+    return result
+}
+
+private fun nodeAchievableInto(
+    pid: String, lid: String, needed: Double,
+    demandId: Any?,
+    allocation: SupplyAllocationResult,
+    data: Map<String, List<Map<String, Any?>>>,
+    visited: MutableSet<Pair<String, String>>,
+    into: MutableMap<Pair<String, String>, Double>,
+): Double {
+    if (needed <= 1e-9) return 0.0
+    val key = pid to lid
+    if (!visited.add(key)) return needed  // cycle guard: assume uncapped
+
+    try {
+        val sk            = SupplyKey(pid, lid)
+        val demandBudgets = allocation.perLotBudgets[demandId] ?: emptyMap<String, Double>()
+        val budgetPrefix  = "$pid|$lid|"
+
+        // Supply at this node: sum lot budgets if critical; treat as uncapped otherwise.
+        val supplyContrib: Double = when {
+            sk !in allocation.graph.supplyIndex -> 0.0
+            demandBudgets.keys.any { it.startsWith(budgetPrefix) } ->
+                demandBudgets.entries.filter { (k, _) -> k.startsWith(budgetPrefix) }.sumOf { (_, q) -> q }
+            else -> needed  // supply exists but not in critical matrix for this demand → uncapped
+        }
+        if (supplyContrib >= needed) {
+            into[key] = needed
+            return needed
+        }
+
+        // Methods at this node: OR group — best method wins.
+        var methodContrib = 0.0
+        for (method in getMethods(pid, lid, data)) {
+            val ma = methodAchievableInto(method, pid, lid, needed, demandId, allocation, data, visited, into)
+            if (ma > methodContrib) methodContrib = ma
+            if (methodContrib >= needed) break
+        }
+
+        val aq = minOf(needed, supplyContrib + methodContrib)
+        into[key] = aq
+        return aq
+    } finally {
+        visited.remove(key)
+    }
+}
+
+private fun methodAchievableInto(
+    method: Map<String, Any?>, pid: String, lid: String, needed: Double,
+    demandId: Any?,
+    allocation: SupplyAllocationResult,
+    data: Map<String, List<Map<String, Any?>>>,
+    visited: MutableSet<Pair<String, String>>,
+    into: MutableMap<Pair<String, String>, Double>,
+): Double {
+    return when (method["type"] as? String) {
+        "purchase" -> needed  // unlimited
+        "move" -> {
+            val fromLid = (method["from_location_id"] as? String)?.trim() ?: return 0.0
+            nodeAchievableInto(pid, fromLid, needed, demandId, allocation, data, visited, into)
+        }
+        "make" -> {
+            // Variants are OR alternatives with equal-split: each handles needed/nVariants.
+            // variantsForMake returns children with qty = needed * rate (full-demand scale).
+            // Per-variant child qty = (needed/nVariants) * rate = cNeededFull / nVariants.
+            val variants = variantsForMake(pid, lid, needed, method, data)
+            if (variants.isEmpty()) return 0.0
+            val nVariants = variants.size.toDouble()
+            var total = 0.0
+            for ((_, children) in variants) {
+                val perVariant = needed / nVariants
+                if (children.isEmpty()) { total += perVariant; continue }
+                // AND: achievable limited by the most-constrained component.
+                var variantAchievable = perVariant
+                for (child in children) {
+                    val cPid        = (child["product_id"] as? String)?.trim() ?: continue
+                    val cLid        = (child["location_id"] as? String)?.trim() ?: continue
+                    val cNeededFull = (child["quantity"]    as? Number)?.toDouble() ?: continue
+                    // Divide by nVariants: variantsForMake scales qty by full `needed`, but
+                    // each variant only handles needed/nVariants of the parent demand.
+                    val cNeeded = cNeededFull / nVariants  // = perVariant * rate
+                    if (cNeeded <= 1e-9) continue
+                    val cAch      = nodeAchievableInto(cPid, cLid, cNeeded, demandId, allocation, data, visited, into)
+                    // Convert child achievable back to parent units: cAch / rate = cAch / (cNeeded/perVariant)
+                    val fromChild = cAch / (cNeeded / perVariant)
+                    if (fromChild < variantAchievable) variantAchievable = fromChild
+                }
+                total += variantAchievable
+            }
+            total
+        }
+        else -> 0.0
+    }
+}
+
+// ── Plan blueprint (sketch-based two-phase planning) ───────────────────────────
+
+/**
+ * Per-node result of the sketch phase.
+ * Captures the achievable quantity AND the pre-selected BOM method so the commit
+ * phase can bypass [getPreferredMethodCascade] — reducing per-node overhead from
+ * O(methods × probeChildren) to O(1) at every BOM depth during planning.
+ */
+data class NodeBlueprint(
+    /** Maximum qty this node can satisfy given its per-lot budget caps. */
+    val achievable: Double,
+    /** Supply portion of achievable (drawn from this node's inventory budget). */
+    val supplyQty: Double = 0.0,
+    /**
+     * First feasible BOM method (by ascending preference int) for the residual.
+     * null = supply fully covers demand (no method needed).
+     */
+    val method: Map<String, Any?>? = null,
+)
+
+typealias DemandBlueprint = Map<Pair<String, String>, NodeBlueprint>
+typealias PlanBlueprint   = Map<Any?, DemandBlueprint>
+
+/**
+ * Sketch phase: one read-only BOM walk per demand that:
+ *  1. Computes achievable quantity at every node (same logic as [computeAchievableQtyMaps]).
+ *  2. Records the FIRST feasible BOM method by preference so the commit phase can
+ *     skip [getPreferredMethodCascade] entirely (no probeChildren calls per node).
+ *
+ * Supersedes [computeAchievableQtyMaps] in the supply-guided pipeline.
+ */
+internal fun computePlanBlueprint(
+    demands: List<Map<String, Any?>>,
+    allocation: SupplyAllocationResult,
+    data: Map<String, List<Map<String, Any?>>>,
+): PlanBlueprint {
+    val result = mutableMapOf<Any?, DemandBlueprint>()
+    for (demand in demands) {
+        val demandId = demand["demand_id"] ?: continue
+        val pid  = (demand["product_id"] as? String)?.trim() ?: continue
+        val lid  = (demand["location_id"] as? String)?.trim() ?: continue
+        val qty  = (demand["quantity"]    as? Number)?.toDouble() ?: continue
+        if (qty <= 0.0) { result[demandId] = emptyMap(); continue }
+        val nodeMap = mutableMapOf<Pair<String, String>, NodeBlueprint>()
+        nodeSketchInto(pid, lid, qty, demandId, allocation, data, mutableSetOf(), nodeMap)
+        result[demandId] = nodeMap
+        val rootAq = nodeMap[pid to lid]?.achievable ?: qty
+        if (rootAq < qty - 1e-9) {
+            log.info("[supply-guided][blueprint-cap] demand={} qty={} achievable={} ({}) nodes={}",
+                demandId, qty.toLong(), rootAq.toLong(),
+                "${"%.1f".format(rootAq * 100.0 / qty)}%", nodeMap.size)
+        }
+    }
+    return result
+}
+
+private fun nodeSketchInto(
+    pid: String, lid: String, needed: Double,
+    demandId: Any?,
+    allocation: SupplyAllocationResult,
+    data: Map<String, List<Map<String, Any?>>>,
+    visited: MutableSet<Pair<String, String>>,
+    into: MutableMap<Pair<String, String>, NodeBlueprint>,
+): Double {
+    if (needed <= 1e-9) return 0.0
+    val key = pid to lid
+    if (!visited.add(key)) return needed  // cycle guard: assume uncapped
+    try {
+        val sk            = SupplyKey(pid, lid)
+        val demandBudgets = allocation.perLotBudgets[demandId] ?: emptyMap<String, Double>()
+        val budgetPrefix  = "$pid|$lid|"
+
+        val supplyQty: Double = when {
+            sk !in allocation.graph.supplyIndex -> 0.0
+            demandBudgets.keys.any { it.startsWith(budgetPrefix) } ->
+                demandBudgets.entries.filter { (k, _) -> k.startsWith(budgetPrefix) }.sumOf { (_, q) -> q }
+            else -> needed
+        }
+        if (supplyQty >= needed) {
+            into[key] = NodeBlueprint(achievable = needed, supplyQty = needed)
+            return needed
+        }
+
+        val residual = needed - supplyQty
+
+        // First feasible method by preference (ascending int = higher priority).
+        // Takes the first method with achievable > 0 — no backtracking in commit phase.
+        val methods = getMethods(pid, lid, data)
+            .sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
+
+        var selectedMethod: Map<String, Any?>? = null
+        var selectedAchievable = 0.0
+
+        for (method in methods) {
+            val ma = methodAchievableForSketch(method, pid, lid, residual, demandId, allocation, data, visited, into)
+            if (ma > 1e-9) {
+                selectedMethod = method
+                selectedAchievable = ma
+                break
+            }
+        }
+
+        val aq = supplyQty + selectedAchievable
+        into[key] = NodeBlueprint(achievable = aq, supplyQty = supplyQty, method = selectedMethod)
+        return aq
+    } finally {
+        visited.remove(key)
+    }
+}
+
+// Same arithmetic as methodAchievableInto but recurses via nodeSketchInto to populate blueprint entries.
+private fun methodAchievableForSketch(
+    method: Map<String, Any?>, pid: String, lid: String, needed: Double,
+    demandId: Any?,
+    allocation: SupplyAllocationResult,
+    data: Map<String, List<Map<String, Any?>>>,
+    visited: MutableSet<Pair<String, String>>,
+    into: MutableMap<Pair<String, String>, NodeBlueprint>,
+): Double {
+    return when (method["type"] as? String) {
+        "purchase" -> needed
+        "move" -> {
+            val fromLid = (method["from_location_id"] as? String)?.trim() ?: return 0.0
+            nodeSketchInto(pid, fromLid, needed, demandId, allocation, data, visited, into)
+        }
+        "make" -> {
+            val variants = variantsForMake(pid, lid, needed, method, data)
+            if (variants.isEmpty()) return 0.0
+            val nVariants = variants.size.toDouble()
+            var total = 0.0
+            for ((_, children) in variants) {
+                val perVariant = needed / nVariants
+                if (children.isEmpty()) { total += perVariant; continue }
+                var variantAchievable = perVariant
+                for (child in children) {
+                    val cPid        = (child["product_id"] as? String)?.trim() ?: continue
+                    val cLid        = (child["location_id"] as? String)?.trim() ?: continue
+                    val cNeededFull = (child["quantity"]    as? Number)?.toDouble() ?: continue
+                    val cNeeded = cNeededFull / nVariants
+                    if (cNeeded <= 1e-9) continue
+                    val cAch      = nodeSketchInto(cPid, cLid, cNeeded, demandId, allocation, data, visited, into)
+                    val fromChild = cAch / (cNeeded / perVariant)
+                    if (fromChild < variantAchievable) variantAchievable = fromChild
+                }
+                total += variantAchievable
+            }
+            total
+        }
+        else -> 0.0
+    }
+}
+
+// ── Post-planning trace ─────────────────────────────────────────────────────────
+
+/**
+ * Logs the request → allocation → pegging pipeline for critically scarce supplies,
+ * and runs the compensation-pass telemetry (budget GC diagnostics).
+ * Called after [legacyCommit] completes, with the committed pegging trees.
+ */
+internal fun logSupplyGuidedTrace(
+    allocation: SupplyAllocationResult,
+    pegging: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+) {
+    val lotPeggedByLot = extractLotDrawsFromPegging(pegging)
+    for ((lotKey, allocDemands) in allocation.lotAllocByLot.entries.sortedByDescending { it.value.values.sum() }) {
         val pipeIdx  = lotKey.indexOf('|')
         val pipeIdx2 = if (pipeIdx >= 0) lotKey.indexOf('|', pipeIdx + 1) else -1
         if (pipeIdx < 0 || pipeIdx2 < 0) continue
-        val pid = lotKey.substring(0, pipeIdx)
-        val lid = lotKey.substring(pipeIdx + 1, pipeIdx2)
-        val sid = lotKey.substring(pipeIdx2 + 1)
-        val sk  = SupplyKey(pid, lid)
-        val totalRequest = criticalMatrix.byColumn[sk]?.values?.sum() ?: continue
-        val totalSupply  = supplyTotals[sk] ?: continue
-        if (totalSupply <= 0 || totalSupply >= totalRequest * 0.01) continue  // critical only
-        val lotInfo   = (data["supply"] ?: emptyList()).firstOrNull {
+        val pid          = lotKey.substring(0, pipeIdx)
+        val lid          = lotKey.substring(pipeIdx + 1, pipeIdx2)
+        val sid          = lotKey.substring(pipeIdx2 + 1)
+        val sk           = SupplyKey(pid, lid)
+        val totalRequest = allocation.criticalMatrix.byColumn[sk]?.values?.sum() ?: continue
+        val totalSupply  = allocation.supplyTotals[sk] ?: continue
+        if (totalSupply <= 0 || totalSupply >= totalRequest * 0.01) continue
+        val lotInfo        = (data["supply"] ?: emptyList()).firstOrNull {
             it["supply_id"]?.toString()?.trim() == sid && it["product_id"]?.toString()?.trim() == pid
         }
-        val lotQty    = (lotInfo?.get("qty") as? Number)?.toDouble() ?: 0.0
-        val lotDateStr = (lotInfo?.get("supply_date") as? String)?.take(10) ?: "?"
-        val requestNeeds   = criticalMatrix.byColumn[sk] ?: emptyMap<Any?, Double>()
-        val peggedByDemand = lotPeggedByLot[sk]?.get(sid) ?: emptyMap<Any?, Double>()
-        // All competing demands for this supply (sorted by request qty, includes date-blocked ones).
-        val sortedDemands = requestNeeds.entries.sortedByDescending { it.value }.map { it.key }
-        val lines = sortedDemands.mapNotNull { did: Any? ->
-            val req    = requestNeeds[did]   ?: 0.0
-            val alloc  = allocDemands[did]   ?: 0.0
-            val pegged = peggedByDemand[did] ?: 0.0
+        val lotQty         = (lotInfo?.get("qty") as? Number)?.toDouble() ?: 0.0
+        val lotDateStr     = (lotInfo?.get("supply_date") as? String)?.take(10) ?: "?"
+        val requestNeeds   = allocation.criticalMatrix.byColumn[sk] ?: emptyMap()
+        val peggedByDemand = lotPeggedByLot[sk]?.get(sid) ?: emptyMap()
+        val lines = requestNeeds.entries.sortedByDescending { it.value }.mapNotNull { (did, _) ->
+            val req    = requestNeeds[did]      ?: 0.0
+            val alloc  = allocDemands[did]      ?: 0.0
+            val pegged = peggedByDemand[did]    ?: 0.0
             if (req < 1e-9 && alloc < 1e-9 && pegged < 1e-9) null
             else "$did:${req.toLong()}->${alloc.toLong()}->${pegged.toLong()}"
         }
@@ -310,30 +581,22 @@ internal fun runSupplyGuidedPlanning(
             pid, lid, sid, lotDateStr, lotQty.toLong(), lines.joinToString(", "))
     }
 
-    // ── Step 3c: GC unused budgets via compensation passes ─────────────────────
-    // Extract what each demand actually drew from each supply-bearing node,
-    // then redistribute the undrawn slack to cap-bound demands.
-    // Note: full convergence (re-running Loop 2 with updated caps) is deferred;
-    // these passes are telemetry + single-pass redistribution only.
-    if (sgConfig.maxCompensationPasses > 0) {
-        val actualDraws = extractActualDrawsFromPegging(commitResult.planningPegging)
+    // Compensation-pass telemetry (re-planning with updated caps is deferred; this is diagnostics only).
+    if (allocation.sgConfig.maxCompensationPasses > 0) {
+        val actualDraws = extractActualDrawsFromPegging(pegging)
+        var allocations = allocation.allocations
         var changed = false
-        repeat(sgConfig.maxCompensationPasses) { pass ->
-            val cr = compensate(allocations, actualDraws, criticalMatrix, demandPriorities, sgConfig.allocationMode)
+        repeat(allocation.sgConfig.maxCompensationPasses) { pass ->
+            val cr = compensate(allocations, actualDraws, allocation.criticalMatrix,
+                                allocation.demandPriorities, allocation.sgConfig.allocationMode)
             if (!cr.redistributed) return@repeat
-            log.info(
-                "[supply-guided] compensation pass {}: supplies={} redistributed={:.2f} absorbed={:.2f}",
-                pass + 1, cr.supplyCount, cr.qtyRedistributed, cr.qtyAbsorbed,
-            )
+            log.info("[supply-guided] compensation pass {}: supplies={} redistributed={:.2f} absorbed={:.2f}",
+                pass + 1, cr.supplyCount, cr.qtyRedistributed, cr.qtyAbsorbed)
             allocations = cr.allocations
             changed = true
         }
-        if (changed) {
-            log.info("[supply-guided] compensation complete; re-plan with updated caps is TODO (convergence loop)")
-        }
+        if (changed) log.info("[supply-guided] compensation complete; re-plan with updated caps is TODO (convergence loop)")
     }
-
-    return commitResult
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -409,7 +672,7 @@ private fun extractLotDrawsFromPegging(
                 val sk = SupplyKey(pid, lid)
                 result.getOrPut(sk) { mutableMapOf() }
                     .getOrPut(sid) { mutableMapOf() }
-                    .merge(demandId, qty, Double::plus)
+                    .merge(demandId, qty) { a, b -> a + b }
             }
         }
 

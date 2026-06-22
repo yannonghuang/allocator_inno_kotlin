@@ -340,7 +340,7 @@ fun Routing.allocateRoutes() {
                 "result" to null,
                 "error" to null,
             )
-            engineScope.launch { runPlanBackground(jobId, caseId, data, config) }
+            engineScope.launch { runPlanBackground(jobId, caseId, data, config, autoSave = true) }
             call.response.headers.append("Location", "/cases/$caseId/plan/status/$jobId")
             call.respond(HttpStatusCode.Accepted, buildJsonObject {
                 put("job_id", jobId)
@@ -350,6 +350,7 @@ fun Routing.allocateRoutes() {
             return@post
         }
 
+        casePlanResults.remove(caseId)  // release previous result before allocating a new one
         val result = runPlanning(data, config = config)
         val enriched = enrichPlanResultWithData(caseId, result.output, data)
         casePlanResults[caseId] = enriched
@@ -1004,14 +1005,11 @@ fun Routing.allocateRoutes() {
         }
 
         // Lazily re-enrich stale results that pre-date requested_qty enrichment.
-        // Check by looking at the first committed_demand entry; if requested_qty is absent,
-        // reload case data and re-enrich, then persist so it only runs once.
+        // Check by scanning the raw JSON string for the two field names rather than
+        // doing a full parse (avoids a second large object tree in heap for large results).
         val resultJson: String? = if (raw.result != null && raw.status == "success") {
             val needsEnrichment = runCatching {
-                val parsed = Json.parseToJsonElement(raw.result).jsonObject
-                val firstDemand = parsed["committed_demands"]?.jsonArray?.firstOrNull()?.jsonObject
-                // Re-enrich if either requested_qty or shortage is absent (shortage was added later)
-                firstDemand != null && (!firstDemand.containsKey("requested_qty") || !firstDemand.containsKey("shortage"))
+                !raw.result.contains("\"requested_qty\"") || !raw.result.contains("\"shortage\"")
             }.getOrElse { false }
 
             if (needsEnrichment) {
@@ -1060,6 +1058,54 @@ fun Routing.allocateRoutes() {
             )
         }
 
+        // Inject planning_pegging into the result element.
+        // Priority: (1) in-memory casePlanResults — zero cost, always current for fresh runs;
+        // (2) plan_pegging table — authoritative after a server restart.
+        // The result column never stores planning_pegging (stripped at save time).
+        // Lazy persistence: if we serve from memory and the DB table is empty for this run,
+        // kick off a background write so pegging survives a future server restart.
+        val resultElement: JsonElement? = resultJson?.let { json ->
+            runCatching {
+                val base = Json.parseToJsonElement(json)
+                if (raw.status == "success" && base is JsonObject) {
+                    @Suppress("UNCHECKED_CAST")
+                    val memPegging = (casePlanResults[caseId]?.get("planning_pegging") as? List<Map<String, Any?>>)
+                    val peggingArray: JsonArray?
+                    if (memPegging != null) {
+                        peggingArray = buildJsonArray { memPegging.forEach { add(anyToJson(it)) } }
+                        // Persist lazily if not yet in DB — fire-and-forget, non-fatal.
+                        val alreadyPersisted = transaction {
+                            PlanPegging.selectAll().where { PlanPegging.planRunId eq raw.id }.count() > 0
+                        }
+                        if (!alreadyPersisted) {
+                            val capturedEnriched = casePlanResults[caseId]
+                            if (capturedEnriched != null) {
+                                engineScope.launch {
+                                    try {
+                                        savePlanPeggingRows(raw.id, capturedEnriched)
+                                        log.info("Lazy pegging persist complete for run {}", raw.id)
+                                    } catch (e: Exception) {
+                                        log.warn("Lazy pegging persist failed for run {}: {}", raw.id, e.message)
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        val rows = transaction {
+                            PlanPegging.selectAll()
+                                .where { PlanPegging.planRunId eq raw.id }
+                                .map { it[PlanPegging.entry] }
+                        }
+                        peggingArray = if (rows.isNotEmpty()) buildJsonArray { rows.forEach { add(Json.parseToJsonElement(it)) } }
+                                       else null
+                    }
+                    if (peggingArray != null)
+                        JsonObject(base.toMutableMap().apply { put("planning_pegging", peggingArray) })
+                    else base
+                } else base
+            }.getOrNull()
+        }
+
         val rawAttempts = parseAttempts(raw.attempts)
         val response = PlanRunFullResponse(
             id = raw.id,
@@ -1068,7 +1114,7 @@ fun Routing.allocateRoutes() {
             status = raw.status,
             config = raw.config?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
             overrideSnapshot = raw.overrideSnapshot?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
-            result = resultJson?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
+            result = resultElement,
             error = raw.error,
             name = raw.name,
             notes = raw.notes,
@@ -1174,9 +1220,10 @@ fun Routing.allocateRoutes() {
                     PlanSupplyAllocations.batchInsert(supplyAllocs) { alloc ->
                         this[PlanSupplyAllocations.caseId]      = caseId
                         this[PlanSupplyAllocations.planRunId]   = targetRunId
-                        this[PlanSupplyAllocations.supplyId]    = alloc["supply_id"] as String
-                        this[PlanSupplyAllocations.demandId]    = alloc["demand_id"] as? String
-                        this[PlanSupplyAllocations.qtyConsumed] = (alloc["qty_consumed"] as? Number)?.toDouble() ?: 0.0
+                        this[PlanSupplyAllocations.supplyId]     = alloc["supply_id"] as String
+                        this[PlanSupplyAllocations.demandId]     = alloc["demand_id"] as? String
+                        this[PlanSupplyAllocations.qtyConsumed]  = (alloc["qty_consumed"] as? Number)?.toDouble() ?: 0.0
+                        this[PlanSupplyAllocations.qtyAllocated] = (alloc["qty_allocated"] as? Number)?.toDouble()
                     }
                 }
                 // The ready row is about to be deleted (with KB rows detached
@@ -1189,6 +1236,12 @@ fun Routing.allocateRoutes() {
                     nameArg?.ifBlank { null }?.let { put("name", JsonPrimitive(it)) }
                     notesArg?.ifBlank { null }?.let { put("notes", JsonPrimitive(it)) }
                 })
+            }
+            // Pegging is chunked into small separate transactions after the main commit.
+            try {
+                savePlanPeggingRows(targetRunId, enriched)
+            } catch (e: Exception) {
+                log.warn("Pegging save failed for overridden run $targetRunId (result already committed): ${e.message}")
             }
             // Refresh the KB snapshot for the target run with its new result.
             try {
@@ -1225,12 +1278,14 @@ fun Routing.allocateRoutes() {
             call.respond(buildJsonObject { put("id", runId); put("status", currentStatus) })
             return@post
         }
-        if (currentStatus != "ready") {
-            throw IllegalStateException("Cannot save plan run with status '$currentStatus'")
-        }
-
         val enriched = casePlanResults[caseId]
             ?: throw NoSuchElementException("No in-memory plan result for case $caseId. Re-run plan first.")
+        // Allow saving a 'failed' run if in-memory results are present — the plan
+        // computation may have succeeded but status was set to 'failed' by a
+        // downstream error (e.g. OOM during status serialization).
+        if (currentStatus != "ready" && currentStatus != "failed") {
+            throw IllegalStateException("Cannot save plan run with status '$currentStatus'")
+        }
         val resultJson = serializeResultOrNull(enriched)
         if (resultJson == null) {
             // Result too large to serialize (OOM). Mark the run failed with a clear
@@ -1259,17 +1314,25 @@ fun Routing.allocateRoutes() {
                 // Idempotent: clear any prior allocations for this run before re-inserting
                 PlanSupplyAllocations.deleteWhere { PlanSupplyAllocations.planRunId eq runId }
                 PlanSupplyAllocations.batchInsert(supplyAllocs) { alloc ->
-                    this[PlanSupplyAllocations.caseId]      = caseId
-                    this[PlanSupplyAllocations.planRunId]   = runId
-                    this[PlanSupplyAllocations.supplyId]    = alloc["supply_id"] as String
-                    this[PlanSupplyAllocations.demandId]    = alloc["demand_id"] as? String
-                    this[PlanSupplyAllocations.qtyConsumed] = (alloc["qty_consumed"] as? Number)?.toDouble() ?: 0.0
+                    this[PlanSupplyAllocations.caseId]       = caseId
+                    this[PlanSupplyAllocations.planRunId]    = runId
+                    this[PlanSupplyAllocations.supplyId]     = alloc["supply_id"] as String
+                    this[PlanSupplyAllocations.demandId]     = alloc["demand_id"] as? String
+                    this[PlanSupplyAllocations.qtyConsumed]  = (alloc["qty_consumed"] as? Number)?.toDouble() ?: 0.0
+                    this[PlanSupplyAllocations.qtyAllocated] = (alloc["qty_allocated"] as? Number)?.toDouble()
                 }
             }
             com.allocator.services.emitPlanRunEvent(caseId, runId, "saved", buildJsonObject {
                 nameArg?.ifBlank { null }?.let { put("name", JsonPrimitive(it)) }
                 notesArg?.ifBlank { null }?.let { put("notes", JsonPrimitive(it)) }
             })
+        }
+        // Pegging is chunked into small separate transactions to avoid TCP-buffer deadlock
+        // on large batches.  A failure here is non-fatal: the plan result is already committed.
+        try {
+            savePlanPeggingRows(runId, enriched)
+        } catch (e: Exception) {
+            log.warn("Pegging save failed for run $runId (result already committed): ${e.message}")
         }
         // Snapshot into the dissociated KB store. Every successful run flows
         // into the KB regardless of origin (user-initiated or KB expansion).
@@ -1546,11 +1609,39 @@ private fun anyToJson(v: Any?): JsonElement = when (v) {
  * consumers like the soundness check — see runSoundnessCheckForRun).
  */
 private fun serializeResultOrNull(enriched: Map<String, Any?>): String? =
-    runCatching { anyToJson(enriched).toString() }.getOrElse { e ->
+    runCatching { anyToJson(enriched - "planning_pegging").toString() }.getOrElse { e ->
         val n = (enriched["work_orders"] as? List<*>)?.size ?: -1
         log.error("Plan result serialization failed (${n} work_orders) — too large to persist: $e")
         null
     }
+
+/**
+ * Write planning_pegging entries to plan_pegging table. Must be called inside a transaction.
+ * Idempotent: deletes any prior rows for this run before inserting.
+ */
+// Sending all pegging rows in a single JDBC batch pipeline (208 × ~1.5 MB = 310 MB) causes a
+// TCP-buffer deadlock: PostgreSQL fills its send buffer while the JVM's receive buffer is full
+// (JVM is busy serializing the next bind parameters and not reading).  The workaround is to
+// split the inserts into small chunks so each round-trip stays within the socket buffer limits.
+private const val PEGGING_CHUNK_SIZE = 5
+
+// Called OUTSIDE the main save transaction so a pegging failure never rolls back the committed
+// plan result.  Manages its own transactions internally.
+@Suppress("UNCHECKED_CAST")
+private fun savePlanPeggingRows(runId: Int, enriched: Map<String, Any?>) {
+    val entries = (enriched["planning_pegging"] as? List<Map<String, Any?>>).orEmpty()
+    if (entries.isEmpty()) return
+    transaction { PlanPegging.deleteWhere { PlanPegging.planRunId eq runId } }
+    entries.chunked(PEGGING_CHUNK_SIZE).forEach { chunk ->
+        transaction {
+            PlanPegging.batchInsert(chunk) { entry ->
+                this[PlanPegging.planRunId] = runId
+                this[PlanPegging.demandId] = entry["demand_id"]?.toString()?.takeIf { it.isNotBlank() }
+                this[PlanPegging.entry] = anyToJson(entry).toString()
+            }
+        }
+    }
+}
 
 /** Human-readable error stored on a run whose result couldn't be serialized/persisted. */
 private fun resultTooLargeError(enriched: Map<String, Any?>): String {
@@ -1587,24 +1678,40 @@ private fun jsonToAny(v: JsonElement): Any? = when (v) {
  */
 @Suppress("UNCHECKED_CAST")
 internal fun loadPlanResultFromDb(caseId: Int, runId: Int? = null): Map<String, Any>? {
-    val resultJson = transaction {
+    data class DbRow(val resultJson: String, val resolvedRunId: Int)
+    val row = transaction {
         if (runId != null) {
             PlanRuns.selectAll()
                 .where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }
                 .firstOrNull()
-                ?.get(PlanRuns.result)
+                ?.let { r -> r[PlanRuns.result]?.let { json -> DbRow(json, runId) } }
         } else {
             PlanRuns.selectAll()
                 .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
                 .orderBy(PlanRuns.id, SortOrder.DESC)
                 .firstOrNull()
-                ?.get(PlanRuns.result)
+                ?.let { r -> r[PlanRuns.result]?.let { json -> DbRow(json, r[PlanRuns.id]) } }
         }
     } ?: return null
-    return runCatching {
-        jsonToAny(Json.parseToJsonElement(resultJson)) as? Map<String, Any>
-    }.getOrNull()
+    val base = runCatching {
+        jsonToAny(Json.parseToJsonElement(row.resultJson)) as? Map<String, Any>
+    }.getOrNull() ?: return null
+    val pegging = loadPlanPeggingFromDb(row.resolvedRunId)
+    return if (pegging.isEmpty()) base else base + ("planning_pegging" to pegging)
 }
+
+/** Load all pegging entries for a run from the plan_pegging table. */
+@Suppress("UNCHECKED_CAST")
+internal fun loadPlanPeggingFromDb(runId: Int): List<Map<String, Any?>> =
+    transaction {
+        PlanPegging.selectAll()
+            .where { PlanPegging.planRunId eq runId }
+            .mapNotNull { row ->
+                runCatching {
+                    jsonToAny(Json.parseToJsonElement(row[PlanPegging.entry])) as? Map<String, Any?>
+                }.getOrNull()
+            }
+    }
 
 /** Return set of (parent_id, child_id) for real BOM rows (VIRTUAL != Y). */
 private fun getBomRealPairs(): Set<Pair<String, String>> {
@@ -2202,6 +2309,12 @@ internal suspend fun runPlanBackground(
     }
     planJobRunIds[jobId] = planRunId
 
+    // Release the previous plan result for this case so GC can reclaim its
+    // memory before enrichment allocates a new one. Without this, the old
+    // result (~1-2 GB of JVM objects) stays live alongside the new planning
+    // data and the new enriched result, tripling peak heap usage.
+    casePlanResults.remove(caseId)
+
     try {
         val total = data["demand"]?.size ?: 0
         val progressCb: (Map<String, Any?>) -> Unit = { p ->
@@ -2222,15 +2335,11 @@ internal suspend fun runPlanBackground(
         val enriched = enrichPlanResultWithData(caseId, raw.output, data)
         casePlanResults[caseId] = enriched
 
-        // Mark run as ready (or auto-save when [autoSave] is true: write the
-        // result, promote to success, and seed the KB. The auto-save path is
-        // for chat-driven plans where the user already committed to the run
-        // by asking the agent to execute it — there's no separate "decide
-        // whether to keep this run" UX in the chat. Page-driven runs default
-        // to autoSave=false and use the explicit /save endpoint.
+        // For auto-save runs: persist result + allocations, then immediately surface
+        // "completed" to the frontend so the UI doesn't stall under heap pressure.
+        // Pegging rows and KB upsert are fire-and-forget in a separate coroutine — they
+        // are non-fatal and can be very slow (208 × ~33 MB trees).
         val resultJson = if (autoSave) serializeResultOrNull(enriched) else null
-        // Auto-save but serialization failed (result too large) ⇒ mark FAILED with a
-        // clear error instead of a bogus `success` row with a NULL result.
         val serializeFailed = autoSave && resultJson == null
         transaction {
             PlanRuns.update({ PlanRuns.id eq planRunId }) {
@@ -2251,9 +2360,10 @@ internal suspend fun runPlanBackground(
                     PlanSupplyAllocations.batchInsert(supplyAllocs) { alloc ->
                         this[PlanSupplyAllocations.caseId]      = caseId
                         this[PlanSupplyAllocations.planRunId]   = planRunId
-                        this[PlanSupplyAllocations.supplyId]    = alloc["supply_id"] as String
-                        this[PlanSupplyAllocations.demandId]    = alloc["demand_id"] as? String
-                        this[PlanSupplyAllocations.qtyConsumed] = (alloc["qty_consumed"] as? Number)?.toDouble() ?: 0.0
+                        this[PlanSupplyAllocations.supplyId]     = alloc["supply_id"] as String
+                        this[PlanSupplyAllocations.demandId]     = alloc["demand_id"] as? String
+                        this[PlanSupplyAllocations.qtyConsumed]  = (alloc["qty_consumed"] as? Number)?.toDouble() ?: 0.0
+                        this[PlanSupplyAllocations.qtyAllocated] = (alloc["qty_allocated"] as? Number)?.toDouble()
                     }
                 }
                 com.allocator.services.emitPlanRunEvent(caseId, planRunId, "saved", buildJsonObject {
@@ -2261,19 +2371,28 @@ internal suspend fun runPlanBackground(
                 })
             }
         }
-        if (autoSave) {
-            try {
-                val kbRowId = com.allocator.services.KbStore.upsertFromPlanRun(planRunId)
-                log.info("Auto-save: plan_run={} promoted to success, kb_record={}", planRunId, kbRowId)
-            } catch (e: Exception) {
-                log.warn("KB upsert failed for auto-saved run $planRunId: ${e.message}")
-            }
-        }
 
+        // Surface completion to the frontend immediately — before slow pegging/KB work.
         planJobs[jobId]?.let { job ->
             job["status"] = "completed"
             job["result"] = enriched
             job["progress"] = mapOf("current" to total, "total" to total)
+        }
+
+        // KB upsert runs in a background coroutine — non-fatal, can be slow.
+        // Pegging is NOT saved here: GET /plan-runs/{id} serves it from casePlanResults
+        // (in-memory) while the cache is warm, and falls back to plan_pegging table after
+        // restart. Pegging is written to the table by the explicit /save endpoint instead,
+        // so it is persisted when the user navigates to the saved run after a restart.
+        if (autoSave && !serializeFailed) {
+            engineScope.launch {
+                try {
+                    val kbRowId = com.allocator.services.KbStore.upsertFromPlanRun(planRunId)
+                    log.info("Auto-save: plan_run={} promoted to success, kb_record={}", planRunId, kbRowId)
+                } catch (e: Exception) {
+                    log.warn("KB upsert failed for auto-saved run $planRunId: ${e.message}")
+                }
+            }
         }
     } catch (e: Exception) {
         log.error("Plan job $jobId failed: ${e.message}", e)

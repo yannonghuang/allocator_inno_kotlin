@@ -305,9 +305,13 @@ fun allocateSuppliesPerLot(
             val lotDate = parseDate(lot["supply_date"] as? String)
 
             // Filter to demands eligible for this lot by date.
+            // Period-bucket demands (request_due_time = 1st of month) extend to end-of-month
+            // so they compete for any lot whose supply_date falls within their period, not just
+            // lots that arrive before the first of the month.
             val eligibleNeeds = demandNeeds.filter { (demandId, _) ->
                 val dd = demandDates[demandId]
-                lotDate == null || dd == null || !dd.isBefore(lotDate)
+                val eligDate = if (dd != null && dd.dayOfMonth == 1) dd.plusMonths(1).minusDays(1) else dd
+                lotDate == null || eligDate == null || !eligDate.isBefore(lotDate)
             }
             if (eligibleNeeds.isEmpty()) continue
 

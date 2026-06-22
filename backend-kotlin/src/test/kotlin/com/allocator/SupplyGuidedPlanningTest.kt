@@ -146,12 +146,12 @@ class SupplyGuidedPlanningTest : FunSpec({
 
     // ── C. Inventory-aware BOM walk ───────────────────────────────────────────
 
-    test("inventory-aware walk prunes non-supply path and misses deeper supply") {
+    test("reachability: all reachable supply paths are included regardless of inventory preference") {
         // FG can be made via:
-        //   BOM_A → R1@L  (R1 has supply: direct supply-bearing child)
-        //   BOM_B → R2@L  (R2 has NO supply, but R2 can be made from R3@L which DOES)
-        // inventory-aware: only BOM_A path followed (R2 child is not supply-bearing).
-        // naive:            both paths followed → reaches R3 through R2.
+        //   BOM_A → R1@L  (R1 has supply)
+        //   BOM_B → R2@L  (R2 has no supply, but R2 can be made from R3@L which does)
+        // Reachability-based budgeting follows union-all paths → both R1 and R3 are reached.
+        // buildInventoryAwareNeedsMatrix is now an alias for buildNeedsMatrix (same behavior).
         val data = mkData(
             supplies = listOf(supply("R1", "L", 50.0), supply("R3", "L", 50.0)),
             methodMake = listOf(
@@ -170,21 +170,20 @@ class SupplyGuidedPlanningTest : FunSpec({
         val aware = buildInventoryAwareNeedsMatrix(demands, data)
         val naive = buildNeedsMatrix(demands, data)
 
-        // Inventory-aware: BOM_A chosen (R1 is supply-bearing); BOM_B pruned → R3 never discovered.
+        // Both follow all paths: D1 competes for R1 (direct) and R3 (via R2).
         aware.byRow["D1"] shouldNotBe null
         aware.byRow["D1"]!!.containsKey(SupplyKey("R1", "L")) shouldBe true
-        aware.byRow["D1"]!!.containsKey(SupplyKey("R3", "L")) shouldBe false
-
-        // Naive (union-all): BOM_B also traversed → R2 explored → R3 reached and emitted.
-        naive.byRow["D1"]!!.containsKey(SupplyKey("R1", "L")) shouldBe true
-        naive.byRow["D1"]!!.containsKey(SupplyKey("R3", "L")) shouldBe true
+        aware.byRow["D1"]!!.containsKey(SupplyKey("R3", "L")) shouldBe true
+        // Both functions are identical under reachability-based budgeting.
+        aware.byRow["D1"] shouldBe naive.byRow["D1"]
     }
 
     // ── C1. Simple test + simple claim (buildNeedsMatrix) ────────────────────
 
-    test("request map: demand request quantity equals demand_qty times bom_rate") {
+    test("request map: demand request weight equals raw demand quantity (not BOM-rate-adjusted)") {
         // D1 needs FG@L (qty=100). FG is made from R3@L at rate 2.0. R3 has supply.
-        // Simple claim: D1's request for R3@L = 100 × 2.0 = 200.
+        // Reachability-based budgeting: D1's request weight = demand qty = 100 (not 100×2=200).
+        // BOM rates are a planning concern, not a budgeting concern.
         val data = mkData(
             supplies = listOf(supply("R3", "L", 500.0)),
             methodMake = listOf(
@@ -195,7 +194,7 @@ class SupplyGuidedPlanningTest : FunSpec({
             ),
         )
         val matrix = buildNeedsMatrix(listOf(demand("D1", "FG", "L", qty = 100.0)), data)
-        matrix.byRow["D1"]!![SupplyKey("R3", "L")]!! shouldBe (200.0 plusOrMinus 1e-6)
+        matrix.byRow["D1"]!![SupplyKey("R3", "L")]!! shouldBe (100.0 plusOrMinus 1e-6)
     }
 
     test("request map: demand appears in supply column even when an alternate supply-bearing path exists") {

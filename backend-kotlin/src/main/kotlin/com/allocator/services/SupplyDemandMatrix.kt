@@ -1,43 +1,29 @@
 package com.allocator.services
 
+
 /**
- * Phase 1 of supply-level consolidation — build the bipartite (demand × supply)
- * needs matrix.
+ * Phase 1 of supply-guided planning — build the bipartite (demand × supply)
+ * needs matrix via BOM reachability.
  *
- * ## Two variants
+ * ## Design
  *
- * **Union-all** ([buildNeedsMatrix]): follows every method at every BOM node.
- * Every demand that can reach a supply via any path gets a request row for
- * that supply. Used for allocation — every competing demand participates so
- * the allocation amounts are fair.
+ * Budgeting is separate from planning. The request matrix answers only
+ * "which demands compete for which supply?" Rate math (OR-splits, nVariants,
+ * BOM quantities) belongs to the planning phase and must not appear here.
  *
- * **Inventory-aware** ([buildInventoryAwareNeedsMatrix]): at each BOM node,
- * if any method has supply-bearing direct children, only those methods are
- * followed (others are pruned). Falls back to union-all when no method has
- * supply-bearing direct children. Used for budget structure — each demand's
- * budget only covers the supplies plan() will naturally reach on its
- * inventory-preferred path, avoiding budget caps at wrong BOM levels.
+ * A demand D competes for supply S if S is reachable from D's BOM root via
+ * any path in the BOM DAG (union-all). The matrix value is the raw demand
+ * quantity, used by the allocator to split supply proportionally:
+ *   allocation(D, S) = available(S) × demandQty(D) / Σ demandQty(competing).
  *
  * ## Algorithm
  *
  * The BOM DAG is precomputed once ([buildBomGraph]):
- *   1. BFS from all demand roots + method nodes + supply nodes: collects every
- *      reachable (pid, lid) and its outgoing edges. For each BOM node, both
- *      the full edge set (union-all) and the inventory-only edge set
- *      (methods with supply-bearing direct children) are stored.
- *   2. Kahn's topological sort on the full edge set. The resulting order is
- *      also valid for the inventory-only subgraph (a subset of edges can only
- *      reduce in-degrees, never create ordering violations).
+ *   BFS from all demand roots + method nodes + supply nodes; collects every
+ *   reachable (pid, lid) and its union-all outgoing edges.
  *
- * Per demand, only rate propagation is needed ([propagateRates]):
- *   - Seed rate[demandRoot] = demandQty.
- *   - Iterate the precomputed topo order; for each node with non-null rate,
- *     emit a supply need if supply-bearing, then propagate rate × edgeRate.
- *   - Union-all uses `graph.edges`; inventory-aware uses `graph.inventoryEdges`
- *     at nodes where it is non-empty, otherwise falls back to `graph.edges`.
- *
- * This reduces cost from O(N × per-demand BFS + getMethods calls) to
- * O(V+E) graph setup + O(N × V_global) rate propagation with map lookups.
+ * Per demand, BFS from the demand root through [BomGraph.edges] ([buildReachabilityMatrix]):
+ *   All reachable supply nodes → emit (demandId, supplyKey, demandQty).
  */
 
 /** A leaf or intermediate supply identified by (productId, locationId). */
@@ -64,35 +50,28 @@ data class NeedsMatrix(
 }
 
 /**
- * Build the needs matrix using the **union-all** BOM walk.
+ * Build the needs matrix via BOM reachability (union-all).
  *
- * Every demand that can reach a supply via any BOM path gets a request row
- * for that supply. Use this for allocation — all competing demands participate
- * so allocation amounts are fair.
+ * Every demand that can reach a supply via any BOM path competes for that
+ * supply. Matrix value = raw demand quantity (used for proportional allocation).
  */
 fun buildNeedsMatrix(
     demands: List<Map<String, Any?>>,
     data: Map<String, List<Map<String, Any?>>>,
 ): NeedsMatrix {
     val graph = buildBomGraph(demands, data)
-    return propagateRates(demands, graph, inventoryAware = false)
+    return buildReachabilityMatrix(demands, graph)
 }
 
 /**
- * Build the needs matrix using the **inventory-aware** BOM walk.
- *
- * At each BOM node, if any method has supply-bearing direct children, only
- * those methods are followed. Falls back to union-all when no such method
- * exists. Use this for budget structure — each demand's budget covers only
- * the supplies plan() will naturally reach on its inventory-preferred path.
+ * Alias for [buildNeedsMatrix]. Retained for call-site compatibility; the
+ * inventory-aware distinction is removed — reachability-based budgeting uses
+ * union-all paths for all demands.
  */
 fun buildInventoryAwareNeedsMatrix(
     demands: List<Map<String, Any?>>,
     data: Map<String, List<Map<String, Any?>>>,
-): NeedsMatrix {
-    val graph = buildBomGraph(demands, data)
-    return propagateRates(demands, graph, inventoryAware = true)
-}
+): NeedsMatrix = buildNeedsMatrix(demands, data)
 
 // ── Global BOM graph ─────────────────────────────────────────────────────────
 
@@ -245,20 +224,19 @@ internal fun buildBomGraph(
     return BomGraph(edges, inventoryEdges, topoOrder, supplyIndex)
 }
 
-// ── Rate propagation ─────────────────────────────────────────────────────────
+// ── Reachability-based request matrix ────────────────────────────────────────
 
 /**
- * Propagate demand quantities through the precomputed [graph] and collect
- * supply requests per demand.
+ * Build the needs matrix via BFS reachability through the precomputed [graph].
  *
- * @param inventoryAware when true, uses [BomGraph.inventoryEdges] at nodes
- *   where it is defined; falls back to [BomGraph.edges] elsewhere. When
- *   false, always uses [BomGraph.edges] (union-all).
+ * For each demand, BFS from the demand root through union-all edges. Every
+ * reachable supply node → this demand competes for that supply. The matrix
+ * value is the raw demand quantity (not BOM-rate-adjusted), so the downstream
+ * allocator splits supply proportionally to demand size.
  */
-internal fun propagateRates(
+internal fun buildReachabilityMatrix(
     demands: List<Map<String, Any?>>,
     graph: BomGraph,
-    inventoryAware: Boolean,
 ): NeedsMatrix {
     val byRow = mutableMapOf<Any?, MutableMap<SupplyKey, Double>>()
 
@@ -269,25 +247,22 @@ internal fun propagateRates(
         if (qty <= 0) continue
         val demandId = demand["demand_id"]
 
-        val rate  = mutableMapOf<Pair<String, String>, Double>()
-        rate[productId to locationId] = qty
+        val visited = mutableSetOf<Pair<String, String>>()
+        val queue   = ArrayDeque<Pair<String, String>>()
+        val root    = productId to locationId
+        visited.add(root)
+        queue.addLast(root)
 
         val needs = mutableMapOf<SupplyKey, Double>()
-        for (node in graph.topoOrder) {
-            val accumQty = rate[node] ?: continue
-            if (accumQty <= 1e-12) continue
-            val sk = SupplyKey(node.first, node.second)
-            if (sk in graph.supplyIndex) {
-                needs[sk] = (needs[sk] ?: 0.0) + accumQty
-            }
-            val outEdges = if (inventoryAware)
-                graph.inventoryEdges[node] ?: graph.edges[node] ?: emptyList()
-            else
-                graph.edges[node] ?: emptyList()
-            for ((child, edgeRate) in outEdges) {
-                rate[child] = (rate[child] ?: 0.0) + accumQty * edgeRate
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            val sk   = SupplyKey(node.first, node.second)
+            if (sk in graph.supplyIndex) needs[sk] = qty
+            for ((child, _) in graph.edges[node] ?: emptyList()) {
+                if (visited.add(child)) queue.addLast(child)
             }
         }
+
         if (needs.isNotEmpty()) byRow[demandId] = needs
     }
 

@@ -269,14 +269,40 @@ object PlanRuns : Table("plan_run") {
     override val primaryKey = PrimaryKey(id)
 }
 
+/**
+ * Per-demand pegging trees for a saved planning run.
+ *
+ * Stores each entry from `planning_pegging` as a separate row so the data can
+ * be fetched on-demand (one row per WO pegging request) rather than loading the
+ * entire ~330 MB blob from the plan result JSON. The result JSON column only
+ * stores everything else (work_orders, committed_demands, kpis, …) which fits
+ * comfortably in ~53 MB.
+ *
+ * - `demand_id` is null for consolidated cross-demand pegging entries.
+ * - `entry` is the full JSON of one pegging list item (demand_id, tree,
+ *   consolidated_demand_ids, passthrough, …).
+ */
+object PlanPegging : Table("plan_pegging") {
+    val id        = integer("id").autoIncrement()
+    val planRunId = integer("plan_run_id").references(PlanRuns.id, onDelete = ReferenceOption.CASCADE)
+    val demandId  = varchar("demand_id", 255).nullable()
+    val entry     = text("entry")
+    override val primaryKey = PrimaryKey(id)
+    init { index("ix_plan_pegging_run", false, planRunId) }
+}
+
 /** Supply lots consumed by a saved planning run — written on plan save, read by supply view. */
 object PlanSupplyAllocations : Table("plan_supply_allocation") {
-    val id          = integer("id").autoIncrement()
-    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
-    val planRunId   = integer("plan_run_id").references(PlanRuns.id, onDelete = ReferenceOption.CASCADE)
-    val supplyId    = varchar("supply_id", 255)
-    val demandId    = varchar("demand_id", 255).nullable()
-    val qtyConsumed = double("qty_consumed")
+    val id           = integer("id").autoIncrement()
+    val caseId       = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val planRunId    = integer("plan_run_id").references(PlanRuns.id, onDelete = ReferenceOption.CASCADE)
+    val supplyId     = varchar("supply_id", 255)
+    val demandId     = varchar("demand_id", 255).nullable()
+    val qtyConsumed  = double("qty_consumed")
+    // Demand's proportional entitlement from the lot (lot_initial × demand_qty / Σ_competing_demand_qtys).
+    // Always ≥ qty_consumed; the gap is supply the demand was entitled to but didn't draw
+    // because other lots covered its need first.
+    val qtyAllocated = double("qty_allocated").nullable()
     override val primaryKey = PrimaryKey(id)
 }
 

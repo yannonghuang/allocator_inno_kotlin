@@ -20,4 +20,4 @@ FROM eclipse-temurin:21-jre
 WORKDIR /app
 COPY --from=builder /app/build/libs/app.jar app.jar
 EXPOSE 8000
-CMD ["java", "-Xmx6g", "-jar", "app.jar"]
+CMD ["java", "-Xmx12g", "-jar", "app.jar"]
