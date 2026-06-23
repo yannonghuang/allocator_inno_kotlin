@@ -3449,9 +3449,11 @@ internal fun readjustConsolidatedWoTiming(
         } else node
     }
 
+    var iter = 0
     do {
         changed = false
         updatedEnd.clear()
+        iter++
         @Suppress("UNCHECKED_CAST")
         workingTrees = workingTrees.map { entry ->
             val tree    = entry["tree"] as? Map<String, Any?> ?: return@map entry
@@ -3459,6 +3461,7 @@ internal fun readjustConsolidatedWoTiming(
             if (newTree === tree) entry
             else entry.toMutableMap().also { it["tree"] = newTree }
         }
+        log.info("readjustConsolidatedWoTiming iter={} changed={} trees={}", iter, changed, workingTrees.size)
     } while (changed)
 
     val adjustedConsolidated = woConsolidation.consolidated.map { c ->
@@ -4759,7 +4762,7 @@ fun runPlanning(
     // Supply-guided enabled → two-loop model (request map → allocation → budget-commit).
     // Disabled → run phase 3 directly against real inventory; useTaggedLookup
     // is needed only for supply-split overrides (real buckets split per demand).
-    val commitResult: LegacyCommitResult
+    var commitResult: LegacyCommitResult
     var producedByComponent: Map<String, Double> = emptyMap()
     var releasedByComponent: Map<String, Double> = emptyMap()
     // Empty list — retained for shape compatibility with historical consumers
@@ -4793,8 +4796,9 @@ fun runPlanning(
             achievableQtyMaps = achievableQtyMaps,
             planBlueprint     = planBlueprint,
         )
-        // Post-planning trace + compensation-pass telemetry.
-        logSupplyGuidedTrace(sgAllocation, commitResult.planningPegging, data)
+        // Post-planning trace + compensation-pass telemetry (opt-in: trace_lots=true).
+        if (sgAllocation.sgConfig.traceLots)
+            logSupplyGuidedTrace(sgAllocation, commitResult.planningPegging, data)
     } else if (consolidationConfig.enabled) {
         val iterated = runV2Iterated(
             demands, inventory, data, config, consolidationConfig, overrideIndex, progressCallback,
@@ -4814,18 +4818,27 @@ fun runPlanning(
     committedDemands.addAll(commitResult.committedDemands)
     workOrders.addAll(commitResult.workOrders)
     planningPegging.addAll(commitResult.planningPegging)
+    // Release commitResult's pegging reference — originals are now only in planningPegging,
+    // which is cleared after allPegging is built, allowing GC to reclaim the trees.
+    commitResult = commitResult.copy(planningPegging = emptyList())
 
     // With realPegging on, Pass-1 re-supplied the real lots (real supply_id) and the per-demand
     // trees consume them directly — so the `demand_id=null` production trees would DOUBLE-claim
     // those lots in soundness/aggregation. Drop them; per-demand trees carry the real consumption.
-    val basePegging = if (consolidationConfig.realPegging) planningPegging else (consolidatedPegging + planningPegging)
-    // Prune cycle_stopped phantom loop nodes from every pegging tree before returning.
+    // Prune cycle_stopped phantom loop nodes. Scope `base` inside a run{} so it goes out of scope
+    // immediately after pruning, allowing the GC to reclaim original trees before verification passes.
     @Suppress("UNCHECKED_CAST")
-    val allPegging = basePegging.mapNotNull { entry ->
-        val tree = entry["tree"] as? Map<String, Any?> ?: return@mapNotNull null
-        val pruned = prunePhantomLoops(tree, isRoot = true) ?: return@mapNotNull null
-        entry.toMutableMap().apply { put("tree", pruned) }
+    var allPegging: List<Map<String, Any?>> = run {
+        val base = if (consolidationConfig.realPegging) planningPegging else (consolidatedPegging + planningPegging)
+        base.mapNotNull { entry ->
+            val tree = entry["tree"] as? Map<String, Any?> ?: return@mapNotNull null
+            val pruned = prunePhantomLoops(tree, isRoot = true) ?: return@mapNotNull null
+            entry.toMutableMap().apply { put("tree", pruned) }
+        }
     }
+    // Release original pegging lists so GC can reclaim them before the verification + timing passes.
+    planningPegging.clear()
+    consolidatedPegging.clear()
     val suppliesForCap = data["supply"] ?: emptyList()
     val supplyAllocations = extractSupplyAllocations(allPegging, suppliesForCap, demands)
     val supplyCapViolations = verifySupplyCap(suppliesForCap, supplyAllocations)
@@ -4892,6 +4905,8 @@ fun runPlanning(
     }
 
     val timingFix = fixTimingFromPegging(consolidatedWOs + workOrders, allPegging, data)
+    // Release pruned trees; timingFix holds the timing-adjusted copies.
+    allPegging = emptyList()
 
     // Phase-1 cross-WO arbitration. Opt-in via planning config flag — the
     // feature shifts WO start times when shared resources are contended, so
@@ -5032,12 +5047,14 @@ fun runPlanning(
             "original_lead_days"  to origLeadDays,
         )
     }
+    log.info("[plan] adjustedNative built: native={}", adjustedNative.size)
 
     // R7g: WO conservation — post-trim consolidated WO qty vs served-demand consumption.
     // Uses adjustedTrees (final pegging) and adjustedConsolidated (final WO list).
     val woConservationViolations = if (producedByComponent.isNotEmpty())
         verifyWoConservation(producedByComponent, adjustedTrees, adjustedConsolidated, servedDemandIds = servedDemandIds)
     else emptyList<String>()
+    log.info("[plan] verifyWoConservation done: violations={}", woConservationViolations.size)
 
     val output: Map<String, Any> = mapOf(
         "committed_demands"      to committedDemands,

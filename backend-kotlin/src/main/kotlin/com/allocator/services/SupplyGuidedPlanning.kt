@@ -37,6 +37,8 @@ data class SupplyGuidedConfig(
      * Range [0, 10]; default 1.
      */
     val maxCompensationPasses: Int = 1,
+    /** Enable post-planning lot-draw trace + compensation telemetry. Off by default — can OOM on large runs. */
+    val traceLots: Boolean = false,
 )
 
 fun parseSupplyGuidedConfig(config: Map<String, Any?>?): SupplyGuidedConfig {
@@ -52,7 +54,8 @@ fun parseSupplyGuidedConfig(config: Map<String, Any?>?): SupplyGuidedConfig {
         else             -> "demand_qty"
     }
     val maxCompensationPasses = ((m["max_compensation_passes"] as? Number)?.toInt() ?: 1).coerceIn(0, 10)
-    return SupplyGuidedConfig(enabled, allocationMode, maxCompensationPasses)
+    val traceLots = m["trace_lots"] as? Boolean ?: false
+    return SupplyGuidedConfig(enabled, allocationMode, maxCompensationPasses, traceLots)
 }
 
 // ── Allocation result ──────────────────────────────────────────────────────────
