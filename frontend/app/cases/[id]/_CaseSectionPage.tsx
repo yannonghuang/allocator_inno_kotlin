@@ -31,6 +31,7 @@ import {
   // Post-response polling: chat reuses getPlanStatus to track plans that
   // exceeded the agent's 25s blocking window.
   getPlanRun,
+  getPlanRunPegging,
   deletePlanRun,
   type PlanRun,
   type PlanRunFull,
@@ -1205,6 +1206,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   } | null>(null);
   const [planLoading, setPlanLoading] = useState(false);
   const [planError, setPlanError] = useState<string | null>(null);
+
+  // Lazily fetch planning_pegging from the separate /pegging endpoint and merge it into
+  // planResult. Called after every setPlanResult(full.result) from a DB-loaded run, since
+  // the plan-run detail endpoint no longer embeds pegging (was causing 20s load times).
+  const loadAndMergePegging = (caseId: number | string, runId: number) => {
+    getPlanRunPegging(Number(caseId), runId)
+      .then(({ planning_pegging }) => {
+        setPlanResult((prev) => prev ? { ...prev, planning_pegging: planning_pegging as PlanningPeggingEntry[] } : prev);
+      })
+      .catch(() => { /* pegging unavailable — drill-down shows empty trees */ });
+  };
   const [planPeggingOpen, setPlanPeggingOpen] = useState(false);
   const [planPeggingContext, setPlanPeggingContext] = useState<
     | { type: 'demand'; row: CommittedDemand }
@@ -1790,7 +1802,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             (async () => {
               try {
                 const full = await getPlanRun(id, planRunId);
-                if (full.result) setPlanResult(full.result as typeof planResult);
+                if (full.result) { setPlanResult(full.result as typeof planResult); loadAndMergePegging(id, planRunId); }
                 setCurrentPlanRunId(planRunId);
                 setFreshPlanRunId(planRunId);
                 setOverrideCandidateRunId(null);
@@ -1844,6 +1856,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         if (st.status === 'completed' && st.result) {
           const freshId = st.plan_run_id ?? null;
           setPlanResult(st.result);
+          if (freshId != null) loadAndMergePegging(id, freshId);
           setPlanRunSaveError(null);
           setPlanWorkOrderPeggingCache({});
           setSupplyCriticalityMap({});
@@ -2397,6 +2410,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       if (signal.cancelled) return;
       if (full.result) {
         setPlanResult(full.result as typeof planResult);
+        loadAndMergePegging(id, chosen.id);
         setCurrentPlanRunId(chosen.id);
         setPlanWorkOrderPeggingCache({});
         if (full.config) {
@@ -3847,6 +3861,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       const full = await getPlanRun(id, runId);
       if (full.result) {
         setPlanResult(full.result as typeof planResult);
+        loadAndMergePegging(id, runId);
         setCurrentPlanRunId(runId);
         setFreshPlanRunId(null);
         setOverrideCandidateRunId(null);

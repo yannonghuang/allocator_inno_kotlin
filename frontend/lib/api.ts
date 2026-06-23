@@ -901,6 +901,12 @@ export async function getPlanRun(caseId: number, runId: number): Promise<PlanRun
   return r.json();
 }
 
+export async function getPlanRunPegging(caseId: number, runId: number): Promise<{ planning_pegging: unknown[] }> {
+  const r = await fetch(`${API}/cases/${caseId}/plan-runs/${runId}/pegging`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
 /** Returns the current unsaved (status="ready") plan run with its in-memory result,
  *  or null if none exists or the server-side memory has expired. */
 export async function getUnsavedPlanRun(caseId: number): Promise<PlanRunFull | null> {

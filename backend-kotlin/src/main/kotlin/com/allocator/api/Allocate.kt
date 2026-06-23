@@ -1070,27 +1070,10 @@ fun Routing.allocateRoutes() {
             )
         }
 
-        // Inject planning_pegging into the result element.
-        // Pegging is always served from plan_pegging table — casePlanResults no longer holds it.
-        // Pegging is eagerly persisted right after planning so it is always available here.
-        val resultElement: JsonElement? = resultJson?.let { json ->
-            runCatching {
-                val base = Json.parseToJsonElement(json)
-                if (raw.status == "success" && base is JsonObject) {
-                    val rows = transaction {
-                        PlanPegging.selectAll()
-                            .where { PlanPegging.planRunId eq raw.id }
-                            .map { it[PlanPegging.entry] }
-                    }
-                    val peggingArray: JsonArray? = if (rows.isNotEmpty())
-                        buildJsonArray { rows.forEach { add(Json.parseToJsonElement(it)) } }
-                    else null
-                    if (peggingArray != null)
-                        JsonObject(base.toMutableMap().apply { put("planning_pegging", peggingArray) })
-                    else base
-                } else base
-            }.getOrNull()
-        }
+        // planning_pegging is served from a separate /pegging endpoint (plan_pegging table).
+        // Do NOT inject it here — loading 200 × 1.5 MB pegging trees on every plan-run detail
+        // request causes 20-second response times. The frontend fetches pegging lazily.
+        val resultElement: JsonElement? = resultJson?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() }
 
         val rawAttempts = parseAttempts(raw.attempts)
         val response = PlanRunFullResponse(
@@ -1115,6 +1098,30 @@ fun Routing.allocateRoutes() {
             attempts = rawAttempts,
         )
         call.respond(response)
+    }
+
+    // ── GET /cases/{case_id}/plan-runs/{run_id}/pegging ──────────────────────
+    // Returns planning_pegging as a raw JSON array streamed directly from the plan_pegging
+    // table without intermediate parsing — avoids the 20s latency of loading 200 × 1.5 MB
+    // trees into JsonElement objects. Frontend fetches this lazily after loading the run.
+    get("/cases/{case_id}/plan-runs/{run_id}/pegging") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val runId = call.parameters["run_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid run_id")
+        transaction {
+            PlanRuns.selectAll().where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }
+                .singleOrNull() ?: throw NoSuchElementException("Plan run not found")
+        }
+        val rows = transaction {
+            PlanPegging.selectAll()
+                .where { PlanPegging.planRunId eq runId }
+                .map { it[PlanPegging.entry] }
+        }
+        val sb = StringBuilder("{\"planning_pegging\":[")
+        rows.forEachIndexed { i, s -> if (i > 0) sb.append(','); sb.append(s) }
+        sb.append("]}")
+        call.respondText(sb.toString(), contentType = io.ktor.http.ContentType.Application.Json)
     }
 
     // ── DELETE /cases/{case_id}/plan-runs/{run_id} ────────────────────────────
