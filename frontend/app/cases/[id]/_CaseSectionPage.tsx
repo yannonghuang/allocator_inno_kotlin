@@ -1228,6 +1228,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planPeggingSearch, setPlanPeggingSearch] = useState('');
   const [planPeggingMatchPath, setPlanPeggingMatchPath] = useState<string | null>(null);
   const [planPeggingMatchIndex, setPlanPeggingMatchIndex] = useState(0);
+  // Per-demand pegging cache — populated lazily when user opens a demand's pegging panel.
+  // Keys are demand_id strings; values are the fetched PlanningPeggingEntry or 'loading'/'error'.
+  const [demandPeggingCache, setDemandPeggingCache] = useState<Record<string, PlanningPeggingEntry | 'loading' | 'error'>>({});
   const [planPeggingMatchPaths, setPlanPeggingMatchPaths] = useState<string[]>([]);
   useEffect(() => {
     setPlanPeggingSearch('');
@@ -1802,7 +1805,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             (async () => {
               try {
                 const full = await getPlanRun(id, planRunId);
-                if (full.result) { setPlanResult(full.result as typeof planResult); loadAndMergePegging(id, planRunId); }
+                if (full.result) setPlanResult(full.result as typeof planResult);
                 setCurrentPlanRunId(planRunId);
                 setFreshPlanRunId(planRunId);
                 setOverrideCandidateRunId(null);
@@ -1856,7 +1859,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         if (st.status === 'completed' && st.result) {
           const freshId = st.plan_run_id ?? null;
           setPlanResult(st.result);
-          if (freshId != null) loadAndMergePegging(id, freshId);
           setPlanRunSaveError(null);
           setPlanWorkOrderPeggingCache({});
           setSupplyCriticalityMap({});
@@ -2120,6 +2122,31 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       return next;
     });
   }, [planPeggingContext, planResult]);
+
+  // Lazily fetch per-demand pegging tree when user opens the pegging panel and the
+  // tree is not in planResult.planning_pegging (bulk load is disabled — trees are too large).
+  useEffect(() => {
+    if (planPeggingContext?.type !== 'demand') return;
+    const demandId = String(planPeggingContext.row.demand_id ?? '').trim();
+    if (!demandId) return;
+    const inResult = planResult?.planning_pegging?.some((e) => String(e.demand_id ?? '').trim() === demandId);
+    if (inResult) return;
+    if (demandPeggingCache[demandId]) return;
+    const planRunId = currentPlanRunId ?? freshPlanRunId;
+    if (!planRunId || !id) return;
+    setDemandPeggingCache((prev) => ({ ...prev, [demandId]: 'loading' }));
+    getPlanRunPegging(Number(id), planRunId, demandId)
+      .then(({ planning_pegging }) => {
+        const entry = planning_pegging[planning_pegging.length - 1] as PlanningPeggingEntry | undefined;
+        if (entry) {
+          setDemandPeggingCache((prev) => ({ ...prev, [demandId]: entry }));
+          setPlanResult((prev) => prev ? { ...prev, planning_pegging: [...(prev.planning_pegging ?? []), entry] } : prev);
+        } else {
+          setDemandPeggingCache((prev) => ({ ...prev, [demandId]: 'error' }));
+        }
+      })
+      .catch(() => setDemandPeggingCache((prev) => ({ ...prev, [demandId]: 'error' })));
+  }, [planPeggingContext, planResult, demandPeggingCache, currentPlanRunId, freshPlanRunId, id]);
 
   // Reset assessment result/history when a different supply is opened in the
   // breakdown slide-in (where the assessment UI now lives).
@@ -2410,7 +2437,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       if (signal.cancelled) return;
       if (full.result) {
         setPlanResult(full.result as typeof planResult);
-        loadAndMergePegging(id, chosen.id);
         setCurrentPlanRunId(chosen.id);
         setPlanWorkOrderPeggingCache({});
         if (full.config) {
@@ -3175,6 +3201,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return m;
   }, [planResult?.supply_allocations]);
 
+  const demandCustomerMap = useMemo(() => {
+    const m = new Map<string, string | null>();
+    for (const d of planResult?.committed_demands ?? []) {
+      if (d.demand_id) m.set(d.demand_id, d.customer ?? null);
+    }
+    return m;
+  }, [planResult?.committed_demands]);
+
   // lotId → demandId → qty — used by the supply-explain allocation heatmap.
   // supply_id → demand_id → qty_allocated (demand's proportional entitlement from this lot).
   // Uses qty_allocated when present (new runs); falls back to qty_consumed for older runs.
@@ -3387,10 +3421,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return map;
   }, [planResult]);
 
+  // supplyView (from plan_supply_allocation via backend) keyed by supply_id — used as
+  // fallback when supplyPeggingMap is empty (pegging trees too large to load in-memory).
+  const supplyViewRowMap = useMemo(() => {
+    const m = new Map<string, SupplyViewRow>();
+    for (const r of supplyView) m.set(r.supply_id, r);
+    return m;
+  }, [supplyView]);
+
   /** Join caseSupplies rows with supplyPeggingMap to produce the enriched supply view. */
   const planSupplyViewRows = useMemo((): PlanSupplyViewRow[] => {
     return caseSupplies.map((s) => {
       const pegging = supplyPeggingMap.get(s.supplyId);
+      const svRow = supplyViewRowMap.get(s.supplyId);
       // Prefer persisted supply_allocations (written on save); fall back to pegging-tree traversal
       // so the pre-save preview still shows approximate consumption figures.
       const consumedQty = supplyConsumedMap.size > 0
@@ -3411,14 +3454,24 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         consumedQty,
         residualQty,
         utilizationRate,
-        peggedDemandCount: pegging?.demands.length ?? 0,
-        totalPeggedQty: pegging?.totalPeggedQty ?? 0,
-        peggedDemands: pegging?.demands ?? [],
+        peggedDemandCount: pegging?.demands.length ?? svRow?.pegged_demands ?? 0,
+        totalPeggedQty: pegging?.totalPeggedQty ?? svRow?.total_pegged_qty ?? 0,
+        peggedDemands: pegging?.demands.length
+          ? pegging.demands
+          : (() => {
+              const dm = lotDemandAllocMap.get(s.supplyId);
+              if (!dm) return [];
+              return Array.from(dm.entries()).map(([demandId, qty]) => ({
+                demandId,
+                customer: demandCustomerMap.get(demandId) ?? null,
+                qtyConsumed: qty,
+              }));
+            })(),
         splitInfos: supplySplitInfoMap.get(s.supplyId) ?? [],
         demandPath,
       };
     });
-  }, [caseSupplies, supplyPeggingMap, supplyConsumedMap, supplySplitInfoMap, supplyDemandPathMap]);
+  }, [caseSupplies, supplyPeggingMap, supplyConsumedMap, lotDemandAllocMap, demandCustomerMap, supplySplitInfoMap, supplyDemandPathMap, supplyViewRowMap]);
 
   /** Sum of qty per productId across all plan supply view rows (unfiltered). */
   const planSupplyProductTotalMap = useMemo((): Record<string, number> => {
@@ -3861,7 +3914,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       const full = await getPlanRun(id, runId);
       if (full.result) {
         setPlanResult(full.result as typeof planResult);
-        loadAndMergePegging(id, runId);
         setCurrentPlanRunId(runId);
         setFreshPlanRunId(null);
         setOverrideCandidateRunId(null);
@@ -10583,7 +10635,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 const entry = matchingEntries.length > 0 ? matchingEntries[matchingEntries.length - 1] : undefined;
                 tree = entry?.tree ?? null;
                 if (!tree) {
-                  return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>No pegging tree for this demand. Re-run plan to get planning_pegging.</p>;
+                  const cacheState = demandPeggingCache[demandIdNorm];
+                  if (cacheState === 'loading') return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>Loading pegging tree…</p>;
+                  if (cacheState === 'error') return <p style={{ color: '#f87171', fontSize: '0.9rem' }}>Failed to load pegging tree for this demand.</p>;
+                  return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>Loading pegging tree…</p>;
                 }
               }
 

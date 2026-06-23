@@ -1100,28 +1100,24 @@ fun Routing.allocateRoutes() {
         call.respond(response)
     }
 
-    // ── GET /cases/{case_id}/plan-runs/{run_id}/pegging ──────────────────────
-    // Returns planning_pegging as a raw JSON array streamed directly from the plan_pegging
-    // table without intermediate parsing — avoids the 20s latency of loading 200 × 1.5 MB
-    // trees into JsonElement objects. Frontend fetches this lazily after loading the run.
-    get("/cases/{case_id}/plan-runs/{run_id}/pegging") {
+    // ── GET /cases/{case_id}/plan-runs/{run_id}/pegging/{demand_id} ──────────
+    // Returns a single demand's pegging tree as raw JSON. Fetched on-demand when the
+    // user opens a demand's pegging drill-down panel, not loaded in bulk at page load.
+    // Individual real-demand trees are 8-11 MB; VIRTUAL consolidation trees can be 80-170 MB.
+    get("/cases/{case_id}/plan-runs/{run_id}/pegging/{demand_id}") {
         val caseId = call.parameters["case_id"]?.toIntOrNull()
             ?: throw IllegalArgumentException("Invalid case_id")
         val runId = call.parameters["run_id"]?.toIntOrNull()
             ?: throw IllegalArgumentException("Invalid run_id")
-        transaction {
-            PlanRuns.selectAll().where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }
-                .singleOrNull() ?: throw NoSuchElementException("Plan run not found")
-        }
-        val rows = transaction {
+        val demandId = call.parameters["demand_id"]
+            ?: throw IllegalArgumentException("Invalid demand_id")
+        val entry = transaction {
             PlanPegging.selectAll()
-                .where { PlanPegging.planRunId eq runId }
+                .where { (PlanPegging.planRunId eq runId) and (PlanPegging.demandId eq demandId) }
                 .map { it[PlanPegging.entry] }
-        }
-        val sb = StringBuilder("{\"planning_pegging\":[")
-        rows.forEachIndexed { i, s -> if (i > 0) sb.append(','); sb.append(s) }
-        sb.append("]}")
-        call.respondText(sb.toString(), contentType = io.ktor.http.ContentType.Application.Json)
+                .firstOrNull()
+        } ?: throw NoSuchElementException("Pegging not found for demand $demandId in run $runId")
+        call.respondText(entry, contentType = io.ktor.http.ContentType.Application.Json)
     }
 
     // ── DELETE /cases/{case_id}/plan-runs/{run_id} ────────────────────────────

@@ -901,10 +901,12 @@ export async function getPlanRun(caseId: number, runId: number): Promise<PlanRun
   return r.json();
 }
 
-export async function getPlanRunPegging(caseId: number, runId: number): Promise<{ planning_pegging: unknown[] }> {
-  const r = await fetch(`${API}/cases/${caseId}/plan-runs/${runId}/pegging`);
+export async function getPlanRunPegging(caseId: number, runId: number, demandId: string): Promise<{ planning_pegging: unknown[] }> {
+  const r = await fetch(`${API}/cases/${caseId}/plan-runs/${runId}/pegging/${encodeURIComponent(demandId)}`);
   if (!r.ok) throw new Error(await r.text());
-  return r.json();
+  // Backend returns the raw pegging entry JSON; wrap it in an array to match the old bulk shape.
+  const entry = await r.json();
+  return { planning_pegging: [entry] };
 }
 
 /** Returns the current unsaved (status="ready") plan run with its in-memory result,
