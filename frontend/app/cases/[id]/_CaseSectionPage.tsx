@@ -2343,7 +2343,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     }
     allocationViewRunIdRef.current = runId;
     setSupplyViewLoading(true);
-    getSupplyView(id, runId, currentPlanRunId != null ? { plan_run_id: currentPlanRunId } : undefined)
+    const svPlanRunId = currentPlanRunId ?? freshPlanRunId;
+    getSupplyView(id, runId, svPlanRunId != null ? { plan_run_id: svPlanRunId } : undefined)
       .then((s) => setSupplyView(s.supply_view))
       .catch(() => setSupplyView([]))
       .finally(() => setSupplyViewLoading(false));
@@ -2477,11 +2478,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   useEffect(() => {
     if (!selectedRunId) return;
     setSupplyViewLoading(true);
-    getSupplyView(id, selectedRunId, currentPlanRunId != null ? { plan_run_id: currentPlanRunId } : undefined)
+    const svPlanRunId = currentPlanRunId ?? freshPlanRunId;
+    getSupplyView(id, selectedRunId, svPlanRunId != null ? { plan_run_id: svPlanRunId } : undefined)
       .then((s) => setSupplyView(s.supply_view))
       .catch(() => setSupplyView([]))
       .finally(() => setSupplyViewLoading(false));
-  }, [currentPlanRunId, selectedRunId, id]);
+  }, [currentPlanRunId, freshPlanRunId, selectedRunId, id]);
 
   // Lazy-load allocation view only when user opens the Allocation tab (scalable: no heavy request on run select)
   useEffect(() => {
