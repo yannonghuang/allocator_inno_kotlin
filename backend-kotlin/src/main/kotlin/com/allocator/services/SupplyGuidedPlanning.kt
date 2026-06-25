@@ -251,6 +251,21 @@ internal fun buildSupplyAllocation(
     )
 }
 
+/** Flatten perLotBudgets to (supplyId, demandId?, qty) triples for DB persistence.
+ *  Only emits lot-level keys ("pid|lid|sid"); aggregate ("pid|lid") keys are skipped. */
+internal fun buildAllocationBudgetRows(perLotBudgets: Map<Any?, MutableMap<String, Double>>): List<Triple<String, String?, Double>> {
+    val rows = mutableListOf<Triple<String, String?, Double>>()
+    for ((demandId, budgetMap) in perLotBudgets) {
+        for ((key, qty) in budgetMap) {
+            if (key.count { it == '|' } < 2) continue
+            val supplyId = key.substringAfterLast('|')
+            if (supplyId.isBlank() || qty <= 1e-12) continue
+            rows.add(Triple(supplyId, demandId?.toString(), qty))
+        }
+    }
+    return rows
+}
+
 // ── Achievable-quantity pre-computation ────────────────────────────────────────
 
 /**
