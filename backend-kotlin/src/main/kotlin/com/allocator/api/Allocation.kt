@@ -142,7 +142,7 @@ fun Routing.allocationRoutes() {
 
         log.info("[allocation] generating allocation for case {}: {} demands, {} supplies", caseId, demands.size, supplies.size)
         val result  = buildSupplyAllocation(demands, data, config)
-        val budgets = buildAllocationBudgetRows(result)
+        val budgets = buildAllocationBudgetRows(result.perLotBudgets)
         val newRows = budgets.map { (sid, did, qty) -> CaseAllocRow(sid, did, qty) }
         log.info("[allocation] generated {} rows for case {} ({} critical supply lots)", newRows.size, caseId, newRows.map { it.supplyId }.distinct().size)
 

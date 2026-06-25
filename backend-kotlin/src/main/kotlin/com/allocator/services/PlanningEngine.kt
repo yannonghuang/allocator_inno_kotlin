@@ -4786,7 +4786,7 @@ fun runPlanning(
             log.info("[supply-guided] using case_allocation override: {} demand budget entries", precomputedBudgets.size)
             sgAllocationBase.copy(perLotBudgets = precomputedBudgets)
         } else {
-            allocationBudgetRows = buildAllocationBudgetRows(sgAllocationBase)
+            allocationBudgetRows = buildAllocationBudgetRows(sgAllocationBase.perLotBudgets)
             sgAllocationBase
         }
         // Step 2b: sketch phase — one read-only BOM walk that both computes achievable caps
