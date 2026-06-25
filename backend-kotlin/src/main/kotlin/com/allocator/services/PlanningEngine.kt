@@ -423,12 +423,18 @@ private fun consumeFromInventory(
     need: Double,
     preferDemandId: Any? = null,
     /**
-     * Optional hard cap on total qty consumed at this (productId, locationId) regardless of
-     * the demand's actual need. Used by Stage-3 budget-driven planning to enforce a per-demand
-     * allocation share at the merged-leaf component without polluting [inventory] with tagged
-     * synthetic buckets. `null` means unlimited (legacy behavior).
+     * Optional hard cap on total qty consumed at this (productId, locationId).
+     * Takes precedence over [perLotBudget] for the overall limit.
+     * `null` means unlimited (legacy behavior).
      */
     budgetCap: Double? = null,
+    /**
+     * Optional per-lot budget caps: supplyId → remaining qty allowed for this demand.
+     * When set, each lot is additionally capped by its own entry. The map is mutated
+     * in-place to deduct consumed amounts so the caller can track remaining budgets.
+     * Lots whose supplyId is absent from the map are uncapped at the lot level.
+     */
+    perLotBudget: MutableMap<String, Double>? = null,
 ): List<ConsumedBucket> {
     val pid = productId.trim()
     val lid = locationId.trim()
@@ -451,33 +457,49 @@ private fun consumeFromInventory(
             if (remaining <= 0) break
             val avail = (b["qty"] as? Number)?.toDouble() ?: 0.0
             if (avail <= 0) continue
-            val take = min(avail, remaining)
+            val sid = b["supply_id"]?.toString()
+            // perLotBudget acts as a whitelist: a lot absent from the map gets cap 0.0 (not unlimited).
+            val lotCap = if (perLotBudget != null && sid != null) (perLotBudget[sid] ?: 0.0) else null
+            val take = min(avail, if (lotCap != null) min(remaining, lotCap) else remaining)
+            if (take <= 0) continue
             b["qty"] = avail - take
             remaining -= take
+            if (perLotBudget != null && sid != null && lotCap != null) {
+                perLotBudget[sid] = (lotCap - take).coerceAtLeast(0.0)
+            }
             val sd = b["supply_date"] as? String
             val commitTime = if (sd != null) formatDate(parseDate(sd)) else null
             consumed.add(ConsumedBucket(
-                supplyId = b["supply_id"]?.toString(),
+                supplyId = sid,
                 qty = take,
                 commitTime = commitTime,
             ))
         }
     }
 
+    // Fast path: use (pid,lid) index when available (IndexedInventory), avoiding O(N) scan.
+    val candidateBuckets: List<MutableMap<String, Any?>> =
+        (inventory as? IndexedInventory)?.idx?.get(Pair(pid, lid))
+            ?: inventory.filter { b -> b["product_id"]?.toString()?.trim() == pid && b["location_id"]?.toString()?.trim() == lid }
+
     if (preferDemandId != null) {
         // Pass 1: tagged buckets for this demand only
-        val tagged = inventory.filter { matches(it) && it["demand_tag"] == preferDemandId }
+        val tagged = candidateBuckets
+            .filter { (it["qty"] as? Number)?.toDouble() ?: 0.0 > 0 && it["demand_tag"] == preferDemandId }
             .sortedWith(sorter)
         consumeFrom(tagged)
         // Pass 2: untagged buckets (no demand_tag key, or demand_tag == null)
         if (remaining > 0) {
-            val untagged = inventory.filter { matches(it) && !it.containsKey("demand_tag") || (matches(it) && it["demand_tag"] == null) }
+            val untagged = candidateBuckets
+                .filter { (it["qty"] as? Number)?.toDouble() ?: 0.0 > 0 && (!it.containsKey("demand_tag") || it["demand_tag"] == null) }
                 .sortedWith(sorter)
             consumeFrom(untagged)
         }
     } else {
         // Original behavior: single pass over all matching buckets
-        val buckets = inventory.filter { matches(it) }.sortedWith(sorter)
+        val buckets = candidateBuckets
+            .filter { (it["qty"] as? Number)?.toDouble() ?: 0.0 > 0 }
+            .sortedWith(sorter)
         consumeFrom(buckets)
     }
 
@@ -495,6 +517,73 @@ private fun copyInventory(inventory: List<Map<String, Any?>>): MutableList<Mutab
             "demand_tag" to b["demand_tag"],
         )
     }.toMutableList()
+
+// ── Hot-path indexes: avoid O(N) list scans on every plan() call ──────────────
+//
+// With 4738 supply rows, 7450 method_make rows, 3622 method_move rows, and
+// 14592 BOM rows, linear scans in consumeFromInventory / getMethods /
+// variantsForMake dominate runtime on large plans (150+ min for 208 demands).
+// Indexes are built once in legacyCommit and threaded via JVM subtyping —
+// no function signature changes needed: callers detect the wrappers via `as?`.
+
+/** Method + BOM lookup index built once per legacyCommit call. */
+internal data class DataIndex(
+    val makeByPidLid: Map<Pair<String, String>, List<Map<String, Any?>>>,
+    val moveByPidToLid: Map<Pair<String, String>, List<Map<String, Any?>>>,
+    val buyByPidLid: Map<Pair<String, String>, List<Map<String, Any?>>>,
+    /** BOM rows keyed by bom_id; secondary filter by parent_id applied at use site. */
+    val bomByBomId: Map<String, List<Map<String, Any?>>>,
+    /** BOM rows keyed by parent_id for the fallback (no bom_id match) case. */
+    val bomByParentId: Map<String, List<Map<String, Any?>>>,
+)
+
+/** Wraps the data map with a [DataIndex]; detected via `data as? PlanData`. */
+internal class PlanData(
+    private val raw: Map<String, List<Map<String, Any?>>>,
+    val idx: DataIndex,
+) : Map<String, List<Map<String, Any?>>> by raw
+
+/** Wraps the inventory list with a (pid,lid)→rows index; detected via `inventory as? IndexedInventory`. */
+internal class IndexedInventory(
+    private val list: MutableList<MutableMap<String, Any?>>,
+    val idx: Map<Pair<String, String>, List<MutableMap<String, Any?>>>,
+) : MutableList<MutableMap<String, Any?>> by list
+
+private fun buildDataIndex(data: Map<String, List<Map<String, Any?>>>): DataIndex = DataIndex(
+    makeByPidLid = (data["method_make"] ?: emptyList()).groupBy {
+        Pair(it["product_id"]?.toString()?.trim() ?: "", it["location_id"]?.toString()?.trim() ?: "")
+    },
+    moveByPidToLid = (data["method_move"] ?: emptyList()).groupBy {
+        Pair(it["product_id"]?.toString()?.trim() ?: "", it["to_location_id"]?.toString()?.trim() ?: "")
+    },
+    buyByPidLid = (data["method_buy"] ?: emptyList()).groupBy {
+        Pair(it["product_id"]?.toString()?.trim() ?: "", it["location_id"]?.toString()?.trim() ?: "")
+    },
+    bomByBomId = (data["bom"] ?: emptyList()).groupBy {
+        it["bom_id"]?.toString()?.trim() ?: ""
+    },
+    bomByParentId = (data["bom"] ?: emptyList()).groupBy {
+        it["parent_id"]?.toString()?.trim() ?: ""
+    },
+)
+
+private fun buildInventoryIndex(
+    inventory: List<MutableMap<String, Any?>>,
+): Map<Pair<String, String>, List<MutableMap<String, Any?>>> =
+    inventory.groupBy { row ->
+        Pair(row["product_id"]?.toString()?.trim() ?: "", row["location_id"]?.toString()?.trim() ?: "")
+    }
+
+/** Cheap qty-only snapshot: captures the current qty of every bucket in order. */
+private fun snapshotQtys(inventory: List<MutableMap<String, Any?>>): DoubleArray =
+    DoubleArray(inventory.size) { i -> (inventory[i]["qty"] as? Number)?.toDouble() ?: 0.0 }
+
+/** Restores qty values in-place from a [snapshotQtys] snapshot.
+ *  In-place restore (vs clear+addAll) keeps [IndexedInventory.idx] pointers valid
+ *  across rollbacks, so the index remains usable after partial-plan rollback. */
+private fun restoreQtys(inventory: List<MutableMap<String, Any?>>, snap: DoubleArray) {
+    for (i in snap.indices) inventory[i]["qty"] = snap[i]
+}
 
 // ── BOM / variant helpers ──────────────────────────────────────────────────────
 
@@ -527,6 +616,20 @@ internal fun variantsForMake(
             )
         }
         return byAlt.map { (k, v) -> Pair(k, v.toList()) }
+    }
+
+    // Fast path: O(1) bom_id lookup when PlanData index is available.
+    val idx = (data as? PlanData)?.idx
+    if (idx != null) {
+        val primary = (idx.bomByBomId[bomId] ?: emptyList())
+            .filter { (it["parent_id"] as? String)?.trim() == pid }
+        if (primary.isNotEmpty()) return buildVariants(primary)
+        val fallback = (idx.bomByParentId[pid] ?: emptyList())
+        if (fallback.isNotEmpty()) {
+            log.debug("variantsForMake: no BOM rows for bom_id={} parent={}; using fallback", bomId, pid)
+            return buildVariants(fallback)
+        }
+        return emptyList()
     }
 
     // Primary: match bom_id + parent_id
@@ -668,8 +771,19 @@ fun getMethods(productId: String, locationId: String, data: Map<String, List<Map
     // move into VIRTUAL — `make@1000` produces inventory at 1000, not VIRTUAL,
     // and so does not directly satisfy a demand at VIRTUAL.
     val emptyLocFallback = loc.isEmpty()
-    val result = mutableListOf<Map<String, Any?>>()
 
+    // Fast path: O(1) index lookup when PlanData is available, avoiding O(N) scans.
+    val idx = (data as? PlanData)?.idx
+    if (idx != null && !emptyLocFallback) {
+        val result = mutableListOf<Map<String, Any?>>()
+        val key = Pair(pid, loc)
+        idx.buyByPidLid[key]?.forEach { m -> result.add(mapOf("type" to "purchase") + m) }
+        idx.makeByPidLid[key]?.forEach { m -> result.add(mapOf("type" to "make") + m) }
+        idx.moveByPidToLid[key]?.forEach { m -> result.add(mapOf("type" to "move") + m) }
+        return result
+    }
+
+    val result = mutableListOf<Map<String, Any?>>()
     (data["method_buy"] ?: emptyList()).forEach { m ->
         if ((m["product_id"] as? String)?.trim() == pid) {
             val mLoc = (m["location_id"] as? String)?.trim() ?: ""
@@ -911,6 +1025,26 @@ private fun scoreVariant(
 private data class Quadruple<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
 
 /**
+ * Probe-based variant scorer — O(children × inventory buckets), no copies.
+ *
+ * Returns the same Quadruple shape as [scoreVariant] so callers can swap
+ * without structural changes.  `anyFailed` is optimistic (see [probeChildren]
+ * for the trade-off).  Use only for *ranking* / *cascade* paths where a
+ * wrong pick produces a suboptimal but still-correct commit result.
+ * [firstFeasibleMethod] must keep [scoreVariant] for strict consolidation
+ * correctness.
+ */
+private fun probeVariant(
+    childList: List<Map<String, Any?>>,
+    inventory: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+    planningPath: Set<Pair<String, String>>,
+): Quadruple<LocalDate?, Double, Double, Boolean> {
+    val r = probeChildren(childList, inventory, data, planningPath)
+    return Quadruple(if (r.anyFailed) null else r.maxCommitDate, r.consumed, r.purchaseQty, r.anyFailed)
+}
+
+/**
  * Return the first method (in ascending preference order) whose root BOM passes cascade's
  * feasibility probe, or null if every method fails.  Mirrors the probe inside
  * [getPreferredMethodCascade]; exposed so consolidation can skip demands whose parent can
@@ -1004,12 +1138,12 @@ internal fun getPreferredMethodCascade(
             "purchase" -> false
             "move" -> {
                 val children = childMaterialsForMove(m, quantity)
-                scoreVariant("cascade", children, inventory, data, reqDt, leadDays, planningPath, depth - 1, config).fourth
+                probeChildren(children, inventory, data, planningPath).anyFailed
             }
             "make" -> {
                 val variants = variantsForMake(productId, productionLocation, quantity, m, data)
-                variants.isEmpty() || variants.all { (altKey, childList) ->
-                    scoreVariant(altKey, childList, inventory, data, reqDt, leadDays, planningPath, depth - 1, config).fourth
+                variants.isEmpty() || variants.all { (_, childList) ->
+                    probeChildren(childList, inventory, data, planningPath).anyFailed
                 }
             }
             else -> false
@@ -1095,7 +1229,6 @@ internal fun scoreMethodsForElaborate(
     data class Raw(val method: Map<String, Any?>, val ts: Double, val consumed: Double, val purchase: Double, val failed: Boolean)
 
     val raw = methods.map { m ->
-        val invCopy = copyInventory(inventory)
         val productionLocation = (m["location_id"] ?: m["to_location_id"] ?: locationId) as? String ?: locationId
         val reqDt = parseDate(reqTimeStr) ?: requestTimeDt
         val leadDays = when (m["type"]) {
@@ -1104,17 +1237,13 @@ internal fun scoreMethodsForElaborate(
             "purchase" -> (m["lead_days_supply"] as? Number)?.toDouble() ?: 0.0
             else -> 0.0
         }
-        val cReqDt = dateAddDays(reqDt, -leadDays)
-        var maxCommit: LocalDate? = null
-        var purchaseQty = 0.0
-        var anyFailed = false
 
         val childMaterials = when (m["type"]) {
             "make" -> {
                 val variants = variantsForMake(productId, productionLocation, quantity, m, data)
                 if (variants.isEmpty()) return@map Raw(m, LATE_DATE.toEpochDay().toDouble(), 0.0, 0.0, true)
                 val (variantList, _) = getPreferredVariants(
-                    variants, invCopy, data, reqDt, leadDays, planningPath, depth - 1, quantity,
+                    variants, inventory, data, reqDt, leadDays, planningPath, depth - 1, quantity,
                     multiple = false, scoreWeights = scoreWeights, topN = null,
                     config = simConfig,
                 )
@@ -1124,41 +1253,10 @@ internal fun scoreMethodsForElaborate(
             else -> emptyList()
         }
 
-        val beforeQty = invCopy.sumOf { (it["qty"] as? Number)?.toDouble() ?: 0.0 }
-        for (c in childMaterials) {
-            val cDemand = mapOf(
-                "demand_id" to null,
-                "product_id" to c["product_id"],
-                "location_id" to c["location_id"],
-                "quantity" to c["quantity"],
-                "request_due_time" to formatDate(cReqDt),
-                "request_time" to formatDate(cReqDt),
-            )
-            val (solvedList, cWos, _) = plan(cDemand, invCopy, data, cReqDt, depth = depth - 1, planningPath = planningPath, config = simConfig)
-            for (s in solvedList) {
-                if ((s["quantity"] as? Number)?.toDouble() ?: 0.0 <= 0) continue
-                val ct = s["commit_time"] as? String
-                val reason = s["commit_reason"] as? String ?: ""
-                // cycle_stopped/cycle_detected rows are emitted at full residual qty
-                // with a `commit_time` set to the demand's request_due_time — they
-                // look like successful commits to a naive scoring loop, even though
-                // no production happened. Treat them as inert: no `maxCommit`
-                // contribution, no `anyFailed` flip. The method's *real* deliverable
-                // qty stays captured via `consumed` (inventory taken before the
-                // cycle stop) and via the non-cycle siblings in `solvedList`.
-                if (reason == "cycle_stopped" || reason == "cycle_detected") continue
-                if (ct == null || (reason.isNotBlank() && reason !in BENIGN_REASONS)) anyFailed = true
-                if (ct != null) parseDate(ct)?.let { dt -> if (maxCommit == null || dt > maxCommit) maxCommit = dt }
-            }
-            for (wo in cWos) {
-                if (wo["method"] == "purchase") purchaseQty += (wo["quantity"] as? Number)?.toDouble() ?: 0.0
-            }
-        }
-        val afterQty = invCopy.sumOf { (it["qty"] as? Number)?.toDouble() ?: 0.0 }
-        val consumed = beforeQty - afterQty
-        if (anyFailed) maxCommit = null
-        val ts = maxCommit?.toEpochDay()?.toDouble() ?: LATE_DATE.toEpochDay().toDouble()
-        Raw(m, ts, consumed, purchaseQty, anyFailed)
+        val probe = probeChildren(childMaterials, inventory, data, planningPath)
+        val ts = (if (probe.anyFailed) null else probe.maxCommitDate)
+            ?.toEpochDay()?.toDouble() ?: LATE_DATE.toEpochDay().toDouble()
+        Raw(m, ts, probe.consumed, probe.purchaseQty, probe.anyFailed)
     }
 
     val validTs = raw.filter { !it.failed }.map { it.ts }
@@ -1292,6 +1390,8 @@ internal fun planMethodSlot(
     feasibilityCache: MutableMap<Pair<String, String>, Int>? = null,
     structuralFailedMakes: MutableMap<Pair<String, String>, String>? = null,
     initialBudget: Map<String, Double>? = null,
+    nodeQtyCaps: Map<Pair<String, String>, Double>? = null,
+    demandBlueprint: DemandBlueprint? = null,
 ): MethodSlotResult {
     val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
     val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
@@ -1352,9 +1452,44 @@ internal fun planMethodSlot(
         else -> Pair(emptyList<Map<String, Any?>>(), "")
     }
 
+    // ── Pre-scale to achievable using nodeQtyCaps (single-pass guard) ─────────
+    // When the probing step has pre-computed per-node achievable quantities, derive
+    // the minimum scale factor from capped children and reduce slotQty + child
+    // quantities before the first-pass loop. This makes anyChildShort = false for
+    // all cap-bounded cases, eliminating the second-pass BOM retrace.
+    var activeSlotQty = slotQty
+    val activeChildren: List<Map<String, Any?>>
+    if (nodeQtyCaps != null && childMaterials.isNotEmpty() && slotQty > 1e-9) {
+        var minScale = 1.0
+        for (c in childMaterials) {
+            val cPid = (c["product_id"] as? String)?.trim() ?: continue
+            val cLid = (c["location_id"] as? String)?.trim() ?: continue
+            val cNeeded = (c["quantity"] as? Number)?.toDouble() ?: continue
+            if (cNeeded <= 1e-9) continue
+            val cap = nodeQtyCaps[cPid to cLid] ?: continue
+            if (cap >= cNeeded - 1e-9) continue
+            val s = cap / cNeeded
+            if (s < minScale) minScale = s
+        }
+        if (minScale < 1.0 - 1e-9) {
+            activeSlotQty = floor(slotQty * minScale).coerceAtLeast(0.0)
+            val finalScale = if (slotQty > 1e-9) activeSlotQty / slotQty else 1.0
+            activeChildren = childMaterials.map { c ->
+                val q = (c["quantity"] as? Number)?.toDouble() ?: return@map c
+                c + mapOf("quantity" to q * finalScale)
+            }
+            log.info("[nodeqtycap-prescale] parent={}@{} did={} requested={} effective={} scale={}",
+                productId, productionLocation, demandId, slotQty, activeSlotQty, "%.4f".format(minScale))
+        } else {
+            activeChildren = childMaterials
+        }
+    } else {
+        activeChildren = childMaterials
+    }
+
     // 4) Recursively plan children — with partial-fulfillment support.
     //    a) Snapshot inventory before any child planning.
-    //    b) Run a first pass for all children at full slotQty.
+    //    b) Run a first pass for all children at full activeSlotQty.
     //    c) Compute the achievable parent qty as the bottleneck ratio.
     //    d) If partial: restore the snapshot and re-plan at the proportionally-
     //       scaled achievable qty (second pass).
@@ -1363,12 +1498,15 @@ internal fun planMethodSlot(
     val commitTimes = mutableListOf<LocalDate>()
     val childPeggingNodes = mutableListOf<Map<String, Any?>>()
 
-    val inventorySnap = copyInventory(inventory)
+    // Qty-only snapshot: captures just the qty values in position order.
+    // In-place restore (restoreQtys) keeps IndexedInventory.idx pointers valid
+    // across rollbacks — no object replacement, same MutableMaps throughout.
+    val inventorySnap = snapshotQtys(inventory)
     val budgetSnap: Map<String, Double>? = budget?.toMap()
 
-    // ── First pass: plan all children at full slotQty ─────────────────────────
+    // ── First pass: plan all children at activeSlotQty ───────────────────────
     val childPassResults = mutableListOf<ChildPassResult>()
-    for (c in childMaterials) {
+    for (c in activeChildren) {
         if (m["type"] == "make") {
             val parentKey = productId.trim()
             val childKey = (c["product_id"] as? String)?.trim() ?: ""
@@ -1383,7 +1521,7 @@ internal fun planMethodSlot(
             // Inherit the originating demand's customer so customer-specific constraints
             // apply to sub-components, not just the finished good.
             "customer_id" to demand["customer_id"], "customer" to demand["customer"])
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget)
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint)
         val effectiveQty = solvedList.sumOf { s ->
             val r = s["commit_reason"] as? String
             if (r == "cycle_stopped" || r == "cycle_detected") 0.0
@@ -1391,15 +1529,27 @@ internal fun planMethodSlot(
             else 0.0
         }
         val cTimes = solvedList.mapNotNull { s -> parseDate(s["commit_time"] as? String) }
-        childPassResults.add(ChildPassResult(c, neededQty, effectiveQty, cWos, cPegging, cTimes, solvedList))
+        // Tag gc_bom_rate on the demand node so GCEngine can scale into AND-children
+        // recursively without needing the original BOM table. Rate = child_need / parent_slotQty.
+        val bomRate = if (activeSlotQty > 1e-9) neededQty / activeSlotQty else 0.0
+        val taggedPegging = cPegging?.plus("gc_bom_rate" to bomRate)
+        childPassResults.add(ChildPassResult(c, neededQty, effectiveQty, cWos, taggedPegging, cTimes, solvedList))
     }
 
-    val anyChildShort = childPassResults.any { cr -> cr.effectiveQty < cr.neededQty - 1e-9 }
+    // Blueprint mode: BOM rates produce fractional child quantities (e.g. 452.0012 from
+    // demand_qty × bom_rate). nodeQtyCaps round to integer achievable (e.g. 452.0), so the
+    // child commits 452.0 against needed 452.0012 — a 0.0012-unit "shortfall" that is purely
+    // floating-point noise. With 1e-9 tolerance this triggers the second-pass BOM re-traversal
+    // for every single BOM node, making it the dominant planning cost. With 0.5 tolerance in
+    // blueprint mode, sub-unit noise is absorbed; genuine shortfalls (typically many units) still
+    // trigger the second pass. Non-blueprint runs keep the strict 1e-9 tolerance.
+    val anyChildShortTolerance = if (demandBlueprint != null) 0.5 else 1e-9
+    val anyChildShort = childPassResults.any { cr -> cr.effectiveQty < cr.neededQty - anyChildShortTolerance }
 
     // ── Determine achievable parent qty ──────────────────────────────────────
     var achievableParentQty: Double
-    if (!anyChildShort || childMaterials.isEmpty()) {
-        achievableParentQty = slotQty
+    if (!anyChildShort || activeChildren.isEmpty()) {
+        achievableParentQty = activeSlotQty
         // Root-bottleneck tagging on the no-shortage path. Required because
         // the OUTER planMethodSlot's second pass calls plan() at the
         // post-convergence achievable qty, where deeper children fit
@@ -1426,9 +1576,9 @@ internal fun planMethodSlot(
             commitTimes.addAll(cr.cTimes)
         }
     } else {
-        val (rawAchievable, isOrSplit) = computeRawAchievable(childPassResults, slotQty, woChildrenRelation)
-        val capped = if (rawAchievable >= slotQty - 1e-6) slotQty
-                     else floor(rawAchievable).coerceIn(0.0, slotQty)
+        val (rawAchievable, isOrSplit) = computeRawAchievable(childPassResults, activeSlotQty, woChildrenRelation)
+        val capped = if (rawAchievable >= activeSlotQty - 1e-6) activeSlotQty
+                     else floor(rawAchievable).coerceIn(0.0, activeSlotQty)
 
         if (capped <= 1e-9) {
             // Nothing achievable — emit a zero-qty placeholder pegging node so the UI
@@ -1448,8 +1598,7 @@ internal fun planMethodSlot(
             // Subtree-wide by construction: `inventory` is one global list passed
             // by reference through all recursive plan() calls; restoring at the
             // outer level reverts mutations at every depth below.
-            inventory.clear()
-            inventory.addAll(inventorySnap)
+            restoreQtys(inventory, inventorySnap)
             if (budget != null && budgetSnap != null) {
                 budget.clear()
                 budget.putAll(budgetSnap)
@@ -1592,8 +1741,16 @@ internal fun planMethodSlot(
             // bottleneck child(ren), the deeper bottleneck chain (e.g. "260-0385
             // @2000 was the limiter at 11607" → "supply cap at 260-0385_2000_111
             // was the leaf cause") survives into the displayed tree.
+            // When blueprint is active, nodeQtyCaps values come from the sketch phase
+            // which uses integer-unit supply counts. BOM rates (e.g. 452.0012848...)
+            // produce fractional slotQty values that differ from nodeQtyCaps by <0.002
+            // units due to floating-point arithmetic. Using 1e-6 causes these sub-unit
+            // gaps to trigger a full second-pass BOM re-traversal on every node —
+            // the dominant planning cost. With 0.5 tolerance, sub-unit noise is ignored;
+            // genuine shortfalls (typically tens or hundreds of units short) still trigger.
+            val andMinTolerance = if (demandBlueprint != null) 0.5 else 1e-6
             val bottleneckPegging: Map<Pair<String, String>, Map<String, Any?>?> =
-                if (achievableParentQty < slotQty - 1e-6) {
+                if (achievableParentQty < activeSlotQty - andMinTolerance) {
                     val ratios = childPassResults.map { cr ->
                         if (cr.neededQty > 1e-9) cr.effectiveQty / cr.neededQty
                         else Double.POSITIVE_INFINITY
@@ -1649,69 +1806,43 @@ internal fun planMethodSlot(
                     productId, productionLocation, demandId, slotQty, achievableParentQty, rootBottleneckKeys)
             }
 
-            // ── Second pass: restore inventory + budget and re-plan children at achievable qty.
-            inventory.clear()
-            inventory.addAll(inventorySnap)
-            if (budget != null && budgetSnap != null) {
-                budget.clear()
-                budget.putAll(budgetSnap)
-            }
-            val scale = achievableParentQty / slotQty
-            val scaledChildren = scaleChildMaterials(childMaterials, scale)
-            // AND conservation guard. The first-pass `achievable` is the min child ratio, so on the
-            // re-plan each AND child SHOULD cover its scaled share exactly (consistent makes have
-            // zero shortfall — R4's tolerance is 1e-6). But a move-cycle (e.g. 504-1989@1000↔@2000 →
-            // cycle_stopped) or inventory that's scarcer at the smaller qty can leave a required
-            // child materially short. Emitting `achievable` then would commit the make ABOVE its
-            // children (the R4/R8 conservation break). Track any such child off its authoritative
-            // committed_qty (what soundness reads); small fractional slack is ignored.
-            var andChildShortfall = false
-            for (c in scaledChildren) {
-                if (m["type"] == "make") {
-                    val parentKey = productId.trim()
-                    val childKey = (c["product_id"] as? String)?.trim() ?: ""
-                    if (Pair(parentKey, childKey) in REAL_BOM_PAIRS) {
-                        log.info("planning: real BOM partial re-plan parent={} child={} demand={} achievable={}", parentKey, childKey, demandId, achievableParentQty)
-                    }
-                }
-                val cReqDt = dateAddDays(reqDt, -leadDays)
-                val cDemand = mapOf("demand_id" to demandId, "product_id" to c["product_id"], "location_id" to c["location_id"],
-                    "quantity" to c["quantity"], "request_due_time" to formatDate(cReqDt), "request_time" to formatDate(cReqDt),
-                    "customer_id" to demand["customer_id"], "customer" to demand["customer"])
-                val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget)
-                childWos.addAll(cWos)
-                val cPid = (c["product_id"] as? String)?.trim() ?: ""
-                val cLid = (c["location_id"] as? String)?.trim() ?: ""
-                val key = Pair(cPid, cLid)
-                if (cPegging != null) {
-                    // Tag the second-pass pegging with `is_bottleneck=true` for
-                    // children that were the AND-min limiter at first-pass, and
-                    // `is_root_bottleneck=true` for the genuine origin per iter-0
-                    // budget cap. The two flags differ: `is_bottleneck` covers
-                    // ALL siblings tied at the post-convergence smeared cap;
-                    // `is_root_bottleneck` covers only the leaf whose iter-0
-                    // cap-to-need ratio was the smallest (the origin that
-                    // dragged the others down via convergence).
-                    var tagged = cPegging
-                    if (key in bottleneckPegging) tagged = tagged + ("is_bottleneck" to true)
-                    if (key in rootBottleneckKeys) tagged = tagged + ("is_root_bottleneck" to true)
-                    childPeggingNodes.add(tagged)
-                }
-                solvedList.forEach { s -> parseDate(s["commit_time"] as? String)?.let { commitTimes.add(it) } }
-                // Did this AND child materially under-deliver its scaled requirement? Use its own
-                // committed_qty (the value soundness R4 checks). Threshold tolerates fractional
-                // rounding (0.5) and a 2% band; the real failures (move-cycle) deliver ~0.
-                if (m["type"] == "make") {
-                    val childCommitted = (cPegging?.get("committed_qty") as? Number)?.toDouble() ?: 0.0
-                    val scaledNeed = (c["quantity"] as? Number)?.toDouble() ?: 0.0
-                    if (scaledNeed > 1e-6 && childCommitted < scaledNeed - maxOf(0.5, scaledNeed * 0.02)) {
-                        andChildShortfall = true
-                    }
-                }
+            // ── GC: trim over-committed first-pass children, return excess to inventory ──────
+            // Replaces snapshot-restore + second-pass re-plan. For each AND-child that
+            // committed more than its achievable share (achievableParentQty * bomRate),
+            // garbageCollectPegging walks the child's pegging subtree and returns the
+            // excess inventory (and budget) in-place. Only over-committed children are
+            // touched; children that delivered at or below their share are kept as-is.
+            // Bottleneck / root-bottleneck tags from the first pass are preserved on
+            // the (now-trimmed) pegging nodes so the UI attribution is unchanged.
+            val gcScale = achievableParentQty / activeSlotQty
+            for (cr in childPassResults) {
+                val targetQty = cr.neededQty * gcScale
+                val woScale   = if (cr.effectiveQty > 1e-9) targetQty / cr.effectiveQty else 0.0
+                childWos.addAll(scaleWos(cr.wos, woScale))
+                commitTimes.addAll(cr.cTimes)
+                val peg = cr.pegging ?: continue
+                val trimmed: Map<String, Any?> = if (cr.effectiveQty > targetQty + 1e-9)
+                    garbageCollectPegging(peg, targetQty, inventory, budget)
+                else peg
+                // reconcile() derives BOM rate as child.quantity / wo.quantity. In the old second-pass
+                // world the child node was replanned at targetQty so its quantity == targetQty. In the
+                // GC world the node comes from the first pass where quantity == neededQty (the full
+                // first-pass request). Without this fix, rateOf = neededQty / achievableParentQty
+                // (e.g. 40/10 = 4.0) instead of the true BOM rate (neededQty / activeSlotQty = 1.0),
+                // causing reconcile to cut the parent commit to effectiveQty / inflatedRate = 2.5.
+                val scaled = trimmed + ("quantity" to targetQty)
+                val pid = (cr.child["product_id"] as? String)?.trim() ?: ""
+                val lid = (cr.child["location_id"] as? String)?.trim() ?: ""
+                val key = pid to lid
+                var tagged: Map<String, Any?> = scaled
+                if (key in bottleneckPegging) tagged = tagged + ("is_bottleneck" to true)
+                if (key in rootBottleneckKeys) tagged = tagged + ("is_root_bottleneck" to true)
+                childPeggingNodes.add(tagged)
             }
 
-            // Move conservation: a move WO has exactly one source-side child whose
-            // committed_qty must equal the parent qty.
+            // Move conservation safety: GC targets exactly achievableParentQty for the
+            // move-source child (bomRate=1). Correct parent if GC could not fully return
+            // (e.g. missing inventory bucket) so the WO qty never exceeds the child commit.
             if (m["type"] == "move") {
                 val childCommit = childPeggingNodes.firstOrNull()?.let {
                     (it["committed_qty"] as? Number)?.toDouble()
@@ -1719,26 +1850,6 @@ internal fun planMethodSlot(
                 if (childCommit != null && childCommit < achievableParentQty - 1e-6) {
                     achievableParentQty = floor(childCommit).coerceAtLeast(0.0)
                 }
-            }
-
-            // AND conservation enforcement: a make whose required child under-delivered on the
-            // re-plan cannot actually be built at `achievable` — committing it would exceed what
-            // its children supply (R4/R8). Block it (→0) instead. Restore inventory/budget first so
-            // the siblings that DID commit are rolled back too (no orphan leaves / R7d). buildWoNode
-            // marks the 0-qty node failed → soundness skips it and the WO flatten drops it. The
-            // demand's waterfall then tries another method, or it under-fills honestly.
-            if (m["type"] == "make" && andChildShortfall) {
-                inventory.clear(); inventory.addAll(inventorySnap)
-                if (budget != null && budgetSnap != null) { budget.clear(); budget.putAll(budgetSnap) }
-                val startDt0 = computeStartDt(reqDt, leadDays, emptyList())
-                val blockedNode = buildWoNode(productId, productionLocation, 0.0, m["type"] as? String ?: "", m,
-                    startDt0, null, 0, 0.0, methodChoiceExplanation, variantExplanation, woChildrenRelation,
-                    childPeggingNodes, overrideActive, failed = true, woGroupId = null, data = data)
-                log.info("[ANDMIN-conservation-block] parent={}@{} did={} achievable={} — required AND child under-delivered on re-plan, make blocked",
-                    productId, productionLocation, demandId, achievableParentQty)
-                return MethodSlotResult(achievableQty = 0.0, wos = emptyList(), methodPeggingNode = blockedNode,
-                    latestCommit = null, anyChildShort = true,
-                    blockedReason = "child_failed:$productId@$productionLocation(and_conservation)")
             }
         }
     }
@@ -1809,7 +1920,7 @@ fun getPreferredVariants(
 
     val needRanking = multiple == false || (topN != null && topN >= 1)
     val scored = variants.map { (altKey, childList) ->
-        val sc = scoreVariant(altKey, childList, inventory, data, reqDt, leadDays, planningPath, depth, config)
+        val sc = probeVariant(childList, inventory, data, planningPath)
         ScoredVariant(sc, altKey, childList, sc.fourth)
     }
 
@@ -1957,12 +2068,54 @@ fun plan(
      * plan() calls so deeper levels can also identify their own roots.
      */
     initialBudget: Map<String, Double>? = null,
+    /**
+     * Optional per-node achievable quantity caps from the supply-guided probing
+     * step ([computeAchievableQtyMaps]).  When the probed achievable at
+     * (productId to locationId) is less than [demand]["quantity"], plan() caps
+     * the effective demand and re-enters itself — so downstream supply draws
+     * and WO emission never exceed what the budget tree can cover.
+     * Threaded through all recursive plan() / planMethodSlot() calls.
+     */
+    nodeQtyCaps: Map<Pair<String, String>, Double>? = null,
+    /**
+     * Optional per-demand BOM blueprint from [computePlanBlueprint].
+     * When present and the current (productId, locationId) has a blueprint entry whose
+     * method is still in effectiveMethods, the commit phase uses it directly — skipping
+     * [getPreferredMethodCascade] and its probeChildren overhead.
+     * Threaded through all recursive plan() / planMethodSlot() calls.
+     */
+    demandBlueprint: DemandBlueprint? = null,
 ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
 
     val productId = (demand["product_id"] as? String)?.trim() ?: ""
     val locationId = (demand["location_id"] as? String)?.trim() ?: ""
     val quantity = (demand["quantity"] as? Number)?.toDouble() ?: 0.0
     val demandId = demand["demand_id"]
+
+    // Apply per-node achievable cap from the supply-guided probing step.
+    // If the probed achievable at this node is less than the requested qty,
+    // cap and re-enter with a modified demand so all downstream draws and WO
+    // emission work on the achievable quantity — no try-and-error required.
+    val nodeCap = nodeQtyCaps?.get(productId to locationId)
+    if (nodeCap != null && nodeCap < quantity - 1e-9) {
+        return plan(
+            demand           = demand + mapOf("quantity" to nodeCap),
+            inventory        = inventory,
+            data             = data,
+            requestTimeDt    = requestTimeDt,
+            depth            = depth,
+            planningPath     = planningPath,
+            config           = config,
+            preferDemandId   = preferDemandId,
+            overrideIndex    = overrideIndex,
+            budget           = budget,
+            feasibilityCache = feasibilityCache,
+            structuralFailedMakes = structuralFailedMakes,
+            initialBudget    = initialBudget,
+            nodeQtyCaps      = nodeQtyCaps,
+            demandBlueprint  = demandBlueprint,
+        )
+    }
     val reqTimeStr = demand["request_due_time"] as? String ?: demand["request_time"] as? String
     val customerId = demand["customer_id"]
     val customer = demand["customer"]
@@ -2013,11 +2166,58 @@ fun plan(
 
     // 1) Fulfill from inventory (FIFO)
     val componentKey = "$productId|$locationId"
+    // Per-lot caps: collect all budget entries whose key starts with "$pid|$lid|".
+    val perLotBudget: MutableMap<String, Double>? = budget?.let { b ->
+        val prefix = "$componentKey|"
+        val lotEntries = b.entries.filter { it.key.startsWith(prefix) }
+        if (lotEntries.isEmpty()) null
+        else lotEntries.associateTo(mutableMapOf()) { (k, v) ->
+            k.removePrefix(prefix) to v   // supplyId → remaining
+        }
+    }
+    // Aggregate cap: explicit key, or sum of per-lot entries.
+    // In non-realPegging mode all synthetic supplies share supply_id "consolidated_pid_lid" so
+    // no per-lot key ever matches inside consumeFromInventory — the aggregate cap is the only
+    // guard; perLotBudget values are reduced proportionally on write-back.
+    val totalLotBudgetBefore = perLotBudget?.values?.sum() ?: 0.0
     val budgetCap = budget?.get(componentKey)
-    val consumedBuckets = consumeFromInventory(inventory, productId, locationId, quantity, preferDemandId, budgetCap)
+        ?: perLotBudget?.values?.sum()?.takeIf { it > 1e-9 }
+    val consumedBuckets = consumeFromInventory(
+        inventory, productId, locationId, quantity, preferDemandId, budgetCap, perLotBudget,
+    )
     val taken = consumedBuckets.sumOf { it.qty }
-    if (budget != null && budgetCap != null) {
+    // Write back per-lot budget remainders.
+    if (budget != null && perLotBudget != null) {
+        val lotCapWasConsumed = (totalLotBudgetBefore - (perLotBudget.values.sum())) > 1e-9
+        if (lotCapWasConsumed) {
+            // realPegging: per-lot caps were enforced in-place by consumeFromInventory; write back.
+            for ((sid, remaining) in perLotBudget) {
+                budget["$componentKey|$sid"] = remaining
+            }
+        } else if (taken > 1e-9 && totalLotBudgetBefore > 1e-9) {
+            // non-realPegging: synthetic supply_id didn't match any lot key, so lot entries
+            // were not mutated. Proportionally reduce all lot entries to track the aggregate.
+            val consumedFraction = taken.coerceAtMost(totalLotBudgetBefore) / totalLotBudgetBefore
+            for ((sid, cap) in perLotBudget) {
+                budget["$componentKey|$sid"] = (cap * (1.0 - consumedFraction)).coerceAtLeast(0.0)
+            }
+        }
+    }
+    if (budget != null && budgetCap != null && budget.containsKey(componentKey)) {
         budget[componentKey] = (budgetCap - taken).coerceAtLeast(0.0)
+    }
+    // ── [MAP] Log draws on 260-0141-02 per lot ───────────────────────────────────
+    if (productId == "260-0141-02") {
+        consumedBuckets.forEach { cb ->
+            val lotKey = if (cb.supplyId != null) "$componentKey|${cb.supplyId}" else componentKey
+            val lotCap = budget?.get(lotKey) // remaining after deduction
+            log.info("[map][draw] demand={} lot={} taken={} budgetRemaining={}",
+                demandId, cb.supplyId ?: "(agg)", cb.qty.toLong(), lotCap?.toLong() ?: "N/A")
+        }
+        if (consumedBuckets.isEmpty()) {
+            log.info("[map][draw] demand={} supply={} need={} taken=0 (no inventory or capped)",
+                demandId, componentKey, quantity.toLong())
+        }
     }
     val fulfillCommitTime = consumedBuckets.firstOrNull()?.commitTime
     val demandFulfilledList = mutableListOf<Map<String, Any?>>()
@@ -2213,6 +2413,17 @@ fun plan(
 
     val elaborateAtThisLevel = shouldElaborateAtDepth(depth, methodCfg.depth)
 
+    // ── Blueprint shortcut (preference mode only) ──────────────────────────
+    // Pre-selected in the sketch phase. Applied to BOTH the waterfall path
+    // (collapses to 1 slot) and the cascade/single-method path (bypasses
+    // getPreferredMethodCascade). Not used in elaborate mode.
+    val blueprintEntry = if (!useElaborateMethod) {
+        demandBlueprint?.get(productId to locationId)
+    } else null
+    val blueprintMethod = blueprintEntry?.method?.takeIf { bm ->
+        effectiveMethods.any { it === bm || it == bm }
+    }
+
     // ── Waterfall multi-method allocation ──────────────────────────────────
     // Restricted to root via `elaborateAtThisLevel` (gated by
     // `method_selection.depth=1`). Waterfall does both reactive fallback
@@ -2227,17 +2438,21 @@ fun plan(
         // Rank methods once. Preference mode → ascending preference int (cascade
         // order). Elaborate mode → composite score descending. Failed elaborate
         // candidates carry score=-1e9 and naturally sink to the bottom.
-        val ranked: List<Map<String, Any?>> = if (useElaborateMethod) {
-            scoreMethodsForElaborate(effectiveMethods, demand, inventory, data, requestTimeDt, config, depth, path)
-                .sortedWith(
-                    // Tiebreaker by preference asc — see getPreferredMethodElaborate
-                    // for the rationale (tied sims under deep blocks would otherwise
-                    // pick whatever comes first in getMethods's iteration order).
-                    compareByDescending<MethodScore> { it.score }
-                        .thenBy { (it.method["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
-                ).map { it.method }
-        } else {
-            effectiveMethods.sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
+        // Blueprint: if a method was pre-selected in the sketch phase, collapse the
+        // waterfall to a single slot — eliminating the second-slot re-traversal.
+        val ranked: List<Map<String, Any?>> = when {
+            blueprintMethod != null -> listOf(blueprintMethod)
+            useElaborateMethod -> {
+                scoreMethodsForElaborate(effectiveMethods, demand, inventory, data, requestTimeDt, config, depth, path)
+                    .sortedWith(
+                        // Tiebreaker by preference asc — see getPreferredMethodElaborate
+                        // for the rationale (tied sims under deep blocks would otherwise
+                        // pick whatever comes first in getMethods's iteration order).
+                        compareByDescending<MethodScore> { it.score }
+                            .thenBy { (it.method["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
+                    ).map { it.method }
+            }
+            else -> effectiveMethods.sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
         }
 
         // Override-active determination for waterfall: only "did override narrow
@@ -2287,6 +2502,8 @@ fun plan(
                 feasibilityCache = feasibilityCache,
                 structuralFailedMakes = structuralFailedMakes,
                 initialBudget = initialBudget,
+                nodeQtyCaps = nodeQtyCaps,
+                demandBlueprint = demandBlueprint,
             )
             // Always record the slot's pegging node so the UI shows every attempt
             // (including blocked ones with zero qty). Hard-failures still consume
@@ -2329,6 +2546,11 @@ fun plan(
 
     // ── Single method selection ────────────────────────────────────────────────
     val (m, methodChoiceExplanation) = when {
+        blueprintMethod != null -> {
+            val loc  = (blueprintMethod["location_id"] ?: blueprintMethod["to_location_id"] ?: "").toString()
+            val pref = (blueprintMethod["preference"] as? Number)?.toInt() ?: 0
+            Pair(blueprintMethod, "Blueprint: ${blueprintMethod["type"]} @ $loc (pref $pref)")
+        }
         effectiveMethods.size == 1 -> {
             val m = effectiveMethods[0]; val loc = (m["location_id"] ?: m["to_location_id"] ?: "").toString()
             val base = "Only option: ${m["type"]} @ $loc."
@@ -2342,6 +2564,7 @@ fun plan(
     // Override is active only when it actually changed the selected method vs auto-selection.
     // For elaborate mode (expensive), fall back to checking whether choices were restricted.
     val methodOverrideActive = methodOverride != null && when {
+        blueprintMethod != null        -> overrideFilteredMethods.size < methods.size
         useElaborateMethod && elaborateAtThisLevel -> overrideFilteredMethods.size < methods.size
         else -> getPreferredMethod(methods).first?.get("type")?.toString() != m?.get("type")?.toString()
     }
@@ -2454,6 +2677,8 @@ fun plan(
             feasibilityCache = feasibilityCache,
             structuralFailedMakes = structuralFailedMakes,
             initialBudget = initialBudget,
+            nodeQtyCaps = nodeQtyCaps,
+            demandBlueprint = demandBlueprint,
         )
         combinedPegging.add(attempt.methodPeggingNode)
         if (attempt.blockedReason != null) {
@@ -2747,7 +2972,11 @@ private fun scaleSubtree(node: Map<String, Any?>, factor: Double): Map<String, A
     return nn
 }
 
-private fun reconcile(node: Map<String, Any?>, target: Double): Pair<Map<String, Any?>, Double> {
+private fun reconcile(
+    node: Map<String, Any?>,
+    target: Double,
+    data: Map<String, List<Map<String, Any?>>>,
+): Pair<Map<String, Any?>, Double> {
     if (node["failed"] == true) return node to 0.0
     val allChildren = node["children"] as? List<*> ?: emptyList<Any?>()
     when (node["type"]) {
@@ -2762,7 +2991,7 @@ private fun reconcile(node: Map<String, Any?>, target: Double): Pair<Map<String,
             var remaining = target
             val newChildren = allChildren.map { ch ->
                 val cm = ch as? Map<String, Any?> ?: return@map ch
-                val (nc, g) = reconcile(cm, remaining.coerceAtLeast(0.0))
+                val (nc, g) = reconcile(cm, remaining.coerceAtLeast(0.0), data)
                 remaining -= g
                 nc
             }
@@ -2779,7 +3008,7 @@ private fun reconcile(node: Map<String, Any?>, target: Double): Pair<Map<String,
             val demandChildren = allChildren.mapNotNull { it as? Map<String, Any?> }.filter { it["type"] == "demand" }
             if (method == "purchase" || demandChildren.isEmpty()) {
                 // Procurement / leaf-backed WO delivers `want`; trim leaf children to it.
-                val newChildren = allChildren.map { ch -> (ch as? Map<String, Any?>)?.let { reconcile(it, want).first } ?: ch }
+                val newChildren = allChildren.map { ch -> (ch as? Map<String, Any?>)?.let { reconcile(it, want, data).first } ?: ch }
                 return (node + mapOf("quantity" to want, "children" to newChildren)) to want
             }
             fun rateOf(cd: Map<String, Any?>) = if (curQty > 1e-9) ((cd["quantity"] as? Number)?.toDouble() ?: 0.0) / curQty else 0.0
@@ -2792,12 +3021,33 @@ private fun reconcile(node: Map<String, Any?>, target: Double): Pair<Map<String,
                 // upstream, leaving the source committed above the move (R4_move). Asking for `want`
                 // caps the source to it.
                 val r = if (method == "move") 1.0 else rateOf(cd)
-                val (nc, c) = reconcile(cd, want * r)
+                val (nc, c) = reconcile(cd, want * r, data)
                 Triple(nc, r, if (r > 1e-9) c / r else Double.POSITIVE_INFINITY)
             }
             val rawSupply = when {
                 method == "move" -> firstAsk.firstOrNull()?.third ?: want   // single source side
-                rel == "or"      -> want                                    // OR-split handled as sum upstream
+                rel == "or"      -> {
+                    // OR-split: each variant independently contributes to the parent.
+                    // The correct parent qty = Σ(c_i / BOM_rate_actual_i) — the same formula R4
+                    // soundness uses. We look up actual BOM rates from the BOM table rather than
+                    // inferring them from cd["quantity"] / curQty, because the latter encodes
+                    // BOM_rate × variantShare / achievedParentQty and is wrong when the OR WO
+                    // achieved less than slotQty (achievedQty < slotQty → rateOf is inflated →
+                    // Σ third/n undershoots by slotQty/achievedQty, causing R4 actual>>expected).
+                    val parentPid = (node["product_id"] as? String)?.trim() ?: ""
+                    val bomRows = data["bom"] ?: emptyList()
+                    val parentBomRows = bomRows.filter { (it["parent_id"] as? String)?.trim() == parentPid }
+                    val sum = firstAsk.zip(demandChildren).sumOf { (ask, cd) ->
+                        val (_, r, third) = ask
+                        val c = third * r  // committed_qty for this variant: c = (c/r) × r
+                        val childPid = (cd["product_id"] as? String)?.trim() ?: ""
+                        val actualRate = parentBomRows
+                            .firstOrNull { (it["child_id"] as? String)?.trim() == childPid }
+                            ?.let { (it["rate"] as? Number)?.toDouble() }
+                        if (actualRate != null && actualRate > 1e-9) c / actualRate else third
+                    }
+                    sum.coerceAtMost(want)
+                }
                 else             -> firstAsk.minOfOrNull { it.third } ?: want // AND make: least dominates
             }
             // EXACT — commit exactly the least-supplied child's contribution. (No slack band: it
@@ -2807,14 +3057,22 @@ private fun reconcile(node: Map<String, Any?>, target: Double): Pair<Map<String,
             val supply = rawSupply.coerceIn(0.0, want)
             // Re-trim over-supplied components down to supply × rate by PROPORTIONAL scaling of the
             // already-reconciled subtree (no second reconcile — that would be exponential).
+            // For OR WOs: skip trimming — each variant already holds its independently-reconciled
+            // commitment; re-scaling them to `supply × rateOf` would over-correct (when supply < want
+            // due to budget-cap shortfalls, targetT = supply × rateOf_i < c_i, forcing a second
+            // scale-down that under-commits what the child actually delivered).
             var askIdx = 0
             val newChildren = allChildren.map { ch ->
                 val cm = ch as? Map<String, Any?> ?: return@map ch
                 if (cm["type"] != "demand") return@map cm
                 val (asked, r, _) = firstAsk[askIdx]; askIdx++
-                val askedCommitted = (asked["committed_qty"] as? Number)?.toDouble() ?: (want * r)
-                val targetT = supply * r
-                if (askedCommitted > 1e-9 && targetT < askedCommitted - 1e-9) scaleSubtree(asked, targetT / askedCommitted) else asked
+                if (rel == "or") {
+                    asked  // keep each variant's reconciled commitment as-is
+                } else {
+                    val askedCommitted = (asked["committed_qty"] as? Number)?.toDouble() ?: (want * r)
+                    val targetT = supply * r
+                    if (askedCommitted > 1e-9 && targetT < askedCommitted - 1e-9) scaleSubtree(asked, targetT / askedCommitted) else asked
+                }
             }
             val failed = supply <= 1e-6 && demandChildren.isNotEmpty()
             val nn = node + mapOf("quantity" to supply, "children" to newChildren) +
@@ -3191,9 +3449,11 @@ internal fun readjustConsolidatedWoTiming(
         } else node
     }
 
+    var iter = 0
     do {
         changed = false
         updatedEnd.clear()
+        iter++
         @Suppress("UNCHECKED_CAST")
         workingTrees = workingTrees.map { entry ->
             val tree    = entry["tree"] as? Map<String, Any?> ?: return@map entry
@@ -3201,6 +3461,7 @@ internal fun readjustConsolidatedWoTiming(
             if (newTree === tree) entry
             else entry.toMutableMap().also { it["tree"] = newTree }
         }
+        log.info("readjustConsolidatedWoTiming iter={} changed={} trees={}", iter, changed, workingTrees.size)
     } while (changed)
 
     val adjustedConsolidated = woConsolidation.consolidated.map { c ->
@@ -3439,6 +3700,7 @@ private fun prunePhantomLoops(
 internal fun extractSupplyAllocations(
     pegging: List<Map<String, Any?>>,
     supplies: List<Map<String, Any?>>,
+    demands: List<Map<String, Any?>> = emptyList(),
 ): List<Map<String, Any?>> {
     val remainingBySupply = mutableMapOf<String, Double>()
     for (s in supplies) {
@@ -3447,7 +3709,7 @@ internal fun extractSupplyAllocations(
         remainingBySupply[sid] = (remainingBySupply[sid] ?: 0.0) + qty
     }
 
-    val result = mutableListOf<Map<String, Any?>>()
+    val result = mutableListOf<MutableMap<String, Any?>>()
 
     // Walk variant 1: attribute every supply leaf to a single demand id (default behavior).
     fun walk(node: Map<String, Any?>, demandId: String?) {
@@ -3474,7 +3736,7 @@ internal fun extractSupplyAllocations(
                 rawQty  // synthetic/non-physical bucket — no cap
             }
             if (effectiveQty > 1e-9) {
-                result.add(mapOf(
+                result.add(mutableMapOf(
                     "supply_id"    to supplyId,
                     "demand_id"    to (demandId ?: ""),
                     "qty_consumed" to effectiveQty,
@@ -3511,7 +3773,7 @@ internal fun extractSupplyAllocations(
                     for ((did, w) in weights) {
                         val share = effectiveQty * (w / totalWeight)
                         if (share > 1e-9) {
-                            result.add(mapOf(
+                            result.add(mutableMapOf(
                                 "supply_id"    to supplyId,
                                 "demand_id"    to did,
                                 "qty_consumed" to share,
@@ -3519,7 +3781,7 @@ internal fun extractSupplyAllocations(
                         }
                     }
                 } else {
-                    result.add(mapOf(
+                    result.add(mutableMapOf(
                         "supply_id"    to supplyId,
                         "demand_id"    to "",
                         "qty_consumed" to effectiveQty,
@@ -3546,6 +3808,51 @@ internal fun extractSupplyAllocations(
         }
         val demandId = entry["demand_id"] as? String
         walk(tree, demandId)
+    }
+
+    // Post-process: compute qty_allocated = demand's proportional entitlement from each lot.
+    // Each physical lot distributes its full initial qty to competing demands proportionally by
+    // demand quantity — allocation is lot-local and independent of whether the plan over-supplies
+    // globally. qty_consumed records what was actually drawn; qty_allocated records the entitlement.
+    // Demands that consumed 0 from a lot (because other lots served them) are excluded here
+    // (they appear in no pegging tree), so allocations are normalised among consuming demands only.
+    // Mutates result records in-place (MutableMap) to avoid allocating a new map per record.
+    val demandQtyMap: Map<String, Double> = demands
+        .mapNotNull { d -> (d["demand_id"] as? String)?.let { id -> id to ((d["quantity"] as? Number)?.toDouble() ?: 0.0) } }
+        .toMap()
+    // lot initial qty lookup (physical lots only — synthetic/consolidated buckets have no entry)
+    val lotInitialQty: Map<String, Double> = supplies
+        .mapNotNull { s -> (s["supply_id"] as? String)?.let { id -> id to ((s["qty"] as? Number)?.toDouble() ?: 0.0) } }
+        .groupBy({ it.first }, { it.second })
+        .mapValues { (_, qtys) -> qtys.sum() }
+
+    // Build per-lot weight totals in one pass so each lot's totalWeight is computed once, not per-record
+    data class LotStats(val lotQty: Double, var totalWeight: Double = 0.0)
+    val lotStats = mutableMapOf<String, LotStats>()
+    for (rec in result) {
+        val sid = rec["supply_id"] as? String ?: continue
+        val lotQty = lotInitialQty[sid] ?: continue  // skip synthetic buckets
+        val stats = lotStats.getOrPut(sid) { LotStats(lotQty) }
+        val did = rec["demand_id"] as? String
+        val w = (if (did != null) demandQtyMap[did] else null)
+            ?: (rec["qty_consumed"] as? Number)?.toDouble()
+            ?: 0.0
+        stats.totalWeight += w
+    }
+    // Second pass: write qty_allocated in-place
+    for (rec in result) {
+        val sid = rec["supply_id"] as? String
+        val stats = if (sid != null) lotStats[sid] else null
+        val qtyAllocated: Double = if (stats != null && stats.totalWeight > 1e-12) {
+            val did = rec["demand_id"] as? String
+            val w = (if (did != null) demandQtyMap[did] else null)
+                ?: (rec["qty_consumed"] as? Number)?.toDouble()
+                ?: 0.0
+            stats.lotQty * w / stats.totalWeight
+        } else {
+            (rec["qty_consumed"] as? Number)?.toDouble() ?: 0.0
+        }
+        rec["qty_allocated"] = qtyAllocated
     }
     return result
 }
@@ -3820,11 +4127,47 @@ private fun runV2Iterated(
     val initialInventory: List<Map<String, Any?>> = inventory.map { it.toMap() }
 
     val graph    = buildResolutionGraph(demands, data)
-    val ancestry = BomAncestry(data["bom"] ?: emptyList())
+    // ── [MAP] Request map: raw paths per supply column ───────────────────────────
+    // Groups every resolution path by (supplyPid, supplyLid); each entry shows which
+    // demands reach that supply and at what quantity — this is the request map.
+    run {
+        val byColumn = graph.paths.groupBy { Triple(it.leaf.productId, it.leaf.locationId, it.leaf.supplyId) }
+        val contested = byColumn.filter { (_, ps) -> ps.map { it.demandId }.toSet().size > 1 }
+        log.info("[map][request] {} supply lots total, {} contested (>1 demand)",
+            byColumn.size, contested.size)
+        contested.entries
+            .sortedWith(compareBy({ it.key.first }, { it.key.second }, { it.key.third ?: "" }))
+            .forEach { (col, paths) ->
+                val byDemand = paths.groupBy { it.demandId }
+                log.info("[map][request] supply={}@{} lot={} demands={}  qty-by-demand={}",
+                    col.first, col.second, col.third ?: "?", byDemand.size,
+                    byDemand.entries.sortedByDescending { e -> e.value.sumOf { it.leafQuantity() } }
+                        .take(10)
+                        .joinToString { (d, ps) -> "$d:${ps.sumOf { it.leafQuantity() }.toLong()}" })
+            }
+    }
+
     // Pass 1 (inventory allocation) ALWAYS pools universally — bucket 0 — so scarce
     // on-hand stock is shared fairly across every competing demand regardless of due
     // date. (The UI "Bucket (days)" controls Pass 2 / WO batching, a separate schedule.)
-    val baseMerged = mergeGroups(graph, ancestry, periodDays = 0)
+    val baseMerged = mergeGroups(graph, periodDays = 0)
+
+    // ── [MAP] Demand map: per-supply groups used by consolidation ────────────────
+    // Identical to request map — each group is the set of demands competing for that supply.
+    run {
+        val contested = baseMerged.filter { it.members.map { m -> m.demandId }.toSet().size > 1 }
+        log.info("[map][demand] {} supply lots total, {} contested (>1 demand)",
+            baseMerged.size, contested.size)
+        contested
+            .sortedWith(compareBy({ it.leafPid }, { it.leafLid }, { it.supplyId ?: "" }))
+            .forEach { g ->
+                log.info("[map][demand] supply={}@{} lot={} totalQty={} demands={}  top-demands={}",
+                    g.leafPid, g.leafLid, g.supplyId ?: "?", g.totalQty.toLong(),
+                    g.members.map { it.demandId }.toSet().size,
+                    g.members.sortedByDescending { it.qty }.take(10)
+                        .joinToString { m -> "${m.demandId}:${m.qty.toLong()}" })
+            }
+    }
 
     var memberCaps: Map<Pair<String, String>, Map<Any?, Double>> = emptyMap()
     var lastConsolidatedWOs: List<Map<String, Any?>> = emptyList()
@@ -3890,6 +4233,30 @@ private fun runV2Iterated(
                 structuralFailedMakes = structuralFailedMakes)
         }
 
+        // ── [MAP] Allocation map: per-demand per-supply allocations ─────────────────
+        // For iter=0 only — shows what each demand was promised from each supply.
+        if (iter == 0) {
+            // Group by supply column → list of (demand, qty)
+            val bySupply = mutableMapOf<String, MutableList<Pair<Any?, Double>>>()
+            for ((demandId, allocs) in consResult.allocation) {
+                for ((componentKey, qty) in allocs) {
+                    if (qty > 1e-9) bySupply.getOrPut(componentKey) { mutableListOf() }.add(demandId to qty)
+                }
+            }
+            val contested = bySupply.filter { it.value.size > 1 }
+            log.info("[map][allocation] iter=0: {} supply columns allocated, {} contested (>1 demand)",
+                bySupply.size, contested.size)
+            contested.entries
+                .sortedBy { it.key }
+                .forEach { (col, entries) ->
+                    val total = entries.sumOf { it.second }
+                    log.info("[map][allocation]   supply={} total={} demands={}  breakdown={}",
+                        col, total.toLong(), entries.size,
+                        entries.sortedByDescending { it.second }.take(10)
+                            .joinToString { (d, q) -> "$d:${q.toLong()}" })
+                }
+        }
+
         // The output components Pass-1 allocated (merged-leaf level). Deep BOM-child supplies it
         // consumed inside its own plan() stay depleted in both paths — only these outputs are
         // re-supplied to per-demand planning.
@@ -3908,7 +4275,7 @@ private fun runV2Iterated(
             // real lots capped by `budgets` → same allocation, real pegging. (Restoring the full
             // inventory instead would let demands re-consume deep raws and drift the allocation.)
             val allocatedPLs = producedByComponent.keys.map {
-                val p = it.split("|", limit = 2)
+                val p = it.split("|")
                 (p.getOrElse(0) { "" }.trim()) to (p.getOrElse(1) { "" }.trim())
             }.toHashSet()
             fun plOf(m: Map<String, Any?>) =
@@ -3916,15 +4283,28 @@ private fun runV2Iterated(
             inventory.removeAll { plOf(it) in allocatedPLs }
             for (b in initialInventory) if (plOf(b) in allocatedPLs) inventory.add(b.toMutableMap())
         } else {
-            // Emit one untagged synthetic supply per (pid, lid) for every produced component.
+            // Build a lookup of supply_date by supply_id from the pre-consolidation inventory so
+            // synthetic buckets preserve the original lot's availability date, maintaining
+            // FIFO ordering (on-hand inventory consumed before future work orders).
+            // supply_id uses "consolidated_pid_lid" (NOT the real lot id) so that demand pegging
+            // in plan() references a distinct key and doesn't double-count with the real lot's
+            // consolidation pegging tree.
+            val initialSupplyDates: Map<String, String?> = initialInventory
+                .mapNotNull { b -> (b["supply_id"] as? String)?.let { sid -> sid to b["supply_date"] as? String } }
+                .toMap()
             for ((componentKey, totalQty) in producedByComponent) {
                 if (totalQty <= 1e-12) continue
-                val parts = componentKey.split("|", limit = 2)
+                val parts = componentKey.split("|")
                 val pid = parts.getOrElse(0) { "" }
                 val lid = parts.getOrElse(1) { "" }
-                val supplyDate = consResult.consolidatedWOs
-                    .firstOrNull { it["product_id"] == pid && it["location_id"] == lid }
-                    ?.get("end_time") as? String
+                val originalSupplyId = parts.getOrElse(2) { "" }.ifBlank { null }
+                val supplyDate = if (originalSupplyId != null) {
+                    initialSupplyDates[originalSupplyId]
+                } else {
+                    consResult.consolidatedWOs
+                        .firstOrNull { it["product_id"] == pid && it["location_id"] == lid }
+                        ?.get("end_time") as? String
+                }
                 inventory.add(mutableMapOf(
                     "product_id"  to pid,
                     "location_id" to lid,
@@ -3946,6 +4326,26 @@ private fun runV2Iterated(
         }
         val budgets: Map<Any?, MutableMap<String, Double>> = consResult.allocation.mapValues { (_, allocs) ->
             allocs.mapValues { (_, q) -> q }.toMutableMap()
+        }
+
+        // ── [MAP] Budget map: per-demand caps entering plan() ────────────────────
+        // For iter=0 only. Each entry = what plan() is allowed to consume from that supply.
+        if (iter == 0) {
+            val bySupply = mutableMapOf<String, MutableList<Pair<Any?, Double>>>()
+            for ((demandId, caps) in budgets) {
+                for ((supplyKey, cap) in caps) {
+                    if (cap > 1e-9) bySupply.getOrPut(supplyKey) { mutableListOf() }.add(demandId to cap)
+                }
+            }
+            val contested = bySupply.filter { it.value.size > 1 }
+            log.info("[map][budget] iter=0: {} supplies with caps, {} contested",
+                bySupply.size, contested.size)
+            contested.entries.sortedBy { it.key }.forEach { (supplyKey, entries) ->
+                log.info("[map][budget]   supply={} capped-demands={}  caps={}",
+                    supplyKey, entries.size,
+                    entries.sortedByDescending { it.second }.take(10)
+                        .joinToString { (d, q) -> "$d:${q.toLong()}" })
+            }
         }
 
         // Phase 3 — forward progressCallback live, tagged with iteration metadata
@@ -3970,6 +4370,27 @@ private fun runV2Iterated(
             sharedStructuralFailedMakes = structuralFailedMakes,
             iter0Allocation = iter0AllocationSnapshot,
         )
+
+        // ── [MAP] Budget consumption: drawn vs cap after plan() for each demand ──
+        if (iter == 0) {
+            val bySupply = mutableMapOf<String, MutableList<Triple<Any?, Double, Double>>>() // demand, cap, drawn
+            for ((demandId, caps) in initialBudgets) {
+                val remaining = budgets[demandId] ?: emptyMap()
+                for ((supplyKey, cap) in caps) {
+                    if (cap < 1e-9) continue
+                    val drawn = cap - (remaining[supplyKey] ?: 0.0)
+                    bySupply.getOrPut(supplyKey) { mutableListOf() }.add(Triple(demandId, cap, drawn.coerceAtLeast(0.0)))
+                }
+            }
+            bySupply.filter { it.value.size > 1 }.entries.sortedBy { it.key }.forEach { (supplyKey, entries) ->
+                val totalCap   = entries.sumOf { it.second }
+                val totalDrawn = entries.sumOf { it.third }
+                log.info("[map][consumed] supply={} cap={} drawn={} unused={}  breakdown={}",
+                    supplyKey, totalCap.toLong(), totalDrawn.toLong(), (totalCap - totalDrawn).toLong(),
+                    entries.sortedByDescending { it.third }.take(10)
+                        .joinToString { (d, c, w) -> "$d:drawn=${w.toLong()}/cap=${c.toLong()}" })
+            }
+        }
 
         // Over-production: any leftover budget at the merged leaf.
         val totalOver = budgets.values.sumOf { db ->
@@ -4086,18 +4507,21 @@ private fun runV2Iterated(
         val overByComponent = mutableMapOf<String, Double>()
         for ((demandId, demandBudget) in budgets) {
             val initial = initialBudgets[demandId] ?: continue
+            val consumedByPidLid = mutableMapOf<Pair<String, String>, Double>()
             for ((componentKey, remaining) in demandBudget) {
                 val initQty = initial[componentKey] ?: continue
                 val consumed = (initQty - remaining).coerceAtLeast(0.0)
-                val parts = componentKey.split("|", limit = 2)
+                val parts = componentKey.split("|")
                 val pid = parts.getOrElse(0) { "" }
                 val lid = parts.getOrElse(1) { "" }
-                val key = Pair(pid, lid)
-                val prevCap = prevCaps[key]?.get(demandId) ?: Double.POSITIVE_INFINITY
-                newCaps.getOrPut(key) { mutableMapOf() }[demandId] = min(prevCap, consumed)
+                consumedByPidLid.merge(Pair(pid, lid), consumed, Double::plus)
                 if (remaining > 1e-9) {
                     overByComponent.merge(componentKey, remaining, Double::plus)
                 }
+            }
+            for ((key, totalConsumed) in consumedByPidLid) {
+                val prevCap = prevCaps[key]?.get(demandId) ?: Double.POSITIVE_INFINITY
+                newCaps.getOrPut(key) { mutableMapOf() }[demandId] = min(prevCap, totalConsumed)
             }
         }
         memberCaps = newCaps
@@ -4117,7 +4541,7 @@ private fun runV2Iterated(
  * phase 2 (real supplies + tagged synthetic buckets). Emits committed rows,
  * work orders, and per-demand pegging trees.
  */
-private fun legacyCommit(
+internal fun legacyCommit(
     demands: List<Map<String, Any?>>,
     inventory: MutableList<MutableMap<String, Any?>>,
     data: Map<String, List<Map<String, Any?>>>,
@@ -4150,6 +4574,20 @@ private fun legacyCommit(
      * `is_bottleneck` flag on smearing-aligned siblings.
      */
     iter0Allocation: Map<Any?, Map<String, Double>>? = null,
+    /**
+     * Optional per-demand per-node achievable quantity caps from
+     * [computeAchievableQtyMaps].  Keyed by demand_id → (pid to lid) → achievable qty.
+     * When present, the per-demand slice is threaded into [plan] as [nodeQtyCaps]
+     * so every node in the BOM tree is capped before supply draws are attempted,
+     * preventing WO emission for quantities the budget tree can never cover.
+     */
+    achievableQtyMaps: Map<Any?, Map<Pair<String, String>, Double>>? = null,
+    /**
+     * Optional per-demand BOM blueprint from [computePlanBlueprint].
+     * When present, the per-demand blueprint slice is passed to [plan] so method
+     * selection is bypassed for nodes that have a pre-selected method in the sketch.
+     */
+    planBlueprint: PlanBlueprint? = null,
 ): LegacyCommitResult {
     val committedDemands = mutableListOf<Map<String, Any?>>()
     val workOrders = mutableListOf<Map<String, Any?>>()
@@ -4161,6 +4599,22 @@ private fun legacyCommit(
     // `data` and `purchase_allowed` don't change mid-commit.
     val feasibilityCache: MutableMap<Pair<String, String>, Int> = sharedFeasibilityCache ?: mutableMapOf()
     val structuralFailedMakes: MutableMap<Pair<String, String>, String> = sharedStructuralFailedMakes ?: mutableMapOf()
+
+    // Build hot-path indexes once for all demands. These eliminate the O(N) linear
+    // scans in getMethods (11K rows), variantsForMake (14K rows), and
+    // consumeFromInventory (4K+ rows) that dominate runtime on large plans.
+    // Passed via JVM subtyping — no signature changes to plan() or helpers.
+    val planData: Map<String, List<Map<String, Any?>>> =
+        if (data !is PlanData) PlanData(data, buildDataIndex(data)) else data
+    val indexedInventory: MutableList<MutableMap<String, Any?>> =
+        if (inventory !is IndexedInventory) IndexedInventory(inventory, buildInventoryIndex(inventory)) else inventory
+    log.info("legacyCommit: built indexes (supply={} make={} move={} bom={})",
+        inventory.size,
+        (data["method_make"] ?: emptyList()).size,
+        (data["method_move"] ?: emptyList()).size,
+        (data["bom"] ?: emptyList()).size,
+    )
+
     demands.forEachIndexed { i, d ->
         val reqStr = d["request_due_time"] as? String ?: d["request_time"] as? String
         val reqDt = parseDate(reqStr)
@@ -4179,12 +4633,14 @@ private fun legacyCommit(
                 demandId, demandBudget.size, entries)
         }
         val (solvedList, wos, peggingNode) = plan(
-            d, inventory, data, reqDt,
+            d, indexedInventory, planData, reqDt,
             config = config, preferDemandId = prefId, overrideIndex = overrideIndex,
             budget = demandBudget,
             feasibilityCache = feasibilityCache,
             structuralFailedMakes = structuralFailedMakes,
             initialBudget = iter0Allocation?.get(demandId),
+            nodeQtyCaps = achievableQtyMaps?.get(demandId),
+            demandBlueprint = planBlueprint?.get(demandId),
         )
         committedDemands.addAll(solvedList)
         workOrders.addAll(wos)
@@ -4303,9 +4759,10 @@ fun runPlanning(
     val consolidatedPegging = mutableListOf<Map<String, Any?>>()
 
     // Consolidation enabled → fixed-point iteration (phases 2+3+4 fused).
+    // Supply-guided enabled → two-loop model (request map → allocation → budget-commit).
     // Disabled → run phase 3 directly against real inventory; useTaggedLookup
     // is needed only for supply-split overrides (real buckets split per demand).
-    val commitResult: LegacyCommitResult
+    var commitResult: LegacyCommitResult
     var producedByComponent: Map<String, Double> = emptyMap()
     var releasedByComponent: Map<String, Double> = emptyMap()
     // Empty list — retained for shape compatibility with historical consumers
@@ -4313,7 +4770,36 @@ fun runPlanning(
     // The supply-level orchestrator (consolidation.scope="all") was retired
     // in 2026-05; only the leaf-level fixed-point pipeline remains.
     val supplyLevelAllocations: List<Map<String, Any?>> = emptyList()
-    if (consolidationConfig.enabled) {
+    val supplyGuidedConfig = parseSupplyGuidedConfig(config)
+    // Supply-guided takes priority over legacy consolidation when enabled.
+    if (supplyGuidedConfig.enabled) {
+        // Step 1+2: pure allocation — BOM reachability walk + proportional supply split.
+        val sgAllocation = buildSupplyAllocation(demands, data, config)
+        // Step 2b: sketch phase — one read-only BOM walk that both computes achievable caps
+        // AND pre-selects the first-feasible BOM method per node per demand.
+        // Replaces computeAchievableQtyMaps; eliminates getPreferredMethodCascade overhead
+        // (probeChildren per node) from the commit phase entirely.
+        val planBlueprint = computePlanBlueprint(demands, sgAllocation, data)
+        val achievableQtyMaps = planBlueprint.mapValues { (_, db) ->
+            db.mapValues { (_, nb) -> nb.achievable }
+        }
+        // Step 3: commit with pre-selected methods, per-node caps, and per-lot budget guards.
+        commitResult = legacyCommit(
+            demands           = demands,
+            inventory         = inventory,
+            data              = data,
+            config            = config,
+            overrideIndex     = overrideIndex,
+            useTaggedLookup   = false,
+            progressCallback  = progressCallback,
+            budgets           = sgAllocation.perLotBudgets,
+            achievableQtyMaps = achievableQtyMaps,
+            planBlueprint     = planBlueprint,
+        )
+        // Post-planning trace + compensation-pass telemetry (opt-in: trace_lots=true).
+        if (sgAllocation.sgConfig.traceLots)
+            logSupplyGuidedTrace(sgAllocation, commitResult.planningPegging, data)
+    } else if (consolidationConfig.enabled) {
         val iterated = runV2Iterated(
             demands, inventory, data, config, consolidationConfig, overrideIndex, progressCallback,
         )
@@ -4332,20 +4818,29 @@ fun runPlanning(
     committedDemands.addAll(commitResult.committedDemands)
     workOrders.addAll(commitResult.workOrders)
     planningPegging.addAll(commitResult.planningPegging)
+    // Release commitResult's pegging reference — originals are now only in planningPegging,
+    // which is cleared after allPegging is built, allowing GC to reclaim the trees.
+    commitResult = commitResult.copy(planningPegging = emptyList())
 
     // With realPegging on, Pass-1 re-supplied the real lots (real supply_id) and the per-demand
     // trees consume them directly — so the `demand_id=null` production trees would DOUBLE-claim
     // those lots in soundness/aggregation. Drop them; per-demand trees carry the real consumption.
-    val basePegging = if (consolidationConfig.realPegging) planningPegging else (consolidatedPegging + planningPegging)
-    // Prune cycle_stopped phantom loop nodes from every pegging tree before returning.
+    // Prune cycle_stopped phantom loop nodes. Scope `base` inside a run{} so it goes out of scope
+    // immediately after pruning, allowing the GC to reclaim original trees before verification passes.
     @Suppress("UNCHECKED_CAST")
-    val allPegging = basePegging.mapNotNull { entry ->
-        val tree = entry["tree"] as? Map<String, Any?> ?: return@mapNotNull null
-        val pruned = prunePhantomLoops(tree, isRoot = true) ?: return@mapNotNull null
-        entry.toMutableMap().apply { put("tree", pruned) }
+    var allPegging: List<Map<String, Any?>> = run {
+        val base = if (consolidationConfig.realPegging) planningPegging else (consolidatedPegging + planningPegging)
+        base.mapNotNull { entry ->
+            val tree = entry["tree"] as? Map<String, Any?> ?: return@mapNotNull null
+            val pruned = prunePhantomLoops(tree, isRoot = true) ?: return@mapNotNull null
+            entry.toMutableMap().apply { put("tree", pruned) }
+        }
     }
+    // Release original pegging lists so GC can reclaim them before the verification + timing passes.
+    planningPegging.clear()
+    consolidatedPegging.clear()
     val suppliesForCap = data["supply"] ?: emptyList()
-    val supplyAllocations = extractSupplyAllocations(allPegging, suppliesForCap)
+    val supplyAllocations = extractSupplyAllocations(allPegging, suppliesForCap, demands)
     val supplyCapViolations = verifySupplyCap(suppliesForCap, supplyAllocations)
     // R7e: physical conservation — only count pegging from served demands (committed > 0).
     // Unserved demands have their inventory restored by plan()'s invCopy rollback; excluding
@@ -4410,6 +4905,8 @@ fun runPlanning(
     }
 
     val timingFix = fixTimingFromPegging(consolidatedWOs + workOrders, allPegging, data)
+    // Release pruned trees; timingFix holds the timing-adjusted copies.
+    allPegging = emptyList()
 
     // Phase-1 cross-WO arbitration. Opt-in via planning config flag — the
     // feature shifts WO start times when shared resources are contended, so
@@ -4455,7 +4952,7 @@ fun runPlanning(
     val reconciledTrees = finalTimings.peggingTrees.map { entry ->
         val tree = entry["tree"] as? Map<String, Any?> ?: return@map entry
         val rootReq = (tree["quantity"] as? Number)?.toDouble() ?: 0.0
-        val (reconciled, after) = reconcile(tree, rootReq)
+        val (reconciled, after) = reconcile(tree, rootReq, data)
         val did = entry["demand_id"]?.toString()?.takeIf { it.isNotBlank() }
         // OVERWRITE (not sum): R0 compares committed_demands to the LAST pegging tree per demand
         // (treeByDemand = peggingByDemand.mapValues { it.last() }), so when a demand has several
@@ -4550,12 +5047,14 @@ fun runPlanning(
             "original_lead_days"  to origLeadDays,
         )
     }
+    log.info("[plan] adjustedNative built: native={}", adjustedNative.size)
 
     // R7g: WO conservation — post-trim consolidated WO qty vs served-demand consumption.
     // Uses adjustedTrees (final pegging) and adjustedConsolidated (final WO list).
     val woConservationViolations = if (producedByComponent.isNotEmpty())
         verifyWoConservation(producedByComponent, adjustedTrees, adjustedConsolidated, servedDemandIds = servedDemandIds)
     else emptyList<String>()
+    log.info("[plan] verifyWoConservation done: violations={}", woConservationViolations.size)
 
     val output: Map<String, Any> = mapOf(
         "committed_demands"      to committedDemands,

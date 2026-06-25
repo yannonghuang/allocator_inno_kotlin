@@ -685,6 +685,21 @@ export async function getPlanStatus(caseId: number, jobId: string): Promise<Plan
   return r.json();
 }
 
+export type PeggingSaveStatus = {
+  run_id: number;
+  chunks_done: number;
+  chunks_total: number;
+  pct: number;
+};
+
+/** Returns null when no background pegging save is in flight for this case. */
+export async function getPeggingSaveStatus(caseId: number): Promise<PeggingSaveStatus | null> {
+  const r = await fetch(`${API}/cases/${caseId}/plan/pegging-save-status`);
+  if (r.status === 204) return null;
+  if (!r.ok) return null;
+  return r.json();
+}
+
 export type PlanningCopilotMessage = {
   role: 'user' | 'assistant';
   text: string;
@@ -899,6 +914,14 @@ export async function getPlanRun(caseId: number, runId: number): Promise<PlanRun
   const r = await fetch(`${API}/cases/${caseId}/plan-runs/${runId}`);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
+}
+
+export async function getPlanRunPegging(caseId: number, runId: number, demandId: string): Promise<{ planning_pegging: unknown[] }> {
+  const r = await fetch(`${API}/cases/${caseId}/plan-runs/${runId}/pegging/${encodeURIComponent(demandId)}`);
+  if (!r.ok) throw new Error(await r.text());
+  // Backend returns the raw pegging entry JSON; wrap it in an array to match the old bulk shape.
+  const entry = await r.json();
+  return { planning_pegging: [entry] };
 }
 
 /** Returns the current unsaved (status="ready") plan run with its in-memory result,

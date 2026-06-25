@@ -108,7 +108,7 @@ private fun createTables() {
         Operations, Bors, Resources,
         Supplies, MethodMoves, AllocationRuns, AllocationActions,
         ManualOverrides, PlanRuns, MaterialEvents, WoScheduleEvents, MaterialImpactAssessments,
-        PlanSupplyAllocations, NegotiationWaits, PlanRunEvents, AgentMemory,
+        PlanPegging, PlanSupplyAllocations, NegotiationWaits, PlanRunEvents, AgentMemory,
         KbRecords
     )
 }
@@ -246,6 +246,8 @@ private fun migrateSchema() {
         "ALTER TABLE plan_run ADD COLUMN IF NOT EXISTS chosen_depth INTEGER",
         // Per-depth attempt durations for optimal-depth search (JSON array)
         "ALTER TABLE plan_run ADD COLUMN IF NOT EXISTS attempts TEXT",
+        // Proportional lot entitlement alongside consumed qty
+        "ALTER TABLE plan_supply_allocation ADD COLUMN IF NOT EXISTS qty_allocated DOUBLE PRECISION",
         // Fix FK constraints to use ON DELETE CASCADE (idempotent: drop if exists, re-add)
         *cascadeFkMigrations()
     )

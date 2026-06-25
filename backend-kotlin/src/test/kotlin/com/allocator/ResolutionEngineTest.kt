@@ -307,120 +307,12 @@ class ResolutionEngineTest : FunSpec({
             demand("D2", "B", "L1", 20.0),
         )
         val graph = buildResolutionGraph(demands, data)
-        val ancestry = BomAncestry(emptyList())
-        val merged = mergeGroups(graph, ancestry, periodDays = 0)
+        val merged = mergeGroups(graph, periodDays = 0)
         merged shouldHaveSize 2
         merged.map { it.leafPid }.toSet() shouldBe setOf("A", "B")
     }
 
-    test("mergeGroups: linear ancestry collapses shallow group into deepest descendant") {
-        // BOM: SHALLOW → DEEP (rate 3). Demand D1 resolves to SHALLOW, D2 to DEEP.
-        // Expectation: only one group survives, at DEEP, with both members present.
-        val bomRows = listOf(bom("SHALLOW", "DEEP", 3.0))
-        val data = mapOf(
-            "bom" to bomRows,
-            "method_make" to listOf(mk("SHALLOW", "L1")),
-            "method_buy"  to emptyList<Map<String, Any?>>(),
-            "method_move" to emptyList<Map<String, Any?>>(),
-            "supply" to listOf(
-                supply("SHALLOW", "L1", 100.0, "S_SHALLOW"),
-                supply("DEEP",    "L1", 100.0, "S_DEEP"),
-            ),
-        )
-        val demands = listOf(
-            demand("D1", "SHALLOW", "L1", 10.0, priority = 100),
-            demand("D2", "DEEP",    "L1", 5.0,  priority = 200),
-        )
-        val graph = buildResolutionGraph(demands, data)
-        val ancestry = BomAncestry(bomRows)
-        val merged = mergeGroups(graph, ancestry, periodDays = 0)
-        merged shouldHaveSize 1
-        val g = merged[0]
-        g.leafPid shouldBe "DEEP"
-        g.members shouldHaveSize 2
-        // D1 promoted from SHALLOW to DEEP at rate 3 → 10 × 3 = 30.
-        // D2 stays as itself (qty 5).
-        val byDid = g.members.associateBy { it.demandId }
-        byDid["D1"]!!.qty shouldBe (30.0 plusOrMinus 1e-9)
-        byDid["D1"]!!.originalLeafPid shouldBe "SHALLOW"
-        byDid["D1"]!!.promotionRate shouldBe (3.0 plusOrMinus 1e-9)
-        byDid["D2"]!!.qty shouldBe (5.0 plusOrMinus 1e-9)
-        byDid["D2"]!!.originalLeafPid shouldBe "DEEP"
-        byDid["D2"]!!.promotionRate shouldBe (1.0 plusOrMinus 1e-9)
-        g.totalQty shouldBe (35.0 plusOrMinus 1e-9)
-    }
-
-    test("mergeGroups: chain A→B→C with all three as groups → all collapse to C") {
-        // BOM: A → B (rate 2) → C (rate 5). All three have supply, three demands one per leaf.
-        val bomRows = listOf(
-            bom("A", "B", 2.0),
-            bom("B", "C", 5.0),
-        )
-        val data = mapOf(
-            "bom" to bomRows,
-            "method_make" to listOf(mk("A", "L1"), mk("B", "L1")),
-            "method_buy"  to emptyList<Map<String, Any?>>(),
-            "method_move" to emptyList<Map<String, Any?>>(),
-            "supply" to listOf(
-                supply("A", "L1", 100.0, "S_A"),
-                supply("B", "L1", 100.0, "S_B"),
-                supply("C", "L1", 100.0, "S_C"),
-            ),
-        )
-        val demands = listOf(
-            demand("DA", "A", "L1", 1.0),
-            demand("DB", "B", "L1", 1.0),
-            demand("DC", "C", "L1", 1.0),
-        )
-        val merged = mergeGroups(buildResolutionGraph(demands, data), BomAncestry(bomRows), periodDays = 0)
-        merged shouldHaveSize 1
-        val g = merged[0]
-        g.leafPid shouldBe "C"
-        val byDid = g.members.associateBy { it.demandId }
-        // DA → C at rate 2*5 = 10 → 1 × 10 = 10.
-        byDid["DA"]!!.qty shouldBe (10.0 plusOrMinus 1e-9)
-        // DB → C at rate 5 → 1 × 5 = 5.
-        byDid["DB"]!!.qty shouldBe (5.0 plusOrMinus 1e-9)
-        // DC stays as itself → 1.
-        byDid["DC"]!!.qty shouldBe (1.0 plusOrMinus 1e-9)
-        g.totalQty shouldBe (16.0 plusOrMinus 1e-9)
-    }
-
-    test("mergeGroups: diamond branching split-promotes shallow into both descendants") {
-        // BOM: A → B (rate 2) AND A → C (rate 4); B and C are non-comparable.
-        val bomRows = listOf(
-            bom("A", "B", 2.0, altGroup = "g1"),
-            bom("A", "C", 4.0, altGroup = "g2"),
-        )
-        val data = mapOf(
-            "bom" to bomRows,
-            "method_make" to listOf(mk("A", "L1")),
-            "method_buy"  to emptyList<Map<String, Any?>>(),
-            "method_move" to emptyList<Map<String, Any?>>(),
-            "supply" to listOf(
-                supply("A", "L1", 100.0, "S_A"),
-                supply("B", "L1", 100.0, "S_B"),
-                supply("C", "L1", 100.0, "S_C"),
-            ),
-        )
-        val demands = listOf(
-            demand("DA", "A", "L1", 1.0),
-            demand("DB", "B", "L1", 7.0),
-            demand("DC", "C", "L1", 11.0),
-        )
-        val merged = mergeGroups(buildResolutionGraph(demands, data), BomAncestry(bomRows), periodDays = 0)
-        // Two surviving groups (B and C); A gets split-promoted into both.
-        merged shouldHaveSize 2
-        val byLeaf = merged.associateBy { it.leafPid }
-        // B group: original DB (7) + promoted DA (1 × rate 2 = 2) = 9.
-        byLeaf["B"]!!.totalQty shouldBe (9.0 plusOrMinus 1e-9)
-        byLeaf["B"]!!.members.map { it.demandId }.toSet() shouldBe setOf("DA", "DB")
-        // C group: original DC (11) + promoted DA (1 × rate 4 = 4) = 15.
-        byLeaf["C"]!!.totalQty shouldBe (15.0 plusOrMinus 1e-9)
-        byLeaf["C"]!!.members.map { it.demandId }.toSet() shouldBe setOf("DA", "DC")
-    }
-
-    test("mergeGroups: ancestry across DIFFERENT time buckets does NOT merge") {
+    test("mergeGroups: demands in different time buckets stay as separate groups") {
         // Same BOM SHALLOW→DEEP, but demands due in different periods so they fall into
         // different time buckets. Each bucket has only its own group → no merge.
         val bomRows = listOf(bom("SHALLOW", "DEEP", 2.0))
@@ -438,14 +330,14 @@ class ResolutionEngineTest : FunSpec({
             demand("D1", "SHALLOW", "L1", 10.0, due = "2024-01-15"),
             demand("D2", "DEEP",    "L1", 5.0,  due = "2024-12-15"),
         )
-        val merged = mergeGroups(buildResolutionGraph(demands, data), BomAncestry(bomRows), periodDays = 30)
+        val merged = mergeGroups(buildResolutionGraph(demands, data), periodDays = 30)
         // Different buckets → both groups survive.
         merged shouldHaveSize 2
         merged.map { it.leafPid }.toSet() shouldBe setOf("SHALLOW", "DEEP")
     }
 
     test("mergeGroups: empty graph yields empty list") {
-        val merged = mergeGroups(ResolutionGraph(emptyList()), BomAncestry(emptyList()), periodDays = 0)
+        val merged = mergeGroups(ResolutionGraph(emptyList()), periodDays = 0)
         merged.shouldBeEmpty()
     }
 
@@ -493,17 +385,24 @@ class ResolutionEngineTest : FunSpec({
 
         @Suppress("UNCHECKED_CAST")
         val pegging = result["planning_pegging"] as List<Map<String, Any?>>
-        // Find consolidated entries (engine output for the merged group).
-        val consolidatedEntries = pegging.filter { it["consolidated"] == true }
-        // Exactly one consolidated group — the merged 502-2588 group containing both demands.
-        consolidatedEntries shouldHaveSize 1
-        val entry = consolidatedEntries[0]
-        @Suppress("UNCHECKED_CAST")
-        val tree = entry["tree"] as Map<String, Any?>
-        tree["product_id"] shouldBe "502-2588"
-        @Suppress("UNCHECKED_CAST")
-        val sharers = entry["consolidated_demand_ids"] as List<Any?>
-        sharers.toSet() shouldBe setOf("DA", "DB")
+        // With realPegging=true each demand gets its own tree; both DA and DB must
+        // have pegging that includes supply from 502-2588 (the shared leaf).
+        fun collectSupplyIds(node: Any?): List<String> {
+            if (node !is Map<*, *>) return emptyList()
+            val result = mutableListOf<String>()
+            if (node["type"] == "supply") {
+                val sid = node["supply_id"]?.toString()
+                if (sid != null) result.add(sid)
+            }
+            @Suppress("UNCHECKED_CAST")
+            (node["children"] as? List<*>)?.forEach { result.addAll(collectSupplyIds(it)) }
+            return result
+        }
+        val perDemandEntries = pegging.filter { it["demand_id"] != null }
+        perDemandEntries.map { it["demand_id"] }.toSet() shouldBe setOf("DA", "DB")
+        for (entry in perDemandEntries) {
+            collectSupplyIds(entry["tree"]).any { it == "S_2588" } shouldBe true
+        }
     }
 
     test("buildResolutionGraph: purchase method is a leaf") {
@@ -851,7 +750,7 @@ class ResolutionEngineTest : FunSpec({
             MergedMember(demandId = "DB", qty = 20.0, priority = 0, dueDate = null,
                 originalLeafPid = "X", originalLeafLid = "L1", promotionRate = 1.0),
         )
-        val g = MergedGroup("X", "L1", java.time.LocalDate.parse("2024-01-01"), members)
+        val g = MergedGroup("X", "L1", null, null, null, java.time.LocalDate.parse("2024-01-01"), members)
         val capped = g.withMemberCaps(mapOf("DA" to 4.0))  // DB uncapped
         val byDid = capped.members.associateBy { it.demandId }
         byDid["DA"]!!.qty shouldBe (4.0 plusOrMinus 1e-9)
@@ -864,7 +763,7 @@ class ResolutionEngineTest : FunSpec({
             MergedMember("DA", 10.0, 0, null, "X", "L1", 1.0),
             MergedMember("DB", 10.0, 0, null, "X", "L1", 1.0),
         )
-        val g = MergedGroup("X", "L1", java.time.LocalDate.parse("2024-01-01"), members)
+        val g = MergedGroup("X", "L1", null, null, null, java.time.LocalDate.parse("2024-01-01"), members)
         val capped = g.withMemberCaps(mapOf("DA" to 0.0))
         capped.members.map { it.demandId } shouldBe listOf("DB")
         capped.totalQty shouldBe (10.0 plusOrMinus 1e-9)
@@ -872,7 +771,7 @@ class ResolutionEngineTest : FunSpec({
 
     test("withMemberCaps: cap >= current sum is a no-op for that demand") {
         val members = listOf(MergedMember("DA", 10.0, 0, null, "X", "L1", 1.0))
-        val g = MergedGroup("X", "L1", java.time.LocalDate.parse("2024-01-01"), members)
+        val g = MergedGroup("X", "L1", null, null, null, java.time.LocalDate.parse("2024-01-01"), members)
         val capped = g.withMemberCaps(mapOf("DA" to 99.0))
         capped.members.single().qty shouldBe (10.0 plusOrMinus 1e-9)
     }
@@ -884,7 +783,7 @@ class ResolutionEngineTest : FunSpec({
             MergedMember("DA", 12.0, 0, null, "C", "L1", 4.0),
             MergedMember("DB", 5.0,  0, null, "X", "L1", 1.0),
         )
-        val g = MergedGroup("X", "L1", java.time.LocalDate.parse("2024-01-01"), members)
+        val g = MergedGroup("X", "L1", null, null, null, java.time.LocalDate.parse("2024-01-01"), members)
         // DA's current sum = 18; cap at 9 → scale factor 0.5.
         val capped = g.withMemberCaps(mapOf("DA" to 9.0))
         val daMembers = capped.members.filter { it.demandId == "DA" }

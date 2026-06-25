@@ -94,6 +94,12 @@ data class ResolutionNode(
     val method: Map<String, Any?>?,
     /** True when traversal stopped here (inventory-bearing or terminal purchase). */
     val isLeaf: Boolean,
+    /** Supply lot identifier — set on inventory-bearing leaves, null elsewhere. */
+    val supplyId: String? = null,
+    /** Arrival date of this supply lot — set on inventory-bearing leaves, null elsewhere. */
+    val supplyDate: LocalDate? = null,
+    /** Available quantity of this specific supply lot. */
+    val supplyQty: Double? = null,
 )
 
 /**
@@ -178,7 +184,12 @@ fun buildResolutionGraph(
             out = collected,
         )
         if (collected.isEmpty()) {
-            log.debug("buildResolutionGraph: demand {} produced no paths (no methods reachable)", demandId)
+            log.debug("[map][request] demand={} product={}@{} produced 0 paths (no method/supply reachable)",
+                demandId, productId, locationId)
+        } else {
+            log.debug("[map][request] demand={} product={}@{} paths={} supply-columns={}",
+                demandId, productId, locationId, collected.size,
+                collected.map { "${it.leaf.productId}@${it.leaf.locationId}" }.toSet().size)
         }
         paths.addAll(collected)
     }
@@ -232,14 +243,22 @@ data class MergedMember(
     val promotionRate: Double,
 )
 
-/** A consolidation group whose members may have been promoted from shallower groups. */
+/** A consolidation group for one specific supply lot competing across demands. */
 data class MergedGroup(
     val leafPid: String,
     val leafLid: String,
+    /** Supply lot identifier — null means aggregated (all lots at this (pid, lid)). */
+    val supplyId: String?,
+    /** Arrival date of this supply lot — null if not known. */
+    val supplyDate: java.time.LocalDate?,
+    /** Available quantity of this supply lot. */
+    val supplyQty: Double?,
     val timeBucket: java.time.LocalDate,
     val members: List<MergedMember>,
 ) {
     val totalQty: Double get() = members.sumOf { it.qty }
+    /** Budget key used in plan() — "$pid|$lid|$supplyId" when supplyId is known, else "$pid|$lid". */
+    val budgetKey: String get() = if (supplyId != null) "$leafPid|$leafLid|$supplyId" else "$leafPid|$leafLid"
 }
 
 /**
@@ -293,64 +312,42 @@ fun MergedGroup.withMemberCaps(caps: Map<Any?, Double>): MergedGroup {
  */
 fun mergeGroups(
     graph: ResolutionGraph,
-    ancestry: BomAncestry,
     periodDays: Int,
 ): List<MergedGroup> {
-    data class Key(val pid: String, val lid: String, val bucket: java.time.LocalDate)
+    data class Key(
+        val pid: String, val lid: String,
+        val supplyId: String?,
+        val bucket: java.time.LocalDate,
+    )
+    data class LotMeta(val supplyDate: java.time.LocalDate?, val supplyQty: Double?)
 
-    // Bucket paths by leaf×bucket. Each path becomes one (un-promoted) member.
-    val raw = mutableMapOf<Key, MutableList<MergedMember>>()
+    // Bucket paths by (leaf supply lot, bucket). Each path becomes one member.
+    val raw  = mutableMapOf<Key, MutableList<MergedMember>>()
+    val meta = mutableMapOf<Key, LotMeta>()
     for (p in graph.paths) {
-        val key = Key(p.leaf.productId, p.leaf.locationId, timeBucket(p.dueDate, periodDays))
+        val leaf = p.leaf
+        val key  = Key(leaf.productId, leaf.locationId, leaf.supplyId, timeBucket(p.dueDate, periodDays))
         val member = MergedMember(
-            demandId         = p.demandId,
-            qty              = p.leafQuantity(),
-            priority         = p.priority,
-            dueDate          = p.dueDate,
-            originalLeafPid  = p.leaf.productId,
-            originalLeafLid  = p.leaf.locationId,
-            promotionRate    = 1.0,
+            demandId        = p.demandId,
+            qty             = p.leafQuantity(),
+            priority        = p.priority,
+            dueDate         = p.dueDate,
+            originalLeafPid = leaf.productId,
+            originalLeafLid = leaf.locationId,
+            promotionRate   = 1.0,
         )
         raw.getOrPut(key) { mutableListOf() }.add(member)
+        if (key !in meta) meta[key] = LotMeta(leaf.supplyDate, leaf.supplyQty)
     }
 
-    // Process each bucket independently — ancestry is checked only within the same time window.
-    val byBucket: Map<java.time.LocalDate, List<Key>> = raw.keys.groupBy { it.bucket }
-    for ((_, keysInBucket) in byBucket) {
-        for (a in keysInBucket) {
-            val members = raw[a] ?: continue
-            if (members.isEmpty()) continue
-            // Descendants of `a` within this bucket (same time window only).
-            val descendants = keysInBucket.filter { it != a && ancestry.isAncestor(a.pid, it.pid) }
-            if (descendants.isEmpty()) continue
-            // Maximal descendants — those that are not themselves ancestors of any other descendant.
-            // For a linear chain a→b→c this picks {c}; for a diamond a→b, a→c with b≁c, {b, c}.
-            val maximal = descendants.filter { d ->
-                descendants.none { other -> other != d && ancestry.isAncestor(other.pid, d.pid) }
-            }
-            // Split-promote: every member contributes to every maximal descendant at its
-            // converted rate. Drop the original (members.clear) so the shallow group becomes empty.
-            for (m in members) {
-                for (dKey in maximal) {
-                    val rate = ancestry.cumulativeRate(a.pid, dKey.pid) ?: continue
-                    raw[dKey]!!.add(m.copy(
-                        qty            = m.qty * rate,
-                        promotionRate  = m.promotionRate * rate,
-                        // originalLeafPid/Lid stays as the path's true stop point — it records
-                        // *where the demand actually consumes inventory at commit time*, which
-                        // can differ from the merged group's leaf.
-                    ))
-                }
-            }
-            members.clear()
-        }
-    }
-
-    // Drop emptied groups, sort deterministically.
+    // Demand map = request map: one group per supply lot per time bucket.
+    // No promotion — each lot allocates only the demands that directly requested it.
     return raw.entries
-        .filter { it.value.isNotEmpty() }
-        .map { (k, ms) -> MergedGroup(k.pid, k.lid, k.bucket, ms.toList()) }
-        .sortedWith(compareBy({ it.timeBucket }, { it.leafPid }, { it.leafLid }))
+        .map { (k, ms) ->
+            val m = meta[k]
+            MergedGroup(k.pid, k.lid, k.supplyId, m?.supplyDate, m?.supplyQty, k.bucket, ms.toList())
+        }
+        .sortedWith(compareBy({ it.timeBucket }, { it.leafPid }, { it.leafLid }, { it.supplyId }))
 }
 
 /**
@@ -373,20 +370,23 @@ fun MergedGroup.toConsolidationGroup(): ConsolidationGroup {
             viaOrAlternative = false,
         )
     }
-    return ConsolidationGroup(leafPid, leafLid, timeBucket, needs, totalQty)
+    return ConsolidationGroup(leafPid, leafLid, timeBucket, needs, totalQty, supplyId)
 }
 
 // ── Internals ─────────────────────────────────────────────────────────────────
 
-private fun buildSupplyIndexForResolution(data: Map<String, List<Map<String, Any?>>>): Set<Pair<String, String>> =
+/** Maps (productId, locationId) → list of supply rows (one per lot) with qty > 0. */
+private fun buildSupplyIndexForResolution(
+    data: Map<String, List<Map<String, Any?>>>,
+): Map<Pair<String, String>, List<Map<String, Any?>>> =
     (data["supply"] ?: emptyList())
         .filter { s -> ((s["qty"] as? Number)?.toDouble() ?: 0.0) > 0 }
-        .mapNotNull { s ->
-            val pid = s["product_id"]?.toString()?.trim() ?: return@mapNotNull null
-            val lid = s["location_id"]?.toString()?.trim() ?: return@mapNotNull null
-            if (pid.isBlank() || lid.isBlank()) null else Pair(pid, lid)
+        .groupBy { s ->
+            val pid = s["product_id"]?.toString()?.trim() ?: return@groupBy ("" to "")
+            val lid = s["location_id"]?.toString()?.trim() ?: return@groupBy ("" to "")
+            pid to lid
         }
-        .toSet()
+        .filterKeys { (pid, lid) -> pid.isNotBlank() && lid.isNotBlank() }
 
 private fun parseDateOrNull(s: String?): LocalDate? {
     if (s.isNullOrBlank()) return null
@@ -416,7 +416,7 @@ private fun walkResolution(
     cumulativeRate: Double,
     depth: Int,
     data: Map<String, List<Map<String, Any?>>>,
-    supplyIndex: Set<Pair<String, String>>,
+    supplyIndex: Map<Pair<String, String>, List<Map<String, Any?>>>,
     visited: Set<Pair<String, String>>,
     chain: List<ResolutionNode>,
     demandId: Any?,
@@ -428,10 +428,22 @@ private fun walkResolution(
     val key = productId to locationId
     if (key in visited) return
 
-    // Inventory-bearing node → emit leaf, stop.
-    if (key in supplyIndex) {
-        val leaf = ResolutionNode(productId, locationId, cumulativeRate, depth, method = null, isLeaf = true)
-        out.add(ResolutionPath(demandId, priority, dueDate, requestedQty, chain + leaf))
+    // Inventory-bearing node → emit one path per supply lot, stop.
+    val lots = supplyIndex[key]
+    if (lots != null) {
+        for (lot in lots) {
+            val sid  = lot["supply_id"]?.toString()
+            val sQty = (lot["qty"] as? Number)?.toDouble()
+            val sDate = parseDateOrNull(
+                lot["supply_date"]?.toString() ?: lot["available_date"]?.toString()
+            )
+            val leaf = ResolutionNode(
+                productId, locationId, cumulativeRate, depth,
+                method = null, isLeaf = true,
+                supplyId = sid, supplyDate = sDate, supplyQty = sQty,
+            )
+            out.add(ResolutionPath(demandId, priority, dueDate, requestedQty, chain + leaf))
+        }
         return
     }
 

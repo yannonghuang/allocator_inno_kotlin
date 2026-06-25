@@ -24,6 +24,8 @@ import {
   runPlan,
   runPlanAsync,
   getPlanStatus,
+  getPeggingSaveStatus,
+  type PeggingSaveStatus,
   planningAgent,
   listActivePlanJobs,
   type ActivePlanJob,
@@ -31,6 +33,7 @@ import {
   // Post-response polling: chat reuses getPlanStatus to track plans that
   // exceeded the agent's 25s blocking window.
   getPlanRun,
+  getPlanRunPegging,
   deletePlanRun,
   type PlanRun,
   type PlanRunFull,
@@ -1205,6 +1208,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   } | null>(null);
   const [planLoading, setPlanLoading] = useState(false);
   const [planError, setPlanError] = useState<string | null>(null);
+
+  // Lazily fetch planning_pegging from the separate /pegging endpoint and merge it into
+  // planResult. Called after every setPlanResult(full.result) from a DB-loaded run, since
+  // the plan-run detail endpoint no longer embeds pegging (was causing 20s load times).
+  const loadAndMergePegging = (caseId: number | string, runId: number) => {
+    getPlanRunPegging(Number(caseId), runId)
+      .then(({ planning_pegging }) => {
+        setPlanResult((prev) => prev ? { ...prev, planning_pegging: planning_pegging as PlanningPeggingEntry[] } : prev);
+      })
+      .catch(() => { /* pegging unavailable — drill-down shows empty trees */ });
+  };
   const [planPeggingOpen, setPlanPeggingOpen] = useState(false);
   const [planPeggingContext, setPlanPeggingContext] = useState<
     | { type: 'demand'; row: CommittedDemand }
@@ -1216,6 +1230,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planPeggingSearch, setPlanPeggingSearch] = useState('');
   const [planPeggingMatchPath, setPlanPeggingMatchPath] = useState<string | null>(null);
   const [planPeggingMatchIndex, setPlanPeggingMatchIndex] = useState(0);
+  // Per-demand pegging cache — populated lazily when user opens a demand's pegging panel.
+  // Keys are demand_id strings; values are the fetched PlanningPeggingEntry or 'loading'/'error'.
+  const [demandPeggingCache, setDemandPeggingCache] = useState<Record<string, PlanningPeggingEntry | 'loading' | 'error'>>({});
   const [planPeggingMatchPaths, setPlanPeggingMatchPaths] = useState<string[]>([]);
   useEffect(() => {
     setPlanPeggingSearch('');
@@ -1391,6 +1408,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [peggingSaveStatus, setPeggingSaveStatus] = useState<PeggingSaveStatus | null>(null);
+  const peggingSavePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [copilotOpen, setCopilotOpen] = useState(false);
   const [copilotMessages, setCopilotMessages] = useState<PlanningCopilotMessage[]>([]);
   const [copilotInput, setCopilotInput] = useState('');
@@ -1636,6 +1655,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [supExplainPanelWidth, setSupExplainPanelWidth] = useState(420);
   const supExplainResizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [supExplainResizing, setSupExplainResizing] = useState(false);
+  const [peggedSort, setPeggedSort] = useState<{ key: 'demand' | 'customer' | 'requested' | 'allocated' | 'consumed' | 'share'; dir: 'asc' | 'desc' } | null>(null);
+  const [peggedDemandFilter, setPeggedDemandFilter] = useState('');
+  const [peggedCustomerFilter, setPeggedCustomerFilter] = useState('');
   const [planRunHistoryPanelWidth, setPlanRunHistoryPanelWidth] = useState(520);
   const planRunHistoryResizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [planRunHistoryResizing, setPlanRunHistoryResizing] = useState(false);
@@ -1941,6 +1963,30 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     };
   }, [planJobId, id]);
 
+  // Poll background pegging save status. Starts when plan job finishes (planJobId cleared)
+  // or when the page loads with a fresh run. Stops when the backend returns 204 (save done).
+  useEffect(() => {
+    if (!id) return;
+    const poll = async () => {
+      try {
+        const status = await getPeggingSaveStatus(id);
+        setPeggingSaveStatus(status);
+        if (!status && peggingSavePollRef.current) {
+          clearInterval(peggingSavePollRef.current);
+          peggingSavePollRef.current = null;
+        }
+      } catch { /* transient — keep polling */ }
+    };
+    poll();
+    if (peggingSavePollRef.current) clearInterval(peggingSavePollRef.current);
+    peggingSavePollRef.current = setInterval(poll, 3000);
+    return () => {
+      if (peggingSavePollRef.current) { clearInterval(peggingSavePollRef.current); peggingSavePollRef.current = null; }
+    };
+  // Re-trigger when a plan finishes (planJobId goes null) or on mount.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, planJobId]);
+
   // Load case supplies once we have a plan result (fetched once; cleared when planResult is cleared).
   useEffect(() => {
     if (!planResult || !id) {
@@ -2104,6 +2150,31 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       return next;
     });
   }, [planPeggingContext, planResult]);
+
+  // Lazily fetch per-demand pegging tree when user opens the pegging panel and the
+  // tree is not in planResult.planning_pegging (bulk load is disabled — trees are too large).
+  useEffect(() => {
+    if (planPeggingContext?.type !== 'demand') return;
+    const demandId = String(planPeggingContext.row.demand_id ?? '').trim();
+    if (!demandId) return;
+    const inResult = planResult?.planning_pegging?.some((e) => String(e.demand_id ?? '').trim() === demandId);
+    if (inResult) return;
+    if (demandPeggingCache[demandId]) return;
+    const planRunId = currentPlanRunId ?? freshPlanRunId;
+    if (!planRunId || !id) return;
+    setDemandPeggingCache((prev) => ({ ...prev, [demandId]: 'loading' }));
+    getPlanRunPegging(Number(id), planRunId, demandId)
+      .then(({ planning_pegging }) => {
+        const entry = planning_pegging[planning_pegging.length - 1] as PlanningPeggingEntry | undefined;
+        if (entry) {
+          setDemandPeggingCache((prev) => ({ ...prev, [demandId]: entry }));
+          setPlanResult((prev) => prev ? { ...prev, planning_pegging: [...(prev.planning_pegging ?? []), entry] } : prev);
+        } else {
+          setDemandPeggingCache((prev) => ({ ...prev, [demandId]: 'error' }));
+        }
+      })
+      .catch(() => setDemandPeggingCache((prev) => ({ ...prev, [demandId]: 'error' })));
+  }, [planPeggingContext, planResult, demandPeggingCache, currentPlanRunId, freshPlanRunId, id]);
 
   // Reset assessment result/history when a different supply is opened in the
   // breakdown slide-in (where the assessment UI now lives).
@@ -2340,7 +2411,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     }
     allocationViewRunIdRef.current = runId;
     setSupplyViewLoading(true);
-    getSupplyView(id, runId, currentPlanRunId != null ? { plan_run_id: currentPlanRunId } : undefined)
+    const svPlanRunId = currentPlanRunId ?? freshPlanRunId;
+    getSupplyView(id, runId, svPlanRunId != null ? { plan_run_id: svPlanRunId } : undefined)
       .then((s) => setSupplyView(s.supply_view))
       .catch(() => setSupplyView([]))
       .finally(() => setSupplyViewLoading(false));
@@ -2474,11 +2546,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   useEffect(() => {
     if (!selectedRunId) return;
     setSupplyViewLoading(true);
-    getSupplyView(id, selectedRunId, currentPlanRunId != null ? { plan_run_id: currentPlanRunId } : undefined)
+    const svPlanRunId = currentPlanRunId ?? freshPlanRunId;
+    getSupplyView(id, selectedRunId, svPlanRunId != null ? { plan_run_id: svPlanRunId } : undefined)
       .then((s) => setSupplyView(s.supply_view))
       .catch(() => setSupplyView([]))
       .finally(() => setSupplyViewLoading(false));
-  }, [currentPlanRunId, selectedRunId, id]);
+  }, [currentPlanRunId, freshPlanRunId, selectedRunId, id]);
 
   // Lazy-load allocation view only when user opens the Allocation tab (scalable: no heavy request on run select)
   useEffect(() => {
@@ -3156,6 +3229,29 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return m;
   }, [planResult?.supply_allocations]);
 
+  const demandCustomerMap = useMemo(() => {
+    const m = new Map<string, string | null>();
+    for (const d of planResult?.committed_demands ?? []) {
+      if (d.demand_id) m.set(d.demand_id, d.customer ?? null);
+    }
+    return m;
+  }, [planResult?.committed_demands]);
+
+  // lotId → demandId → qty — used by the supply-explain allocation heatmap.
+  // supply_id → demand_id → qty_allocated (demand's proportional entitlement from this lot).
+  // Uses qty_allocated when present (new runs); falls back to qty_consumed for older runs.
+  const lotDemandAllocMap = useMemo(() => {
+    const m = new Map<string, Map<string, number>>();
+    for (const a of planResult?.supply_allocations ?? []) {
+      if (!a.demand_id) continue;
+      let dm = m.get(a.supply_id);
+      if (!dm) { dm = new Map(); m.set(a.supply_id, dm); }
+      const qty = a.qty_allocated != null ? a.qty_allocated : a.qty_consumed;
+      dm.set(a.demand_id, (dm.get(a.demand_id) ?? 0) + qty);
+    }
+    return m;
+  }, [planResult?.supply_allocations]);
+
   /**
    * Map supply_id → SupplySplitInfo for supplies consumed by a consolidated WO.
    * Walks each consolidated pegging entry's tree to find real supply leaves and
@@ -3353,10 +3449,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return map;
   }, [planResult]);
 
+  // supplyView (from plan_supply_allocation via backend) keyed by supply_id — used as
+  // fallback when supplyPeggingMap is empty (pegging trees too large to load in-memory).
+  const supplyViewRowMap = useMemo(() => {
+    const m = new Map<string, SupplyViewRow>();
+    for (const r of supplyView) m.set(r.supply_id, r);
+    return m;
+  }, [supplyView]);
+
   /** Join caseSupplies rows with supplyPeggingMap to produce the enriched supply view. */
   const planSupplyViewRows = useMemo((): PlanSupplyViewRow[] => {
     return caseSupplies.map((s) => {
       const pegging = supplyPeggingMap.get(s.supplyId);
+      const svRow = supplyViewRowMap.get(s.supplyId);
       // Prefer persisted supply_allocations (written on save); fall back to pegging-tree traversal
       // so the pre-save preview still shows approximate consumption figures.
       const consumedQty = supplyConsumedMap.size > 0
@@ -3377,14 +3482,24 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         consumedQty,
         residualQty,
         utilizationRate,
-        peggedDemandCount: pegging?.demands.length ?? 0,
-        totalPeggedQty: pegging?.totalPeggedQty ?? 0,
-        peggedDemands: pegging?.demands ?? [],
+        peggedDemandCount: pegging?.demands.length ?? svRow?.pegged_demands ?? 0,
+        totalPeggedQty: pegging?.totalPeggedQty ?? svRow?.total_pegged_qty ?? 0,
+        peggedDemands: pegging?.demands.length
+          ? pegging.demands
+          : (() => {
+              const dm = lotDemandAllocMap.get(s.supplyId);
+              if (!dm) return [];
+              return Array.from(dm.entries()).map(([demandId, qty]) => ({
+                demandId,
+                customer: demandCustomerMap.get(demandId) ?? null,
+                qtyConsumed: qty,
+              }));
+            })(),
         splitInfos: supplySplitInfoMap.get(s.supplyId) ?? [],
         demandPath,
       };
     });
-  }, [caseSupplies, supplyPeggingMap, supplyConsumedMap, supplySplitInfoMap, supplyDemandPathMap]);
+  }, [caseSupplies, supplyPeggingMap, supplyConsumedMap, lotDemandAllocMap, demandCustomerMap, supplySplitInfoMap, supplyDemandPathMap, supplyViewRowMap]);
 
   /** Sum of qty per productId across all plan supply view rows (unfiltered). */
   const planSupplyProductTotalMap = useMemo((): Record<string, number> => {
@@ -5127,6 +5242,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           </div>
         )}
         {planError && <p style={{ color: '#f87171', marginTop: '0.5rem' }}>{planError}</p>}
+        {peggingSaveStatus && (
+          <div style={{ marginTop: '0.5rem', maxWidth: 400 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', color: '#a16207', marginBottom: '0.25rem' }}>
+              <span>Saving pegging data for run #{peggingSaveStatus.run_id} — {peggingSaveStatus.pct}%</span>
+              <span style={{ color: '#71717a' }}>{peggingSaveStatus.chunks_done}/{peggingSaveStatus.chunks_total} chunks</span>
+            </div>
+            <div style={{ height: 5, backgroundColor: '#27272a', borderRadius: 4, overflow: 'hidden' }}>
+              <div style={{ height: '100%', width: `${peggingSaveStatus.pct}%`, backgroundColor: '#d97706', transition: 'width 0.4s ease' }} />
+            </div>
+          </div>
+        )}
         {planResult && !planLoading && (
           <>
             {(() => {
@@ -5903,8 +6029,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     let workOrderRows = planWorkOrderHideDummyProdArea
                       ? activeWorkOrders.filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'))
                       : activeWorkOrders;
-                    // Compute the supply-backing map early so it can drive the phantom filter below
-                    // and also be used by the WO expand panel later in this block.
+                    // Supply-backing maps used by the WO expand panel for pegging drill-down.
                     const { suppliesMap: woSuppliesMap, crossEntrySupplyMap: woCrossEntrySupplyMap, peggedQtyMap: woPeggedQtyMap } = buildWoMaps(planResult.planning_pegging ?? []);
                     // Filters refer to work-order pegging (each WO's supplies subtree), not demand pegging.
                     const anyPeggingFilter = planDemandRealMakeOnly || planDemandBuyOnly || planDemandRealMoveOnly || planWoDemandedByMultiple || planWoMultiSupply || planWoPurchaseOnly || planWoMakeOnly || planWoMoveOnly || planWoHasOverride;
@@ -5932,41 +6057,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         return r.wo_consolidation_split_details?.some((d) => d.demand_id === demandIdFilter) ?? false;
                       });
                     }
-                    // Build the set of "backed" WO signatures: product|location|method triples for
-                    // which at least one WO node in the pegging tree has supply leaves.
-                    // We intentionally ignore demand_id here because individual WO rows often carry
-                    // a specific demand_id while the corresponding pegging WO node lives inside a
-                    // consolidated entry (demand_id null) — the keys never reliably match.
-                    // Make WOs are excluded from phantom filtering because their supply leaves are
-                    // components with different product_ids and are not in woSuppliesMap.
-                    const backedWoSigs = new Set<string>();
-                    const collectBackedWos = (node: PlanningPeggingNode): void => {
-                      if (node.type === 'work_order') {
-                        if (collectAllSupplyLeaves(node).length > 0) {
-                          backedWoSigs.add(`${node.product_id ?? ''}|${node.location_id ?? ''}|${(node.method ?? '').toLowerCase()}`);
-                        }
-                        (node.children ?? []).forEach(collectBackedWos);
-                      } else {
-                        (node.children ?? []).forEach(collectBackedWos);
-                      }
-                    };
-                    for (const entry of planResult.planning_pegging ?? []) {
-                      collectBackedWos(entry.tree);
-                    }
-                    workOrderRows = workOrderRows.filter((r) => {
-                      // When VirtualProduct_* rows are explicitly shown (checkbox unchecked),
-                      // bypass the phantom filter — the checkbox is the sole visibility control
-                      // for these rows; phantom-filtering them would make unchecking ineffective.
-                      if (!planWorkOrderHideDummyProdArea && (r.product_id ?? '').trim().startsWith('VirtualProduct_')) return true;
-                      const method = (r.method ?? '').toLowerCase();
-                      if (method === 'make') return true;
-                      // Consolidated move WOs carry product_id=null (same-prod_area mixed-product
-                      // shipment). Their constituent native moves ARE backed in the pegging tree,
-                      // but the null product_id can never match a per-product signature in
-                      // backedWoSigs — pass them through unconditionally.
-                      if (method === 'move' && r.product_id == null) return true;
-                      return backedWoSigs.has(`${r.product_id ?? ''}|${r.location_id ?? ''}|${(r.method ?? '').toLowerCase()}`);
-                    });
+                    // All consolidated WOs are valid plan actions — no phantom filtering.
+                    // Previously we filtered by pegging-tree backing (backedWoSigs) but pegging
+                    // is now lazy-loaded per demand, so planning_pegging is always empty here and
+                    // the set was always empty, silently dropping all purchase and non-null-product
+                    // move orders. All three methods (make/purchase/move) are passed through; the
+                    // VirtualProduct visibility is already handled by the checkbox filter above.
                     // Aggregate lots with the same logical WO key so the table shows total quantity per work order
                     const grouped = new Map<string, WorkOrder>();
                     for (const r of workOrderRows) {
@@ -7177,7 +7273,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                   style={isSelected ? { background: 'rgba(167,139,250,0.25)', borderColor: '#a78bfa' } : undefined}
                                   onClick={() => {
                                     if (isSelected) { setSupExplainOpen(false); setSupExplainKey(null); setSupExplainRow(null); }
-                                    else { setSupExplainRow(r); setSupExplainKey(k); setSupExplainOpen(true); }
+                                    else { setSupExplainRow(r); setSupExplainKey(k); setSupExplainOpen(true); setPeggedSort(null); setPeggedDemandFilter(''); setPeggedCustomerFilter(''); }
                                   }}
                                 >{tc('show')}</button>
                               );
@@ -9424,6 +9520,136 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   )}
                 </p>
               </section>
+              {/* ── Allocation Map (lot × demand heatmap) ─────────────────── */}
+              {(() => {
+                const compKey = `${supExplainRow.productId}|${supExplainRow.locationId ?? ''}`;
+                // All lots for this product@location that have any allocation data
+                const lots = planSupplyViewRows
+                  .filter(r => `${r.productId}|${r.locationId ?? ''}` === compKey && lotDemandAllocMap.has(r.supplyId))
+                  .sort((a, b) => {
+                    const da = a.supplyDate ?? '9999-99-99';
+                    const db = b.supplyDate ?? '9999-99-99';
+                    return da < db ? -1 : da > db ? 1 : 0;
+                  });
+                if (lots.length === 0) return null;
+                // Seed with ALL committed demands for this product@location (zero-allocation ones show as empty columns)
+                const demandTotals = new Map<string, number>();
+                for (const cd of planResult?.committed_demands ?? []) {
+                  if (cd.demand_id && cd.product_id === supExplainRow.productId && cd.location_id === supExplainRow.locationId) {
+                    demandTotals.set(cd.demand_id, 0);
+                  }
+                }
+                // Accumulate actual allocations on top
+                for (const lot of lots) {
+                  const dm = lotDemandAllocMap.get(lot.supplyId);
+                  if (!dm) continue;
+                  dm.forEach((qty, did) => demandTotals.set(did, (demandTotals.get(did) ?? 0) + qty));
+                }
+                // Sort: allocated demands first (desc), then zero-allocation demands (alphabetically)
+                const visibleDemands = Array.from(demandTotals.entries())
+                  .sort((a, b) => b[1] !== a[1] ? b[1] - a[1] : a[0].localeCompare(b[0]))
+                  .map(([d]) => d);
+                const demandCustomer = (did: string) => {
+                  const cd = planResult?.committed_demands?.find(d => d.demand_id === did);
+                  return cd?.customer ?? null;
+                };
+                // Short label: strip common prefix from demand IDs for compact headers
+                const shortLabel = (did: string) => did.length > 16 ? did.slice(-14) : did;
+                const cellColor = (fraction: number) => {
+                  if (fraction < 1e-9) return '#27272a';
+                  const intensity = Math.min(1, fraction);
+                  // interpolate #27272a → #7c3aed (dark to vivid purple)
+                  const r = Math.round(39 + (124 - 39) * intensity);
+                  const g = Math.round(39 + (58 - 39) * intensity);
+                  const b = Math.round(42 + (237 - 42) * intensity);
+                  return `rgb(${r},${g},${b})`;
+                };
+                return (
+                  <section style={{ marginBottom: '1.25rem' }}>
+                    <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                      Allocation Map
+                      <span style={{ marginLeft: 6, fontWeight: 400, color: '#71717a', fontSize: '0.72rem', textTransform: 'none' }}>
+                        {lots.length} lot{lots.length !== 1 ? 's' : ''} · {visibleDemands.length} competing demand{visibleDemands.length !== 1 ? 's' : ''}
+                      </span>
+                    </h4>
+                    <div style={{ overflowX: 'auto', fontSize: '0.72rem' }}>
+                      <table style={{ borderCollapse: 'collapse', minWidth: '100%' }}>
+                        <thead>
+                          <tr>
+                            <th style={{ padding: '2px 6px 4px 0', textAlign: 'left', color: '#71717a', whiteSpace: 'nowrap', minWidth: 90, fontWeight: 400 }}>Lot</th>
+                            <th style={{ padding: '2px 4px 4px', textAlign: 'right', color: '#71717a', whiteSpace: 'nowrap', fontWeight: 400 }}>Init qty</th>
+                            {visibleDemands.map(did => (
+                              <th key={did} style={{ padding: '2px 2px 4px', textAlign: 'center', maxWidth: 64, fontWeight: 400 }}>
+                                <div style={{ color: '#a1a1aa', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 64 }} title={`${did}\n${demandCustomer(did) ?? ''}`}>
+                                  {shortLabel(did)}
+                                </div>
+                                <div style={{ color: '#71717a', fontSize: '0.68rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 64 }}>
+                                  {qtyFmt(demandTotals.get(did) ?? 0)}
+                                </div>
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {lots.map(lot => {
+                            const dm = lotDemandAllocMap.get(lot.supplyId) ?? new Map<string, number>();
+                            const isCurrent = lot.supplyId === supExplainRow.supplyId;
+                            return (
+                              <tr key={lot.supplyId} style={{ background: isCurrent ? 'rgba(124,58,237,0.08)' : 'transparent' }}>
+                                <td style={{ padding: '2px 6px 2px 0', color: isCurrent ? '#c4b5fd' : '#a1a1aa', whiteSpace: 'nowrap' }}>
+                                  {lot.supplyDate ?? 'no date'}
+                                </td>
+                                <td style={{ padding: '2px 4px', textAlign: 'right', color: '#71717a', whiteSpace: 'nowrap' }}>
+                                  {qtyFmt(lot.qty)}
+                                </td>
+                                {visibleDemands.map(did => {
+                                  const qty = dm.get(did) ?? 0;
+                                  const frac = lot.qty > 0 ? qty / lot.qty : 0;
+                                  return (
+                                    <td key={did} style={{ padding: '1px 2px' }}>
+                                      <div
+                                        title={`${did} ← ${qtyFmt(qty)} (${(frac * 100).toFixed(1)}% of lot)`}
+                                        style={{
+                                          background: cellColor(frac),
+                                          borderRadius: 3,
+                                          textAlign: 'center',
+                                          padding: '2px 3px',
+                                          color: frac > 0.4 ? '#f4f4f5' : frac > 0.05 ? '#c4b5fd' : '#52525b',
+                                          minWidth: 36,
+                                          whiteSpace: 'nowrap',
+                                        }}
+                                      >
+                                        {qty > 0 ? qtyFmt(qty) : ''}
+                                      </div>
+                                    </td>
+                                  );
+                                })}
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                        <tfoot>
+                          <tr style={{ borderTop: '1px solid #3d3d40' }}>
+                            <td style={{ padding: '3px 6px 1px 0', color: '#71717a' }}>Total</td>
+                            <td style={{ padding: '3px 4px 1px', textAlign: 'right', color: '#71717a' }}>
+                              {qtyFmt(lots.reduce((s, l) => s + l.qty, 0))}
+                            </td>
+                            {visibleDemands.map(did => (
+                              <td key={did} style={{ padding: '3px 2px 1px', textAlign: 'center', color: '#a1a1aa', fontWeight: 600 }}>
+                                {qtyFmt(demandTotals.get(did) ?? 0)}
+                              </td>
+                            ))}
+                          </tr>
+                        </tfoot>
+                      </table>
+                    </div>
+                    <p style={{ margin: '0.3rem 0 0', fontSize: '0.7rem', color: '#52525b' }}>
+                      Cell = qty actually drawn from lot by demand. Color intensity = fraction of lot.
+                      Current lot highlighted.
+                    </p>
+                  </section>
+                );
+              })()}
               {/* ── Assessment UI (impact what-if) ────────────────────────── */}
               <section style={{ marginBottom: '1.25rem' }}>
                 <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('supplyView.assessment.heading')}</h4>
@@ -9521,96 +9747,159 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 {supExplainRow.peggedDemands.length === 0 ? (
                   <p style={{ margin: 0, fontSize: '0.875rem', color: '#71717a' }}>{tP('supExplain.peggedEmpty')}</p>
                 ) : (
-                  <>
-                    <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem' }}>
-                      <strong>{supExplainRow.peggedDemandCount}</strong> {tP('supExplain.peggedConsumedSuffix')}
-                      ({' '}{tP('supExplain.peggedTotal')} <strong>{qtyFmt(Number(supExplainRow.totalPeggedQty))}</strong>{' '}):
-                    </p>
-                    {/* New "Path" column annotates each pegged demand with which consolidation
-                        group it flowed through (or "direct" for main-loop / passthrough). This
-                        makes the row counts of the two tables on this slide-in semantically
-                        reconcile: every pegged demand reveals its provenance, and the user
-                        can see how the totals line up across paths. */}
-                    <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
-                      <colgroup>
-                        <col style={{ width: '24%' }} />
-                        <col style={{ width: '20%' }} />
-                        <col style={{ width: '16%' }} />
-                        <col style={{ width: '13%' }} />
-                        <col style={{ width: '14%' }} />
-                        <col style={{ width: '13%' }} />
-                      </colgroup>
-                      <thead>
-                        <tr style={{ color: '#a1a1aa', textAlign: 'left' }}>
-                          <th style={{ paddingBottom: '0.2rem' }}>{tP('supExplain.peggedColDemand')}</th>
-                          <th style={{ paddingBottom: '0.2rem' }}>{tP('supExplain.peggedColCustomer')}</th>
-                          <th style={{ paddingBottom: '0.2rem' }}>{tP('supExplain.peggedColPath') /* 'Path' / '路径' */}</th>
-                          <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('supExplain.peggedColRequested')}</th>
-                          <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('supExplain.peggedColQty')}</th>
-                          <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('supExplain.peggedColShare')}</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {supExplainRow.peggedDemands.map((d, i) => {
-                          const total = Number(supExplainRow.totalPeggedQty) || 0;
-                          const share = total > 1e-9 ? (Number(d.qtyConsumed) / total) * 100 : 0;
-                          // Path label covers BOTH multi-demand consolidation groups AND
-                          // passthrough singletons; absent = main-loop direct consumption.
-                          const groupLabel = supExplainRow.demandPath[d.demandId] ?? null;
-                          // Make the demand id clickable so the user can jump straight to that
-                          // demand's pegging tree. Only active when the corresponding
-                          // committed_demand row exists (i.e. it's a real user-level demand we
-                          // can render a tree for). This restores the demand-hyperlink behavior
-                          // that the deleted Impact column used to provide.
-                          const demandRow = planResult?.committed_demands.find((cd) => cd.demand_id === d.demandId);
-                          const demandKey = demandRow ? `demand|${demandRow.demand_id ?? ''}|${demandRow.product_id}|${demandRow.location_id}` : null;
-                          return (
-                            <tr key={`${d.demandId}-${i}`} style={{ borderTop: '1px solid #3d3d40' }}>
-                              <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                {demandRow && demandKey ? (
-                                  <button
-                                    type="button"
-                                    className="secondary"
-                                    style={{ fontSize: '0.74rem', padding: '1px 6px', fontFamily: 'monospace' }}
-                                    title={tP('supExplain.openDemandPegging')}
-                                    onClick={() => {
-                                      // Switch to the planPegging slide-in for this demand.
-                                      // Capture the current supExplain row so the planPegging
-                                      // slide-in can render a "← back to <supplyId>" link that
-                                      // restores the Breakdown view.
-                                      setPreviousSupExplainRow(supExplainRow);
-                                      setPlanPeggingContext({ type: 'demand', row: demandRow });
-                                      setPlanPeggingOpen(true);
-                                      setWoPeggingRowKey(demandKey);
-                                      setSupExplainOpen(false);
-                                      setSupExplainKey(null);
-                                      setSupExplainRow(null);
-                                    }}
-                                  >{d.demandId}</button>
-                                ) : (
-                                  <span>{d.demandId}</span>
-                                )}
-                              </td>
-                              <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', color: '#a1a1aa', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.customer ?? '–'}</td>
-                              <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '0.74rem' }}>
-                                {groupLabel ? (
-                                  <span style={{ color: '#67e8f9' }} title={`via consolidation group ${groupLabel}`}>{groupLabel}</span>
-                                ) : (
-                                  <span style={{ color: '#a1a1aa', fontStyle: 'italic' }} title="Direct main-loop / passthrough consumption (no consolidation split)">{tP('supExplain.peggedPathDirect') /* 'direct' / '直接' */}</span>
-                                )}
-                              </td>
-                              <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right', color: '#a1a1aa' }}>{demandRow?.requested_qty != null ? qtyFmt(Number(demandRow.requested_qty)) : '–'}</td>
-                              <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right' }}>{qtyFmt(Number(d.qtyConsumed))}</td>
-                              <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right', color: '#a1a1aa' }}>{share.toFixed(1)}%</td>
+                  (() => {
+                    // Share = qty consumed from this lot / lot initial qty — fraction of the lot used.
+                    const lotInitialQty = Number(supExplainRow.initialQty) || 0;
+                    // Build enriched rows so we can sort/filter uniformly
+                    const enriched = supExplainRow.peggedDemands.map((d) => {
+                      const demandRow = planResult?.committed_demands.find((cd) => cd.demand_id === d.demandId);
+                      const demandKey = demandRow ? `demand|${demandRow.demand_id ?? ''}|${demandRow.product_id}|${demandRow.location_id}` : null;
+                      const groupLabel = supExplainRow.demandPath[d.demandId] ?? null;
+                      const requestedQty = demandRow?.requested_qty != null ? Number(demandRow.requested_qty) : null;
+                      const consumedQty = Number(d.qtyConsumed);
+                      const share = lotInitialQty > 1e-9 ? (consumedQty / lotInitialQty) * 100 : 0;
+                      const allocQty = lotDemandAllocMap.get(supExplainRow.supplyId)?.get(d.demandId) ?? 0;
+                      return { d, demandRow, demandKey, groupLabel, requestedQty, consumedQty, share, allocQty };
+                    });
+                    // Filter
+                    const dfLower = peggedDemandFilter.trim().toLowerCase();
+                    const cfLower = peggedCustomerFilter.trim().toLowerCase();
+                    const filtered = enriched.filter((r) =>
+                      (!dfLower || r.d.demandId.toLowerCase().includes(dfLower)) &&
+                      (!cfLower || (r.d.customer ?? '').toLowerCase().includes(cfLower))
+                    );
+                    // Sort
+                    const sorted = peggedSort ? [...filtered].sort((a, b) => {
+                      const dir = peggedSort.dir === 'asc' ? 1 : -1;
+                      switch (peggedSort.key) {
+                        case 'demand':   return dir * a.d.demandId.localeCompare(b.d.demandId);
+                        case 'customer': return dir * (a.d.customer ?? '').localeCompare(b.d.customer ?? '');
+                        case 'requested': return dir * ((a.requestedQty ?? -1) - (b.requestedQty ?? -1));
+                        case 'allocated': return dir * (a.allocQty - b.allocQty);
+                        case 'consumed': return dir * (a.consumedQty - b.consumedQty);
+                        case 'share':    return dir * (a.share - b.share);
+                        default: return 0;
+                      }
+                    }) : filtered;
+                    // Footer sums (over filtered rows only)
+                    const sumRequested = filtered.reduce((s, r) => s + (r.requestedQty ?? 0), 0);
+                    const sumAllocated = filtered.reduce((s, r) => s + r.allocQty, 0);
+                    const sumConsumed  = filtered.reduce((s, r) => s + r.consumedQty, 0);
+                    const sortIndicator = (key: typeof peggedSort extends null ? never : NonNullable<typeof peggedSort>['key']) => {
+                      if (!peggedSort || peggedSort.key !== key) return <span style={{ color: '#52525b', marginLeft: 2 }}>⇅</span>;
+                      return <span style={{ color: '#a78bfa', marginLeft: 2 }}>{peggedSort.dir === 'asc' ? '↑' : '↓'}</span>;
+                    };
+                    const toggleSort = (key: NonNullable<typeof peggedSort>['key']) => {
+                      setPeggedSort((prev) =>
+                        prev?.key === key
+                          ? { key, dir: prev.dir === 'asc' ? 'desc' : 'asc' }
+                          : { key, dir: 'asc' }
+                      );
+                    };
+                    const thBtn: React.CSSProperties = { background: 'none', border: 'none', cursor: 'pointer', color: '#a1a1aa', fontSize: '0.78rem', padding: 0, fontWeight: 600 };
+                    return (
+                      <>
+                        <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem' }}>
+                          <strong>{supExplainRow.peggedDemandCount}</strong> {tP('supExplain.peggedConsumedSuffix')}
+                          ({' '}{tP('supExplain.peggedTotal')} <strong>{qtyFmt(Number(supExplainRow.totalPeggedQty))}</strong>{' '}):
+                        </p>
+                        {/* Filters */}
+                        <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.4rem' }}>
+                          <input
+                            type="text"
+                            placeholder="Filter demand…"
+                            value={peggedDemandFilter}
+                            onChange={(e) => setPeggedDemandFilter(e.target.value)}
+                            style={{ flex: 1, fontSize: '0.75rem', padding: '2px 6px', background: '#27272a', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 3, minWidth: 0 }}
+                          />
+                          <input
+                            type="text"
+                            placeholder="Filter customer…"
+                            value={peggedCustomerFilter}
+                            onChange={(e) => setPeggedCustomerFilter(e.target.value)}
+                            style={{ flex: 1, fontSize: '0.75rem', padding: '2px 6px', background: '#27272a', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 3, minWidth: 0 }}
+                          />
+                        </div>
+                        <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
+                          <colgroup>
+                            <col style={{ width: '22%' }} />
+                            <col style={{ width: '18%' }} />
+                            <col style={{ width: '13%' }} />
+                            <col style={{ width: '11%' }} />
+                            <col style={{ width: '12%' }} />
+                            <col style={{ width: '12%' }} />
+                            <col style={{ width: '12%' }} />
+                          </colgroup>
+                          <thead>
+                            <tr style={{ textAlign: 'left' }}>
+                              <th style={{ paddingBottom: '0.2rem' }}><button type="button" style={thBtn} onClick={() => toggleSort('demand')}>{tP('supExplain.peggedColDemand')}{sortIndicator('demand')}</button></th>
+                              <th style={{ paddingBottom: '0.2rem' }}><button type="button" style={thBtn} onClick={() => toggleSort('customer')}>{tP('supExplain.peggedColCustomer')}{sortIndicator('customer')}</button></th>
+                              <th style={{ paddingBottom: '0.2rem', color: '#a1a1aa' }}>{tP('supExplain.peggedColPath')}</th>
+                              <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}><button type="button" style={{ ...thBtn, width: '100%', textAlign: 'right' }} onClick={() => toggleSort('requested')}>{tP('supExplain.peggedColRequested')}{sortIndicator('requested')}</button></th>
+                              <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}><button type="button" style={{ ...thBtn, width: '100%', textAlign: 'right' }} onClick={() => toggleSort('allocated')}>{tP('supExplain.peggedColAllocated')}{sortIndicator('allocated')}</button></th>
+                              <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}><button type="button" style={{ ...thBtn, width: '100%', textAlign: 'right' }} onClick={() => toggleSort('consumed')}>{tP('supExplain.peggedColQty')}{sortIndicator('consumed')}</button></th>
+                              <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}><button type="button" style={{ ...thBtn, width: '100%', textAlign: 'right' }} onClick={() => toggleSort('share')}>{tP('supExplain.peggedColShare')}{sortIndicator('share')}</button></th>
                             </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                    <p style={{ margin: '0.4rem 0 0', fontSize: '0.75rem', color: '#71717a', lineHeight: 1.5 }}>
-                      {tP('supExplain.peggedShareNote')}
-                    </p>
-                  </>
+                          </thead>
+                          <tbody>
+                            {sorted.map(({ d, demandRow, demandKey, groupLabel, requestedQty, consumedQty, share, allocQty }, i) => (
+                              <tr key={`${d.demandId}-${i}`} style={{ borderTop: '1px solid #3d3d40' }}>
+                                <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {demandRow && demandKey ? (
+                                    <button
+                                      type="button"
+                                      className="secondary"
+                                      style={{ fontSize: '0.74rem', padding: '1px 6px', fontFamily: 'monospace' }}
+                                      title={tP('supExplain.openDemandPegging')}
+                                      onClick={() => {
+                                        setPreviousSupExplainRow(supExplainRow);
+                                        setPlanPeggingContext({ type: 'demand', row: demandRow });
+                                        setPlanPeggingOpen(true);
+                                        setWoPeggingRowKey(demandKey);
+                                        setSupExplainOpen(false);
+                                        setSupExplainKey(null);
+                                        setSupExplainRow(null);
+                                      }}
+                                    >{d.demandId}</button>
+                                  ) : (
+                                    <span>{d.demandId}</span>
+                                  )}
+                                </td>
+                                <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', color: '#a1a1aa', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.customer ?? '–'}</td>
+                                <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '0.74rem' }}>
+                                  {groupLabel ? (
+                                    <span style={{ color: '#67e8f9' }} title={`via consolidation group ${groupLabel}`}>{groupLabel}</span>
+                                  ) : (
+                                    <span style={{ color: '#a1a1aa', fontStyle: 'italic' }} title="Direct main-loop / passthrough consumption (no consolidation split)">{tP('supExplain.peggedPathDirect')}</span>
+                                  )}
+                                </td>
+                                <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right', color: '#a1a1aa' }}>{requestedQty != null ? qtyFmt(requestedQty) : '–'}</td>
+                                <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right', color: '#c4b5fd' }}>{allocQty > 0 ? qtyFmt(allocQty) : '–'}</td>
+                                <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right' }}>{qtyFmt(consumedQty)}</td>
+                                <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right', color: '#a1a1aa' }}>{share.toFixed(1)}%</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                          <tfoot>
+                            <tr style={{ borderTop: '2px solid #52525b', color: '#e4e4e7', fontWeight: 600 }}>
+                              <td style={{ padding: '0.25rem 0.4rem 0.1rem 0' }} colSpan={3}>
+                                {filtered.length < enriched.length
+                                  ? <span style={{ fontSize: '0.74rem', color: '#a1a1aa' }}>{filtered.length} / {enriched.length}</span>
+                                  : <span style={{ fontSize: '0.74rem', color: '#71717a' }}>{enriched.length} rows</span>}
+                              </td>
+                              <td style={{ padding: '0.25rem 0 0.1rem 0.4rem', textAlign: 'right' }}>{sumRequested > 0 ? qtyFmt(sumRequested) : '–'}</td>
+                              <td style={{ padding: '0.25rem 0 0.1rem 0.4rem', textAlign: 'right', color: '#c4b5fd' }}>{sumAllocated > 0 ? qtyFmt(sumAllocated) : '–'}</td>
+                              <td style={{ padding: '0.25rem 0 0.1rem 0.4rem', textAlign: 'right' }}>{qtyFmt(sumConsumed)}</td>
+                              <td />
+                            </tr>
+                          </tfoot>
+                        </table>
+                        <p style={{ margin: '0.4rem 0 0', fontSize: '0.75rem', color: '#71717a', lineHeight: 1.5 }}>
+                          {tP('supExplain.peggedShareNote')}
+                        </p>
+                      </>
+                    );
+                  })()
                 )}
               </section>
               {/* CONSOLIDATION SPLIT sections were collapsed into the Pegged Demands table
@@ -10355,7 +10644,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 const entry = matchingEntries.length > 0 ? matchingEntries[matchingEntries.length - 1] : undefined;
                 tree = entry?.tree ?? null;
                 if (!tree) {
-                  return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>No pegging tree for this demand. Re-run plan to get planning_pegging.</p>;
+                  const cacheState = demandPeggingCache[demandIdNorm];
+                  if (cacheState === 'loading') return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>Loading pegging tree…</p>;
+                  if (cacheState === 'error') return <p style={{ color: '#f87171', fontSize: '0.9rem' }}>Failed to load pegging tree for this demand.</p>;
+                  return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>Loading pegging tree…</p>;
                 }
               }
 
