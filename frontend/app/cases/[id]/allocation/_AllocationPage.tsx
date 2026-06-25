@@ -436,10 +436,10 @@ export function AllocationPage() {
           {generating ? 'Generating…' : 'Generate'}
         </button>
         <button style={btnStyle()} onClick={() => importRef.current?.click()} disabled={importLoading}>
-          {importLoading ? 'Importing…' : 'Import CSV'}
+          {importLoading ? 'Uploading…' : 'Upload CSV'}
         </button>
         <input ref={importRef} type="file" accept=".csv,text/csv" style={{ display: 'none' }} onChange={handleImport} />
-        <button style={btnStyle()} onClick={handleExport} disabled={rows.length === 0}>Export CSV</button>
+        <button style={btnStyle()} onClick={handleExport} disabled={rows.length === 0}>Download CSV</button>
         <button style={btnStyle('danger')} onClick={handleClear} disabled={clearing || rows.length === 0}>
           {clearing ? 'Clearing…' : 'Clear'}
         </button>
@@ -453,7 +453,7 @@ export function AllocationPage() {
 
       {rows.length === 0 ? (
         <div style={{ padding: '3rem 1rem', textAlign: 'center', color: '#52525b', fontSize: '0.875rem' }}>
-          No allocation map — click <strong style={{ color: '#93c5fd' }}>Generate</strong> to create one, or <strong style={{ color: '#93c5fd' }}>Import CSV</strong> to load one.
+          No allocation map — click <strong style={{ color: '#93c5fd' }}>Generate</strong> to create one, or <strong style={{ color: '#93c5fd' }}>Upload CSV</strong> to load one.
         </div>
       ) : (
         <>
