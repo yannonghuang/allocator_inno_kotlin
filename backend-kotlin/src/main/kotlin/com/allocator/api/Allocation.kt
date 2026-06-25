@@ -3,6 +3,7 @@ package com.allocator.api
 import com.allocator.CaseAllocations
 import com.allocator.Cases
 import com.allocator.Demands
+import com.allocator.PlanRuns
 import com.allocator.services.CaseLoader
 import com.allocator.services.buildAllocationBudgetRows
 import com.allocator.services.buildSupplyAllocation
@@ -136,9 +137,28 @@ fun Routing.allocationRoutes() {
                       else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrElse { JsonObject(emptyMap()) }
         val configJson = payload["config"]
         @Suppress("UNCHECKED_CAST")
-        val config: Map<String, Any?>? = if (configJson != null && configJson !is JsonNull)
+        val config: Map<String, Any?>? = if (configJson != null && configJson !is JsonNull) {
             runCatching { jsonElementToNative(configJson) as? Map<String, Any?> }.getOrNull()
-        else null
+        } else {
+            // No config in request body — load from the latest completed plan run for this case
+            // so purchasable_materials (and other settings) are applied consistently.
+            val latestConfigJson = transaction {
+                PlanRuns.select(PlanRuns.config)
+                    .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
+                    .orderBy(PlanRuns.id to SortOrder.DESC)
+                    .limit(1)
+                    .singleOrNull()
+                    ?.get(PlanRuns.config)
+            }
+            if (latestConfigJson != null) {
+                @Suppress("UNCHECKED_CAST")
+                runCatching {
+                    jsonElementToNative(Json.parseToJsonElement(latestConfigJson)) as? Map<String, Any?>
+                }.getOrNull().also {
+                    log.info("[allocation] using config from latest plan run for case {}", caseId)
+                }
+            } else null
+        }
 
         log.info("[allocation] generating allocation for case {}: {} demands, {} supplies", caseId, demands.size, supplies.size)
         val result  = buildSupplyAllocation(demands, data, config)
