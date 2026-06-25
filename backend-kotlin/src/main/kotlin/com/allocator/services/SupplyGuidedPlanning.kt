@@ -114,14 +114,21 @@ internal fun buildSupplyAllocation(
         )
     }
 
-    // Critical-materials filter: caps only on non-purchasable materials.
-    // Open-world semantics: absent from allocation map ⇒ uncapped in planning.
+    // Critical-materials filter:
+    //   Step A — restrict to raw-buyable materials: products that appear in method_buy AND
+    //            have prod_area='raw' in productlocation.  Make-only, WIP, and OB items
+    //            are excluded entirely — they are not "Purchase allowed" candidates.
+    //   Step B — from those candidates, keep only the UNSELECTED ones: products NOT in
+    //            purchasable_materials config (the user's "Purchase allowed" selection).
+    //   Open-world semantics: absent from allocation map ⇒ uncapped in planning.
+    val rawBuyableIds  = buildRawBuyableSet(data)
+    val candidateMatrix = filterToProductIds(requestMatrix, rawBuyableIds)
     val purchasable    = effectivePurchasableSet(config, data)
-    val criticalMatrix = if (purchasable == null) requestMatrix
-                         else filterToCritical(requestMatrix, purchasable)
+    val criticalMatrix = if (purchasable == null) candidateMatrix
+                         else filterToCritical(candidateMatrix, purchasable)
     log.info(
-        "[supply-guided] critical matrix: {} supply columns (non-purchasable) of {} total",
-        criticalMatrix.byColumn.size, requestMatrix.byColumn.size,
+        "[supply-guided] critical matrix: {} supply columns (raw-buyable unselected) of {} raw-buyable of {} total",
+        criticalMatrix.byColumn.size, candidateMatrix.byColumn.size, requestMatrix.byColumn.size,
     )
 
     // Step 2 — supply allocation: split each lot proportionally among competing demands.
@@ -713,6 +720,33 @@ private fun extractLotDrawsFromPegging(
 
 private fun filterToCritical(matrix: NeedsMatrix, purchasable: Set<String>): NeedsMatrix {
     val newByColumn = matrix.byColumn.filterKeys { it.productId !in purchasable }
+    if (newByColumn.isEmpty()) return NeedsMatrix(emptyMap(), emptyMap())
+    val newByRow = mutableMapOf<Any?, MutableMap<SupplyKey, Double>>()
+    for ((sk, demandNeeds) in newByColumn) {
+        for ((demandId, qty) in demandNeeds) {
+            newByRow.getOrPut(demandId) { mutableMapOf() }[sk] = qty
+        }
+    }
+    return NeedsMatrix(newByRow, newByColumn)
+}
+
+/** Returns the set of product_ids that are raw-buyable: have at least one method_buy entry
+ *  AND have prod_area='raw' in productlocation.  These are the only materials that can appear
+ *  in the "Purchase allowed" config and therefore the only ones that belong in the allocation map. */
+private fun buildRawBuyableSet(data: Map<String, List<Map<String, Any?>>>): Set<String> {
+    val rawIds = (data["productlocation"] ?: emptyList())
+        .filter { (it["prod_area"] as? String)?.trim() == "raw" }
+        .mapNotNull { (it["product_id"] as? String)?.trim() }
+        .toHashSet()
+    return (data["method_buy"] ?: emptyList())
+        .mapNotNull { (it["product_id"] as? String)?.trim() }
+        .filter { it.isNotEmpty() && it in rawIds }
+        .toSet()
+}
+
+/** Keeps only supply columns whose productId is in [productIds]; rebuilds byRow accordingly. */
+private fun filterToProductIds(matrix: NeedsMatrix, productIds: Set<String>): NeedsMatrix {
+    val newByColumn = matrix.byColumn.filterKeys { it.productId in productIds }
     if (newByColumn.isEmpty()) return NeedsMatrix(emptyMap(), emptyMap())
     val newByRow = mutableMapOf<Any?, MutableMap<SupplyKey, Double>>()
     for ((sk, demandNeeds) in newByColumn) {
