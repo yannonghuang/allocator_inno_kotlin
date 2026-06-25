@@ -306,6 +306,17 @@ object PlanSupplyAllocations : Table("plan_supply_allocation") {
     override val primaryKey = PrimaryKey(id)
 }
 
+/** Standalone allocation map for a case — independent of any plan run lifecycle. */
+object CaseAllocations : Table("case_allocation") {
+    val id           = integer("id").autoIncrement()
+    val caseId       = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val supplyId     = varchar("supply_id", 255)
+    val demandId     = varchar("demand_id", 255).nullable()
+    val qtyAllocated = double("qty_allocated")
+    override val primaryKey = PrimaryKey(id)
+    init { index("ix_case_allocation_case", false, caseId) }
+}
+
 /** Persisted material impact assessment results (rating + LLM explanation per supply change). */
 object MaterialImpactAssessments : Table("material_impact_assessment") {
     val id                  = integer("id").autoIncrement()

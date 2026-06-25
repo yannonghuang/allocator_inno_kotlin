@@ -676,6 +676,30 @@ internal fun purchasableSet(config: Map<String, Any?>?): Set<String>? {
 }
 
 /**
+ * Partitions all method_buy products into (rawBuyables, nonRawBuyables) by checking
+ * productlocation.prod_area.  Shared by [effectivePurchasableSet] and [buildRawBuyableSet]
+ * so the rawIds scan over productlocation is done exactly once per callsite.
+ *
+ * @return Pair(rawBuyables, nonRawBuyables)
+ *   rawBuyables    — products with method_buy AND prod_area='raw'  (the "Purchase allowed" candidates)
+ *   nonRawBuyables — products with method_buy AND prod_area≠'raw'  (purchased sub-assemblies, etc.)
+ */
+internal fun partitionBuyables(data: Map<String, List<Map<String, Any?>>>): Pair<Set<String>, Set<String>> {
+    val rawIds = (data["productlocation"] ?: emptyList())
+        .filter { (it["prod_area"] as? String)?.trim() == "raw" }
+        .mapNotNull { (it["product_id"] as? String)?.trim() }
+        .toHashSet()
+    val rawBuyables    = mutableSetOf<String>()
+    val nonRawBuyables = mutableSetOf<String>()
+    for (row in (data["method_buy"] ?: emptyList())) {
+        val pid = (row["product_id"] as? String)?.trim() ?: continue
+        if (pid.isEmpty()) continue
+        if (pid in rawIds) rawBuyables.add(pid) else nonRawBuyables.add(pid)
+    }
+    return rawBuyables to nonRawBuyables
+}
+
+/**
  * The effective buy-whitelist actually applied by the planner. The user-facing
  * `purchasable_materials` list controls RAW-material purchases ONLY — the picker enumerates
  * raw materials (productlocation.prod_area='raw' with a method_buy). Some buyable products
@@ -690,13 +714,7 @@ internal fun effectivePurchasableSet(
     data: Map<String, List<Map<String, Any?>>>,
 ): Set<String>? {
     val base = purchasableSet(config) ?: return null
-    val rawIds = (data["productlocation"] ?: emptyList())
-        .filter { (it["prod_area"] as? String)?.trim() == "raw" }
-        .mapNotNull { (it["product_id"] as? String)?.trim() }
-        .toHashSet()
-    val nonRawBuyables = (data["method_buy"] ?: emptyList())
-        .mapNotNull { (it["product_id"] as? String)?.trim() }
-        .filter { it.isNotEmpty() && it !in rawIds }
+    val (_, nonRawBuyables) = partitionBuyables(data)
     return base + nonRawBuyables
 }
 
@@ -4687,6 +4705,8 @@ fun runPlanning(
     data: Map<String, List<Map<String, Any?>>>,
     config: Map<String, Any?>? = null,
     progressCallback: ((Map<String, Any?>) -> Unit)? = null,
+    /** Pre-computed case-level allocation budgets (demandId → lotKey → qty). When non-null, overrides the internal SupplyAllocator step while keeping the BOM graph computed fresh. */
+    precomputedBudgets: Map<Any?, MutableMap<String, Double>>? = null,
 ): RunPlanningResult {
     val inventory: MutableList<MutableMap<String, Any?>> = (data["supply"] ?: emptyList()).map { s ->
         mutableMapOf(
@@ -4774,7 +4794,13 @@ fun runPlanning(
     // Supply-guided takes priority over legacy consolidation when enabled.
     if (supplyGuidedConfig.enabled) {
         // Step 1+2: pure allocation — BOM reachability walk + proportional supply split.
-        val sgAllocation = buildSupplyAllocation(demands, data, config)
+        val sgAllocationBase = buildSupplyAllocation(demands, data, config)
+        val sgAllocation = if (precomputedBudgets != null) {
+            log.info("[supply-guided] using case_allocation override: {} demand budget entries", precomputedBudgets.size)
+            sgAllocationBase.copy(perLotBudgets = precomputedBudgets)
+        } else {
+            sgAllocationBase
+        }
         // Step 2b: sketch phase — one read-only BOM walk that both computes achievable caps
         // AND pre-selects the first-feasible BOM method per node per demand.
         // Replaces computeAchievableQtyMaps; eliminates getPreferredMethodCascade overhead
