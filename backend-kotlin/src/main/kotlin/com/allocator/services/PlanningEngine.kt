@@ -4677,8 +4677,6 @@ data class RunPlanningResult(
      * Empty when consolidation is disabled.
      */
     val producedByComponent: Map<String, Double> = emptyMap(),
-    /** Flattened (supply_id, demand_id?, qty_allocated) rows from the SupplyAllocator step. Empty when supply-guided is disabled. Used to seed case_allocation after a plan run. */
-    val allocationBudgetRows: List<Triple<String, String?, Double>> = emptyList(),
 )
 
 /**
@@ -4689,6 +4687,8 @@ fun runPlanning(
     data: Map<String, List<Map<String, Any?>>>,
     config: Map<String, Any?>? = null,
     progressCallback: ((Map<String, Any?>) -> Unit)? = null,
+    /** Pre-computed case-level allocation budgets (demandId → lotKey → qty). When non-null, overrides the internal SupplyAllocator step while keeping the BOM graph computed fresh. */
+    precomputedBudgets: Map<Any?, MutableMap<String, Double>>? = null,
 ): RunPlanningResult {
     val inventory: MutableList<MutableMap<String, Any?>> = (data["supply"] ?: emptyList()).map { s ->
         mutableMapOf(
@@ -4772,14 +4772,17 @@ fun runPlanning(
     // The supply-level orchestrator (consolidation.scope="all") was retired
     // in 2026-05; only the leaf-level fixed-point pipeline remains.
     val supplyLevelAllocations: List<Map<String, Any?>> = emptyList()
-    var allocationBudgetRows: List<Triple<String, String?, Double>> = emptyList()
     val supplyGuidedConfig = parseSupplyGuidedConfig(config)
     // Supply-guided takes priority over legacy consolidation when enabled.
     if (supplyGuidedConfig.enabled) {
         // Step 1+2: pure allocation — BOM reachability walk + proportional supply split.
-        val sgAllocation = buildSupplyAllocation(demands, data, config)
-        // Capture computed budgets to seed case_allocation after the run (Allocation module display).
-        allocationBudgetRows = com.allocator.services.buildAllocationBudgetRows(sgAllocation.perLotBudgets)
+        val sgAllocationBase = buildSupplyAllocation(demands, data, config)
+        val sgAllocation = if (precomputedBudgets != null) {
+            log.info("[supply-guided] using case_allocation override: {} demand budget entries", precomputedBudgets.size)
+            sgAllocationBase.copy(perLotBudgets = precomputedBudgets)
+        } else {
+            sgAllocationBase
+        }
         // Step 2b: sketch phase — one read-only BOM walk that both computes achievable caps
         // AND pre-selects the first-feasible BOM method per node per demand.
         // Replaces computeAchievableQtyMaps; eliminates getPreferredMethodCascade overhead
@@ -5096,7 +5099,6 @@ fun runPlanning(
         inventoryEffectiveInitial = inventoryEffectiveInitial,
         inventoryLeftover = inventory.map { it.toMap() },
         producedByComponent = producedByComponent,
-        allocationBudgetRows = allocationBudgetRows,
     )
 }
 

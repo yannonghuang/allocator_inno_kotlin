@@ -2464,22 +2464,13 @@ internal suspend fun runPlanBackground(
             }
         }
 
-        val raw = runPlanning(data, config = config, progressCallback = progressCb)
+        val caseAllocRows = loadCaseAllocRows(caseId)
+        val precomputedBudgets = if (caseAllocRows != null) {
+            log.info("[plan] case {} has {} case_allocation rows — using as budget override", caseId, caseAllocRows.size)
+            buildBudgetsFromCaseAlloc(caseAllocRows, data["supply"] ?: emptyList())
+        } else null
+        val raw = runPlanning(data, config = config, progressCallback = progressCb, precomputedBudgets = precomputedBudgets)
         log.info("[plan] runPlanning done for run {}", planRunId)
-        // Always refresh case_allocation with freshly computed budgets so the Allocation
-        // module always reflects what this plan run used.
-        if (raw.allocationBudgetRows.isNotEmpty()) {
-            transaction {
-                CaseAllocations.deleteWhere { CaseAllocations.caseId eq caseId }
-                CaseAllocations.batchInsert(raw.allocationBudgetRows) { (sid, did, qty) ->
-                    this[CaseAllocations.caseId]       = caseId
-                    this[CaseAllocations.supplyId]     = sid
-                    this[CaseAllocations.demandId]     = did
-                    this[CaseAllocations.qtyAllocated] = qty
-                }
-            }
-            log.info("[plan] refreshed case_allocation with {} rows for case {}", raw.allocationBudgetRows.size, caseId)
-        }
         // Hint GC to collect planning intermediates (reconciledTrees, workingTrees, nodeLevelWos,
         // etc.) that went out of scope when runPlanning returned, freeing headroom for enrichment.
         @Suppress("ExplicitGarbageCollectionCall")
