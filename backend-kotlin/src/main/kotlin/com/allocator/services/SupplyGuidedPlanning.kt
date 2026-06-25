@@ -251,13 +251,26 @@ internal fun buildSupplyAllocation(
     )
 }
 
-/** Flatten perLotBudgets to (supplyId, demandId?, qty) triples for DB persistence.
- *  Only emits lot-level keys ("pid|lid|sid"); aggregate ("pid|lid") keys are skipped. */
-internal fun buildAllocationBudgetRows(perLotBudgets: Map<Any?, MutableMap<String, Double>>): List<Triple<String, String?, Double>> {
+/**
+ * Flatten perLotBudgets to (supplyId, demandId?, qty) triples for DB persistence.
+ * Only emits lot-level keys ("pid|lid|sid") for supply keys where total supply < total demand —
+ * i.e. genuinely constraining (critical) materials. Non-constraining supplies are excluded
+ * because their allocation is trivially full and not useful to store or display.
+ */
+internal fun buildAllocationBudgetRows(allocation: SupplyAllocationResult): List<Triple<String, String?, Double>> {
+    // Build the set of aggregate keys ("pid|lid") for truly constrained supplies.
+    val constrainedAggKeys = allocation.criticalMatrix.byColumn.keys.filter { sk ->
+        val totalSupply = allocation.supplyTotals[sk] ?: 0.0
+        val totalDemand = allocation.criticalMatrix.byColumn[sk]?.values?.sum() ?: 0.0
+        totalSupply < totalDemand
+    }.map { it.toString() }.toSet()
+
     val rows = mutableListOf<Triple<String, String?, Double>>()
-    for ((demandId, budgetMap) in perLotBudgets) {
+    for ((demandId, budgetMap) in allocation.perLotBudgets) {
         for ((key, qty) in budgetMap) {
             if (key.count { it == '|' } < 2) continue
+            val aggKey   = key.substringBeforeLast('|')
+            if (aggKey !in constrainedAggKeys) continue
             val supplyId = key.substringAfterLast('|')
             if (supplyId.isBlank() || qty <= 1e-12) continue
             rows.add(Triple(supplyId, demandId?.toString(), qty))

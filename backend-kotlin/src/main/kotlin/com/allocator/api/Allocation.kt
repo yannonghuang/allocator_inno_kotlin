@@ -4,6 +4,7 @@ import com.allocator.CaseAllocations
 import com.allocator.Cases
 import com.allocator.Demands
 import com.allocator.services.CaseLoader
+import com.allocator.services.buildAllocationBudgetRows
 import com.allocator.services.buildSupplyAllocation
 import io.ktor.http.*
 import io.ktor.server.application.*
@@ -140,22 +141,10 @@ fun Routing.allocationRoutes() {
         else null
 
         log.info("[allocation] generating allocation for case {}: {} demands, {} supplies", caseId, demands.size, supplies.size)
-        val result = buildSupplyAllocation(demands, data, config)
-
-        // Flatten perLotBudgets → (supply_id, demand_id, qty_allocated) rows.
-        // Only emit lot-level keys (contain a 3rd '|' segment), not aggregate "$pid|$lid" keys.
-        val newRows = mutableListOf<CaseAllocRow>()
-        for ((demandId, budgetMap) in result.perLotBudgets) {
-            for ((key, qty) in budgetMap) {
-                // Skip aggregate keys — they are sums of lot entries
-                val pipes = key.count { it == '|' }
-                if (pipes < 2) continue
-                val supplyId = key.substringAfterLast('|')
-                if (supplyId.isBlank() || qty <= 1e-12) continue
-                newRows.add(CaseAllocRow(supplyId, demandId?.toString(), qty))
-            }
-        }
-        log.info("[allocation] generated {} rows for case {}", newRows.size, caseId)
+        val result  = buildSupplyAllocation(demands, data, config)
+        val budgets = buildAllocationBudgetRows(result)
+        val newRows = budgets.map { (sid, did, qty) -> CaseAllocRow(sid, did, qty) }
+        log.info("[allocation] generated {} rows for case {} ({} critical supply lots)", newRows.size, caseId, newRows.map { it.supplyId }.distinct().size)
 
         transaction {
             CaseAllocations.deleteWhere { CaseAllocations.caseId eq caseId }
