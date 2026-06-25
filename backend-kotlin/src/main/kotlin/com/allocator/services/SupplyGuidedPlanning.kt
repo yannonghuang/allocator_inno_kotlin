@@ -730,19 +730,10 @@ private fun filterToCritical(matrix: NeedsMatrix, purchasable: Set<String>): Nee
     return NeedsMatrix(newByRow, newByColumn)
 }
 
-/** Returns the set of product_ids that are raw-buyable: have at least one method_buy entry
- *  AND have prod_area='raw' in productlocation.  These are the only materials that can appear
- *  in the "Purchase allowed" config and therefore the only ones that belong in the allocation map. */
-private fun buildRawBuyableSet(data: Map<String, List<Map<String, Any?>>>): Set<String> {
-    val rawIds = (data["productlocation"] ?: emptyList())
-        .filter { (it["prod_area"] as? String)?.trim() == "raw" }
-        .mapNotNull { (it["product_id"] as? String)?.trim() }
-        .toHashSet()
-    return (data["method_buy"] ?: emptyList())
-        .mapNotNull { (it["product_id"] as? String)?.trim() }
-        .filter { it.isNotEmpty() && it in rawIds }
-        .toSet()
-}
+/** Returns the set of product_ids that are raw-buyable ("Purchase allowed" candidates).
+ *  Delegates to [partitionBuyables] — same classification used by [effectivePurchasableSet]. */
+private fun buildRawBuyableSet(data: Map<String, List<Map<String, Any?>>>): Set<String> =
+    partitionBuyables(data).first
 
 /** Keeps only supply columns whose productId is in [productIds]; rebuilds byRow accordingly. */
 private fun filterToProductIds(matrix: NeedsMatrix, productIds: Set<String>): NeedsMatrix {
