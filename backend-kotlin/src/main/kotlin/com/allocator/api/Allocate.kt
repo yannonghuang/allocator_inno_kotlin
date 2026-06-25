@@ -2464,16 +2464,11 @@ internal suspend fun runPlanBackground(
             }
         }
 
-        val caseAllocRows = loadCaseAllocRows(caseId)
-        val precomputedBudgets = if (caseAllocRows != null) {
-            log.info("[plan] case {} has {} case_allocation rows — using as budget override", caseId, caseAllocRows.size)
-            buildBudgetsFromCaseAlloc(caseAllocRows, data["supply"] ?: emptyList())
-        } else null
-        val raw = runPlanning(data, config = config, progressCallback = progressCb, precomputedBudgets = precomputedBudgets)
+        val raw = runPlanning(data, config = config, progressCallback = progressCb)
         log.info("[plan] runPlanning done for run {}", planRunId)
-        // Seed case_allocation from computed budgets — only when no manual allocation was in use.
-        // This lets the Allocation module display what the planner actually used.
-        if (precomputedBudgets == null && raw.allocationBudgetRows.isNotEmpty()) {
+        // Always refresh case_allocation with freshly computed budgets so the Allocation
+        // module always reflects what this plan run used.
+        if (raw.allocationBudgetRows.isNotEmpty()) {
             transaction {
                 CaseAllocations.deleteWhere { CaseAllocations.caseId eq caseId }
                 CaseAllocations.batchInsert(raw.allocationBudgetRows) { (sid, did, qty) ->
@@ -2483,7 +2478,7 @@ internal suspend fun runPlanBackground(
                     this[CaseAllocations.qtyAllocated] = qty
                 }
             }
-            log.info("[plan] seeded case_allocation with {} rows for case {}", raw.allocationBudgetRows.size, caseId)
+            log.info("[plan] refreshed case_allocation with {} rows for case {}", raw.allocationBudgetRows.size, caseId)
         }
         // Hint GC to collect planning intermediates (reconciledTrees, workingTrees, nodeLevelWos,
         // etc.) that went out of scope when runPlanning returned, freeing headroom for enrichment.
