@@ -55,12 +55,24 @@ object KbStore {
      *  for runs not yet represented in kb_records (unsound, in-flight, etc.). */
     fun extractKpisFromResult(resultRaw: String?): JsonObject = extractKpis(resultRaw)
 
+    /** Extract headline KPIs from an already-extracted plan_kpis JSON fragment.
+     *  Used by the list endpoint which uses PostgreSQL server-side JSON extraction
+     *  to avoid loading the full result column (up to 50MB/run) into JVM memory. */
+    fun extractKpisFromPlanKpisJson(planKpisJson: String?): JsonObject =
+        extractKpisObject(planKpisJson?.let {
+            runCatching { json.parseToJsonElement(it).jsonObject }.getOrNull()
+        })
+
     /** Headline KPI snapshot extracted from a plan_run.result JSON tree. */
     private fun extractKpis(resultRaw: String?): JsonObject {
         if (resultRaw.isNullOrBlank()) return buildJsonObject { }
         val root = runCatching { json.parseToJsonElement(resultRaw).jsonObject }.getOrNull()
             ?: return buildJsonObject { }
-        val kpis = root["plan_kpis"] as? JsonObject ?: return buildJsonObject { }
+        return extractKpisObject(root["plan_kpis"] as? JsonObject)
+    }
+
+    private fun extractKpisObject(kpis: JsonObject?): JsonObject {
+        if (kpis == null) return buildJsonObject { }
         val delivery = kpis["delivery"] as? JsonObject
         val fairness = kpis["fairness"] as? JsonObject
         val mfg = kpis["manufacturing"] as? JsonObject

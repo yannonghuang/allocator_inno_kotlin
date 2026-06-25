@@ -685,6 +685,21 @@ export async function getPlanStatus(caseId: number, jobId: string): Promise<Plan
   return r.json();
 }
 
+export type PeggingSaveStatus = {
+  run_id: number;
+  chunks_done: number;
+  chunks_total: number;
+  pct: number;
+};
+
+/** Returns null when no background pegging save is in flight for this case. */
+export async function getPeggingSaveStatus(caseId: number): Promise<PeggingSaveStatus | null> {
+  const r = await fetch(`${API}/cases/${caseId}/plan/pegging-save-status`);
+  if (r.status === 204) return null;
+  if (!r.ok) return null;
+  return r.json();
+}
+
 export type PlanningCopilotMessage = {
   role: 'user' | 'assistant';
   text: string;

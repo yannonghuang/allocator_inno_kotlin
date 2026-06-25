@@ -40,6 +40,17 @@ internal val planJobs = ConcurrentHashMap<String, MutableMap<String, Any?>>()
 internal val casePlanResults = ConcurrentHashMap<Int, Map<String, Any>>()
 // jobId → plan_run.id for associating async jobs with persisted runs
 internal val planJobRunIds = ConcurrentHashMap<String, Int>()
+// Pegging transit cache: run_id → pegging entries held in memory while the background
+// savePlanPeggingRows coroutine is writing them to the DB (typically 10-20 min).
+// Pegging requests check here before hitting plan_pegging table so the user can
+// drill into demand/WO pegging immediately after a run completes.
+// Entries are removed once the DB save finishes (or on failure).
+internal val planPeggingTransit = ConcurrentHashMap<Int, List<Map<String, Any?>>>()
+
+// Live progress for each in-flight background pegging save.
+// runId → Triple(caseId, chunksDone, chunksTotal)
+// Used by the pegging-save-status endpoint so the frontend can show a progress bar.
+internal val peggingSaveInfo = ConcurrentHashMap<Int, Triple<Int, Int, Int>>()
 // Bootstrap (KB-seeding) job state. Each entry tracks an end-to-end multi-preset
 // sweep: the planner runs each preset sequentially, persists each as a new
 // plan_run with metadata.bootstrap=true, then triggers the soundness check.
@@ -625,6 +636,27 @@ fun Routing.allocateRoutes() {
         })
     }
 
+    // ── GET /cases/{case_id}/plan/pegging-save-status ────────────────────────
+    // Returns progress of the background pegging save for this case's latest run,
+    // or null if no save is in flight. Frontend polls this to show a progress bar.
+    get("/cases/{case_id}/plan/pegging-save-status") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val entry = peggingSaveInfo.entries.firstOrNull { (_, v) -> v.first == caseId }
+        if (entry == null) {
+            call.respond(io.ktor.http.HttpStatusCode.NoContent)
+        } else {
+            val (runId, info) = entry
+            val (_, chunksDone, chunksTotal) = info
+            call.respond(buildJsonObject {
+                put("run_id", JsonPrimitive(runId))
+                put("chunks_done", JsonPrimitive(chunksDone))
+                put("chunks_total", JsonPrimitive(chunksTotal))
+                put("pct", JsonPrimitive(if (chunksTotal > 0) (100.0 * chunksDone / chunksTotal).toInt() else 0))
+            })
+        }
+    }
+
     // ── GET /cases/{case_id}/plan/work-order-pegging ──────────────────────────
     get("/cases/{case_id}/plan/work-order-pegging") {
         val caseId = call.parameters["case_id"]?.toIntOrNull()
@@ -651,7 +683,12 @@ fun Routing.allocateRoutes() {
         }
 
         // Pegging is no longer kept in casePlanResults — load from plan_pegging table.
-        // For a specific run_id the run is known; for the latest run query plan_runs by case.
+        // Use PostgreSQL jsonb_path_query to extract only the matching WO node subtree
+        // directly in the DB. This avoids loading full 83-173MB VIRTUAL demand entries
+        // into the JVM (which caused exit-137 OOM kills).  Each returned row is one
+        // WO node (including its supply children) rather than a full demand tree.
+        // During the background pegging save (first 10-20 min after a run completes),
+        // we search planPeggingTransit (the full in-memory trees) directly.
         @Suppress("UNCHECKED_CAST")
         val planningPegging: List<Map<String, Any?>> = run {
             val mem = result["planning_pegging"] as? List<Map<String, Any?>>
@@ -662,7 +699,49 @@ fun Routing.allocateRoutes() {
                     .orderBy(PlanRuns.id, SortOrder.DESC)
                     .firstOrNull()?.get(PlanRuns.id)
             }
-            if (peggingRunId != null) loadPlanPeggingFromDb(peggingRunId) else emptyList()
+            if (peggingRunId == null) return@run emptyList()
+            val demandIdsRaw = call.request.queryParameters["demand_ids"] ?: ""
+            val neededIds: Set<String> = when {
+                demandId.isNotBlank() -> setOf(demandId)
+                else -> demandIdsRaw.split(",").map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+            }
+            if (neededIds.isEmpty()) return@run emptyList()
+            // Check in-transit cache first (populated while background pegging save runs).
+            // Transit entries are the raw enriched["planning_pegging"] maps, which already
+            // contain "demand_id" and "tree" keys — return them directly, no re-wrapping.
+            val transit = planPeggingTransit[peggingRunId]
+            if (transit != null) {
+                return@run transit.filter { it["demand_id"]?.toString() in neededIds }
+            }
+            // Build safe IN clause from system-generated demand IDs (single-quote escaped)
+            val idsLiteral = neededIds.joinToString(",") { "'${it.replace("'", "''")}'" }
+            // jsonpath: $. variables are resolved via the jsonb_build_object vars arg
+            val jpath = "\$.** ? (@.type == \"work_order\" && @.product_id == \$prod && @.location_id == \$loc && @.method == \$meth)"
+            transaction {
+                exec(
+                    "SELECT p.demand_id, jsonb_path_query(p.entry::jsonb, '$jpath'::jsonpath, " +
+                    "jsonb_build_object('prod', ?, 'loc', ?, 'meth', ?)) AS wo_node " +
+                    "FROM plan_pegging p " +
+                    "WHERE p.plan_run_id = ? AND p.demand_id IN ($idsLiteral)",
+                    args = listOf(
+                        Pair(org.jetbrains.exposed.sql.TextColumnType(), productId),
+                        Pair(org.jetbrains.exposed.sql.TextColumnType(), locationId),
+                        Pair(org.jetbrains.exposed.sql.TextColumnType(), method),
+                        Pair(org.jetbrains.exposed.sql.IntegerColumnType(), peggingRunId),
+                    )
+                ) { rs ->
+                    val out = mutableListOf<Map<String, Any?>>()
+                    while (rs.next()) {
+                        val dId = rs.getString("demand_id")
+                        val nodeJson = rs.getString("wo_node") ?: continue
+                        val node = runCatching {
+                            jsonToAny(Json.parseToJsonElement(nodeJson)) as? Map<String, Any?>
+                        }.getOrNull() ?: continue
+                        out.add(mapOf("demand_id" to dId, "tree" to node))
+                    }
+                    out
+                } ?: emptyList()
+            }
         }
 
         // A demand can have multiple pegging trees (one per component group when consolidation is on).
@@ -843,29 +922,23 @@ fun Routing.allocateRoutes() {
             val activeRunId = com.allocator.services.resolveActiveRunId(designatedId, successIds)
             val idStatusPairs = rows.map { it[PlanRuns.id] to it[PlanRuns.status] }
             val initialRunId = com.allocator.services.resolveInitialRunId(idStatusPairs)
-            // Pre-load KB snapshots for this case so each row can pick up its
-            // KPIs in O(1). KB rows are keyed by config signature; fall back
-            // to parsing plan_run.result directly when no KB row exists yet
-            // (e.g. unsound or in-flight runs that didn't backfill).
-            val kbBySig: Map<String, com.allocator.services.KbStore.KbRecord> =
-                com.allocator.services.KbStore.listForCase(caseId)
-            // Compute config signatures once; identify rows that need a
-            // fallback `result` fetch and lazy-load only those.
-            val sigByRunId: Map<Int, String?> = rows.associate { row ->
-                val cfg = row[PlanRuns.config]?.let { raw ->
-                    runCatching { Json.parseToJsonElement(raw).jsonObject }.getOrNull()
-                }
-                row[PlanRuns.id] to cfg?.let { com.allocator.services.CaseBootstrap.signatureFor(it) }
+            // Extract per-run KPIs using PostgreSQL server-side JSON extraction so we never
+            // load the full result column (up to ~50MB/run) into JVM memory.  Using KB
+            // records here was wrong: KB is keyed by config signature, so all runs sharing
+            // the same config showed the LATEST run's KPIs instead of each run's own values.
+            val runIdsWithResult = rows.filter { it[PlanRuns.status] == "success" }.map { it[PlanRuns.id] }
+            val kpisByRunId: Map<Int, JsonObject> = if (runIdsWithResult.isEmpty()) emptyMap() else {
+                val ids = runIdsWithResult.joinToString(",")
+                exec("SELECT id, result::jsonb->'plan_kpis' AS plan_kpis FROM plan_run WHERE id IN ($ids) AND result IS NOT NULL") { rs ->
+                    val m = mutableMapOf<Int, JsonObject>()
+                    while (rs.next()) {
+                        val kpisJson = rs.getString("plan_kpis")
+                        if (kpisJson != null)
+                            m[rs.getInt("id")] = com.allocator.services.KbStore.extractKpisFromPlanKpisJson(kpisJson)
+                    }
+                    m
+                } ?: emptyMap()
             }
-            val needsFallbackIds = rows.mapNotNull { row ->
-                val rid = row[PlanRuns.id]
-                val sig = sigByRunId[rid]
-                if (sig == null || sig !in kbBySig) rid else null
-            }
-            val resultByRunId: Map<Int, String?> = if (needsFallbackIds.isEmpty()) emptyMap()
-                else PlanRuns.select(listOf(PlanRuns.id, PlanRuns.result))
-                    .where { PlanRuns.id inList needsFallbackIds }
-                    .associate { it[PlanRuns.id] to it[PlanRuns.result] }
             rows.map { row ->
                 val snapshot = row[PlanRuns.overrideSnapshot]
                 val parsedSnapshot = snapshot?.let { runCatching { Json.parseToJsonElement(it) as? JsonArray }.getOrNull() }
@@ -876,15 +949,8 @@ fun Routing.allocateRoutes() {
                 val finishedInstant = row[PlanRuns.finishedAt]
                 val chosenDepth = row[PlanRuns.chosenDepth]
                 val attempts = parseAttempts(row[PlanRuns.attempts])
-                // KPI snapshot lookup: prefer the KB row (already extracted +
-                // cached) when present; otherwise compute on-the-fly from the
-                // run's stored result so unsound / in-flight runs still get
-                // KPI columns in the run-history view.
                 val configRaw = row[PlanRuns.config]
-                val configSig = sigByRunId[runId]
-                val kpis: JsonObject = configSig?.let { sig -> kbBySig[sig] }?.let { kb ->
-                    runCatching { Json.parseToJsonElement(kb.kpisSnapshotJson).jsonObject }.getOrNull()
-                } ?: com.allocator.services.KbStore.extractKpisFromResult(resultByRunId[runId])
+                val kpis: JsonObject = kpisByRunId[runId] ?: buildJsonObject {}
                 fun n(k: String): Double? = kpis[k]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
                 fun i(k: String): Int? = kpis[k]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
                 PlanRunResponse(
@@ -1111,6 +1177,15 @@ fun Routing.allocateRoutes() {
             ?: throw IllegalArgumentException("Invalid run_id")
         val demandId = call.parameters["demand_id"]
             ?: throw IllegalArgumentException("Invalid demand_id")
+        // Check in-transit cache first (populated while background pegging save is in progress).
+        val transitEntries = planPeggingTransit[runId]
+        val transitEntry = transitEntries?.firstOrNull { it["demand_id"] == demandId }
+        if (transitEntry != null) {
+            val sb = StringBuilder()
+            anyToJsonString(transitEntry, sb)
+            call.respondText(sb.toString(), contentType = io.ktor.http.ContentType.Application.Json)
+            return@get
+        }
         val entry = transaction {
             PlanPegging.selectAll()
                 .where { (PlanPegging.planRunId eq runId) and (PlanPegging.demandId eq demandId) }
@@ -1660,11 +1735,12 @@ private const val PEGGING_CHUNK_SIZE = 5
 // Called OUTSIDE the main save transaction so a pegging failure never rolls back the committed
 // plan result.  Manages its own transactions internally.
 @Suppress("UNCHECKED_CAST")
-private fun savePlanPeggingRows(runId: Int, enriched: Map<String, Any?>) {
+private fun savePlanPeggingRows(runId: Int, enriched: Map<String, Any?>, caseId: Int = 0) {
     val entries = (enriched["planning_pegging"] as? List<Map<String, Any?>>).orEmpty()
     if (entries.isEmpty()) return
     val totalChunks = (entries.size + PEGGING_CHUNK_SIZE - 1) / PEGGING_CHUNK_SIZE
     log.info("[plan] savePlanPeggingRows start: entries={} chunks={} run={}", entries.size, totalChunks, runId)
+    if (caseId != 0) peggingSaveInfo[runId] = Triple(caseId, 0, totalChunks)
     transaction { PlanPegging.deleteWhere { PlanPegging.planRunId eq runId } }
     entries.chunked(PEGGING_CHUNK_SIZE).forEachIndexed { idx, chunk ->
         log.info("[plan] Pegging chunk {}/{} serializing run={}", idx + 1, totalChunks, runId)
@@ -1681,6 +1757,7 @@ private fun savePlanPeggingRows(runId: Int, enriched: Map<String, Any?>) {
                 this[PlanPegging.entry] = json
             }
         }
+        if (caseId != 0) peggingSaveInfo[runId] = Triple(caseId, idx + 1, totalChunks)
         log.info("[plan] Pegging chunk {}/{} done run={}", idx + 1, totalChunks, runId)
     }
 }
@@ -2124,20 +2201,16 @@ private fun planKpis(
     val consumptionRate = if (initialTotal > 0) consumedTotal / initialTotal else null
 
     fun methodStats(methodVal: String): Map<String, Any?> {
+        // Each row in work_orders has a unique wo_group_id — count rows directly.
+        // No deduplication by product+location and no pegging-flag gate so the KPI
+        // matches the count shown in the work orders table (which groups by wo_group_id).
         val wos = workOrders.filter { wo ->
-            (wo["method"] as? String ?: "").trim().lowercase() == methodVal &&
-            when (methodVal) {
-                "make" -> wo["pegging_includes_real_make"] == true
-                "move" -> wo["pegging_includes_real_move"] == true
-                else -> true
-            }
+            (wo["method"] as? String ?: "").trim().lowercase() == methodVal
         }
-        val seen = mutableMapOf<String, Double>()
-        for (wo in wos) {
-            val key = "${wo["demand_id"]}|${wo["product_id"]}|${wo["location_id"]}|${wo["method"]}"
-            seen[key] = (seen[key] ?: 0.0) + (wo["quantity"] as? Number ?: 0).toDouble()
-        }
-        return mapOf("order_count" to seen.size, "total_quantity" to roundQty(seen.values.sum()))
+        return mapOf(
+            "order_count" to wos.size,
+            "total_quantity" to roundQty(wos.sumOf { (it["quantity"] as? Number ?: 0).toDouble() })
+        )
     }
 
     // Fairness — distribution of fill ratios across demands. Aggregate fill_rate_pct
@@ -2394,24 +2467,25 @@ internal suspend fun runPlanBackground(
         val raw = runPlanning(data, config = config, progressCallback = progressCb)
         log.info("[plan] runPlanning done for run {}", planRunId)
         // Hint GC to collect planning intermediates (reconciledTrees, workingTrees, nodeLevelWos,
-        // etc.) that went out of scope when runPlanning returned, freeing headroom before we
-        // serialize the 200 pegging trees.
+        // etc.) that went out of scope when runPlanning returned, freeing headroom for enrichment.
         @Suppress("ExplicitGarbageCollectionCall")
         System.gc()
-        // Persist pegging before enrichment — serializing 200 trees while raw.output is the only
-        // large structure in memory avoids the GC pressure that occurs if we wait until after
-        // enrichPlanResultWithData has also allocated enriched WO copies.
-        runCatching { savePlanPeggingRows(planRunId, raw.output) }
-            .onSuccess { log.info("[plan] Pegging persisted for run {}", planRunId) }
-            .onFailure { e -> log.warn("[plan] Pegging persist failed for run {}: {}", planRunId, e.message) }
         val enriched = enrichPlanResultWithData(caseId, raw.output, data)
         log.info("[plan] enrichPlanResultWithData done for run {}", planRunId)
-        // Strip pegging from the in-memory cache — pegging trees for 200+ demands are
-        // too large to keep live indefinitely. Pegging is served from plan_pegging table.
+
+        // Cache pegging in the transit map so pegging requests can be served from memory
+        // while the background DB save is in progress (typically 10-20 min for 200 trees).
+        @Suppress("UNCHECKED_CAST")
+        val peggingEntries = (enriched["planning_pegging"] as? List<Map<String, Any?>>).orEmpty()
+        if (peggingEntries.isNotEmpty()) planPeggingTransit[planRunId] = peggingEntries
+
+        // Strip pegging from the per-case in-memory cache — pegging trees for 200+ demands
+        // are too large to keep indefinitely. Requests fall back to planPeggingTransit
+        // (during save) or the plan_pegging table (after save completes).
         casePlanResults[caseId] = enriched - "planning_pegging"
 
         // For auto-save runs: persist result + allocations, then immediately surface
-        // "completed" to the frontend. KB upsert is fire-and-forget (non-fatal, can be slow).
+        // "completed" to the frontend. Pegging and KB upsert are fire-and-forget.
         val resultJson = if (autoSave) serializeResultOrNull(enriched) else null
         val serializeFailed = autoSave && resultJson == null
         transaction {
@@ -2445,12 +2519,31 @@ internal suspend fun runPlanBackground(
             }
         }
 
-        // Surface completion to the frontend. Pegging is already in plan_pegging table
-        // (written synchronously above). Strip from job result to prevent OOM in anyToJson.
+        // Surface completion to the frontend immediately — pegging save runs in background.
         planJobs[jobId]?.let { job ->
             job["status"] = "completed"
             job["result"] = enriched - "planning_pegging"
             job["progress"] = mapOf("current" to total, "total" to total)
+        }
+
+        // Persist pegging in background — serializing 1.9GB of trees to the DB takes
+        // 10-20 min and should not block the run from appearing as "success".
+        // Pegging is served from planPeggingTransit until the save finishes.
+        // peggingSaveInfo tracks chunk progress so the frontend can show a progress bar.
+        if (peggingEntries.isNotEmpty()) {
+            engineScope.launch {
+                runCatching { savePlanPeggingRows(planRunId, enriched, caseId) }
+                    .onSuccess {
+                        log.info("[plan] Pegging persisted for run {}", planRunId)
+                        planPeggingTransit.remove(planRunId)
+                        peggingSaveInfo.remove(planRunId)
+                    }
+                    .onFailure { e ->
+                        log.warn("[plan] Pegging persist failed for run {}: {}", planRunId, e.message)
+                        planPeggingTransit.remove(planRunId)
+                        peggingSaveInfo.remove(planRunId)
+                    }
+            }
         }
 
         // KB upsert runs in a background coroutine — non-fatal, can be slow.

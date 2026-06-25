@@ -24,6 +24,8 @@ import {
   runPlan,
   runPlanAsync,
   getPlanStatus,
+  getPeggingSaveStatus,
+  type PeggingSaveStatus,
   planningAgent,
   listActivePlanJobs,
   type ActivePlanJob,
@@ -1406,6 +1408,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [peggingSaveStatus, setPeggingSaveStatus] = useState<PeggingSaveStatus | null>(null);
+  const peggingSavePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [copilotOpen, setCopilotOpen] = useState(false);
   const [copilotMessages, setCopilotMessages] = useState<PlanningCopilotMessage[]>([]);
   const [copilotInput, setCopilotInput] = useState('');
@@ -1958,6 +1962,30 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       }
     };
   }, [planJobId, id]);
+
+  // Poll background pegging save status. Starts when plan job finishes (planJobId cleared)
+  // or when the page loads with a fresh run. Stops when the backend returns 204 (save done).
+  useEffect(() => {
+    if (!id) return;
+    const poll = async () => {
+      try {
+        const status = await getPeggingSaveStatus(id);
+        setPeggingSaveStatus(status);
+        if (!status && peggingSavePollRef.current) {
+          clearInterval(peggingSavePollRef.current);
+          peggingSavePollRef.current = null;
+        }
+      } catch { /* transient — keep polling */ }
+    };
+    poll();
+    if (peggingSavePollRef.current) clearInterval(peggingSavePollRef.current);
+    peggingSavePollRef.current = setInterval(poll, 3000);
+    return () => {
+      if (peggingSavePollRef.current) { clearInterval(peggingSavePollRef.current); peggingSavePollRef.current = null; }
+    };
+  // Re-trigger when a plan finishes (planJobId goes null) or on mount.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, planJobId]);
 
   // Load case supplies once we have a plan result (fetched once; cleared when planResult is cleared).
   useEffect(() => {
@@ -5214,6 +5242,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           </div>
         )}
         {planError && <p style={{ color: '#f87171', marginTop: '0.5rem' }}>{planError}</p>}
+        {peggingSaveStatus && (
+          <div style={{ marginTop: '0.5rem', maxWidth: 400 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', color: '#a16207', marginBottom: '0.25rem' }}>
+              <span>Saving pegging data for run #{peggingSaveStatus.run_id} — {peggingSaveStatus.pct}%</span>
+              <span style={{ color: '#71717a' }}>{peggingSaveStatus.chunks_done}/{peggingSaveStatus.chunks_total} chunks</span>
+            </div>
+            <div style={{ height: 5, backgroundColor: '#27272a', borderRadius: 4, overflow: 'hidden' }}>
+              <div style={{ height: '100%', width: `${peggingSaveStatus.pct}%`, backgroundColor: '#d97706', transition: 'width 0.4s ease' }} />
+            </div>
+          </div>
+        )}
         {planResult && !planLoading && (
           <>
             {(() => {
@@ -5990,8 +6029,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     let workOrderRows = planWorkOrderHideDummyProdArea
                       ? activeWorkOrders.filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'))
                       : activeWorkOrders;
-                    // Compute the supply-backing map early so it can drive the phantom filter below
-                    // and also be used by the WO expand panel later in this block.
+                    // Supply-backing maps used by the WO expand panel for pegging drill-down.
                     const { suppliesMap: woSuppliesMap, crossEntrySupplyMap: woCrossEntrySupplyMap, peggedQtyMap: woPeggedQtyMap } = buildWoMaps(planResult.planning_pegging ?? []);
                     // Filters refer to work-order pegging (each WO's supplies subtree), not demand pegging.
                     const anyPeggingFilter = planDemandRealMakeOnly || planDemandBuyOnly || planDemandRealMoveOnly || planWoDemandedByMultiple || planWoMultiSupply || planWoPurchaseOnly || planWoMakeOnly || planWoMoveOnly || planWoHasOverride;
@@ -6019,41 +6057,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         return r.wo_consolidation_split_details?.some((d) => d.demand_id === demandIdFilter) ?? false;
                       });
                     }
-                    // Build the set of "backed" WO signatures: product|location|method triples for
-                    // which at least one WO node in the pegging tree has supply leaves.
-                    // We intentionally ignore demand_id here because individual WO rows often carry
-                    // a specific demand_id while the corresponding pegging WO node lives inside a
-                    // consolidated entry (demand_id null) — the keys never reliably match.
-                    // Make WOs are excluded from phantom filtering because their supply leaves are
-                    // components with different product_ids and are not in woSuppliesMap.
-                    const backedWoSigs = new Set<string>();
-                    const collectBackedWos = (node: PlanningPeggingNode): void => {
-                      if (node.type === 'work_order') {
-                        if (collectAllSupplyLeaves(node).length > 0) {
-                          backedWoSigs.add(`${node.product_id ?? ''}|${node.location_id ?? ''}|${(node.method ?? '').toLowerCase()}`);
-                        }
-                        (node.children ?? []).forEach(collectBackedWos);
-                      } else {
-                        (node.children ?? []).forEach(collectBackedWos);
-                      }
-                    };
-                    for (const entry of planResult.planning_pegging ?? []) {
-                      collectBackedWos(entry.tree);
-                    }
-                    workOrderRows = workOrderRows.filter((r) => {
-                      // When VirtualProduct_* rows are explicitly shown (checkbox unchecked),
-                      // bypass the phantom filter — the checkbox is the sole visibility control
-                      // for these rows; phantom-filtering them would make unchecking ineffective.
-                      if (!planWorkOrderHideDummyProdArea && (r.product_id ?? '').trim().startsWith('VirtualProduct_')) return true;
-                      const method = (r.method ?? '').toLowerCase();
-                      if (method === 'make') return true;
-                      // Consolidated move WOs carry product_id=null (same-prod_area mixed-product
-                      // shipment). Their constituent native moves ARE backed in the pegging tree,
-                      // but the null product_id can never match a per-product signature in
-                      // backedWoSigs — pass them through unconditionally.
-                      if (method === 'move' && r.product_id == null) return true;
-                      return backedWoSigs.has(`${r.product_id ?? ''}|${r.location_id ?? ''}|${(r.method ?? '').toLowerCase()}`);
-                    });
+                    // All consolidated WOs are valid plan actions — no phantom filtering.
+                    // Previously we filtered by pegging-tree backing (backedWoSigs) but pegging
+                    // is now lazy-loaded per demand, so planning_pegging is always empty here and
+                    // the set was always empty, silently dropping all purchase and non-null-product
+                    // move orders. All three methods (make/purchase/move) are passed through; the
+                    // VirtualProduct visibility is already handled by the checkbox filter above.
                     // Aggregate lots with the same logical WO key so the table shows total quantity per work order
                     const grouped = new Map<string, WorkOrder>();
                     for (const r of workOrderRows) {
