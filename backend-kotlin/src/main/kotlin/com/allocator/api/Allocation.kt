@@ -61,6 +61,37 @@ internal fun buildBudgetsFromCaseAlloc(
     return result
 }
 
+/**
+ * Run the supply allocation for [caseId] using [data] and [config], persist the result to
+ * case_allocation, and return the saved rows. Config is required for purchasable_materials
+ * filtering — pass null only when no plan run has been run yet for the case.
+ *
+ * This is the single shared implementation used by both the Generate endpoint and the
+ * plan-run seeding path in runPlanBackground.
+ */
+internal fun generateAndSeedCaseAllocation(
+    caseId: Int,
+    data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
+): List<CaseAllocRow> {
+    val demands = data["demand"] ?: emptyList()
+    val result  = buildSupplyAllocation(demands, data, config)
+    val rows    = buildAllocationBudgetRows(result.perLotBudgets)
+                      .map { (sid, did, qty) -> CaseAllocRow(sid, did, qty) }
+    if (rows.isNotEmpty()) {
+        transaction {
+            CaseAllocations.deleteWhere { CaseAllocations.caseId eq caseId }
+            CaseAllocations.batchInsert(rows) { row ->
+                this[CaseAllocations.caseId]       = caseId
+                this[CaseAllocations.supplyId]     = row.supplyId
+                this[CaseAllocations.demandId]     = row.demandId
+                this[CaseAllocations.qtyAllocated] = row.qtyAllocated
+            }
+        }
+    }
+    return rows
+}
+
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 fun Routing.allocationRoutes() {
@@ -127,54 +158,38 @@ fun Routing.allocationRoutes() {
                 ?: throw NoSuchElementException("Case not found")
         }
         val data = transaction { CaseLoader.load(caseId) }
-        val demands = data["demand"] ?: emptyList()
-        val supplies = data["supply"] ?: emptyList()
-        if (demands.isEmpty()) throw IllegalArgumentException("No demand data for case $caseId")
-        if (supplies.isEmpty()) throw IllegalArgumentException("No supply data for case $caseId")
+        if ((data["demand"] ?: emptyList()).isEmpty()) throw IllegalArgumentException("No demand data for case $caseId")
+        if ((data["supply"] ?: emptyList()).isEmpty()) throw IllegalArgumentException("No supply data for case $caseId")
 
-        val body = runCatching { call.receiveText() }.getOrElse { "" }
-        val payload = if (body.isBlank()) JsonObject(emptyMap())
-                      else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrElse { JsonObject(emptyMap()) }
-        val configJson = payload["config"]
-        @Suppress("UNCHECKED_CAST")
-        val config: Map<String, Any?>? = if (configJson != null && configJson !is JsonNull) {
-            runCatching { jsonElementToNative(configJson) as? Map<String, Any?> }.getOrNull()
-        } else {
-            // No config in request body — load from the latest completed plan run for this case
-            // so purchasable_materials (and other settings) are applied consistently.
-            val latestConfigJson = transaction {
-                PlanRuns.select(PlanRuns.config)
-                    .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
-                    .orderBy(PlanRuns.id to SortOrder.DESC)
-                    .limit(1)
-                    .singleOrNull()
-                    ?.get(PlanRuns.config)
-            }
-            if (latestConfigJson != null) {
+        // Config: prefer caller-supplied; fall back to latest plan run config so
+        // purchasable_materials filtering is always applied correctly.
+        val config: Map<String, Any?>? = run {
+            val body = runCatching { call.receiveText() }.getOrElse { "" }
+            val payload = if (body.isBlank()) null
+                          else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrNull()
+            val configJson = payload?.get("config")
+            if (configJson != null && configJson !is JsonNull) {
                 @Suppress("UNCHECKED_CAST")
-                runCatching {
-                    jsonElementToNative(Json.parseToJsonElement(latestConfigJson)) as? Map<String, Any?>
-                }.getOrNull().also {
-                    log.info("[allocation] using config from latest plan run for case {}", caseId)
+                runCatching { jsonElementToNative(configJson) as? Map<String, Any?> }.getOrNull()
+            } else {
+                val latestConfigJson = transaction {
+                    PlanRuns.select(PlanRuns.config)
+                        .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
+                        .orderBy(PlanRuns.id to SortOrder.DESC)
+                        .limit(1)
+                        .singleOrNull()
+                        ?.get(PlanRuns.config)
                 }
-            } else null
-        }
-
-        log.info("[allocation] generating allocation for case {}: {} demands, {} supplies", caseId, demands.size, supplies.size)
-        val result  = buildSupplyAllocation(demands, data, config)
-        val budgets = buildAllocationBudgetRows(result.perLotBudgets)
-        val newRows = budgets.map { (sid, did, qty) -> CaseAllocRow(sid, did, qty) }
-        log.info("[allocation] generated {} rows for case {} ({} critical supply lots)", newRows.size, caseId, newRows.map { it.supplyId }.distinct().size)
-
-        transaction {
-            CaseAllocations.deleteWhere { CaseAllocations.caseId eq caseId }
-            CaseAllocations.batchInsert(newRows) { row ->
-                this[CaseAllocations.caseId]       = caseId
-                this[CaseAllocations.supplyId]     = row.supplyId
-                this[CaseAllocations.demandId]     = row.demandId
-                this[CaseAllocations.qtyAllocated] = row.qtyAllocated
+                latestConfigJson?.let {
+                    @Suppress("UNCHECKED_CAST")
+                    runCatching { jsonElementToNative(Json.parseToJsonElement(it)) as? Map<String, Any?> }.getOrNull()
+                }.also { if (it != null) log.info("[allocation] using config from latest plan run for case {}", caseId) }
             }
         }
+
+        log.info("[allocation] generating allocation for case {}", caseId)
+        val newRows = generateAndSeedCaseAllocation(caseId, data, config)
+        log.info("[allocation] generated {} rows for case {} ({} critical supply lots)", newRows.size, caseId, newRows.map { it.supplyId }.distinct().size)
 
         val responseRows = newRows.map { row ->
             buildJsonObject {

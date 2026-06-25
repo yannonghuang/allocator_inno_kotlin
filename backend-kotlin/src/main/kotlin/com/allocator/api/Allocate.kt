@@ -2471,20 +2471,12 @@ internal suspend fun runPlanBackground(
         } else null
         val raw = runPlanning(data, config = config, progressCallback = progressCb, precomputedBudgets = precomputedBudgets)
         log.info("[plan] runPlanning done for run {}", planRunId)
-        // Seed case_allocation only when no user allocation existed — so the Allocation module
-        // shows something after the first plan run. Once the user has set an allocation map
-        // (via Generate / Import / edits), plan runs leave it untouched.
-        if (precomputedBudgets == null && raw.allocationBudgetRows.isNotEmpty()) {
-            transaction {
-                CaseAllocations.deleteWhere { CaseAllocations.caseId eq caseId }
-                CaseAllocations.batchInsert(raw.allocationBudgetRows) { (sid, did, qty) ->
-                    this[CaseAllocations.caseId]       = caseId
-                    this[CaseAllocations.supplyId]     = sid
-                    this[CaseAllocations.demandId]     = did
-                    this[CaseAllocations.qtyAllocated] = qty
-                }
-            }
-            log.info("[plan] seeded case_allocation with {} rows for case {}", raw.allocationBudgetRows.size, caseId)
+        // Seed case_allocation only when no user allocation existed.
+        // Uses the same generateAndSeedCaseAllocation() function as the Generate endpoint
+        // so the allocation is computed and filtered identically in both paths.
+        if (precomputedBudgets == null) {
+            val allocRows = generateAndSeedCaseAllocation(caseId, data, config)
+            log.info("[plan] seeded case_allocation with {} rows for case {}", allocRows.size, caseId)
         }
         // Hint GC to collect planning intermediates (reconciledTrees, workingTrees, nodeLevelWos,
         // etc.) that went out of scope when runPlanning returned, freeing headroom for enrichment.
