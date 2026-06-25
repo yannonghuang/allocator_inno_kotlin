@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams } from 'next/navigation';
+import { useTranslations } from 'next-intl';
 import {
   AllocationRow,
   CaseDemandRow,
@@ -51,6 +52,7 @@ function fmtQty(q: number): string {
 export function AllocationPage() {
   const params = useParams();
   const caseId = Number(params.id);
+  const t = useTranslations('allocationPage');
 
   // Committed state
   const [rows, setRows]         = useState<AllocationRow[] | null>(null);
@@ -102,7 +104,7 @@ export function AllocationPage() {
       const a = (e.target as HTMLElement).closest('a[href]') as HTMLAnchorElement | null;
       if (!a) return;
       const href = a.getAttribute('href') ?? '';
-      if (href && !href.startsWith('#') && !confirm('You have unsaved changes. Leave without saving?')) {
+      if (href && !href.startsWith('#') && !confirm(t('confirmLeave'))) {
         e.preventDefault();
         e.stopPropagation();
       }
@@ -147,7 +149,7 @@ export function AllocationPage() {
     const m = new Map<string, Set<string>>();
     for (const r of rows) {
       const did  = r.demand_id ?? '';
-      const cust = demandMeta.get(did)?.customer_id ?? 'Unknown';
+      const cust = demandMeta.get(did)?.customer_id ?? t('unknownCustomer');
       if (!m.has(cust)) m.set(cust, new Set());
       m.get(cust)!.add(did);
     }
@@ -404,7 +406,7 @@ export function AllocationPage() {
   const clearPending = () => { setPendingChanges(new Map()); setUndoStack([]); setRedoStack([]); };
 
   const handleGenerate = async () => {
-    if (hasPending && !confirm('This will discard unsaved changes. Continue?')) return;
+    if (hasPending && !confirm(t('confirmDiscard'))) return;
     setGenerating(true); setError(null);
     try { setRows(await generateAllocation(caseId)); clearPending(); }
     catch (e) { setError(String(e)); }
@@ -414,7 +416,7 @@ export function AllocationPage() {
   const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    if (hasPending && !confirm('This will discard unsaved changes. Continue?')) {
+    if (hasPending && !confirm(t('confirmDiscard'))) {
       if (importRef.current) importRef.current.value = '';
       return;
     }
@@ -434,7 +436,7 @@ export function AllocationPage() {
   };
 
   const handleClear = async () => {
-    if (!confirm('Clear the allocation map? Planning will revert to auto-allocation.')) return;
+    if (!confirm(t('confirmClear'))) return;
     setClearing(true);
     try { await deleteAllocation(caseId); setRows([]); clearPending(); }
     catch (e) { setError(String(e)); }
@@ -495,7 +497,7 @@ export function AllocationPage() {
   // ── Render ────────────────────────────────────────────────────────────────
 
   if (rows === null)
-    return <div style={{ padding: '2rem', color: '#71717a', fontSize: '0.875rem' }}>Loading allocation…</div>;
+    return <div style={{ padding: '2rem', color: '#71717a', fontSize: '0.875rem' }}>{t('loading')}</div>;
 
   const totalLots    = new Set(rows.map(r => r.supply_id)).size;
   const totalDemands = new Set(rows.map(r => r.demand_id ?? '')).size;
@@ -517,27 +519,27 @@ export function AllocationPage() {
       {/* Action bar */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '0.75rem' }}>
         <button style={btn('primary')} onClick={handleGenerate} disabled={generating}>
-          {generating ? 'Generating…' : 'Generate'}
+          {generating ? t('generating') : t('generate')}
         </button>
         <button style={btn()} onClick={() => importRef.current?.click()} disabled={importLoading}>
-          {importLoading ? 'Uploading…' : 'Upload CSV'}
+          {importLoading ? t('uploading') : t('uploadCsv')}
         </button>
         <input ref={importRef} type="file" accept=".csv,text/csv" style={{ display: 'none' }} onChange={handleImport} />
-        <button style={btn()} onClick={handleExport} disabled={!rows.length}>Download CSV</button>
+        <button style={btn()} onClick={handleExport} disabled={!rows.length}>{t('downloadCsv')}</button>
         <button style={btn('danger')} onClick={handleClear} disabled={clearing || !rows.length}>
-          {clearing ? 'Clearing…' : 'Clear'}
+          {clearing ? t('clearing') : t('clear')}
         </button>
         {!!rows.length && (<>
           {sep}
           <button style={{ ...btn(), opacity: undoStack.length ? 1 : 0.35 }}
-            onClick={undo} disabled={!undoStack.length} title="Undo  Ctrl+Z">↩ Undo</button>
+            onClick={undo} disabled={!undoStack.length} title={t('undoTitle')}>{t('undo')}</button>
           <button style={{ ...btn(), opacity: redoStack.length ? 1 : 0.35 }}
-            onClick={redo} disabled={!redoStack.length} title="Redo  Ctrl+Shift+Z">↪ Redo</button>
+            onClick={redo} disabled={!redoStack.length} title={t('redoTitle')}>{t('redo')}</button>
           {sep}
           <button
             style={{ ...btn(hasPending ? 'save' : 'ghost'), opacity: hasPending ? 1 : 0.35 }}
-            onClick={handleSave} disabled={!hasPending || saving} title="Save  Ctrl+S">
-            {saving ? 'Saving…' : hasPending ? `Save (${pendingChanges.size})` : 'Save'}
+            onClick={handleSave} disabled={!hasPending || saving} title={t('saveTitle')}>
+            {saving ? t('saving') : hasPending ? t('saveWithCount', { count: pendingChanges.size }) : t('save')}
           </button>
         </>)}
       </div>
@@ -545,7 +547,7 @@ export function AllocationPage() {
       {/* Unsaved-changes banner */}
       {hasPending && (
         <div style={{ background: '#1c1008', border: '1px solid #78350f', borderRadius: 4, padding: '0.4rem 0.75rem', fontSize: '0.78rem', color: '#fdba74', marginBottom: '0.75rem' }}>
-          ⚠ {pendingChanges.size} unsaved change{pendingChanges.size !== 1 ? 's' : ''} — press <strong>Ctrl+S</strong> to save or <strong>Undo</strong> to revert.
+          {t('unsavedBanner', { count: pendingChanges.size })}
         </div>
       )}
 
@@ -557,16 +559,16 @@ export function AllocationPage() {
 
       {!rows.length ? (
         <div style={{ padding: '3rem 1rem', textAlign: 'center', color: '#52525b', fontSize: '0.875rem' }}>
-          No allocation map — click <strong style={{ color: '#93c5fd' }}>Generate</strong> to create one, or <strong style={{ color: '#93c5fd' }}>Upload CSV</strong> to load one.
+          {t('emptyHint')} <strong style={{ color: '#93c5fd' }}>{t('generate')}</strong> {t('emptyHintMiddle')} <strong style={{ color: '#93c5fd' }}>{t('uploadCsv')}</strong> {t('emptyHintAfter')}
         </div>
       ) : (<>
         {/* Pivot toggles */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap', marginBottom: '0.75rem', fontSize: '0.8rem', color: '#71717a' }}>
-          <span>{totalLots} supply lots × {totalDemands} demands</span>
+          <span>{t('lotsVsDemands', { lots: totalLots, demands: totalDemands })}</span>
           {sep}
-          <span>Supply:</span>
-          <button style={toggleBtn(supplyPivot === 'lot')} onClick={() => setSupplyPivot('lot')}>By Lot</button>
-          <button style={toggleBtn(supplyPivot === 'product-location')} onClick={() => setSupplyPivot('product-location')}>By Product+Location</button>
+          <span>{t('supplyLabel')}</span>
+          <button style={toggleBtn(supplyPivot === 'lot')} onClick={() => setSupplyPivot('lot')}>{t('byLot')}</button>
+          <button style={toggleBtn(supplyPivot === 'product-location')} onClick={() => setSupplyPivot('product-location')}>{t('byProductLocation')}</button>
         </div>
 
         {/* Matrix */}
@@ -574,7 +576,7 @@ export function AllocationPage() {
           <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: '0.8rem' }}>
             <thead>
               <tr>
-                <th rowSpan={anyCustomerExpanded ? 2 : 1} style={labelThSt}>Supply</th>
+                <th rowSpan={anyCustomerExpanded ? 2 : 1} style={labelThSt}>{t('supplyHeader')}</th>
                 {demandGroups.map(({ custId, demandIds }) => {
                   const exp = expandedCustomers.has(custId);
                   return (
@@ -592,7 +594,7 @@ export function AllocationPage() {
                     </th>
                   );
                 })}
-                <th rowSpan={anyCustomerExpanded ? 2 : 1} style={{ ...thSt, borderLeft: '1px solid #27272a' }}>Total</th>
+                <th rowSpan={anyCustomerExpanded ? 2 : 1} style={{ ...thSt, borderLeft: '1px solid #27272a' }}>{t('totalHeader')}</th>
               </tr>
               {anyCustomerExpanded && (
                 <tr>
@@ -700,7 +702,7 @@ export function AllocationPage() {
               )}
               {/* Column totals */}
               <tr style={{ borderTop: '1px solid #3f3f46', background: '#16161a' }}>
-                <td style={{ ...labelTd(), color: '#71717a', fontWeight: 500, cursor: 'default' }}>Total</td>
+                <td style={{ ...labelTd(), color: '#71717a', fontWeight: 500, cursor: 'default' }}>{t('totalHeader')}</td>
                 {colSpecs.map(spec => {
                   const k = colSpecKey(spec);
                   return <td key={k} style={{ ...totalTd, borderLeft: 'none' }}>{fmtQty(getColTotal(spec))}</td>;
