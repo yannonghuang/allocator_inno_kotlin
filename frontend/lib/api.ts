@@ -1965,3 +1965,81 @@ export async function deleteKbRecord(caseId: number, recordId: number): Promise<
   const r = await fetch(`${API}/cases/${caseId}/kb-records/${recordId}`, { method: 'DELETE' });
   if (!r.ok) throw new Error(await r.text());
 }
+
+// ── Case demands (lightweight) ─────────────────────────────────────────────────
+
+export type CaseDemandRow = {
+  demand_id: string;
+  customer_id: string;
+  product_id: string;
+  location_id: string | null;
+  quantity: number;
+  request_due_time: string | null;
+};
+
+export async function getCaseDemands(caseId: number): Promise<CaseDemandRow[]> {
+  const r = await fetch(`${API}/cases/${caseId}/demands`);
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return data.demands as CaseDemandRow[];
+}
+
+// ── Allocation map ─────────────────────────────────────────────────────────────
+
+export type AllocationRow = {
+  supply_id: string;
+  demand_id: string | null;
+  qty_allocated: number;
+};
+
+/** GET /cases/{id}/allocation — null when no allocation exists yet (204). */
+export async function getAllocation(caseId: number): Promise<AllocationRow[] | null> {
+  const r = await fetch(`${API}/cases/${caseId}/allocation`);
+  if (r.status === 204) return null;
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return data.rows as AllocationRow[];
+}
+
+/** POST /cases/{id}/allocation/generate — runs SupplyAllocator and saves result. */
+export async function generateAllocation(caseId: number): Promise<AllocationRow[]> {
+  const r = await fetch(`${API}/cases/${caseId}/allocation/generate`, { method: 'POST' });
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return data.rows as AllocationRow[];
+}
+
+/** PUT /cases/{id}/allocation — upsert (partial or full) rows. */
+export async function updateAllocationRows(caseId: number, rows: AllocationRow[]): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/allocation`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rows }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+/** DELETE /cases/{id}/allocation — clear all rows. */
+export async function deleteAllocation(caseId: number): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/allocation`, { method: 'DELETE' });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+/** POST /cases/{id}/allocation/import — upload CSV, replace all rows. */
+export async function importAllocationCsv(caseId: number, csvText: string): Promise<AllocationRow[]> {
+  const r = await fetch(`${API}/cases/${caseId}/allocation/import`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: csvText,
+  });
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return data.rows as AllocationRow[];
+}
+
+/** GET /cases/{id}/allocation/export — download CSV text. */
+export async function exportAllocationCsv(caseId: number): Promise<string> {
+  const r = await fetch(`${API}/cases/${caseId}/allocation/export`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.text();
+}

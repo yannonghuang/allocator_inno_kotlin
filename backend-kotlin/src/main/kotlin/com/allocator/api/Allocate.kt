@@ -2464,7 +2464,12 @@ internal suspend fun runPlanBackground(
             }
         }
 
-        val raw = runPlanning(data, config = config, progressCallback = progressCb)
+        val caseAllocRows = loadCaseAllocRows(caseId)
+        val precomputedBudgets = if (caseAllocRows != null) {
+            log.info("[plan] case {} has {} case_allocation rows — using as budget override", caseId, caseAllocRows.size)
+            buildBudgetsFromCaseAlloc(caseAllocRows, data["supply"] ?: emptyList())
+        } else null
+        val raw = runPlanning(data, config = config, progressCallback = progressCb, precomputedBudgets = precomputedBudgets)
         log.info("[plan] runPlanning done for run {}", planRunId)
         // Hint GC to collect planning intermediates (reconciledTrees, workingTrees, nodeLevelWos,
         // etc.) that went out of scope when runPlanning returned, freeing headroom for enrichment.

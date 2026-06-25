@@ -108,7 +108,7 @@ private fun createTables() {
         Operations, Bors, Resources,
         Supplies, MethodMoves, AllocationRuns, AllocationActions,
         ManualOverrides, PlanRuns, MaterialEvents, WoScheduleEvents, MaterialImpactAssessments,
-        PlanPegging, PlanSupplyAllocations, NegotiationWaits, PlanRunEvents, AgentMemory,
+        PlanPegging, PlanSupplyAllocations, CaseAllocations, NegotiationWaits, PlanRunEvents, AgentMemory,
         KbRecords
     )
 }

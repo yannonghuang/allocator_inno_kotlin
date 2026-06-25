@@ -1,5 +1,6 @@
 package com.allocator
 
+import com.allocator.api.allocationRoutes
 import com.allocator.api.allocateRoutes
 import com.allocator.api.assessmentRoutes
 import com.allocator.api.bomGraphRoutes
@@ -101,6 +102,7 @@ fun Application.configureRouting() {
         }
         caseRoutes()
         overrideRoutes()
+        allocationRoutes()
         allocateRoutes()
         peggingRoutes()
         resourceUtilizationRoutes()
