@@ -2471,6 +2471,20 @@ internal suspend fun runPlanBackground(
         } else null
         val raw = runPlanning(data, config = config, progressCallback = progressCb, precomputedBudgets = precomputedBudgets)
         log.info("[plan] runPlanning done for run {}", planRunId)
+        // Seed case_allocation from computed budgets — only when no manual allocation was in use.
+        // This lets the Allocation module display what the planner actually used.
+        if (precomputedBudgets == null && raw.allocationBudgetRows.isNotEmpty()) {
+            transaction {
+                CaseAllocations.deleteWhere { CaseAllocations.caseId eq caseId }
+                CaseAllocations.batchInsert(raw.allocationBudgetRows) { (sid, did, qty) ->
+                    this[CaseAllocations.caseId]       = caseId
+                    this[CaseAllocations.supplyId]     = sid
+                    this[CaseAllocations.demandId]     = did
+                    this[CaseAllocations.qtyAllocated] = qty
+                }
+            }
+            log.info("[plan] seeded case_allocation with {} rows for case {}", raw.allocationBudgetRows.size, caseId)
+        }
         // Hint GC to collect planning intermediates (reconciledTrees, workingTrees, nodeLevelWos,
         // etc.) that went out of scope when runPlanning returned, freeing headroom for enrichment.
         @Suppress("ExplicitGarbageCollectionCall")

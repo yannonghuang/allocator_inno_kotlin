@@ -4677,6 +4677,8 @@ data class RunPlanningResult(
      * Empty when consolidation is disabled.
      */
     val producedByComponent: Map<String, Double> = emptyMap(),
+    /** Flattened (supply_id, demand_id?, qty_allocated) rows from the SupplyAllocator step. Empty when supply-guided is disabled. Used to seed case_allocation after a plan run. */
+    val allocationBudgetRows: List<Triple<String, String?, Double>> = emptyList(),
 )
 
 /**
@@ -4772,6 +4774,7 @@ fun runPlanning(
     // The supply-level orchestrator (consolidation.scope="all") was retired
     // in 2026-05; only the leaf-level fixed-point pipeline remains.
     val supplyLevelAllocations: List<Map<String, Any?>> = emptyList()
+    var allocationBudgetRows: List<Triple<String, String?, Double>> = emptyList()
     val supplyGuidedConfig = parseSupplyGuidedConfig(config)
     // Supply-guided takes priority over legacy consolidation when enabled.
     if (supplyGuidedConfig.enabled) {
@@ -4781,6 +4784,8 @@ fun runPlanning(
             log.info("[supply-guided] using case_allocation override: {} demand budget entries", precomputedBudgets.size)
             sgAllocationBase.copy(perLotBudgets = precomputedBudgets)
         } else {
+            // Capture computed budgets to seed case_allocation after the run
+            allocationBudgetRows = buildAllocationBudgetRows(sgAllocationBase.perLotBudgets)
             sgAllocationBase
         }
         // Step 2b: sketch phase — one read-only BOM walk that both computes achievable caps
@@ -5099,6 +5104,7 @@ fun runPlanning(
         inventoryEffectiveInitial = inventoryEffectiveInitial,
         inventoryLeftover = inventory.map { it.toMap() },
         producedByComponent = producedByComponent,
+        allocationBudgetRows = allocationBudgetRows,
     )
 }
 
