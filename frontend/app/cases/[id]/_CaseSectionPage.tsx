@@ -615,13 +615,16 @@ function ConstraintPicker({
   options,
   constraints,
   onChange,
+  defaultCollapsed,
   tP,
 }: {
   options: ConstraintOptions;
   constraints: ConstraintRule[];
   onChange: (next: ConstraintRule[]) => void;
+  defaultCollapsed?: boolean;
   tP: (k: string) => string;
 }) {
+  const [collapsed, setCollapsed] = useState(defaultCollapsed ?? false);
   const [customer, setCustomer] = useState('');
   const [parent, setParent] = useState('');
   const [location, setLocation] = useState('*');
@@ -646,52 +649,62 @@ function ConstraintPicker({
   };
 
   return (
-    <div>
-      <div style={{ fontSize: '0.7rem', color: '#71717a', marginBottom: 4 }}>{tP('config.constraintHint')}</div>
-      {options.parents.length === 0 ? (
-        <div style={{ fontSize: '0.72rem', color: '#71717a' }}>{tP('config.constraintNoAlternatives')}</div>
-      ) : (
-        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 6 }}>
-          <SearchableSelect
-            value={customer}
-            onChange={setCustomer}
-            options={options.customers.map((c) => ({ value: c.customer_id, label: custLabel(c.customer_id) }))}
-            placeholder={`${tP('config.constraintCustomer')}…`}
-            width={220}
-            tP={tP}
-          />
-          <SearchableSelect
-            value={parent}
-            onChange={(v) => { setParent(v); setLocation('*'); setChild(''); }}
-            options={options.parents.map((p) => ({ value: p.parent, label: p.parent }))}
-            placeholder={`${tP('config.constraintParent')}…`}
-            width={260}
-            tP={tP}
-          />
-          <select value={location} onChange={(e) => setLocation(e.target.value)} disabled={!parent} style={selStyle}>
-            <option value="*">{tP('config.constraintLocationAny')}</option>
-            {locationOpts.map((l) => <option key={l} value={l}>{l}</option>)}
-          </select>
-          <select value={child} onChange={(e) => setChild(e.target.value)} disabled={!parent} style={selStyle}>
-            <option value="">{tP('config.constraintChild')}…</option>
-            {childOpts.map((c) => <option key={c} value={c}>{c}</option>)}
-          </select>
-          <button type="button" onClick={addRule} disabled={!canAdd} style={{ ...btnStyle, opacity: canAdd ? 1 : 0.4, cursor: canAdd ? 'pointer' : 'default' }}>{tP('config.constraintAdd')}</button>
-        </div>
-      )}
-      {constraints.length === 0 ? (
-        <div style={{ fontSize: '0.72rem', color: '#71717a' }}>{tP('config.constraintEmpty')}</div>
-      ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
-          {constraints.map((r, i) => (
-            <div key={`${r.customer}|${r.parent}|${r.location}|${r.child}`} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.76rem' }}>
-              <span style={{ fontFamily: 'monospace', color: '#e4e4e7' }}>
-                {r.customer} · {r.parent} @ {anyLoc(r.location)} ⇒ {r.child}
-              </span>
-              <button type="button" title={tP('config.constraintRemove')} onClick={() => onChange(constraints.filter((_, j) => j !== i))}
-                style={{ background: 'none', border: 'none', color: '#f87171', cursor: 'pointer', fontSize: '0.95rem', lineHeight: 1, padding: 0 }}>×</button>
+    <div style={{ marginTop: '0.4rem' }}>
+      <button type="button" onClick={() => setCollapsed((c) => !c)}
+        style={{ display: 'inline-flex', alignItems: 'center', gap: 6, background: '#27272a', border: '1px solid #3f3f46', borderRadius: 4, padding: '3px 9px', color: '#d4d4d8', fontSize: '0.72rem', cursor: 'pointer' }}>
+        <span>{collapsed ? '▸' : '▾'}</span>
+        <span>{collapsed ? tP('config.constraintShow') : tP('config.constraintHide')}</span>
+        <span style={{ color: '#a1a1aa' }}>{`(${constraints.length})`}</span>
+      </button>
+      {!collapsed && (
+        <div style={{ marginTop: 4 }}>
+          <div style={{ fontSize: '0.7rem', color: '#71717a', marginBottom: 4 }}>{tP('config.constraintHint')}</div>
+          {options.parents.length === 0 ? (
+            <div style={{ fontSize: '0.72rem', color: '#71717a' }}>{tP('config.constraintNoAlternatives')}</div>
+          ) : (
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 6 }}>
+              <SearchableSelect
+                value={customer}
+                onChange={setCustomer}
+                options={options.customers.map((c) => ({ value: c.customer_id, label: custLabel(c.customer_id) }))}
+                placeholder={`${tP('config.constraintCustomer')}…`}
+                width={220}
+                tP={tP}
+              />
+              <SearchableSelect
+                value={parent}
+                onChange={(v) => { setParent(v); setLocation('*'); setChild(''); }}
+                options={options.parents.map((p) => ({ value: p.parent, label: p.parent }))}
+                placeholder={`${tP('config.constraintParent')}…`}
+                width={260}
+                tP={tP}
+              />
+              <select value={location} onChange={(e) => setLocation(e.target.value)} disabled={!parent} style={selStyle}>
+                <option value="*">{tP('config.constraintLocationAny')}</option>
+                {locationOpts.map((l) => <option key={l} value={l}>{l}</option>)}
+              </select>
+              <select value={child} onChange={(e) => setChild(e.target.value)} disabled={!parent} style={selStyle}>
+                <option value="">{tP('config.constraintChild')}…</option>
+                {childOpts.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+              <button type="button" onClick={addRule} disabled={!canAdd} style={{ ...btnStyle, opacity: canAdd ? 1 : 0.4, cursor: canAdd ? 'pointer' : 'default' }}>{tP('config.constraintAdd')}</button>
             </div>
-          ))}
+          )}
+          {constraints.length === 0 ? (
+            <div style={{ fontSize: '0.72rem', color: '#71717a' }}>{tP('config.constraintEmpty')}</div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+              {constraints.map((r, i) => (
+                <div key={`${r.customer}|${r.parent}|${r.location}|${r.child}`} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.76rem' }}>
+                  <span style={{ fontFamily: 'monospace', color: '#e4e4e7' }}>
+                    {r.customer} · {r.parent} @ {anyLoc(r.location)} ⇒ {r.child}
+                  </span>
+                  <button type="button" title={tP('config.constraintRemove')} onClick={() => onChange(constraints.filter((_, j) => j !== i))}
+                    style={{ background: 'none', border: 'none', color: '#f87171', cursor: 'pointer', fontSize: '0.95rem', lineHeight: 1, padding: 0 }}>×</button>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -4891,6 +4904,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 options={constraintOptions}
                 constraints={planningConfig.constraints ?? []}
                 onChange={(next) => setPlanningConfig((c) => ({ ...c, constraints: next }))}
+                defaultCollapsed
                 tP={tP}
               />
             </div>
