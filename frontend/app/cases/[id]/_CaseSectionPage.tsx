@@ -1499,17 +1499,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const presetDiffSummary = (config: Record<string, unknown>): string => {
     const ms = (config.method_selection ?? {}) as Record<string, unknown>;
     const cs = (config.consolidation ?? {}) as Record<string, unknown>;
-    const sw = (ms.score_weights ?? {}) as Record<string, number>;
     const diffs: string[] = [];
     if (ms.mode !== 'preference') diffs.push(`mode: preference → ${ms.mode}`);
     if (Number(ms.max_methods) !== 1) diffs.push(`max_methods: 1 → ${ms.max_methods}`);
     if (Number(ms.depth) !== 1) diffs.push(`depth: 1 → ${ms.depth}`);
     if (ms.max_bom_depth != null && Number(ms.max_bom_depth) !== 3) diffs.push(`max_bom_depth: 3 → ${ms.max_bom_depth}`);
-    if (Number(sw.commit_time) !== 0.4 || Number(sw.inventory_consumed) !== 0.35 || Number(sw.purchase) !== 0.25) {
-      diffs.push(`weights: (${sw.commit_time}, ${sw.inventory_consumed}, ${sw.purchase})`);
-    }
     if (cs.allocation_mode !== 'fair') diffs.push(`allocation_mode: fair → ${cs.allocation_mode}`);
-    if (cs.enabled === false) diffs.push(`consolidation: on → off`);
     if (Number(cs.period_days ?? 30) !== 30) diffs.push(`period_days: 30 → ${cs.period_days}`);
     if (config.purchase_allowed === true) diffs.push(`purchase: off → on`);
     return diffs.join(' · ');
@@ -1545,10 +1540,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       mode: 'preference',
       depth: 1,
       multiple: false,
-      elaborate: false,
       max_methods: 1,
       max_bom_depth: 3,
-      score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 },
     },
     consolidation: {
       enabled: true,
@@ -1578,7 +1571,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       case 'purchase_allowed':    cfg.purchase_allowed = value; break;
       case 'mode':
         ms.mode = value;
-        ms.elaborate = value === 'elaborate';
         break;
       // Compound axis: scoring profile implies mode=elaborate + a weight triple.
       case 'score_weights': {
@@ -4876,92 +4868,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               </label>
             </div>
 
-            {/* Row 2 — Elaborate scoring: toggle + recursion depth + per-axis weights. All gated on the toggle. */}
-            {(() => {
-              const elaborateOn = planningConfig.method_selection?.elaborate === true
-                || planningConfig.method_selection?.mode === 'elaborate';
-              const weights = planningConfig.method_selection?.score_weights;
-              const wCommit = weights?.commit_time ?? 0.4;
-              const wInv = weights?.inventory_consumed ?? 0.35;
-              const wPurchase = weights?.purchase ?? 0.25;
-              const updateWeight = (key: 'commit_time' | 'inventory_consumed' | 'purchase', v: number) => {
-                const clamped = Math.max(0, Math.min(1, isNaN(v) ? 0 : v));
-                setPlanningConfig((c) => ({
-                  ...c,
-                  method_selection: {
-                    ...c.method_selection,
-                    score_weights: {
-                      commit_time: key === 'commit_time' ? clamped : (c.method_selection?.score_weights?.commit_time ?? 0.4),
-                      inventory_consumed: key === 'inventory_consumed' ? clamped : (c.method_selection?.score_weights?.inventory_consumed ?? 0.35),
-                      purchase: key === 'purchase' ? clamped : (c.method_selection?.score_weights?.purchase ?? 0.25),
-                    },
-                  },
-                }));
-              };
-              const inputStyle: React.CSSProperties = { width: 64, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' };
-              const gatedLabelStyle: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.875rem', opacity: elaborateOn ? 1 : 0.4 };
-              return (
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.9rem', flexWrap: 'wrap', marginTop: '0.45rem' }} title={tP('config.weightsHint')}>
-                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
-                    <input
-                      type="checkbox"
-                      checked={elaborateOn}
-                      onChange={(e) => setPlanningConfig((c) => ({
-                        ...c,
-                        method_selection: {
-                          ...c.method_selection,
-                          elaborate: e.target.checked,
-                          mode: e.target.checked ? 'elaborate' : 'preference',
-                        },
-                      }))}
-                    />
-                    <span>{tP('config.elaborateMethod')}</span>
-                  </label>
-                  <label style={gatedLabelStyle}>
-                    <span style={{ color: '#a1a1aa' }}>{tP('config.methodDepth')}</span>
-                    <input
-                      type="number"
-                      min={1}
-                      max={500}
-                      disabled={!elaborateOn}
-                      value={planningConfig.method_selection?.depth ?? 1}
-                      onChange={(e) => {
-                        const v = Math.max(1, Math.min(500, parseInt(e.target.value, 10) || 1));
-                        setPlanningConfig((c) => ({ ...c, method_selection: { ...c.method_selection, depth: v } }));
-                      }}
-                      style={{ width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
-                    />
-                  </label>
-                  <span style={{ color: '#a1a1aa', fontSize: '0.8rem', opacity: elaborateOn ? 1 : 0.5 }}>{tP('config.weightsLabel')}</span>
-                  <label style={gatedLabelStyle}>
-                    <span style={{ color: '#a1a1aa' }}>{tP('config.weightCommit')}</span>
-                    <input type="number" min={0} max={1} step={0.05}
-                      disabled={!elaborateOn}
-                      value={wCommit}
-                      onChange={(e) => updateWeight('commit_time', parseFloat(e.target.value))}
-                      style={inputStyle} />
-                  </label>
-                  <label style={gatedLabelStyle}>
-                    <span style={{ color: '#a1a1aa' }}>{tP('config.weightInventory')}</span>
-                    <input type="number" min={0} max={1} step={0.05}
-                      disabled={!elaborateOn}
-                      value={wInv}
-                      onChange={(e) => updateWeight('inventory_consumed', parseFloat(e.target.value))}
-                      style={inputStyle} />
-                  </label>
-                  <label style={gatedLabelStyle}>
-                    <span style={{ color: '#a1a1aa' }}>{tP('config.weightPurchase')}</span>
-                    <input type="number" min={0} max={1} step={0.05}
-                      disabled={!elaborateOn}
-                      value={wPurchase}
-                      onChange={(e) => updateWeight('purchase', parseFloat(e.target.value))}
-                      style={inputStyle} />
-                  </label>
-                </div>
-              );
-            })()}
-
-            {/* Row 3 — Buy-method gate. Independent of mode/depth/weights. */}
+            {/* Row 2 — Buy-method gate. Independent of mode/depth/weights. */}
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', marginTop: '0.45rem' }}>
               <input
                 type="checkbox"
@@ -5010,25 +4917,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             </label>
           </fieldset>
 
-          {/* ── Group 2: Demand consolidation (sharing across demands) ── */}
+          {/* ── Group 2: Demand consolidation (always on; sub-controls are the only knobs) ── */}
           <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
-            <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-              {tP('config.groupConsolidation')}
+            <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}
+              title={tP('config.consolidate')}>
+              {tP('config.groupConsolidation')} ⓘ
             </legend>
             <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
-              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
-                <input
-                  type="checkbox"
-                  checked={planningConfig.consolidation?.enabled === true}
-                  onChange={(e) => setPlanningConfig((c) => ({
-                    ...c,
-                    consolidation: { ...c.consolidation, enabled: e.target.checked },
-                  }))}
-                />
-                <span>{tP('config.consolidate')}</span>
-              </label>
               <label
-                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }}
                 title={tP('config.bucketDaysTooltip')}
               >
                 <span style={{ color: '#a1a1aa' }}>{tP('config.bucketDays')}</span>
@@ -5036,7 +4933,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   type="number"
                   min={0}
                   max={365}
-                  disabled={planningConfig.consolidation?.enabled !== true}
                   value={planningConfig.consolidation?.period_days ?? 30}
                   onChange={(e) => {
                     const raw = parseInt(e.target.value, 10);
@@ -5046,10 +4942,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   style={{ width: 64, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
                 />
               </label>
-              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}>
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }}>
                 <span style={{ color: '#a1a1aa' }}>{tP('config.splitPolicy')}</span>
                 <select
-                  disabled={planningConfig.consolidation?.enabled !== true}
                   value={planningConfig.consolidation?.allocation_mode ?? 'fair'}
                   onChange={(e) => setPlanningConfig((c) => ({
                     ...c,
@@ -5063,7 +4958,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 </select>
               </label>
               <label
-                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }}
                 title={tP('config.maxIterTooltip')}
               >
                 <span style={{ color: '#a1a1aa' }}>{tP('config.maxIter')}</span>
@@ -5071,7 +4966,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   type="number"
                   min={1}
                   max={15}
-                  disabled={planningConfig.consolidation?.enabled !== true}
                   value={planningConfig.consolidation?.max_iterations ?? 1}
                   onChange={(e) => {
                     const raw = parseInt(e.target.value, 10);
@@ -8076,8 +7970,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       const summary = presetConfigSummary(effectiveConfig);
                       const ms = (effectiveConfig.method_selection ?? {}) as Record<string, unknown>;
                       const cs = (effectiveConfig.consolidation ?? {}) as Record<string, unknown>;
-                      const sw = (ms.score_weights ?? {}) as Record<string, number>;
-                      const elaborateOn = ms.mode === 'elaborate' || ms.elaborate === true;
                       const updateConfig = (mutator: (cfg: Record<string, unknown>) => void) => {
                         const next = JSON.parse(JSON.stringify(effectiveConfig)) as Record<string, unknown>;
                         mutator(next);
@@ -8138,18 +8030,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                     </select>
                                   </label>
                                   <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                                    <input type="checkbox" checked={!!elaborateOn}
-                                      onChange={(e) => updateConfig((c) => {
-                                        const m = (c.method_selection ?? {}) as Record<string, unknown>;
-                                        m.elaborate = e.target.checked;
-                                        m.mode = e.target.checked ? 'elaborate' : 'preference';
-                                        c.method_selection = m;
-                                      })} />
-                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editElaborate')}</span>
-                                  </label>
-                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, opacity: elaborateOn ? 1 : 0.4 }}>
                                     <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editDepth')}</span>
-                                    <input type="number" min={1} max={10} disabled={!elaborateOn}
+                                    <input type="number" min={1} max={10}
                                       value={Number(ms.depth ?? 1)}
                                       onChange={(e) => updateConfig((c) => {
                                         const m = (c.method_selection ?? {}) as Record<string, unknown>;
@@ -8175,43 +8057,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                     <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editPurchase')}</span>
                                   </label>
                                 </div>
-                                {/* Score weights — always rendered so the knob is discoverable;
-                                    dimmed + disabled when elaborate is off (mirrors the planning
-                                    page pattern). Editing weights with elaborate off has no effect
-                                    on the run, but pre-staging them then flipping the toggle is a
-                                    common workflow. */}
-                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'center', fontSize: '0.78rem', marginBottom: 6, paddingLeft: 8, opacity: elaborateOn ? 1 : 0.45 }}>
-                                  <span style={{ fontSize: '0.7rem', color: '#71717a' }}>{tP('bootstrap.editWeights')}</span>
-                                  {(['commit_time','inventory_consumed','purchase'] as const).map((k) => (
-                                    <label key={k} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                                      <span style={{ color: '#a1a1aa', fontSize: '0.72rem' }}>{k.replace('_',' ')}</span>
-                                      <input type="number" step={0.05} min={0} max={1}
-                                        disabled={!elaborateOn}
-                                        value={Number(sw[k] ?? (k === 'commit_time' ? 0.4 : k === 'inventory_consumed' ? 0.35 : 0.25))}
-                                        onChange={(e) => updateConfig((c) => {
-                                          const m = (c.method_selection ?? {}) as Record<string, unknown>;
-                                          const w = { ...((m.score_weights ?? {}) as Record<string, number>) };
-                                          w[k] = Math.max(0, Math.min(1, parseFloat(e.target.value) || 0));
-                                          m.score_weights = w; c.method_selection = m;
-                                        })}
-                                        style={{ ...inputStyle, width: 64 }} />
-                                    </label>
-                                  ))}
-                                </div>
-                                {/* Consolidation (demand side) */}
+                                {/* Consolidation (demand side — always on) */}
                                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'center', fontSize: '0.78rem', marginBottom: 6 }}>
                                   <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                                    <input type="checkbox" checked={cs.enabled !== false}
-                                      onChange={(e) => updateConfig((c) => {
-                                        const v = (c.consolidation ?? {}) as Record<string, unknown>;
-                                        v.enabled = e.target.checked; c.consolidation = v;
-                                      })} />
-                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editConsolidationEnabled')}</span>
-                                  </label>
-                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, opacity: cs.enabled !== false ? 1 : 0.4 }}>
                                     <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editPeriodDays')}</span>
                                     <input type="number" min={0} max={365}
-                                      disabled={cs.enabled === false}
                                       value={Number(cs.period_days ?? 30)}
                                       onChange={(e) => updateConfig((c) => {
                                         const v = (c.consolidation ?? {}) as Record<string, unknown>;
@@ -8220,10 +8070,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                       })}
                                       style={{ ...inputStyle, width: 64 }} />
                                   </label>
-                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, opacity: cs.enabled !== false ? 1 : 0.4 }}>
+                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                                     <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editAllocation')}</span>
                                     <select value={String(cs.allocation_mode ?? 'fair')}
-                                      disabled={cs.enabled === false}
                                       onChange={(e) => updateConfig((c) => {
                                         const v = (c.consolidation ?? {}) as Record<string, unknown>;
                                         v.allocation_mode = e.target.value; c.consolidation = v;

@@ -141,8 +141,9 @@ internal fun resolveMethodSelection(config: Map<String, Any?>?): MethodSelection
     } ?: emptyMap()
     val modeStr = (raw["mode"] as? String)?.trim()?.lowercase()
     val mode = when (modeStr) {
-        "preference", "elaborate" -> modeStr
-        null -> if (raw["elaborate"] == true) "elaborate" else "preference"
+        "preference" -> modeStr
+        "elaborate" -> { log.warn("method_selection.mode='elaborate' is deprecated; using preference"); "preference" }
+        null -> "preference"
         else -> {
             log.warn("Invalid method_selection.mode='{}'; defaulting to preference", modeStr)
             "preference"
