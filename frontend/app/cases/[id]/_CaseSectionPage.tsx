@@ -651,8 +651,8 @@ function ConstraintPicker({
   return (
     <div style={{ marginTop: '0.4rem' }}>
       <button type="button" onClick={() => setCollapsed((c) => !c)}
-        style={{ display: 'inline-flex', alignItems: 'center', gap: 6, background: '#27272a', border: '1px solid #3f3f46', borderRadius: 4, padding: '3px 9px', color: '#d4d4d8', fontSize: '0.72rem', cursor: 'pointer' }}>
-        <span>{collapsed ? '▸' : '▾'}</span>
+        style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', background: 'none', border: 'none', padding: 0, color: 'inherit', fontSize: '0.875rem', cursor: 'pointer' }}>
+        <span style={{ fontSize: '0.7rem', color: '#a1a1aa' }}>{collapsed ? '▸' : '▾'}</span>
         <span>{collapsed ? tP('config.constraintShow') : tP('config.constraintHide')}</span>
         <span style={{ color: '#a1a1aa' }}>{`(${constraints.length})`}</span>
       </button>
