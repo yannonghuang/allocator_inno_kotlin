@@ -4793,10 +4793,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
               {tP('config.groupMethodSelection')}
             </legend>
-            {/* Row 1 — Bounds: how far the planner exhausts methods + how deep make-fallback admits. */}
+            {/* ── Method ── */}
+            <div style={{ fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.3rem' }}>
+              {tP('config.subheadMethod')}
+            </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
-              {/* Max methods (replaces the legacy `multiple` boolean). Defaults to 2 in
-                  sync with the backend; legacy `multiple: false` reads as 1, `multiple: true` as 2. */}
               <label
                 style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', cursor: 'pointer' }}
                 title={tP('config.methodMaxCountTooltip')}
@@ -4843,60 +4844,70 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               </label>
             </div>
 
-            {/* Row 2 — Buy-method gate. Independent of mode/depth/weights. */}
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', marginTop: '0.45rem' }}>
-              <input
-                type="checkbox"
-                checked={planningConfig.purchase_allowed !== false}
-                onChange={(e) => setPlanningConfig((c) => ({ ...c, purchase_allowed: e.target.checked }))}
-              />
-              <span>{tP('config.purchaseAllowed')}</span>
-            </label>
-
-            {/* Row 3b — Selective purchase: when purchase is allowed, optionally
-                restrict to a whitelist of raw materials. Empty ⇒ all raw materials
-                are purchasable (default). Hidden when purchase is off. */}
-            {planningConfig.purchase_allowed !== false && (
-              <div style={{ marginTop: '0.45rem', marginLeft: '1.5rem' }}>
-                <div style={{ fontSize: '0.72rem', color: '#a1a1aa', marginBottom: 2 }}>
-                  {tP('config.purchasableMaterials')}
-                </div>
-                {purchasableOptions.length === 0 ? (
-                  <div style={{ fontSize: '0.72rem', color: '#71717a' }}>{tP('config.purchasableNone')}</div>
-                ) : (
-                  <RawMaterialPicker
-                    options={purchasableOptions}
-                    selected={planningConfig.purchasable_materials ?? []}
-                    onChange={(next) => setPlanningConfig((c) => ({ ...c, purchasable_materials: next }))}
-                    defaultCollapsed
-                    tP={tP}
-                  />
-                )}
+            {/* ── Purchase ── */}
+            <div style={{ marginTop: '0.65rem', borderTop: '1px solid #27272a', paddingTop: '0.4rem' }}>
+              <div style={{ fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.3rem' }}>
+                {tP('config.subheadPurchase')}
               </div>
-            )}
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={planningConfig.purchase_allowed !== false}
+                  onChange={(e) => setPlanningConfig((c) => ({ ...c, purchase_allowed: e.target.checked }))}
+                />
+                <span>{tP('config.purchaseAllowed')}</span>
+              </label>
+              {planningConfig.purchase_allowed !== false && (
+                <div style={{ marginTop: '0.35rem', marginLeft: '1.5rem' }}>
+                  <div style={{ fontSize: '0.72rem', color: '#a1a1aa', marginBottom: 2 }}>
+                    {tP('config.purchasableMaterials')}
+                  </div>
+                  {purchasableOptions.length === 0 ? (
+                    <div style={{ fontSize: '0.72rem', color: '#71717a' }}>{tP('config.purchasableNone')}</div>
+                  ) : (
+                    <RawMaterialPicker
+                      options={purchasableOptions}
+                      selected={planningConfig.purchasable_materials ?? []}
+                      onChange={(next) => setPlanningConfig((c) => ({ ...c, purchasable_materials: next }))}
+                      defaultCollapsed
+                      tP={tP}
+                    />
+                  )}
+                </div>
+              )}
+            </div>
 
-            {/* Row 4 — Cross-WO arbitration. Off by default during opt-in
-                rollout; flipping it on means concurrent WOs at the same
-                location queue against a shared resource calendar instead
-                of stacking their rates past pool size. */}
-            <label
-              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', marginTop: '0.45rem' }}
-              title={tP('config.enableGlobalSchedulingTooltip')}
-            >
-              <input
-                type="checkbox"
-                checked={planningConfig.enable_global_scheduling !== false}
-                onChange={(e) => setPlanningConfig((c) => ({ ...c, enable_global_scheduling: e.target.checked }))}
+            {/* ── Scheduling ── */}
+            <div style={{ marginTop: '0.65rem', borderTop: '1px solid #27272a', paddingTop: '0.4rem' }}>
+              <div style={{ fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.3rem' }}>
+                {tP('config.subheadScheduling')}
+              </div>
+              <label
+                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}
+                title={tP('config.enableGlobalSchedulingTooltip')}
+              >
+                <input
+                  type="checkbox"
+                  checked={planningConfig.enable_global_scheduling !== false}
+                  onChange={(e) => setPlanningConfig((c) => ({ ...c, enable_global_scheduling: e.target.checked }))}
+                />
+                <span>{tP('config.enableGlobalScheduling')}</span>
+              </label>
+            </div>
+
+            {/* ── Constraints ── */}
+            <div style={{ marginTop: '0.65rem', borderTop: '1px solid #27272a', paddingTop: '0.4rem' }}>
+              <div style={{ fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.15rem' }}>
+                {tP('config.subheadConstraints')}
+              </div>
+              <ConstraintPicker
+                options={constraintOptions}
+                constraints={planningConfig.constraints ?? []}
+                onChange={(next) => setPlanningConfig((c) => ({ ...c, constraints: next }))}
+                defaultCollapsed
+                tP={tP}
               />
-              <span>{tP('config.enableGlobalScheduling')}</span>
-            </label>
-            <ConstraintPicker
-              options={constraintOptions}
-              constraints={planningConfig.constraints ?? []}
-              onChange={(next) => setPlanningConfig((c) => ({ ...c, constraints: next }))}
-              defaultCollapsed
-              tP={tP}
-            />
+            </div>
           </fieldset>
 
           {/* ── Group 2: Post-plan handling (run AFTER planning, do not affect planner) ── */}

@@ -282,6 +282,10 @@
     },
     "config": {
       "groupMethodSelection": "Configurations",
+      "subheadMethod": "Method",
+      "subheadPurchase": "Purchase",
+      "subheadScheduling": "Scheduling",
+      "subheadConstraints": "Constraints",
       "groupPostPlan": "Post-plan handling",
       "groupConstraints": "Constraints",
       "constraintShow": "Show constraints",

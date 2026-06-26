@@ -282,6 +282,10 @@
     },
     "config": {
       "groupMethodSelection": "计划配置",
+      "subheadMethod": "方法",
+      "subheadPurchase": "采购",
+      "subheadScheduling": "排程",
+      "subheadConstraints": "约束条件",
       "groupPostPlan": "计划后处理",
       "groupConstraints": "约束规则",
       "constraintShow": "展开约束",
