@@ -281,9 +281,8 @@
       }
     },
     "config": {
-      "groupMethodSelection": "Method selection",
-      "groupConsolidation": "Demand consolidation",
-      "groupPostPlan": "Post-plan analysis",
+      "groupMethodSelection": "Configurations",
+      "groupPostPlan": "Post-plan handling",
       "groupConstraints": "Constraints",
       "constraintShow": "Show constraints",
       "constraintHide": "Hide constraints",
@@ -330,7 +329,7 @@
       "enableGlobalSchedulingTooltip": "When on (default), the planner walks WOs in (priority desc, due-date asc, start asc) order and pushes a WO's start later if its required resources are already reserved by earlier WOs at the same location. Uncheck to revert to the legacy single-WO parallelism behavior.",
       "consolidate": "Consolidate shared components in two passes: pool on-hand inventory across competing demands (split by policy), then batch the resulting make/move/buy work orders that fall in the same scheduling window",
       "bucketDays": "WO batch window (days):",
-      "bucketDaysTooltip": "Scheduling window for Pass 2 (work-order batching): same-component make/move/buy orders that start within this many days are merged into one batch. 0 = one batch per component across the whole horizon. Inventory allocation (Pass 1) is unaffected — it always pools on-hand stock universally (bucket 0) for fairness across all demands.",
+      "bucketDaysTooltip": "Batch the resulting make/move/buy work orders that fall in the same scheduling window. 0 = one batch per component across the whole horizon.",
       "splitPolicy": "Split policy:",
       "maxIter": "Max iter #:",
       "maxIterTooltip": "Max Pass-1 inventory-allocation passes (1–15). 1 (default) = a single fast pass, but a demand can be allocated more stock than it uses, orphaning the slack (fine when supply is ample). Set higher (e.g. 15) when supply-constrained to re-run the over-claim/compensate/converge loop, which reclaims orphaned allocations for tighter inventory utilization — at higher runtime.",

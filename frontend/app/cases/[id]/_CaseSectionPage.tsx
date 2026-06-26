@@ -4788,7 +4788,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       <section>
         <h2>{tSec('planning')}</h2>
         <div style={{ marginBottom: '0.75rem' }}>
-          {/* ── Group 1: Method selection (how methods are ranked + tried per demand) ── */}
+          {/* ── Group 1: Configurations (how methods are ranked + tried per demand) ── */}
           <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.65rem', margin: '0 0 0.55rem' }}>
             <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
               {tP('config.groupMethodSelection')}
@@ -4892,11 +4892,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             </label>
           </fieldset>
 
-          {/* ── Group 2: Demand consolidation (always on; sub-controls are the only knobs) ── */}
+          {/* ── Group 2: Post-plan handling (run AFTER planning, do not affect planner) ── */}
           <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
-            <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}
-              title={tP('config.consolidate')}>
-              {tP('config.groupConsolidation')} ⓘ
+            <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              {tP('config.groupPostPlan')}
             </legend>
             <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
               <label
@@ -4917,15 +4916,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   style={{ width: 64, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
                 />
               </label>
-            </div>
-          </fieldset>
-
-          {/* ── Group 3: Post-plan analysis (run AFTER planning, do not affect planner) ── */}
-          <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
-            <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-              {tP('config.groupPostPlan')}
-            </legend>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
               <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
                 <input
                   type="checkbox"
