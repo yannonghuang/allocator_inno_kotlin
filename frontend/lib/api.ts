@@ -425,8 +425,6 @@ export type PlanningConfig = {
     enabled?: boolean;
     /** Width of the time bucket in days (0–365). 0 (default) collapses every demand into a single bucket regardless of due date. */
     period_days?: number;
-    /** How to split consolidated output among competing demands. Default: fair. */
-    allocation_mode?: 'priority_first' | 'proportional' | 'fair';
     /**
      * Max Pass-1 allocation iterations (1–15). 1 (default) = single fast pass but may
      * orphan slack inventory; >1 re-runs the over-claim/compensate/converge loop for

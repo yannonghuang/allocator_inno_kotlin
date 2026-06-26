@@ -900,7 +900,7 @@
       "off": "off",
       "naturalLangInfo": "Ask in natural language: run a plan, explain why a demand committed partial, compare two runs, recheck soundness, schedule a shutdown / maintenance window, and more.",
       "configSummary": "Methods: {methods}. Purchase: {purchase}. Consolidation: {consolidation}.",
-      "consolidationOnDetail": "on · {days}d · {split}",
+      "consolidationOnDetail": "on · {days}d",
       "splitProportional": "proportional",
       "splitPriorityFirst": "priority-first",
       "splitFair": "fair",

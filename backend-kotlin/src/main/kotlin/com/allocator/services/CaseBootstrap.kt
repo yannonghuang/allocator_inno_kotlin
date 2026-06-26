@@ -74,7 +74,6 @@ private fun cfg(
     depth: Int = 1,
     maxBomDepth: Int = 3,                              // make-fallback admission cap (default 3)
     weights: Triple<Double, Double, Double>? = null,   // (commit, inventory, purchase)
-    allocationMode: String = "fair",                   // "fair" | "proportional" | "priority_first"
     consolidationEnabled: Boolean = true,
     periodDays: Int = 30,
     purchaseAllowed: Boolean = false,
@@ -104,7 +103,6 @@ private fun cfg(
     putJsonObject("consolidation") {
         put("enabled", consolidationEnabled)
         put("period_days", periodDays)
-        put("allocation_mode", allocationMode)
     }
     putJsonObject("variant_selection") {
         put("multiple", true)
@@ -123,7 +121,6 @@ object CaseBootstrap {
     private const val AXIS_MAX        = "max_methods"
     private const val AXIS_DEPTH      = "depth"
     private const val AXIS_BOM_DEPTH  = "max_bom_depth"
-    private const val AXIS_ALLOC      = "allocation_mode"
     private const val AXIS_CONSOLID   = "consolidation"
     private const val AXIS_PURCHASE   = "purchase"
     private const val AXIS_ELABORATE  = "elaborate"
@@ -165,10 +162,6 @@ object CaseBootstrap {
         // max_bom_depth axis: make-fallback admission cap. Default is 3, so we
         // include 1 (no make-fallback), 2, 4, 5 to bracket sensitivity.
         for (n in listOf(1, 2, 4, 5)) add("bom_depth=$n", AXIS_BOM_DEPTH, cfg(maxBomDepth = n))
-
-        // Allocation mode axis.
-        add("alloc=proportional",   AXIS_ALLOC, cfg(allocationMode = "proportional"))
-        add("alloc=priority_first", AXIS_ALLOC, cfg(allocationMode = "priority_first"))
 
         // Consolidation axis.
         add("consolidation=off", AXIS_CONSOLID, cfg(consolidationEnabled = false))
@@ -456,7 +449,6 @@ object CaseBootstrap {
             "max_methods" -> cfg(maxMethods = (parsedValue as? Number)?.toInt() ?: 1)
             "depth" -> cfg(depth = (parsedValue as? Number)?.toInt() ?: 1)
             "max_bom_depth" -> cfg(maxBomDepth = (parsedValue as? Number)?.toInt() ?: 3)
-            "allocation_mode" -> cfg(allocationMode = (parsedValue as? String) ?: "fair")
             "consolidation_enabled" -> cfg(consolidationEnabled = (parsedValue as? Boolean) ?: true)
             "period_days" -> cfg(periodDays = (parsedValue as? Number)?.toInt() ?: 30)
             "purchase_allowed" -> cfg(purchaseAllowed = (parsedValue as? Boolean) ?: false)

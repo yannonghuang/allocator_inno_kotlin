@@ -900,7 +900,7 @@
       "off": "关",
       "naturalLangInfo": "用自然语言提问：运行计划、解释某个需求为何只部分满足、对比两次运行、重新校验合理性、停产/检修窗口排程等。",
       "configSummary": "方法：{methods}。采购：{purchase}。合并：{consolidation}。",
-      "consolidationOnDetail": "开 · {days}天 · {split}",
+      "consolidationOnDetail": "开 · {days}天",
       "splitProportional": "按比例",
       "splitPriorityFirst": "优先级优先",
       "splitFair": "公平",

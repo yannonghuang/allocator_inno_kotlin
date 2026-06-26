@@ -776,27 +776,6 @@ function formatCommitReason(reason: string, purchaseAllowed: boolean): { label: 
   const tooltip = chain.map(c => `${c.product} @ ${c.location}`).join(' → ') + ` → ${rootCause}`;
   return { label, tooltip };
 }
-/**
- * Human-readable description of a consolidation split policy.
- * Used in both the WO and Supply Explain panels so users can see what
- * "Fair" / "Proportional" / "Priority first" actually mean — the formula,
- * what it splits with respect to, and the shortage behaviour.
- */
-function splitPolicyExplanation(
-  mode: string | null | undefined,
-  tP: (k: string) => string,
-): { headline: string; detail: string } {
-  switch (mode) {
-    case 'proportional':
-      return { headline: tP('policyExp.proportionalHeadline'), detail: tP('policyExp.proportionalDetail') };
-    case 'priority_first':
-      return { headline: tP('policyExp.priorityFirstHeadline'), detail: tP('policyExp.priorityFirstDetail') };
-    case 'fair':
-      return { headline: tP('policyExp.fairHeadline'), detail: tP('policyExp.fairDetail') };
-    default:
-      return { headline: mode ?? tP('policyExp.unknownHeadline'), detail: tP('policyExp.unknownDetail') };
-  }
-}
 
 import { PeggingTree, pathKeyFromPath, type PeggingGraph } from '@/app/components/PeggingTree';
 import BomGraphTab from '@/app/components/BomGraphTab';
@@ -1404,7 +1383,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // Buyable raw materials for the selective-purchase whitelist dropdown + copilot /raw picker.
   const [purchasableOptions, setPurchasableOptions] = useState<PurchasableRawMaterial[]>([]);
   const [constraintOptions, setConstraintOptions] = useState<ConstraintOptions>({ customers: [], parents: [] });
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 30, allocation_mode: 'fair' }, purchase_allowed: false, purchasable_materials: [], constraints: [], analyze_criticality: false, check_soundness: true, enable_global_scheduling: true });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 30 }, purchase_allowed: false, purchasable_materials: [], constraints: [], analyze_criticality: false, check_soundness: true, enable_global_scheduling: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1504,7 +1483,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (Number(ms.max_methods) !== 1) diffs.push(`max_methods: 1 → ${ms.max_methods}`);
     if (Number(ms.depth) !== 1) diffs.push(`depth: 1 → ${ms.depth}`);
     if (ms.max_bom_depth != null && Number(ms.max_bom_depth) !== 3) diffs.push(`max_bom_depth: 3 → ${ms.max_bom_depth}`);
-    if (cs.allocation_mode !== 'fair') diffs.push(`allocation_mode: fair → ${cs.allocation_mode}`);
     if (Number(cs.period_days ?? 30) !== 30) diffs.push(`period_days: 30 → ${cs.period_days}`);
     if (config.purchase_allowed === true) diffs.push(`purchase: off → on`);
     return diffs.join(' · ');
@@ -1528,7 +1506,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (sw && (sw.commit_time != null || sw.inventory_consumed != null || sw.purchase != null)) {
       parts.push(`w=(${Number(sw.commit_time ?? 0)}, ${Number(sw.inventory_consumed ?? 0)}, ${Number(sw.purchase ?? 0)})`);
     }
-    parts.push(`alloc=${cs.allocation_mode ?? 'fair'}`);
     parts.push(`cons=${cs.enabled === false ? 'off' : 'on'}`);
     if (Number(cs.period_days ?? 30) !== 30) parts.push(`p=${cs.period_days}`);
     parts.push(`purch=${config.purchase_allowed === true ? 'on' : 'off'}`);
@@ -1546,7 +1523,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     consolidation: {
       enabled: true,
       period_days: 30,
-      allocation_mode: 'fair',
     },
     variant_selection: { multiple: true },
     purchase_allowed: false,
@@ -1565,7 +1541,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       case 'max_methods':         ms.max_methods = value; break;
       case 'depth':               ms.depth = value; break;
       case 'scope':               cs.scope = value; break;
-      case 'allocation_mode':     cs.allocation_mode = value; break;
       case 'consolidation_enabled': cs.enabled = value; break;
       case 'period_days':         cs.period_days = value; break;
       case 'purchase_allowed':    cfg.purchase_allowed = value; break;
@@ -3323,7 +3298,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         const candidateCount = entry.consolidated_demand_ids?.length ?? 0;
         if (!rootPid || (totalNeed <= 0 && totalProduced <= 0)) continue;
         info = {
-          mode: fallbackMode ?? (planningConfig.consolidation?.allocation_mode ?? 'fair'),
+          mode: fallbackMode ?? 'fair',
           groupProductId: rootPid,
           groupLocationId: rootLid,
           groupTotalNeed: totalNeed,
@@ -4942,21 +4917,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   style={{ width: 64, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
                 />
               </label>
-              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }}>
-                <span style={{ color: '#a1a1aa' }}>{tP('config.splitPolicy')}</span>
-                <select
-                  value={planningConfig.consolidation?.allocation_mode ?? 'fair'}
-                  onChange={(e) => setPlanningConfig((c) => ({
-                    ...c,
-                    consolidation: { ...c.consolidation, allocation_mode: e.target.value as 'priority_first' | 'proportional' | 'fair' },
-                  }))}
-                  style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
-                >
-                  <option value="fair">{tP('config.fair')}</option>
-                  <option value="proportional">{tP('config.proportional')}</option>
-                  <option value="priority_first">{tP('config.priorityFirst')}</option>
-                </select>
-              </label>
               <label
                 style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }}
                 title={tP('config.maxIterTooltip')}
@@ -5069,7 +5029,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               },
               purchase_allowed: false,
               constraints: [],
-              consolidation: { enabled: true, period_days: 30, allocation_mode: 'fair' },
+              consolidation: { enabled: true, period_days: 30 },
             })}
             title={tP('config.resetDefaultsTitle')}
             style={{ padding: '6px 12px' }}
@@ -8070,18 +8030,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                       })}
                                       style={{ ...inputStyle, width: 64 }} />
                                   </label>
-                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editAllocation')}</span>
-                                    <select value={String(cs.allocation_mode ?? 'fair')}
-                                      onChange={(e) => updateConfig((c) => {
-                                        const v = (c.consolidation ?? {}) as Record<string, unknown>;
-                                        v.allocation_mode = e.target.value; c.consolidation = v;
-                                      })} style={inputStyle}>
-                                      <option value="fair">fair</option>
-                                      <option value="proportional">proportional</option>
-                                      <option value="priority_first">priority_first</option>
-                                    </select>
-                                  </label>
                                 </div>
                                 {isEdited && (
                                   <div style={{ marginTop: 6 }}>
@@ -9197,85 +9145,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   </>
                 )}
               </section>
-              {/* Consolidation split */}
-              {woExplainRow.wo_consolidation_split_details && woExplainRow.wo_consolidation_split_details.length > 1 && (
-                <section style={{ marginBottom: '1.25rem' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
-                    <h4 style={{ margin: 0, color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('woExplain.consolidationSplit')}</h4>
-                    <button
-                      type="button"
-                      className="secondary"
-                      style={{ fontSize: '0.72rem', padding: '2px 8px' }}
-                      onClick={() => { setWoExplainOpen(false); setWoExplainKey(null); openOverrideDialog('component_split', woExplainRow); }}
-                    >
-                      {tP('woExplain.overrideSplit')}
-                    </button>
-                  </div>
-                  <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem' }}>
-                    {tP('woExplain.consolidatedFor')} <strong>{woExplainRow.wo_consolidation_split_details.length}</strong> {tP('woExplain.demandsTotal')} <strong>{qtyFmt(woExplainRow.wo_consolidation_total_planned ?? 0)}</strong>).
-                    {' '}{tP('woExplain.splitMode')} <strong>{woExplainRow.wo_consolidation_split_mode === 'proportional' ? tP('woExplain.proportional') : woExplainRow.wo_consolidation_split_mode === 'priority_first' ? tP('woExplain.priorityFirst') : tP('woExplain.splitFair')}</strong>.
-                  </p>
-                  {(() => {
-                    const exp = splitPolicyExplanation(woExplainRow.wo_consolidation_split_mode, tP);
-                    const overrideActive = woExplainRow.consolidation_override_active === true;
-                    return (
-                      <div style={{ margin: '0 0 0.6rem', padding: '0.55rem 0.75rem', background: '#27272a', borderRadius: 6, borderLeft: '3px solid #67e8f9' }}>
-                        <div style={{ fontSize: '0.78rem', color: '#67e8f9', marginBottom: '0.25rem', fontWeight: 600 }}>{exp.headline}</div>
-                        <p style={{ margin: 0, fontSize: '0.78rem', color: '#a1a1aa', lineHeight: 1.5 }}>{exp.detail}</p>
-                        <p style={{ margin: '0.4rem 0 0', fontSize: '0.72rem', color: '#71717a', fontStyle: 'italic' }}>
-                          {overrideActive
-                            ? <>{tP('woExplain.policySourceOverridePre')} <code style={{ background: '#1c1c1e', padding: '0 4px', borderRadius: 3 }}>component_split</code> {tP('woExplain.policySourceOverridePost')}</>
-                            : <>{tP('woExplain.policySourceConfigPre')} <code style={{ background: '#1c1c1e', padding: '0 4px', borderRadius: 3 }}>consolidation.allocation_mode</code> {tP('woExplain.policySourceConfigMid')} <em>{tP('woExplain.overrideSplit')}</em> {tP('woExplain.policySourceConfigSuffix')}</>}
-                        </p>
-                      </div>
-                    );
-                  })()}
-                  <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse' }}>
-                    <thead>
-                      <tr style={{ color: '#a1a1aa', textAlign: 'left' }}>
-                        <th style={{ paddingBottom: '0.2rem' }}>{tP('woExplain.columns.demand')}</th>
-                        <th style={{ paddingBottom: '0.2rem' }}>{tP('woExplain.columns.parentProduct')}</th>
-                        <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('woExplain.columns.priority')}</th>
-                        <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('woExplain.columns.requested')}</th>
-                        <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('woExplain.columns.allocated')}</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {woExplainRow.wo_consolidation_split_details.map((row, i) => (
-                        <tr key={i} style={{ borderTop: '1px solid #3d3d40' }}>
-                          <td style={{ padding: '0.2rem 0.4rem 0.2rem 0' }}>
-                            {(() => {
-                              if (!row.demand_id) return '–';
-                              const dRow = (planResult?.committed_demands ?? []).find((d) => d.demand_id === row.demand_id) ?? null;
-                              if (!dRow) return row.demand_id;
-                              const dKey = `demand|${row.demand_id}|${dRow.product_id ?? ''}|${dRow.location_id ?? ''}`;
-                              return (
-                                <button
-                                  type="button"
-                                  style={{ background: 'none', border: 'none', padding: 0, color: '#60a5fa', cursor: 'pointer', fontSize: 'inherit', fontFamily: 'inherit', textDecoration: 'underline' }}
-                                  onClick={() => {
-                                    setPreviousWoExplainRow(woExplainRow);
-                                    setPlanPeggingContext({ type: 'demand', row: dRow });
-                                    setPlanPeggingOpen(true);
-                                    setWoPeggingRowKey(dKey);
-                                    setWoExplainOpen(false);
-                                  }}
-                                >{row.demand_id}</button>
-                              );
-                            })()}
-                          </td>
-                          <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', color: '#a1a1aa' }}>{row.parent_product}</td>
-                          <td style={{ padding: '0.2rem 0', textAlign: 'right' }}>{row.priority}</td>
-                          <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right' }}>{qtyFmt(row.requested_qty)}</td>
-                          <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right', color: row.allocated_qty < row.requested_qty - 0.01 ? '#f87171' : '#4ade80' }}>
-                            {qtyFmt(row.allocated_qty)}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </section>
-              )}
               {/* Supply alternatives */}
               <section style={{ marginBottom: '1.25rem' }}>
                 <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('woExplain.supplyAlts')}</h4>
@@ -9873,14 +9742,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     : tP('copilot.oneByPreference')}.{' '}
                 <strong>{tP('copilot.purchase')}</strong> {planningConfig.purchase_allowed === false ? tP('copilot.disabled') : tP('copilot.allowed')}.{' '}
                 <strong>{tP('copilot.consolidation')}</strong> {planningConfig.consolidation?.enabled === true
-                  ? tP('copilot.consolidationOnDetail', {
-                      days: planningConfig.consolidation.period_days ?? 30,
-                      split: planningConfig.consolidation.allocation_mode === 'proportional'
-                        ? tP('copilot.splitProportional')
-                        : planningConfig.consolidation.allocation_mode === 'priority_first'
-                          ? tP('copilot.splitPriorityFirst')
-                          : tP('copilot.splitFair'),
-                    })
+                  ? tP('copilot.consolidationOnDetail', { days: planningConfig.consolidation.period_days ?? 30 })
                   : tP('copilot.off')}. {tP('copilot.naturalLangInfo')}
               </p>
             </div>
