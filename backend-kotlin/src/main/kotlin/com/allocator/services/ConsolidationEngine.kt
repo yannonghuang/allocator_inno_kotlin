@@ -104,7 +104,6 @@ fun buildSupplyCapMap(
 data class ConsolidationConfig(
     val enabled: Boolean = false,
     val periodDays: Int = 30,
-    val maxIterations: Int = 1,
     /**
      * When true, Pass-1 inventory-consolidation re-supplies the depleted on-hand stock to per-demand
      * planning using the REAL `supply_id`s (distributed across the original lots) instead of a
@@ -124,8 +123,7 @@ fun parseConsolidationConfig(config: Map<String, Any?>?): ConsolidationConfig {
     val m = sub as? Map<String, Any?> ?: return ConsolidationConfig()
     val enabled = m["enabled"] as? Boolean ?: false
     val periodDays = ((m["period_days"] as? Number)?.toInt() ?: 30).coerceIn(0, 365)
-    val maxIterations = ((m["max_iterations"] ?: m["max_iter"]) as? Number)?.toInt()?.coerceIn(1, 15) ?: 1
     val realPegging = m["real_pegging"] as? Boolean ?: true
-    return ConsolidationConfig(enabled, periodDays, maxIterations, realPegging)
+    return ConsolidationConfig(enabled, periodDays, realPegging)
 }
 

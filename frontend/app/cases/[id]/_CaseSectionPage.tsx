@@ -4917,24 +4917,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   style={{ width: 64, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
                 />
               </label>
-              <label
-                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }}
-                title={tP('config.maxIterTooltip')}
-              >
-                <span style={{ color: '#a1a1aa' }}>{tP('config.maxIter')}</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={15}
-                  value={planningConfig.consolidation?.max_iterations ?? 1}
-                  onChange={(e) => {
-                    const raw = parseInt(e.target.value, 10);
-                    const v = Math.max(1, Math.min(15, Number.isNaN(raw) ? 1 : raw));
-                    setPlanningConfig((c) => ({ ...c, consolidation: { ...c.consolidation, max_iterations: v } }));
-                  }}
-                  style={{ width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
-                />
-              </label>
             </div>
           </fieldset>
 

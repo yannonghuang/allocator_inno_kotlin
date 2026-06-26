@@ -425,12 +425,6 @@ export type PlanningConfig = {
     enabled?: boolean;
     /** Width of the time bucket in days (0–365). 0 (default) collapses every demand into a single bucket regardless of due date. */
     period_days?: number;
-    /**
-     * Max Pass-1 allocation iterations (1–15). 1 (default) = single fast pass but may
-     * orphan slack inventory; >1 re-runs the over-claim/compensate/converge loop for
-     * tighter inventory utilization (use when supply-constrained), slower.
-     */
-    max_iterations?: number;
   };
   /**
    * Post-plan UI behavior toggles. These do not affect planner output — they
