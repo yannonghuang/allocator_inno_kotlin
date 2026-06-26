@@ -4890,6 +4890,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               />
               <span>{tP('config.enableGlobalScheduling')}</span>
             </label>
+            <ConstraintPicker
+              options={constraintOptions}
+              constraints={planningConfig.constraints ?? []}
+              onChange={(next) => setPlanningConfig((c) => ({ ...c, constraints: next }))}
+              defaultCollapsed
+              tP={tP}
+            />
           </fieldset>
 
           {/* ── Group 2: Post-plan handling (run AFTER planning, do not affect planner) ── */}
@@ -4938,19 +4945,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             </div>
           </fieldset>
 
-          {/* ── Group 4: Constraints (customer-specific BOM-alternative pins) ── */}
-          <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
-            <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-              {tP('config.groupConstraints')}
-            </legend>
-            <ConstraintPicker
-              options={constraintOptions}
-              constraints={planningConfig.constraints ?? []}
-              onChange={(next) => setPlanningConfig((c) => ({ ...c, constraints: next }))}
-              defaultCollapsed
-              tP={tP}
-            />
-          </fieldset>
           <br style={{ marginTop: '0.25rem' }} />
           <button
             type="button"
