@@ -657,7 +657,7 @@ function ConstraintPicker({
         <span style={{ color: '#a1a1aa' }}>{`(${constraints.length})`}</span>
       </button>
       {!collapsed && (
-        <div style={{ marginTop: 4 }}>
+        <div style={{ marginTop: '0.35rem', marginLeft: '1.5rem' }}>
           <div style={{ fontSize: '0.7rem', color: '#71717a', marginBottom: 4 }}>{tP('config.constraintHint')}</div>
           {options.parents.length === 0 ? (
             <div style={{ fontSize: '0.72rem', color: '#71717a' }}>{tP('config.constraintNoAlternatives')}</div>
