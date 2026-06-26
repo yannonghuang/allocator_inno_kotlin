@@ -4855,7 +4855,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   checked={planningConfig.purchase_allowed !== false}
                   onChange={(e) => setPlanningConfig((c) => ({ ...c, purchase_allowed: e.target.checked }))}
                 />
-                <span>{tP('config.purchaseAllowed')}</span>
+                <span style={{ fontSize: '0.875rem' }}>{tP('config.purchaseAllowed')}</span>
               </label>
               {planningConfig.purchase_allowed !== false && (
                 <div style={{ marginTop: '0.35rem', marginLeft: '1.5rem' }}>
@@ -4891,13 +4891,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   checked={planningConfig.enable_global_scheduling !== false}
                   onChange={(e) => setPlanningConfig((c) => ({ ...c, enable_global_scheduling: e.target.checked }))}
                 />
-                <span>{tP('config.enableGlobalScheduling')}</span>
+                <span style={{ fontSize: '0.875rem' }}>{tP('config.enableGlobalScheduling')}</span>
               </label>
             </div>
 
             {/* ── Constraints ── */}
             <div style={{ marginTop: '0.65rem', borderTop: '1px solid #27272a', paddingTop: '0.4rem' }}>
-              <div style={{ fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.15rem' }}>
+              <div style={{ fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.3rem' }}>
                 {tP('config.subheadConstraints')}
               </div>
               <ConstraintPicker
