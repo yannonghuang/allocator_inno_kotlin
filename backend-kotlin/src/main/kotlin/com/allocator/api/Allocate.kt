@@ -563,7 +563,20 @@ fun Routing.allocateRoutes() {
         call.respond(buildJsonObject {
             put("status", job["status"]?.toString() ?: "unknown")
             put("progress", anyToJson(job["progress"]))
-            if (job["result"] != null) put("result", anyToJson(job["result"]))
+            // result is held in-memory only for non-autoSave or serialization-failed runs.
+            // For normal completed autoSave runs, result was persisted to DB — read it from
+            // there so the large JVM object graph is not kept alive in planJobs indefinitely.
+            val cachedResult = job["result"]
+            when {
+                cachedResult != null -> put("result", anyToJson(cachedResult))
+                job["status"] == "completed" -> planJobRunIds[jobId]?.let { runId ->
+                    val resultJson = transaction {
+                        PlanRuns.select(PlanRuns.result).where { PlanRuns.id eq runId }
+                            .singleOrNull()?.get(PlanRuns.result)
+                    }
+                    if (resultJson != null) put("result", Json.parseToJsonElement(resultJson))
+                }
+            }
             if (job["error"] != null) put("error", job["error"]?.toString() ?: "")
             planJobRunIds[jobId]?.let { put("plan_run_id", it) }
         })
@@ -2484,6 +2497,12 @@ internal suspend fun runPlanBackground(
     // data and the new enriched result, tripling peak heap usage.
     casePlanResults.remove(caseId)
 
+    // Evict terminal planJobs entries for this case — without this, every completed
+    // run accumulates its enriched result (or DB pointer) in planJobs indefinitely.
+    planJobs.entries.filter { (_, j) -> j["case_id"] == caseId && j["status"] in setOf("completed", "failed") }
+        .map { it.key }
+        .forEach { jid -> planJobs.remove(jid); planJobRunIds.remove(jid) }
+
     try {
         val total = data["demand"]?.size ?: 0
         val progressCb: (Map<String, Any?>) -> Unit = { p ->
@@ -2579,7 +2598,10 @@ internal suspend fun runPlanBackground(
         // Surface completion to the frontend immediately — pegging save runs in background.
         planJobs[jobId]?.let { job ->
             job["status"] = "completed"
-            job["result"] = enriched - "planning_pegging"
+            // For autoSave runs that persisted successfully, the status endpoint reads
+            // the result from DB rather than holding the 500MB+ enriched map here forever.
+            // Only keep in-memory when serialization failed (result is lost from DB).
+            if (!autoSave || serializeFailed) job["result"] = enriched - "planning_pegging"
             job["progress"] = mapOf("current" to total, "total" to total)
         }
 
