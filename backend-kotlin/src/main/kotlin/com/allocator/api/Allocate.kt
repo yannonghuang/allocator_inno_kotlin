@@ -1549,12 +1549,23 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
     }
 
     val report = try {
-        val (resultJson, overrideSnapshotJson) = transaction {
+        data class SoundnessInputs(
+            val resultJson: String?,
+            val overrideSnapshotJson: String?,
+            val invInitialJson: String?,
+            val invLeftoverJson: String?,
+        )
+        val inputs = transaction {
             val row = PlanRuns.selectAll().where { PlanRuns.id eq runId }.single()
-            Pair(row[PlanRuns.result], row[PlanRuns.overrideSnapshot])
+            SoundnessInputs(
+                resultJson = row[PlanRuns.result],
+                overrideSnapshotJson = row[PlanRuns.overrideSnapshot],
+                invInitialJson = row[PlanRuns.inventoryEffectiveInitial],
+                invLeftoverJson = row[PlanRuns.inventoryLeftover],
+            )
         }
-        if (resultJson == null) throw IllegalStateException("Plan run has no result to check")
-        val resultElement = Json.parseToJsonElement(resultJson)
+        if (inputs.resultJson == null) throw IllegalStateException("Plan run has no result to check")
+        val resultElement = Json.parseToJsonElement(inputs.resultJson)
         @Suppress("UNCHECKED_CAST")
         val resultMap = jsonElementToNative(resultElement) as? Map<String, Any?>
             ?: throw IllegalStateException("Plan run result is not a JSON object")
@@ -1565,7 +1576,7 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
         @Suppress("UNCHECKED_CAST")
         val committedDemandsForCheck = (resultMap["committed_demands"] as? List<Map<String, Any?>>) ?: emptyList()
         @Suppress("UNCHECKED_CAST")
-        val overrideRows: List<Map<String, Any?>> = overrideSnapshotJson?.let {
+        val overrideRows: List<Map<String, Any?>> = inputs.overrideSnapshotJson?.let {
             runCatching {
                 val parsed = Json.parseToJsonElement(it)
                 (jsonElementToNative(parsed) as? List<Map<String, Any?>>) ?: emptyList()
@@ -1575,6 +1586,25 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
         val data = transaction { CaseLoader.load(caseId) }
         @Suppress("UNCHECKED_CAST")
         val demands = (data["demand"] as? List<Map<String, Any?>>) ?: emptyList()
+        // R7e: parse persisted inventory snapshots if available.
+        @Suppress("UNCHECKED_CAST")
+        fun parseInvJson(json: String?): List<Map<String, Any?>> = json?.let {
+            runCatching { (jsonElementToNative(Json.parseToJsonElement(it)) as? List<Map<String, Any?>>) ?: emptyList() }.getOrElse { emptyList() }
+        } ?: emptyList()
+        val inventoryInitial = parseInvJson(inputs.invInitialJson)
+        val inventoryLeftover = parseInvJson(inputs.invLeftoverJson)
+        // R7e: load persisted supply allocations from plan_supply_allocation table.
+        val supplyAllocations: List<Map<String, Any?>> = if (inventoryInitial.isNotEmpty()) {
+            transaction {
+                PlanSupplyAllocations.selectAll()
+                    .where { PlanSupplyAllocations.planRunId eq runId }
+                    .map { row -> mapOf(
+                        "supply_id"    to row[PlanSupplyAllocations.supplyId],
+                        "demand_id"    to row[PlanSupplyAllocations.demandId],
+                        "qty_consumed" to row[PlanSupplyAllocations.qtyConsumed],
+                    )}
+            }
+        } else emptyList()
         com.allocator.services.checkRunSoundness(
             planningPegging = planningPegging,
             demands = demands,
@@ -1583,6 +1613,9 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
             workOrders = workOrders,
             committedDemands = committedDemandsForCheck,
             overrideIndex = overrideIndexForCheck,
+            inventoryEffectiveInitial = inventoryInitial,
+            inventoryLeftover = inventoryLeftover,
+            supplyAllocations = supplyAllocations,
         )
     } catch (e: Exception) {
         transaction {
@@ -1631,6 +1664,9 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
                     put("actual", anyToJson(v.actual))
                 }
             }
+        }
+        putJsonArray("conservation_violations") {
+            for (msg in report.conservationViolations) add(JsonPrimitive(msg))
         }
     }
     transaction {
@@ -2500,6 +2536,13 @@ internal suspend fun runPlanBackground(
         // "completed" to the frontend. Pegging and KB upsert are fire-and-forget.
         val resultJson = if (autoSave) serializeResultOrNull(enriched) else null
         val serializeFailed = autoSave && resultJson == null
+        // Serialize inventory snapshots for R7e soundness check (compact — supply_id + qty only).
+        val invInitialJson = if (autoSave && !serializeFailed)
+            runCatching { anyToJson(raw.inventoryEffectiveInitial.map { mapOf("supply_id" to it["supply_id"], "qty" to it["qty"]) }).toString() }.getOrNull()
+        else null
+        val invLeftoverJson = if (autoSave && !serializeFailed)
+            runCatching { anyToJson(raw.inventoryLeftover.map { mapOf("supply_id" to it["supply_id"], "qty" to it["qty"]) }).toString() }.getOrNull()
+        else null
         transaction {
             PlanRuns.update({ PlanRuns.id eq planRunId }) {
                 it[PlanRuns.status] = when {
@@ -2510,6 +2553,8 @@ internal suspend fun runPlanBackground(
                 if (serializeFailed) it[PlanRuns.error] = resultTooLargeError(enriched)
                 it[PlanRuns.finishedAt] = kotlinx.datetime.Clock.System.now()
                 if (autoSave && resultJson != null) it[PlanRuns.result] = resultJson
+                if (invInitialJson != null) it[PlanRuns.inventoryEffectiveInitial] = invInitialJson
+                if (invLeftoverJson != null) it[PlanRuns.inventoryLeftover] = invLeftoverJson
             }
             if (autoSave && !serializeFailed) {
                 @Suppress("UNCHECKED_CAST")

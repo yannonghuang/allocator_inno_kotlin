@@ -266,6 +266,10 @@ object PlanRuns : Table("plan_run") {
     /** User-controlled active flag used by /resolve. Multiple rows may be active; latest id wins.
      *  When no row is active for a case, /resolve falls back to the latest run by id within that case. */
     val active = bool("active").default(false)
+    /** JSON: inventory snapshot AFTER supply-split overrides, BEFORE planning. Used by R7e soundness check. */
+    val inventoryEffectiveInitial = text("inventory_effective_initial").nullable()
+    /** JSON: inventory snapshot AFTER all planning passes (physical supply leftover). Used by R7e soundness check. */
+    val inventoryLeftover = text("inventory_leftover").nullable()
     override val primaryKey = PrimaryKey(id)
 }
 
