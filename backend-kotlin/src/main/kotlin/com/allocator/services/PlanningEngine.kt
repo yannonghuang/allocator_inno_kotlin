@@ -3683,8 +3683,9 @@ private fun prunePhantomLoops(
     val explicitlyFailed = node["failed"] == true
     val descendantInsideFailedWo = insideFailedWo || (type == "work_order" && explicitlyFailed)
 
-    val prunedChildren = (node["children"] as? List<Map<String, Any?>>)
-        ?.mapNotNull { prunePhantomLoops(it, isRoot = false, parentIsMoveWo = isMoveWo, insideFailedWo = descendantInsideFailedWo) } ?: emptyList()
+    val originalChildren = node["children"] as? List<Map<String, Any?>> ?: emptyList()
+    val prunedChildren = originalChildren
+        .mapNotNull { prunePhantomLoops(it, isRoot = false, parentIsMoveWo = isMoveWo, insideFailedWo = descendantInsideFailedWo) }
 
     // Preserve explicitly-failed work_orders even when empty — they're
     // diagnostic markers (failed move with cycle_stopped child pruned out,
@@ -3695,6 +3696,9 @@ private fun prunePhantomLoops(
     // not real component demands (children of make WOs or the root).
     if (type == "demand" && prunedChildren.isEmpty() && !isRoot && parentIsMoveWo) return null
 
+    // Avoid copying the node map when children are unchanged — the pegging tree
+    // can have millions of nodes and copying every one exhausts the heap.
+    if (prunedChildren.size == originalChildren.size) return node
     return node.toMutableMap().apply { put("children", prunedChildren) }
 }
 
