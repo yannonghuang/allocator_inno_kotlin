@@ -75,7 +75,11 @@ private fun gcSupplyNode(
         }
     }
 
-    return node + ("quantity" to roundQty(effectiveCap))
+    // Keep exact double — mirrors the "do not round supply leaves" policy from
+    // consumeFromInventory (PlanningEngine.kt:2249). GC returns exact excess to
+    // inventory; rounding the leaf to an integer breaks the conservation identity
+    // (leftover + pegged ≠ initial by up to 0.5 × number_of_gc_trimmed_leaves).
+    return node + ("quantity" to effectiveCap)
 }
 
 // ── Work-order node ──────────────────────────────────────────────────────────
