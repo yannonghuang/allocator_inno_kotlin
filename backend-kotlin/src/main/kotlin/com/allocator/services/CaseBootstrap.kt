@@ -268,10 +268,6 @@ object CaseBootstrap {
                     ms.entries.forEach { (k, v) -> if (k != "max_bom_depth") put(k, v) }
                     put("max_bom_depth", JsonPrimitive((parsedValue as? Number)?.toInt() ?: 3))
                 }
-                "allocation_mode" -> putJsonObject("consolidation") {
-                    cs.entries.forEach { (k, v) -> if (k != "allocation_mode") put(k, v) }
-                    put("allocation_mode", JsonPrimitive((parsedValue as? String) ?: "fair"))
-                }
                 "consolidation_enabled" -> putJsonObject("consolidation") {
                     cs.entries.forEach { (k, v) -> if (k != "enabled") put(k, v) }
                     put("enabled", JsonPrimitive((parsedValue as? Boolean) ?: true))
@@ -324,9 +320,9 @@ object CaseBootstrap {
         val variations: List<JsonElement>, // values the curated library enumerates (datalist hints)
         /** Group id — axes in the same group are rendered under one header
          *  in the dialog and can be collapsed together. Groups capture
-         *  logical dependencies: e.g. period_days and allocation_mode only
-         *  matter when consolidation is enabled, so they share the
-         *  "consolidation" group with consolidation_enabled. */
+         *  logical dependencies: e.g. period_days only matters when
+         *  consolidation is enabled, so they share the "consolidation"
+         *  group with consolidation_enabled. */
         val group: String,
     )
 
@@ -383,7 +379,7 @@ object CaseBootstrap {
         ),
         // ── Consolidation cluster ────────────────────────────────────────
         // consolidation_enabled is the cluster's "primary" knob;
-        // scope, period_days, and allocation_mode are sub-knobs that live
+        // scope and period_days are sub-knobs that live
         // nested under consolidation in the planner config (see cfg()).
         AxisSpec(
             name = "consolidation_enabled", label = "Consolidation",
@@ -410,15 +406,6 @@ object CaseBootstrap {
             baselineValue = JsonPrimitive(0),
             defaultSeed = JsonPrimitive(7),
             variations = listOf(7, 14, 30, 60).map { JsonPrimitive(it) },
-            group = GROUP_CONSOLID,
-        ),
-        AxisSpec(
-            name = "allocation_mode", label = "Allocation mode",
-            description = "How competing demands split a constrained supply.",
-            valueType = "enum", enumValues = listOf("fair", "proportional", "priority_first"),
-            baselineValue = JsonPrimitive("fair"),
-            defaultSeed = JsonPrimitive("proportional"),
-            variations = listOf("proportional", "priority_first").map { JsonPrimitive(it) },
             group = GROUP_CONSOLID,
         ),
         // Purchase is a method-selection knob (it permits purchase orders
@@ -656,12 +643,11 @@ object CaseBootstrap {
         val wC = fmtDbl(sw.dbl("commit_time", 0.4))
         val wI = fmtDbl(sw.dbl("inventory_consumed", 0.35))
         val wP = fmtDbl(sw.dbl("purchase", 0.25))
-        val alloc = cs.str("allocation_mode", "fair")
         val consEnabled = cs.bool("enabled", true)
         val period = cs.int("period_days", 0)
         val purch = config.bool("purchase_allowed", false)
         return "m=$mode|max=$maxM|d=$depth|bom=$bomDepth|w=$wC,$wI,$wP|" +
-            "alloc=$alloc|cons=$consEnabled|p=$period|purch=$purch"
+            "cons=$consEnabled|p=$period|purch=$purch"
     }
 
     /** Wrap a preset's metadata bundle for plan_run.metadata. The signature is

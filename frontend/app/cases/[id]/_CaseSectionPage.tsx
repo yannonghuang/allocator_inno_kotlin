@@ -1275,44 +1275,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
 
   // Effective WO badge counts: phantom-filtered + lot-grouped, so badge = shown + VirtualProduct_*-hidden.
   const woTabEffectiveCounts = useMemo(() => {
-    const backedSigs = new Set<string>();
-    const collectBacked = (node: PlanningPeggingNode): void => {
-      if (node.type === 'work_order') {
-        if (collectAllSupplyLeaves(node).length > 0)
-          backedSigs.add(`${node.product_id ?? ''}|${node.location_id ?? ''}|${(node.method ?? '').toLowerCase()}`);
-        (node.children ?? []).forEach(collectBacked);
-      } else {
-        (node.children ?? []).forEach(collectBacked);
-      }
-    };
-    for (const entry of planResult?.planning_pegging ?? []) collectBacked(entry.tree);
-
     const effectiveCount = (wos: WorkOrder[]): number => {
-      // Both virtual and non-virtual counts use the same 6-field grouping key as the table
-      // so the badge reflects unique work orders, not raw lots (multiple lots of the same
-      // WO collapse into one row in the table and must be counted as one here too).
+      // Count unique grouped rows using the same 7-field key the table uses, so badge = table
+      // row count when no checkbox filters are active. Phantom filtering was removed from the
+      // table (planning_pegging is lazy-loaded so backedSigs was always empty, silently
+      // dropping purchase and move orders from the badge while the table showed them all).
       const woKey = (r: WorkOrder) => [
         String(r.demand_id ?? ''), String(r.product_id ?? ''), String(r.location_id ?? ''),
         String(r.method ?? ''), String(r.location_source ?? ''), String(r.prod_area ?? ''),
         r.consolidated ? String(r.wo_group_id ?? '') : '',
       ].join('|');
-      const virtualKeys = new Set(
-        wos.filter((r) => (r.product_id ?? '').trim().startsWith('VirtualProduct_')).map(woKey)
-      );
-      const afterPhantom = wos
-        .filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'))
-        .filter((r) => {
-          const m = (r.method ?? '').toLowerCase();
-          // Mirror the table phantom filter exactly: make always passes; consolidated move WOs
-          // with null product_id (same-prod_area mixed-product shipments) pass unconditionally; everything else
-          // needs a pegging-backed supply signature.
-          if (m === 'make') return true;
-          if (m === 'move' && !r.product_id) return true;
-          return backedSigs.has(`${r.product_id ?? ''}|${r.location_id ?? ''}|${m}`);
-        });
-      const nonVirtualKeys = new Set(afterPhantom.map(woKey));
-      // badge = phantom-filtered non-virtual unique + virtual unique (same dedup as table grouping)
-      return nonVirtualKeys.size + virtualKeys.size;
+      return new Set(wos.map(woKey)).size;
     };
 
     return {
@@ -1506,7 +1479,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (sw && (sw.commit_time != null || sw.inventory_consumed != null || sw.purchase != null)) {
       parts.push(`w=(${Number(sw.commit_time ?? 0)}, ${Number(sw.inventory_consumed ?? 0)}, ${Number(sw.purchase ?? 0)})`);
     }
-    parts.push(`cons=${cs.enabled === false ? 'off' : 'on'}`);
+    parts.push(`wo_batch=${cs.enabled === false ? 'off' : 'on'}`);
     if (Number(cs.period_days ?? 30) !== 30) parts.push(`p=${cs.period_days}`);
     parts.push(`purch=${config.purchase_allowed === true ? 'on' : 'off'}`);
     return parts.join(' · ');
