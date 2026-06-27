@@ -3670,7 +3670,9 @@ private fun prunePhantomLoops(
         // cycle). Keep them as leaf nodes so users can see the cause.
         // Outside failed subtrees, drop as "phantom move cycle" noise.
         if (insideFailedWo) {
-            return node.toMutableMap().apply { put("children", emptyList<Any>()) }
+            // Mutate in place — nodes are LinkedHashMap at runtime (buildMap/mutableMapOf).
+            (node as MutableMap<String, Any?>)["children"] = emptyList<Any>()
+            return node
         }
         return null
     }
@@ -3696,10 +3698,13 @@ private fun prunePhantomLoops(
     // not real component demands (children of make WOs or the root).
     if (type == "demand" && prunedChildren.isEmpty() && !isRoot && parentIsMoveWo) return null
 
-    // Avoid copying the node map when children are unchanged — the pegging tree
-    // can have millions of nodes and copying every one exhausts the heap.
-    if (prunedChildren.size == originalChildren.size) return node
-    return node.toMutableMap().apply { put("children", prunedChildren) }
+    // Mutate children in place — avoids copying every ancestor node on the path to a
+    // pruned leaf (which was O(nodes) heap for large pegging trees). Each node appears
+    // exactly once in the tree so in-place mutation is safe. Skip the write when nothing changed.
+    if (prunedChildren.size != originalChildren.size) {
+        (node as MutableMap<String, Any?>)["children"] = prunedChildren
+    }
+    return node
 }
 
 // ── Supply allocation extraction ───────────────────────────────────────────────
