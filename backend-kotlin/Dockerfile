@@ -12,6 +12,7 @@ COPY gradlew gradlew
 COPY build.gradle.kts build.gradle.kts
 COPY settings.gradle.kts settings.gradle.kts
 RUN chmod +x gradlew && ./gradlew dependencies --no-daemon -q
+ARG CACHEBUST=1
 COPY src src
 RUN ./gradlew shadowJar --no-daemon -q && \
     find build/libs -name "*.jar" ! -name "*-plain.jar" | head -1 | xargs -I{} cp {} build/libs/app.jar
