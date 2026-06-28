@@ -4731,11 +4731,17 @@ internal fun verifyInventoryPriority(
         supplyMeta[sid] = SupplyMeta(pid, lid, supplyDate)
     }
 
-    // Leftover qty by supply_id, skipping consolidated synthetic buckets.
+    // Leftover qty by supply_id, skipping consolidated synthetic buckets and
+    // demand-tagged reservation buckets. Tagged buckets are private to their
+    // assigned demand (consumeFromInventory pass 1 only serves tagged demand);
+    // their leftover is not available to other demands' WOs, so it would be a
+    // false positive to flag WOs at the same component as a priority violation.
     val leftoverBySupply = mutableMapOf<String, Double>()
     for (inv in inventoryLeftover) {
         val sid = inv["supply_id"]?.toString() ?: continue
         if (sid.startsWith("consolidated_")) continue
+        val demandTag = inv["demand_tag"]
+        if (demandTag != null && demandTag.toString().isNotBlank()) continue
         val qty = (inv["qty"] as? Number)?.toDouble() ?: 0.0
         if (qty > tolerance) leftoverBySupply.merge(sid, qty, Double::plus)
     }

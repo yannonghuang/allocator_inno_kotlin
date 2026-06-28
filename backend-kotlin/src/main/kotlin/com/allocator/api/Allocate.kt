@@ -2558,12 +2558,20 @@ internal suspend fun runPlanBackground(
         // "completed" to the frontend. Pegging and KB upsert are fire-and-forget.
         val resultJson = if (autoSave) serializeResultOrNull(enriched) else null
         val serializeFailed = autoSave && resultJson == null
-        // Serialize inventory snapshots for R7e soundness check (compact — supply_id + qty only).
+        // Serialize inventory snapshots for R7e / R10 soundness checks.
+        // Include demand_tag so R10 can exclude per-demand reservation buckets —
+        // tagged buckets are private to their assigned demand and their leftover
+        // is not available to other demands' WOs (should not trigger R10).
+        fun compactInv(rows: List<Map<String, Any?>>) = rows.map {
+            val m = mutableMapOf<String, Any?>("supply_id" to it["supply_id"], "qty" to it["qty"])
+            it["demand_tag"]?.let { tag -> m["demand_tag"] = tag }
+            m
+        }
         val invInitialJson = if (autoSave && !serializeFailed)
-            runCatching { anyToJson(raw.inventoryEffectiveInitial.map { mapOf("supply_id" to it["supply_id"], "qty" to it["qty"]) }).toString() }.getOrNull()
+            runCatching { anyToJson(compactInv(raw.inventoryEffectiveInitial)).toString() }.getOrNull()
         else null
         val invLeftoverJson = if (autoSave && !serializeFailed)
-            runCatching { anyToJson(raw.inventoryLeftover.map { mapOf("supply_id" to it["supply_id"], "qty" to it["qty"]) }).toString() }.getOrNull()
+            runCatching { anyToJson(compactInv(raw.inventoryLeftover)).toString() }.getOrNull()
         else null
         transaction {
             PlanRuns.update({ PlanRuns.id eq planRunId }) {
