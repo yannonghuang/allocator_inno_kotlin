@@ -4156,6 +4156,43 @@ fun runPlanning(
     // which is cleared after allPegging is built, allowing GC to reclaim the trees.
     commitResult = commitResult.copy(planningPegging = emptyList())
 
+    // ── Cross-demand critical material reallocation ────────────────────────────
+    // Critical materials (no purchase method) are tagged to specific demands by
+    // case_allocation. When a demand is served via an alternative BOM path, its
+    // reserved lot stays tagged and unused — blocked from other demands by
+    // perLotBudget. Release those leftover tagged lots back to the common pool
+    // and re-plan any fully-unserved demands against the freed inventory.
+    // Partially-served demands are left untouched (multi-slot pegging conflict risk).
+    run {
+        val criticalMatReleased = releaseCriticalMaterialLeftover(inventory)
+        if (criticalMatReleased > 1e-6) {
+            val committedByDemand = committedDemands
+                .groupBy { it["demand_id"]?.toString() }
+                .mapValues { (_, rows) -> rows.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 } }
+            val demandsForRealloc = demands.filter { d ->
+                val did = d["demand_id"]?.toString() ?: return@filter false
+                (committedByDemand[did] ?: 0.0) < 1e-6   // fully unserved only
+            }
+            if (demandsForRealloc.isNotEmpty()) {
+                log.info("[realloc-critical] released {} units of critical material; re-planning {} unserved demands",
+                    criticalMatReleased, demandsForRealloc.size)
+                val reallocResult = legacyCommit(
+                    demands          = demandsForRealloc,
+                    inventory        = inventory,
+                    data             = data,
+                    config           = config,
+                    overrideIndex    = overrideIndex,
+                    useTaggedLookup  = false,
+                    progressCallback = null,
+                    // No budget: released lots are now common pool, uncapped
+                )
+                committedDemands.addAll(reallocResult.committedDemands)
+                workOrders.addAll(reallocResult.workOrders)
+                planningPegging.addAll(reallocResult.planningPegging)
+            }
+        }
+    }
+
     // With realPegging on, Pass-1 re-supplied the real lots (real supply_id) and the per-demand
     // trees consume them directly — so the `demand_id=null` production trees would DOUBLE-claim
     // those lots in soundness/aggregation. Drop them; per-demand trees carry the real consumption.
@@ -4889,6 +4926,27 @@ private fun reallocSubtree(
         count += inner
     }
     return (if (!changed) node else node + ("children" to newChildren)) to count
+}
+
+/**
+ * Removes demand_tag from every supply bucket that has leftover qty, releasing it
+ * back to the common inventory pool for cross-demand reallocation.
+ * Returns the total quantity released.
+ */
+private fun releaseCriticalMaterialLeftover(
+    inventory: MutableList<MutableMap<String, Any?>>,
+    tolerance: Double = 1e-6,
+): Double {
+    var released = 0.0
+    for (bucket in inventory) {
+        val qty = (bucket["qty"] as? Number)?.toDouble() ?: 0.0
+        if (qty > tolerance && bucket.containsKey("demand_tag") && bucket["demand_tag"] != null) {
+            bucket.remove("demand_tag")
+            released += qty
+        }
+    }
+    if (released > tolerance) log.info("[realloc-critical] un-tagged {:.4f} units of critical material leftover", released)
+    return released
 }
 
 /**
