@@ -651,13 +651,13 @@ function ConstraintPicker({
   return (
     <div style={{ marginTop: '0.4rem' }}>
       <button type="button" onClick={() => setCollapsed((c) => !c)}
-        style={{ display: 'inline-flex', alignItems: 'center', gap: 6, background: '#27272a', border: '1px solid #3f3f46', borderRadius: 4, padding: '3px 9px', color: '#d4d4d8', fontSize: '0.72rem', cursor: 'pointer' }}>
-        <span>{collapsed ? '▸' : '▾'}</span>
+        style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', background: 'none', border: 'none', padding: 0, color: 'inherit', fontSize: '0.875rem', cursor: 'pointer' }}>
+        <span style={{ fontSize: '0.7rem', color: '#a1a1aa' }}>{collapsed ? '▸' : '▾'}</span>
         <span>{collapsed ? tP('config.constraintShow') : tP('config.constraintHide')}</span>
         <span style={{ color: '#a1a1aa' }}>{`(${constraints.length})`}</span>
       </button>
       {!collapsed && (
-        <div style={{ marginTop: 4 }}>
+        <div style={{ marginTop: '0.35rem', marginLeft: '1.5rem' }}>
           <div style={{ fontSize: '0.7rem', color: '#71717a', marginBottom: 4 }}>{tP('config.constraintHint')}</div>
           {options.parents.length === 0 ? (
             <div style={{ fontSize: '0.72rem', color: '#71717a' }}>{tP('config.constraintNoAlternatives')}</div>
@@ -775,27 +775,6 @@ function formatCommitReason(reason: string, purchaseAllowed: boolean): { label: 
   // Tooltip shows the full failure path for debugging.
   const tooltip = chain.map(c => `${c.product} @ ${c.location}`).join(' → ') + ` → ${rootCause}`;
   return { label, tooltip };
-}
-/**
- * Human-readable description of a consolidation split policy.
- * Used in both the WO and Supply Explain panels so users can see what
- * "Fair" / "Proportional" / "Priority first" actually mean — the formula,
- * what it splits with respect to, and the shortage behaviour.
- */
-function splitPolicyExplanation(
-  mode: string | null | undefined,
-  tP: (k: string) => string,
-): { headline: string; detail: string } {
-  switch (mode) {
-    case 'proportional':
-      return { headline: tP('policyExp.proportionalHeadline'), detail: tP('policyExp.proportionalDetail') };
-    case 'priority_first':
-      return { headline: tP('policyExp.priorityFirstHeadline'), detail: tP('policyExp.priorityFirstDetail') };
-    case 'fair':
-      return { headline: tP('policyExp.fairHeadline'), detail: tP('policyExp.fairDetail') };
-    default:
-      return { headline: mode ?? tP('policyExp.unknownHeadline'), detail: tP('policyExp.unknownDetail') };
-  }
 }
 
 import { PeggingTree, pathKeyFromPath, type PeggingGraph } from '@/app/components/PeggingTree';
@@ -1296,44 +1275,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
 
   // Effective WO badge counts: phantom-filtered + lot-grouped, so badge = shown + VirtualProduct_*-hidden.
   const woTabEffectiveCounts = useMemo(() => {
-    const backedSigs = new Set<string>();
-    const collectBacked = (node: PlanningPeggingNode): void => {
-      if (node.type === 'work_order') {
-        if (collectAllSupplyLeaves(node).length > 0)
-          backedSigs.add(`${node.product_id ?? ''}|${node.location_id ?? ''}|${(node.method ?? '').toLowerCase()}`);
-        (node.children ?? []).forEach(collectBacked);
-      } else {
-        (node.children ?? []).forEach(collectBacked);
-      }
-    };
-    for (const entry of planResult?.planning_pegging ?? []) collectBacked(entry.tree);
-
     const effectiveCount = (wos: WorkOrder[]): number => {
-      // Both virtual and non-virtual counts use the same 6-field grouping key as the table
-      // so the badge reflects unique work orders, not raw lots (multiple lots of the same
-      // WO collapse into one row in the table and must be counted as one here too).
+      // Count unique grouped rows using the same 7-field key the table uses, so badge = table
+      // row count when no checkbox filters are active. Phantom filtering was removed from the
+      // table (planning_pegging is lazy-loaded so backedSigs was always empty, silently
+      // dropping purchase and move orders from the badge while the table showed them all).
       const woKey = (r: WorkOrder) => [
         String(r.demand_id ?? ''), String(r.product_id ?? ''), String(r.location_id ?? ''),
         String(r.method ?? ''), String(r.location_source ?? ''), String(r.prod_area ?? ''),
         r.consolidated ? String(r.wo_group_id ?? '') : '',
       ].join('|');
-      const virtualKeys = new Set(
-        wos.filter((r) => (r.product_id ?? '').trim().startsWith('VirtualProduct_')).map(woKey)
-      );
-      const afterPhantom = wos
-        .filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'))
-        .filter((r) => {
-          const m = (r.method ?? '').toLowerCase();
-          // Mirror the table phantom filter exactly: make always passes; consolidated move WOs
-          // with null product_id (same-prod_area mixed-product shipments) pass unconditionally; everything else
-          // needs a pegging-backed supply signature.
-          if (m === 'make') return true;
-          if (m === 'move' && !r.product_id) return true;
-          return backedSigs.has(`${r.product_id ?? ''}|${r.location_id ?? ''}|${m}`);
-        });
-      const nonVirtualKeys = new Set(afterPhantom.map(woKey));
-      // badge = phantom-filtered non-virtual unique + virtual unique (same dedup as table grouping)
-      return nonVirtualKeys.size + virtualKeys.size;
+      return new Set(wos.map(woKey)).size;
     };
 
     return {
@@ -1404,7 +1356,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // Buyable raw materials for the selective-purchase whitelist dropdown + copilot /raw picker.
   const [purchasableOptions, setPurchasableOptions] = useState<PurchasableRawMaterial[]>([]);
   const [constraintOptions, setConstraintOptions] = useState<ConstraintOptions>({ customers: [], parents: [] });
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 30, allocation_mode: 'fair' }, purchase_allowed: false, purchasable_materials: [], constraints: [], analyze_criticality: false, check_soundness: true, enable_global_scheduling: true });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 30 }, purchase_allowed: false, purchasable_materials: [], constraints: [], analyze_criticality: false, check_soundness: true, enable_global_scheduling: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1499,17 +1451,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const presetDiffSummary = (config: Record<string, unknown>): string => {
     const ms = (config.method_selection ?? {}) as Record<string, unknown>;
     const cs = (config.consolidation ?? {}) as Record<string, unknown>;
-    const sw = (ms.score_weights ?? {}) as Record<string, number>;
     const diffs: string[] = [];
     if (ms.mode !== 'preference') diffs.push(`mode: preference → ${ms.mode}`);
     if (Number(ms.max_methods) !== 1) diffs.push(`max_methods: 1 → ${ms.max_methods}`);
     if (Number(ms.depth) !== 1) diffs.push(`depth: 1 → ${ms.depth}`);
     if (ms.max_bom_depth != null && Number(ms.max_bom_depth) !== 3) diffs.push(`max_bom_depth: 3 → ${ms.max_bom_depth}`);
-    if (Number(sw.commit_time) !== 0.4 || Number(sw.inventory_consumed) !== 0.35 || Number(sw.purchase) !== 0.25) {
-      diffs.push(`weights: (${sw.commit_time}, ${sw.inventory_consumed}, ${sw.purchase})`);
-    }
-    if (cs.allocation_mode !== 'fair') diffs.push(`allocation_mode: fair → ${cs.allocation_mode}`);
-    if (cs.enabled === false) diffs.push(`consolidation: on → off`);
     if (Number(cs.period_days ?? 30) !== 30) diffs.push(`period_days: 30 → ${cs.period_days}`);
     if (config.purchase_allowed === true) diffs.push(`purchase: off → on`);
     return diffs.join(' · ');
@@ -1533,8 +1479,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (sw && (sw.commit_time != null || sw.inventory_consumed != null || sw.purchase != null)) {
       parts.push(`w=(${Number(sw.commit_time ?? 0)}, ${Number(sw.inventory_consumed ?? 0)}, ${Number(sw.purchase ?? 0)})`);
     }
-    parts.push(`alloc=${cs.allocation_mode ?? 'fair'}`);
-    parts.push(`cons=${cs.enabled === false ? 'off' : 'on'}`);
+    parts.push(`wo_batch=${cs.enabled === false ? 'off' : 'on'}`);
     if (Number(cs.period_days ?? 30) !== 30) parts.push(`p=${cs.period_days}`);
     parts.push(`purch=${config.purchase_allowed === true ? 'on' : 'off'}`);
     return parts.join(' · ');
@@ -1545,15 +1490,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       mode: 'preference',
       depth: 1,
       multiple: false,
-      elaborate: false,
       max_methods: 1,
       max_bom_depth: 3,
-      score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 },
     },
     consolidation: {
       enabled: true,
       period_days: 30,
-      allocation_mode: 'fair',
     },
     variant_selection: { multiple: true },
     purchase_allowed: false,
@@ -1572,13 +1514,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       case 'max_methods':         ms.max_methods = value; break;
       case 'depth':               ms.depth = value; break;
       case 'scope':               cs.scope = value; break;
-      case 'allocation_mode':     cs.allocation_mode = value; break;
       case 'consolidation_enabled': cs.enabled = value; break;
       case 'period_days':         cs.period_days = value; break;
       case 'purchase_allowed':    cfg.purchase_allowed = value; break;
       case 'mode':
         ms.mode = value;
-        ms.elaborate = value === 'elaborate';
         break;
       // Compound axis: scoring profile implies mode=elaborate + a weight triple.
       case 'score_weights': {
@@ -3331,7 +3271,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         const candidateCount = entry.consolidated_demand_ids?.length ?? 0;
         if (!rootPid || (totalNeed <= 0 && totalProduced <= 0)) continue;
         info = {
-          mode: fallbackMode ?? (planningConfig.consolidation?.allocation_mode ?? 'fair'),
+          mode: fallbackMode ?? 'fair',
           groupProductId: rootPid,
           groupLocationId: rootLid,
           groupTotalNeed: totalNeed,
@@ -4821,15 +4761,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       <section>
         <h2>{tSec('planning')}</h2>
         <div style={{ marginBottom: '0.75rem' }}>
-          {/* ── Group 1: Method selection (how methods are ranked + tried per demand) ── */}
+          {/* ── Group 1: Configurations (how methods are ranked + tried per demand) ── */}
           <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.65rem', margin: '0 0 0.55rem' }}>
             <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
               {tP('config.groupMethodSelection')}
             </legend>
-            {/* Row 1 — Bounds: how far the planner exhausts methods + how deep make-fallback admits. */}
+            {/* ── Method ── */}
+            <div style={{ fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.3rem' }}>
+              {tP('config.subheadMethod')}
+            </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
-              {/* Max methods (replaces the legacy `multiple` boolean). Defaults to 2 in
-                  sync with the backend; legacy `multiple: false` reads as 1, `multiple: true` as 2. */}
               <label
                 style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', cursor: 'pointer' }}
                 title={tP('config.methodMaxCountTooltip')}
@@ -4876,159 +4817,80 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               </label>
             </div>
 
-            {/* Row 2 — Elaborate scoring: toggle + recursion depth + per-axis weights. All gated on the toggle. */}
-            {(() => {
-              const elaborateOn = planningConfig.method_selection?.elaborate === true
-                || planningConfig.method_selection?.mode === 'elaborate';
-              const weights = planningConfig.method_selection?.score_weights;
-              const wCommit = weights?.commit_time ?? 0.4;
-              const wInv = weights?.inventory_consumed ?? 0.35;
-              const wPurchase = weights?.purchase ?? 0.25;
-              const updateWeight = (key: 'commit_time' | 'inventory_consumed' | 'purchase', v: number) => {
-                const clamped = Math.max(0, Math.min(1, isNaN(v) ? 0 : v));
-                setPlanningConfig((c) => ({
-                  ...c,
-                  method_selection: {
-                    ...c.method_selection,
-                    score_weights: {
-                      commit_time: key === 'commit_time' ? clamped : (c.method_selection?.score_weights?.commit_time ?? 0.4),
-                      inventory_consumed: key === 'inventory_consumed' ? clamped : (c.method_selection?.score_weights?.inventory_consumed ?? 0.35),
-                      purchase: key === 'purchase' ? clamped : (c.method_selection?.score_weights?.purchase ?? 0.25),
-                    },
-                  },
-                }));
-              };
-              const inputStyle: React.CSSProperties = { width: 64, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' };
-              const gatedLabelStyle: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.875rem', opacity: elaborateOn ? 1 : 0.4 };
-              return (
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.9rem', flexWrap: 'wrap', marginTop: '0.45rem' }} title={tP('config.weightsHint')}>
-                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
-                    <input
-                      type="checkbox"
-                      checked={elaborateOn}
-                      onChange={(e) => setPlanningConfig((c) => ({
-                        ...c,
-                        method_selection: {
-                          ...c.method_selection,
-                          elaborate: e.target.checked,
-                          mode: e.target.checked ? 'elaborate' : 'preference',
-                        },
-                      }))}
-                    />
-                    <span>{tP('config.elaborateMethod')}</span>
-                  </label>
-                  <label style={gatedLabelStyle}>
-                    <span style={{ color: '#a1a1aa' }}>{tP('config.methodDepth')}</span>
-                    <input
-                      type="number"
-                      min={1}
-                      max={500}
-                      disabled={!elaborateOn}
-                      value={planningConfig.method_selection?.depth ?? 1}
-                      onChange={(e) => {
-                        const v = Math.max(1, Math.min(500, parseInt(e.target.value, 10) || 1));
-                        setPlanningConfig((c) => ({ ...c, method_selection: { ...c.method_selection, depth: v } }));
-                      }}
-                      style={{ width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
-                    />
-                  </label>
-                  <span style={{ color: '#a1a1aa', fontSize: '0.8rem', opacity: elaborateOn ? 1 : 0.5 }}>{tP('config.weightsLabel')}</span>
-                  <label style={gatedLabelStyle}>
-                    <span style={{ color: '#a1a1aa' }}>{tP('config.weightCommit')}</span>
-                    <input type="number" min={0} max={1} step={0.05}
-                      disabled={!elaborateOn}
-                      value={wCommit}
-                      onChange={(e) => updateWeight('commit_time', parseFloat(e.target.value))}
-                      style={inputStyle} />
-                  </label>
-                  <label style={gatedLabelStyle}>
-                    <span style={{ color: '#a1a1aa' }}>{tP('config.weightInventory')}</span>
-                    <input type="number" min={0} max={1} step={0.05}
-                      disabled={!elaborateOn}
-                      value={wInv}
-                      onChange={(e) => updateWeight('inventory_consumed', parseFloat(e.target.value))}
-                      style={inputStyle} />
-                  </label>
-                  <label style={gatedLabelStyle}>
-                    <span style={{ color: '#a1a1aa' }}>{tP('config.weightPurchase')}</span>
-                    <input type="number" min={0} max={1} step={0.05}
-                      disabled={!elaborateOn}
-                      value={wPurchase}
-                      onChange={(e) => updateWeight('purchase', parseFloat(e.target.value))}
-                      style={inputStyle} />
-                  </label>
-                </div>
-              );
-            })()}
-
-            {/* Row 3 — Buy-method gate. Independent of mode/depth/weights. */}
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', marginTop: '0.45rem' }}>
-              <input
-                type="checkbox"
-                checked={planningConfig.purchase_allowed !== false}
-                onChange={(e) => setPlanningConfig((c) => ({ ...c, purchase_allowed: e.target.checked }))}
-              />
-              <span>{tP('config.purchaseAllowed')}</span>
-            </label>
-
-            {/* Row 3b — Selective purchase: when purchase is allowed, optionally
-                restrict to a whitelist of raw materials. Empty ⇒ all raw materials
-                are purchasable (default). Hidden when purchase is off. */}
-            {planningConfig.purchase_allowed !== false && (
-              <div style={{ marginTop: '0.45rem', marginLeft: '1.5rem' }}>
-                <div style={{ fontSize: '0.72rem', color: '#a1a1aa', marginBottom: 2 }}>
-                  {tP('config.purchasableMaterials')}
-                </div>
-                {purchasableOptions.length === 0 ? (
-                  <div style={{ fontSize: '0.72rem', color: '#71717a' }}>{tP('config.purchasableNone')}</div>
-                ) : (
-                  <RawMaterialPicker
-                    options={purchasableOptions}
-                    selected={planningConfig.purchasable_materials ?? []}
-                    onChange={(next) => setPlanningConfig((c) => ({ ...c, purchasable_materials: next }))}
-                    defaultCollapsed
-                    tP={tP}
-                  />
-                )}
+            {/* ── Purchase ── */}
+            <div style={{ marginTop: '0.65rem', borderTop: '1px solid #27272a', paddingTop: '0.4rem' }}>
+              <div style={{ fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.3rem' }}>
+                {tP('config.subheadPurchase')}
               </div>
-            )}
-
-            {/* Row 4 — Cross-WO arbitration. Off by default during opt-in
-                rollout; flipping it on means concurrent WOs at the same
-                location queue against a shared resource calendar instead
-                of stacking their rates past pool size. */}
-            <label
-              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', marginTop: '0.45rem' }}
-              title={tP('config.enableGlobalSchedulingTooltip')}
-            >
-              <input
-                type="checkbox"
-                checked={planningConfig.enable_global_scheduling !== false}
-                onChange={(e) => setPlanningConfig((c) => ({ ...c, enable_global_scheduling: e.target.checked }))}
-              />
-              <span>{tP('config.enableGlobalScheduling')}</span>
-            </label>
-          </fieldset>
-
-          {/* ── Group 2: Demand consolidation (sharing across demands) ── */}
-          <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
-            <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-              {tP('config.groupConsolidation')}
-            </legend>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
               <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
                 <input
                   type="checkbox"
-                  checked={planningConfig.consolidation?.enabled === true}
-                  onChange={(e) => setPlanningConfig((c) => ({
-                    ...c,
-                    consolidation: { ...c.consolidation, enabled: e.target.checked },
-                  }))}
+                  checked={planningConfig.purchase_allowed !== false}
+                  onChange={(e) => setPlanningConfig((c) => ({ ...c, purchase_allowed: e.target.checked }))}
                 />
-                <span>{tP('config.consolidate')}</span>
+                <span style={{ fontSize: '0.875rem' }}>{tP('config.purchaseAllowed')}</span>
               </label>
+              {planningConfig.purchase_allowed !== false && (
+                <div style={{ marginTop: '0.35rem', marginLeft: '1.5rem' }}>
+                  <div style={{ fontSize: '0.72rem', color: '#a1a1aa', marginBottom: 2 }}>
+                    {tP('config.purchasableMaterials')}
+                  </div>
+                  {purchasableOptions.length === 0 ? (
+                    <div style={{ fontSize: '0.72rem', color: '#71717a' }}>{tP('config.purchasableNone')}</div>
+                  ) : (
+                    <RawMaterialPicker
+                      options={purchasableOptions}
+                      selected={planningConfig.purchasable_materials ?? []}
+                      onChange={(next) => setPlanningConfig((c) => ({ ...c, purchasable_materials: next }))}
+                      defaultCollapsed
+                      tP={tP}
+                    />
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* ── Scheduling ── */}
+            <div style={{ marginTop: '0.65rem', borderTop: '1px solid #27272a', paddingTop: '0.4rem' }}>
+              <div style={{ fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.3rem' }}>
+                {tP('config.subheadScheduling')}
+              </div>
               <label
-                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}
+                title={tP('config.enableGlobalSchedulingTooltip')}
+              >
+                <input
+                  type="checkbox"
+                  checked={planningConfig.enable_global_scheduling !== false}
+                  onChange={(e) => setPlanningConfig((c) => ({ ...c, enable_global_scheduling: e.target.checked }))}
+                />
+                <span style={{ fontSize: '0.875rem' }}>{tP('config.enableGlobalScheduling')}</span>
+              </label>
+            </div>
+
+            {/* ── Constraints ── */}
+            <div style={{ marginTop: '0.65rem', borderTop: '1px solid #27272a', paddingTop: '0.4rem' }}>
+              <div style={{ fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.3rem' }}>
+                {tP('config.subheadConstraints')}
+              </div>
+              <ConstraintPicker
+                options={constraintOptions}
+                constraints={planningConfig.constraints ?? []}
+                onChange={(next) => setPlanningConfig((c) => ({ ...c, constraints: next }))}
+                defaultCollapsed
+                tP={tP}
+              />
+            </div>
+          </fieldset>
+
+          {/* ── Group 2: Post-plan handling (run AFTER planning, do not affect planner) ── */}
+          <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
+            <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              {tP('config.groupPostPlan')}
+            </legend>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+              <label
+                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }}
                 title={tP('config.bucketDaysTooltip')}
               >
                 <span style={{ color: '#a1a1aa' }}>{tP('config.bucketDays')}</span>
@@ -5036,7 +4898,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   type="number"
                   min={0}
                   max={365}
-                  disabled={planningConfig.consolidation?.enabled !== true}
                   value={planningConfig.consolidation?.period_days ?? 30}
                   onChange={(e) => {
                     const raw = parseInt(e.target.value, 10);
@@ -5046,50 +4907,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   style={{ width: 64, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
                 />
               </label>
-              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}>
-                <span style={{ color: '#a1a1aa' }}>{tP('config.splitPolicy')}</span>
-                <select
-                  disabled={planningConfig.consolidation?.enabled !== true}
-                  value={planningConfig.consolidation?.allocation_mode ?? 'fair'}
-                  onChange={(e) => setPlanningConfig((c) => ({
-                    ...c,
-                    consolidation: { ...c.consolidation, allocation_mode: e.target.value as 'priority_first' | 'proportional' | 'fair' },
-                  }))}
-                  style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
-                >
-                  <option value="fair">{tP('config.fair')}</option>
-                  <option value="proportional">{tP('config.proportional')}</option>
-                  <option value="priority_first">{tP('config.priorityFirst')}</option>
-                </select>
-              </label>
-              <label
-                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', opacity: planningConfig.consolidation?.enabled === true ? 1 : 0.4 }}
-                title={tP('config.maxIterTooltip')}
-              >
-                <span style={{ color: '#a1a1aa' }}>{tP('config.maxIter')}</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={15}
-                  disabled={planningConfig.consolidation?.enabled !== true}
-                  value={planningConfig.consolidation?.max_iterations ?? 1}
-                  onChange={(e) => {
-                    const raw = parseInt(e.target.value, 10);
-                    const v = Math.max(1, Math.min(15, Number.isNaN(raw) ? 1 : raw));
-                    setPlanningConfig((c) => ({ ...c, consolidation: { ...c.consolidation, max_iterations: v } }));
-                  }}
-                  style={{ width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
-                />
-              </label>
-            </div>
-          </fieldset>
-
-          {/* ── Group 3: Post-plan analysis (run AFTER planning, do not affect planner) ── */}
-          <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
-            <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-              {tP('config.groupPostPlan')}
-            </legend>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
               <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
                 <input
                   type="checkbox"
@@ -5112,19 +4929,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             </div>
           </fieldset>
 
-          {/* ── Group 4: Constraints (customer-specific BOM-alternative pins) ── */}
-          <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
-            <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-              {tP('config.groupConstraints')}
-            </legend>
-            <ConstraintPicker
-              options={constraintOptions}
-              constraints={planningConfig.constraints ?? []}
-              onChange={(next) => setPlanningConfig((c) => ({ ...c, constraints: next }))}
-              defaultCollapsed
-              tP={tP}
-            />
-          </fieldset>
           <br style={{ marginTop: '0.25rem' }} />
           <button
             type="button"
@@ -5175,7 +4979,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               },
               purchase_allowed: false,
               constraints: [],
-              consolidation: { enabled: true, period_days: 30, allocation_mode: 'fair' },
+              consolidation: { enabled: true, period_days: 30 },
             })}
             title={tP('config.resetDefaultsTitle')}
             style={{ padding: '6px 12px' }}
@@ -8076,8 +7880,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       const summary = presetConfigSummary(effectiveConfig);
                       const ms = (effectiveConfig.method_selection ?? {}) as Record<string, unknown>;
                       const cs = (effectiveConfig.consolidation ?? {}) as Record<string, unknown>;
-                      const sw = (ms.score_weights ?? {}) as Record<string, number>;
-                      const elaborateOn = ms.mode === 'elaborate' || ms.elaborate === true;
                       const updateConfig = (mutator: (cfg: Record<string, unknown>) => void) => {
                         const next = JSON.parse(JSON.stringify(effectiveConfig)) as Record<string, unknown>;
                         mutator(next);
@@ -8138,18 +7940,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                     </select>
                                   </label>
                                   <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                                    <input type="checkbox" checked={!!elaborateOn}
-                                      onChange={(e) => updateConfig((c) => {
-                                        const m = (c.method_selection ?? {}) as Record<string, unknown>;
-                                        m.elaborate = e.target.checked;
-                                        m.mode = e.target.checked ? 'elaborate' : 'preference';
-                                        c.method_selection = m;
-                                      })} />
-                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editElaborate')}</span>
-                                  </label>
-                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, opacity: elaborateOn ? 1 : 0.4 }}>
                                     <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editDepth')}</span>
-                                    <input type="number" min={1} max={10} disabled={!elaborateOn}
+                                    <input type="number" min={1} max={10}
                                       value={Number(ms.depth ?? 1)}
                                       onChange={(e) => updateConfig((c) => {
                                         const m = (c.method_selection ?? {}) as Record<string, unknown>;
@@ -8175,43 +7967,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                     <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editPurchase')}</span>
                                   </label>
                                 </div>
-                                {/* Score weights — always rendered so the knob is discoverable;
-                                    dimmed + disabled when elaborate is off (mirrors the planning
-                                    page pattern). Editing weights with elaborate off has no effect
-                                    on the run, but pre-staging them then flipping the toggle is a
-                                    common workflow. */}
-                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'center', fontSize: '0.78rem', marginBottom: 6, paddingLeft: 8, opacity: elaborateOn ? 1 : 0.45 }}>
-                                  <span style={{ fontSize: '0.7rem', color: '#71717a' }}>{tP('bootstrap.editWeights')}</span>
-                                  {(['commit_time','inventory_consumed','purchase'] as const).map((k) => (
-                                    <label key={k} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                                      <span style={{ color: '#a1a1aa', fontSize: '0.72rem' }}>{k.replace('_',' ')}</span>
-                                      <input type="number" step={0.05} min={0} max={1}
-                                        disabled={!elaborateOn}
-                                        value={Number(sw[k] ?? (k === 'commit_time' ? 0.4 : k === 'inventory_consumed' ? 0.35 : 0.25))}
-                                        onChange={(e) => updateConfig((c) => {
-                                          const m = (c.method_selection ?? {}) as Record<string, unknown>;
-                                          const w = { ...((m.score_weights ?? {}) as Record<string, number>) };
-                                          w[k] = Math.max(0, Math.min(1, parseFloat(e.target.value) || 0));
-                                          m.score_weights = w; c.method_selection = m;
-                                        })}
-                                        style={{ ...inputStyle, width: 64 }} />
-                                    </label>
-                                  ))}
-                                </div>
-                                {/* Consolidation (demand side) */}
+                                {/* Consolidation (demand side — always on) */}
                                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'center', fontSize: '0.78rem', marginBottom: 6 }}>
                                   <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                                    <input type="checkbox" checked={cs.enabled !== false}
-                                      onChange={(e) => updateConfig((c) => {
-                                        const v = (c.consolidation ?? {}) as Record<string, unknown>;
-                                        v.enabled = e.target.checked; c.consolidation = v;
-                                      })} />
-                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editConsolidationEnabled')}</span>
-                                  </label>
-                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, opacity: cs.enabled !== false ? 1 : 0.4 }}>
                                     <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editPeriodDays')}</span>
                                     <input type="number" min={0} max={365}
-                                      disabled={cs.enabled === false}
                                       value={Number(cs.period_days ?? 30)}
                                       onChange={(e) => updateConfig((c) => {
                                         const v = (c.consolidation ?? {}) as Record<string, unknown>;
@@ -8219,19 +7979,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                         c.consolidation = v;
                                       })}
                                       style={{ ...inputStyle, width: 64 }} />
-                                  </label>
-                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, opacity: cs.enabled !== false ? 1 : 0.4 }}>
-                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editAllocation')}</span>
-                                    <select value={String(cs.allocation_mode ?? 'fair')}
-                                      disabled={cs.enabled === false}
-                                      onChange={(e) => updateConfig((c) => {
-                                        const v = (c.consolidation ?? {}) as Record<string, unknown>;
-                                        v.allocation_mode = e.target.value; c.consolidation = v;
-                                      })} style={inputStyle}>
-                                      <option value="fair">fair</option>
-                                      <option value="proportional">proportional</option>
-                                      <option value="priority_first">priority_first</option>
-                                    </select>
                                   </label>
                                 </div>
                                 {isEdited && (
@@ -9348,85 +9095,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   </>
                 )}
               </section>
-              {/* Consolidation split */}
-              {woExplainRow.wo_consolidation_split_details && woExplainRow.wo_consolidation_split_details.length > 1 && (
-                <section style={{ marginBottom: '1.25rem' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
-                    <h4 style={{ margin: 0, color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('woExplain.consolidationSplit')}</h4>
-                    <button
-                      type="button"
-                      className="secondary"
-                      style={{ fontSize: '0.72rem', padding: '2px 8px' }}
-                      onClick={() => { setWoExplainOpen(false); setWoExplainKey(null); openOverrideDialog('component_split', woExplainRow); }}
-                    >
-                      {tP('woExplain.overrideSplit')}
-                    </button>
-                  </div>
-                  <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem' }}>
-                    {tP('woExplain.consolidatedFor')} <strong>{woExplainRow.wo_consolidation_split_details.length}</strong> {tP('woExplain.demandsTotal')} <strong>{qtyFmt(woExplainRow.wo_consolidation_total_planned ?? 0)}</strong>).
-                    {' '}{tP('woExplain.splitMode')} <strong>{woExplainRow.wo_consolidation_split_mode === 'proportional' ? tP('woExplain.proportional') : woExplainRow.wo_consolidation_split_mode === 'priority_first' ? tP('woExplain.priorityFirst') : tP('woExplain.splitFair')}</strong>.
-                  </p>
-                  {(() => {
-                    const exp = splitPolicyExplanation(woExplainRow.wo_consolidation_split_mode, tP);
-                    const overrideActive = woExplainRow.consolidation_override_active === true;
-                    return (
-                      <div style={{ margin: '0 0 0.6rem', padding: '0.55rem 0.75rem', background: '#27272a', borderRadius: 6, borderLeft: '3px solid #67e8f9' }}>
-                        <div style={{ fontSize: '0.78rem', color: '#67e8f9', marginBottom: '0.25rem', fontWeight: 600 }}>{exp.headline}</div>
-                        <p style={{ margin: 0, fontSize: '0.78rem', color: '#a1a1aa', lineHeight: 1.5 }}>{exp.detail}</p>
-                        <p style={{ margin: '0.4rem 0 0', fontSize: '0.72rem', color: '#71717a', fontStyle: 'italic' }}>
-                          {overrideActive
-                            ? <>{tP('woExplain.policySourceOverridePre')} <code style={{ background: '#1c1c1e', padding: '0 4px', borderRadius: 3 }}>component_split</code> {tP('woExplain.policySourceOverridePost')}</>
-                            : <>{tP('woExplain.policySourceConfigPre')} <code style={{ background: '#1c1c1e', padding: '0 4px', borderRadius: 3 }}>consolidation.allocation_mode</code> {tP('woExplain.policySourceConfigMid')} <em>{tP('woExplain.overrideSplit')}</em> {tP('woExplain.policySourceConfigSuffix')}</>}
-                        </p>
-                      </div>
-                    );
-                  })()}
-                  <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse' }}>
-                    <thead>
-                      <tr style={{ color: '#a1a1aa', textAlign: 'left' }}>
-                        <th style={{ paddingBottom: '0.2rem' }}>{tP('woExplain.columns.demand')}</th>
-                        <th style={{ paddingBottom: '0.2rem' }}>{tP('woExplain.columns.parentProduct')}</th>
-                        <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('woExplain.columns.priority')}</th>
-                        <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('woExplain.columns.requested')}</th>
-                        <th style={{ paddingBottom: '0.2rem', textAlign: 'right' }}>{tP('woExplain.columns.allocated')}</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {woExplainRow.wo_consolidation_split_details.map((row, i) => (
-                        <tr key={i} style={{ borderTop: '1px solid #3d3d40' }}>
-                          <td style={{ padding: '0.2rem 0.4rem 0.2rem 0' }}>
-                            {(() => {
-                              if (!row.demand_id) return '–';
-                              const dRow = (planResult?.committed_demands ?? []).find((d) => d.demand_id === row.demand_id) ?? null;
-                              if (!dRow) return row.demand_id;
-                              const dKey = `demand|${row.demand_id}|${dRow.product_id ?? ''}|${dRow.location_id ?? ''}`;
-                              return (
-                                <button
-                                  type="button"
-                                  style={{ background: 'none', border: 'none', padding: 0, color: '#60a5fa', cursor: 'pointer', fontSize: 'inherit', fontFamily: 'inherit', textDecoration: 'underline' }}
-                                  onClick={() => {
-                                    setPreviousWoExplainRow(woExplainRow);
-                                    setPlanPeggingContext({ type: 'demand', row: dRow });
-                                    setPlanPeggingOpen(true);
-                                    setWoPeggingRowKey(dKey);
-                                    setWoExplainOpen(false);
-                                  }}
-                                >{row.demand_id}</button>
-                              );
-                            })()}
-                          </td>
-                          <td style={{ padding: '0.2rem 0.4rem 0.2rem 0', color: '#a1a1aa' }}>{row.parent_product}</td>
-                          <td style={{ padding: '0.2rem 0', textAlign: 'right' }}>{row.priority}</td>
-                          <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right' }}>{qtyFmt(row.requested_qty)}</td>
-                          <td style={{ padding: '0.2rem 0 0.2rem 0.4rem', textAlign: 'right', color: row.allocated_qty < row.requested_qty - 0.01 ? '#f87171' : '#4ade80' }}>
-                            {qtyFmt(row.allocated_qty)}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </section>
-              )}
               {/* Supply alternatives */}
               <section style={{ marginBottom: '1.25rem' }}>
                 <h4 style={{ margin: '0 0 0.4rem', color: '#a78bfa', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{tP('woExplain.supplyAlts')}</h4>
@@ -10024,14 +9692,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     : tP('copilot.oneByPreference')}.{' '}
                 <strong>{tP('copilot.purchase')}</strong> {planningConfig.purchase_allowed === false ? tP('copilot.disabled') : tP('copilot.allowed')}.{' '}
                 <strong>{tP('copilot.consolidation')}</strong> {planningConfig.consolidation?.enabled === true
-                  ? tP('copilot.consolidationOnDetail', {
-                      days: planningConfig.consolidation.period_days ?? 30,
-                      split: planningConfig.consolidation.allocation_mode === 'proportional'
-                        ? tP('copilot.splitProportional')
-                        : planningConfig.consolidation.allocation_mode === 'priority_first'
-                          ? tP('copilot.splitPriorityFirst')
-                          : tP('copilot.splitFair'),
-                    })
+                  ? tP('copilot.consolidationOnDetail', { days: planningConfig.consolidation.period_days ?? 30 })
                   : tP('copilot.off')}. {tP('copilot.naturalLangInfo')}
               </p>
             </div>

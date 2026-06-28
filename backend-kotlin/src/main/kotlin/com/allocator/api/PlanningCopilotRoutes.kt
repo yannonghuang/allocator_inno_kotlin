@@ -55,7 +55,7 @@ private data class PlanningCopilotResponse(
 
 private const val SYSTEM_PROMPT = """You are a friendly planning configuration assistant. Users express their requirements in many different ways, in English or Chinese. Your job is to infer their intent from whatever wording they use—do not expect or require specific phrases. Be conversational and natural. Mirror the user's language (reply in Chinese if they wrote in Chinese).
 
-The plan config has three groups plus two post-plan UI toggles: **method_selection** (how make/move/buy methods are chosen), **purchase_allowed** (top-level boolean) and **purchasable_materials** (top-level array — selective whitelist of buyable raw materials), **consolidation** (demand grouping / bucket settings), **analyze_criticality** (top-level boolean, post-plan auto-analysis), and **check_soundness** (top-level boolean, post-plan auto-validation). Any of these can appear in `config_update`. (BOM variants are modeled as distinct make methods, so there is no separate variant config.)
+The plan config has three groups plus two post-plan UI toggles: **method_selection** (how make/move/buy methods are chosen), **purchase_allowed** (top-level boolean) and **purchasable_materials** (top-level array — selective whitelist of buyable raw materials), **consolidation** (WO batch window — groups same-component work orders that start within N days into fewer larger orders), **analyze_criticality** (top-level boolean, post-plan auto-analysis), and **check_soundness** (top-level boolean, post-plan auto-validation). Any of these can appear in `config_update`. (BOM variants are modeled as distinct make methods, so there is no separate variant config.)
 
 Intent → config mapping (interpret any phrasing that conveys the same intent):
 
@@ -108,26 +108,17 @@ Intent → config mapping (interpret any phrasing that conveys the same intent):
    description so the user can confirm. This list of phrasings is NOT exhaustive — interpret any
    equivalent intent.
 
-7) **Enable demand consolidation / group demands / share work orders across demands** (e.g. "enable consolidation", "consolidate demand", "启用合并", "开启合并", "合并需求", "共享组件")
+7) **Enable WO batching (consolidation)** (e.g. "enable consolidation", "batch work orders", "启用合并", "开启合并", "批量合并工单")
    → consolidation: { "enabled": true }.
 
-8) **Disable consolidation / turn it off / do not group** (e.g. "禁用合并", "关闭合并", "不合并")
+8) **Disable WO batching (consolidation)** (e.g. "disable consolidation", "no batching", "禁用合并", "关闭合并", "不合并")
    → consolidation: { "enabled": false }.
 
-9) **Set the consolidation bucket / period / window to N days** (e.g. "30 day bucket", "60天窗口", "period 90 days", "single bucket", "全部合并")
-   → consolidation: { "period_days": N } (clamp 0..365). 0 = single bucket (collapse every demand into one bucket regardless of due date).
+9) **Set the WO batch window to N days** (e.g. "30 day batch window", "60天窗口", "period 90 days", "single bucket", "全部合并")
+   → consolidation: { "period_days": N } (clamp 0..365). 0 = single bucket.
 
-10) **Consolidation split policy — proportional / by share / by quantity** (e.g. "proportional split", "按比例", "按数量", "按份额")
-    → consolidation: { "allocation_mode": "proportional" }.
-
-11) **Consolidation split policy — priority-first / fill highest priority first** (e.g. "priority first", "by priority", "优先级优先", "按优先级")
-    → consolidation: { "allocation_mode": "priority_first" }.
-
-12) **Consolidation split policy — fair / hybrid / no one starved** (e.g. "fair split", "公平", "混合拆分")
-    → consolidation: { "allocation_mode": "fair" }.
-
-13) **Reset / clear / default** → full defaults:
-    method_selection: { "multiple": false, "mode": "preference", "depth": 1 }, purchase_allowed: false, consolidation: { "enabled": true, "period_days": 30, "allocation_mode": "fair" }, analyze_criticality: false, check_soundness: true.
+10) **Reset / clear / default** → full defaults:
+    method_selection: { "multiple": false, "mode": "preference", "depth": 1 }, purchase_allowed: false, consolidation: { "enabled": true, "period_days": 30 }, analyze_criticality: false, check_soundness: true.
 
 14) **Enable criticality analysis after plan** (e.g. "analyze criticality", "criticality on", "open criticality", "启用关键度", "做关键度分析", "开启临界分析")
     → analyze_criticality: true. Auto-saves the run and runs criticality after each plan.
@@ -145,7 +136,7 @@ Valid config_update keys:
 - method_selection: object with optional "multiple" (bool), "mode" ("preference" | "elaborate"), "depth" (int ≥ 1), "max_methods" (int ≥ 1; default 2; waterfall cap), "max_bom_depth" (int 1..10; default 3; make-fallback admission cap), "score_weights" ({ commit_time, inventory_consumed, purchase } — numeric, backend normalizes).
 - purchase_allowed: boolean (top-level, not nested).
 - purchasable_materials: array of product_id strings (top-level). Empty ⇒ all raw materials buyable (default). Non-empty ⇒ strict whitelist; only listed raw materials may be bought. Resolve only against the supplied catalog.
-- consolidation: object with optional "enabled" (bool), "period_days" (int 0..365; 0 = single bucket), "allocation_mode" ("fair" | "proportional" | "priority_first").
+- consolidation: object with optional "enabled" (bool), "period_days" (int 0..365; 0 = single bucket).
 - analyze_criticality: boolean (top-level). Post-plan UI toggle, does not affect the planner itself.
 - check_soundness: boolean (top-level). Post-plan UI toggle, does not affect the planner itself.
 
@@ -244,7 +235,7 @@ private suspend fun llmParse(
         val ac = cu["analyze_criticality"]?.jsonPrimitive?.booleanOrNull
         val sc = cu["check_soundness"]?.jsonPrimitive?.booleanOrNull
         val msOk = ms?.let { "multiple" in it || "elaborate" in it || "mode" in it || "depth" in it || "max_methods" in it || "max_bom_depth" in it || "score_weights" in it } == true
-        val csOk = cs?.let { "enabled" in it || "period_days" in it || "allocation_mode" in it } == true
+        val csOk = cs?.let { "enabled" in it || "period_days" in it } == true
         val paOk = pa != null
         val acOk = ac != null
         val scOk = sc != null
@@ -385,25 +376,15 @@ private fun ruleBasedParse(
         })
         val csEnabled = cs["enabled"]?.jsonPrimitive?.booleanOrNull
         if (csEnabled == false) {
-            parts.add(if (zh) "合并关闭" else "consolidation off")
+            parts.add(if (zh) "工单批量合并关闭" else "WO batching off")
         } else {
             val days = cs["period_days"]?.jsonPrimitive?.intOrNull ?: 30
-            val mode = cs["allocation_mode"]?.jsonPrimitive?.contentOrNull ?: "fair"
-            val modeLabel = if (zh) when (mode) {
-                "proportional" -> "按比例拆分"
-                "priority_first" -> "优先级优先拆分"
-                else -> "公平拆分"
-            } else when (mode) {
-                "proportional" -> "proportional split"
-                "priority_first" -> "priority-first split"
-                else -> "fair split"
-            }
             val bucketLabel = if (zh) {
-                if (days == 0) "单桶" else "${days}天桶"
+                if (days == 0) "单桶" else "${days}天窗口"
             } else {
-                if (days == 0) "single bucket" else "$days-day bucket"
+                if (days == 0) "single bucket" else "$days-day window"
             }
-            parts.add(if (zh) "合并开启（$bucketLabel，$modeLabel）" else "consolidation on ($bucketLabel, $modeLabel)")
+            parts.add(if (zh) "工单批量合并开启（$bucketLabel）" else "WO batching on ($bucketLabel)")
         }
         val analyzeCriticality = current["analyze_criticality"]?.jsonPrimitive?.booleanOrNull == true
         val checkSoundness = current["check_soundness"]?.jsonPrimitive?.booleanOrNull != false  // default true
@@ -414,8 +395,8 @@ private fun ruleBasedParse(
         val sep = if (zh) "、" else ", "
         val desc = if (parts.isEmpty()) (if (zh) "默认" else "default") else parts.joinToString(sep)
         return bi(
-            "Right now we're using $desc. If you'd like to switch, just say so—e.g. \"max methods 2\", \"elaborate methods\", \"method depth 3\", \"max BOM depth 4\", \"allow purchase\", \"check soundness off\", or \"disable consolidation\".",
-            "当前配置：$desc。如需切换，告诉我即可 — 例如「最多方法 2」、「精细方法」、「方法深度 3」、「最大 BOM 深度 4」、「允许采购」、「关闭完整性校验」或「禁用合并」。",
+            "Right now we're using $desc. If you'd like to switch, just say so—e.g. \"max methods 2\", \"elaborate methods\", \"method depth 3\", \"max BOM depth 4\", \"allow purchase\", \"set 14-day batch window\", \"check soundness off\", or \"disable WO batching\".",
+            "当前配置：$desc。如需切换，告诉我即可 — 例如「最多方法 2」、「精细方法」、「方法深度 3」、「最大 BOM 深度 4」、「允许采购」、「设置 14 天批量窗口」、「关闭完整性校验」或「禁用工单批量合并」。",
             raw,
         ) to null
     }
@@ -555,22 +536,20 @@ private fun ruleBasedParse(
         Regex("禁用合并|关闭合并|不合并").containsMatchIn(raw)
     ) {
         return bi(
-            "Disabling consolidation: each demand will get its own work orders again. Re-run plan to apply.",
-            "已禁用合并：每个需求将再次获得各自的生产订单。请重新运行计划以生效。",
+            "Disabling WO batching: same-component work orders will no longer be merged. Re-run plan to apply.",
+            "已禁用工单批量合并：同一组件的工单将不再合并。请重新运行计划以生效。",
             raw,
         ) to mergeConsolidation(current, mapOf("enabled" to JsonPrimitive(false)))
     }
-    if (Regex("enable consolidat|turn on consolidat|consolidate demand|group demand|shared.?component").containsMatchIn(t) ||
-        Regex("启用合并|开启合并|合并需求|共享组件").containsMatchIn(raw)
+    if (Regex("enable consolidat|turn on consolidat|batch work order|enable.*batch|wo batch").containsMatchIn(t) ||
+        Regex("启用合并|开启合并|批量合并工单|开启批量").containsMatchIn(raw)
     ) {
         val days = cs["period_days"]?.jsonPrimitive?.intOrNull ?: 30
-        val mode = cs["allocation_mode"]?.jsonPrimitive?.contentOrNull ?: "fair"
-        val bucketLabel = if (days == 0) "single-bucket" else "$days-day bucket"
-        val zhBucketLabel = if (days == 0) "单桶" else "${days}天桶"
-        val zhMode = when (mode) { "proportional" -> "按比例"; "priority_first" -> "优先级优先"; else -> "公平" }
+        val bucketLabel = if (days == 0) "single-bucket" else "$days-day window"
+        val zhBucketLabel = if (days == 0) "单桶" else "${days}天窗口"
         return bi(
-            "Enabling consolidation ($bucketLabel, $mode split). Demands for the same component in the same bucket will share work orders. Re-run plan to apply.",
-            "已启用合并（$zhBucketLabel，$zhMode 拆分）。同一桶内共享同一组件的需求将共用生产订单。请重新运行计划以生效。",
+            "Enabling WO batching ($bucketLabel). Same-component work orders within the window will be merged into fewer larger orders. Re-run plan to apply.",
+            "已启用工单批量合并（$zhBucketLabel）。同一时间窗口内同一组件的工单将合并为更少的大订单。请重新运行计划以生效。",
             raw,
         ) to mergeConsolidation(current, mapOf("enabled" to JsonPrimitive(true)))
     }
@@ -603,35 +582,6 @@ private fun ruleBasedParse(
             "已将合并时间桶设为 $zhMsg。同一时间窗口内的需求可共用生产订单。请重新运行计划以生效。",
             raw,
         ) to mergeConsolidation(current, mapOf("period_days" to JsonPrimitive(days)))
-    }
-
-    // ── Consolidation allocation_mode ──
-    if (Regex("proportional|split by (qty|quantity|share)|by share").containsMatchIn(t) ||
-        Regex("按比例|按数量|按份额").containsMatchIn(raw)
-    ) {
-        return bi(
-            "Using proportional split: shared work orders are divided across demands in proportion to their requested quantity. Re-run plan to apply.",
-            "采用按比例拆分：共享生产订单按各需求请求数量的比例分配。请重新运行计划以生效。",
-            raw,
-        ) to mergeConsolidation(current, mapOf("allocation_mode" to JsonPrimitive("proportional")))
-    }
-    if (Regex("priority.?first|fill highest priority|by priority|priority order").containsMatchIn(t) ||
-        Regex("优先级优先|按优先级|优先级顺序").containsMatchIn(raw)
-    ) {
-        return bi(
-            "Using priority-first split: highest-priority demands get filled first from shared work orders. Re-run plan to apply.",
-            "采用优先级优先拆分：共享生产订单先满足优先级最高的需求。请重新运行计划以生效。",
-            raw,
-        ) to mergeConsolidation(current, mapOf("allocation_mode" to JsonPrimitive("priority_first")))
-    }
-    if (Regex("\\bfair\\b|hybrid split|no one starved").containsMatchIn(t) ||
-        Regex("公平|混合拆分").containsMatchIn(raw)
-    ) {
-        return bi(
-            "Using fair split: priority guides the order but every demand gets some share—no one is starved. Re-run plan to apply.",
-            "采用公平拆分：优先级决定顺序，但每个需求都能得到一份 — 没人被饿死。请重新运行计划以生效。",
-            raw,
-        ) to mergeConsolidation(current, mapOf("allocation_mode" to JsonPrimitive("fair")))
     }
 
     // ── Post-plan UI toggles: analyze_criticality ──
@@ -693,14 +643,13 @@ private fun ruleBasedParse(
             put("consolidation", buildJsonObject {
                 put("enabled", true)
                 put("period_days", 30)
-                put("allocation_mode", "fair")
             })
             put("analyze_criticality", false)
             put("check_soundness", true)
         }
         return bi(
-            "Reset to defaults: method by preference, purchase disabled, consolidation on (30-day bucket, fair split), criticality off, soundness check on.",
-            "已重置为默认：按偏好方法、禁用采购、合并开启（30 天桶，公平拆分）、关键度关闭、完整性校验开启。",
+            "Reset to defaults: method by preference (cascade), max methods 2, max BOM depth 3, purchase disabled, WO batching on (30-day window), criticality off, soundness check on.",
+            "已重置为默认：按偏好方法（级联）、最多 2 个方法、最大 BOM 深度 3、禁用采购、工单批量合并开启（30 天窗口）、关键度关闭、完整性校验开启。",
             raw,
         ) to patch
     }
