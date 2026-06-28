@@ -2202,7 +2202,7 @@ fun plan(
     val budgetCap = budget?.get(componentKey)
         ?: perLotBudget?.values?.sum()?.takeIf { it > 1e-9 }
     val consumedBuckets = consumeFromInventory(
-        inventory, productId, locationId, quantity, preferDemandId, null, null,
+        inventory, productId, locationId, quantity, preferDemandId, null, perLotBudget,
     )
     val taken = consumedBuckets.sumOf { it.qty }
     // Write back per-lot budget remainders.
