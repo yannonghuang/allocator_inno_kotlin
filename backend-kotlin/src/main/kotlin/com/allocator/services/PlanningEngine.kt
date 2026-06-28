@@ -459,8 +459,8 @@ private fun consumeFromInventory(
             val avail = (b["qty"] as? Number)?.toDouble() ?: 0.0
             if (avail <= 0) continue
             val sid = b["supply_id"]?.toString()
-            // perLotBudget acts as a whitelist: a lot absent from the map gets cap 0.0 (not unlimited).
-            val lotCap = if (perLotBudget != null && sid != null) (perLotBudget[sid] ?: 0.0) else null
+            // perLotBudget caps individual lots present in the map; absent lots are uncapped (non-critical pool).
+            val lotCap = if (perLotBudget != null && sid != null && perLotBudget.containsKey(sid)) perLotBudget[sid] else null
             val take = min(avail, if (lotCap != null) min(remaining, lotCap) else remaining)
             if (take <= 0) continue
             b["qty"] = avail - take
@@ -4321,6 +4321,12 @@ fun runPlanning(
         committedDemands.clear(); committedDemands.addAll(synced)
     }
 
+    // ── Inventory reallocation pass ────────────────────────────────────────────
+    // Consume leftover inventory at components that still have WOs (R10 fix).
+    // Runs after reconcile so quantities are finalised; runs before Pass 2 so WO
+    // consolidation and timing steps see the corrected pegging automatically.
+    val reallocTrees = reallocateInventoryToWos(reconciledTrees, inventory)
+
     // ── Pass 2 — WO consolidation + timing ────────────────────────────────────
     // Mental model: Pass 1 builds the per-demand pegging SKELETON (BOM explosion +
     // alternative selection + quantities); Pass 2 derives the work orders FROM it. The
@@ -4338,7 +4344,7 @@ fun runPlanning(
     // 0 ⇒ one batch per component across the horizon.
     @Suppress("UNCHECKED_CAST")
     val consolidationCfg = config?.get("consolidation") as? Map<String, Any?>
-    val nodeLevelWos = flattenPeggingToWorkOrders(reconciledTrees, data)
+    val nodeLevelWos = flattenPeggingToWorkOrders(reallocTrees, data)
     val consolidateWos = consolidationConfig.enabled && consolidationCfg?.get("consolidate_wos") != false
     // consolidated.consolidated = the merged procurement view; consolidated.native = the same input
     // per-demand WOs, each tagged with `consolidated_group_id` so every native belongs to EXACTLY ONE
@@ -4357,8 +4363,8 @@ fun runPlanning(
     // than the consolidated batch's start_time, push the batch forward (preserving lead_time)
     // and cascade up the BOM until convergence.
     val (adjustedTrees, adjustedConsolidated) = if (consolidateWos)
-        readjustConsolidatedWoTiming(reconciledTrees, consolidation)
-    else ReadjustResult(reconciledTrees, consolidation.consolidated)
+        readjustConsolidatedWoTiming(reallocTrees, consolidation)
+    else ReadjustResult(reallocTrees, consolidation.consolidated)
 
     // Patch native WO timings to match the adjusted consolidated WO for each group.
     // Preserve original per-demand start and lead before overwriting with consolidated timing so
@@ -4731,17 +4737,14 @@ internal fun verifyInventoryPriority(
         supplyMeta[sid] = SupplyMeta(pid, lid, supplyDate)
     }
 
-    // Leftover qty by supply_id, skipping consolidated synthetic buckets and
-    // demand-tagged reservation buckets. Tagged buckets are private to their
-    // assigned demand (consumeFromInventory pass 1 only serves tagged demand);
-    // their leftover is not available to other demands' WOs, so it would be a
-    // false positive to flag WOs at the same component as a priority violation.
+    // Leftover qty by supply_id, skipping consolidated synthetic buckets.
+    // Demand-tagged buckets ARE included — if a demand's tagged supply sits
+    // unused while that demand also has WOs, that is a genuine priority violation:
+    // the planner should have consumed the reserved inventory before creating WOs.
     val leftoverBySupply = mutableMapOf<String, Double>()
     for (inv in inventoryLeftover) {
         val sid = inv["supply_id"]?.toString() ?: continue
         if (sid.startsWith("consolidated_")) continue
-        val demandTag = inv["demand_tag"]
-        if (demandTag != null && demandTag.toString().isNotBlank()) continue
         val qty = (inv["qty"] as? Number)?.toDouble() ?: 0.0
         if (qty > tolerance) leftoverBySupply.merge(sid, qty, Double::plus)
     }
@@ -4785,6 +4788,107 @@ internal fun verifyInventoryPriority(
         log.warn("inventory-priority violation — R10: {}@{} leftover={} woStart={}", pid, lid, leftover, woStart)
     }
     return violations
+}
+
+/**
+ * Post-planning inventory reallocation pass (R10 safety net).
+ *
+ * After the main planning loop, leftover inventory at a component while WOs
+ * also exist there indicates the planner failed to exhaust stock before issuing
+ * new production orders. This pass corrects any residual cases by walking each
+ * demand's reconciled pegging tree and, for every child WO whose product has
+ * leftover inventory, consuming from that inventory and reducing or eliminating
+ * the WO via [garbageCollectPegging] (which returns the WO's BOM-input
+ * components back to the inventory pool for other demands).
+ *
+ * Called BEFORE [flattenPeggingToWorkOrders] so the corrected trees feed into
+ * WO consolidation and timing steps automatically.
+ *
+ * The primary fix for non-critical materials is the [perLotBudget] change in
+ * [consumeFromInventory] (absent lot = uncapped). This pass handles the residual:
+ * critical-material tagged lots stranded when a demand was served via a higher-
+ * priority path, and lot-size rounding remainders.
+ */
+internal fun reallocateInventoryToWos(
+    peggingEntries: List<Map<String, Any?>>,
+    inventory: MutableList<MutableMap<String, Any?>>,
+    tolerance: Double = 1e-6,
+): List<Map<String, Any?>> {
+    var count = 0
+    val result = peggingEntries.map { entry ->
+        val tree = entry["tree"] as? Map<String, Any?> ?: return@map entry
+        val demandId = entry["demand_id"]?.toString()
+        val (newTree, c) = reallocSubtree(tree, inventory, demandId, tolerance)
+        count += c
+        if (newTree === tree) entry else entry.toMutableMap().also { it["tree"] = newTree }
+    }
+    if (count > 0) log.info("[realloc] substituted {} WO nodes with inventory draws", count)
+    return result
+}
+
+@Suppress("UNCHECKED_CAST")
+private fun reallocSubtree(
+    node: Map<String, Any?>,
+    inventory: MutableList<MutableMap<String, Any?>>,
+    demandId: String?,
+    tolerance: Double,
+): Pair<Map<String, Any?>, Int> {
+    val type = node["type"] as? String ?: return node to 0
+    if (type != "work_order" && type != "demand") return node to 0
+    val children = node["children"] as? List<Map<String, Any?>> ?: return node to 0
+    if (children.isEmpty()) return node to 0
+
+    val newChildren = mutableListOf<Map<String, Any?>>()
+    var changed = false
+    var count = 0
+
+    for (child in children) {
+        if (child["type"] == "work_order") {
+            val pid = child["product_id"]?.toString()?.trim() ?: ""
+            val lid = child["location_id"]?.toString()?.trim() ?: ""
+            val childQty = (child["quantity"] as? Number)?.toDouble() ?: 0.0
+            if (childQty > tolerance && pid.isNotEmpty() && lid.isNotEmpty()) {
+                // preferDemandId: critical-material tagged lots for this demand consumed first
+                // (pass 1), then untagged pool (pass 2). Never touches another demand's tagged lots.
+                val consumed = consumeFromInventory(inventory, pid, lid, childQty, preferDemandId = demandId)
+                val totalConsumed = consumed.sumOf { it.qty }
+                if (totalConsumed > tolerance) {
+                    changed = true
+                    count++
+                    val residual = childQty - totalConsumed
+                    if (residual > tolerance) {
+                        // Partial: trim WO — GC returns freed BOM-input component inventory
+                        val trimmed = garbageCollectPegging(child, residual, inventory, budget = null)
+                        val (recursed, inner) = reallocSubtree(trimmed, inventory, demandId, tolerance)
+                        newChildren.add(recursed)
+                        count += inner
+                    } else {
+                        // Full substitution: GC entire WO subtree, returning all input-component inventory
+                        garbageCollectPegging(child, 0.0, inventory, budget = null)
+                    }
+                    // Emit one supply pegging node per consumed lot
+                    for (cb in consumed) {
+                        if (cb.qty <= tolerance) continue
+                        newChildren.add(mapOf(
+                            "type"        to "supply",
+                            "product_id"  to pid,
+                            "location_id" to lid,
+                            "quantity"    to cb.qty,
+                            "supply_id"   to cb.supplyId,
+                            "commit_time" to cb.commitTime,
+                        ))
+                    }
+                    continue
+                }
+            }
+        }
+        // No substitution — recurse into this child for deeper substitutions
+        val (newChild, inner) = reallocSubtree(child, inventory, demandId, tolerance)
+        newChildren.add(if (newChild !== child) newChild else child)
+        changed = changed || (newChild !== child)
+        count += inner
+    }
+    return (if (!changed) node else node + ("children" to newChildren)) to count
 }
 
 /**
