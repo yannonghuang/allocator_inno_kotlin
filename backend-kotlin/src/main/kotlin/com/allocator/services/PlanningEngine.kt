@@ -4690,6 +4690,98 @@ internal fun verifyWoConservation(
 }
 
 /**
+ * R10: inventory-priority check. For each (product_id, location_id) where the plan
+ * created new work orders, verify that all timely physical supply inventory at that
+ * component was consumed before resorting to new production.
+ *
+ * "Timely" means the supply lot's [supply_date] is on or before the earliest WO
+ * [start_time] at the same component — i.e., the inventory was available when the
+ * WO would have started and should have been drawn instead.
+ *
+ * Violations indicate the planner under-consumed existing stock and created
+ * unnecessary WOs, which over-states production load and inflates WO count.
+ *
+ * Skipped when [inventoryLeftover] or [workOrders] is empty (R7e snapshots not
+ * available for historical runs, or a plan with no work orders).
+ *
+ * @param inventoryLeftover   Compact inventory snapshot after all planning passes
+ *        (supply_id + qty only, as persisted to [PlanRuns.inventoryLeftover]).
+ * @param workOrders          Consolidated work orders from the plan output.
+ * @param supplies            Full supply rows from case data ([data["supply"]]).
+ *        Required to look up (product_id, location_id, supply_date) from supply_id.
+ */
+internal fun verifyInventoryPriority(
+    inventoryLeftover: List<Map<String, Any?>>,
+    workOrders: List<Map<String, Any?>>,
+    supplies: List<Map<String, Any?>>,
+    tolerance: Double = 1e-6,
+): List<String> {
+    if (inventoryLeftover.isEmpty() || workOrders.isEmpty()) return emptyList()
+
+    // supply_id → (product_id, location_id, supply_date)
+    data class SupplyMeta(val pid: String, val lid: String, val supplyDate: java.time.LocalDate?)
+    val supplyMeta = mutableMapOf<String, SupplyMeta>()
+    for (s in supplies) {
+        val sid = s["supply_id"]?.toString() ?: continue
+        val pid = (s["product_id"] as? String)?.trim() ?: continue
+        val lid = (s["location_id"] as? String)?.trim() ?: continue
+        val supplyDate = (s["supply_date"] as? String)?.let {
+            runCatching { java.time.LocalDate.parse(it) }.getOrNull()
+        }
+        supplyMeta[sid] = SupplyMeta(pid, lid, supplyDate)
+    }
+
+    // Leftover qty by supply_id, skipping consolidated synthetic buckets.
+    val leftoverBySupply = mutableMapOf<String, Double>()
+    for (inv in inventoryLeftover) {
+        val sid = inv["supply_id"]?.toString() ?: continue
+        if (sid.startsWith("consolidated_")) continue
+        val qty = (inv["qty"] as? Number)?.toDouble() ?: 0.0
+        if (qty > tolerance) leftoverBySupply.merge(sid, qty, Double::plus)
+    }
+    if (leftoverBySupply.isEmpty()) return emptyList()
+
+    // Earliest WO start_time per component (pid|lid). Skip zero-qty and failed WOs.
+    val woEarliestStart = mutableMapOf<String, java.time.LocalDate>()
+    for (wo in workOrders) {
+        val pid = (wo["product_id"] as? String)?.trim() ?: continue
+        val lid = (wo["location_id"] as? String)?.trim() ?: continue
+        if ((wo["quantity"] as? Number)?.toDouble() ?: 0.0 <= 0.0) continue
+        if (wo["failed"] == true) continue
+        val start = (wo["start_time"] as? String)?.let {
+            runCatching { java.time.LocalDate.parse(it) }.getOrNull()
+        } ?: continue
+        val key = "$pid|$lid"
+        val cur = woEarliestStart[key]
+        if (cur == null || start.isBefore(cur)) woEarliestStart[key] = start
+    }
+    if (woEarliestStart.isEmpty()) return emptyList()
+
+    // Accumulate timely leftover by component: leftover lots whose supply_date ≤ earliest WO start.
+    val timelyLeftoverByComponent = mutableMapOf<String, Double>()
+    for ((sid, leftover) in leftoverBySupply) {
+        val meta = supplyMeta[sid] ?: continue
+        val compKey = "${meta.pid}|${meta.lid}"
+        val woStart = woEarliestStart[compKey] ?: continue   // no WO at this component → skip
+        // Supply is "timely" if it was available on or before the WO's start date.
+        // A null supply_date is treated as earliest possible (e.g. on-hand stock) → always timely.
+        if (meta.supplyDate != null && meta.supplyDate.isAfter(woStart)) continue
+        timelyLeftoverByComponent.merge(compKey, leftover, Double::plus)
+    }
+
+    val violations = mutableListOf<String>()
+    for ((compKey, leftover) in timelyLeftoverByComponent.entries.sortedBy { it.key }) {
+        val (pid, lid) = compKey.split("|", limit = 2)
+        val woStart = woEarliestStart[compKey]
+        violations.add(
+            "R10: $pid@$lid — %.4f units of inventory available before earliest WO ($woStart) were not consumed. Existing stock should be exhausted before new WOs are issued.".format(leftover)
+        )
+        log.warn("inventory-priority violation — R10: {}@{} leftover={} woStart={}", pid, lid, leftover, woStart)
+    }
+    return violations
+}
+
+/**
  * Post-processing pass: enforce
  *   start_time(parent WO) >= max(end_time(direct-child WOs))
  * across the assembled work-order list.

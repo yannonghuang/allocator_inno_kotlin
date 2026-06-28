@@ -1681,6 +1681,9 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
         putJsonArray("conservation_violations") {
             for (msg in report.conservationViolations) add(JsonPrimitive(msg))
         }
+        putJsonArray("inventory_priority_violations") {
+            for (msg in report.inventoryPriorityViolations) add(JsonPrimitive(msg))
+        }
     }
     transaction {
         PlanRuns.update({ (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }) {

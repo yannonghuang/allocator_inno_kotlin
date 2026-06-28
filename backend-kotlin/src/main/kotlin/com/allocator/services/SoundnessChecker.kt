@@ -45,6 +45,11 @@ import kotlin.math.abs
  *   R8 conservation (deep check) — committed_qty at root = Σ over leaves
  *      of (leaf.qty × ∏ rates along leaf→root path), within tolerance.
  *      Skipped unless [SoundnessConfig.deepCheck] = true.
+ *   R10 inventory priority — for every (product, location) that has work orders,
+ *      all physical supply inventory available on or before the earliest WO
+ *      start_time must have been consumed. Leftover timely inventory while WOs
+ *      run indicates the planner created unnecessary production. Gates overallSound.
+ *      Skipped when inventoryLeftover snapshots are not provided.
  *
  * The checker is a pure function — it neither mutates inputs nor consults the
  * database. Callers feed it the persisted plan-run state plus the case data.
@@ -123,6 +128,12 @@ data class SoundnessReport(
      * [producedByComponent] or [workOrders] was not passed to [checkRunSoundness].
      */
     val woConservationViolations: List<String> = emptyList(),
+    /**
+     * R10 inventory-priority violations: timely physical supply inventory was left unconsumed
+     * at a (product, location) while new work orders were created there. Empty when
+     * [inventoryLeftover] was not provided (e.g. historical runs without persisted snapshots).
+     */
+    val inventoryPriorityViolations: List<String> = emptyList(),
 )
 
 /**
@@ -463,14 +474,24 @@ fun checkRunSoundness(
             )
         else emptyList()
 
+    // R10: inventory priority — timely physical inventory must be exhausted before
+    // creating WOs at the same component. Only runs when inventoryLeftover is available
+    // (same guard as R7e; skipped for historical runs without persisted snapshots).
+    val inventoryPriorityViolations: List<String> =
+        if (inventoryLeftover.isNotEmpty() && workOrders.isNotEmpty())
+            verifyInventoryPriority(inventoryLeftover, workOrders, supplies)
+        else emptyList()
+
     val soundCount = demandReports.count { it.sound }
     // R7f (component conservation) and R7g (WO conservation) are efficiency signals:
     // they fire at max_iterations=1 by design (budget leakage is expected and reclaimed
     // naturally at higher iter counts). They do NOT gate overallSound so that sound plans
     // can still be promoted to KB even when single-pass allocation leaves some slack.
+    // R10 gates overallSound: creating WOs when inventory is available is a planning error.
     val overallSound = soundCount == demandReports.size &&
         crossViolations.isEmpty() &&
-        conservationViolations.isEmpty()
+        conservationViolations.isEmpty() &&
+        inventoryPriorityViolations.isEmpty()
 
     return SoundnessReport(
         overallSound = overallSound,
@@ -482,6 +503,7 @@ fun checkRunSoundness(
         conservationViolations = conservationViolations,
         componentConservationViolations = componentConservationViolations,
         woConservationViolations = woConservationViolations,
+        inventoryPriorityViolations = inventoryPriorityViolations,
     )
 }
 
