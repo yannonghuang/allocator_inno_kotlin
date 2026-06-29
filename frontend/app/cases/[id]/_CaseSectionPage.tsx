@@ -2116,6 +2116,31 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       .catch(() => setDemandPeggingCache((prev) => ({ ...prev, [demandId]: 'error' })));
   }, [planPeggingContext, planResult, demandPeggingCache, currentPlanRunId, freshPlanRunId, id]);
 
+  // Lazily fetch pegging tree when user highlights a WO row (for predecessor/
+  // successor display), mirroring the demand-panel lazy load above.
+  useEffect(() => {
+    if (!woPegHighlightRow) return;
+    const demandId = String(woPegHighlightRow.demand_id ?? '').trim();
+    if (!demandId) return;
+    const inResult = planResult?.planning_pegging?.some((e) => String(e.demand_id ?? '').trim() === demandId);
+    if (inResult) return;
+    if (demandPeggingCache[demandId]) return;
+    const planRunId = currentPlanRunId ?? freshPlanRunId;
+    if (!planRunId || !id) return;
+    setDemandPeggingCache((prev) => ({ ...prev, [demandId]: 'loading' }));
+    getPlanRunPegging(Number(id), planRunId, demandId)
+      .then(({ planning_pegging }) => {
+        const entry = planning_pegging[planning_pegging.length - 1] as PlanningPeggingEntry | undefined;
+        if (entry) {
+          setDemandPeggingCache((prev) => ({ ...prev, [demandId]: entry }));
+          setPlanResult((prev) => prev ? { ...prev, planning_pegging: [...(prev.planning_pegging ?? []), entry] } : prev);
+        } else {
+          setDemandPeggingCache((prev) => ({ ...prev, [demandId]: 'error' }));
+        }
+      })
+      .catch(() => setDemandPeggingCache((prev) => ({ ...prev, [demandId]: 'error' })));
+  }, [woPegHighlightRow, planResult, demandPeggingCache, currentPlanRunId, freshPlanRunId, id]);
+
   // Reset assessment result/history when a different supply is opened in the
   // breakdown slide-in (where the assessment UI now lives).
   const currentExplainSupplyId = supExplainRow?.supplyId ?? null;
