@@ -158,6 +158,14 @@ data class SoundnessReport(
      * independent of pegging-tree commit_times. Empty when work_orders was not passed.
      */
     val crossTreeTimingViolations: List<Violation> = emptyList(),
+    /**
+     * R13 WO→supply-leaf timing violations: for a WO group in work_orders, at least one
+     * true-leaf supply/purchase child in the pegging tree has a commit_time later than the
+     * WO's start_time. A true-leaf supply has no sub-tree (e.g. physical inventory, PO). For
+     * produced supply (sub-tree present), R12 captures the dependency via the producing WO.
+     * Empty when work_orders was not passed.
+     */
+    val woSupplyLeafViolations: List<Violation> = emptyList(),
 )
 
 /**
@@ -516,18 +524,24 @@ fun checkRunSoundness(
         if (workOrders.isNotEmpty()) verifyWoTimingCrossTree(planningPegging, workOrders, config)
         else emptyList()
 
+    // R13: WO start vs true-leaf supply commit_time — only when work_orders is available.
+    val woSupplyLeafViolations: List<Violation> =
+        if (workOrders.isNotEmpty()) verifyWoSupplyLeafTiming(planningPegging, workOrders, config)
+        else emptyList()
+
     val soundCount = demandReports.count { it.sound }
     // R7f (component conservation) and R7g (WO conservation) are efficiency signals:
     // they fire at max_iterations=1 by design (budget leakage is expected and reclaimed
     // naturally at higher iter counts). They do NOT gate overallSound so that sound plans
     // can still be promoted to KB even when single-pass allocation leaves some slack.
-    // R10, R11, R12 gate overallSound: scheduling errors are planning bugs.
+    // R10–R13 gate overallSound: scheduling errors are planning bugs.
     val overallSound = soundCount == demandReports.size &&
         crossViolations.isEmpty() &&
         conservationViolations.isEmpty() &&
         inventoryPriorityViolations.isEmpty() &&
         woGidOrphanViolations.isEmpty() &&
-        crossTreeTimingViolations.isEmpty()
+        crossTreeTimingViolations.isEmpty() &&
+        woSupplyLeafViolations.isEmpty()
 
     return SoundnessReport(
         overallSound = overallSound,
@@ -542,6 +556,7 @@ fun checkRunSoundness(
         inventoryPriorityViolations = inventoryPriorityViolations,
         woGidOrphanViolations = woGidOrphanViolations,
         crossTreeTimingViolations = crossTreeTimingViolations,
+        woSupplyLeafViolations = woSupplyLeafViolations,
     )
 }
 
@@ -1403,6 +1418,7 @@ internal fun verifyWoTimingCrossTree(
     fun dagWalk(node: Map<String, Any?>, parentGid: String?, depth: Int) {
         if (depth > 60) return
         val type = node["type"] as? String
+        val nodeChildren = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
         if (type == "work_order") {
             if (node["failed"] == true) return
             val gid = (node["wo_group_id"] as? String)?.trim()?.takeIf(String::isNotBlank)
@@ -1410,11 +1426,15 @@ internal fun verifyWoTimingCrossTree(
                 if (parentGid != null && parentGid != gid) {
                     childrenOf.getOrPut(parentGid) { mutableSetOf() }.add(gid)
                 }
-                for (c in (node["children"] as? List<Map<String, Any?>>) ?: emptyList()) dagWalk(c, gid, depth + 1)
+                for (c in nodeChildren) dagWalk(c, gid, depth + 1)
                 return
             }
         }
-        for (c in (node["children"] as? List<Map<String, Any?>>) ?: emptyList()) dagWalk(c, parentGid, depth + 1)
+        // Supply/purchase nodes with sub-trees represent produced supply: recurse
+        // so the producing WO (a few levels down) is captured as a child of parentGid.
+        // This mirrors the L1b fix in buildPeggingDag so R12 can detect the same
+        // WO→supply→WO timing dependency that the production engine now tracks.
+        for (c in nodeChildren) dagWalk(c, parentGid, depth + 1)
     }
 
     for (entry in planningPegging) {
@@ -1452,6 +1472,89 @@ internal fun verifyWoTimingCrossTree(
             rule = "R12_cross_tree_wo_timing",
             nodePath = "summary",
             message = "$totalViolations cross-tree timing violations total (first 20 shown).",
+            actual = totalViolations,
+        ))
+    }
+    return violations
+}
+
+/**
+ * R13: for each WO group in work_orders, check that its start_time is ≥ the commit_time of
+ * every **true-leaf** supply/purchase child in the pegging trees. A true-leaf is a supply or
+ * purchase node with no children (physical inventory, PO). Produced supply (sub-tree present)
+ * is handled by R12, which captures the producing WO as a timing dependency.
+ *
+ * This cross-references work_orders (authoritative lot start times) against pegging-tree supply
+ * metadata and catches violations independent of rewriteTree correctness.
+ */
+@Suppress("UNCHECKED_CAST")
+internal fun verifyWoSupplyLeafTiming(
+    planningPegging: List<Map<String, Any?>>,
+    workOrders: List<Map<String, Any?>>,
+    config: SoundnessConfig,
+): List<Violation> {
+    val woStart = mutableMapOf<String, LocalDate>()
+    for (wo in workOrders) {
+        val gid = (wo["wo_group_id"] as? String)?.trim()?.takeIf(String::isNotBlank) ?: continue
+        val s = parseDateLocal(wo["start_time"] as? String) ?: continue
+        val existing = woStart[gid]
+        if (existing == null || s < existing) woStart[gid] = s
+    }
+
+    val checkedEdges = mutableSetOf<String>()
+    val violations = mutableListOf<Violation>()
+    var totalViolations = 0
+
+    fun walk(node: Map<String, Any?>, parentGid: String?, depth: Int) {
+        if (depth > 60) return
+        val nodeChildren = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
+        when (node["type"] as? String) {
+            "work_order" -> {
+                if (node["failed"] == true) return
+                val gid = (node["wo_group_id"] as? String)?.trim()?.takeIf(String::isNotBlank) ?: return
+                for (c in nodeChildren) walk(c, gid, depth + 1)
+            }
+            "supply", "purchase" -> {
+                // Only check true-leaf supply nodes (no children). Produced supply
+                // (sub-tree present) is covered by R12 via the producing WO edge.
+                if (nodeChildren.isEmpty() && parentGid != null) {
+                    val commit = parseDateLocal(node["commit_time"] as? String) ?: return
+                    val parentStart = woStart[parentGid] ?: return
+                    val edgeKey = "$parentGid|${node["supply_id"] ?: node["commit_time"]}"
+                    if (!checkedEdges.add(edgeKey)) return
+                    if (parentStart.toEpochDay() + config.timeToleranceDays < commit.toEpochDay()) {
+                        totalViolations++
+                        if (violations.size < 20) {
+                            violations.add(Violation(
+                                rule = "R13_wo_supply_leaf_timing",
+                                nodePath = "parent_gid:$parentGid",
+                                message = "WO group $parentGid starts $parentStart but true-leaf " +
+                                    "supply/purchase child has commit_time $commit — WO must start " +
+                                    "no earlier than supply is available.",
+                                expected = commit.toString(),
+                                actual = parentStart.toString(),
+                            ))
+                        }
+                    }
+                } else {
+                    // Produced supply — recurse with same parentGid so nested demand/WO
+                    // nodes continue to be checked.
+                    for (c in nodeChildren) walk(c, parentGid, depth + 1)
+                }
+            }
+            else -> for (c in nodeChildren) walk(c, parentGid, depth + 1)
+        }
+    }
+
+    for (entry in planningPegging) {
+        val tree = entry["tree"] as? Map<String, Any?> ?: continue
+        walk(tree, null, 0)
+    }
+    if (totalViolations > violations.size) {
+        violations.add(Violation(
+            rule = "R13_wo_supply_leaf_timing",
+            nodePath = "summary",
+            message = "$totalViolations WO→supply-leaf timing violations total (first 20 shown).",
             actual = totalViolations,
         ))
     }

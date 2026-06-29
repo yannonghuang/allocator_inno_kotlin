@@ -1701,6 +1701,15 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
                 put("actual", anyToJson(v.actual))
             }
         }
+        putJsonArray("wo_supply_leaf_violations") {
+            for (v in report.woSupplyLeafViolations) addJsonObject {
+                put("rule", v.rule)
+                put("node_path", v.nodePath)
+                put("message", v.message)
+                put("expected", anyToJson(v.expected))
+                put("actual", anyToJson(v.actual))
+            }
+        }
     }
     transaction {
         PlanRuns.update({ (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }) {

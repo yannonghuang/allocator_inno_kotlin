@@ -5221,6 +5221,26 @@ internal fun resequenceFromPegging(
                     updated["commit_time"] = formatDate(newCommit)
                 }
             }
+            "supply", "purchase" -> {
+                // Propagate commit_time forward from children when this supply
+                // lot is produced by a downstream WO (sub-tree present).
+                // Without this, supply.commit_time stays at its pre-arbitration
+                // value even after ResourceScheduler shifts the producing WO —
+                // causing stale demand.commit_times up the tree (wrong reporting)
+                // and stale R5 comparisons if the producing WO is the binding
+                // constraint.
+                val newCommit = newChildren.mapNotNull { ch ->
+                    when (ch["type"] as? String) {
+                        "work_order" -> parseDate(ch["end_time"] as? String)
+                        "demand", "supply", "purchase" -> parseDate(ch["commit_time"] as? String)
+                        else -> null
+                    }
+                }.maxOrNull()
+                val current = parseDate(node["commit_time"] as? String)
+                if (newCommit != null && (current == null || newCommit > current)) {
+                    updated["commit_time"] = formatDate(newCommit)
+                }
+            }
         }
         return updated
     }
@@ -5317,6 +5337,13 @@ internal fun buildPeggingDag(
                         leafConstraintByGid.merge(currentParent, commit) { a, b -> if (b > a) b else a }
                     }
                 }
+                // Recurse into children: when a supply lot is *produced* by a WO (sub-tree exists),
+                // we must add that producing WO into the DAG as a child of currentParent so pushUp
+                // propagates the producing WO's end_time up to the parent WO's start constraint.
+                // Without this, ResourceScheduler shifts (e.g. 500-4212/1000 pushed to Oct) are
+                // invisible to the parent (F30__888 stays at Aug because its leafConstraint is
+                // derived from the supply node's stale pre-arbitration commit_time).
+                for (c in nodeChildren) walk(c, currentParent, depth + 1)
             }
             else -> {
                 for (c in nodeChildren) walk(c, currentParent, depth + 1)
