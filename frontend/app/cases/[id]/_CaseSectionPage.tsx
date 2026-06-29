@@ -821,6 +821,7 @@ type WoEnrichedRow = WorkOrder & {
   _key?: string;
   _prod_area?: string;
   _peg_order?: number;
+  _peg_depth?: number;     // BFS depth from woPegHighlightRow (0=self, 1=direct component, 2=deeper); set when Pegged-only is active
   _demand_label?: string;
   _demand_ids?: string[];
   _requested_qty?: number;
@@ -6018,6 +6019,31 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       // they cannot disagree.
                       woRows = woRows.filter((r) =>
                         peggedRowKindFor(r, woPegHighlightRow, woPegHighlightSets) !== null);
+                      // BFS depth from the highlighted row through the predecessor graph.
+                      // Self=0, direct components=1, deeper sub-components=2+.
+                      // Rows are sorted descending (deepest first → closest to raw material at top,
+                      // FG assembly at bottom) so the list follows build-schedule order.
+                      const depthMap = new Map<string, number>();
+                      const bfsQueue: Array<[string, number]> = woRowPegKeys(woPegHighlightRow).map((k) => [k, 0]);
+                      while (bfsQueue.length) {
+                        const [k, d] = bfsQueue.shift()!;
+                        if (depthMap.has(k)) continue;
+                        depthMap.set(k, d);
+                        for (const child of woPegRelations.childMap.get(k) ?? []) {
+                          if (!depthMap.has(child)) bfsQueue.push([child, d + 1]);
+                        }
+                      }
+                      woRows = woRows.map((r) => {
+                        const keys = woRowPegKeys(r);
+                        const depth = keys.reduce<number>((min, k) => Math.min(min, depthMap.get(k) ?? Infinity), Infinity);
+                        return { ...r, _peg_depth: depth === Infinity ? 0 : depth };
+                      });
+                      woRows = [...woRows].sort((a, b) => {
+                        const da = a._peg_depth ?? 0;
+                        const db = b._peg_depth ?? 0;
+                        if (da !== db) return db - da; // deepest first
+                        return (a.start_time ?? '').localeCompare(b.start_time ?? '');
+                      });
                     }
                     const horizon = computeHorizon(woRows);
                     const woColumns: {
@@ -6082,12 +6108,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             && (r.method ?? '') === (woPegHighlightRow.method ?? '')
                             && (r.demand_id ?? '') === (woPegHighlightRow.demand_id ?? '')
                             && (r.start_time ?? '') === (woPegHighlightRow.start_time ?? '');
-                          let colorOverride: string | undefined;
-                          if (woPegHighlightRow && !isSelf) {
-                            const rKeys = woRowPegKeys(r);
-                            if (rKeys.some((rk) => woPegHighlightSets.ancestors.has(rk))) colorOverride = '#ec4899';
-                            else if (rKeys.some((rk) => woPegHighlightSets.descendants.has(rk))) colorOverride = '#6366f1';
-                          }
+                          // No bar-color override for peg relationships — row-level left-border
+                          // (in rowStyle) signals predecessor/successor without hiding WO type color.
+                          const colorOverride: string | undefined = undefined;
                           return (
                             <ScheduleBar
                               start={r.start_time}
@@ -6604,6 +6627,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                 return { background: 'rgba(251,191,36,0.12)', outline: '1px solid rgba(251,191,36,0.4)' };
                               }
                               if (!r.override_active && !r.consolidation_override_active && woHasSavedOverride(r)) return { borderLeft: '3px solid #b45309' };
+                              // Predecessor/successor relationship — left-border indicates position in
+                              // BOM chain without overriding the WO-type bar color (orange=consolidated,
+                              // blue=native).
+                              if (woPegHighlightRow) {
+                                const rKeys = woRowPegKeys(r);
+                                if (rKeys.some((rk) => woPegHighlightSets.ancestors.has(rk))) return { borderLeft: '3px solid #ec4899' };
+                                if (rKeys.some((rk) => woPegHighlightSets.descendants.has(rk))) return { borderLeft: '3px solid #818cf8' };
+                              }
                               return undefined;
                             }}
                             expandedKeys={woExpandedKeys}
@@ -6622,7 +6653,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               const sup = woSuppliesMap.get(woKey) ?? woSuppliesMap.get(consolidatedWoKey) ?? [];
                               const isMake = sup.length > 0 && sup[0].type === 'demand';
                               const direct = isMake ? (woCrossEntrySupplyMap.get(`${r.demand_id ?? ''}|${r.product_id ?? ''}`) ?? []) : [];
-                              return sup.length > 0 || direct.length > 0;
+                              if (sup.length === 0 && direct.length === 0) return false;
+                              // In Pegged-only mode the component WOs are already visible as
+                              // top-level rows. The ▶ expand would duplicate them inline —
+                              // suppress it so the list is the single source of truth.
+                              if (woPegHighlightRow && woPegFilterPeggedOnly) return false;
+                              return true;
                             }}
                             expandedRowContent={(r) => {
                               const woKey = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
