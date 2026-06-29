@@ -4866,6 +4866,14 @@ private fun fixTimingFromPegging(
     // taggedChildPeggings under blocked AND-bottleneck nodes, so a single
     // physical WO can have many tree-positions.
     val emittedPlanningGids = mutableSetOf<String>()
+    // Cross-tree gid consistency: when the same physical WO (same planningGid) appears in
+    // multiple pegging trees as an OR-group member, each tree would otherwise mint a fresh
+    // orGroupId, leaving all but the first tree with an orphaned gid (no lots in mutableLots).
+    // resequenceFromPegging's pushUp can't propagate through orphaned gids, so parent WOs in
+    // those trees (e.g. VIRTUAL consolidation WOs) are never pushed when ResourceScheduler
+    // shifts the underlying real WOs.  Fix: record the finalGid assigned the first time each
+    // planningGid is processed and reuse it in all subsequent trees.
+    val planningGidToFinalGid = mutableMapOf<String, String>()
     var dedupSkipped = 0
 
     fun emitLotsForWo(
@@ -4976,7 +4984,16 @@ private fun fixTimingFromPegging(
                 ch["type"] == "work_order" && ch["failed"] != true
             }
             val isOrGroup = nonFailedWoChildren.size > 1
-            val orGroupId = if (isOrGroup) nextWoGroupId() else null
+            // For OR-groups: reuse the finalGid from the first tree that processed any of these
+            // children.  Without this, each tree mints a fresh orGroupId; only the first gets
+            // lots, and subsequent trees' nodes are orphaned — pushUp in resequenceFromPegging
+            // can't propagate through them.
+            val existingOrGid = if (isOrGroup) {
+                nonFailedWoChildren.mapNotNull { (_, ch) ->
+                    (ch["wo_group_id"] as? String)?.let { planningGidToFinalGid[it] }
+                }.firstOrNull()
+            } else null
+            val orGroupId = if (isOrGroup) existingOrGid ?: nextWoGroupId() else null
             val altIndexByChild = if (isOrGroup) {
                 nonFailedWoChildren.withIndex()
                     .associate { (altIndex, idxAndCh) -> idxAndCh.index to altIndex }
@@ -4985,8 +5002,10 @@ private fun fixTimingFromPegging(
             val newChildren = children.mapIndexed { i, ch ->
                 if (ch["type"] == "work_order" && ch["failed"] != true) {
                     val planningGid = ch["wo_group_id"] as? String
-                    val finalGid = orGroupId ?: planningGid
+                    val finalGid = orGroupId ?: planningGidToFinalGid[planningGid] ?: planningGid
                     val altIndex = altIndexByChild[i]
+                    // Record the mapping so subsequent trees reuse the same finalGid.
+                    if (planningGid != null && finalGid != null) planningGidToFinalGid[planningGid] = finalGid
                     if (finalGid != null) {
                         emitLotsForWo(ch, finalGid, altIndex, ownerDemandId)
                     }
