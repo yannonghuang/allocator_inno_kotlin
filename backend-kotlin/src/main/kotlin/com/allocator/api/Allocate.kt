@@ -1468,7 +1468,7 @@ fun Routing.allocateRoutes() {
         val body = runCatching { call.receiveText() }.getOrElse { "" }
         val payload = if (body.isBlank()) JsonObject(emptyMap())
                       else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrElse { JsonObject(emptyMap()) }
-        val deepCheck = payload["deep_check"]?.jsonPrimitive?.booleanOrNull ?: false
+        val deepCheck = payload["deep_check"]?.jsonPrimitive?.booleanOrNull ?: true
 
         val reportJson = runSoundnessCheckForRun(caseId, runId, deepCheck)
         call.respond(reportJson)
@@ -1683,6 +1683,23 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
         }
         putJsonArray("inventory_priority_violations") {
             for (msg in report.inventoryPriorityViolations) add(JsonPrimitive(msg))
+        }
+        putJsonArray("wo_gid_orphan_violations") {
+            for (v in report.woGidOrphanViolations) addJsonObject {
+                put("rule", v.rule)
+                put("node_path", v.nodePath)
+                put("message", v.message)
+                put("actual", anyToJson(v.actual))
+            }
+        }
+        putJsonArray("cross_tree_timing_violations") {
+            for (v in report.crossTreeTimingViolations) addJsonObject {
+                put("rule", v.rule)
+                put("node_path", v.nodePath)
+                put("message", v.message)
+                put("expected", anyToJson(v.expected))
+                put("actual", anyToJson(v.actual))
+            }
         }
     }
     transaction {

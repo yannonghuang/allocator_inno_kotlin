@@ -143,7 +143,17 @@ class SoundnessCheckerTest : FunSpec({
         val data = mapOf<String, List<Map<String, Any?>>>(
             "supply" to listOf(supply("S1", "FG", "VIRTUAL", 10.0)),
         )
-        val report = checkRunSoundness(planningPegging = emptyList(), demands = demands, data = data)
+        // R0_no_tree only fires when planningPegging is non-empty — that signals
+        // pegging WAS generated but D1's tree is genuinely missing (engine bug),
+        // vs. an empty list meaning pegging wasn't stored (historical run, fine).
+        val phantomEntry = mapOf(
+            "demand_id" to "D_OTHER",
+            "tree" to mapOf("type" to "demand", "product_id" to "X", "location_id" to "VIRTUAL",
+                "quantity" to 0.0, "committed_qty" to 0.0, "children" to emptyList<Any>()),
+        )
+        val report = checkRunSoundness(
+            planningPegging = listOf(phantomEntry), demands = demands, data = data,
+        )
         report.overallSound shouldBe false
         report.demands shouldHaveSize 1
         report.demands[0].sound shouldBe false
@@ -747,6 +757,143 @@ class SoundnessCheckerTest : FunSpec({
         v.actual shouldBe 150.0
         v.message stringShouldContain "consolidator's allocation"
     }
+
+    // ── R11: wo_group_id orphan check ────────────────────────────────────────────
+
+    test("R11: orphan gid — WO node in tree has no lot in work_orders") {
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0,
+            children = listOf(
+                makeWO("FG", "L1", qty = 10.0).toMutableMap().also { it["wo_group_id"] = "WOG-1" }
+            ))
+        val data = mapOf("method_make" to listOf(mk("FG", "L1")), "bom" to emptyList<Map<String, Any?>>())
+        // work_orders list doesn't contain WOG-1
+        val workOrders = listOf(
+            mapOf("product_id" to "FG", "location_id" to "L1", "quantity" to 10.0,
+                "start_time" to "2024-11-01", "end_time" to "2024-11-01", "wo_group_id" to "WOG-OTHER")
+        )
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", tree)),
+            demands = demands, data = data, workOrders = workOrders,
+        )
+        report.woGidOrphanViolations.map { it.rule } shouldContain "R11_wo_gid_orphan"
+        report.overallSound shouldBe false
+    }
+
+    test("R11: no violation when all tree gids have lots in work_orders") {
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0,
+            children = listOf(
+                makeWO("FG", "L1", qty = 10.0).toMutableMap().also { it["wo_group_id"] = "WOG-1" }
+            ))
+        val data = mapOf("method_make" to listOf(mk("FG", "L1")), "bom" to emptyList<Map<String, Any?>>())
+        val workOrders = listOf(
+            mapOf("product_id" to "FG", "location_id" to "L1", "quantity" to 10.0,
+                "start_time" to "2024-11-01", "end_time" to "2024-11-01", "wo_group_id" to "WOG-1")
+        )
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", tree)),
+            demands = demands, data = data, workOrders = workOrders,
+        )
+        report.woGidOrphanViolations shouldHaveSize 0
+    }
+
+    test("R11: skipped when work_orders is empty") {
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0,
+            children = listOf(
+                makeWO("FG", "L1", qty = 10.0).toMutableMap().also { it["wo_group_id"] = "WOG-ORPHAN" }
+            ))
+        val data = mapOf("method_make" to listOf(mk("FG", "L1")), "bom" to emptyList<Map<String, Any?>>())
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", tree)),
+            demands = demands, data = data, workOrders = emptyList(),
+        )
+        report.woGidOrphanViolations shouldHaveSize 0
+    }
+
+    // ── R12: cross-tree WO temporal ordering ─────────────────────────────────────
+
+    test("R12: violation when parent WO starts before child WO ends") {
+        // Two-level tree: FG(WOG-P) depends on COMP(WOG-C).
+        // workOrders: COMP ends Sep-07, FG starts Aug-20 → violation.
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0,
+            children = listOf(
+                makeWO("FG", "L1", qty = 10.0,
+                    children = listOf(
+                        demandNode("D1", "COMP", "L1", qty = 10.0, committedQty = 10.0,
+                            commitTime = "2024-09-07",
+                            children = listOf(
+                                makeWO("COMP", "L1", qty = 10.0).toMutableMap().also { it["wo_group_id"] = "WOG-C" }
+                            ))
+                    )
+                ).toMutableMap().also { it["wo_group_id"] = "WOG-P" }
+            ))
+        val data = mapOf(
+            "method_make" to listOf(mk("FG", "L1"), mk("COMP", "L1")),
+            "bom" to listOf(bom("FG", "COMP", rate = 1.0)),
+        )
+        val workOrders = listOf(
+            mapOf("wo_group_id" to "WOG-P", "product_id" to "FG",   "location_id" to "L1",
+                "start_time" to "2024-08-20", "end_time" to "2024-09-01", "quantity" to 10.0),
+            mapOf("wo_group_id" to "WOG-C", "product_id" to "COMP", "location_id" to "L1",
+                "start_time" to "2024-08-15", "end_time" to "2024-09-07", "quantity" to 10.0),
+        )
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", tree)),
+            demands = demands, data = data, workOrders = workOrders,
+            config = SoundnessConfig(timeToleranceDays = 1L),
+        )
+        report.crossTreeTimingViolations.map { it.rule } shouldContain "R12_cross_tree_wo_timing"
+        report.overallSound shouldBe false
+    }
+
+    test("R12: no violation when parent starts after child ends") {
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0,
+            children = listOf(
+                makeWO("FG", "L1", qty = 10.0,
+                    children = listOf(
+                        demandNode("D1", "COMP", "L1", qty = 10.0, committedQty = 10.0,
+                            commitTime = "2024-09-07",
+                            children = listOf(
+                                makeWO("COMP", "L1", qty = 10.0).toMutableMap().also { it["wo_group_id"] = "WOG-C" }
+                            ))
+                    )
+                ).toMutableMap().also { it["wo_group_id"] = "WOG-P" }
+            ))
+        val data = mapOf(
+            "method_make" to listOf(mk("FG", "L1"), mk("COMP", "L1")),
+            "bom" to listOf(bom("FG", "COMP", rate = 1.0)),
+        )
+        val workOrders = listOf(
+            mapOf("wo_group_id" to "WOG-P", "product_id" to "FG",   "location_id" to "L1",
+                "start_time" to "2024-09-08", "end_time" to "2024-09-15", "quantity" to 10.0),
+            mapOf("wo_group_id" to "WOG-C", "product_id" to "COMP", "location_id" to "L1",
+                "start_time" to "2024-08-15", "end_time" to "2024-09-07", "quantity" to 10.0),
+        )
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", tree)),
+            demands = demands, data = data, workOrders = workOrders,
+            config = SoundnessConfig(timeToleranceDays = 1L),
+        )
+        report.crossTreeTimingViolations shouldHaveSize 0
+    }
+
+    test("R12: skipped when work_orders is empty") {
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0,
+            children = listOf(supplyLeaf("FG", "L1", "S1", 10.0)))
+        val data = mapOf("supply" to listOf(supply("S1", "FG", "L1", 100.0)))
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", tree)),
+            demands = demands, data = data, workOrders = emptyList(),
+        )
+        report.crossTreeTimingViolations shouldHaveSize 0
+    }
+
+    // ── R7c skipped when no consolidator entries are present ──────────────────
 
     test("R7c skipped when no consolidator entries are present") {
         // Pure non-consolidation run: no consolidated/passthrough entries.
