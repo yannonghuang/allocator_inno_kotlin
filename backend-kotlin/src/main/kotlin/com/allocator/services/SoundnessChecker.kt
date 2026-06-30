@@ -216,6 +216,12 @@ fun checkRunSoundness(
     // bug in one of them. Index by demand_id; if a demand has multiple rows
     // (legacy paths sometimes append per-iteration), sum their `quantity`.
     val committedQtyById = mutableMapOf<String, Double>()
+    // demand_ids whose committed_demands rows are ALL hard-planning-failures (no benign row at
+    // all) — a genuine "nothing could be planned" demand, for which the engine legitimately
+    // emits no pegging tree. R0_no_tree below must skip these the same way committedQtyById
+    // already does (see comment below), or it false-positives on Negative_Inventory_* pseudo-
+    // demands and any fully-blocked real demand.
+    val anyBenignRowByDemand = mutableMapOf<String, Boolean>()
     for (row in committedDemands) {
         val did = row["demand_id"]?.toString() ?: continue
         if (did.isBlank()) continue
@@ -228,10 +234,22 @@ fun checkRunSoundness(
         // real demand). Benign reasons (inventory, partial, null) and the
         // `no_methods_succeeded` zero-qty placeholder pass through.
         val reason = row["commit_reason"] as? String
-        if (isHardPlanningFailure(reason)) continue
+        if (isHardPlanningFailure(reason)) {
+            if (did !in anyBenignRowByDemand) anyBenignRowByDemand[did] = false
+            continue
+        }
+        anyBenignRowByDemand[did] = true
         val q = (row["quantity"] as? Number)?.toDouble() ?: 0.0
         committedQtyById[did] = (committedQtyById[did] ?: 0.0) + q
     }
+    // Negative_Inventory_* pseudo-demands (synthetic rows representing negative starting
+    // inventory) can fail planning so completely that the engine emits no committed_demands
+    // row AT ALL — not even a hard-failure shortfall row — so they never reach
+    // anyBenignRowByDemand above. Catch that case directly by demand_id prefix instead of
+    // relying on committed_demands presence.
+    val hardFailureDemandIds = anyBenignRowByDemand.filterValues { !it }.keys +
+        demands.mapNotNull { it["demand_id"]?.toString() }
+            .filter { it.startsWith("Negative_Inventory_") && it !in anyBenignRowByDemand }
 
     // Total WO production at each (pid, lid). Currently unused by any rule
     // (R7c moved to a more correct cap below). Kept around because rule
@@ -315,9 +333,13 @@ fun checkRunSoundness(
         val tree = treeByDemand[demandId]
         if (tree == null) {
             val qty = (demandRow["quantity"] as? Number)?.toDouble() ?: 0.0
-            if (qty > 0 && planningPegging.isNotEmpty()) {
+            if (qty > 0 && planningPegging.isNotEmpty() && demandId !in hardFailureDemandIds) {
                 // Demand has no pegging tree but pegging was provided — genuine missing
                 // tree. The engine should emit a tree even for cycle_stopped / depth_limit.
+                // (Demands whose committed_demands rows are ALL hard-planning-failures —
+                // e.g. Negative_Inventory_* pseudo-demands with commit_reason=no_methods —
+                // legitimately have no tree at all; skipped above via hardFailureDemandIds,
+                // matching committedQtyById's existing skip for the same row class.)
                 demandReports.add(DemandSoundness(
                     demandId = demandId,
                     sound = false,
@@ -1402,14 +1424,26 @@ internal fun checkRunSoundnessStreaming(
     val supplyById: Map<String, Map<String, Any?>> = supplies.associateBy { it["supply_id"]?.toString() ?: "" }
 
     val committedQtyById = mutableMapOf<String, Double>()
+    // See checkRunSoundness's anyBenignRowByDemand/hardFailureDemandIds for the rationale:
+    // demands whose committed_demands rows are ALL hard-planning-failures (or who have no
+    // committed_demands row at all, e.g. Negative_Inventory_* pseudo-demands) legitimately
+    // get no pegging tree — R0_no_tree below must skip them or it false-positives.
+    val anyBenignRowByDemand = mutableMapOf<String, Boolean>()
     for (row in committedDemands) {
         val did = row["demand_id"]?.toString() ?: continue
         if (did.isBlank()) continue
         val reason = row["commit_reason"] as? String
-        if (isHardPlanningFailure(reason)) continue
+        if (isHardPlanningFailure(reason)) {
+            if (did !in anyBenignRowByDemand) anyBenignRowByDemand[did] = false
+            continue
+        }
+        anyBenignRowByDemand[did] = true
         val q = (row["quantity"] as? Number)?.toDouble() ?: 0.0
         committedQtyById[did] = (committedQtyById[did] ?: 0.0) + q
     }
+    val hardFailureDemandIds = anyBenignRowByDemand.filterValues { !it }.keys +
+        demands.mapNotNull { it["demand_id"]?.toString() }
+            .filter { it.startsWith("Negative_Inventory_") && it !in anyBenignRowByDemand }
 
     // ── Pre-build work_orders index (R11) ────────────────────────────────────
     // Include native (pre-consolidation) gids: after consolidation, individual move-WO gids
@@ -1508,7 +1542,7 @@ internal fun checkRunSoundnessStreaming(
     for ((demandId, demandRow) in demandById) {
         if (demandId in seenCanonicalDemands) continue
         val qty = (demandRow["quantity"] as? Number)?.toDouble() ?: 0.0
-        if (qty > 0 && anyPeggingEntry) {
+        if (qty > 0 && anyPeggingEntry && demandId !in hardFailureDemandIds) {
             demandReports.add(DemandSoundness(
                 demandId = demandId, sound = false,
                 violations = listOf(Violation(rule = "R0_no_tree", nodePath = "", message = "Demand has no pegging tree in planning_pegging.")),

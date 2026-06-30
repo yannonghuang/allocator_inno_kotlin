@@ -3030,7 +3030,24 @@ private fun reconcile(
                 val newChildren = allChildren.map { ch -> (ch as? Map<String, Any?>)?.let { reconcile(it, want, data).first } ?: ch }
                 return (node + mapOf("quantity" to want, "children" to newChildren)) to want
             }
-            fun rateOf(cd: Map<String, Any?>) = if (curQty > 1e-9) ((cd["quantity"] as? Number)?.toDouble() ?: 0.0) / curQty else 0.0
+            // Prefer the TRUE BOM rate over inferring it from cd["quantity"]/curQty — the latter
+            // encodes BOM_rate × (whatever upstream achieved) and drifts from the real rate whenever
+            // an ancestor was already trimmed/lot-rounded inconsistently (the same class of bug
+            // Mechanism C fixed for the OR aggregate below, but the AND branch's ask still used the
+            // naive ratio — propagating, not correcting, upstream drift through nested AND levels;
+            // root cause of the R4_qty_propagation/R8_deep_conservation violation class). Falls back
+            // to the ratio only when no real BOM row exists (synthetic/virtual nodes).
+            val parentPid = (node["product_id"] as? String)?.trim() ?: ""
+            val bomRowsForRate = data["bom"] ?: emptyList()
+            val parentBomRowsForRate = bomRowsForRate.filter { (it["parent_id"] as? String)?.trim() == parentPid }
+            fun rateOf(cd: Map<String, Any?>): Double {
+                val childPid = (cd["product_id"] as? String)?.trim() ?: ""
+                val actualRate = parentBomRowsForRate
+                    .firstOrNull { (it["child_id"] as? String)?.trim() == childPid }
+                    ?.let { (it["rate"] as? Number)?.toDouble() }
+                if (actualRate != null && actualRate > 1e-9) return actualRate
+                return if (curQty > 1e-9) ((cd["quantity"] as? Number)?.toDouble() ?: 0.0) / curQty else 0.0
+            }
             val rel = node["children_relation"] as? String
             // First (and only) ask: each component for want × rate. Capture the trimmed node AND
             // how many parents it can back (committed / rate). Reconcile each child ONCE here.
@@ -3396,6 +3413,13 @@ internal fun consolidateByWaves(
     val consolidatedGidByGid = mutableMapOf<String, String>()
     val consolidatedStartByGid = mutableMapOf<String, LocalDate>()
     val consolidatedEndByGid = mutableMapOf<String, LocalDate>()
+    // lot_count/wave_count as recomputed for this gid's FINAL (post-merge) bucket — propagated back
+    // onto the pegging tree's WO node alongside start/end so R5_lead_time's expected-duration formula
+    // (perLotLead × waveCount) reads the SAME wave count that produced the actual start/end span.
+    // Without this, a gid trimmed by reconcile() across a lot-size boundary keeps its PRE-trim
+    // lot_count/wave_count on the tree node while start/end reflect the post-trim (shorter) span.
+    val consolidatedLotCountByGid = mutableMapOf<String, Int>()
+    val consolidatedWaveCountByGid = mutableMapOf<String, Int>()
 
     fun singletonRow(gid: String, info: GidInfo, start: LocalDate?, end: LocalDate?, cgid: String): Map<String, Any?> = buildMap {
         put("product_id", info.pid)
@@ -3524,7 +3548,10 @@ internal fun consolidateByWaves(
             val info = gidInfo.getValue(gid)
             val cgid = nextWoGroupId()
             consolidatedGidByGid[gid] = cgid
-            consolidatedOut.add(singletonRow(gid, info, null, null, cgid))
+            val row = singletonRow(gid, info, null, null, cgid)
+            consolidatedOut.add(row)
+            consolidatedLotCountByGid[gid] = (row["lot_count"] as? Number)?.toInt() ?: 1
+            consolidatedWaveCountByGid[gid] = 1
             // No parseable date → nothing to propagate; matches old passthrough semantics.
         }
 
@@ -3540,13 +3567,18 @@ internal fun consolidateByWaves(
                     val gcgid = if (gid == gids[0]) cgid else nextWoGroupId()
                     consolidatedGidByGid[gid] = gcgid
                     val st = pendingStart[gid]
-                    consolidatedOut.add(singletonRow(gid, info, st, st, gcgid))
+                    val row = singletonRow(gid, info, st, st, gcgid)
+                    consolidatedOut.add(row)
+                    consolidatedLotCountByGid[gid] = (row["lot_count"] as? Number)?.toInt() ?: 1
+                    consolidatedWaveCountByGid[gid] = 1
                     if (st != null) { consolidatedStartByGid[gid] = st; consolidatedEndByGid[gid] = st }
                 }
                 continue
             }
             val first = gidInfo.getValue(gids[0])
             val mRow = methodRowFor(first.pid, first.lid, first.method, first.locationSource)
+            var bucketLotCount = 1
+            var bucketWaveCount = 1
             val leadDays = if (first.method == "move") {
                 mRow?.let { leadDaysForMethod(it, first.pid, first.lid, totalQty, data) }
                     ?: gids.mapNotNull { gidInfo.getValue(it).nativeDuration }.maxOrNull() ?: 0.0
@@ -3557,6 +3589,8 @@ internal fun consolidateByWaves(
                 val numWaves = Math.ceil(lotCount.toDouble() / cap.toDouble()).toInt().coerceAtLeast(1)
                 val perWaveLead = mRow?.let { leadDaysForMethod(it, first.pid, first.lid, totalQty, data) }
                     ?: gids.mapNotNull { gidInfo.getValue(it).nativeDuration }.maxOrNull() ?: 0.0
+                bucketLotCount = lotCount
+                bucketWaveCount = numWaves
                 numWaves * perWaveLead
             }
             val mergedEnd = dateAddDays(mergedStart, leadDays) ?: mergedStart
@@ -3570,6 +3604,8 @@ internal fun consolidateByWaves(
                 consolidatedGidByGid[gid] = cgid
                 consolidatedStartByGid[gid] = mergedStart
                 consolidatedEndByGid[gid] = mergedEnd
+                consolidatedLotCountByGid[gid] = bucketLotCount
+                consolidatedWaveCountByGid[gid] = bucketWaveCount
             }
         }
 
@@ -3596,7 +3632,10 @@ internal fun consolidateByWaves(
         val cgid = nextWoGroupId()
         consolidatedGidByGid[gid] = cgid
         val st = pendingStart[gid] ?: info.nativeStart
-        consolidatedOut.add(singletonRow(gid, info, st, st, cgid))
+        val row = singletonRow(gid, info, st, st, cgid)
+        consolidatedOut.add(row)
+        consolidatedLotCountByGid[gid] = (row["lot_count"] as? Number)?.toInt() ?: 1
+        consolidatedWaveCountByGid[gid] = 1
         if (st != null) { consolidatedStartByGid[gid] = st; consolidatedEndByGid[gid] = st }
     }
 
@@ -3628,7 +3667,10 @@ internal fun consolidateByWaves(
     // ── Phase G: rewrite the pegging trees with final (wave-pushed) timings, and roll the result up
     // into each demand/supply/purchase node's commit_time bottom-up — single pass, no fixed-point
     // iteration needed since the wave loop above already established globally-consistent timings.
-    val rewrittenTrees = rewritePeggingTimings(peggingTrees, consolidatedStartByGid, consolidatedEndByGid)
+    val rewrittenTrees = rewritePeggingTimings(
+        peggingTrees, consolidatedStartByGid, consolidatedEndByGid,
+        consolidatedLotCountByGid, consolidatedWaveCountByGid,
+    )
 
     return WaveConsolidationResult(rewrittenTrees, WoConsolidation(consolidatedOut, nativeOut))
 }
@@ -3639,11 +3681,22 @@ internal fun consolidateByWaves(
  * [consolidateByWaves] (wave-computed timings) and the main orchestrator (post-arbitration
  * capacity-shifted timings) so both timing-correction passes write back into the trees the same
  * way.
+ *
+ * `lotCountByGid`/`waveCountByGid` are optional (only [consolidateByWaves] supplies them) — they
+ * keep the tree node's `lot_count`/`wave_count` in sync with whatever lot/wave packing actually
+ * produced `startByGid`/`endByGid`'s span. Without this, a WO trimmed by `reconcile()` across a
+ * lot-size boundary keeps its PRE-trim lot_count/wave_count on the tree while start/end reflect
+ * the POST-trim (shorter) span, so the soundness checker's expected-duration formula
+ * (perLotLead × waveCount, read from the same node) disagrees with the actual span it itself wrote.
+ * The post-arbitration call (orchestrator) omits them deliberately — arbitration/resequence only
+ * shift a WO's start+end by the same delta (`pushUp`), preserving its already-correct lot/wave count.
  */
 internal fun rewritePeggingTimings(
     peggingTrees: List<Map<String, Any?>>,
     startByGid: Map<String, LocalDate>,
     endByGid: Map<String, LocalDate>,
+    lotCountByGid: Map<String, Int> = emptyMap(),
+    waveCountByGid: Map<String, Int> = emptyMap(),
 ): List<Map<String, Any?>> {
     @Suppress("UNCHECKED_CAST")
     fun rewriteNode(node: Map<String, Any?>, depth: Int): Map<String, Any?> {
@@ -3658,12 +3711,18 @@ internal fun rewritePeggingTimings(
             val gid = (node["wo_group_id"] as? String)?.trim()?.takeIf { it.isNotBlank() }
             val newStart = gid?.let { startByGid[it] }
             val newEnd = gid?.let { endByGid[it] }
+            val newLotCount = gid?.let { lotCountByGid[it] }
+            val newWaveCount = gid?.let { waveCountByGid[it] }
             val startChanged = newStart != null && formatDate(newStart) != node["start_time"]
             val endChanged = newEnd != null && formatDate(newEnd) != node["end_time"]
-            return if (startChanged || endChanged || childrenChanged) {
+            val lotCountChanged = newLotCount != null && newLotCount != (node["lot_count"] as? Number)?.toInt()
+            val waveCountChanged = newWaveCount != null && newWaveCount != (node["wave_count"] as? Number)?.toInt()
+            return if (startChanged || endChanged || lotCountChanged || waveCountChanged || childrenChanged) {
                 node.toMutableMap().also { m ->
                     if (startChanged) m["start_time"] = formatDate(newStart)
                     if (endChanged) m["end_time"] = formatDate(newEnd)
+                    if (lotCountChanged) m["lot_count"] = newLotCount
+                    if (waveCountChanged) m["wave_count"] = newWaveCount
                     if (childrenChanged) m["children"] = newChildren
                 }
             } else node
