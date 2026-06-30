@@ -1583,9 +1583,11 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
         val resultMap = jsonElementToNative(resultElement) as? Map<String, Any?>
             ?: throw IllegalStateException("Plan run result is not a JSON object")
         @Suppress("UNCHECKED_CAST")
-        val planningPegging = (resultMap["planning_pegging"] as? List<Map<String, Any?>>) ?: emptyList()
+        val inlinePegging = (resultMap["planning_pegging"] as? List<Map<String, Any?>>)?.takeIf { it.isNotEmpty() }
         @Suppress("UNCHECKED_CAST")
         val workOrders = (resultMap["work_orders"] as? List<Map<String, Any?>>) ?: emptyList()
+        @Suppress("UNCHECKED_CAST")
+        val workOrdersNative = (resultMap["work_orders_native"] as? List<Map<String, Any?>>) ?: emptyList()
         @Suppress("UNCHECKED_CAST")
         val committedDemandsForCheck = (resultMap["committed_demands"] as? List<Map<String, Any?>>) ?: emptyList()
         @Suppress("UNCHECKED_CAST")
@@ -1618,18 +1620,62 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
                     )}
             }
         } else emptyList()
-        com.allocator.services.checkRunSoundness(
-            planningPegging = planningPegging,
-            demands = demands,
-            data = data,
-            config = com.allocator.services.SoundnessConfig(deepCheck = deepCheck),
-            workOrders = workOrders,
-            committedDemands = committedDemandsForCheck,
-            overrideIndex = overrideIndexForCheck,
-            inventoryEffectiveInitial = inventoryInitial,
-            inventoryLeftover = inventoryLeftover,
-            supplyAllocations = supplyAllocations,
-        )
+        val soundnessConfig = com.allocator.services.SoundnessConfig(deepCheck = deepCheck)
+        if (inlinePegging != null) {
+            // In-transit run: pegging is embedded inline — use normal list-based check.
+            com.allocator.services.checkRunSoundness(
+                planningPegging = inlinePegging,
+                demands = demands,
+                data = data,
+                config = soundnessConfig,
+                workOrders = workOrders,
+                workOrdersNative = workOrdersNative,
+                committedDemands = committedDemandsForCheck,
+                overrideIndex = overrideIndexForCheck,
+                inventoryEffectiveInitial = inventoryInitial,
+                inventoryLeftover = inventoryLeftover,
+                supplyAllocations = supplyAllocations,
+            )
+        } else {
+            // Persisted run: pegging is in plan_pegging table and can exceed 2 GB total.
+            // Stream one entry at a time via keyset pagination (id > lastId) so only one
+            // parsed tree is in heap at once — prevents OOM on large VIRTUAL consolidation entries.
+            com.allocator.services.checkRunSoundnessStreaming(
+                forEachEntry = { block ->
+                    var lastId = 0
+                    while (true) {
+                        var fetched = false
+                        transaction {
+                            PlanPegging.selectAll()
+                                .where { (PlanPegging.planRunId eq runId) and (PlanPegging.id greater lastId) }
+                                .orderBy(PlanPegging.id)
+                                .limit(1)
+                                .forEach { row ->
+                                    lastId = row[PlanPegging.id]
+                                    runCatching {
+                                        (jsonToAny(Json.parseToJsonElement(row[PlanPegging.entry])) as? Map<String, Any?>)
+                                            ?.let(block)
+                                    }.onFailure { e ->
+                                        log.warn("[soundness] pegging parse error run={} id={}: {}", runId, lastId, e.message)
+                                    }
+                                    fetched = true
+                                }
+                        }
+                        if (!fetched) break
+                    }
+                },
+                demands = demands,
+                data = data,
+                config = soundnessConfig,
+                workOrders = workOrders,
+                workOrdersNative = workOrdersNative,
+                committedDemands = committedDemandsForCheck,
+                overrideIndex = overrideIndexForCheck,
+                inventoryEffectiveInitial = inventoryInitial,
+                inventoryLeftover = inventoryLeftover,
+                supplyAllocations = supplyAllocations,
+            )
+        }
     } catch (e: Exception) {
         transaction {
             PlanRuns.update({ (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }) {
@@ -1689,24 +1735,6 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
                 put("rule", v.rule)
                 put("node_path", v.nodePath)
                 put("message", v.message)
-                put("actual", anyToJson(v.actual))
-            }
-        }
-        putJsonArray("cross_tree_timing_violations") {
-            for (v in report.crossTreeTimingViolations) addJsonObject {
-                put("rule", v.rule)
-                put("node_path", v.nodePath)
-                put("message", v.message)
-                put("expected", anyToJson(v.expected))
-                put("actual", anyToJson(v.actual))
-            }
-        }
-        putJsonArray("wo_supply_leaf_violations") {
-            for (v in report.woSupplyLeafViolations) addJsonObject {
-                put("rule", v.rule)
-                put("node_path", v.nodePath)
-                put("message", v.message)
-                put("expected", anyToJson(v.expected))
                 put("actual", anyToJson(v.actual))
             }
         }

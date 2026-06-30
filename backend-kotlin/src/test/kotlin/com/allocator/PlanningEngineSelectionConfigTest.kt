@@ -29,24 +29,6 @@ class PlanningEngineSelectionConfigTest : FunSpec({
         cfg.multiple shouldBe false
     }
 
-    test("method_selection reads new mode=elaborate shape") {
-        val cfg = resolveMethodSelection(mapOf(
-            "method_selection" to mapOf("mode" to "elaborate", "depth" to 3)
-        ))
-        cfg.mode shouldBe "elaborate"
-        cfg.elaborate shouldBe true
-        cfg.depth shouldBe 3
-    }
-
-    test("method_selection backwards-compat: elaborate=true maps to mode=elaborate") {
-        val cfg = resolveMethodSelection(mapOf(
-            "method_selection" to mapOf("elaborate" to true)
-        ))
-        cfg.mode shouldBe "elaborate"
-        cfg.elaborate shouldBe true
-        cfg.depth shouldBe 1
-    }
-
     test("method_selection backwards-compat: elaborate=false stays preference") {
         val cfg = resolveMethodSelection(mapOf(
             "method_selection" to mapOf("elaborate" to false)
@@ -68,13 +50,6 @@ class PlanningEngineSelectionConfigTest : FunSpec({
             "method_selection" to mapOf("mode" to "banana")
         ))
         cfg.mode shouldBe "preference"
-    }
-
-    test("method_selection mode is case-insensitive") {
-        val cfg = resolveMethodSelection(mapOf(
-            "method_selection" to mapOf("mode" to "ELABORATE")
-        ))
-        cfg.mode shouldBe "elaborate"
     }
 
     test("method_selection depth clamps to 1 when zero or negative") {

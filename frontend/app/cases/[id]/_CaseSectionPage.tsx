@@ -1189,16 +1189,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planLoading, setPlanLoading] = useState(false);
   const [planError, setPlanError] = useState<string | null>(null);
 
-  // Lazily fetch planning_pegging from the separate /pegging endpoint and merge it into
-  // planResult. Called after every setPlanResult(full.result) from a DB-loaded run, since
-  // the plan-run detail endpoint no longer embeds pegging (was causing 20s load times).
-  const loadAndMergePegging = (caseId: number | string, runId: number) => {
-    getPlanRunPegging(Number(caseId), runId)
-      .then(({ planning_pegging }) => {
-        setPlanResult((prev) => prev ? { ...prev, planning_pegging: planning_pegging as PlanningPeggingEntry[] } : prev);
-      })
-      .catch(() => { /* pegging unavailable — drill-down shows empty trees */ });
-  };
   const [planPeggingOpen, setPlanPeggingOpen] = useState(false);
   const [planPeggingContext, setPlanPeggingContext] = useState<
     | { type: 'demand'; row: CommittedDemand }
