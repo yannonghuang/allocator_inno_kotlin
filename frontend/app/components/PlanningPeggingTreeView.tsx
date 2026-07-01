@@ -43,6 +43,11 @@ export type PlanningPeggingTreeProps = {
    *  consolidation. When omitted, consolidated supplies render as plain
    *  leaves with no inline source unfolding. */
   consolidatedSourceResolver?: (embeddedDemandId: string, productId: string) => PlanningPeggingNode[];
+
+  /** When true, suppress lot-count and wave-count annotations on work_order
+   *  node labels. Use in per-logical-WO accordion sections where lot/wave
+   *  counts reflect the consolidated batch, not the individual native WO. */
+  hideLotCount?: boolean;
 };
 
 export function PlanningPeggingTreeView(props: PlanningPeggingTreeProps): JSX.Element {
@@ -62,6 +67,7 @@ export function PlanningPeggingTreeView(props: PlanningPeggingTreeProps): JSX.El
       workOrderRootQty={props.workOrderRootQty}
       contextDemandId={props.contextDemandId}
       consolidatedSourceResolver={props.consolidatedSourceResolver}
+      hideLotCount={props.hideLotCount}
     />
   );
 }
@@ -79,7 +85,7 @@ function NodeView({
   matchPath, matchPaths, criticalPathSet,
   explanationExpanded, onToggleExplanation,
   workOrderRootQty, contextDemandId,
-  consolidatedSourceResolver,
+  consolidatedSourceResolver, hideLotCount,
 }: NodeProps): JSX.Element {
   const t = useTranslations('pegging');
   const rawChildren = node.children ?? [];
@@ -166,13 +172,13 @@ function NodeView({
           const maxLotSize = (node as { max_lot_size?: number | null }).max_lot_size ?? null;
           const waveCount = node.wave_count ?? null;
           const cap = node.parallelism_cap ?? null;
-          const lotPart = lotCount && lotCount > 1 && maxLotSize
+          const lotPart = !hideLotCount && lotCount && lotCount > 1 && maxLotSize
             ? ` · ${lotCount} lots of up to ${qtyFmt(Number(maxLotSize))}`
             : '';
           // Wave annotation only when concurrency actually compresses the
           // schedule (wave_count < lot_count). Skip for sequential WOs to
           // keep labels tight.
-          const wavePart = waveCount && lotCount && cap && cap > 1 && waveCount < lotCount
+          const wavePart = !hideLotCount && waveCount && lotCount && cap && cap > 1 && waveCount < lotCount
             ? ` · ${waveCount} wave${waveCount > 1 ? 's' : ''} of up to ${cap} parallel`
             : '';
           return `${node.method} ${node.product_id} @ ${node.location_id ?? '–'} · ${qtyFmt(qty)}${node.end_time ? ` · end ${node.end_time}` : ''}${lotPart}${wavePart}`;
@@ -379,6 +385,7 @@ function NodeView({
                   workOrderRootQty={null}
                   contextDemandId={contextDemandId}
                   consolidatedSourceResolver={consolidatedSourceResolver}
+                  hideLotCount={hideLotCount}
                 />
               ))
             : consolidatedSourceTrees.length > 0
@@ -415,6 +422,7 @@ function NodeView({
                   workOrderRootQty={null}
                   contextDemandId={contextDemandId}
                   consolidatedSourceResolver={consolidatedSourceResolver}
+                  hideLotCount={hideLotCount}
                 />
               ))}
             </>

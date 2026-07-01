@@ -10449,6 +10449,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                   return { ...prev, [cacheKey]: next };
                                 })}
                                 contextDemandId={did}
+                                hideLotCount={true}
                                 consolidatedSourceResolver={(embeddedDemandId, pid) => {
                                   const allEntries = (planResult?.planning_pegging ?? []).filter(
                                     (e) => String(e.demand_id ?? '').trim() === embeddedDemandId
