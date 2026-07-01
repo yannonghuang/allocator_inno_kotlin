@@ -1229,6 +1229,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [previousWoExplainRow, setPreviousWoExplainRow] = useState<WorkOrder | null>(null);
   const [planWorkOrderPeggingLoading, setPlanWorkOrderPeggingLoading] = useState<string | null>(null);
   const [planWorkOrderPeggingError, setPlanWorkOrderPeggingError] = useState<string | null>(null);
+  // Consolidated WO accordion: which demand sections are open + per-section tree expansion
+  const [woConsolidatedOpenSections, setWoConsolidatedOpenSections] = useState<Set<string>>(new Set());
+  const [woConsolidatedExpanded, setWoConsolidatedExpanded] = useState<Record<string, Set<string>>>({});
+  const woConsolidatedFetchingRef = useRef<Set<string>>(new Set());
   const planPeggingResizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [planPeggingResizing, setPlanPeggingResizing] = useState(false);
   const [planResultTab, setPlanResultTab] = useState<'demands' | 'work_orders' | 'supplies' | 'resourceUtilization'>('demands');
@@ -1996,9 +2000,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return () => { cancelled = true; };
   }, [id]);
 
-  // Reset active-demand selection when the user opens pegging for a different WO
+  // Reset active-demand selection and consolidated accordion when the user opens pegging for a different WO
   useEffect(() => {
     setWoPeggingActiveDemandId(null);
+    setWoConsolidatedOpenSections(new Set());
+    setWoConsolidatedExpanded({});
   }, [planPeggingContext]);
 
   // When the pegging panel opens for a demand, auto-expand the critical-path
@@ -2174,6 +2180,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     planPeggingOpen && planPeggingContext?.type === 'work_order' && id
       ? (() => {
           const row = planPeggingContext.row as WorkOrder;
+          // Multi-demand consolidated WOs use per-demand keys fetched separately; no single woPeggingKey.
+          if (row.demand_id == null && (row.wo_consolidation_split_details?.length ?? 0) > 1) return null;
           const isConsolidated = row.demand_id == null;
           const demandPart = isConsolidated ? '' : String(woPeggingActiveDemandId ?? row.demand_id ?? '').trim();
           // start_time is part of the cache key — different lots (same demand/
@@ -2237,6 +2245,55 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         setPlanWorkOrderPeggingLoading(null);
       });
   }, [id, woPeggingKey, planPeggingContext?.type]);
+
+  // Multi-demand consolidated WO: fetch one pegging tree per contributing logical WO.
+  // Each fetch uses the native WO's start_time (found via consolidated_group_id linkage)
+  // so the backend locates the exact per-demand WO node rather than the merged one.
+  useEffect(() => {
+    if (!planPeggingOpen || planPeggingContext?.type !== 'work_order' || !id || !planResult) return;
+    const row = planPeggingContext.row as WorkOrder;
+    if (row.demand_id != null) return;
+    const sharedDetails = (row.wo_consolidation_split_details ?? [])
+      .filter((d) => !!d.demand_id && d.demand_id !== '') as Array<{ demand_id: string; allocated_qty: number }>;
+    if (sharedDetails.length <= 1) return;
+    const product_id = String(row.product_id ?? '').trim();
+    const location_id = String(row.location_id ?? '').trim();
+    const method = String(row.method ?? '').trim();
+    if (!product_id || !location_id || !method) return;
+    // Open all sections on first open
+    setWoConsolidatedOpenSections((prev) => {
+      if (prev.size > 0) return prev;
+      return new Set(sharedDetails.map((d) => d.demand_id));
+    });
+    for (const { demand_id: did } of sharedDetails) {
+      // Locate the native WO for this demand in this consolidated batch
+      const nativeWo = (planResult.work_orders_native ?? [])
+        .filter((w) => w.consolidated_group_id === row.wo_group_id && w.demand_id === did)
+        .sort((a, b) => (a.start_time ?? '').localeCompare(b.start_time ?? ''))[0];
+      const start_time = nativeWo?.start_time ?? undefined;
+      const cacheKey = `${did}|${product_id}|${location_id}|${method}|${start_time ?? ''}`;
+      if (planWorkOrderPeggingCache[cacheKey]) {
+        setWoConsolidatedExpanded((prev) => prev[cacheKey] ? prev : { ...prev, [cacheKey]: new Set(['0']) });
+        continue;
+      }
+      if (woConsolidatedFetchingRef.current.has(cacheKey)) continue;
+      woConsolidatedFetchingRef.current.add(cacheKey);
+      getWorkOrderPegging(Number(id), {
+        demand_id: did, product_id, location_id, method,
+        start_time: start_time ?? undefined,
+        ...(currentPlanRunId != null ? { run_id: currentPlanRunId } : {}),
+      })
+        .then((res) => {
+          setPlanWorkOrderPeggingCache((prev) => ({ ...prev, [cacheKey]: res.tree }));
+          setWoConsolidatedExpanded((prev) => ({ ...prev, [cacheKey]: new Set(['0']) }));
+        })
+        .catch((err) => {
+          if (typeof console !== 'undefined' && console.error)
+            console.error('[WO consolidated pegging]', did, parseApiError(err));
+        })
+        .finally(() => { woConsolidatedFetchingRef.current.delete(cacheKey); });
+    }
+  }, [planPeggingContext, planPeggingOpen, planResult, id, currentPlanRunId]);
 
   const basketInitialKeys = new Set(basketInitial.map((b) => b.key));
 
@@ -10313,57 +10370,99 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               );
             })()}
             {planPeggingContext.type === 'work_order' && (() => {
-              const row = planPeggingContext.row;
-              // "Shared" means the planner consolidated multiple demands into one WO (demand_id=null).
-              // Demand-specific WOs serve one demand each — not shared even if the same product@location
-              // has sibling WOs for other demands.
-              const sharedDemands = row.demand_id == null
-                ? (row.wo_consolidation_split_details ?? [])
-                    .map((d) => d.demand_id)
-                    .filter((d): d is string => d != null && d !== '')
-                : [];
-              if (sharedDemands.length <= 1) return null;
-              // Multi-product consolidated move WOs can't show a single pegging tree —
-              // chips navigate to demand pegging for the chosen demand instead.
-              const isMultiProductMove = (row.move_components?.length ?? 0) > 1;
-              const active = woPeggingActiveDemandId ?? (sharedDemands[0] ?? '');
-              return (
-                <div style={{ marginBottom: '0.75rem' }}>
-                  <span style={{ fontSize: '0.75rem', color: '#a1a1aa', marginRight: 6 }}>
-                    Consolidated for {sharedDemands.length} demands{isMultiProductMove ? ' — click to open demand pegging:' : ' — viewing:'}
-                  </span>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 4 }}>
-                    {sharedDemands.map((did) => (
-                      <button
-                        key={did}
-                        type="button"
-                        className="secondary"
-                        title={isMultiProductMove ? `Open demand pegging for ${did}` : did}
-                        style={{
-                          fontSize: '0.72rem', padding: '2px 8px', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                          background: active === did ? 'rgba(167,139,250,0.18)' : undefined,
-                          borderColor: active === did ? '#a78bfa' : undefined,
-                          color: isMultiProductMove ? '#60a5fa' : active === did ? '#a78bfa' : undefined,
-                          textDecoration: isMultiProductMove ? 'underline' : undefined,
-                        }}
-                        onClick={() => {
-                          if (isMultiProductMove) {
+              const row = planPeggingContext.row as WorkOrder;
+              if (row.demand_id != null) return null;
+              const sharedDetails = (row.wo_consolidation_split_details ?? [])
+                .filter((d) => !!d.demand_id && d.demand_id !== '') as Array<{ demand_id: string; allocated_qty: number }>;
+              if (sharedDetails.length <= 1) return null;
+              // Multi-product consolidated move WOs: chips navigate to per-demand pegging
+              if ((row.move_components?.length ?? 0) > 1) {
+                return (
+                  <div style={{ marginBottom: '0.75rem' }}>
+                    <span style={{ fontSize: '0.75rem', color: '#a1a1aa', marginRight: 6 }}>
+                      Consolidated for {sharedDetails.length} demands — click to open demand pegging:
+                    </span>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 4 }}>
+                      {sharedDetails.map(({ demand_id: did }) => (
+                        <button key={did} type="button" className="secondary"
+                          title={`Open demand pegging for ${did}`}
+                          style={{ fontSize: '0.72rem', padding: '2px 8px', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: '#60a5fa', textDecoration: 'underline' }}
+                          onClick={() => {
                             const demandRow = planResult?.committed_demands.find((d) => d.demand_id === did) ?? null;
                             if (!demandRow) return;
-                            const demandKey = `demand|${did}|${demandRow.product_id ?? ''}|${demandRow.location_id ?? ''}`;
                             setPlanPeggingContext({ type: 'demand', row: demandRow });
-                            setWoPeggingRowKey(demandKey);
+                            setWoPeggingRowKey(`demand|${did}|${demandRow.product_id ?? ''}|${demandRow.location_id ?? ''}`);
                             setPlanWorkOrderPeggingError(null);
                             setPreviousWoExplainRow(null);
-                          } else {
-                            setWoPeggingActiveDemandId(did);
-                          }
-                        }}
-                      >
-                        {did}
-                      </button>
-                    ))}
+                          }}>{did}</button>
+                      ))}
+                    </div>
                   </div>
+                );
+              }
+              // Single-product consolidated WO: accordion — one section per logical WO
+              const product_id = String(row.product_id ?? '').trim();
+              const location_id = String(row.location_id ?? '').trim();
+              const method = String(row.method ?? '').trim();
+              return (
+                <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
+                  <div style={{ fontSize: '0.75rem', color: '#a1a1aa', marginBottom: 6 }}>
+                    Physical WO fulfilling {sharedDetails.length} logical WOs:
+                  </div>
+                  {sharedDetails.map(({ demand_id: did, allocated_qty: qty }) => {
+                    const nativeWo = (planResult?.work_orders_native ?? [])
+                      .filter((w) => w.consolidated_group_id === row.wo_group_id && w.demand_id === did)
+                      .sort((a, b) => (a.start_time ?? '').localeCompare(b.start_time ?? ''))[0];
+                    const start_time = nativeWo?.start_time ?? undefined;
+                    const cacheKey = `${did}|${product_id}|${location_id}|${method}|${start_time ?? ''}`;
+                    const tree = planWorkOrderPeggingCache[cacheKey] ?? null;
+                    const isOpen = woConsolidatedOpenSections.has(did);
+                    const sectionExpanded = woConsolidatedExpanded[cacheKey] ?? new Set(['0']);
+                    return (
+                      <div key={did} style={{ borderTop: '1px solid #3d3d40' }}>
+                        <button type="button"
+                          onClick={() => setWoConsolidatedOpenSections((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(did)) next.delete(did); else next.add(did);
+                            return next;
+                          })}
+                          style={{ width: '100%', textAlign: 'left', background: 'none', border: 'none', padding: '6px 2px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, color: 'inherit' }}
+                        >
+                          <span style={{ color: '#a1a1aa', fontSize: '0.7rem', flexShrink: 0 }}>{isOpen ? '▾' : '▸'}</span>
+                          <span style={{ color: '#60a5fa', fontSize: '0.8rem', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{did}</span>
+                          <span style={{ color: '#a78bfa', fontSize: '0.75rem', flexShrink: 0, marginLeft: 'auto' }}>{qtyFmt(qty)}</span>
+                        </button>
+                        {isOpen && (
+                          <div style={{ paddingLeft: 8, paddingBottom: 8 }}>
+                            {!tree ? (
+                              <p style={{ color: '#a1a1aa', fontSize: '0.82rem', margin: '4px 0' }}>
+                                {woConsolidatedFetchingRef.current.has(cacheKey) ? 'Loading…' : 'No pegging tree.'}
+                              </p>
+                            ) : (
+                              <PlanningPeggingTreeView
+                                tree={tree}
+                                expanded={sectionExpanded}
+                                onToggle={(path) => setWoConsolidatedExpanded((prev) => {
+                                  const cur = prev[cacheKey] ?? new Set(['0']);
+                                  const next = new Set(cur);
+                                  if (next.has(path)) next.delete(path); else next.add(path);
+                                  return { ...prev, [cacheKey]: next };
+                                })}
+                                contextDemandId={did}
+                                consolidatedSourceResolver={(embeddedDemandId, pid) => {
+                                  const allEntries = (planResult?.planning_pegging ?? []).filter(
+                                    (e) => String(e.demand_id ?? '').trim() === embeddedDemandId
+                                  );
+                                  return allEntries.slice(0, -1).map((e) => e.tree)
+                                    .filter((t): t is PlanningPeggingNode => t != null && t.product_id === pid);
+                                }}
+                              />
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               );
             })()}
@@ -10379,6 +10478,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               );
             })()}
             {planPeggingContext.type !== 'supply' && (() => {
+              // Multi-demand consolidated WOs are fully handled by the accordion above
+              if (planPeggingContext.type === 'work_order') {
+                const _row = planPeggingContext.row as WorkOrder;
+                if (_row.demand_id == null && (_row.wo_consolidation_split_details?.length ?? 0) > 1) return null;
+              }
               let tree: PlanningPeggingNode | null = null;
               const isWoPeggingView = planPeggingContext.type === 'work_order';
               const woPeggingDemandId = isWoPeggingView ? (planPeggingContext.row as WorkOrder).demand_id ?? null : null;
