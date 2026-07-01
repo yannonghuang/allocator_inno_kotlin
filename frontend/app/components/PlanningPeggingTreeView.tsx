@@ -138,8 +138,13 @@ function NodeView({
     : node.type === 'supply' ? 'Supply'
     : node.type === 'purchase' ? 'Purchase'
     : '';
+  // Work-order color matches the WO timeline and KPI panel method colors.
+  const woMethodColor = !isWorkOrder ? '#34d399'
+    : node.method === 'move' ? '#f59e0b'        // amber — transit/move (same as WO timeline)
+    : (node.method === 'buy' || node.method === 'purchase') ? '#22c55e'  // green — purchase
+    : '#3b82f6';                                // blue — make (default)
   const typeColor = isDemand ? '#60a5fa'
-    : isWorkOrder ? '#34d399'
+    : isWorkOrder ? woMethodColor
     : isOperation ? '#fbbf24'   // amber — production setup
     : isResource ? '#22d3ee'    // cyan — capacity / tooling
     : '#a78bfa';

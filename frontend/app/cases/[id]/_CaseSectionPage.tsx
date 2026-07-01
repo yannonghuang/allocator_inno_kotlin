@@ -2919,6 +2919,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     wo_group_id?: string | null;
     consolidated?: boolean;
     _demand_ids?: string[];
+    _is_inventory?: boolean;
     wo_consolidation_split_details?: Array<{ demand_id?: string | null }> | null;
   };
 
@@ -6019,12 +6020,40 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         _requested_qty: requested,
                       };
                     });
+                    // Synthetic inventory rows — one per inventory-committed demand, native tab only.
+                    // These appear alongside WO rows so traceability is end-to-end:
+                    // demand → inventory (point bar) + WO chain (production bars).
+                    if (woTableTab === 'native') {
+                      const invDemands = planResult.committed_demands.filter(
+                        (d) => d.commit_reason === 'inventory' && d.commit_time && d.demand_id
+                          && (!demandIdFilter || d.demand_id === demandIdFilter),
+                      );
+                      for (const d of invDemands) {
+                        woRowsAll.push({
+                          product_id: d.product_id,
+                          location_id: d.location_id,
+                          demand_id: d.demand_id ?? undefined,
+                          method: 'inventory',
+                          quantity: d.quantity,
+                          start_time: d.commit_time,
+                          end_time: d.commit_time,
+                          wo_group_id: `inv:${d.demand_id}`,
+                          _is_inventory: true,
+                          _demand_ids: d.demand_id ? [d.demand_id] : [],
+                          _segments: [{ start: d.commit_time ?? null, end: d.commit_time ?? null }],
+                        } as WoEnrichedRow);
+                      }
+                    }
                     let woRows: WoEnrichedRow[] = woRowsAll;
                     if (woPegHighlightRow) {
                       // Same classifier the toolbar uses for the ↓/↑ counts —
                       // they cannot disagree.
-                      woRows = woRows.filter((r) =>
-                        peggedRowKindFor(r, woPegHighlightRow, woPegHighlightSets) !== null);
+                      woRows = woRows.filter((r) => {
+                        // Inventory rows: show alongside the highlighted WO when it belongs
+                        // to the same demand (inventory fulfills part of the same demand).
+                        if (r._is_inventory) return r.demand_id === woPegHighlightRow.demand_id;
+                        return peggedRowKindFor(r, woPegHighlightRow, woPegHighlightSets) !== null;
+                      });
                       // BFS depth from the highlighted row through the predecessor graph.
                       // Self=0, direct components=1, deeper sub-components=2+.
                       // Rows are sorted descending (deepest first → closest to raw material at top,
@@ -6035,7 +6064,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         const [k, d] = bfsQueue.shift()!;
                         if (depthMap.has(k)) continue;
                         depthMap.set(k, d);
-                        for (const child of woPegRelations.childMap.get(k) ?? []) {
+                        for (const child of Array.from(woPegRelations.childMap.get(k) ?? [])) {
                           if (!depthMap.has(child)) bfsQueue.push([child, d + 1]);
                         }
                       }
@@ -6108,6 +6137,18 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           : undefined,
                         render: (r) => {
                           if (!horizon) return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
+                          // Inventory rows: vertical tick at commit_time (no production span).
+                          if (r._is_inventory) {
+                            const ct = r.start_time ? new Date(r.start_time) : null;
+                            if (!ct || Number.isNaN(ct.getTime())) return null;
+                            const hSpan = Math.max(1, horizon.end.getTime() - horizon.start.getTime());
+                            const leftPct = Math.max(0, Math.min(100, ((ct.getTime() - horizon.start.getTime()) / hSpan) * 100));
+                            return (
+                              <div style={{ position: 'relative', width: '100%', height: '1.25rem', display: 'flex', alignItems: 'center' }}>
+                                <div style={{ position: 'absolute', left: `${leftPct}%`, width: '3px', height: '80%', background: '#16a34a', borderRadius: '1px', transform: 'translateX(-50%)', cursor: 'default' }} />
+                              </div>
+                            );
+                          }
                           const isSelf = !!woPegHighlightRow
                             && r.product_id === woPegHighlightRow.product_id
                             && r.location_id === woPegHighlightRow.location_id
