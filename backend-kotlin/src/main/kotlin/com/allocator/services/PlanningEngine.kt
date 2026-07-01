@@ -3453,6 +3453,12 @@ internal fun consolidateByWaves(
             .groupBy({ it.first }, { it.second })
             .map { (d, qtys) -> mapOf("demand_id" to d, "allocated_qty" to qtys.sum()) }
         val overrideActive = gids.any { gidInfo.getValue(it).overrideActive }
+        // When constituent WOs came from virtual/null-demand pegging entries their demandId is null,
+        // so demandQty is empty and demands=[]. Fall back to sampleMembers (real demand IDs carried
+        // on the virtual entry's consolidated_demand_ids) so the frontend can still show the accordion.
+        val effectiveDemands = demands.ifEmpty {
+            gids.flatMap { gidInfo.getValue(it).sampleMembers ?: emptyList() }.distinct()
+        }
         if (first.method == "move") {
             val moveComponents = gids.groupBy { gidInfo.getValue(it).pid }
                 .map { (p, gs) -> mapOf(
@@ -3477,9 +3483,9 @@ internal fun consolidateByWaves(
                 "wave_index" to 0,
                 "lot_count" to 1,
                 "consolidated" to true,
-                "wo_competing_demands" to demands,
+                "wo_competing_demands" to effectiveDemands,
                 "consolidation_split_details" to splitDetails,
-                "consolidated_demand_ids" to demands,
+                "consolidated_demand_ids" to effectiveDemands,
                 "move_components" to moveComponents,
                 "wo_window_start" to formatDate(mergedStart),
                 "wo_window_end" to formatDate(mergedStart),
@@ -3505,9 +3511,9 @@ internal fun consolidateByWaves(
             "lot_count" to lotCount,
             "max_lot_size" to lotSize,
             "consolidated" to true,
-            "wo_competing_demands" to demands,
+            "wo_competing_demands" to effectiveDemands,
             "consolidation_split_details" to splitDetails,
-            "consolidated_demand_ids" to demands,
+            "consolidated_demand_ids" to effectiveDemands,
             "wo_window_start" to formatDate(mergedStart),
             "wo_window_end" to formatDate(mergedStart),
             "wo_consolidation_total_planned" to totalQty,
