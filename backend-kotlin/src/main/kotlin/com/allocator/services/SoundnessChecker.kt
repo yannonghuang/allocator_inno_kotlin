@@ -483,11 +483,16 @@ fun checkRunSoundness(
 
     // R7e: conservation of mass — only when both inventory snapshots are provided.
     // DB-loaded soundness checks on historical runs pass empty lists and skip this.
+    //
+    // No servedDemandIds filter here: supply allocations already represent real
+    // inventory consumption (extractSupplyAllocations skips failed=true subtrees whose
+    // draws were rolled back). Filtering by post-reconcile servedDemandIds would
+    // incorrectly exclude VIRTUAL consolidation demands whose inventory was consumed
+    // pre-reconcile but whose committed_qty was zeroed by reconcile() post-extraction.
     val conservationViolations: List<String> =
         if (inventoryEffectiveInitial.isNotEmpty() && inventoryLeftover.isNotEmpty())
             verifyInventoryConservation(
                 inventoryEffectiveInitial, inventoryLeftover, supplyAllocations,
-                servedDemandIds = servedDemandIds.ifEmpty { null },
             )
         else emptyList()
 
@@ -1593,11 +1598,10 @@ internal fun checkRunSoundnessStreaming(
         }
     }
 
-    // R7e conservation
-    val servedDemandIds: Set<String> = committedQtyById.filter { (_, qty) -> qty > 1e-9 }.keys
+    // R7e conservation — no servedDemandIds filter (see checkRunSoundness comment above)
     val conservationViolations: List<String> =
         if (inventoryEffectiveInitial.isNotEmpty() && inventoryLeftover.isNotEmpty())
-            verifyInventoryConservation(inventoryEffectiveInitial, inventoryLeftover, supplyAllocations, servedDemandIds = servedDemandIds.ifEmpty { null })
+            verifyInventoryConservation(inventoryEffectiveInitial, inventoryLeftover, supplyAllocations)
         else emptyList()
 
     // R10 inventory priority
