@@ -257,6 +257,7 @@ export type PlanningPeggingNode = {
   pre_process_time?: number | null;
   post_process_time?: number | null;
   prod_area?: string | null;
+  wo_group_id?: string | null;
   /** resource nodes: per-unit consumption rate and the available pool size at this location. */
   resource_rate?: number | null;
   size?: number | null;

@@ -1274,7 +1274,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       const woKey = (r: WorkOrder) => [
         String(r.demand_id ?? ''), String(r.product_id ?? ''), String(r.location_id ?? ''),
         String(r.method ?? ''), String(r.location_source ?? ''), String(r.prod_area ?? ''),
-        r.consolidated ? String(r.wo_group_id ?? '') : '',
+        String(r.wo_group_id ?? ''),
       ].join('|');
       return new Set(wos.map(woKey)).size;
     };
@@ -1324,7 +1324,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planWoPivot, setPlanWoPivot] = useState<'none' | 'prod_area' | 'location' | 'nested' | 'demand'>('none');
   const [planWoLayoutMode, setPlanWoLayoutMode] = useState<'data' | 'split' | 'timeline'>('split');
   const [woPegHighlightRow, setWoPegHighlightRow] = useState<WoEnrichedRow | null>(null);
-  const [woPegFilterPeggedOnly, setWoPegFilterPeggedOnly] = useState(true);
   const [planWoPivotExpanded, setPlanWoPivotExpanded] = useState<Set<string>>(new Set());
   const [planWoPivotSubExpanded, setPlanWoPivotSubExpanded] = useState<Set<string>>(new Set());
   const [woExpandedKeys, setWoExpandedKeys] = useState<Set<string>>(new Set());
@@ -2869,23 +2868,38 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const woPegRelations = useMemo(() => {
     const parentMap = new Map<string, Set<string>>(); // childKey → set of parent (downstream) keys
     const childMap = new Map<string, Set<string>>();  // parentKey → set of child (upstream) keys
-    function visit(node: PlanningPeggingNode, ancestorWoKey: string | null, demandId: string) {
+    function addEdge(childK: string, parentK: string) {
+      if (!parentMap.has(childK)) parentMap.set(childK, new Set());
+      parentMap.get(childK)!.add(parentK);
+      if (!childMap.has(parentK)) childMap.set(parentK, new Set());
+      childMap.get(parentK)!.add(childK);
+    }
+    // Each work_order node emits two parallel edge sets:
+    //   gid-keyed  ("gid:<wo_group_id>"): used by native WOs so two groups with the same
+    //              product/location/method (different time windows) stay in separate BFS trees.
+    //   4-part key (demand|pid|lid|method): kept for consolidated WO fallback, which uses
+    //              demand-based keys because consolidated gids don't appear in planning_pegging.
+    function visit(
+      node: PlanningPeggingNode,
+      ancestorGid: string | null,
+      ancestor4: string | null,
+      demandId: string,
+    ) {
       const nodeDemand = node.demand_id ?? demandId;
-      let myKey: string | null = null;
+      let myGid: string | null = null;
+      let my4: string | null = null;
       if (node.type === 'work_order') {
-        myKey = `${nodeDemand}|${node.product_id ?? ''}|${node.location_id ?? ''}|${node.method ?? ''}`;
-        if (ancestorWoKey) {
-          if (!parentMap.has(myKey)) parentMap.set(myKey, new Set());
-          parentMap.get(myKey)!.add(ancestorWoKey);
-          if (!childMap.has(ancestorWoKey)) childMap.set(ancestorWoKey, new Set());
-          childMap.get(ancestorWoKey)!.add(myKey);
-        }
+        myGid = node.wo_group_id ? `gid:${node.wo_group_id}` : null;
+        my4 = `${nodeDemand}|${node.product_id ?? ''}|${node.location_id ?? ''}|${node.method ?? ''}`;
+        if (myGid && ancestorGid) addEdge(myGid, ancestorGid);
+        if (ancestor4) addEdge(my4, ancestor4);
       }
-      const nextAncestor = myKey ?? ancestorWoKey;
-      for (const child of node.children ?? []) visit(child, nextAncestor, nodeDemand);
+      const nextGid = myGid ?? ancestorGid;
+      const next4 = my4 ?? ancestor4;
+      for (const child of node.children ?? []) visit(child, nextGid, next4, nodeDemand);
     }
     for (const entry of planResult?.planning_pegging ?? []) {
-      visit(entry.tree, null, entry.demand_id ?? '');
+      visit(entry.tree, null, null, entry.demand_id ?? '');
     }
     return { parentMap, childMap };
   }, [planResult]);
@@ -2893,9 +2907,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // ── Shared row identity / pegging-classification helpers ────────────────────
   // These are the single source of truth for "what counts as one row in the
   // work-order view" and "how does a row relate to the highlighted WO".
-  // The "Pegged only" filter (in the table render) AND the up/down-arrow
-  // counts (in the toolbar) both go through `peggedRowKindFor` so they cannot
-  // disagree.
+  // The pegged-row filter (in the table render) and the up/down-arrow counts
+  // (in the toolbar) both go through `peggedRowKindFor` so they cannot disagree.
   type WoRowLike = {
     product_id?: string;
     location_id?: string | null;
@@ -2903,12 +2916,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     demand_id?: string | null;
     location_source?: string | null;
     prod_area?: string | null;
+    wo_group_id?: string | null;
+    consolidated?: boolean;
     _demand_ids?: string[];
     wo_consolidation_split_details?: Array<{ demand_id?: string | null }> | null;
   };
 
-  // 6-part key used to group lots into one logical work-order row.  Both the
+  // 7-part key used to group lots into one logical work-order row.  Both the
   // count walk and the table's grouping derive their row identity from this.
+  // wo_group_id is the 7th component so two native WO groups for the same
+  // product/location/method (different time windows) remain distinct rows.
   const woRowGroupKey = useCallback((r: WoRowLike): string => [
     String(r.demand_id ?? ''),
     String(r.product_id ?? ''),
@@ -2916,6 +2933,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     String(r.method ?? ''),
     String(r.location_source ?? ''),
     String(r.prod_area ?? ''),
+    String(r.wo_group_id ?? ''),
   ].join('|'), []);
 
   // Demand-ids associated with a row.  Enriched rows carry `_demand_ids`
@@ -2929,8 +2947,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       .filter((d): d is string => d != null && d !== '');
   }, []);
 
-  // 4-part pegging keys for a row (consolidation-aware: one key per demand_id).
+  // Pegging keys for a row used to look up ancestor/descendant sets in woPegRelations.
+  // Native WOs (non-consolidated, have wo_group_id) use a gid-prefixed key that maps
+  // 1:1 to the pegging tree node — this keeps two WO groups for the same
+  // product/location/method (different time windows) separate in the BFS traversal.
+  // Consolidated WOs fall back to per-demand 4-part keys (the pegging graph is built
+  // from native planning_pegging trees and stores 4-part edges for this path).
   const woRowPegKeys = useCallback((r: WoRowLike): string[] => {
+    if (!r.consolidated && r.wo_group_id) return [`gid:${r.wo_group_id}`];
     const ids = woRowDemandIds(r);
     return (ids.length ? ids : ['']).map((d) =>
       `${d}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`);
@@ -5810,16 +5834,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         </span>
                         <button
                           type="button"
-                          className={woPegFilterPeggedOnly ? '' : 'secondary'}
-                          style={{ fontSize: '0.7rem', padding: '1px 8px' }}
-                          onClick={() => setWoPegFilterPeggedOnly((v) => !v)}
-                          title={tP('workOrders.filterPeggedOnlyTooltip')}
-                        >{tP('workOrders.filterPeggedOnly')}</button>
-                        <button
-                          type="button"
                           className="secondary"
                           style={{ fontSize: '0.7rem', padding: '1px 8px' }}
-                          onClick={() => { setWoPegHighlightRow(null); setWoPegFilterPeggedOnly(false); }}
+                          onClick={() => { setWoPegHighlightRow(null); }}
                         >{tc('clear')}</button>
                       </span>
                     )}
@@ -5893,12 +5910,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         String(r.method ?? ''),
                         String(r.location_source ?? ''),
                         String(r.prod_area ?? ''),
-                        // A cross-demand consolidated order is ALREADY one PO per window — keep each
-                        // as its own row (by wo_group_id). Without this, every window's batch (all
-                        // demand_id=null, same product/loc/method) collapses into one row whose
-                        // quantity is the sum of all windows while lots/demands stay from one batch,
-                        // so the row total no longer matches its drill-down.
-                        r.consolidated ? String(r.wo_group_id ?? '') : '',
+                        // Include wo_group_id for all WOs (native and consolidated) so each
+                        // pegging-tree node gets its own row. Without this, native WOs sharing
+                        // demand/product/location/method but from different time windows collapse
+                        // into one row and lose independent pegging-tree access.
+                        String(r.wo_group_id ?? ''),
                       ].join('|');
                       const existing = grouped.get(key);
                       const rowQty = Number(r.quantity ?? 0) || 0;
@@ -6004,7 +6020,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       };
                     });
                     let woRows: WoEnrichedRow[] = woRowsAll;
-                    if (woPegHighlightRow && woPegFilterPeggedOnly) {
+                    if (woPegHighlightRow) {
                       // Same classifier the toolbar uses for the ↓/↑ counts —
                       // they cannot disagree.
                       woRows = woRows.filter((r) =>
@@ -6644,10 +6660,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               const isMake = sup.length > 0 && sup[0].type === 'demand';
                               const direct = isMake ? (woCrossEntrySupplyMap.get(`${r.demand_id ?? ''}|${r.product_id ?? ''}`) ?? []) : [];
                               if (sup.length === 0 && direct.length === 0) return false;
-                              // In Pegged-only mode the component WOs are already visible as
+                              // When a WO is highlighted, component WOs are already visible as
                               // top-level rows. The ▶ expand would duplicate them inline —
                               // suppress it so the list is the single source of truth.
-                              if (woPegHighlightRow && woPegFilterPeggedOnly) return false;
+                              if (woPegHighlightRow) return false;
                               return true;
                             }}
                             expandedRowContent={(r) => {
