@@ -339,6 +339,7 @@
       "woBatchBiweekly": "Bi-weekly",
       "woBatchMonthly": "Monthly",
       "woBatchAll": "All",
+      "woBatchFrequency": "Workorder consolidation frequency",
       "woBatchMake": "Make:",
       "woBatchMove": "Move:",
       "woBatchPurchase": "Buy:",

@@ -5029,6 +5029,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             </legend>
             <div style={{ display: 'flex', alignItems: 'center', gap: '1.25rem', flexWrap: 'wrap' }}>
               {/* WO batch scales — grouped visually */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                <span style={{ fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.04em' }}>{tP('config.woBatchFrequency')}</span>
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', padding: '4px 10px', border: '1px solid #3f3f46', borderRadius: 5 }}>
                 {(['make', 'move', 'purchase'] as const).map((type) => {
                   const configKey = `${type}_batch_scale` as 'make_batch_scale' | 'move_batch_scale' | 'purchase_batch_scale';
@@ -5059,6 +5061,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     </label>
                   );
                 })}
+              </div>
               </div>
               <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
                 <input

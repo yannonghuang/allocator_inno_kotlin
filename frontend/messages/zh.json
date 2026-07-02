@@ -339,6 +339,7 @@
       "woBatchBiweekly": "每两周",
       "woBatchMonthly": "每月",
       "woBatchAll": "全部",
+      "woBatchFrequency": "工单合并频率",
       "woBatchMake": "制造：",
       "woBatchMove": "调拨：",
       "woBatchPurchase": "采购：",
