@@ -3274,11 +3274,6 @@ internal fun consolidateByWaves(
     data: Map<String, List<Map<String, Any?>>>,
     windowDays: Int,
 ): WaveConsolidationResult {
-    fun bucketOf(start: LocalDate?): Long {
-        val d = start ?: return Long.MIN_VALUE
-        return if (windowDays <= 0) 0L else Math.floorDiv(d.toEpochDay(), windowDays.toLong())
-    }
-
     data class Occurrence(
         val gid: String,                 // internal identity (real wo_group_id, or synthetic) — bucketing/dependency graph only
         val originalGid: String?,        // raw wo_group_id on the node (possibly null) — preserved on native output
@@ -3538,16 +3533,36 @@ internal fun consolidateByWaves(
             }
         }
 
+        // Group frontier WOs by base identity (pid, lid, method, locationSource) first,
+        // then merge overlapping production intervals within each group.
+        // Fixed-window bucketing (epoch-rooted or calendar-month) splits WOs whose
+        // production intervals physically overlap just because their start dates straddle a
+        // bucket boundary — even when the shorter WO is entirely subsumed by the longer one.
+        // Interval-overlap is the correct semantic: two WOs should consolidate iff their
+        // [pendingStart, pendingStart+duration] intervals intersect.
+        // windowDays <= 0 retains the original "collapse all" behaviour.
         val buckets = linkedMapOf<List<Any?>, MutableList<String>>()
         val passthroughGids = mutableListOf<String>()
+        val baseGroups = linkedMapOf<List<Any?>, MutableList<String>>()
         for (gid in frontier) {
             val info = gidInfo.getValue(gid)
             val start = pendingStart[gid]
             if (start == null) { passthroughGids.add(gid); continue }
-            val key: List<Any?> = if (info.method == "move") listOf(
-                "move", info.locationSource, info.lid, getProdArea(info.pid, info.lid, data), bucketOf(start)
-            ) else listOf(info.pid, info.lid, info.method, info.locationSource, bucketOf(start))
-            buckets.getOrPut(key) { mutableListOf() }.add(gid)
+            val baseKey: List<Any?> = if (info.method == "move") listOf(
+                "move", info.locationSource, info.lid, getProdArea(info.pid, info.lid, data)
+            ) else listOf(info.pid, info.lid, info.method, info.locationSource)
+            baseGroups.getOrPut(baseKey) { mutableListOf() }.add(gid)
+        }
+        for ((baseKey, gids) in baseGroups) {
+            for (gid in gids) {
+                val info = gidInfo.getValue(gid)
+                val start = info.nativeStart ?: pendingStart[gid]!!
+                // Calendar bucket: floor(nativeStart / windowDays). Each WO's bucket is
+                // determined solely by its own planned start — no dependency on other WOs'
+                // durations or ordering. windowDays <= 0 collapses all into bucket 0.
+                val bucket = if (windowDays > 0) start.toEpochDay() / windowDays else 0L
+                buckets.getOrPut(baseKey + listOf(bucket)) { mutableListOf() }.add(gid)
+            }
         }
 
         for (gid in passthroughGids) {
@@ -4596,9 +4611,19 @@ fun runPlanning(
     // wo_group_id so the downstream capacity-patch step below applies uniformly either way.
     @Suppress("UNCHECKED_CAST")
     val consolidationCfg = config?.get("consolidation") as? Map<String, Any?>
-    val consolidateWos = consolidationConfig.enabled && consolidationCfg?.get("consolidate_wos") != false
+    val batchScale = consolidationCfg?.get("wo_batch_scale")?.toString()
+    val consolidateWos = consolidationConfig.enabled
+        && consolidationCfg?.get("consolidate_wos") != false
+        && batchScale != "none"
     val waveResult = if (consolidateWos) {
-        val windowDays = (consolidationCfg?.get("wo_window_days") as? Number)?.toInt() ?: consolidationConfig.periodDays
+        val windowDays = when (batchScale) {
+            "weekly"   -> 7
+            "biweekly" -> 14
+            "monthly"  -> 30
+            "all"      -> 0
+            else -> (consolidationCfg?.get("wo_window_days") as? Number)?.toInt()
+                        ?: consolidationConfig.periodDays
+        }
         val r = consolidateByWaves(reconciledTrees, data, windowDays)
         log.info("Pass 2 cross-demand WO batch (window={}d): {} native → {} consolidated work orders", windowDays, r.consolidation.native.size, r.consolidation.consolidated.size)
         r

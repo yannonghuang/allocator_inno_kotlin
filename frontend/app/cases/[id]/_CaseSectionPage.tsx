@@ -1350,7 +1350,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // Buyable raw materials for the selective-purchase whitelist dropdown + copilot /raw picker.
   const [purchasableOptions, setPurchasableOptions] = useState<PurchasableRawMaterial[]>([]);
   const [constraintOptions, setConstraintOptions] = useState<ConstraintOptions>({ customers: [], parents: [] });
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 30 }, purchase_allowed: false, purchasable_materials: [], constraints: [], analyze_criticality: false, check_soundness: true, enable_global_scheduling: true });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 7, wo_batch_scale: 'weekly' }, purchase_allowed: false, purchasable_materials: [], constraints: [], analyze_criticality: false, check_soundness: true, enable_global_scheduling: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1450,7 +1450,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (Number(ms.max_methods) !== 1) diffs.push(`max_methods: 1 → ${ms.max_methods}`);
     if (Number(ms.depth) !== 1) diffs.push(`depth: 1 → ${ms.depth}`);
     if (ms.max_bom_depth != null && Number(ms.max_bom_depth) !== 3) diffs.push(`max_bom_depth: 3 → ${ms.max_bom_depth}`);
-    if (Number(cs.period_days ?? 30) !== 30) diffs.push(`period_days: 30 → ${cs.period_days}`);
+    const defaultScale = 'weekly';
+    const curScale = (cs.wo_batch_scale as string) ?? defaultScale;
+    if (curScale !== defaultScale) diffs.push(`WO batch: weekly → ${curScale}`);
     if (config.purchase_allowed === true) diffs.push(`purchase: off → on`);
     return diffs.join(' · ');
   };
@@ -1474,7 +1476,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       parts.push(`w=(${Number(sw.commit_time ?? 0)}, ${Number(sw.inventory_consumed ?? 0)}, ${Number(sw.purchase ?? 0)})`);
     }
     parts.push(`wo_batch=${cs.enabled === false ? 'off' : 'on'}`);
-    if (Number(cs.period_days ?? 30) !== 30) parts.push(`p=${cs.period_days}`);
+    const scl = (cs.wo_batch_scale as string) ?? 'weekly';
+    parts.push(`batch=${scl}`);
     parts.push(`purch=${config.purchase_allowed === true ? 'on' : 'off'}`);
     return parts.join(' · ');
   };
@@ -1489,7 +1492,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     },
     consolidation: {
       enabled: true,
-      period_days: 30,
+      period_days: 7,
+      wo_batch_scale: 'weekly',
     },
     variant_selection: { multiple: true },
     purchase_allowed: false,
@@ -1509,7 +1513,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       case 'depth':               ms.depth = value; break;
       case 'scope':               cs.scope = value; break;
       case 'consolidation_enabled': cs.enabled = value; break;
-      case 'period_days':         cs.period_days = value; break;
+      case 'period_days':
+        cs.period_days = value;
+        cs.wo_batch_scale = value === 0 ? 'all' : value === 7 ? 'weekly' : value === 14 ? 'biweekly' : 'monthly';
+        break;
       case 'purchase_allowed':    cfg.purchase_allowed = value; break;
       case 'mode':
         ms.mode = value;
@@ -2180,8 +2187,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     planPeggingOpen && planPeggingContext?.type === 'work_order' && id
       ? (() => {
           const row = planPeggingContext.row as WorkOrder;
-          // Multi-demand consolidated WOs use per-demand keys fetched separately; no single woPeggingKey.
-          if (row.demand_id == null && (row.consolidated_demand_ids?.length ?? 0) > 1) return null;
+          // All null-demand consolidated WOs (single or multi-demand) use per-demand accordion; no single woPeggingKey.
+          if (row.demand_id == null && (row.consolidated_demand_ids?.length ?? 0) >= 1) return null;
           const isConsolidated = row.demand_id == null;
           const demandPart = isConsolidated ? '' : String(woPeggingActiveDemandId ?? row.demand_id ?? '').trim();
           // start_time is part of the cache key — different lots (same demand/
@@ -2262,7 +2269,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       ...splitDetails.map((d) => d.demand_id),
       ...(row.consolidated_demand_ids ?? []).filter((d) => !!d && d !== '' && !splitIds.has(d)),
     ];
-    if (allDemandIds.length <= 1) return;
+    if (allDemandIds.length === 0) return;
     const product_id = String(row.product_id ?? '').trim();
     const location_id = String(row.location_id ?? '').trim();
     const method = String(row.method ?? '').trim();
@@ -4996,21 +5003,24 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
               <label
                 style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }}
-                title={tP('config.bucketDaysTooltip')}
+                title={tP('config.woBatchScaleTooltip')}
               >
-                <span style={{ color: '#a1a1aa' }}>{tP('config.bucketDays')}</span>
-                <input
-                  type="number"
-                  min={0}
-                  max={365}
-                  value={planningConfig.consolidation?.period_days ?? 30}
+                <span style={{ color: '#a1a1aa' }}>{tP('config.woBatchScale')}</span>
+                <select
+                  value={planningConfig.consolidation?.wo_batch_scale ?? 'weekly'}
                   onChange={(e) => {
-                    const raw = parseInt(e.target.value, 10);
-                    const v = Math.max(0, Math.min(365, Number.isNaN(raw) ? 0 : raw));
-                    setPlanningConfig((c) => ({ ...c, consolidation: { ...c.consolidation, period_days: v } }));
+                    const v = e.target.value as 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
+                    const days = v === 'weekly' ? 7 : v === 'biweekly' ? 14 : v === 'monthly' ? 30 : 0;
+                    setPlanningConfig((c) => ({ ...c, consolidation: { ...c.consolidation, wo_batch_scale: v, period_days: days } }));
                   }}
-                  style={{ width: 64, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
-                />
+                  style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+                >
+                  <option value="none">{tP('config.woBatchNone')}</option>
+                  <option value="weekly">{tP('config.woBatchWeekly')}</option>
+                  <option value="biweekly">{tP('config.woBatchBiweekly')}</option>
+                  <option value="monthly">{tP('config.woBatchMonthly')}</option>
+                  <option value="all">{tP('config.woBatchAll')}</option>
+                </select>
               </label>
               <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
                 <input
@@ -5084,7 +5094,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               },
               purchase_allowed: false,
               constraints: [],
-              consolidation: { enabled: true, period_days: 30 },
+              consolidation: { enabled: true, period_days: 7, wo_batch_scale: 'weekly' },
             })}
             title={tP('config.resetDefaultsTitle')}
             style={{ padding: '6px 12px' }}
@@ -8139,18 +8149,27 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                     <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editPurchase')}</span>
                                   </label>
                                 </div>
-                                {/* Consolidation (demand side — always on) */}
+                                {/* Consolidation (WO batch window) */}
                                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'center', fontSize: '0.78rem', marginBottom: 6 }}>
                                   <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editPeriodDays')}</span>
-                                    <input type="number" min={0} max={365}
-                                      value={Number(cs.period_days ?? 30)}
+                                    <span style={{ color: '#a1a1aa' }}>{tP('config.woBatchScale')}</span>
+                                    <select
+                                      value={(cs.wo_batch_scale as string) ?? 'weekly'}
                                       onChange={(e) => updateConfig((c) => {
-                                        const v = (c.consolidation ?? {}) as Record<string, unknown>;
-                                        v.period_days = Math.max(0, Math.min(365, parseInt(e.target.value, 10) || 0));
-                                        c.consolidation = v;
+                                        const v = e.target.value as 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
+                                        const days = v === 'weekly' ? 7 : v === 'biweekly' ? 14 : v === 'monthly' ? 30 : 0;
+                                        const con = (c.consolidation ?? {}) as Record<string, unknown>;
+                                        con.wo_batch_scale = v;
+                                        con.period_days = days;
+                                        c.consolidation = con;
                                       })}
-                                      style={{ ...inputStyle, width: 64 }} />
+                                      style={{ ...inputStyle }}>
+                                      <option value="none">{tP('config.woBatchNone')}</option>
+                                      <option value="weekly">{tP('config.woBatchWeekly')}</option>
+                                      <option value="biweekly">{tP('config.woBatchBiweekly')}</option>
+                                      <option value="monthly">{tP('config.woBatchMonthly')}</option>
+                                      <option value="all">{tP('config.woBatchAll')}</option>
+                                    </select>
                                   </label>
                                 </div>
                                 {isEdited && (
@@ -9864,7 +9883,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     : tP('copilot.oneByPreference')}.{' '}
                 <strong>{tP('copilot.purchase')}</strong> {planningConfig.purchase_allowed === false ? tP('copilot.disabled') : tP('copilot.allowed')}.{' '}
                 <strong>{tP('copilot.consolidation')}</strong> {planningConfig.consolidation?.enabled === true
-                  ? tP('copilot.consolidationOnDetail', { days: planningConfig.consolidation.period_days ?? 30 })
+                  ? (() => {
+                      const scl = planningConfig.consolidation.wo_batch_scale ?? 'weekly';
+                      const keyMap: Record<string, string> = { none: 'woBatchNone', weekly: 'woBatchWeekly', biweekly: 'woBatchBiweekly', monthly: 'woBatchMonthly', all: 'woBatchAll' };
+                      return tP('copilot.consolidationOnDetail', { scale: tP(`config.${keyMap[scl] ?? 'woBatchWeekly'}`) });
+                    })()
                   : tP('copilot.off')}. {tP('copilot.naturalLangInfo')}
               </p>
             </div>
@@ -10388,7 +10411,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 ...splitDetails.map((d) => d.demand_id),
                 ...(row.consolidated_demand_ids ?? []).filter((d) => !!d && d !== '' && !splitIds.has(d)),
               ];
-              if (allDemandIds.length <= 1) return null;
+              if (allDemandIds.length === 0) return null;
               // Multi-product consolidated move WOs: chips navigate to per-demand pegging
               if ((row.move_components?.length ?? 0) > 1) {
                 return (
@@ -10421,7 +10444,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               return (
                 <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
                   <div style={{ fontSize: '0.75rem', color: '#a1a1aa', marginBottom: 6 }}>
-                    Physical WO fulfilling {allDemandIds.length} logical WOs:
+                    Physical WO fulfilling {allDemandIds.length} logical WO{allDemandIds.length !== 1 ? 's' : ''}:
                   </div>
                   {allDemandIds.map((did) => {
                     const qty = splitDetails.find((d) => d.demand_id === did)?.allocated_qty ?? null;
@@ -10494,10 +10517,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               );
             })()}
             {planPeggingContext.type !== 'supply' && (() => {
-              // Multi-demand consolidated WOs are fully handled by the accordion above
+              // All null-demand consolidated WOs (single or multi-demand) are handled by the accordion above
               if (planPeggingContext.type === 'work_order') {
                 const _row = planPeggingContext.row as WorkOrder;
-                if (_row.demand_id == null && (_row.consolidated_demand_ids?.length ?? 0) > 1) return null;
+                if (_row.demand_id == null && (_row.consolidated_demand_ids?.length ?? 0) >= 1) return null;
               }
               let tree: PlanningPeggingNode | null = null;
               const isWoPeggingView = planPeggingContext.type === 'work_order';

@@ -424,8 +424,10 @@ export type PlanningConfig = {
   /** Consolidate shared component demands within a time bucket before planning. */
   consolidation?: {
     enabled?: boolean;
-    /** Width of the time bucket in days (0–365). 0 (default) collapses every demand into a single bucket regardless of due date. */
+    /** Width of the supply-side time bucket in days (0–365). */
     period_days?: number;
+    /** Calendar scale for WO batch grouping. none=skip, weekly=7d, biweekly=14d, monthly=30d, all=single bucket. */
+    wo_batch_scale?: 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
   };
   /**
    * Post-plan UI behavior toggles. These do not affect planner output — they
