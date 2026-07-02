@@ -2221,8 +2221,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           const row = planPeggingContext.row as WorkOrder;
           // All null-demand consolidated WOs (single or multi-demand) use per-demand accordion; no single woPeggingKey.
           if (row.demand_id == null && (row.consolidated_demand_ids?.length ?? 0) >= 1) return null;
-          // Move WOs always show the component manifest; suppress pegging tree fetch.
-          if (row.method === 'move') return null;
+          // Move and purchase WOs always show the component manifest; suppress pegging tree fetch.
+          if (row.method === 'move' || row.method === 'purchase') return null;
           const isConsolidated = row.demand_id == null;
           const demandPart = isConsolidated ? '' : String(woPeggingActiveDemandId ?? row.demand_id ?? '').trim();
           // start_time is part of the cache key — different lots (same demand/
@@ -10479,7 +10479,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               const row = planPeggingContext.row as WorkOrder;
               // For non-move WOs, skip if this is a native single-demand row (demand_id present = no consolidation accordion needed).
               // Move WOs always proceed so the manifest can render even for singletons.
-              if (row.method !== 'move' && row.demand_id != null) return null;
+              if (row.method !== 'move' && row.method !== 'purchase' && row.demand_id != null) return null;
               // Merge split_details (has per-demand qty) with consolidated_demand_ids
               // (populated for virtual-demand WOs where split_details may be empty).
               const splitDetails = (row.wo_consolidation_split_details ?? [])
@@ -10493,14 +10493,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               const allDemandIds = consolidatedDemandIds.length > 0
                 ? consolidatedDemandIds
                 : (row.demand_id ? [row.demand_id] : []);
-              if (row.method !== 'move' && allDemandIds.length === 0) return null;
-              // Move WOs: show manifest (demand × component × qty).
-              // Synthesize move_components for singleton rows from old plans that predate backend fix.
-              const effectiveMoveComponents = row.move_components ?? (
-                row.method === 'move' && row.product_id
-                  ? [{ product_id: row.product_id, quantity: row.quantity, demand_ids: allDemandIds }]
-                  : null
-              );
+              if (row.method !== 'move' && row.method !== 'purchase' && allDemandIds.length === 0) return null;
+              // Move + purchase WOs: show manifest (demand × component × qty) instead of accordion/pegging.
+              const effectiveMoveComponents: { product_id: string; quantity: number; demand_ids: string[] }[] | null =
+                (row.move_components as { product_id: string; quantity: number; demand_ids: string[] }[] | undefined) ?? (() => {
+                  if (row.method === 'move' && row.product_id) {
+                    return [{ product_id: row.product_id, quantity: row.quantity as number, demand_ids: allDemandIds }];
+                  }
+                  if (row.method === 'purchase' && row.product_id) {
+                    if (splitDetails.length > 0) {
+                      return splitDetails.map((d) => ({ product_id: row.product_id!, quantity: d.allocated_qty, demand_ids: [d.demand_id] }));
+                    }
+                    return [{ product_id: row.product_id, quantity: row.quantity as number, demand_ids: allDemandIds }];
+                  }
+                  return null;
+                })();
               if ((effectiveMoveComponents?.length ?? 0) >= 1) {
                 const comps = effectiveMoveComponents!;
                 const manifestRows: { demand: string; comp: string; qty: number }[] = [];
@@ -10657,8 +10664,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             {planPeggingContext.type === 'work_order' && (() => {
               const row = planPeggingContext.row as WorkOrder;
               // For demand-specific WOs (not consolidated), show a single demand note.
-              // Move WOs show demand info inside the manifest table instead.
-              if (row.demand_id == null || row.method === 'move') return null;
+              // Move and purchase WOs show demand info inside the manifest table instead.
+              if (row.demand_id == null || row.method === 'move' || row.method === 'purchase') return null;
               return (
                 <div style={{ marginBottom: '0.75rem', fontSize: '0.75rem', color: '#a1a1aa' }}>
                   Serving demand: <span style={{ color: '#e4e4e7', fontWeight: 500 }}>{row.demand_id}</span>
@@ -10671,7 +10678,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               if (planPeggingContext.type === 'work_order') {
                 const _row = planPeggingContext.row as WorkOrder;
                 if (_row.demand_id == null && (_row.consolidated_demand_ids?.length ?? 0) >= 1) return null;
-                if (_row.method === 'move') return null;
+                if (_row.method === 'move' || _row.method === 'purchase') return null;
               }
               let tree: PlanningPeggingNode | null = null;
               const isWoPeggingView = planPeggingContext.type === 'work_order';
