@@ -2221,6 +2221,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           const row = planPeggingContext.row as WorkOrder;
           // All null-demand consolidated WOs (single or multi-demand) use per-demand accordion; no single woPeggingKey.
           if (row.demand_id == null && (row.consolidated_demand_ids?.length ?? 0) >= 1) return null;
+          // Move WOs always show the component manifest; suppress pegging tree fetch.
+          if (row.method === 'move') return null;
           const isConsolidated = row.demand_id == null;
           const demandPart = isConsolidated ? '' : String(woPeggingActiveDemandId ?? row.demand_id ?? '').trim();
           // start_time is part of the cache key — different lots (same demand/
@@ -10654,9 +10656,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             })()}
             {planPeggingContext.type === 'work_order' && (() => {
               const row = planPeggingContext.row as WorkOrder;
-              // For demand-specific WOs (not consolidated), show a single demand note
-              // analogous to the consolidated tabs, so the UI is consistent.
-              if (row.demand_id == null) return null;
+              // For demand-specific WOs (not consolidated), show a single demand note.
+              // Move WOs show demand info inside the manifest table instead.
+              if (row.demand_id == null || row.method === 'move') return null;
               return (
                 <div style={{ marginBottom: '0.75rem', fontSize: '0.75rem', color: '#a1a1aa' }}>
                   Serving demand: <span style={{ color: '#e4e4e7', fontWeight: 500 }}>{row.demand_id}</span>
@@ -10664,10 +10666,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               );
             })()}
             {planPeggingContext.type !== 'supply' && (() => {
-              // All null-demand consolidated WOs (single or multi-demand) are handled by the accordion above
+              // All null-demand consolidated WOs (single or multi-demand) are handled by the accordion above.
+              // Move WOs are handled by the manifest table above.
               if (planPeggingContext.type === 'work_order') {
                 const _row = planPeggingContext.row as WorkOrder;
                 if (_row.demand_id == null && (_row.consolidated_demand_ids?.length ?? 0) >= 1) return null;
+                if (_row.method === 'move') return null;
               }
               let tree: PlanningPeggingNode | null = null;
               const isWoPeggingView = planPeggingContext.type === 'work_order';
