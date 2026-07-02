@@ -3248,6 +3248,170 @@ internal data class WaveConsolidationResult(
 )
 
 /**
+ * Post-wave display pass: merge consolidated WOs that share the same calendar bucket but arrived
+ * in different Kahn waves (and were therefore never in the same frontier).
+ *
+ * This is a pure presentation transformation — it only rewrites [WoConsolidation.consolidated]
+ * and remaps [WoConsolidation.native] `consolidated_group_id` pointers.  Pegging trees are
+ * intentionally left untouched; native WO timing was already correctly committed during the wave
+ * loop.
+ *
+ * The merge key mirrors the wave loop's base key plus a calendar bucket dimension:
+ *   make/buy:  (product_id, location_id, method, location_source, bucket)
+ *   move:      ("__move__", location_source, location_id, prod_area, bucket)
+ *
+ * Because bucket boundaries are epoch-rooted and fixed per WO (derived solely from that WO's own
+ * `start_time`), grouping is deterministic and cannot cascade.
+ */
+internal fun crossWaveCalendarMerge(
+    consolidation: WoConsolidation,
+    windowDays: Int,
+    data: Map<String, List<Map<String, Any?>>>,
+    batchScale: String? = null,
+): WoConsolidation {
+    val groups = linkedMapOf<List<Any?>, MutableList<Map<String, Any?>>>()
+    for (row in consolidation.consolidated) {
+        val method = row["method"] as? String ?: continue
+        val lid    = row["location_id"] as? String ?: continue
+        val locSrc = row["location_source"] as? String
+        val start  = parseDate(row["start_time"] as? String) ?: continue
+        val bucket = when {
+            batchScale == "monthly" -> start.year * 12L + start.monthValue
+            windowDays > 0          -> start.toEpochDay() / windowDays
+            else                    -> 0L
+        }
+        val key: List<Any?> = if (method == "move")
+            listOf("__move__", locSrc, lid, row["prod_area"], bucket)
+        else
+            listOf(row["product_id"], lid, method, locSrc, bucket)
+        groups.getOrPut(key) { mutableListOf() }.add(row)
+    }
+
+    val mergedConsolidated = mutableListOf<Map<String, Any?>>()
+    val cgidRemap = mutableMapOf<String, String>()
+
+    for ((_, rows) in groups) {
+        // Fast path: single row — keep as-is.
+        if (rows.size == 1) {
+            mergedConsolidated.add(rows[0])
+            val cgid = rows[0]["consolidated_group_id"] as? String
+            if (cgid != null) cgidRemap[cgid] = cgid
+            continue
+        }
+
+        val first  = rows[0]
+        val method = first["method"] as? String ?: continue
+        val lid    = first["location_id"] as? String ?: continue
+        val pid    = first["product_id"] as? String           // null for move
+        val locSrc = first["location_source"] as? String
+
+        val totalQty   = rows.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
+        val mergedStart = rows.mapNotNull { parseDate(it["start_time"] as? String) }.maxOrNull()
+
+        if (mergedStart == null || totalQty <= 1e-9) {
+            mergedConsolidated.addAll(rows)
+            for (r in rows) { val c = r["consolidated_group_id"] as? String; if (c != null) cgidRemap[c] = c }
+            continue
+        }
+
+        // Lead-time recomputation from merged quantity, matching the wave loop's formula.
+        val leadDays: Double = when {
+            method == "move" -> {
+                // Transit time is route-fixed; derive from any existing row's span.
+                rows.mapNotNull { r ->
+                    val s = parseDate(r["start_time"] as? String)
+                    val e = parseDate(r["end_time"] as? String)
+                    if (s != null && e != null) (e.toEpochDay() - s.toEpochDay()).toDouble() else null
+                }.maxOrNull() ?: 0.0
+            }
+            pid != null -> {
+                val methodRow = getMethods(pid, lid, data).firstOrNull { it["type"] == method }
+                val lotSize   = (maxLotSize(pid, lid, data)?.takeIf { it > 0 } ?: totalQty).coerceAtLeast(1e-9)
+                val lotCount  = Math.ceil(totalQty / lotSize).toInt().coerceAtLeast(1)
+                val cap       = if (method == "make") OperationLookup.parallelismCap(pid, lid, data).coerceAtLeast(1) else Int.MAX_VALUE
+                val numWaves  = Math.ceil(lotCount.toDouble() / cap.toDouble()).toInt().coerceAtLeast(1)
+                val perWave   = methodRow?.let { leadDaysForMethod(it, pid, lid, totalQty, data) }
+                    ?: rows.mapNotNull { r ->
+                        val s = parseDate(r["start_time"] as? String)
+                        val e = parseDate(r["end_time"]   as? String)
+                        val wc = (r["wave_count"] as? Number)?.toInt()?.coerceAtLeast(1) ?: 1
+                        if (s != null && e != null) (e.toEpochDay() - s.toEpochDay()).toDouble() / wc else null
+                    }.maxOrNull() ?: 0.0
+                numWaves * perWave
+            }
+            else -> 0.0
+        }
+        val mergedEnd = dateAddDays(mergedStart, leadDays) ?: mergedStart
+
+        // Merge competing demands + split details from all constituent rows.
+        @Suppress("UNCHECKED_CAST")
+        val allDemands = rows.flatMap { (it["wo_competing_demands"] as? List<String>) ?: emptyList() }.distinct()
+        @Suppress("UNCHECKED_CAST")
+        val mergedSplit = rows.flatMap { (it["consolidation_split_details"] as? List<Map<String, Any?>>) ?: emptyList() }
+            .groupBy { it["demand_id"] as? String }
+            .map { (d, es) -> mapOf("demand_id" to d, "allocated_qty" to es.sumOf { (it["allocated_qty"] as? Number)?.toDouble() ?: 0.0 }) }
+        val overrideActive = rows.any { it["override_active"] == true }
+
+        val newCgid = rows[0]["consolidated_group_id"] as? String ?: nextWoGroupId()
+        for (r in rows) { val c = r["consolidated_group_id"] as? String; if (c != null) cgidRemap[c] = newCgid }
+
+        val lotCount = if (method != "move" && pid != null) {
+            val lotSize = (maxLotSize(pid, lid, data)?.takeIf { it > 0 } ?: totalQty).coerceAtLeast(1e-9)
+            Math.ceil(totalQty / lotSize).toInt().coerceAtLeast(1)
+        } else rows.sumOf { (it["lot_count"] as? Number)?.toInt() ?: 1 }
+
+        val mergedRow = buildMap<String, Any?> {
+            put("product_id", pid)
+            put("location_id", lid)
+            put("quantity", totalQty)
+            put("start_time", formatDate(mergedStart))
+            put("end_time", formatDate(mergedEnd))
+            put("method", method)
+            put("location_source", locSrc)
+            put("demand_id", null)
+            put("prod_area", first["prod_area"])
+            put("override_active", overrideActive)
+            put("wo_group_id", newCgid)
+            put("consolidated_group_id", newCgid)
+            put("wave_index", 0)
+            put("lot_count", lotCount)
+            if (pid != null) maxLotSize(pid, lid, data)?.let { put("max_lot_size", it) }
+            put("consolidated", true)
+            put("wo_competing_demands", allDemands)
+            put("consolidation_split_details", mergedSplit)
+            put("consolidated_demand_ids", allDemands)
+            put("wo_window_start", formatDate(mergedStart))
+            put("wo_window_end", formatDate(mergedStart))
+            put("wo_consolidation_total_planned", totalQty)
+            if (method == "move") {
+                @Suppress("UNCHECKED_CAST")
+                val moveComponents = rows.flatMap { (it["move_components"] as? List<Map<String, Any?>>) ?: emptyList() }
+                    .groupBy { it["product_id"] as? String }
+                    .map { (p, comps) -> mapOf(
+                        "product_id" to p,
+                        "quantity"   to comps.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 },
+                        "demand_ids" to comps.flatMap {
+                            @Suppress("UNCHECKED_CAST")
+                            (it["demand_ids"] as? List<String>) ?: emptyList()
+                        }.distinct(),
+                    ) }.sortedBy { it["product_id"] as? String ?: "" }
+                put("move_components", moveComponents)
+            }
+        }
+        mergedConsolidated.add(mergedRow)
+    }
+
+    // Remap native rows' consolidated_group_id to their new canonical cgid.
+    val remappedNative = consolidation.native.map { row ->
+        val cgid = row["consolidated_group_id"] as? String
+        val newCgid = cgid?.let { cgidRemap[it] } ?: cgid
+        if (newCgid == cgid) row else row + mapOf("consolidated_group_id" to newCgid)
+    }
+
+    return WoConsolidation(mergedConsolidated, remappedNative)
+}
+
+/**
  * Bottom-up, level-synchronous WO consolidation + timing propagation. Replaces the old
  * consolidate-once-then-patch design (`consolidateFromPegging` + `readjustConsolidatedWoTiming`):
  * that design bucketed every WO once using its native, pre-correction start_time, then pushed
@@ -3273,6 +3437,7 @@ internal fun consolidateByWaves(
     peggingTrees: List<Map<String, Any?>>,
     data: Map<String, List<Map<String, Any?>>>,
     windowDays: Int,
+    batchScale: String? = null,
 ): WaveConsolidationResult {
     data class Occurrence(
         val gid: String,                 // internal identity (real wo_group_id, or synthetic) — bucketing/dependency graph only
@@ -3557,10 +3722,14 @@ internal fun consolidateByWaves(
             for (gid in gids) {
                 val info = gidInfo.getValue(gid)
                 val start = info.nativeStart ?: pendingStart[gid]!!
-                // Calendar bucket: floor(nativeStart / windowDays). Each WO's bucket is
-                // determined solely by its own planned start — no dependency on other WOs'
-                // durations or ordering. windowDays <= 0 collapses all into bucket 0.
-                val bucket = if (windowDays > 0) start.toEpochDay() / windowDays else 0L
+                // Calendar bucket per planned start. "monthly" uses calendar year×month so every
+                // WO in the same month always shares a bucket regardless of epoch alignment.
+                // Epoch-day division is used for weekly/biweekly; 0 collapses to one bucket ("all").
+                val bucket = when {
+                    batchScale == "monthly" -> start.year * 12L + start.monthValue
+                    windowDays > 0          -> start.toEpochDay() / windowDays
+                    else                    -> 0L
+                }
                 buckets.getOrPut(baseKey + listOf(bucket)) { mutableListOf() }.add(gid)
             }
         }
@@ -4624,9 +4793,11 @@ fun runPlanning(
             else -> (consolidationCfg?.get("wo_window_days") as? Number)?.toInt()
                         ?: consolidationConfig.periodDays
         }
-        val r = consolidateByWaves(reconciledTrees, data, windowDays)
-        log.info("Pass 2 cross-demand WO batch (window={}d): {} native → {} consolidated work orders", windowDays, r.consolidation.native.size, r.consolidation.consolidated.size)
-        r
+        val r = consolidateByWaves(reconciledTrees, data, windowDays, batchScale)
+        val merged = crossWaveCalendarMerge(r.consolidation, windowDays, data, batchScale)
+        log.info("Pass 2 cross-demand WO batch (window={}d): {} native → {} consolidated → {} after cross-wave merge",
+            windowDays, r.consolidation.native.size, r.consolidation.consolidated.size, merged.consolidated.size)
+        WaveConsolidationResult(r.peggingTrees, merged)
     } else {
         val nodeLevelWos = flattenPeggingToWorkOrders(reconciledTrees, data)
             .map { it + ("consolidated_group_id" to it["wo_group_id"]) }
