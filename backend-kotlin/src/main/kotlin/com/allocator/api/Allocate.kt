@@ -3083,6 +3083,12 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
                 "priority_first" -> "priority_first"
                 else             -> "fair"
             })
+            // Per-type WO batch scales — persist when present so reloading a run restores what was run.
+            val validScales = setOf("none", "weekly", "biweekly", "monthly", "all")
+            listOf("wo_batch_scale", "make_batch_scale", "move_batch_scale", "purchase_batch_scale").forEach { key ->
+                val v = consolidation[key]?.toString()
+                if (v != null && v in validScales) put(key, v)
+            }
         }
     }
 }

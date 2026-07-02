@@ -3247,6 +3247,29 @@ internal data class WaveConsolidationResult(
     val consolidation: WoConsolidation,
 )
 
+internal data class WoBatchConfig(
+    val make: String?,
+    val move: String?,
+    val purchase: String?,
+    val legacyWindowDays: Int = 0,
+) {
+    fun scaleFor(method: String?): String? = when (method) {
+        "make"     -> make
+        "move"     -> move
+        "purchase" -> purchase
+        else       -> make
+    }
+}
+
+private fun calendarBucket(start: LocalDate, scale: String?, windowDays: Int): Long = when {
+    scale == "monthly"  -> start.year * 12L + start.monthValue
+    scale == "all"      -> 0L
+    scale == "weekly"   -> start.toEpochDay() / 7
+    scale == "biweekly" -> start.toEpochDay() / 14
+    windowDays > 0      -> start.toEpochDay() / windowDays
+    else                -> 0L
+}
+
 /**
  * Post-wave display pass: merge consolidated WOs that share the same calendar bucket but arrived
  * in different Kahn waves (and were therefore never in the same frontier).
@@ -3267,19 +3290,19 @@ internal fun crossWaveCalendarMerge(
     consolidation: WoConsolidation,
     windowDays: Int,
     data: Map<String, List<Map<String, Any?>>>,
-    batchScale: String? = null,
+    woBatchConfig: WoBatchConfig? = null,
 ): WoConsolidation {
     val groups = linkedMapOf<List<Any?>, MutableList<Map<String, Any?>>>()
+    val nonePassthrough = mutableListOf<Map<String, Any?>>()
     for (row in consolidation.consolidated) {
         val method = row["method"] as? String ?: continue
         val lid    = row["location_id"] as? String ?: continue
         val locSrc = row["location_source"] as? String
         val start  = parseDate(row["start_time"] as? String) ?: continue
-        val bucket = when {
-            batchScale == "monthly" -> start.year * 12L + start.monthValue
-            windowDays > 0          -> start.toEpochDay() / windowDays
-            else                    -> 0L
-        }
+        val methodScale = woBatchConfig?.scaleFor(method)
+        if (methodScale == "none") { nonePassthrough.add(row); continue }
+        val wd = woBatchConfig?.legacyWindowDays ?: windowDays
+        val bucket = calendarBucket(start, methodScale, wd)
         val key: List<Any?> = if (method == "move")
             listOf("__move__", locSrc, lid, row["prod_area"], bucket)
         else
@@ -3289,6 +3312,11 @@ internal fun crossWaveCalendarMerge(
 
     val mergedConsolidated = mutableListOf<Map<String, Any?>>()
     val cgidRemap = mutableMapOf<String, String>()
+    for (row in nonePassthrough) {
+        mergedConsolidated.add(row)
+        val cgid = row["consolidated_group_id"] as? String
+        if (cgid != null) cgidRemap[cgid] = cgid
+    }
 
     for ((_, rows) in groups) {
         // Fast path: single row — keep as-is.
@@ -3437,7 +3465,7 @@ internal fun consolidateByWaves(
     peggingTrees: List<Map<String, Any?>>,
     data: Map<String, List<Map<String, Any?>>>,
     windowDays: Int,
-    batchScale: String? = null,
+    woBatchConfig: WoBatchConfig? = null,
 ): WaveConsolidationResult {
     data class Occurrence(
         val gid: String,                 // internal identity (real wo_group_id, or synthetic) — bucketing/dependency graph only
@@ -3722,15 +3750,13 @@ internal fun consolidateByWaves(
             for (gid in gids) {
                 val info = gidInfo.getValue(gid)
                 val start = info.nativeStart ?: pendingStart[gid]!!
-                // Calendar bucket per planned start. "monthly" uses calendar year×month so every
-                // WO in the same month always shares a bucket regardless of epoch alignment.
-                // Epoch-day division is used for weekly/biweekly; 0 collapses to one bucket ("all").
-                val bucket = when {
-                    batchScale == "monthly" -> start.year * 12L + start.monthValue
-                    windowDays > 0          -> start.toEpochDay() / windowDays
-                    else                    -> 0L
-                }
-                buckets.getOrPut(baseKey + listOf(bucket)) { mutableListOf() }.add(gid)
+                val methodScale = woBatchConfig?.scaleFor(info.method)
+                val wd = woBatchConfig?.legacyWindowDays ?: windowDays
+                val effectiveBucketKey: List<Any?> = if (methodScale == "none")
+                    baseKey + listOf("__none__", gid)  // singleton — never merges with any peer
+                else
+                    baseKey + listOf(calendarBucket(start, methodScale, wd))
+                buckets.getOrPut(effectiveBucketKey) { mutableListOf() }.add(gid)
             }
         }
 
@@ -4780,23 +4806,27 @@ fun runPlanning(
     // wo_group_id so the downstream capacity-patch step below applies uniformly either way.
     @Suppress("UNCHECKED_CAST")
     val consolidationCfg = config?.get("consolidation") as? Map<String, Any?>
-    val batchScale = consolidationCfg?.get("wo_batch_scale")?.toString()
+    val globalScale = consolidationCfg?.get("wo_batch_scale")?.toString()
+    val makeBatchScale     = (consolidationCfg?.get("make_batch_scale")?.toString() ?: globalScale) ?: "weekly"
+    val moveBatchScale     = (consolidationCfg?.get("move_batch_scale")?.toString() ?: globalScale) ?: "weekly"
+    val purchaseBatchScale = (consolidationCfg?.get("purchase_batch_scale")?.toString() ?: globalScale) ?: "weekly"
     val consolidateWos = consolidationConfig.enabled
         && consolidationCfg?.get("consolidate_wos") != false
-        && batchScale != "none"
+        && listOf(makeBatchScale, moveBatchScale, purchaseBatchScale).any { it != "none" }
     val waveResult = if (consolidateWos) {
-        val windowDays = when (batchScale) {
-            "weekly"   -> 7
-            "biweekly" -> 14
-            "monthly"  -> 30
-            "all"      -> 0
-            else -> (consolidationCfg?.get("wo_window_days") as? Number)?.toInt()
-                        ?: consolidationConfig.periodDays
-        }
-        val r = consolidateByWaves(reconciledTrees, data, windowDays, batchScale)
-        val merged = crossWaveCalendarMerge(r.consolidation, windowDays, data, batchScale)
-        log.info("Pass 2 cross-demand WO batch (window={}d): {} native → {} consolidated → {} after cross-wave merge",
-            windowDays, r.consolidation.native.size, r.consolidation.consolidated.size, merged.consolidated.size)
+        val legacyWindowDays = (consolidationCfg?.get("wo_window_days") as? Number)?.toInt()
+            ?: consolidationConfig.periodDays
+        val woBatchConfig = WoBatchConfig(
+            make     = makeBatchScale,
+            move     = moveBatchScale,
+            purchase = purchaseBatchScale,
+            legacyWindowDays = legacyWindowDays,
+        )
+        val r = consolidateByWaves(reconciledTrees, data, legacyWindowDays, woBatchConfig)
+        val merged = crossWaveCalendarMerge(r.consolidation, legacyWindowDays, data, woBatchConfig)
+        log.info("Pass 2 WO batch (make={} move={} purchase={}): {} native → {} consolidated → {} after cross-wave merge",
+            makeBatchScale, moveBatchScale, purchaseBatchScale,
+            r.consolidation.native.size, r.consolidation.consolidated.size, merged.consolidated.size)
         WaveConsolidationResult(r.peggingTrees, merged)
     } else {
         val nodeLevelWos = flattenPeggingToWorkOrders(reconciledTrees, data)
@@ -5266,11 +5296,15 @@ internal fun verifyInventoryPriority(
     }
     if (leftoverBySupply.isEmpty()) return emptyList()
 
-    // Earliest WO start_time per component (pid|lid). Skip zero-qty and failed WOs.
+    // Earliest WO start_time per component (pid|lid). Skip zero-qty, failed, and move WOs.
+    // Move WOs deliver supply to location_id (they create, not consume, inventory there), so they
+    // are irrelevant to the inventory-priority check: leftover stock at the destination does not
+    // imply the move was unnecessary — it may have been needed for a different downstream demand.
     val woEarliestStart = mutableMapOf<String, java.time.LocalDate>()
     for (wo in workOrders) {
         val pid = (wo["product_id"] as? String)?.trim() ?: continue
         val lid = (wo["location_id"] as? String)?.trim() ?: continue
+        if (wo["method"] == "move") continue
         if ((wo["quantity"] as? Number)?.toDouble() ?: 0.0 <= 0.0) continue
         if (wo["failed"] == true) continue
         val start = (wo["start_time"] as? String)?.let {

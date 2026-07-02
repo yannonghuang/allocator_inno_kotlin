@@ -1097,6 +1097,21 @@ function buildWoMaps(pegging: PlanningPeggingEntry[]): {
   return { suppliesMap, crossEntrySupplyMap, peggedQtyMap };
 }
 
+function normalizePlanningConfig(cfg: PlanningConfig): PlanningConfig {
+  const cs = cfg.consolidation;
+  if (!cs) return cfg;
+  const globalFb = cs.wo_batch_scale ?? 'weekly';
+  return {
+    ...cfg,
+    consolidation: {
+      ...cs,
+      make_batch_scale:     cs.make_batch_scale     ?? globalFb,
+      move_batch_scale:     cs.move_batch_scale     ?? globalFb,
+      purchase_batch_scale: cs.purchase_batch_scale ?? globalFb,
+    },
+  };
+}
+
 export function CaseDetail({ section: sectionProp = 'planning', subsection }: { section?: string; subsection?: string }) {
   const tNav = useTranslations('nav');
   const tSec = useTranslations('sections');
@@ -1350,7 +1365,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // Buyable raw materials for the selective-purchase whitelist dropdown + copilot /raw picker.
   const [purchasableOptions, setPurchasableOptions] = useState<PurchasableRawMaterial[]>([]);
   const [constraintOptions, setConstraintOptions] = useState<ConstraintOptions>({ customers: [], parents: [] });
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 7, wo_batch_scale: 'weekly' }, purchase_allowed: false, purchasable_materials: [], constraints: [], analyze_criticality: false, check_soundness: true, enable_global_scheduling: true });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' }, purchase_allowed: false, purchasable_materials: [], constraints: [], analyze_criticality: false, check_soundness: true, enable_global_scheduling: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1451,8 +1466,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (Number(ms.depth) !== 1) diffs.push(`depth: 1 → ${ms.depth}`);
     if (ms.max_bom_depth != null && Number(ms.max_bom_depth) !== 3) diffs.push(`max_bom_depth: 3 → ${ms.max_bom_depth}`);
     const defaultScale = 'weekly';
-    const curScale = (cs.wo_batch_scale as string) ?? defaultScale;
-    if (curScale !== defaultScale) diffs.push(`WO batch: weekly → ${curScale}`);
+    const globalFb = (cs.wo_batch_scale as string) ?? defaultScale;
+    (['make', 'move', 'purchase'] as const).forEach((k) => {
+      const cur = ((cs as Record<string, unknown>)[`${k}_batch_scale`] as string) ?? globalFb;
+      if (cur !== defaultScale) diffs.push(`${k}-batch: weekly → ${cur}`);
+    });
     if (config.purchase_allowed === true) diffs.push(`purchase: off → on`);
     return diffs.join(' · ');
   };
@@ -1476,8 +1494,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       parts.push(`w=(${Number(sw.commit_time ?? 0)}, ${Number(sw.inventory_consumed ?? 0)}, ${Number(sw.purchase ?? 0)})`);
     }
     parts.push(`wo_batch=${cs.enabled === false ? 'off' : 'on'}`);
-    const scl = (cs.wo_batch_scale as string) ?? 'weekly';
-    parts.push(`batch=${scl}`);
+    const globalFb = (cs.wo_batch_scale as string) ?? 'weekly';
+    const mScale  = ((cs as Record<string, unknown>).make_batch_scale as string) ?? globalFb;
+    const mvScale = ((cs as Record<string, unknown>).move_batch_scale as string) ?? globalFb;
+    const pScale  = ((cs as Record<string, unknown>).purchase_batch_scale as string) ?? globalFb;
+    parts.push(`batch=${mScale}/${mvScale}/${pScale}`);
     parts.push(`purch=${config.purchase_allowed === true ? 'on' : 'off'}`);
     return parts.join(' · ');
   };
@@ -1493,7 +1514,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     consolidation: {
       enabled: true,
       period_days: 7,
-      wo_batch_scale: 'weekly',
+      make_batch_scale: 'weekly',
+      move_batch_scale: 'weekly',
+      purchase_batch_scale: 'weekly',
     },
     variant_selection: { multiple: true },
     purchase_allowed: false,
@@ -1513,10 +1536,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       case 'depth':               ms.depth = value; break;
       case 'scope':               cs.scope = value; break;
       case 'consolidation_enabled': cs.enabled = value; break;
-      case 'period_days':
+      case 'period_days': {
         cs.period_days = value;
-        cs.wo_batch_scale = value === 0 ? 'all' : value === 7 ? 'weekly' : value === 14 ? 'biweekly' : 'monthly';
+        const snapped = value === 0 ? 'all' : value === 7 ? 'weekly' : value === 14 ? 'biweekly' : 'monthly';
+        (cs as Record<string, unknown>).make_batch_scale = snapped;
+        (cs as Record<string, unknown>).move_batch_scale = snapped;
+        (cs as Record<string, unknown>).purchase_batch_scale = snapped;
         break;
+      }
       case 'purchase_allowed':    cfg.purchase_allowed = value; break;
       case 'mode':
         ms.mode = value;
@@ -1759,13 +1786,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 if (full.config) {
                   const cfg = full.config as PlanningConfig;
                   const chosen = full.chosen_depth ?? null;
-                  setPlanningConfig({
+                  setPlanningConfig(normalizePlanningConfig({
                     ...cfg,
                     method_selection: {
                       ...cfg.method_selection,
                       depth: chosen ?? cfg.method_selection?.depth ?? 1,
                     },
-                  });
+                  }));
                 }
                 listPlanRuns(id).then(setPlanRunHistory).catch(() => { /* ignore */ });
               } catch {
@@ -2496,13 +2523,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         if (full.config) {
           const cfg = full.config as PlanningConfig;
           const chosenDepth = full.chosen_depth ?? null;
-          setPlanningConfig({
+          setPlanningConfig(normalizePlanningConfig({
             ...cfg,
             method_selection: {
               ...cfg.method_selection,
               depth: chosenDepth ?? cfg.method_selection?.depth ?? 1,
             },
-          });
+          }));
         }
         restoreCriticality(chosen.id);
       }
@@ -4006,13 +4033,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           // whatever depth was in the saved config snapshot.
           const cfg = full.config as PlanningConfig;
           const chosen = full.chosen_depth ?? null;
-          setPlanningConfig({
+          setPlanningConfig(normalizePlanningConfig({
             ...cfg,
             method_selection: {
               ...cfg.method_selection,
               depth: chosen ?? 1,
             },
-          });
+          }));
         }
         setPlanRunHistoryOpen(false);
       }
@@ -5000,28 +5027,39 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
               {tP('config.groupPostPlan')}
             </legend>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
-              <label
-                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }}
-                title={tP('config.woBatchScaleTooltip')}
-              >
-                <span style={{ color: '#a1a1aa' }}>{tP('config.woBatchScale')}</span>
-                <select
-                  value={planningConfig.consolidation?.wo_batch_scale ?? 'weekly'}
-                  onChange={(e) => {
-                    const v = e.target.value as 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
-                    const days = v === 'weekly' ? 7 : v === 'biweekly' ? 14 : v === 'monthly' ? 30 : 0;
-                    setPlanningConfig((c) => ({ ...c, consolidation: { ...c.consolidation, wo_batch_scale: v, period_days: days } }));
-                  }}
-                  style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
-                >
-                  <option value="none">{tP('config.woBatchNone')}</option>
-                  <option value="weekly">{tP('config.woBatchWeekly')}</option>
-                  <option value="biweekly">{tP('config.woBatchBiweekly')}</option>
-                  <option value="monthly">{tP('config.woBatchMonthly')}</option>
-                  <option value="all">{tP('config.woBatchAll')}</option>
-                </select>
-              </label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '1.25rem', flexWrap: 'wrap' }}>
+              {/* WO batch scales — grouped visually */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', padding: '4px 10px', border: '1px solid #3f3f46', borderRadius: 5 }}>
+                {(['make', 'move', 'purchase'] as const).map((type) => {
+                  const configKey = `${type}_batch_scale` as 'make_batch_scale' | 'move_batch_scale' | 'purchase_batch_scale';
+                  const labelKey = `woBatch${type.charAt(0).toUpperCase() + type.slice(1)}` as 'woBatchMake' | 'woBatchMove' | 'woBatchPurchase';
+                  const globalFb = planningConfig.consolidation?.wo_batch_scale ?? 'weekly';
+                  const val = (planningConfig.consolidation?.[configKey] ?? globalFb) as string;
+                  return (
+                    <label key={type}
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.875rem' }}
+                      title={tP('config.woBatchScaleTooltip')}
+                    >
+                      <span style={{ color: '#a1a1aa' }}>{tP(`config.${labelKey}`)}</span>
+                      <select
+                        value={val}
+                        onChange={(e) => {
+                          const v = e.target.value as 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
+                          const days = v === 'weekly' ? 7 : v === 'biweekly' ? 14 : v === 'monthly' ? 30 : 0;
+                          setPlanningConfig((c) => ({ ...c, consolidation: { ...c.consolidation, [configKey]: v, period_days: days } }));
+                        }}
+                        style={{ padding: '3px 4px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+                      >
+                        <option value="none">{tP('config.woBatchNone')}</option>
+                        <option value="weekly">{tP('config.woBatchWeekly')}</option>
+                        <option value="biweekly">{tP('config.woBatchBiweekly')}</option>
+                        <option value="monthly">{tP('config.woBatchMonthly')}</option>
+                        <option value="all">{tP('config.woBatchAll')}</option>
+                      </select>
+                    </label>
+                  );
+                })}
+              </div>
               <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
                 <input
                   type="checkbox"
@@ -5094,7 +5132,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               },
               purchase_allowed: false,
               constraints: [],
-              consolidation: { enabled: true, period_days: 7, wo_batch_scale: 'weekly' },
+              consolidation: { enabled: true, period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' },
             })}
             title={tP('config.resetDefaultsTitle')}
             style={{ padding: '6px 12px' }}
@@ -8149,28 +8187,36 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                     <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editPurchase')}</span>
                                   </label>
                                 </div>
-                                {/* Consolidation (WO batch window) */}
+                                {/* Consolidation (WO batch window per type) */}
                                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'center', fontSize: '0.78rem', marginBottom: 6 }}>
-                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                                    <span style={{ color: '#a1a1aa' }}>{tP('config.woBatchScale')}</span>
-                                    <select
-                                      value={(cs.wo_batch_scale as string) ?? 'weekly'}
-                                      onChange={(e) => updateConfig((c) => {
-                                        const v = e.target.value as 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
-                                        const days = v === 'weekly' ? 7 : v === 'biweekly' ? 14 : v === 'monthly' ? 30 : 0;
-                                        const con = (c.consolidation ?? {}) as Record<string, unknown>;
-                                        con.wo_batch_scale = v;
-                                        con.period_days = days;
-                                        c.consolidation = con;
-                                      })}
-                                      style={{ ...inputStyle }}>
-                                      <option value="none">{tP('config.woBatchNone')}</option>
-                                      <option value="weekly">{tP('config.woBatchWeekly')}</option>
-                                      <option value="biweekly">{tP('config.woBatchBiweekly')}</option>
-                                      <option value="monthly">{tP('config.woBatchMonthly')}</option>
-                                      <option value="all">{tP('config.woBatchAll')}</option>
-                                    </select>
-                                  </label>
+                                  {(['make', 'move', 'purchase'] as const).map((type) => {
+                                    const configKey = `${type}_batch_scale`;
+                                    const labelKey = `woBatch${type.charAt(0).toUpperCase() + type.slice(1)}` as 'woBatchMake' | 'woBatchMove' | 'woBatchPurchase';
+                                    const globalFb = (cs.wo_batch_scale as string) ?? 'weekly';
+                                    const val = ((cs as Record<string, unknown>)[configKey] as string) ?? globalFb;
+                                    return (
+                                      <label key={type} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                        <span style={{ color: '#a1a1aa' }}>{tP(`config.${labelKey}`)}</span>
+                                        <select
+                                          value={val}
+                                          onChange={(e) => updateConfig((c) => {
+                                            const v = e.target.value as 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
+                                            const days = v === 'weekly' ? 7 : v === 'biweekly' ? 14 : v === 'monthly' ? 30 : 0;
+                                            const con = (c.consolidation ?? {}) as Record<string, unknown>;
+                                            con[configKey] = v;
+                                            con.period_days = days;
+                                            c.consolidation = con;
+                                          })}
+                                          style={{ ...inputStyle }}>
+                                          <option value="none">{tP('config.woBatchNone')}</option>
+                                          <option value="weekly">{tP('config.woBatchWeekly')}</option>
+                                          <option value="biweekly">{tP('config.woBatchBiweekly')}</option>
+                                          <option value="monthly">{tP('config.woBatchMonthly')}</option>
+                                          <option value="all">{tP('config.woBatchAll')}</option>
+                                        </select>
+                                      </label>
+                                    );
+                                  })}
                                 </div>
                                 {isEdited && (
                                   <div style={{ marginTop: 6 }}>
@@ -9608,7 +9654,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 ) : (
                   (() => {
                     // Share = qty consumed from this lot / lot initial qty — fraction of the lot used.
-                    const lotInitialQty = Number(supExplainRow.initialQty) || 0;
+                    const lotInitialQty = Number(supExplainRow.qty) || 0;
                     // Build enriched rows so we can sort/filter uniformly
                     const enriched = supExplainRow.peggedDemands.map((d) => {
                       const demandRow = planResult?.committed_demands.find((cd) => cd.demand_id === d.demandId);
@@ -9884,9 +9930,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <strong>{tP('copilot.purchase')}</strong> {planningConfig.purchase_allowed === false ? tP('copilot.disabled') : tP('copilot.allowed')}.{' '}
                 <strong>{tP('copilot.consolidation')}</strong> {planningConfig.consolidation?.enabled === true
                   ? (() => {
-                      const scl = planningConfig.consolidation.wo_batch_scale ?? 'weekly';
+                      const gfb = planningConfig.consolidation.wo_batch_scale ?? 'weekly';
                       const keyMap: Record<string, string> = { none: 'woBatchNone', weekly: 'woBatchWeekly', biweekly: 'woBatchBiweekly', monthly: 'woBatchMonthly', all: 'woBatchAll' };
-                      return tP('copilot.consolidationOnDetail', { scale: tP(`config.${keyMap[scl] ?? 'woBatchWeekly'}`) });
+                      const label = (k: 'make' | 'move' | 'purchase') => {
+                        const scl = (planningConfig.consolidation?.[`${k}_batch_scale`] ?? gfb) as string;
+                        return tP(`config.${keyMap[scl] ?? 'woBatchWeekly'}`);
+                      };
+                      return tP('copilot.consolidationOnDetail', { scale: `make:${label('make')} move:${label('move')} buy:${label('purchase')}` });
                     })()
                   : tP('copilot.off')}. {tP('copilot.naturalLangInfo')}
               </p>
