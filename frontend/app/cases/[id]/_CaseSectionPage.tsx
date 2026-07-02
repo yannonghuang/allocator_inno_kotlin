@@ -10483,16 +10483,20 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               const splitDetails = (row.wo_consolidation_split_details ?? [])
                 .filter((d) => !!d.demand_id && d.demand_id !== '') as Array<{ demand_id: string; allocated_qty: number }>;
               const splitIds = new Set(splitDetails.map((d) => d.demand_id));
-              const allDemandIds = [
+              const consolidatedDemandIds = [
                 ...splitDetails.map((d) => d.demand_id),
                 ...(row.consolidated_demand_ids ?? []).filter((d) => !!d && d !== '' && !splitIds.has(d)),
               ];
-              if (allDemandIds.length === 0) return null;
+              // For singleton move WOs, demand_id is set directly; split_details/consolidated_demand_ids are absent.
+              const allDemandIds = consolidatedDemandIds.length > 0
+                ? consolidatedDemandIds
+                : (row.demand_id ? [row.demand_id] : []);
+              if (row.method !== 'move' && allDemandIds.length === 0) return null;
               // Move WOs: show manifest (demand × component × qty).
               // Synthesize move_components for singleton rows from old plans that predate backend fix.
               const effectiveMoveComponents = row.move_components ?? (
                 row.method === 'move' && row.product_id
-                  ? [{ product_id: row.product_id, quantity: row.quantity, demand_ids: row.demand_id ? [row.demand_id] : allDemandIds }]
+                  ? [{ product_id: row.product_id, quantity: row.quantity, demand_ids: allDemandIds }]
                   : null
               );
               if ((effectiveMoveComponents?.length ?? 0) >= 1) {
