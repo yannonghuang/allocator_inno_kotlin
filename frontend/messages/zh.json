@@ -577,9 +577,14 @@
         "demand": "需求",
         "shortage": "缺口",
         "locationSource": "地点来源",
-        "pegging": "追溯",
+        "pegging": "详情",
         "explain": "解释",
         "override": "覆盖"
+      },
+      "moveManifest": {
+        "demand": "需求",
+        "component": "物料",
+        "qty": "数量"
       },
       "scheduleHorizon": {
         "weekly": "周",

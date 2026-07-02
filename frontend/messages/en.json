@@ -577,9 +577,14 @@
         "demand": "Demand",
         "shortage": "Shortage",
         "locationSource": "Location source",
-        "pegging": "Pegging",
+        "pegging": "Detail",
         "explain": "Explain",
         "override": "Override"
+      },
+      "moveManifest": {
+        "demand": "Demand",
+        "component": "Component",
+        "qty": "Qty"
       },
       "scheduleHorizon": {
         "weekly": "Weekly",
