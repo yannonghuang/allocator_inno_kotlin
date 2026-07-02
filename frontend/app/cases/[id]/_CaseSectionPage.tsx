@@ -10475,7 +10475,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             })()}
             {planPeggingContext.type === 'work_order' && (() => {
               const row = planPeggingContext.row as WorkOrder;
-              if (row.demand_id != null) return null;
+              // For non-move WOs, skip if this is a native single-demand row (demand_id present = no consolidation accordion needed).
+              // Move WOs always proceed so the manifest can render even for singletons.
+              if (row.method !== 'move' && row.demand_id != null) return null;
               // Merge split_details (has per-demand qty) with consolidated_demand_ids
               // (populated for virtual-demand WOs where split_details may be empty).
               const splitDetails = (row.wo_consolidation_split_details ?? [])
