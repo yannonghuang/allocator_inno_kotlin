@@ -6291,7 +6291,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               colorOverride={colorOverride}
                               consolidated={r.consolidated}
                               segments={r._segments}
-                              onClick={() => setWoPegHighlightRow(isSelf ? null : r)}
+                              onClick={() => woTableTab === 'native' ? setWoPegHighlightRow(isSelf ? null : r) : undefined}
                             />
                           );
                         },
@@ -6368,7 +6368,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           setPlanPeggingContext({ type: 'demand', row: demandRow });
                           setPlanPeggingOpen(true);
                           setWoPeggingRowKey(demandKey);
-                          setWoPegHighlightRow(r);
+                          if (woTableTab === 'native') setWoPegHighlightRow(r);
                         };
                         const linkStyle: React.CSSProperties = { background: 'none', border: 'none', padding: 0, color: '#60a5fa', cursor: 'pointer', textDecoration: 'underline', fontSize: 'inherit', fontFamily: 'inherit' };
                         if (ids.length === 1) {
@@ -6413,7 +6413,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             onClick={(e) => {
                               e.stopPropagation();
                               if (isPeggingActive) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setPreviousManifestWoRow(null); setWoPegHighlightRow(null); }
-                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setPreviousManifestWoRow(null); setWoPegHighlightRow(r); }
+                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setPreviousManifestWoRow(null); if (woTableTab === 'native') setWoPegHighlightRow(r); }
                             }}
                           >{tc('show')}</button>
                         );
