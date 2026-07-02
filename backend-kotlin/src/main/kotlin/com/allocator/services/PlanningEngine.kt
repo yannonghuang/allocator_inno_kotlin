@@ -3625,6 +3625,11 @@ internal fun consolidateByWaves(
         put("wave_index", 0)
         if (info.method == "move") {
             put("lot_count", 1)
+            put("move_components", listOf(mapOf(
+                "product_id" to info.pid,
+                "quantity"   to info.totalQty,
+                "demand_ids" to info.demandQty.keys.toList(),
+            )))
         } else {
             val lotSize = (maxLotSize(info.pid, info.lid, data)?.takeIf { it > 0 } ?: info.totalQty).coerceAtLeast(1e-9)
             put("lot_count", Math.ceil(info.totalQty / lotSize).toInt().coerceAtLeast(1))
