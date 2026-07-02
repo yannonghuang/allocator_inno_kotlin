@@ -586,7 +586,8 @@
         "component": "物料",
         "qty": "数量",
         "footerDemands": "个需求",
-        "footerComponents": "种物料"
+        "footerComponents": "种物料",
+        "backToManifest": "返回清单"
       },
       "scheduleHorizon": {
         "weekly": "周",

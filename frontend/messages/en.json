@@ -586,7 +586,8 @@
         "component": "Component",
         "qty": "Qty",
         "footerDemands": "demands",
-        "footerComponents": "components"
+        "footerComponents": "components",
+        "backToManifest": "Back to manifest"
       },
       "scheduleHorizon": {
         "weekly": "Weekly",

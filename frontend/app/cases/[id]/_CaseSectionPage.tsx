@@ -1242,6 +1242,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // whenever the planPegging slide-in is closed via any path (Close button or new context).
   const [previousSupExplainRow, setPreviousSupExplainRow] = useState<PlanSupplyViewRow | null>(null);
   const [previousWoExplainRow, setPreviousWoExplainRow] = useState<WorkOrder | null>(null);
+  // When navigating from the move manifest (work_order context) into a demand pegging tree,
+  // stores the WO row so the "go back" button can restore the manifest view.
+  const [previousManifestWoRow, setPreviousManifestWoRow] = useState<WorkOrder | null>(null);
   const [planWorkOrderPeggingLoading, setPlanWorkOrderPeggingLoading] = useState<string | null>(null);
   const [planWorkOrderPeggingError, setPlanWorkOrderPeggingError] = useState<string | null>(null);
   // Consolidated WO accordion: which demand sections are open + per-section tree expansion
@@ -5736,8 +5739,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                   className="secondary"
                                   style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
                                   onClick={() => {
-                                    if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); }
-                                    else { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); }
+                                    if (isSelected) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setPreviousManifestWoRow(null); }
+                                    else { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setPreviousManifestWoRow(null); }
                                   }}
                                 >{tc('show')}</button>
                               );
@@ -6407,8 +6410,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             style={isSelected ? { background: 'rgba(56,189,248,0.2)', borderColor: '#38bdf8' } : undefined}
                             onClick={(e) => {
                               e.stopPropagation();
-                              if (isPeggingActive) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setWoPegHighlightRow(null); }
-                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setWoPegHighlightRow(r); }
+                              if (isPeggingActive) { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setPreviousManifestWoRow(null); setWoPegHighlightRow(null); }
+                              else { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); setWoPeggingRowKey(k); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setPreviousManifestWoRow(null); setWoPegHighlightRow(r); }
                             }}
                           >{tc('show')}</button>
                         );
@@ -10133,7 +10136,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         >
           <div
             style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 0, pointerEvents: 'auto' }}
-            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); }}
+            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setPreviousManifestWoRow(null); }}
             aria-hidden
           />
           <div
@@ -10251,6 +10254,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 </button>
               </div>
             )}
+            {previousManifestWoRow && (
+              <div style={{ marginBottom: '0.5rem' }}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPlanPeggingContext({ type: 'work_order', row: previousManifestWoRow });
+                    setWoPeggingRowKey(`${previousManifestWoRow.demand_id ?? ''}|${previousManifestWoRow.product_id ?? ''}|${previousManifestWoRow.location_id}|${previousManifestWoRow.method ?? ''}|${previousManifestWoRow.start_time ?? ''}`);
+                    setPlanWorkOrderPeggingError(null);
+                    setPreviousManifestWoRow(null);
+                  }}
+                  style={{ background: 'none', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '0.78rem', padding: 0, display: 'flex', alignItems: 'center', gap: '0.3rem' }}
+                >
+                  ← {tP('workOrders.moveManifest.backToManifest')}
+                </button>
+              </div>
+            )}
             {previousWoExplainRow && (
               <div style={{ marginBottom: '0.5rem' }}>
                 <button
@@ -10285,7 +10304,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     ? tP('peggingPanel.titleDemand', { label: planPeggingContext.row.demand_id ?? planPeggingContext.row.product_id ?? '' })
                     : tP('peggingPanel.titleWorkOrder', { product: planPeggingContext.row.product_id ?? '', location: planPeggingContext.row.location_id ?? '' })}
               </h3>
-              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tc('close')}</button>
+              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setPreviousManifestWoRow(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tc('close')}</button>
             </div>
             <p style={{ margin: 0, marginBottom: '0.5rem', fontSize: '0.8rem', color: '#71717a' }}>
               {planPeggingContext.type === 'supply'
@@ -10514,13 +10533,33 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         </tr>
                       </thead>
                       <tbody>
-                        {manifestRows.map((r2, i) => (
-                          <tr key={i} style={{ borderBottom: '1px solid #27272a' }}>
-                            <td style={{ padding: '5px 14px 5px 0', color: '#a1a1aa', wordBreak: 'break-all', fontSize: '0.8rem' }}>{r2.demand}</td>
-                            <td style={{ padding: '5px 14px 5px 0', color: '#e4e4e7', fontFamily: 'monospace', fontSize: '0.8rem' }}>{r2.comp}</td>
-                            <td style={{ padding: '5px 0', textAlign: 'right', color: '#fafafa', fontVariantNumeric: 'tabular-nums' }}>{qtyFmt(r2.qty)}</td>
-                          </tr>
-                        ))}
+                        {manifestRows.map((r2, i) => {
+                          const demandRow = r2.demand !== '–'
+                            ? (planResult?.committed_demands.find((d) => d.demand_id === r2.demand) ?? null)
+                            : null;
+                          return (
+                            <tr key={i} style={{ borderBottom: '1px solid #27272a' }}>
+                              <td style={{ padding: '5px 14px 5px 0', wordBreak: 'break-all', fontSize: '0.8rem' }}>
+                                {demandRow ? (
+                                  <button
+                                    type="button"
+                                    style={{ background: 'none', border: 'none', padding: 0, color: '#60a5fa', cursor: 'pointer', textDecoration: 'underline', fontSize: 'inherit', textAlign: 'left', wordBreak: 'break-all' }}
+                                    onClick={() => {
+                                      setPreviousManifestWoRow(row);
+                                      setPlanPeggingContext({ type: 'demand', row: demandRow });
+                                      setWoPeggingRowKey(`demand|${r2.demand}|${demandRow.product_id ?? ''}|${demandRow.location_id ?? ''}`);
+                                      setPlanWorkOrderPeggingError(null);
+                                    }}
+                                  >{r2.demand}</button>
+                                ) : (
+                                  <span style={{ color: '#a1a1aa' }}>{r2.demand}</span>
+                                )}
+                              </td>
+                              <td style={{ padding: '5px 14px 5px 0', color: '#e4e4e7', fontFamily: 'monospace', fontSize: '0.8rem' }}>{r2.comp}</td>
+                              <td style={{ padding: '5px 0', textAlign: 'right', color: '#fafafa', fontVariantNumeric: 'tabular-nums' }}>{qtyFmt(r2.qty)}</td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                       <tfoot>
                         <tr style={{ borderTop: '2px solid #3f3f46', color: '#a1a1aa', fontSize: '0.78rem' }}>
