@@ -584,7 +584,9 @@
       "moveManifest": {
         "demand": "需求",
         "component": "物料",
-        "qty": "数量"
+        "qty": "数量",
+        "footerDemands": "个需求",
+        "footerComponents": "种物料"
       },
       "scheduleHorizon": {
         "weekly": "周",

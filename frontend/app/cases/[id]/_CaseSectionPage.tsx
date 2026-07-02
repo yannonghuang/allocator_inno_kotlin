@@ -1349,6 +1349,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [woExplainOpen, setWoExplainOpen] = useState(false);
   const [woExplainRow, setWoExplainRow] = useState<WorkOrder | null>(null);
   const [woExplainKey, setWoExplainKey] = useState<string | null>(null);
+  const [manifestSortCol, setManifestSortCol] = useState<'demand' | 'comp' | 'qty'>('demand');
+  const [manifestSortDir, setManifestSortDir] = useState<'asc' | 'desc'>('asc');
   const [woScheduleModalRow, setWoScheduleModalRow] = useState<WorkOrder | null>(null);
   const [supExplainOpen, setSupExplainOpen] = useState(false);
   const [supExplainRow, setSupExplainRow] = useState<PlanSupplyViewRow | null>(null);
@@ -10479,15 +10481,36 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     }
                   }
                 }
-                manifestRows.sort((a, b) => a.demand.localeCompare(b.demand) || a.comp.localeCompare(b.comp));
+                // Apply sort
+                const dir = manifestSortDir === 'asc' ? 1 : -1;
+                manifestRows.sort((a, b) => {
+                  if (manifestSortCol === 'qty') return dir * (a.qty - b.qty);
+                  if (manifestSortCol === 'comp') return dir * (a.comp.localeCompare(b.comp) || a.demand.localeCompare(b.demand));
+                  return dir * (a.demand.localeCompare(b.demand) || a.comp.localeCompare(b.comp));
+                });
+                // Footer aggregates — use raw comps (not expanded rows) to avoid double-counting qty
+                const distinctDemands = new Set(manifestRows.map((r2) => r2.demand)).size;
+                const distinctComps = new Set(comps.map((c) => c.product_id)).size;
+                const totalQty = comps.reduce((s, c) => s + Number(c.quantity), 0);
+                const thStyle = (col: typeof manifestSortCol, align: 'left' | 'right' = 'left'): React.CSSProperties => ({
+                  textAlign: align, padding: '5px 14px 5px 0', fontWeight: 500, cursor: 'pointer',
+                  userSelect: 'none', color: manifestSortCol === col ? '#e4e4e7' : '#71717a',
+                  ...(align === 'right' ? { paddingRight: 0 } : {}),
+                });
+                const sortIcon = (col: typeof manifestSortCol) =>
+                  manifestSortCol === col ? (manifestSortDir === 'asc' ? ' ▲' : ' ▼') : '';
+                const toggleSort = (col: typeof manifestSortCol) => {
+                  if (manifestSortCol === col) setManifestSortDir((d) => d === 'asc' ? 'desc' : 'asc');
+                  else { setManifestSortCol(col); setManifestSortDir('asc'); }
+                };
                 return (
-                  <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
+                  <div style={{ flex: 1, overflow: 'auto', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
                     <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' }}>
                       <thead>
-                        <tr style={{ color: '#71717a', borderBottom: '2px solid #3f3f46', position: 'sticky', top: 0, background: '#1c1c1e' }}>
-                          <th style={{ textAlign: 'left', padding: '5px 14px 5px 0', fontWeight: 500 }}>{tP('workOrders.moveManifest.demand')}</th>
-                          <th style={{ textAlign: 'left', padding: '5px 14px 5px 0', fontWeight: 500 }}>{tP('workOrders.moveManifest.component')}</th>
-                          <th style={{ textAlign: 'right', padding: '5px 0', fontWeight: 500 }}>{tP('workOrders.moveManifest.qty')}</th>
+                        <tr style={{ borderBottom: '2px solid #3f3f46', position: 'sticky', top: 0, background: '#1c1c1e' }}>
+                          <th style={thStyle('demand')} onClick={() => toggleSort('demand')}>{tP('workOrders.moveManifest.demand')}{sortIcon('demand')}</th>
+                          <th style={thStyle('comp')} onClick={() => toggleSort('comp')}>{tP('workOrders.moveManifest.component')}{sortIcon('comp')}</th>
+                          <th style={{ ...thStyle('qty', 'right'), paddingRight: 0 }} onClick={() => toggleSort('qty')}>{tP('workOrders.moveManifest.qty')}{sortIcon('qty')}</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -10499,6 +10522,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           </tr>
                         ))}
                       </tbody>
+                      <tfoot>
+                        <tr style={{ borderTop: '2px solid #3f3f46', color: '#a1a1aa', fontSize: '0.78rem' }}>
+                          <td style={{ padding: '5px 14px 5px 0' }}>{distinctDemands} {tP('workOrders.moveManifest.footerDemands')}</td>
+                          <td style={{ padding: '5px 14px 5px 0' }}>{distinctComps} {tP('workOrders.moveManifest.footerComponents')}</td>
+                          <td style={{ padding: '5px 0', textAlign: 'right', color: '#fafafa', fontVariantNumeric: 'tabular-nums' }}>{qtyFmt(totalQty)}</td>
+                        </tr>
+                      </tfoot>
                     </table>
                   </div>
                 );

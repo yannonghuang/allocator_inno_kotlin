@@ -584,7 +584,9 @@
       "moveManifest": {
         "demand": "Demand",
         "component": "Component",
-        "qty": "Qty"
+        "qty": "Qty",
+        "footerDemands": "demands",
+        "footerComponents": "components"
       },
       "scheduleHorizon": {
         "weekly": "Weekly",
