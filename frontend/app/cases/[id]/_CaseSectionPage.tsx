@@ -10486,8 +10486,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 ...(row.consolidated_demand_ids ?? []).filter((d) => !!d && d !== '' && !splitIds.has(d)),
               ];
               if (allDemandIds.length === 0) return null;
-              // Multi-product consolidated move WOs: show component manifest (demand × component × qty).
-              if ((row.move_components?.length ?? 0) > 1) {
+              // Move WOs with component data: show manifest (demand × component × qty). Covers singletons too.
+              if ((row.move_components?.length ?? 0) >= 1) {
                 const comps = row.move_components!;
                 const manifestRows: { demand: string; comp: string; qty: number }[] = [];
                 for (const c of comps) {
