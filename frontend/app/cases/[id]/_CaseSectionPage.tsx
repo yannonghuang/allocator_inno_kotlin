@@ -6386,43 +6386,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       } },
                       { key: 'location_source', label: tP('workOrders.columns.locationSource'), sortable: true, render: (r) => r.location_source ?? '–' },
                       { key: '_peg_order', label: tP('workOrders.columns.pegging'), sortable: true, render: (r) => {
-                        // Move WOs: show inline component manifest instead of a pegging drill-down.
-                        if (r.method === 'move') {
-                          const comps = r.move_components ?? [];
-                          if (comps.length > 0) {
-                            const MAX_VISIBLE = 8;
-                            const visible = comps.slice(0, MAX_VISIBLE);
-                            const extra = comps.length - MAX_VISIBLE;
-                            return (
-                              <table style={{ fontSize: '0.72rem', borderCollapse: 'collapse', width: '100%', tableLayout: 'fixed' }}>
-                                <thead>
-                                  <tr style={{ color: '#71717a', borderBottom: '1px solid #3f3f46' }}>
-                                    <th style={{ textAlign: 'left', padding: '1px 6px 1px 0', fontWeight: 400, width: '40%' }}>{tP('workOrders.moveManifest.demand')}</th>
-                                    <th style={{ textAlign: 'left', padding: '1px 6px 1px 0', fontWeight: 400, width: '35%' }}>{tP('workOrders.moveManifest.component')}</th>
-                                    <th style={{ textAlign: 'right', padding: '1px 0', fontWeight: 400, width: '25%' }}>{tP('workOrders.moveManifest.qty')}</th>
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {visible.map((c, i) => {
-                                    const demands = (c.demand_ids ?? []).filter(Boolean);
-                                    const demandStr = demands.length === 0 ? '–' : demands.join(', ');
-                                    const demandShort = demandStr.length > 22 ? demandStr.slice(0, 22) + '…' : demandStr;
-                                    return (
-                                      <tr key={i} style={{ borderBottom: i < visible.length - 1 ? '1px solid #27272a' : undefined }}>
-                                        <td style={{ padding: '1px 6px 1px 0', color: '#a1a1aa', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={demandStr}>{demandShort}</td>
-                                        <td style={{ padding: '1px 6px 1px 0', color: '#e4e4e7', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={c.product_id}>{c.product_id}</td>
-                                        <td style={{ padding: '1px 0', textAlign: 'right', color: '#a1a1aa' }}>{qtyFmt(Number(c.quantity))}</td>
-                                      </tr>
-                                    );
-                                  })}
-                                  {extra > 0 && (
-                                    <tr><td colSpan={3} style={{ padding: '1px 0', color: '#52525b', fontStyle: 'italic' }}>…{extra} more</td></tr>
-                                  )}
-                                </tbody>
-                              </table>
-                            );
-                          }
-                        }
                         const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
                         // isPeggingActive: this WO's pegging is the direct content of the panel.
                         const isPeggingActive = woPeggingRowKey === k;
@@ -10502,28 +10465,41 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 ...(row.consolidated_demand_ids ?? []).filter((d) => !!d && d !== '' && !splitIds.has(d)),
               ];
               if (allDemandIds.length === 0) return null;
-              // Multi-product consolidated move WOs: chips navigate to per-demand pegging
+              // Multi-product consolidated move WOs: show component manifest (demand × component × qty).
               if ((row.move_components?.length ?? 0) > 1) {
+                const comps = row.move_components!;
+                const manifestRows: { demand: string; comp: string; qty: number }[] = [];
+                for (const c of comps) {
+                  const demands = (c.demand_ids ?? []).filter(Boolean);
+                  if (demands.length === 0) {
+                    manifestRows.push({ demand: '–', comp: c.product_id, qty: Number(c.quantity) });
+                  } else {
+                    for (const d of demands) {
+                      manifestRows.push({ demand: d, comp: c.product_id, qty: Number(c.quantity) });
+                    }
+                  }
+                }
+                manifestRows.sort((a, b) => a.demand.localeCompare(b.demand) || a.comp.localeCompare(b.comp));
                 return (
-                  <div style={{ marginBottom: '0.75rem' }}>
-                    <span style={{ fontSize: '0.75rem', color: '#a1a1aa', marginRight: 6 }}>
-                      Consolidated for {allDemandIds.length} demands — click to open demand pegging:
-                    </span>
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 4 }}>
-                      {allDemandIds.map((did) => (
-                        <button key={did} type="button" className="secondary"
-                          title={`Open demand pegging for ${did}`}
-                          style={{ fontSize: '0.72rem', padding: '2px 8px', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: '#60a5fa', textDecoration: 'underline' }}
-                          onClick={() => {
-                            const demandRow = planResult?.committed_demands.find((d) => d.demand_id === did) ?? null;
-                            if (!demandRow) return;
-                            setPlanPeggingContext({ type: 'demand', row: demandRow });
-                            setWoPeggingRowKey(`demand|${did}|${demandRow.product_id ?? ''}|${demandRow.location_id ?? ''}`);
-                            setPlanWorkOrderPeggingError(null);
-                            setPreviousWoExplainRow(null);
-                          }}>{did}</button>
-                      ))}
-                    </div>
+                  <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
+                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' }}>
+                      <thead>
+                        <tr style={{ color: '#71717a', borderBottom: '2px solid #3f3f46', position: 'sticky', top: 0, background: '#1c1c1e' }}>
+                          <th style={{ textAlign: 'left', padding: '5px 14px 5px 0', fontWeight: 500 }}>{tP('workOrders.moveManifest.demand')}</th>
+                          <th style={{ textAlign: 'left', padding: '5px 14px 5px 0', fontWeight: 500 }}>{tP('workOrders.moveManifest.component')}</th>
+                          <th style={{ textAlign: 'right', padding: '5px 0', fontWeight: 500 }}>{tP('workOrders.moveManifest.qty')}</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {manifestRows.map((r2, i) => (
+                          <tr key={i} style={{ borderBottom: '1px solid #27272a' }}>
+                            <td style={{ padding: '5px 14px 5px 0', color: '#a1a1aa', wordBreak: 'break-all', fontSize: '0.8rem' }}>{r2.demand}</td>
+                            <td style={{ padding: '5px 14px 5px 0', color: '#e4e4e7', fontFamily: 'monospace', fontSize: '0.8rem' }}>{r2.comp}</td>
+                            <td style={{ padding: '5px 0', textAlign: 'right', color: '#fafafa', fontVariantNumeric: 'tabular-nums' }}>{qtyFmt(r2.qty)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
                 );
               }
