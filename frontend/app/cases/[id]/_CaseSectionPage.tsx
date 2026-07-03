@@ -10515,26 +10515,26 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 })();
               if ((effectiveMoveComponents?.length ?? 0) >= 1) {
                 const comps = effectiveMoveComponents!;
-                const manifestRows: { demand: string; comp: string; qty: number }[] = [];
+                const committedDemandIds = new Set(planResult?.committed_demands.map((d) => d.demand_id) ?? []);
+                // One row per component. For move WOs, move_components has no per-demand qty split,
+                // so expanding per demand would duplicate the physical quantity. For purchase WOs the
+                // comps already come from splitDetails (one entry per demand with its own qty).
+                const manifestRows: { demands: string[]; comp: string; qty: number }[] = [];
                 for (const c of comps) {
-                  const demands = (c.demand_ids ?? []).filter(Boolean);
-                  if (demands.length === 0) {
-                    manifestRows.push({ demand: '–', comp: c.product_id, qty: Number(c.quantity) });
-                  } else {
-                    for (const d of demands) {
-                      manifestRows.push({ demand: d, comp: c.product_id, qty: Number(c.quantity) });
-                    }
-                  }
+                  // Filter to only real committed demands; skip virtual / non-committed IDs.
+                  const realDemands = (c.demand_ids ?? []).filter((d) => d && committedDemandIds.has(d));
+                  manifestRows.push({ demands: realDemands, comp: c.product_id, qty: Number(c.quantity) });
                 }
-                // Apply sort
+                // Apply sort (key by first demand or '–' when none)
+                const demandKey = (r2: { demands: string[] }) => r2.demands[0] ?? '–';
                 const dir = manifestSortDir === 'asc' ? 1 : -1;
                 manifestRows.sort((a, b) => {
                   if (manifestSortCol === 'qty') return dir * (a.qty - b.qty);
-                  if (manifestSortCol === 'comp') return dir * (a.comp.localeCompare(b.comp) || a.demand.localeCompare(b.demand));
-                  return dir * (a.demand.localeCompare(b.demand) || a.comp.localeCompare(b.comp));
+                  if (manifestSortCol === 'comp') return dir * (a.comp.localeCompare(b.comp) || demandKey(a).localeCompare(demandKey(b)));
+                  return dir * (demandKey(a).localeCompare(demandKey(b)) || a.comp.localeCompare(b.comp));
                 });
-                // Footer aggregates — use raw comps (not expanded rows) to avoid double-counting qty
-                const distinctDemands = new Set(manifestRows.map((r2) => r2.demand)).size;
+                const allManifestDemands = new Set(manifestRows.flatMap((r2) => r2.demands));
+                const distinctDemands = allManifestDemands.size;
                 const distinctComps = new Set(comps.map((c) => c.product_id)).size;
                 const totalQty = comps.reduce((s, c) => s + Number(c.quantity), 0);
                 const thStyle = (col: typeof manifestSortCol, align: 'left' | 'right' = 'left'): React.CSSProperties => ({
@@ -10559,33 +10559,37 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         </tr>
                       </thead>
                       <tbody>
-                        {manifestRows.map((r2, i) => {
-                          const demandRow = r2.demand !== '–'
-                            ? (planResult?.committed_demands.find((d) => d.demand_id === r2.demand) ?? null)
-                            : null;
-                          return (
+                        {manifestRows.map((r2, i) => (
                             <tr key={i} style={{ borderBottom: '1px solid #27272a' }}>
                               <td style={{ padding: '5px 14px 5px 0', wordBreak: 'break-all', fontSize: '0.8rem' }}>
-                                {demandRow ? (
-                                  <button
-                                    type="button"
-                                    style={{ background: 'none', border: 'none', padding: 0, color: '#60a5fa', cursor: 'pointer', textDecoration: 'underline', fontSize: 'inherit', textAlign: 'left', wordBreak: 'break-all' }}
-                                    onClick={() => {
-                                      setPreviousManifestWoRow(row);
-                                      setPlanPeggingContext({ type: 'demand', row: demandRow });
-                                      setWoPeggingRowKey(`demand|${r2.demand}|${demandRow.product_id ?? ''}|${demandRow.location_id ?? ''}`);
-                                      setPlanWorkOrderPeggingError(null);
-                                    }}
-                                  >{r2.demand}</button>
+                                {r2.demands.length === 0 ? (
+                                  <span style={{ color: '#a1a1aa' }}>–</span>
                                 ) : (
-                                  <span style={{ color: '#a1a1aa' }}>{r2.demand}</span>
+                                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                                    {r2.demands.map((d) => {
+                                      const demandRow = planResult?.committed_demands.find((cd) => cd.demand_id === d) ?? null;
+                                      return demandRow ? (
+                                        <button key={d} type="button"
+                                          style={{ background: 'none', border: 'none', padding: 0, color: '#60a5fa', cursor: 'pointer', textDecoration: 'underline', fontSize: 'inherit', textAlign: 'left', wordBreak: 'break-all' }}
+                                          onClick={() => {
+                                            setPreviousManifestWoRow(row);
+                                            setPlanPeggingContext({ type: 'demand', row: demandRow });
+                                            setWoPeggingRowKey(`demand|${d}|${demandRow.product_id ?? ''}|${demandRow.location_id ?? ''}`);
+                                            setPlanWorkOrderPeggingError(null);
+                                          }}
+                                        >{d}</button>
+                                      ) : (
+                                        <span key={d} style={{ color: '#a1a1aa' }}>{d}</span>
+                                      );
+                                    })}
+                                  </div>
                                 )}
                               </td>
                               <td style={{ padding: '5px 14px 5px 0', color: '#e4e4e7', fontFamily: 'monospace', fontSize: '0.8rem' }}>{r2.comp}</td>
                               <td style={{ padding: '5px 0', textAlign: 'right', color: '#fafafa', fontVariantNumeric: 'tabular-nums' }}>{qtyFmt(r2.qty)}</td>
                             </tr>
-                          );
-                        })}
+                          ))}
+
                       </tbody>
                       <tfoot>
                         <tr style={{ borderTop: '2px solid #3f3f46', color: '#a1a1aa', fontSize: '0.78rem' }}>
