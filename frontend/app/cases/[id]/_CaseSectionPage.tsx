@@ -3323,17 +3323,31 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return m;
   }, [planResult?.committed_demands]);
 
-  // lotId → demandId → qty — used by the supply-explain allocation heatmap.
   // supply_id → demand_id → qty_allocated (demand's proportional entitlement from this lot).
-  // Uses qty_allocated when present (new runs); falls back to qty_consumed for older runs.
+  // Only critical lots (non-purchasable raw materials) have a qty_allocated; non-critical lots
+  // (purchasable / FIFO) have qty_allocated = null and are excluded from this map so the UI
+  // renders "–" instead of a misleading proportional figure.
   const lotDemandAllocMap = useMemo(() => {
     const m = new Map<string, Map<string, number>>();
     for (const a of planResult?.supply_allocations ?? []) {
-      if (!a.demand_id) continue;
+      if (!a.demand_id || a.qty_allocated == null) continue;  // non-critical lots: no allocation concept
       let dm = m.get(a.supply_id);
       if (!dm) { dm = new Map(); m.set(a.supply_id, dm); }
-      const qty = a.qty_allocated != null ? a.qty_allocated : a.qty_consumed;
-      dm.set(a.demand_id, (dm.get(a.demand_id) ?? 0) + qty);
+      dm.set(a.demand_id, (dm.get(a.demand_id) ?? 0) + a.qty_allocated);
+    }
+    return m;
+  }, [planResult?.supply_allocations]);
+
+  // supply_id → demand_id → qty_consumed — used as peggedDemands fallback when planning_pegging
+  // is not loaded inline (large runs stream pegging from DB). Separate from lotDemandAllocMap
+  // so non-critical supplies (qty_allocated = null) still show their pegged demands.
+  const supplyDemandConsumedMap = useMemo(() => {
+    const m = new Map<string, Map<string, number>>();
+    for (const a of planResult?.supply_allocations ?? []) {
+      if (!a.demand_id || a.qty_consumed <= 1e-9) continue;
+      let dm = m.get(a.supply_id);
+      if (!dm) { dm = new Map(); m.set(a.supply_id, dm); }
+      dm.set(a.demand_id, (dm.get(a.demand_id) ?? 0) + a.qty_consumed);
     }
     return m;
   }, [planResult?.supply_allocations]);
@@ -3573,7 +3587,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         peggedDemands: pegging?.demands.length
           ? pegging.demands
           : (() => {
-              const dm = lotDemandAllocMap.get(s.supplyId);
+              // Fallback when planning_pegging isn't loaded inline (large runs).
+              // Use qty_consumed (not qty_allocated) so non-critical supplies are also shown.
+              const dm = supplyDemandConsumedMap.get(s.supplyId);
               if (!dm) return [];
               return Array.from(dm.entries()).map(([demandId, qty]) => ({
                 demandId,
@@ -3585,7 +3601,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         demandPath,
       };
     });
-  }, [caseSupplies, supplyPeggingMap, supplyConsumedMap, lotDemandAllocMap, demandCustomerMap, supplySplitInfoMap, supplyDemandPathMap, supplyViewRowMap]);
+  }, [caseSupplies, supplyPeggingMap, supplyConsumedMap, supplyDemandConsumedMap, lotDemandAllocMap, demandCustomerMap, supplySplitInfoMap, supplyDemandPathMap, supplyViewRowMap]);
 
   /** Sum of qty per productId across all plan supply view rows (unfiltered). */
   const planSupplyProductTotalMap = useMemo((): Record<string, number> => {

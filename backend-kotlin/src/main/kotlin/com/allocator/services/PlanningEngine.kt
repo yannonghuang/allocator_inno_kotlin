@@ -4280,6 +4280,10 @@ internal fun extractSupplyAllocations(
     pegging: List<Map<String, Any?>>,
     supplies: List<Map<String, Any?>>,
     demands: List<Map<String, Any?>> = emptyList(),
+    /** Supply IDs that belong to critical (non-purchasable) lots. When non-null, only these
+     *  lots receive a proportional qty_allocated; all other lots are non-critical (FIFO
+     *  consumption, uncapped) and emit qty_allocated = null so the UI shows "–". */
+    criticalSupplyIds: Set<String>? = null,
 ): List<Map<String, Any?>> {
     val remainingBySupply = mutableMapOf<String, Double>()
     for (s in supplies) {
@@ -4390,11 +4394,9 @@ internal fun extractSupplyAllocations(
     }
 
     // Post-process: compute qty_allocated = demand's proportional entitlement from each lot.
-    // Each physical lot distributes its full initial qty to competing demands proportionally by
-    // demand quantity — allocation is lot-local and independent of whether the plan over-supplies
-    // globally. qty_consumed records what was actually drawn; qty_allocated records the entitlement.
-    // Demands that consumed 0 from a lot (because other lots served them) are excluded here
-    // (they appear in no pegging tree), so allocations are normalised among consuming demands only.
+    // Only critical lots (those in criticalSupplyIds) receive a proportional entitlement;
+    // non-critical lots are consumed FIFO without allocation — their qty_allocated is null
+    // so the UI renders "–" rather than a misleading proportional figure.
     // Mutates result records in-place (MutableMap) to avoid allocating a new map per record.
     val demandQtyMap: Map<String, Double> = demands
         .mapNotNull { d -> (d["demand_id"] as? String)?.let { id -> id to ((d["quantity"] as? Number)?.toDouble() ?: 0.0) } }
@@ -4405,11 +4407,12 @@ internal fun extractSupplyAllocations(
         .groupBy({ it.first }, { it.second })
         .mapValues { (_, qtys) -> qtys.sum() }
 
-    // Build per-lot weight totals in one pass so each lot's totalWeight is computed once, not per-record
+    // Build per-lot weight totals (critical lots only)
     data class LotStats(val lotQty: Double, var totalWeight: Double = 0.0)
     val lotStats = mutableMapOf<String, LotStats>()
     for (rec in result) {
         val sid = rec["supply_id"] as? String ?: continue
+        if (criticalSupplyIds != null && sid !in criticalSupplyIds) continue  // non-critical: skip
         val lotQty = lotInitialQty[sid] ?: continue  // skip synthetic buckets
         val stats = lotStats.getOrPut(sid) { LotStats(lotQty) }
         val did = rec["demand_id"] as? String
@@ -4418,11 +4421,14 @@ internal fun extractSupplyAllocations(
             ?: 0.0
         stats.totalWeight += w
     }
-    // Second pass: write qty_allocated in-place
+    // Second pass: write qty_allocated in-place; null for non-critical lots
     for (rec in result) {
         val sid = rec["supply_id"] as? String
+        val isCritical = criticalSupplyIds == null || (sid != null && sid in criticalSupplyIds)
         val stats = if (sid != null) lotStats[sid] else null
-        val qtyAllocated: Double = if (stats != null && stats.totalWeight > 1e-12) {
+        val qtyAllocated: Double? = if (!isCritical) {
+            null  // non-critical (purchasable): FIFO consumption, no proportional allocation
+        } else if (stats != null && stats.totalWeight > 1e-12) {
             val did = rec["demand_id"] as? String
             val w = (if (did != null) demandQtyMap[did] else null)
                 ?: (rec["qty_consumed"] as? Number)?.toDouble()
@@ -4729,7 +4735,13 @@ fun runPlanning(
     // Release original pegging lists so GC can reclaim them before the verification + timing passes.
     planningPegging.clear()
     val suppliesForCap = data["supply"] ?: emptyList()
-    val supplyAllocations = extractSupplyAllocations(allPegging, suppliesForCap, demands)
+    // Critical supply IDs = lots whose perLotBudget was computed (non-purchasable raw materials).
+    // Non-critical lots are consumed FIFO without allocation; they get qty_allocated = null.
+    val criticalSupplyIds: Set<String> = sgAllocation.perLotBudgets.values
+        .flatMap { it.keys }
+        .filterTo(mutableSetOf()) { it.count { c -> c == '|' } >= 2 }
+        .mapTo(mutableSetOf()) { it.substringAfterLast('|') }
+    val supplyAllocations = extractSupplyAllocations(allPegging, suppliesForCap, demands, criticalSupplyIds)
     val supplyCapViolations = verifySupplyCap(suppliesForCap, supplyAllocations)
     // R7e: physical conservation — only count pegging from served demands (committed > 0).
     // Unserved demands have their inventory restored by plan()'s invCopy rollback; excluding

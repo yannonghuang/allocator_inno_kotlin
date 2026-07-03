@@ -237,6 +237,10 @@ internal fun buildBomGraph(
 internal fun buildReachabilityMatrix(
     demands: List<Map<String, Any?>>,
     graph: BomGraph,
+    /** When non-null, only supply nodes whose product_id is in this set are recorded.
+     *  Non-critical supply leaves are skipped, avoiding allocation work for purchasable
+     *  materials whose lots are uncapped in planning anyway. */
+    criticalPids: Set<String>? = null,
 ): NeedsMatrix {
     val byRow = mutableMapOf<Any?, MutableMap<SupplyKey, Double>>()
 
@@ -257,7 +261,8 @@ internal fun buildReachabilityMatrix(
         while (queue.isNotEmpty()) {
             val node = queue.removeFirst()
             val sk   = SupplyKey(node.first, node.second)
-            if (sk in graph.supplyIndex) needs[sk] = qty
+            if (sk in graph.supplyIndex && (criticalPids == null || sk.productId in criticalPids))
+                needs[sk] = qty
             for ((child, _) in graph.edges[node] ?: emptyList()) {
                 if (visited.add(child)) queue.addLast(child)
             }
