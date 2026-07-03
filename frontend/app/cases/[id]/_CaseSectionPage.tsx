@@ -6138,7 +6138,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         _prod_area: String(r.prod_area ?? ''),
                         _peg_order: pegOrderMap.get(`${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`),
                         _demand_label: demandLabel,
-                        _demand_ids: r.demand_id ? [r.demand_id] : splitDemandIds,
+                        _demand_ids: r.demand_id ? [r.demand_id] : splitDemandIds.length ? splitDemandIds :
+                          // Consolidated move WOs: demand_id=null + no split_details; fall back to
+                          // consolidated_demand_ids filtering virtual so the Demand column isn't blank.
+                          ((r.consolidated_demand_ids as string[] | null | undefined)
+                            ?? (r.wo_competing_demands as string[] | null | undefined)
+                            ?? []).filter((d: string) => !!d && !d.toUpperCase().includes('VIRTUAL')),
                         _requested_qty: requested,
                       };
                     });
@@ -10523,13 +10528,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 for (const c of comps) {
                   if (c.demand_splits && c.demand_splits.length > 0) {
                     for (const s of c.demand_splits) {
-                      if (committedDemandIds.has(s.demand_id)) {
+                      // Skip virtual demands — they are supply-planning artifacts, not end-customer demands.
+                      if (committedDemandIds.has(s.demand_id) && !s.demand_id.toUpperCase().includes('VIRTUAL')) {
                         manifestRows.push({ demand: s.demand_id, comp: c.product_id, qty: s.quantity });
                       }
                     }
                   } else {
-                    // No per-demand split: one row per component, first committed demand as key.
-                    const realDemands = (c.demand_ids ?? []).filter((d) => d && committedDemandIds.has(d));
+                    // No per-demand split: one row per component, first non-virtual committed demand as key.
+                    const realDemands = (c.demand_ids ?? []).filter((d) => d && committedDemandIds.has(d) && !d.toUpperCase().includes('VIRTUAL'));
                     manifestRows.push({ demand: realDemands[0] ?? null, comp: c.product_id, qty: Number(c.quantity) });
                   }
                 }
@@ -10542,7 +10548,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 });
                 const distinctDemands = new Set(manifestRows.map((r2) => r2.demand).filter(Boolean)).size;
                 const distinctComps = new Set(manifestRows.map((r2) => r2.comp)).size;
-                const totalQty = manifestRows.reduce((s, r2) => s + r2.qty, 0);
+                // Physical total from components (includes units serving virtual/consolidated demands).
+                const totalQty = comps.reduce((s, c) => s + Number(c.quantity), 0);
                 const thStyle = (col: typeof manifestSortCol, align: 'left' | 'right' = 'left'): React.CSSProperties => ({
                   textAlign: align, padding: '5px 14px 5px 0', fontWeight: 500, cursor: 'pointer',
                   userSelect: 'none', color: manifestSortCol === col ? '#e4e4e7' : '#71717a',
