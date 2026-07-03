@@ -10495,10 +10495,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 : (row.demand_id ? [row.demand_id] : []);
               if (row.method !== 'move' && row.method !== 'purchase' && allDemandIds.length === 0) return null;
               // Move + purchase WOs: show manifest (demand × component × qty) instead of accordion/pegging.
+              // crossWaveCalendarMerge flatMaps move_components from singletonRow outputs that had none,
+              // producing [] (truthy but empty). Treat empty move_components as absent so the synthesis runs.
+              const rawMoveComponents = row.move_components as { product_id: string; quantity: number; demand_ids?: string[] }[] | undefined;
               const effectiveMoveComponents: { product_id: string; quantity: number; demand_ids: string[] }[] | null =
-                (row.move_components as { product_id: string; quantity: number; demand_ids: string[] }[] | undefined) ?? (() => {
-                  if (row.method === 'move' && row.product_id) {
-                    return [{ product_id: row.product_id, quantity: row.quantity as number, demand_ids: allDemandIds }];
+                (rawMoveComponents?.length ? rawMoveComponents as { product_id: string; quantity: number; demand_ids: string[] }[] : null) ?? (() => {
+                  if (row.method === 'move') {
+                    const pid = row.product_id ?? null;
+                    if (!pid) return null;
+                    return [{ product_id: pid, quantity: row.quantity as number, demand_ids: allDemandIds }];
                   }
                   if (row.method === 'purchase' && row.product_id) {
                     if (splitDetails.length > 0) {
