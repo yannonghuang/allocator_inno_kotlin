@@ -3558,7 +3558,12 @@ internal fun consolidateByWaves(
     for (entry in peggingTrees) {
         @Suppress("UNCHECKED_CAST")
         val members = entry["consolidated_demand_ids"] as? List<String>
-        walk(entry["tree"], entry["demand_id"], members, null, 0)
+        // Skip supply-only pegging entries: demand_id = null AND no consolidated_demand_ids.
+        // These are pure supply-graph entries with no real demand context; walking them produces
+        // demand-orphan WO groups (empty demandQty + empty sampleMembers) in the consolidation output.
+        val entryDemandId = entry["demand_id"]?.toString()?.takeIf { it.isNotBlank() }
+        if (entryDemandId == null && members.isNullOrEmpty()) continue
+        walk(entry["tree"], entryDemandId, members, null, 0)
     }
 
     // ── Phase B: aggregate occurrences by gid (sums ALL occurrences of a shared gid, e.g. the same
