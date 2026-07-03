@@ -3438,6 +3438,11 @@ internal fun crossWaveCalendarMerge(
                         )
                     }.sortedBy { it["product_id"] as? String ?: "" }
                 put("move_components", moveComponents)
+                // Singleton rows entering crossWaveCalendarMerge carry their own product_id.
+                // After merging, if the shipment spans multiple products, null it out so the
+                // WO table renders "N components" instead of showing the first product's id.
+                val distinctMovePids = moveComponents.mapNotNull { it["product_id"] as? String }.distinct()
+                if (distinctMovePids.size != 1) put("product_id", null)
             }
         }
         mergedConsolidated.add(mergedRow)

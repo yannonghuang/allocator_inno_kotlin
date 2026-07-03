@@ -6140,12 +6140,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         _demand_label: demandLabel,
                         _demand_ids: r.demand_id ? [r.demand_id] : splitDemandIds.length ? splitDemandIds : (() => {
                           // Consolidated move WOs: demand_id=null, no split_details.
-                          // Use consolidated_demand_ids but only IDs that are both non-virtual AND
-                          // present in committed_demands — must match what the manifest shows.
+                          // Fall back to consolidated_demand_ids filtered to committed_demands.
+                          // Include virtual demands — they are committed and traceable.
                           const commitSet = new Set((planResult?.committed_demands ?? []).map((d) => d.demand_id));
                           return ((r.consolidated_demand_ids as string[] | null | undefined)
                             ?? (r.wo_competing_demands as string[] | null | undefined)
-                            ?? []).filter((d: string) => !!d && !d.toUpperCase().includes('VIRTUAL') && commitSet.has(d));
+                            ?? []).filter((d: string) => !!d && commitSet.has(d));
                         })(),
                         _requested_qty: requested,
                       };
@@ -10530,23 +10530,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 const manifestRows: { demand: string | null; comp: string; qty: number }[] = [];
                 for (const c of comps) {
                   if (c.demand_splits && c.demand_splits.length > 0) {
-                    // Show one row per committed non-virtual demand split.
-                    const realSplits = c.demand_splits.filter(
-                      (s) => committedDemandIds.has(s.demand_id) && !s.demand_id.toUpperCase().includes('VIRTUAL'),
-                    );
-                    if (realSplits.length > 0) {
-                      for (const s of realSplits) {
+                    // One row per committed demand split (virtual demands included — they are
+                    // committed and give the user a traceable demand id).
+                    const committedSplits = c.demand_splits.filter((s) => committedDemandIds.has(s.demand_id));
+                    if (committedSplits.length > 0) {
+                      for (const s of committedSplits) {
                         manifestRows.push({ demand: s.demand_id, comp: c.product_id, qty: s.quantity });
                       }
                     } else {
-                      // All splits are virtual/non-committed (e.g. WO serves only virtual consolidation
-                      // demands). Show the component without demand attribution so the row isn't invisible.
+                      // No committed demands at all — show component row with no demand attribution.
                       manifestRows.push({ demand: null, comp: c.product_id, qty: Number(c.quantity) });
                     }
                   } else {
-                    // No per-demand split: one row per component, first committed non-virtual demand as key.
-                    const realDemands = (c.demand_ids ?? []).filter((d) => d && committedDemandIds.has(d) && !d.toUpperCase().includes('VIRTUAL'));
-                    manifestRows.push({ demand: realDemands[0] ?? null, comp: c.product_id, qty: Number(c.quantity) });
+                    // No per-demand split: one row per component, first committed demand as key.
+                    const committedDemands = (c.demand_ids ?? []).filter((d) => d && committedDemandIds.has(d));
+                    manifestRows.push({ demand: committedDemands[0] ?? null, comp: c.product_id, qty: Number(c.quantity) });
                   }
                 }
                 const demandKey = (r2: { demand: string | null }) => r2.demand ?? '–';
