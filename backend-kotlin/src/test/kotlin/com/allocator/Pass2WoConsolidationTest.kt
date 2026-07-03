@@ -1,19 +1,19 @@
 package com.allocator
 
-import com.allocator.services.WoConsolidation
+import com.allocator.services.consolidateByWaves
 import com.allocator.services.consolidateWorkOrdersByTiming
-import com.allocator.services.readjustConsolidatedWoTiming
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.collections.shouldContainExactlyInAnyOrder
 import io.kotest.matchers.doubles.plusOrMinus
 import io.kotest.matchers.shouldBe
-import java.time.LocalDate
-import java.time.format.DateTimeFormatter
+import io.kotest.matchers.nulls.shouldNotBeNull
 
 /**
  * Pass 2 — work-order timing/scheduling consolidation. Batches same-
  * (product, location, method, source) WOs that start within the same window into
- * fewer, larger orders, preserving total quantity.
+ * fewer, larger orders, preserving total quantity. `consolidateByWaves` does this
+ * bottom-up in topological waves over the global WO dependency graph, so a parent
+ * is never bucketed/timed until every live dependency has been finalized.
  */
 class Pass2WoConsolidationTest : FunSpec({
 
@@ -93,7 +93,14 @@ class Pass2WoConsolidationTest : FunSpec({
             wo("RAW1", "L", "purchase", 100.0, "2024-05-01", "2024-06-20", "D1"),
             wo("RAW1", "L", "purchase", 100.0, "2024-09-01", "2024-10-21", "D2"),
         )
-        consolidateWorkOrdersByTiming(wos, data, windowDays = 7).consolidated.size shouldBe 2
+        // Different time windows → two separate consolidated WOs; each singleton gets
+        // lot_count recomputed from qty/lotSize (not carried as native lot_count=1).
+        val out = consolidateWorkOrdersByTiming(wos, data, windowDays = 7).consolidated
+        out.size shouldBe 2
+        out.forEach { wo ->
+            // 100 / max_lot_size(1000) = ceil(0.1) = 1 lot each
+            wo["lot_count"] shouldBe 1
+        }
     }
 
     test("merged group collapses to ONE batch WO carrying total qty + lot_count") {
@@ -107,228 +114,32 @@ class Pass2WoConsolidationTest : FunSpec({
         out[0]["lot_count"] shouldBe 3                        // ceil(2500 / max_lot_size 1000)
     }
 
-    test("singletons and failed WOs pass through unchanged") {
+    test("singletons pass through unchanged; failed WOs are excluded") {
         val wos = listOf(
             wo("RAW1", "L", "purchase", 100.0, "2024-05-01", "2024-06-20", "D1"),
             wo("RAW1", "L", "make", 50.0, "2024-05-01", "2024-05-10", "D2", failed = true),
         )
         val out = consolidateWorkOrdersByTiming(wos, data, windowDays = 30).consolidated
-        out.size shouldBe 2
+        // Failed WOs are excluded (flattenPeggingToWorkOrders already skips them in production;
+        // the one-pass design aligns consolidation with the same filter).
+        out.size shouldBe 1
+        out[0]["product_id"] shouldBe "RAW1"
         out.none { it["consolidated"] == true } shouldBe true
     }
 
-    // ── Helpers for readjustConsolidatedWoTiming tests ──────────────────────────────────────────
-
-    val D = DateTimeFormatter.ofPattern("yyyy-MM-dd")
-    fun daysBetween(start: String, end: String): Long =
-        LocalDate.parse(end, D).toEpochDay() - LocalDate.parse(start, D).toEpochDay()
-
-    // Pegging tree WO node
-    fun woNode(
-        woGid: String, start: String, end: String,
-        children: List<Map<String, Any?>> = emptyList(),
-        failed: Boolean = false,
-    ): Map<String, Any?> = buildMap {
-        put("type", "work_order"); put("wo_group_id", woGid)
-        put("start_time", start); put("end_time", end)
-        if (children.isNotEmpty()) put("children", children)
-        if (failed) put("failed", true)
-    }
-
-    // Pegging tree entry
-    fun peg(demandId: String, tree: Map<String, Any?>): Map<String, Any?> =
-        mapOf("demand_id" to demandId, "tree" to tree)
-
-    // Consolidated WO record
-    fun cWo(cgid: String, start: String, end: String): Map<String, Any?> =
-        mapOf("consolidated_group_id" to cgid, "start_time" to start, "end_time" to end)
-
-    // Native WO record
-    fun nWo(woGid: String, cgid: String, start: String, end: String): Map<String, Any?> =
-        mapOf("wo_group_id" to woGid, "consolidated_group_id" to cgid, "start_time" to start, "end_time" to end)
-
-    @Suppress("UNCHECKED_CAST")
-    fun treeOf(entry: Map<String, Any?>) = entry["tree"] as Map<String, Any?>
-
-    @Suppress("UNCHECKED_CAST")
-    fun childAt(node: Map<String, Any?>, idx: Int = 0) =
-        (node["children"] as List<Map<String, Any?>>)[idx]
-
-    // ── readjustConsolidatedWoTiming tests ──────────────────────────────────────────────────────
-
-    test("readjust — leaf WO start pushed to latest constituent; lead_time preserved") {
-        // D1.start=May01, D2.start=May03 — batch can't begin until May03; lead=7d
-        // consolidated initial: start=May01, end=May08
-        // expected after: start=May03, end=May10; both demand pegging WOs updated
-        val trees = listOf(
-            peg("D1", woNode("W1", "2024-05-01", "2024-05-05")),
-            peg("D2", woNode("W2", "2024-05-03", "2024-05-08")),
-        )
-        val consolidation = WoConsolidation(
-            consolidated = listOf(cWo("CG1", "2024-05-01", "2024-05-08")),
-            native = listOf(
-                nWo("W1", "CG1", "2024-05-01", "2024-05-05"),
-                nWo("W2", "CG1", "2024-05-03", "2024-05-08"),
-            ),
-        )
-        val (adjTrees, adjConsolidated) = readjustConsolidatedWoTiming(trees, consolidation)
-
-        adjConsolidated[0]["start_time"] shouldBe "2024-05-03"
-        adjConsolidated[0]["end_time"] shouldBe "2024-05-10"
-
-        treeOf(adjTrees[0])["start_time"] shouldBe "2024-05-03"
-        treeOf(adjTrees[0])["end_time"] shouldBe "2024-05-10"
-        treeOf(adjTrees[1])["start_time"] shouldBe "2024-05-03"
-        treeOf(adjTrees[1])["end_time"] shouldBe "2024-05-10"
-
-        // lead_time preserved
-        daysBetween(adjConsolidated[0]["start_time"] as String, adjConsolidated[0]["end_time"] as String) shouldBe 7L
-    }
-
-    test("readjust — no-op when all constituents share the same start; returns same tree references") {
-        val node1 = woNode("W1", "2024-05-01", "2024-05-08")
-        val node2 = woNode("W2", "2024-05-01", "2024-05-08")
-        val entry1 = peg("D1", node1)
-        val entry2 = peg("D2", node2)
-        val trees = listOf(entry1, entry2)
-        val consolidation = WoConsolidation(
-            consolidated = listOf(cWo("CG1", "2024-05-01", "2024-05-08")),
-            native = listOf(
-                nWo("W1", "CG1", "2024-05-01", "2024-05-08"),
-                nWo("W2", "CG1", "2024-05-01", "2024-05-08"),
-            ),
-        )
-        val (adjTrees, _) = readjustConsolidatedWoTiming(trees, consolidation)
-        // Structural sharing: unchanged entries are the exact same reference
-        adjTrees[0] shouldBe entry1
-        adjTrees[1] shouldBe entry2
-    }
-
-    test("readjust — singleton group (1-demand) never needs a push") {
-        val entry = peg("D1", woNode("W1", "2024-05-01", "2024-05-08"))
-        val consolidation = WoConsolidation(
-            consolidated = listOf(cWo("CG1", "2024-05-01", "2024-05-08")),
-            native = listOf(nWo("W1", "CG1", "2024-05-01", "2024-05-08")),
-        )
-        val (adjTrees, adjCons) = readjustConsolidatedWoTiming(listOf(entry), consolidation)
-        adjCons[0]["start_time"] shouldBe "2024-05-01"
-        adjCons[0]["end_time"] shouldBe "2024-05-08"
-        adjTrees[0] shouldBe entry
-    }
-
-    test("readjust — cascade: delayed component pushes parent WO in same BOM pass") {
-        // D1: FG1(May06–May15, lead=9d) depends on RAW1(May01–May05, lead=4d) [CG_RAW]
-        // D2: FG2(May09–May18, lead=9d) depends on RAW2(May03–May08, lead=5d) [CG_RAW]
-        // CG_RAW start=May01 must push to May03 → parent WO effective_start = May10
-        // CG_FG  start=May06 must push to May10
-        val raw1 = woNode("W_RAW_D1", "2024-05-01", "2024-05-05")
-        val raw2 = woNode("W_RAW_D2", "2024-05-03", "2024-05-08")
-        val fg1  = woNode("W_FG_D1",  "2024-05-06", "2024-05-15", children = listOf(raw1))
-        val fg2  = woNode("W_FG_D2",  "2024-05-09", "2024-05-18", children = listOf(raw2))
-        val trees = listOf(peg("D1", fg1), peg("D2", fg2))
-        val consolidation = WoConsolidation(
-            consolidated = listOf(
-                cWo("CG_RAW", "2024-05-01", "2024-05-08"),   // lead=7d
-                cWo("CG_FG",  "2024-05-06", "2024-05-18"),   // lead=12d
-            ),
-            native = listOf(
-                nWo("W_RAW_D1", "CG_RAW", "2024-05-01", "2024-05-05"),
-                nWo("W_RAW_D2", "CG_RAW", "2024-05-03", "2024-05-08"),
-                nWo("W_FG_D1",  "CG_FG",  "2024-05-06", "2024-05-15"),
-                nWo("W_FG_D2",  "CG_FG",  "2024-05-09", "2024-05-18"),
-            ),
-        )
-        val (adjTrees, adjCons) = readjustConsolidatedWoTiming(trees, consolidation)
-
-        val cRaw = adjCons.first { it["consolidated_group_id"] == "CG_RAW" }
-        val cFg  = adjCons.first { it["consolidated_group_id"] == "CG_FG" }
-
-        // RAW batch pushed: D2.start=May03 > CG_RAW.start=May01
-        cRaw["start_time"] shouldBe "2024-05-03"
-        cRaw["end_time"]   shouldBe "2024-05-10"   // May03 + 7d lead
-        daysBetween(cRaw["start_time"] as String, cRaw["end_time"] as String) shouldBe 7L
-
-        // FG batch pushed: effective_start=RAW.end=May10 > CG_FG.start=May06
-        cFg["start_time"] shouldBe "2024-05-10"
-        cFg["end_time"]   shouldBe "2024-05-22"    // May10 + 12d lead
-        daysBetween(cFg["start_time"] as String, cFg["end_time"] as String) shouldBe 12L
-
-        // D1 pegging: both levels updated
-        val d1Fg  = treeOf(adjTrees[0])
-        val d1Raw = childAt(d1Fg)
-        d1Raw["start_time"] shouldBe "2024-05-03"; d1Raw["end_time"] shouldBe "2024-05-10"
-        d1Fg["start_time"]  shouldBe "2024-05-10"; d1Fg["end_time"]  shouldBe "2024-05-22"
-
-        // D2 pegging: both levels updated
-        val d2Fg  = treeOf(adjTrees[1])
-        val d2Raw = childAt(d2Fg)
-        d2Raw["start_time"] shouldBe "2024-05-03"; d2Raw["end_time"] shouldBe "2024-05-10"
-        d2Fg["start_time"]  shouldBe "2024-05-10"; d2Fg["end_time"]  shouldBe "2024-05-22"
-    }
-
-    test("readjust — failed WO nodes are skipped and passed through unchanged") {
-        val failedNode = woNode("W_FAIL", "2024-05-01", "2024-05-05", failed = true)
-        val trees = listOf(peg("D1", failedNode))
-        val consolidation = WoConsolidation(
-            consolidated = listOf(cWo("CG1", "2024-05-01", "2024-05-08")),
-            native = listOf(nWo("W_FAIL", "CG1", "2024-05-01", "2024-05-05")),
-        )
-        val (adjTrees, _) = readjustConsolidatedWoTiming(trees, consolidation)
-        // Failed node must not be mutated
-        treeOf(adjTrees[0])["end_time"] shouldBe "2024-05-05"
-        treeOf(adjTrees[0])["failed"]   shouldBe true
-    }
-
-    test("readjust — WO nodes without wo_group_id are unchanged (no consolidated match)") {
-        // A demand pegging may have WO nodes whose wo_group_id is absent
-        val orphan = mapOf("type" to "work_order", "start_time" to "2024-05-01", "end_time" to "2024-05-05")
-        val trees = listOf(peg("D1", orphan))
-        val consolidation = WoConsolidation(consolidated = emptyList(), native = emptyList())
-        val (adjTrees, _) = readjustConsolidatedWoTiming(trees, consolidation)
-        treeOf(adjTrees[0])["end_time"] shouldBe "2024-05-05"
-    }
-
-    test("readjust — stable: second call on already-converged output is identity") {
-        val trees = listOf(
-            peg("D1", woNode("W1", "2024-05-01", "2024-05-05")),
-            peg("D2", woNode("W2", "2024-05-03", "2024-05-08")),
-        )
-        val consolidation = WoConsolidation(
-            consolidated = listOf(cWo("CG1", "2024-05-01", "2024-05-08")),
-            native = listOf(
-                nWo("W1", "CG1", "2024-05-01", "2024-05-05"),
-                nWo("W2", "CG1", "2024-05-03", "2024-05-08"),
-            ),
-        )
-        val (adjTrees1, adjCons1) = readjustConsolidatedWoTiming(trees, consolidation)
-        // Build a new WoConsolidation from the adjusted output and call again
-        val consolidation2 = WoConsolidation(
-            consolidated = adjCons1,
-            native = listOf(
-                nWo("W1", "CG1", adjCons1[0]["start_time"] as String, adjCons1[0]["end_time"] as String),
-                nWo("W2", "CG1", adjCons1[0]["start_time"] as String, adjCons1[0]["end_time"] as String),
-            ),
-        )
-        val (adjTrees2, adjCons2) = readjustConsolidatedWoTiming(adjTrees1, consolidation2)
-        // Second pass must produce identical output (no further changes)
-        adjCons2[0]["start_time"] shouldBe adjCons1[0]["start_time"]
-        adjCons2[0]["end_time"]   shouldBe adjCons1[0]["end_time"]
-        adjTrees2[0] shouldBe adjTrees1[0]
-        adjTrees2[1] shouldBe adjTrees1[1]
-    }
-
     test("PARTITION invariant — every native belongs to EXACTLY ONE consolidated WO; qty conserved") {
-        // A mix: a 2-WO merge group, a lone singleton (different window), and a failed pass-through.
+        // A mix: a 2-WO merge group, a lone singleton (different window), and a failed WO (excluded).
         val wos = listOf(
             wo("RAW1", "L", "purchase", 200.0, "2024-05-01", "2024-06-20", "D1"),
             wo("RAW1", "L", "purchase", 300.0, "2024-05-03", "2024-06-22", "D2"),
             wo("RAW1", "L", "purchase", 70.0, "2024-09-01", "2024-10-21", "D3"),  // far window → singleton
-            wo("RAW1", "L", "make", 50.0, "2024-05-01", "2024-05-10", "D4", failed = true),  // pass-through
+            wo("RAW1", "L", "make", 50.0, "2024-05-01", "2024-05-10", "D4", failed = true),  // excluded
         )
         val res = consolidateWorkOrdersByTiming(wos, data, windowDays = 7)
+        val validWos = wos.filterNot { it["failed"] == true }
 
-        // 1. Coverage: every native is present, and each carries a consolidated_group_id.
-        res.native.size shouldBe wos.size
+        // 1. Coverage: every non-failed native is present, each carries a consolidated_group_id.
+        res.native.size shouldBe validWos.size
         res.native.all { it["consolidated_group_id"] != null } shouldBe true
 
         // 2. Bijection: the group ids seen on natives are exactly those on the consolidated WOs,
@@ -345,7 +156,164 @@ class Pass2WoConsolidationTest : FunSpec({
             qtyOf(c) shouldBe (members.sumOf { qtyOf(it) } plusOrMinus 1e-6)
         }
 
-        // 4. Global conservation: total qty is preserved across the partition.
-        res.consolidated.sumOf { qtyOf(it) } shouldBe (wos.sumOf { qtyOf(it) } plusOrMinus 1e-6)
+        // 4. Global conservation: total qty across non-failed WOs is preserved.
+        res.consolidated.sumOf { qtyOf(it) } shouldBe (validWos.sumOf { qtyOf(it) } plusOrMinus 1e-6)
+    }
+
+    // ── consolidateByWaves — bottom-up wave propagation over real pegging trees ─────────────────
+
+    // Pegging tree WO node carrying full product/method identity (unlike the flat `wo()` helper,
+    // demand_id is NOT set here — it's threaded down from the `peg()` wrapper, matching how
+    // consolidateByWaves's walk() actually attributes demandId to every WO node in a tree).
+    fun woNode(
+        gid: String, pid: String, lid: String, method: String, qty: Double,
+        start: String, end: String,
+        source: String? = null,
+        children: List<Map<String, Any?>> = emptyList(),
+        failed: Boolean = false,
+    ): Map<String, Any?> = buildMap {
+        put("type", "work_order"); put("wo_group_id", gid)
+        put("product_id", pid); put("location_id", lid); put("method", method)
+        put("quantity", qty); put("start_time", start); put("end_time", end)
+        put("location_source", source)
+        if (children.isNotEmpty()) put("children", children)
+        if (failed) put("failed", true)
+    }
+
+    fun peg(demandId: String, tree: Map<String, Any?>): Map<String, Any?> =
+        mapOf("demand_id" to demandId, "tree" to tree)
+
+    @Suppress("UNCHECKED_CAST")
+    fun treeOf(entry: Map<String, Any?>) = entry["tree"] as Map<String, Any?>
+
+    @Suppress("UNCHECKED_CAST")
+    fun childAt(node: Map<String, Any?>, idx: Int = 0) =
+        (node["children"] as List<Map<String, Any?>>)[idx]
+
+    test("multi-wave cascade: a delayed RAW batch pushes the FG batch's start in the same pass") {
+        // D1: FG(May05–?) depends on RAW_D1(May01–May08, 7d lead via native-duration fallback)
+        // D2: FG(May06–?) depends on RAW_D2(May03–May10, 7d lead via native-duration fallback)
+        // RAW_D1/RAW_D2 share (product,location,method) and merge in wave 0. A merged bucket's start
+        // must be >= EVERY member's own pendingStart (each member's own correctly-computed earliest
+        // legal start) or the later member's predecessor constraint would be silently violated — so
+        // the merge takes max(May01,May03)=May03, end=May03+7d=May10 (no method_buy fixture, so lead
+        // falls back to native duration).
+        // Both FG batches depend on RAW and must wait for the merged RAW group's end (May10) — later
+        // than either FG's own native start — before being bucketed in wave 1.
+        val rawD1 = woNode("WG_RAW_D1", "RAW1", "L", "purchase", 200.0, "2024-05-01", "2024-05-08")
+        val rawD2 = woNode("WG_RAW_D2", "RAW1", "L", "purchase", 300.0, "2024-05-03", "2024-05-10")
+        val fgD1 = woNode("WG_FG_D1", "FG1", "L", "make", 80.0, "2024-05-05", "2024-05-09", children = listOf(rawD1))
+        val fgD2 = woNode("WG_FG_D2", "FG1", "L", "make", 80.0, "2024-05-06", "2024-05-10", children = listOf(rawD2))
+        val trees = listOf(peg("D1", fgD1), peg("D2", fgD2))
+
+        val res = consolidateByWaves(trees, data, windowDays = 30)
+
+        val cRaw = res.consolidation.consolidated.first { it["method"] == "purchase" }
+        val cFg = res.consolidation.consolidated.first { it["method"] == "make" }
+
+        cRaw["start_time"] shouldBe "2024-05-03"
+        cRaw["end_time"] shouldBe "2024-05-10"
+
+        // FG must wait for RAW's end (May10), not start at either of its own native starts.
+        cFg["start_time"] shouldBe "2024-05-10"
+
+        // The rewritten pegging trees reflect the same final timing at both levels.
+        val d1Fg = treeOf(res.peggingTrees[0])
+        val d1Raw = childAt(d1Fg)
+        d1Raw["start_time"] shouldBe "2024-05-03"; d1Raw["end_time"] shouldBe "2024-05-10"
+        d1Fg["start_time"] shouldBe "2024-05-10"
+
+        val d2Fg = treeOf(res.peggingTrees[1])
+        val d2Raw = childAt(d2Fg)
+        d2Raw["start_time"] shouldBe "2024-05-03"; d2Raw["end_time"] shouldBe "2024-05-10"
+        d2Fg["start_time"] shouldBe "2024-05-10"
+    }
+
+    test("cross-tree shared wo_group_id (F30__888-style): occurrences aggregate before bucketing") {
+        // Two SEPARATE pegging trees (e.g. a VIRTUAL consolidation demand and a real demand)
+        // referencing the SAME physical WO group, each carrying a partial slice of its quantity.
+        val sliceD1 = woNode("WG_SHARED", "RAW1", "L", "purchase", 150.0, "2024-05-01", "2024-05-08")
+        val sliceD2 = woNode("WG_SHARED", "RAW1", "L", "purchase", 350.0, "2024-05-01", "2024-05-08")
+        val trees = listOf(peg("D1", sliceD1), peg("D2", sliceD2))
+
+        val res = consolidateByWaves(trees, data, windowDays = 30)
+
+        // Aggregated into exactly ONE consolidated WO carrying the combined quantity.
+        res.consolidation.consolidated.size shouldBe 1
+        qtyOf(res.consolidation.consolidated[0]) shouldBe (500.0 plusOrMinus 1e-6)
+        @Suppress("UNCHECKED_CAST")
+        (res.consolidation.consolidated[0]["wo_competing_demands"] as List<String>) shouldContainExactlyInAnyOrder
+            listOf("D1", "D2")
+
+        // Both native occurrences roll into the SAME consolidated group.
+        res.consolidation.native.size shouldBe 2
+        val cgid = res.consolidation.consolidated[0]["consolidated_group_id"]
+        cgid.shouldNotBeNull()
+        res.consolidation.native.all { it["consolidated_group_id"] == cgid } shouldBe true
+    }
+
+    test("lot_count and duration recompute together across a lot-size boundary") {
+        // FG1@L: max_lot_size=100, lead_time=3d/wave, no operation/bor fixture so parallelismCap
+        // falls back to 0 → coerced to a cap of 1 lot per wave. Two 80-unit make WOs, each under
+        // the lot-size cap alone (1 lot, 3d), merge to 160 units → lot_count=ceil(160/100)=2,
+        // numWaves=ceil(2/1)=2, duration=2*3d=6d — neither value matches either constituent alone.
+        val fgData: Map<String, List<Map<String, Any?>>> = mapOf(
+            "productlocation" to listOf(
+                mapOf("product_id" to "FG1", "location_id" to "L", "max_lot_size" to 100.0),
+            ),
+            "method_make" to listOf(
+                mapOf("product_id" to "FG1", "location_id" to "L", "lead_time" to 3),
+            ),
+        )
+        val w1 = woNode("WG_FG_A", "FG1", "L", "make", 80.0, "2024-05-01", "2024-05-03")
+        val w2 = woNode("WG_FG_B", "FG1", "L", "make", 80.0, "2024-05-01", "2024-05-03")
+        val trees = listOf(peg("D1", w1), peg("D2", w2))
+
+        val res = consolidateByWaves(trees, fgData, windowDays = 30)
+
+        res.consolidation.consolidated.size shouldBe 1
+        val c = res.consolidation.consolidated[0]
+        qtyOf(c) shouldBe (160.0 plusOrMinus 1e-6)
+        c["lot_count"] shouldBe 2
+        c["start_time"] shouldBe "2024-05-01"
+        c["end_time"] shouldBe "2024-05-07"   // May01 + 2 waves * 3d
+    }
+
+    test("failed=true subtrees are excluded uniformly — AND (BOM) child and OR (alt-method) sibling") {
+        // AND case: FG depends on two BOM components, one of which is failed=true.
+        val rawOk = woNode("WG_RAW_OK", "RAW1", "L", "purchase", 100.0, "2024-05-01", "2024-05-08")
+        val rawFailed = woNode("WG_RAW_FAIL", "RAW2", "L", "purchase", 999.0, "2024-05-01", "2024-05-08", failed = true)
+        val fg = woNode("WG_FG", "FG1", "L", "make", 80.0, "2024-05-09", "2024-05-12", children = listOf(rawOk, rawFailed))
+
+        // OR case: two top-level sibling alternatives for the same demand, one is the non-chosen
+        // (failed=true) alternative method.
+        val altA = woNode("WG_ALT_A", "RAW3", "L", "purchase", 50.0, "2024-05-01", "2024-05-05", failed = true)
+        val altB = woNode("WG_ALT_B", "RAW3", "L", "purchase", 50.0, "2024-05-01", "2024-05-05")
+        val orRoot = mapOf("type" to "demand", "children" to listOf(altA, altB))
+
+        val res = consolidateByWaves(listOf(peg("D1", fg), peg("D2", orRoot)), data, windowDays = 30)
+
+        val gids = res.consolidation.consolidated.mapNotNull { it["wo_group_id"] as? String } +
+            res.consolidation.native.mapNotNull { it["wo_group_id"] as? String }
+        gids.shouldNotContainFailedGids("WG_RAW_FAIL", "WG_ALT_A")
+        res.consolidation.consolidated.size shouldBe 3   // WG_RAW_OK, WG_FG, WG_ALT_B — failed gids excluded
+
+        // The failed AND-child carries no dependency edge, so FG's wave resolution is driven
+        // entirely by WG_RAW_OK's end_time (May08) — not blocked or altered by the excluded sibling.
+        val cFg = res.consolidation.consolidated.first { it["wo_group_id"] == "WG_FG" }
+        cFg["start_time"] shouldBe "2024-05-09"
+
+        // Failed nodes are left unmutated in the rewritten trees (passed through, not dropped —
+        // pegging trees keep them for diagnostics even though the WO lists exclude them).
+        val fgTree = treeOf(res.peggingTrees[0])
+        val failedChild = childAt(fgTree, 1)
+        failedChild["failed"] shouldBe true
+        failedChild["end_time"] shouldBe "2024-05-08"
     }
 })
+
+private fun List<String>.shouldNotContainFailedGids(vararg failedGids: String) {
+    for (g in failedGids) {
+        if (this.contains(g)) throw AssertionError("expected failed gid $g to be excluded from WO output, found in $this")
+    }
+}

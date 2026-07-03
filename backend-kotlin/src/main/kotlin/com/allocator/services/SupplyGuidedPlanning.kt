@@ -115,11 +115,14 @@ internal fun buildSupplyAllocation(
     }
 
     // Critical-materials filter:
-    //   Step A — restrict to raw-buyable materials: products that appear in method_buy AND
-    //            have prod_area='raw' in productlocation.  Make-only, WIP, and OB items
-    //            are excluded entirely — they are not "Purchase allowed" candidates.
-    //   Step B — from those candidates, keep only the UNSELECTED ones: products NOT in
-    //            purchasable_materials config (the user's "Purchase allowed" selection).
+    //   Step A — restrict to the "Purchasable raw materials" candidate set: products that have
+    //            method_buy AND prod_area='raw' in productlocation.  This is exactly the set
+    //            that appears in the UI selection list.  Make-only, WIP, and OB items are
+    //            excluded — they are not purchasable candidates.
+    //   Step B — from those candidates, keep only the UNSELECTED (unchecked) ones: products
+    //            NOT in purchasable_materials config.  These are the materials the user has
+    //            explicitly NOT allowed purchasing → existing supply is the only source →
+    //            proportional allocation is required.
     //   Open-world semantics: absent from allocation map ⇒ uncapped in planning.
     val rawBuyableIds  = buildRawBuyableSet(data)
     val candidateMatrix = filterToProductIds(requestMatrix, rawBuyableIds)
@@ -730,7 +733,8 @@ private fun filterToCritical(matrix: NeedsMatrix, purchasable: Set<String>): Nee
     return NeedsMatrix(newByRow, newByColumn)
 }
 
-/** Returns the set of product_ids that are raw-buyable ("Purchase allowed" candidates).
+/** Returns the "Purchasable raw materials" candidate set: products with method_buy AND
+ *  prod_area='raw' in productlocation — the exact set shown in the UI selection list.
  *  Delegates to [partitionBuyables] — same classification used by [effectivePurchasableSet]. */
 private fun buildRawBuyableSet(data: Map<String, List<Map<String, Any?>>>): Set<String> =
     partitionBuyables(data).first

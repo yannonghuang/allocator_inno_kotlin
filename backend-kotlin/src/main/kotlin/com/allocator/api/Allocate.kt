@@ -1468,7 +1468,7 @@ fun Routing.allocateRoutes() {
         val body = runCatching { call.receiveText() }.getOrElse { "" }
         val payload = if (body.isBlank()) JsonObject(emptyMap())
                       else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrElse { JsonObject(emptyMap()) }
-        val deepCheck = payload["deep_check"]?.jsonPrimitive?.booleanOrNull ?: false
+        val deepCheck = payload["deep_check"]?.jsonPrimitive?.booleanOrNull ?: true
 
         val reportJson = runSoundnessCheckForRun(caseId, runId, deepCheck)
         call.respond(reportJson)
@@ -1583,9 +1583,11 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
         val resultMap = jsonElementToNative(resultElement) as? Map<String, Any?>
             ?: throw IllegalStateException("Plan run result is not a JSON object")
         @Suppress("UNCHECKED_CAST")
-        val planningPegging = (resultMap["planning_pegging"] as? List<Map<String, Any?>>) ?: emptyList()
+        val inlinePegging = (resultMap["planning_pegging"] as? List<Map<String, Any?>>)?.takeIf { it.isNotEmpty() }
         @Suppress("UNCHECKED_CAST")
         val workOrders = (resultMap["work_orders"] as? List<Map<String, Any?>>) ?: emptyList()
+        @Suppress("UNCHECKED_CAST")
+        val workOrdersNative = (resultMap["work_orders_native"] as? List<Map<String, Any?>>) ?: emptyList()
         @Suppress("UNCHECKED_CAST")
         val committedDemandsForCheck = (resultMap["committed_demands"] as? List<Map<String, Any?>>) ?: emptyList()
         @Suppress("UNCHECKED_CAST")
@@ -1618,18 +1620,62 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
                     )}
             }
         } else emptyList()
-        com.allocator.services.checkRunSoundness(
-            planningPegging = planningPegging,
-            demands = demands,
-            data = data,
-            config = com.allocator.services.SoundnessConfig(deepCheck = deepCheck),
-            workOrders = workOrders,
-            committedDemands = committedDemandsForCheck,
-            overrideIndex = overrideIndexForCheck,
-            inventoryEffectiveInitial = inventoryInitial,
-            inventoryLeftover = inventoryLeftover,
-            supplyAllocations = supplyAllocations,
-        )
+        val soundnessConfig = com.allocator.services.SoundnessConfig(deepCheck = deepCheck)
+        if (inlinePegging != null) {
+            // In-transit run: pegging is embedded inline — use normal list-based check.
+            com.allocator.services.checkRunSoundness(
+                planningPegging = inlinePegging,
+                demands = demands,
+                data = data,
+                config = soundnessConfig,
+                workOrders = workOrders,
+                workOrdersNative = workOrdersNative,
+                committedDemands = committedDemandsForCheck,
+                overrideIndex = overrideIndexForCheck,
+                inventoryEffectiveInitial = inventoryInitial,
+                inventoryLeftover = inventoryLeftover,
+                supplyAllocations = supplyAllocations,
+            )
+        } else {
+            // Persisted run: pegging is in plan_pegging table and can exceed 2 GB total.
+            // Stream one entry at a time via keyset pagination (id > lastId) so only one
+            // parsed tree is in heap at once — prevents OOM on large VIRTUAL consolidation entries.
+            com.allocator.services.checkRunSoundnessStreaming(
+                forEachEntry = { block ->
+                    var lastId = 0
+                    while (true) {
+                        var fetched = false
+                        transaction {
+                            PlanPegging.selectAll()
+                                .where { (PlanPegging.planRunId eq runId) and (PlanPegging.id greater lastId) }
+                                .orderBy(PlanPegging.id)
+                                .limit(1)
+                                .forEach { row ->
+                                    lastId = row[PlanPegging.id]
+                                    runCatching {
+                                        (jsonToAny(Json.parseToJsonElement(row[PlanPegging.entry])) as? Map<String, Any?>)
+                                            ?.let(block)
+                                    }.onFailure { e ->
+                                        log.warn("[soundness] pegging parse error run={} id={}: {}", runId, lastId, e.message)
+                                    }
+                                    fetched = true
+                                }
+                        }
+                        if (!fetched) break
+                    }
+                },
+                demands = demands,
+                data = data,
+                config = soundnessConfig,
+                workOrders = workOrders,
+                workOrdersNative = workOrdersNative,
+                committedDemands = committedDemandsForCheck,
+                overrideIndex = overrideIndexForCheck,
+                inventoryEffectiveInitial = inventoryInitial,
+                inventoryLeftover = inventoryLeftover,
+                supplyAllocations = supplyAllocations,
+            )
+        }
     } catch (e: Exception) {
         transaction {
             PlanRuns.update({ (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }) {
@@ -1680,6 +1726,17 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
         }
         putJsonArray("conservation_violations") {
             for (msg in report.conservationViolations) add(JsonPrimitive(msg))
+        }
+        putJsonArray("inventory_priority_violations") {
+            for (msg in report.inventoryPriorityViolations) add(JsonPrimitive(msg))
+        }
+        putJsonArray("wo_gid_orphan_violations") {
+            for (v in report.woGidOrphanViolations) addJsonObject {
+                put("rule", v.rule)
+                put("node_path", v.nodePath)
+                put("message", v.message)
+                put("actual", anyToJson(v.actual))
+            }
         }
     }
     transaction {
@@ -2555,12 +2612,20 @@ internal suspend fun runPlanBackground(
         // "completed" to the frontend. Pegging and KB upsert are fire-and-forget.
         val resultJson = if (autoSave) serializeResultOrNull(enriched) else null
         val serializeFailed = autoSave && resultJson == null
-        // Serialize inventory snapshots for R7e soundness check (compact — supply_id + qty only).
+        // Serialize inventory snapshots for R7e / R10 soundness checks.
+        // Include demand_tag so R10 can exclude per-demand reservation buckets —
+        // tagged buckets are private to their assigned demand and their leftover
+        // is not available to other demands' WOs (should not trigger R10).
+        fun compactInv(rows: List<Map<String, Any?>>) = rows.map {
+            val m = mutableMapOf<String, Any?>("supply_id" to it["supply_id"], "qty" to it["qty"])
+            it["demand_tag"]?.let { tag -> m["demand_tag"] = tag }
+            m
+        }
         val invInitialJson = if (autoSave && !serializeFailed)
-            runCatching { anyToJson(raw.inventoryEffectiveInitial.map { mapOf("supply_id" to it["supply_id"], "qty" to it["qty"]) }).toString() }.getOrNull()
+            runCatching { anyToJson(compactInv(raw.inventoryEffectiveInitial)).toString() }.getOrNull()
         else null
         val invLeftoverJson = if (autoSave && !serializeFailed)
-            runCatching { anyToJson(raw.inventoryLeftover.map { mapOf("supply_id" to it["supply_id"], "qty" to it["qty"]) }).toString() }.getOrNull()
+            runCatching { anyToJson(compactInv(raw.inventoryLeftover)).toString() }.getOrNull()
         else null
         transaction {
             PlanRuns.update({ PlanRuns.id eq planRunId }) {
@@ -3018,6 +3083,12 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
                 "priority_first" -> "priority_first"
                 else             -> "fair"
             })
+            // Per-type WO batch scales — persist when present so reloading a run restores what was run.
+            val validScales = setOf("none", "weekly", "biweekly", "monthly", "all")
+            listOf("wo_batch_scale", "make_batch_scale", "move_batch_scale", "purchase_batch_scale").forEach { key ->
+                val v = consolidation[key]?.toString()
+                if (v != null && v in validScales) put(key, v)
+            }
         }
     }
 }

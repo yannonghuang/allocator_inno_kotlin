@@ -44,7 +44,17 @@ import kotlin.math.abs
  *      taught to restore inventory.
  *   R8 conservation (deep check) — committed_qty at root = Σ over leaves
  *      of (leaf.qty × ∏ rates along leaf→root path), within tolerance.
- *      Skipped unless [SoundnessConfig.deepCheck] = true.
+ *      Enabled by default ([SoundnessConfig.deepCheck] = true).
+ *   R10 inventory priority — for every (product, location) that has work orders,
+ *   R11 wo_group_id orphan check — every wo_group_id referenced in any pegging
+ *      tree WO node must map to at least one lot in work_orders. An orphaned gid
+ *      means resequenceFromPegging's pushUp skipped the subtree — parent WOs in
+ *      that tree are not pushed when ResourceScheduler shifts the underlying lots.
+ *      Skipped when work_orders is not provided to [checkRunSoundness].
+ *      all physical supply inventory available on or before the earliest WO
+ *      start_time must have been consumed. Leftover timely inventory while WOs
+ *      run indicates the planner created unnecessary production. Gates overallSound.
+ *      Skipped when inventoryLeftover snapshots are not provided.
  *
  * The checker is a pure function — it neither mutates inputs nor consults the
  * database. Callers feed it the persisted plan-run state plus the case data.
@@ -62,7 +72,7 @@ data class SoundnessConfig(
      * accumulating qty × rate. Cost is O(tree size) per demand — proportional
      * to plan complexity.
      */
-    val deepCheck: Boolean = false,
+    val deepCheck: Boolean = true,
     /** Floating-point tolerance for quantity / rate comparisons. */
     val tolerance: Double = 1e-6,
     /**
@@ -123,6 +133,19 @@ data class SoundnessReport(
      * [producedByComponent] or [workOrders] was not passed to [checkRunSoundness].
      */
     val woConservationViolations: List<String> = emptyList(),
+    /**
+     * R10 inventory-priority violations: timely physical supply inventory was left unconsumed
+     * at a (product, location) while new work orders were created there. Empty when
+     * [inventoryLeftover] was not provided (e.g. historical runs without persisted snapshots).
+     */
+    val inventoryPriorityViolations: List<String> = emptyList(),
+    /**
+     * R11 wo_group_id orphan violations: a wo_group_id referenced in a pegging-tree WO node
+     * has no corresponding lot in work_orders. Orphaned gids break pushUp propagation in
+     * resequenceFromPegging, causing parent WOs in those trees to not be rescheduled when
+     * ResourceScheduler shifts the underlying real WOs. Empty when work_orders was not passed.
+     */
+    val woGidOrphanViolations: List<Violation> = emptyList(),
 )
 
 /**
@@ -152,6 +175,7 @@ fun checkRunSoundness(
     data: Map<String, List<Map<String, Any?>>>,
     config: SoundnessConfig = SoundnessConfig(),
     workOrders: List<Map<String, Any?>> = emptyList(),
+    workOrdersNative: List<Map<String, Any?>> = emptyList(),
     committedDemands: List<Map<String, Any?>> = emptyList(),
     overrideIndex: Map<String, Map<String, Any?>> = emptyMap(),
     /**
@@ -192,6 +216,12 @@ fun checkRunSoundness(
     // bug in one of them. Index by demand_id; if a demand has multiple rows
     // (legacy paths sometimes append per-iteration), sum their `quantity`.
     val committedQtyById = mutableMapOf<String, Double>()
+    // demand_ids whose committed_demands rows are ALL hard-planning-failures (no benign row at
+    // all) — a genuine "nothing could be planned" demand, for which the engine legitimately
+    // emits no pegging tree. R0_no_tree below must skip these the same way committedQtyById
+    // already does (see comment below), or it false-positives on Negative_Inventory_* pseudo-
+    // demands and any fully-blocked real demand.
+    val anyBenignRowByDemand = mutableMapOf<String, Boolean>()
     for (row in committedDemands) {
         val did = row["demand_id"]?.toString() ?: continue
         if (did.isBlank()) continue
@@ -204,10 +234,22 @@ fun checkRunSoundness(
         // real demand). Benign reasons (inventory, partial, null) and the
         // `no_methods_succeeded` zero-qty placeholder pass through.
         val reason = row["commit_reason"] as? String
-        if (isHardPlanningFailure(reason)) continue
+        if (isHardPlanningFailure(reason)) {
+            if (did !in anyBenignRowByDemand) anyBenignRowByDemand[did] = false
+            continue
+        }
+        anyBenignRowByDemand[did] = true
         val q = (row["quantity"] as? Number)?.toDouble() ?: 0.0
         committedQtyById[did] = (committedQtyById[did] ?: 0.0) + q
     }
+    // Negative_Inventory_* pseudo-demands (synthetic rows representing negative starting
+    // inventory) can fail planning so completely that the engine emits no committed_demands
+    // row AT ALL — not even a hard-failure shortfall row — so they never reach
+    // anyBenignRowByDemand above. Catch that case directly by demand_id prefix instead of
+    // relying on committed_demands presence.
+    val hardFailureDemandIds = anyBenignRowByDemand.filterValues { !it }.keys +
+        demands.mapNotNull { it["demand_id"]?.toString() }
+            .filter { it.startsWith("Negative_Inventory_") && it !in anyBenignRowByDemand }
 
     // Total WO production at each (pid, lid). Currently unused by any rule
     // (R7c moved to a more correct cap below). Kept around because rule
@@ -291,9 +333,13 @@ fun checkRunSoundness(
         val tree = treeByDemand[demandId]
         if (tree == null) {
             val qty = (demandRow["quantity"] as? Number)?.toDouble() ?: 0.0
-            if (qty > 0 && planningPegging.isNotEmpty()) {
+            if (qty > 0 && planningPegging.isNotEmpty() && demandId !in hardFailureDemandIds) {
                 // Demand has no pegging tree but pegging was provided — genuine missing
                 // tree. The engine should emit a tree even for cycle_stopped / depth_limit.
+                // (Demands whose committed_demands rows are ALL hard-planning-failures —
+                // e.g. Negative_Inventory_* pseudo-demands with commit_reason=no_methods —
+                // legitimately have no tree at all; skipped above via hardFailureDemandIds,
+                // matching committedQtyById's existing skip for the same row class.)
                 demandReports.add(DemandSoundness(
                     demandId = demandId,
                     sound = false,
@@ -437,11 +483,16 @@ fun checkRunSoundness(
 
     // R7e: conservation of mass — only when both inventory snapshots are provided.
     // DB-loaded soundness checks on historical runs pass empty lists and skip this.
+    //
+    // No servedDemandIds filter here: supply allocations already represent real
+    // inventory consumption (extractSupplyAllocations skips failed=true subtrees whose
+    // draws were rolled back). Filtering by post-reconcile servedDemandIds would
+    // incorrectly exclude VIRTUAL consolidation demands whose inventory was consumed
+    // pre-reconcile but whose committed_qty was zeroed by reconcile() post-extraction.
     val conservationViolations: List<String> =
         if (inventoryEffectiveInitial.isNotEmpty() && inventoryLeftover.isNotEmpty())
             verifyInventoryConservation(
                 inventoryEffectiveInitial, inventoryLeftover, supplyAllocations,
-                servedDemandIds = servedDemandIds.ifEmpty { null },
             )
         else emptyList()
 
@@ -463,14 +514,30 @@ fun checkRunSoundness(
             )
         else emptyList()
 
+    // R10: inventory priority — timely physical inventory must be exhausted before
+    // creating WOs at the same component. Only runs when inventoryLeftover is available
+    // (same guard as R7e; skipped for historical runs without persisted snapshots).
+    val inventoryPriorityViolations: List<String> =
+        if (inventoryLeftover.isNotEmpty() && workOrders.isNotEmpty())
+            verifyInventoryPriority(inventoryLeftover, workOrders, supplies)
+        else emptyList()
+
+    // R11: wo_group_id orphan check — only when work_orders is available.
+    val woGidOrphanViolations: List<Violation> =
+        if (workOrders.isNotEmpty()) verifyWoGidOrphans(planningPegging, workOrders, workOrdersNative)
+        else emptyList()
+
     val soundCount = demandReports.count { it.sound }
     // R7f (component conservation) and R7g (WO conservation) are efficiency signals:
     // they fire at max_iterations=1 by design (budget leakage is expected and reclaimed
     // naturally at higher iter counts). They do NOT gate overallSound so that sound plans
     // can still be promoted to KB even when single-pass allocation leaves some slack.
+    // R10/R11 gate overallSound: scheduling errors are planning bugs.
     val overallSound = soundCount == demandReports.size &&
         crossViolations.isEmpty() &&
-        conservationViolations.isEmpty()
+        conservationViolations.isEmpty() &&
+        inventoryPriorityViolations.isEmpty() &&
+        woGidOrphanViolations.isEmpty()
 
     return SoundnessReport(
         overallSound = overallSound,
@@ -482,6 +549,8 @@ fun checkRunSoundness(
         conservationViolations = conservationViolations,
         componentConservationViolations = componentConservationViolations,
         woConservationViolations = woConservationViolations,
+        inventoryPriorityViolations = inventoryPriorityViolations,
+        woGidOrphanViolations = woGidOrphanViolations,
     )
 }
 
@@ -1248,6 +1317,68 @@ private class WalkContext(
     }
 }
 
+/**
+ * R11 — wo_group_id orphan check.
+ *
+ * Collects every wo_group_id referenced by a non-failed WO node across all
+ * pegging trees, then checks each against the set of gids present in
+ * work_orders.  An orphaned gid (in trees but not in lots) means
+ * resequenceFromPegging's pushUp returned early for that subtree —
+ * parent WOs in the affected chain are not rescheduled when
+ * ResourceScheduler shifts underlying real WOs, leading to stale timings.
+ */
+@Suppress("UNCHECKED_CAST")
+internal fun verifyWoGidOrphans(
+    planningPegging: List<Map<String, Any?>>,
+    workOrders: List<Map<String, Any?>>,
+    workOrdersNative: List<Map<String, Any?>> = emptyList(),
+): List<Violation> {
+    fun extractGids(list: List<Map<String, Any?>>): Set<String> =
+        list.mapNotNullTo(mutableSetOf()) { (it["wo_group_id"] as? String)?.trim()?.takeIf(String::isNotBlank) }
+    // Include native (pre-consolidation) gids: move WOs merged into a mixed-cargo consolidated WO
+    // retain their original gid only in work_orders_native, not in consolidated work_orders.
+    val gidsInLots: Set<String> = extractGids(workOrders) + extractGids(workOrdersNative)
+
+    val orphans = mutableSetOf<String>()
+
+    fun collect(node: Map<String, Any?>, depth: Int) {
+        if (depth > 60) return
+        if (node["failed"] == true) return  // mirror flattenPeggingToWorkOrders: skip entire failed subtree
+        if (node["type"] == "work_order") {
+            val gid = (node["wo_group_id"] as? String)?.trim()
+            if (!gid.isNullOrBlank() && gid !in gidsInLots) orphans.add(gid)
+        }
+        for (c in (node["children"] as? List<Map<String, Any?>>) ?: emptyList()) collect(c, depth + 1)
+    }
+
+    for (entry in planningPegging) {
+        val tree = entry["tree"] as? Map<String, Any?> ?: continue
+        collect(tree, 0)
+    }
+
+    if (orphans.isEmpty()) return emptyList()
+    val violations = mutableListOf<Violation>()
+    val sample = orphans.take(20)
+    for (gid in sample) {
+        violations.add(Violation(
+            rule = "R11_wo_gid_orphan",
+            nodePath = "gid:$gid",
+            message = "wo_group_id '$gid' is referenced in pegging trees but has no lot in work_orders. " +
+                "resequenceFromPegging's pushUp cannot propagate timing through this subtree.",
+            actual = gid,
+        ))
+    }
+    if (orphans.size > 20) {
+        violations.add(Violation(
+            rule = "R11_wo_gid_orphan",
+            nodePath = "summary",
+            message = "${orphans.size} orphaned wo_group_ids total (first 20 shown).",
+            actual = orphans.size,
+        ))
+    }
+    return violations
+}
+
 private fun parseDateLocal(s: String?): LocalDate? {
     if (s.isNullOrBlank()) return null
     return try {
@@ -1255,4 +1386,262 @@ private fun parseDateLocal(s: String?): LocalDate? {
     } catch (_: DateTimeParseException) {
         null
     }
+}
+
+/**
+ * Streaming variant of [checkRunSoundness] that processes pegging entries one at a time.
+ *
+ * Use when the full pegging dataset is too large to hold in memory (e.g. a persisted run
+ * loaded from the plan_pegging table where total JSON can exceed 2 GB).  The caller supplies
+ * a [forEachEntry] callback that drives iteration: the callback receives a block and must call
+ * the block exactly once per pegging entry.  Each entry is processed immediately and can be
+ * GC-collected before the next one arrives.
+ *
+ * Cross-tree rule R11 accumulates a lightweight gid set across all entries and checks it after
+ * the pass completes.
+ *
+ * Differences from [checkRunSoundness]:
+ * - R7f (component conservation) and R7g (WO conservation) are not supported (they require
+ *   producedByComponent, which is only available for in-transit runs).
+ * - Otherwise equivalent: same per-demand rules (R0–R9), same cross-demand rules (R7b, R7c,
+ *   R7e, R10, R11).
+ */
+@Suppress("UNCHECKED_CAST")
+internal fun checkRunSoundnessStreaming(
+    forEachEntry: ((Map<String, Any?>) -> Unit) -> Unit,
+    demands: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+    config: SoundnessConfig = SoundnessConfig(),
+    workOrders: List<Map<String, Any?>> = emptyList(),
+    workOrdersNative: List<Map<String, Any?>> = emptyList(),
+    committedDemands: List<Map<String, Any?>> = emptyList(),
+    overrideIndex: Map<String, Map<String, Any?>> = emptyMap(),
+    inventoryEffectiveInitial: List<Map<String, Any?>> = emptyList(),
+    inventoryLeftover: List<Map<String, Any?>> = emptyList(),
+    supplyAllocations: List<Map<String, Any?>> = emptyList(),
+): SoundnessReport {
+    // ── Index building (same as checkRunSoundness) ────────────────────────────
+    val demandById: Map<String, Map<String, Any?>> = demands.associateBy { it["demand_id"]?.toString() ?: "" }
+    val bomRows = data["bom"] ?: emptyList()
+    val methodMakes = data["method_make"] ?: emptyList()
+    val methodMoves = data["method_move"] ?: emptyList()
+    val supplies = data["supply"] ?: emptyList()
+    val supplyById: Map<String, Map<String, Any?>> = supplies.associateBy { it["supply_id"]?.toString() ?: "" }
+
+    val committedQtyById = mutableMapOf<String, Double>()
+    // See checkRunSoundness's anyBenignRowByDemand/hardFailureDemandIds for the rationale:
+    // demands whose committed_demands rows are ALL hard-planning-failures (or who have no
+    // committed_demands row at all, e.g. Negative_Inventory_* pseudo-demands) legitimately
+    // get no pegging tree — R0_no_tree below must skip them or it false-positives.
+    val anyBenignRowByDemand = mutableMapOf<String, Boolean>()
+    for (row in committedDemands) {
+        val did = row["demand_id"]?.toString() ?: continue
+        if (did.isBlank()) continue
+        val reason = row["commit_reason"] as? String
+        if (isHardPlanningFailure(reason)) {
+            if (did !in anyBenignRowByDemand) anyBenignRowByDemand[did] = false
+            continue
+        }
+        anyBenignRowByDemand[did] = true
+        val q = (row["quantity"] as? Number)?.toDouble() ?: 0.0
+        committedQtyById[did] = (committedQtyById[did] ?: 0.0) + q
+    }
+    val hardFailureDemandIds = anyBenignRowByDemand.filterValues { !it }.keys +
+        demands.mapNotNull { it["demand_id"]?.toString() }
+            .filter { it.startsWith("Negative_Inventory_") && it !in anyBenignRowByDemand }
+
+    // ── Pre-build work_orders index (R11) ────────────────────────────────────
+    // Include native (pre-consolidation) gids: after consolidation, individual move-WO gids
+    // (e.g. wog19 for a per-product VIRTUAL move) survive only in work_orders_native, not in
+    // the consolidated work_orders (which merges them into a mixed-cargo WO with a new gid).
+    fun extractGids(list: List<Map<String, Any?>>): Set<String> =
+        list.mapNotNullTo(mutableSetOf()) { (it["wo_group_id"] as? String)?.trim()?.takeIf(String::isNotBlank) }
+    val gidsInLots: Set<String> = extractGids(workOrders) + extractGids(workOrdersNative)
+
+    // ── Streaming accumulators ────────────────────────────────────────────────
+    val consolidatorAllocationByComponent = mutableMapOf<String, Double>()
+    val seenCanonicalDemands = mutableSetOf<String>()
+    val peggingDuplicateDemandCount = mutableMapOf<String, Int>()
+    val demandReports = mutableListOf<DemandSoundness>()
+    val crossDemandSupplyConsumption  = mutableMapOf<String, Double>()
+    val crossDemandSyntheticConsumption = mutableMapOf<String, Double>()
+    var anyPeggingEntry = false
+
+    val orphanGids = mutableSetOf<String>()                            // R11
+
+    // ── Single streaming pass ─────────────────────────────────────────────────
+    forEachEntry { entry ->
+        anyPeggingEntry = true
+        val isConsolidated = entry["consolidated"] == true
+        val isPassthrough  = entry["passthrough"]  == true
+        val did = entry["demand_id"]?.toString()
+        val tree = (entry["tree"] as? Map<String, Any?>) ?: return@forEachEntry
+
+        // R7c: consolidator allocation accumulation
+        if (isConsolidated || isPassthrough) {
+            val pid = (tree["product_id"]    as? String)?.trim()?.takeIf(String::isNotBlank)
+            val lid = (tree["location_id"]   as? String)?.trim()?.takeIf(String::isNotBlank)
+            val committed = (tree["committed_qty"] as? Number)?.toDouble() ?: 0.0
+            if (pid != null && lid != null && committed > 0) {
+                val key = "$pid|$lid"
+                consolidatorAllocationByComponent[key] = (consolidatorAllocationByComponent[key] ?: 0.0) + committed
+            }
+        }
+
+        // R11: collect orphaned gids from this tree
+        if (workOrders.isNotEmpty()) {
+            fun collectGids(node: Map<String, Any?>, depth: Int) {
+                if (depth > 60) return
+                if (node["failed"] == true) return  // mirror flattenPeggingToWorkOrders: skip entire failed subtree
+                if (node["type"] == "work_order") {
+                    val gid = (node["wo_group_id"] as? String)?.trim()
+                    if (!gid.isNullOrBlank() && gid !in gidsInLots) orphanGids.add(gid)
+                }
+                for (c in (node["children"] as? List<Map<String, Any?>>) ?: emptyList()) collectGids(c, depth + 1)
+            }
+            collectGids(tree, 0)
+        }
+
+        // Per-demand checks (R0–R9): only canonical demand entries
+        if (did == null || did.isBlank() || isPassthrough || isConsolidated) return@forEachEntry
+
+        peggingDuplicateDemandCount[did] = (peggingDuplicateDemandCount[did] ?: 0) + 1
+        if (!seenCanonicalDemands.add(did)) return@forEachEntry  // duplicate — skip; R0 fires below
+
+        val demandRow = demandById[did] ?: return@forEachEntry
+
+        val ctx = WalkContext(
+            demandId   = did,
+            demandRow  = demandRow,
+            bomRows    = bomRows,
+            methodMakes = methodMakes,
+            methodMoves = methodMoves,
+            supplyById  = supplyById,
+            config      = config,
+            overrideIndex = overrideIndex,
+            data        = data,
+        )
+        ctx.walkRoot(tree)
+
+        for ((supplyId, qty) in ctx.supplyConsumption)    crossDemandSupplyConsumption.merge(supplyId, qty, Double::plus)
+        for ((compKey, qty) in ctx.syntheticConsumption)  crossDemandSyntheticConsumption.merge(compKey, qty, Double::plus)
+
+        if (committedQtyById.isNotEmpty()) {
+            val tableQty = committedQtyById[did]
+            val treeQty  = (tree["committed_qty"] as? Number)?.toDouble() ?: 0.0
+            if (tableQty != null && kotlin.math.abs(tableQty - treeQty) > config.tolerance) {
+                ctx.violations.add(Violation(
+                    rule     = "R0_committed_consistency",
+                    nodePath = "0",
+                    message  = "committed_demands.quantity=$tableQty doesn't match pegging root.committed_qty=$treeQty for demand $did.",
+                    expected = treeQty,
+                    actual   = tableQty,
+                ))
+            }
+        }
+
+        demandReports.add(DemandSoundness(demandId = did, sound = ctx.violations.isEmpty(), violations = ctx.violations.toList()))
+    }
+
+    // ── Post-pass: missing-tree reports ──────────────────────────────────────
+    for ((demandId, demandRow) in demandById) {
+        if (demandId in seenCanonicalDemands) continue
+        val qty = (demandRow["quantity"] as? Number)?.toDouble() ?: 0.0
+        if (qty > 0 && anyPeggingEntry && demandId !in hardFailureDemandIds) {
+            demandReports.add(DemandSoundness(
+                demandId = demandId, sound = false,
+                violations = listOf(Violation(rule = "R0_no_tree", nodePath = "", message = "Demand has no pegging tree in planning_pegging.")),
+            ))
+        } else {
+            demandReports.add(DemandSoundness(demandId = demandId, sound = true, violations = emptyList()))
+        }
+    }
+
+    val crossViolations = mutableListOf<Violation>()
+
+    // R0 pegging duplicate
+    for ((did, count) in peggingDuplicateDemandCount) {
+        if (count <= 1) continue
+        crossViolations.add(Violation(
+            rule = "R0_pegging_duplicate", nodePath = "demand:$did",
+            message = "demand_id=$did has $count entries in planning_pegging; expected exactly one canonical tree.",
+            expected = 1, actual = count,
+        ))
+    }
+
+    // R7b cross-demand supply.qty bound
+    for ((supplyId, totalConsumed) in crossDemandSupplyConsumption) {
+        val supply = supplyById[supplyId] ?: continue
+        val available = (supply["qty"] as? Number)?.toDouble() ?: 0.0
+        val tol = maxOf(config.tolerance, 1e-9 * available)
+        if (totalConsumed > available + tol) {
+            crossViolations.add(Violation(
+                rule = "R7b_supply_overconsumption", nodePath = "supply:$supplyId",
+                message = "Total qty consumed across all demands exceeds supply.qty.",
+                expected = available, actual = totalConsumed,
+            ))
+        }
+    }
+
+    // R7c synthetic-bucket bound
+    if (consolidatorAllocationByComponent.isNotEmpty()) {
+        for ((componentKey, totalConsumed) in crossDemandSyntheticConsumption) {
+            val cap = consolidatorAllocationByComponent[componentKey] ?: 0.0
+            val tol = maxOf(config.tolerance, 1e-9 * cap)
+            if (totalConsumed > cap + tol) {
+                crossViolations.add(Violation(
+                    rule = "R7c_consolidated_overconsumption", nodePath = "synthetic:$componentKey",
+                    message = "Σ consumption from synthetic 'consolidated_$componentKey' bucket exceeds consolidator's allocation at $componentKey.",
+                    expected = cap, actual = totalConsumed,
+                ))
+            }
+        }
+    }
+
+    // R7e conservation — no servedDemandIds filter (see checkRunSoundness comment above)
+    val conservationViolations: List<String> =
+        if (inventoryEffectiveInitial.isNotEmpty() && inventoryLeftover.isNotEmpty())
+            verifyInventoryConservation(inventoryEffectiveInitial, inventoryLeftover, supplyAllocations)
+        else emptyList()
+
+    // R10 inventory priority
+    val inventoryPriorityViolations: List<String> =
+        if (inventoryLeftover.isNotEmpty() && workOrders.isNotEmpty())
+            verifyInventoryPriority(inventoryLeftover, workOrders, supplies)
+        else emptyList()
+
+    // R11: from accumulated orphan gids
+    val woGidOrphanViolations: List<Violation> = if (workOrders.isNotEmpty() && orphanGids.isNotEmpty()) {
+        val vs = mutableListOf<Violation>()
+        for (gid in orphanGids.take(20)) {
+            vs.add(Violation(rule = "R11_wo_gid_orphan", nodePath = "gid:$gid",
+                message = "wo_group_id '$gid' is referenced in pegging trees but has no lot in work_orders. " +
+                    "resequenceFromPegging's pushUp cannot propagate timing through this subtree.",
+                actual = gid))
+        }
+        if (orphanGids.size > 20) vs.add(Violation(rule = "R11_wo_gid_orphan", nodePath = "summary",
+            message = "${orphanGids.size} orphaned wo_group_ids total (first 20 shown).", actual = orphanGids.size))
+        vs
+    } else emptyList()
+
+    val soundCount = demandReports.count { it.sound }
+    val overallSound = soundCount == demandReports.size &&
+        crossViolations.isEmpty() &&
+        conservationViolations.isEmpty() &&
+        inventoryPriorityViolations.isEmpty() &&
+        woGidOrphanViolations.isEmpty()
+
+    return SoundnessReport(
+        overallSound  = overallSound,
+        demandCount   = demandReports.size,
+        soundCount    = soundCount,
+        demands       = demandReports,
+        crossDemandViolations = crossViolations,
+        deepCheck     = config.deepCheck,
+        conservationViolations = conservationViolations,
+        componentConservationViolations = emptyList(),  // not applicable for DB-loaded runs
+        woConservationViolations        = emptyList(),  // not applicable for DB-loaded runs
+        inventoryPriorityViolations     = inventoryPriorityViolations,
+        woGidOrphanViolations           = woGidOrphanViolations,
+    )
 }

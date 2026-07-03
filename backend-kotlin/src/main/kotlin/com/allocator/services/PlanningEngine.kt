@@ -459,8 +459,8 @@ private fun consumeFromInventory(
             val avail = (b["qty"] as? Number)?.toDouble() ?: 0.0
             if (avail <= 0) continue
             val sid = b["supply_id"]?.toString()
-            // perLotBudget acts as a whitelist: a lot absent from the map gets cap 0.0 (not unlimited).
-            val lotCap = if (perLotBudget != null && sid != null) (perLotBudget[sid] ?: 0.0) else null
+            // perLotBudget caps individual lots present in the map; absent lots are uncapped (non-critical pool).
+            val lotCap = if (perLotBudget != null && sid != null && perLotBudget.containsKey(sid)) perLotBudget[sid] else null
             val take = min(avail, if (lotCap != null) min(remaining, lotCap) else remaining)
             if (take <= 0) continue
             b["qty"] = avail - take
@@ -2202,7 +2202,7 @@ fun plan(
     val budgetCap = budget?.get(componentKey)
         ?: perLotBudget?.values?.sum()?.takeIf { it > 1e-9 }
     val consumedBuckets = consumeFromInventory(
-        inventory, productId, locationId, quantity, preferDemandId, budgetCap, perLotBudget,
+        inventory, productId, locationId, quantity, preferDemandId, null, perLotBudget,
     )
     val taken = consumedBuckets.sumOf { it.qty }
     // Write back per-lot budget remainders.
@@ -3030,7 +3030,24 @@ private fun reconcile(
                 val newChildren = allChildren.map { ch -> (ch as? Map<String, Any?>)?.let { reconcile(it, want, data).first } ?: ch }
                 return (node + mapOf("quantity" to want, "children" to newChildren)) to want
             }
-            fun rateOf(cd: Map<String, Any?>) = if (curQty > 1e-9) ((cd["quantity"] as? Number)?.toDouble() ?: 0.0) / curQty else 0.0
+            // Prefer the TRUE BOM rate over inferring it from cd["quantity"]/curQty — the latter
+            // encodes BOM_rate × (whatever upstream achieved) and drifts from the real rate whenever
+            // an ancestor was already trimmed/lot-rounded inconsistently (the same class of bug
+            // Mechanism C fixed for the OR aggregate below, but the AND branch's ask still used the
+            // naive ratio — propagating, not correcting, upstream drift through nested AND levels;
+            // root cause of the R4_qty_propagation/R8_deep_conservation violation class). Falls back
+            // to the ratio only when no real BOM row exists (synthetic/virtual nodes).
+            val parentPid = (node["product_id"] as? String)?.trim() ?: ""
+            val bomRowsForRate = data["bom"] ?: emptyList()
+            val parentBomRowsForRate = bomRowsForRate.filter { (it["parent_id"] as? String)?.trim() == parentPid }
+            fun rateOf(cd: Map<String, Any?>): Double {
+                val childPid = (cd["product_id"] as? String)?.trim() ?: ""
+                val actualRate = parentBomRowsForRate
+                    .firstOrNull { (it["child_id"] as? String)?.trim() == childPid }
+                    ?.let { (it["rate"] as? Number)?.toDouble() }
+                if (actualRate != null && actualRate > 1e-9) return actualRate
+                return if (curQty > 1e-9) ((cd["quantity"] as? Number)?.toDouble() ?: 0.0) / curQty else 0.0
+            }
             val rel = node["children_relation"] as? String
             // First (and only) ask: each component for want × rate. Capture the trimmed node AND
             // how many parents it can back (committed / rate). Reconcile each child ONCE here.
@@ -3150,7 +3167,7 @@ private fun flattenPeggingToWorkOrders(
                 put("prod_area", getProdArea(pid, lid, data))
                 put("override_active", n["override_active"] ?: false)
                 put("wo_group_id", n["wo_group_id"])
-                put("lot_count", n["lot_count"])
+                put("lot_count", 1)            // capacity/lot-size splitting deferred to WO consolidation
                 put("max_lot_size", n["max_lot_size"])
                 put("wave_index", 0)
                 if (members != null) put("consolidated_demand_ids", members)
@@ -3170,8 +3187,8 @@ private fun flattenPeggingToWorkOrders(
  * Pass 2 — work-order timing/scheduling consolidation.
  *
  * Batches per-demand work orders that produce/buy/move the SAME
- * (product, location, method, source) and start within the same scheduling window
- * into fewer, larger orders (re-lotted by max_lot_size), cutting the WO count.
+ * (product, location, method, source) into fewer, larger orders (re-lotted by
+ * max_lot_size), cutting the WO count.
  * This is the scheduling counterpart to Pass-1 inventory allocation: Pass 1 decides
  * WHO gets scarce stock; Pass 2 decides HOW to batch the resulting production.
  *
@@ -3181,16 +3198,18 @@ private fun flattenPeggingToWorkOrders(
  * existing consolidated-WO rendering. Singleton groups pass through unchanged, as do
  * failed-WO stubs and any WO without a parseable start.
  *
- * Merged timing: the batch is ready by the EARLIEST member end (so it serves the
- * soonest demand in the window), started one full lead earlier.
+ * Lot-count strategy — sum first, then divide to lots:
+ *   • make / buy → keyed by (product, location, method, source, window): WOs in the same
+ *     window are merged; the merged total is divided by max_lot_size to derive `lot_count`
+ *     (NOT summing the constituent native lot_counts). Resource capacity (lot sizing) is
+ *     applied ONLY here, not at the per-demand native-WO level (native WOs carry lot_count=1).
+ *     Singletons also get lot_count recomputed from qty/lotSize.
+ *   • MOVE → same windowing; merged into a single mixed-cargo shipment per window.
  *
  * Size: each group collapses to ONE batch order carrying the group's TOTAL quantity
- * plus `lot_count` = ceil(total / max_lot_size) — the max-lot-size detail is metadata,
- * not separate work orders. (Re-emitting per-lot WOs would not shrink the count, since
- * the inputs are already one lot each: the WO count is driven by total_qty/max_lot_size.)
+ * plus `lot_count` = ceil(total / max_lot_size).
  *
- * @param windowDays scheduling bucket width; <=0 collapses the whole horizon into one
- *   window. Conservative default is a small window (e.g. 7) so batching stays local.
+ * @param windowDays scheduling bucket width; <=0 collapses the whole horizon into one window.
  */
 internal data class WoConsolidation(
     /** Merged work-order summary: consolidated batches + un-mergeable singletons + pass-throughs. */
@@ -3200,154 +3219,527 @@ internal data class WoConsolidation(
     val native: List<Map<String, Any?>>,
 )
 
-internal data class ReadjustResult(
-    val peggingTrees: List<Map<String, Any?>>,
-    val consolidatedWos: List<Map<String, Any?>>,
-)
-
+/**
+ * Test bridge: wraps a flat list of native WOs in synthetic single-node pegging trees and
+ * delegates to [consolidateByWaves]. Preserves the original test API so unit tests don't need to
+ * construct full pegging trees. Each WO is given its own synthetic node (no nesting), so the
+ * dependency graph is trivially empty and every group resolves in wave 0 — identical behavior to
+ * the old single-pass bucketing.
+ */
 internal fun consolidateWorkOrdersByTiming(
     workOrders: List<Map<String, Any?>>,
     data: Map<String, List<Map<String, Any?>>>,
     windowDays: Int,
 ): WoConsolidation {
-    val consolidatedOut = mutableListOf<Map<String, Any?>>()
-    val nativeOut = mutableListOf<Map<String, Any?>>()
-
-    // INVARIANT: every native (input) WO is included in EXACTLY ONE consolidated WO. Each output WO
-    // and its constituent native(s) share a `consolidated_group_id`, so the two lists form a strict
-    // partition — no native is lost, and none is double-counted across the native/consolidated tabs.
-    fun emitSingleton(wo: Map<String, Any?>) {
-        val cgid = nextWoGroupId()
-        consolidatedOut.add(wo + ("consolidated_group_id" to cgid))
-        nativeOut.add(wo + ("consolidated_group_id" to cgid))
-    }
-
-    if (workOrders.size < 2) {
-        workOrders.forEach { emitSingleton(it) }
-        return WoConsolidation(consolidatedOut, nativeOut)
-    }
-
-    fun bucketOf(start: String?): Long {
-        val d = parseDate(start) ?: return Long.MIN_VALUE
-        return if (windowDays <= 0) 0L else Math.floorDiv(d.toEpochDay(), windowDays.toLong())
-    }
-
-    val passthrough = mutableListOf<Map<String, Any?>>()
-    val groupable = mutableListOf<Map<String, Any?>>()
-    for (wo in workOrders) {
-        if (wo["failed"] == true || parseDate(wo["start_time"] as? String) == null) passthrough.add(wo)
-        else groupable.add(wo)
-    }
-    passthrough.forEach { emitSingleton(it) }
-
-    // Eligibility (WORK-ORDER-LIST summary only — never touches the per-demand pegging, so
-    // constituents need NOT have identical sub-trees). qty = sum, start = min, end = max.
-    //   • make / buy → keyed by (product, location, method, source, window): one batch per
-    //     component, since each order produces/procures a single product.
-    //   • MOVE → keyed by (source, target, prod_area, window): a physical move from one
-    //     location to another in a window is a single shipment, but only components that
-    //     share the same prod_area are consolidated together — this preserves prod_area
-    //     attribution on the merged WO so pivot views align with the native breakdown.
-    //     The merged move WO still carries a `move_components` manifest.
-    val groups = groupable.groupBy {
-        if (it["method"] == "move") listOf(
-            "move",
-            (it["location_source"] as? String)?.trim(),  // source
-            (it["location_id"] as? String)?.trim(),       // target
-            (it["prod_area"] as? String)?.trim(),          // same prod_area only
-            bucketOf(it["start_time"] as? String),
-        ) else listOf(
-            (it["product_id"] as? String)?.trim(),
-            (it["location_id"] as? String)?.trim(),
-            it["method"] as? String,
-            (it["location_source"] as? String)?.trim(),
-            bucketOf(it["start_time"] as? String),
+    val trees = workOrders.map { wo ->
+        mapOf(
+            "demand_id" to wo["demand_id"],
+            "tree" to (wo + mapOf("type" to "work_order", "children" to emptyList<Any>())),
         )
     }
+    return consolidateByWaves(trees, data, windowDays).consolidation
+}
 
-    for ((_, wos) in groups) {
-        if (wos.size == 1) { emitSingleton(wos[0]); continue }
-        val first = wos[0]
-        val pid = (first["product_id"] as? String) ?: ""
-        val lid = (first["location_id"] as? String) ?: ""
-        val method = (first["method"] as? String) ?: ""
-        val totalQty = wos.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
-        if (totalQty <= 1e-9) { wos.forEach { emitSingleton(it) }; continue }
-        // This batch's id — shared with every constituent native via `consolidated_group_id`.
-        val cgid = nextWoGroupId()
+/** Result of [consolidateByWaves]: the rewritten pegging trees (final, pushed timings) plus the
+ *  consolidated/native WO lists. */
+internal data class WaveConsolidationResult(
+    val peggingTrees: List<Map<String, Any?>>,
+    val consolidation: WoConsolidation,
+)
 
-        // Merged span = [min(start), max(end)] across the constituents.
-        val mergedStart = wos.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull()
-        val mergedEnd = wos.mapNotNull { parseDate(it["end_time"] as? String) }.maxOrNull()
-        val demands = wos.mapNotNull { it["demand_id"] as? String }.filter { it.isNotBlank() }.distinct()
-        // Per-demand split: drives the union predecessor/successor (↓/↑) and the Requested column
-        // in the UI — woRowDemandIds reads wo_consolidation_split_details[].demand_id.
-        val splitDetails = wos.filter { (it["demand_id"] as? String)?.isNotBlank() == true }
-            .groupBy { it["demand_id"] as String }
-            .map { (d, ws) -> mapOf("demand_id" to d, "allocated_qty" to ws.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }) }
-        val overrideActive = wos.any { it["override_active"] == true }
+internal data class WoBatchConfig(
+    val make: String?,
+    val move: String?,
+    val purchase: String?,
+    val legacyWindowDays: Int = 0,
+) {
+    fun scaleFor(method: String?): String? = when (method) {
+        "make"     -> make
+        "move"     -> move
+        "purchase" -> purchase
+        else       -> make
+    }
+}
 
-        if (method == "move") {
-            // Same-prod_area mixed-product shipment: source → target in this window, carrying
-            // DIFFERENT components together, but all belonging to the same prod_area. There is
-            // no single product_id — the cargo is the `move_components` manifest (one entry per
-            // product). lot_count = 1 (one shipment; a move models reachability, with no
-            // per-product lotting). Pegging is untouched; per-product move nodes stay in each
-            // demand's tree, so soundness/drill-down by product still resolve there.
-            val moveComponents = wos.groupBy { (it["product_id"] as? String)?.trim() ?: "" }
-                .map { (p, ws) ->
+private fun calendarBucket(start: LocalDate, scale: String?, windowDays: Int): Long = when {
+    scale == "monthly"  -> start.year * 12L + start.monthValue
+    scale == "all"      -> 0L
+    scale == "weekly"   -> start.toEpochDay() / 7
+    scale == "biweekly" -> start.toEpochDay() / 14
+    windowDays > 0      -> start.toEpochDay() / windowDays
+    else                -> 0L
+}
+
+/**
+ * Post-wave display pass: merge consolidated WOs that share the same calendar bucket but arrived
+ * in different Kahn waves (and were therefore never in the same frontier).
+ *
+ * This is a pure presentation transformation — it only rewrites [WoConsolidation.consolidated]
+ * and remaps [WoConsolidation.native] `consolidated_group_id` pointers.  Pegging trees are
+ * intentionally left untouched; native WO timing was already correctly committed during the wave
+ * loop.
+ *
+ * The merge key mirrors the wave loop's base key plus a calendar bucket dimension:
+ *   make/buy:  (product_id, location_id, method, location_source, bucket)
+ *   move:      ("__move__", location_source, location_id, prod_area, bucket)
+ *
+ * Because bucket boundaries are epoch-rooted and fixed per WO (derived solely from that WO's own
+ * `start_time`), grouping is deterministic and cannot cascade.
+ */
+internal fun crossWaveCalendarMerge(
+    consolidation: WoConsolidation,
+    windowDays: Int,
+    data: Map<String, List<Map<String, Any?>>>,
+    woBatchConfig: WoBatchConfig? = null,
+): WoConsolidation {
+    val groups = linkedMapOf<List<Any?>, MutableList<Map<String, Any?>>>()
+    val nonePassthrough = mutableListOf<Map<String, Any?>>()
+    for (row in consolidation.consolidated) {
+        val method = row["method"] as? String ?: continue
+        val lid    = row["location_id"] as? String ?: continue
+        val locSrc = row["location_source"] as? String
+        val start  = parseDate(row["start_time"] as? String) ?: continue
+        val methodScale = woBatchConfig?.scaleFor(method)
+        if (methodScale == "none") { nonePassthrough.add(row); continue }
+        val wd = woBatchConfig?.legacyWindowDays ?: windowDays
+        val bucket = calendarBucket(start, methodScale, wd)
+        val key: List<Any?> = if (method == "move")
+            listOf("__move__", locSrc, lid, row["prod_area"], bucket)
+        else
+            listOf(row["product_id"], lid, method, locSrc, bucket)
+        groups.getOrPut(key) { mutableListOf() }.add(row)
+    }
+
+    val mergedConsolidated = mutableListOf<Map<String, Any?>>()
+    val cgidRemap = mutableMapOf<String, String>()
+    for (row in nonePassthrough) {
+        mergedConsolidated.add(row)
+        val cgid = row["consolidated_group_id"] as? String
+        if (cgid != null) cgidRemap[cgid] = cgid
+    }
+
+    for ((_, rows) in groups) {
+        // Fast path: single row — keep as-is.
+        if (rows.size == 1) {
+            mergedConsolidated.add(rows[0])
+            val cgid = rows[0]["consolidated_group_id"] as? String
+            if (cgid != null) cgidRemap[cgid] = cgid
+            continue
+        }
+
+        val first  = rows[0]
+        val method = first["method"] as? String ?: continue
+        val lid    = first["location_id"] as? String ?: continue
+        val pid    = first["product_id"] as? String           // null for move
+        val locSrc = first["location_source"] as? String
+
+        val totalQty   = rows.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
+        val mergedStart = rows.mapNotNull { parseDate(it["start_time"] as? String) }.maxOrNull()
+
+        if (mergedStart == null || totalQty <= 1e-9) {
+            mergedConsolidated.addAll(rows)
+            for (r in rows) { val c = r["consolidated_group_id"] as? String; if (c != null) cgidRemap[c] = c }
+            continue
+        }
+
+        // Lead-time recomputation from merged quantity, matching the wave loop's formula.
+        val leadDays: Double = when {
+            method == "move" -> {
+                // Transit time is route-fixed; derive from any existing row's span.
+                rows.mapNotNull { r ->
+                    val s = parseDate(r["start_time"] as? String)
+                    val e = parseDate(r["end_time"] as? String)
+                    if (s != null && e != null) (e.toEpochDay() - s.toEpochDay()).toDouble() else null
+                }.maxOrNull() ?: 0.0
+            }
+            pid != null -> {
+                val methodRow = getMethods(pid, lid, data).firstOrNull { it["type"] == method }
+                val lotSize   = (maxLotSize(pid, lid, data)?.takeIf { it > 0 } ?: totalQty).coerceAtLeast(1e-9)
+                val lotCount  = Math.ceil(totalQty / lotSize).toInt().coerceAtLeast(1)
+                val cap       = if (method == "make") OperationLookup.parallelismCap(pid, lid, data).coerceAtLeast(1) else Int.MAX_VALUE
+                val numWaves  = Math.ceil(lotCount.toDouble() / cap.toDouble()).toInt().coerceAtLeast(1)
+                val perWave   = methodRow?.let { leadDaysForMethod(it, pid, lid, totalQty, data) }
+                    ?: rows.mapNotNull { r ->
+                        val s = parseDate(r["start_time"] as? String)
+                        val e = parseDate(r["end_time"]   as? String)
+                        val wc = (r["wave_count"] as? Number)?.toInt()?.coerceAtLeast(1) ?: 1
+                        if (s != null && e != null) (e.toEpochDay() - s.toEpochDay()).toDouble() / wc else null
+                    }.maxOrNull() ?: 0.0
+                numWaves * perWave
+            }
+            else -> 0.0
+        }
+        val mergedEnd = dateAddDays(mergedStart, leadDays) ?: mergedStart
+
+        // Merge competing demands + split details from all constituent rows.
+        // Singleton rows only set demand_id (not wo_competing_demands); fall back to it so
+        // cross-wave merges of singletons still produce a non-empty consolidated_demand_ids.
+        @Suppress("UNCHECKED_CAST")
+        val allDemands = rows.flatMap { row ->
+            val fromCompeting = (row["wo_competing_demands"] as? List<String>) ?: emptyList()
+            val fromDemandId  = (row["demand_id"] as? String)?.takeIf { it.isNotBlank() }?.let { listOf(it) } ?: emptyList()
+            fromCompeting.ifEmpty { fromDemandId }
+        }.distinct()
+        @Suppress("UNCHECKED_CAST")
+        val mergedSplit = rows.flatMap { (it["consolidation_split_details"] as? List<Map<String, Any?>>) ?: emptyList() }
+            .groupBy { it["demand_id"] as? String }
+            .map { (d, es) -> mapOf("demand_id" to d, "allocated_qty" to es.sumOf { (it["allocated_qty"] as? Number)?.toDouble() ?: 0.0 }) }
+        val overrideActive = rows.any { it["override_active"] == true }
+
+        val newCgid = rows[0]["consolidated_group_id"] as? String ?: nextWoGroupId()
+        for (r in rows) { val c = r["consolidated_group_id"] as? String; if (c != null) cgidRemap[c] = newCgid }
+
+        val lotCount = if (method != "move" && pid != null) {
+            val lotSize = (maxLotSize(pid, lid, data)?.takeIf { it > 0 } ?: totalQty).coerceAtLeast(1e-9)
+            Math.ceil(totalQty / lotSize).toInt().coerceAtLeast(1)
+        } else rows.sumOf { (it["lot_count"] as? Number)?.toInt() ?: 1 }
+
+        val mergedRow = buildMap<String, Any?> {
+            put("product_id", pid)
+            put("location_id", lid)
+            put("quantity", totalQty)
+            put("start_time", formatDate(mergedStart))
+            put("end_time", formatDate(mergedEnd))
+            put("method", method)
+            put("location_source", locSrc)
+            put("demand_id", null)
+            put("prod_area", first["prod_area"])
+            put("override_active", overrideActive)
+            put("wo_group_id", newCgid)
+            put("consolidated_group_id", newCgid)
+            put("wave_index", 0)
+            put("lot_count", lotCount)
+            if (pid != null) maxLotSize(pid, lid, data)?.let { put("max_lot_size", it) }
+            put("consolidated", true)
+            put("wo_competing_demands", allDemands)
+            put("consolidation_split_details", mergedSplit)
+            put("consolidated_demand_ids", allDemands)
+            put("wo_window_start", formatDate(mergedStart))
+            put("wo_window_end", formatDate(mergedStart))
+            put("wo_consolidation_total_planned", totalQty)
+            if (method == "move") {
+                @Suppress("UNCHECKED_CAST")
+                val moveComponents = rows.flatMap { (it["move_components"] as? List<Map<String, Any?>>) ?: emptyList() }
+                    .groupBy { it["product_id"] as? String }
+                    .map { (p, comps) ->
+                        @Suppress("UNCHECKED_CAST")
+                        val splitMap = comps.flatMap { c ->
+                            (c["demand_splits"] as? List<Map<String, Any?>>) ?: emptyList()
+                        }.groupBy { it["demand_id"] as? String }
+                         .mapValues { (_, es) -> es.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 } }
+                        val demandSplits = splitMap.entries
+                            .sortedBy { it.key ?: "" }
+                            .map { (d, qty) -> mapOf("demand_id" to d, "quantity" to qty) }
+                        mapOf(
+                            "product_id"    to p,
+                            "quantity"      to comps.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 },
+                            "demand_ids"    to demandSplits.map { it["demand_id"] as String },
+                            "demand_splits" to demandSplits,
+                        )
+                    }.sortedBy { it["product_id"] as? String ?: "" }
+                put("move_components", moveComponents)
+                // Singleton rows entering crossWaveCalendarMerge carry their own product_id.
+                // After merging, if the shipment spans multiple products, null it out so the
+                // WO table renders "N components" instead of showing the first product's id.
+                val distinctMovePids = moveComponents.mapNotNull { it["product_id"] as? String }.distinct()
+                if (distinctMovePids.size != 1) put("product_id", null)
+            }
+        }
+        mergedConsolidated.add(mergedRow)
+    }
+
+    // Remap native rows' consolidated_group_id to their new canonical cgid.
+    val remappedNative = consolidation.native.map { row ->
+        val cgid = row["consolidated_group_id"] as? String
+        val newCgid = cgid?.let { cgidRemap[it] } ?: cgid
+        if (newCgid == cgid) row else row + mapOf("consolidated_group_id" to newCgid)
+    }
+
+    return WoConsolidation(mergedConsolidated, remappedNative)
+}
+
+/**
+ * Bottom-up, level-synchronous WO consolidation + timing propagation. Replaces the old
+ * consolidate-once-then-patch design (`consolidateFromPegging` + `readjustConsolidatedWoTiming`):
+ * that design bucketed every WO once using its native, pre-correction start_time, then pushed
+ * timing in a second pass that never re-bucketed — a WO pushed across a window boundary stayed
+ * merged with whatever else landed in its ORIGINAL bucket, and lead_time was preserved as the
+ * original interval instead of being recomputed from the post-merge lot_count.
+ *
+ * This processes WO groups (`wo_group_id`) in bottom-up topological waves, across ALL pegging
+ * trees at once (so a wo_group_id shared by more than one tree — e.g. a VIRTUAL consolidation
+ * demand sharing a physical WO with a real demand — resolves once, correctly). A group is only
+ * bucketed/timed once every group it depends on (BOM/alternative-method children, and producing
+ * WOs reached through a produced-supply sub-tree) has already been finalized. Each wave re-buckets
+ * using the just-computed (pushed) start time and recomputes duration from the post-merge
+ * lot_count via the same wave-packing formula used to build native WOs in [buildWorkOrders] — so a
+ * parent is never bucketed/timed before its dependencies are known, by construction, and "parent
+ * starts before child finishes" cannot occur.
+ *
+ * Same output contract as before: `consolidated` and `native` form a strict partition keyed by
+ * `consolidated_group_id`. Failed subtrees and zero-qty make WOs are skipped (mirroring
+ * flattenPeggingToWorkOrders so the R11 soundness check stays in sync).
+ */
+internal fun consolidateByWaves(
+    peggingTrees: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+    windowDays: Int,
+    woBatchConfig: WoBatchConfig? = null,
+): WaveConsolidationResult {
+    data class Occurrence(
+        val gid: String,                 // internal identity (real wo_group_id, or synthetic) — bucketing/dependency graph only
+        val originalGid: String?,        // raw wo_group_id on the node (possibly null) — preserved on native output
+        val pid: String,
+        val lid: String,
+        val method: String?,
+        val locationSource: String?,
+        val qty: Double,
+        val nativeStart: LocalDate?,
+        val nativeEnd: LocalDate?,
+        val demandId: String?,
+        val overrideActive: Boolean,
+        val nativeMaxLotSize: Any?,
+        val members: List<String>?,
+    )
+
+    class GidInfo {
+        var pid: String = ""
+        var lid: String = ""
+        var method: String? = null
+        var locationSource: String? = null
+        var totalQty: Double = 0.0
+        var occurrenceCount: Int = 0
+        var nativeStart: LocalDate? = null
+        var overrideActive: Boolean = false
+        var nativeDuration: Double? = null
+        val demandQty: LinkedHashMap<String, Double> = LinkedHashMap()
+        var sampleMembers: List<String>? = null
+    }
+
+    // ── Phase A: walk every pegging tree once, collecting WO occurrences and the GLOBAL
+    // dependency graph (parentsOf: gid -> set of gids that depend on it). Mirrors buildPeggingDag's
+    // walk: skip failed subtrees, re-root through work_order nodes, recurse THROUGH supply/purchase
+    // children without changing the current parent (so a producing WO nested under a supply node is
+    // attributed as a dependency of the ORIGINAL consuming WO), and record leafConstraintByGid (the
+    // latest supply/purchase commit_time reachable under a gid) as a lower bound on that gid's start.
+    val occurrences = mutableListOf<Occurrence>()
+    val parentsOf = mutableMapOf<String, MutableSet<String>>()
+    val leafConstraintByGid = mutableMapOf<String, LocalDate>()
+    var syntheticSeq = 0
+
+    @Suppress("UNCHECKED_CAST")
+    fun walk(node: Any?, demandId: Any?, members: List<String>?, currentParent: String?, depth: Int) {
+        if (depth > 80) return
+        val n = node as? Map<String, Any?> ?: return
+        if (n["failed"] == true) return
+        val nodeChildren = (n["children"] as? List<*>) ?: emptyList<Any?>()
+        when (n["type"] as? String) {
+            "work_order" -> {
+                if (n["method"] == "make" && ((n["quantity"] as? Number)?.toDouble() ?: 0.0) < 1e-6) return
+                val pid = (n["product_id"] as? String)?.trim() ?: ""
+                val lid = (n["location_id"] as? String)?.trim() ?: ""
+                val realGid = (n["wo_group_id"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+                val gid = realGid ?: "__occ${syntheticSeq++}"
+                val nativeStart = parseDate(n["start_time"] as? String)
+                val nativeEnd = parseDate(n["end_time"] as? String)
+                occurrences.add(Occurrence(
+                    gid = gid,
+                    originalGid = realGid,
+                    pid = pid, lid = lid,
+                    method = n["method"] as? String,
+                    locationSource = (n["location_source"] as? String)?.trim(),
+                    qty = (n["quantity"] as? Number)?.toDouble() ?: 0.0,
+                    nativeStart = nativeStart,
+                    nativeEnd = nativeEnd,
+                    demandId = demandId?.toString()?.takeIf { it.isNotBlank() },
+                    overrideActive = n["override_active"] == true,
+                    nativeMaxLotSize = n["max_lot_size"],
+                    members = members,
+                ))
+                if (currentParent != null && currentParent != gid) {
+                    parentsOf.getOrPut(gid) { mutableSetOf() }.add(currentParent)
+                }
+                val nextParent = realGid ?: currentParent
+                for (c in nodeChildren) walk(c, demandId, members, nextParent, depth + 1)
+            }
+            "supply", "purchase" -> {
+                if (currentParent != null) {
+                    parseDate(n["commit_time"] as? String)?.let { commit ->
+                        leafConstraintByGid.merge(currentParent, commit) { a, b -> if (b > a) b else a }
+                    }
+                }
+                for (c in nodeChildren) walk(c, demandId, members, currentParent, depth + 1)
+            }
+            else -> for (c in nodeChildren) walk(c, demandId, members, currentParent, depth + 1)
+        }
+    }
+
+    for (entry in peggingTrees) {
+        @Suppress("UNCHECKED_CAST")
+        val members = entry["consolidated_demand_ids"] as? List<String>
+        // Skip supply-only pegging entries: demand_id = null AND no consolidated_demand_ids.
+        // These are pure supply-graph entries with no real demand context; walking them produces
+        // demand-orphan WO groups (empty demandQty + empty sampleMembers) in the consolidation output.
+        val entryDemandId = entry["demand_id"]?.toString()?.takeIf { it.isNotBlank() }
+        if (entryDemandId == null && members.isNullOrEmpty()) continue
+        walk(entry["tree"], entryDemandId, members, null, 0)
+    }
+
+    // ── Phase B: aggregate occurrences by gid (sums ALL occurrences of a shared gid, e.g. the same
+    // physical WO referenced from a VIRTUAL tree and a real-demand tree, BEFORE bucketing). ───────
+    val gidInfo = linkedMapOf<String, GidInfo>()
+    for (occ in occurrences) {
+        val info = gidInfo.getOrPut(occ.gid) { GidInfo() }
+        if (info.occurrenceCount == 0) {
+            info.pid = occ.pid; info.lid = occ.lid; info.method = occ.method; info.locationSource = occ.locationSource
+        }
+        info.totalQty += occ.qty
+        info.occurrenceCount++
+        if (occ.nativeStart != null && (info.nativeStart == null || occ.nativeStart < info.nativeStart!!)) info.nativeStart = occ.nativeStart
+        if (occ.overrideActive) info.overrideActive = true
+        if (occ.nativeStart != null && occ.nativeEnd != null) {
+            val dur = (occ.nativeEnd.toEpochDay() - occ.nativeStart.toEpochDay()).toDouble()
+            if (info.nativeDuration == null || dur > info.nativeDuration!!) info.nativeDuration = dur
+        }
+        if (occ.demandId != null) info.demandQty[occ.demandId] = (info.demandQty[occ.demandId] ?: 0.0) + occ.qty
+        if (occ.members != null) info.sampleMembers = occ.members
+    }
+
+    // ── Phase C: invert parentsOf (child -> parents) into directDeps (parent -> children) to seed
+    // Kahn's-algorithm in-degree counts. ──────────────────────────────────────────────────────────
+    val directDeps = mutableMapOf<String, MutableSet<String>>()
+    for ((child, parents) in parentsOf) {
+        for (p in parents) directDeps.getOrPut(p) { mutableSetOf() }.add(child)
+    }
+    val remaining = mutableMapOf<String, Int>()
+    for (gid in gidInfo.keys) remaining[gid] = directDeps[gid]?.size ?: 0
+
+    fun methodRowFor(pid: String, lid: String, method: String?, locationSource: String?): Map<String, Any?>? {
+        if (method == null) return null
+        val candidates = getMethods(pid, lid, data).filter { it["type"] == method }
+        return if (method == "move") candidates.firstOrNull { (it["from_location_id"] as? String)?.trim() == locationSource } ?: candidates.firstOrNull()
+        else candidates.firstOrNull()
+    }
+
+    val consolidatedOut = mutableListOf<Map<String, Any?>>()
+    val consolidatedGidByGid = mutableMapOf<String, String>()
+    val consolidatedStartByGid = mutableMapOf<String, LocalDate>()
+    val consolidatedEndByGid = mutableMapOf<String, LocalDate>()
+    // lot_count/wave_count as recomputed for this gid's FINAL (post-merge) bucket — propagated back
+    // onto the pegging tree's WO node alongside start/end so R5_lead_time's expected-duration formula
+    // (perLotLead × waveCount) reads the SAME wave count that produced the actual start/end span.
+    // Without this, a gid trimmed by reconcile() across a lot-size boundary keeps its PRE-trim
+    // lot_count/wave_count on the tree node while start/end reflect the post-trim (shorter) span.
+    val consolidatedLotCountByGid = mutableMapOf<String, Int>()
+    val consolidatedWaveCountByGid = mutableMapOf<String, Int>()
+
+    fun singletonRow(gid: String, info: GidInfo, start: LocalDate?, end: LocalDate?, cgid: String): Map<String, Any?> = buildMap {
+        put("product_id", info.pid)
+        put("location_id", info.lid)
+        put("quantity", info.totalQty)
+        put("start_time", formatDate(start))
+        put("end_time", formatDate(end))
+        put("method", info.method)
+        put("location_source", info.locationSource)
+        put("demand_id", info.demandQty.keys.firstOrNull())
+        put("prod_area", getProdArea(info.pid, info.lid, data))
+        put("override_active", info.overrideActive)
+        put("wo_group_id", gid)
+        put("consolidated_group_id", cgid)
+        put("wave_index", 0)
+        if (info.method == "move") {
+            put("lot_count", 1)
+            val demandSplits = info.demandQty.entries.map { (d, qty) ->
+                mapOf("demand_id" to d, "quantity" to qty)
+            }
+            put("move_components", listOf(mapOf(
+                "product_id"   to info.pid,
+                "quantity"     to info.totalQty,
+                "demand_ids"   to info.demandQty.keys.toList(),
+                "demand_splits" to demandSplits,
+            )))
+            // crossWaveCalendarMerge aggregates allDemands from wo_competing_demands;
+            // singleton rows must emit it so their demand IDs survive the merge.
+            put("wo_competing_demands", info.demandQty.keys.toList())
+            if (info.sampleMembers != null) put("consolidated_demand_ids", info.sampleMembers)
+            else put("consolidated_demand_ids", info.demandQty.keys.toList())
+        } else {
+            val lotSize = (maxLotSize(info.pid, info.lid, data)?.takeIf { it > 0 } ?: info.totalQty).coerceAtLeast(1e-9)
+            put("lot_count", Math.ceil(info.totalQty / lotSize).toInt().coerceAtLeast(1))
+            put("max_lot_size", lotSize)
+        }
+        if (info.method != "move" && info.sampleMembers != null) put("consolidated_demand_ids", info.sampleMembers)
+    }
+
+    fun mergedRow(gids: List<String>, mergedStart: LocalDate, mergedEnd: LocalDate, cgid: String): Map<String, Any?> {
+        val first = gidInfo.getValue(gids[0])
+        val totalQty = gids.sumOf { gidInfo.getValue(it).totalQty }
+        val demands = gids.flatMap { gidInfo.getValue(it).demandQty.keys }.distinct()
+        val splitDetails = gids.flatMap { g -> gidInfo.getValue(g).demandQty.entries.map { it.key to it.value } }
+            .groupBy({ it.first }, { it.second })
+            .map { (d, qtys) -> mapOf("demand_id" to d, "allocated_qty" to qtys.sum()) }
+        val overrideActive = gids.any { gidInfo.getValue(it).overrideActive }
+        // When constituent WOs came from virtual/null-demand pegging entries their demandId is null,
+        // so demandQty is empty and demands=[]. Fall back to sampleMembers (real demand IDs carried
+        // on the virtual entry's consolidated_demand_ids) so the frontend can still show the accordion.
+        val effectiveDemands = demands.ifEmpty {
+            gids.flatMap { gidInfo.getValue(it).sampleMembers ?: emptyList() }.distinct()
+        }
+        if (first.method == "move") {
+            val moveComponents = gids.groupBy { gidInfo.getValue(it).pid }
+                .map { (p, gs) ->
+                    val splitMap = gs.flatMap { g ->
+                        gidInfo.getValue(g).demandQty.entries.map { (d, qty) -> d to qty }
+                    }.groupBy({ it.first }, { it.second })
+                     .mapValues { it.value.sum() }
+                    val demandSplits = splitMap.entries
+                        .sortedBy { it.key }
+                        .map { (d, qty) -> mapOf("demand_id" to d, "quantity" to qty) }
                     mapOf(
-                        "product_id" to p,
-                        "quantity" to ws.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 },
-                        "demand_ids" to ws.mapNotNull { it["demand_id"] as? String }.filter { it.isNotBlank() }.distinct(),
+                        "product_id"    to p,
+                        "quantity"      to gs.sumOf { gidInfo.getValue(it).totalQty },
+                        "demand_ids"    to demandSplits.map { it["demand_id"] as String },
+                        "demand_splits" to demandSplits,
                     )
                 }
                 .sortedBy { (it["product_id"] as? String) ?: "" }
-            consolidatedOut.add(mapOf(
-                "product_id" to null,                          // mixed cargo within same prod_area
-                "location_id" to lid,                          // target
-                "quantity" to totalQty,                        // exact sum of constituents → conserved
+            return mapOf(
+                "product_id" to null,
+                "location_id" to first.lid,
+                "quantity" to totalQty,
                 "start_time" to formatDate(mergedStart),
                 "end_time" to formatDate(mergedEnd),
                 "method" to "move",
-                "location_source" to first["location_source"], // source
+                "location_source" to first.locationSource,
                 "demand_id" to null,
-                "prod_area" to first["prod_area"],             // shared prod_area of all constituents
+                "prod_area" to getProdArea(first.pid, first.lid, data),
                 "override_active" to overrideActive,
                 "wo_group_id" to cgid,
                 "consolidated_group_id" to cgid,
                 "wave_index" to 0,
                 "lot_count" to 1,
                 "consolidated" to true,
-                "wo_competing_demands" to demands,
+                "wo_competing_demands" to effectiveDemands,
                 "consolidation_split_details" to splitDetails,
-                "consolidated_demand_ids" to demands,
+                "consolidated_demand_ids" to effectiveDemands,
                 "move_components" to moveComponents,
                 "wo_window_start" to formatDate(mergedStart),
-                "wo_window_end" to formatDate(wos.mapNotNull { parseDate(it["start_time"] as? String) }.maxOrNull()),
+                "wo_window_end" to formatDate(mergedStart),
                 "wo_consolidation_total_planned" to totalQty,
-            ))
-            wos.forEach { nativeOut.add(it + ("consolidated_group_id" to cgid)) }
-            continue
+            )
         }
-
-        val lotSize = (maxLotSize(pid, lid, data)?.takeIf { it > 0 } ?: totalQty).coerceAtLeast(1e-9)
+        val lotSize = (maxLotSize(first.pid, first.lid, data)?.takeIf { it > 0 } ?: totalQty).coerceAtLeast(1e-9)
         val lotCount = Math.ceil(totalQty / lotSize).toInt().coerceAtLeast(1)
-
-        // One batch order for the whole group. The max-lot-size detail is carried as
-        // `lot_count` metadata rather than exploding back into per-lot work orders —
-        // that is what actually shrinks the work-order count (inputs are already one
-        // lot each, so re-lotting would reproduce them).
-        consolidatedOut.add(mapOf(
-            "product_id" to pid,
-            "location_id" to lid,
-            "quantity" to totalQty,                            // exact sum of constituents → conserved
+        return mapOf(
+            "product_id" to first.pid,
+            "location_id" to first.lid,
+            "quantity" to totalQty,
             "start_time" to formatDate(mergedStart),
             "end_time" to formatDate(mergedEnd),
-            "method" to method,
-            "location_source" to first["location_source"],
+            "method" to first.method,
+            "location_source" to first.locationSource,
             "demand_id" to null,
-            "prod_area" to first["prod_area"],
+            "prod_area" to getProdArea(first.pid, first.lid, data),
             "override_active" to overrideActive,
             "wo_group_id" to cgid,
             "consolidated_group_id" to cgid,
@@ -3355,143 +3747,307 @@ internal fun consolidateWorkOrdersByTiming(
             "lot_count" to lotCount,
             "max_lot_size" to lotSize,
             "consolidated" to true,
-            "wo_competing_demands" to demands,
-            // Per-demand split breakdown (INTERNAL key name — the API enrichment in Allocate.kt
-            // maps consolidation_split_details → wo_consolidation_split_details). The UI reads it
-            // to derive the union predecessor/successor (each demand's pegging keys feed the ↓/↑
-            // relation BFS) and to set Requested = Committed. This keeps the merged order linked
-            // to the (intact) per-demand pegging instead of becoming a dead-end.
+            "wo_competing_demands" to effectiveDemands,
             "consolidation_split_details" to splitDetails,
-            // The constituent demands, so a batched order remains traceable: the pegging
-            // endpoint and the supplies/Requested maps resolve a consolidated WO back to each
-            // of these demands' per-demand pegging nodes for (product, location, method).
-            "consolidated_demand_ids" to demands,
-            // The original start-window the constituents fell in. The pegging endpoint filters
-            // the per-demand nodes to this range so the resolved/aggregated node matches THIS
-            // batch (not every window of those demands for the same component).
-            "wo_window_start" to formatDate(wos.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull()),
-            "wo_window_end" to formatDate(wos.mapNotNull { parseDate(it["start_time"] as? String) }.maxOrNull()),
+            "consolidated_demand_ids" to effectiveDemands,
+            "wo_window_start" to formatDate(mergedStart),
+            "wo_window_end" to formatDate(mergedStart),
             "wo_consolidation_total_planned" to totalQty,
-        ))
-        wos.forEach { nativeOut.add(it + ("consolidated_group_id" to cgid)) }
+        )
     }
-    return WoConsolidation(consolidatedOut, nativeOut)
-}
 
-private data class ConsolidatedWoState(var startTime: LocalDate, val leadTime: Long) {
-    val endTime: LocalDate get() = startTime.plusDays(leadTime)
+    // ── Phase D/E: Kahn's-algorithm wave loop. Each wave buckets/merges/recomputes-duration for
+    // every gid whose dependencies are all already resolved, then propagates the new end_time up to
+    // direct parents (pendingStart bump + in-degree decrement) before the next wave starts. ────────
+    val pendingStart = mutableMapOf<String, LocalDate>()
+    for ((gid, info) in gidInfo) info.nativeStart?.let { pendingStart[gid] = it }
+
+    var frontier: List<String> = gidInfo.keys.filter { (remaining[it] ?: 0) == 0 }
+    val visited = mutableSetOf<String>()
+    var guard = 0
+    while (frontier.isNotEmpty() && guard < 10000) {
+        guard++
+        for (gid in frontier) {
+            leafConstraintByGid[gid]?.let { lc ->
+                val cur = pendingStart[gid]
+                if (cur == null || lc > cur) pendingStart[gid] = lc
+            }
+        }
+
+        // Group frontier WOs by base identity (pid, lid, method, locationSource) first,
+        // then merge overlapping production intervals within each group.
+        // Fixed-window bucketing (epoch-rooted or calendar-month) splits WOs whose
+        // production intervals physically overlap just because their start dates straddle a
+        // bucket boundary — even when the shorter WO is entirely subsumed by the longer one.
+        // Interval-overlap is the correct semantic: two WOs should consolidate iff their
+        // [pendingStart, pendingStart+duration] intervals intersect.
+        // windowDays <= 0 retains the original "collapse all" behaviour.
+        val buckets = linkedMapOf<List<Any?>, MutableList<String>>()
+        val passthroughGids = mutableListOf<String>()
+        val baseGroups = linkedMapOf<List<Any?>, MutableList<String>>()
+        for (gid in frontier) {
+            val info = gidInfo.getValue(gid)
+            val start = pendingStart[gid]
+            if (start == null) { passthroughGids.add(gid); continue }
+            val baseKey: List<Any?> = if (info.method == "move") listOf(
+                "move", info.locationSource, info.lid, getProdArea(info.pid, info.lid, data)
+            ) else listOf(info.pid, info.lid, info.method, info.locationSource)
+            baseGroups.getOrPut(baseKey) { mutableListOf() }.add(gid)
+        }
+        for ((baseKey, gids) in baseGroups) {
+            for (gid in gids) {
+                val info = gidInfo.getValue(gid)
+                val start = info.nativeStart ?: pendingStart[gid]!!
+                val methodScale = woBatchConfig?.scaleFor(info.method)
+                val wd = woBatchConfig?.legacyWindowDays ?: windowDays
+                val effectiveBucketKey: List<Any?> = if (methodScale == "none")
+                    baseKey + listOf("__none__", gid)  // singleton — never merges with any peer
+                else
+                    baseKey + listOf(calendarBucket(start, methodScale, wd))
+                buckets.getOrPut(effectiveBucketKey) { mutableListOf() }.add(gid)
+            }
+        }
+
+        for (gid in passthroughGids) {
+            val info = gidInfo.getValue(gid)
+            val cgid = nextWoGroupId()
+            consolidatedGidByGid[gid] = cgid
+            val row = singletonRow(gid, info, null, null, cgid)
+            consolidatedOut.add(row)
+            consolidatedLotCountByGid[gid] = (row["lot_count"] as? Number)?.toInt() ?: 1
+            consolidatedWaveCountByGid[gid] = 1
+            // No parseable date → nothing to propagate; matches old passthrough semantics.
+        }
+
+        for ((_, gids) in buckets) {
+            val totalOccCount = gids.sumOf { gidInfo.getValue(it).occurrenceCount }
+            val totalQty = gids.sumOf { gidInfo.getValue(it).totalQty }
+            val mergedStart = gids.mapNotNull { pendingStart[it] }.maxOrNull()
+            val cgid = nextWoGroupId()
+            if (mergedStart == null || totalQty <= 1e-9) {
+                // Degenerate: emit each gid as its own singleton (mirrors old zero-qty handling).
+                for (gid in gids) {
+                    val info = gidInfo.getValue(gid)
+                    val gcgid = if (gid == gids[0]) cgid else nextWoGroupId()
+                    consolidatedGidByGid[gid] = gcgid
+                    val st = pendingStart[gid]
+                    val row = singletonRow(gid, info, st, st, gcgid)
+                    consolidatedOut.add(row)
+                    consolidatedLotCountByGid[gid] = (row["lot_count"] as? Number)?.toInt() ?: 1
+                    consolidatedWaveCountByGid[gid] = 1
+                    if (st != null) { consolidatedStartByGid[gid] = st; consolidatedEndByGid[gid] = st }
+                }
+                continue
+            }
+            val first = gidInfo.getValue(gids[0])
+            val mRow = methodRowFor(first.pid, first.lid, first.method, first.locationSource)
+            var bucketLotCount = 1
+            var bucketWaveCount = 1
+            val leadDays = if (first.method == "move") {
+                mRow?.let { leadDaysForMethod(it, first.pid, first.lid, totalQty, data) }
+                    ?: gids.mapNotNull { gidInfo.getValue(it).nativeDuration }.maxOrNull() ?: 0.0
+            } else {
+                val lotSize = (maxLotSize(first.pid, first.lid, data)?.takeIf { it > 0 } ?: totalQty).coerceAtLeast(1e-9)
+                val lotCount = Math.ceil(totalQty / lotSize).toInt().coerceAtLeast(1)
+                val cap = if (first.method == "make") OperationLookup.parallelismCap(first.pid, first.lid, data).coerceAtLeast(1) else Int.MAX_VALUE
+                val numWaves = Math.ceil(lotCount.toDouble() / cap.toDouble()).toInt().coerceAtLeast(1)
+                val perWaveLead = mRow?.let { leadDaysForMethod(it, first.pid, first.lid, totalQty, data) }
+                    ?: gids.mapNotNull { gidInfo.getValue(it).nativeDuration }.maxOrNull() ?: 0.0
+                bucketLotCount = lotCount
+                bucketWaveCount = numWaves
+                numWaves * perWaveLead
+            }
+            val mergedEnd = dateAddDays(mergedStart, leadDays) ?: mergedStart
+
+            if (totalOccCount <= 1) {
+                consolidatedOut.add(singletonRow(gids[0], first, mergedStart, mergedEnd, cgid))
+            } else {
+                consolidatedOut.add(mergedRow(gids, mergedStart, mergedEnd, cgid))
+            }
+            for (gid in gids) {
+                consolidatedGidByGid[gid] = cgid
+                consolidatedStartByGid[gid] = mergedStart
+                consolidatedEndByGid[gid] = mergedEnd
+                consolidatedLotCountByGid[gid] = bucketLotCount
+                consolidatedWaveCountByGid[gid] = bucketWaveCount
+            }
+        }
+
+        val nextCandidates = LinkedHashSet<String>()
+        for (gid in frontier) {
+            visited.add(gid)
+            val end = consolidatedEndByGid[gid] ?: continue
+            for (parent in (parentsOf[gid] ?: emptySet())) {
+                if (parent in visited) continue
+                val cur = pendingStart[parent]
+                if (cur == null || end > cur) pendingStart[parent] = end
+                remaining[parent] = (remaining[parent] ?: 0) - 1
+                if ((remaining[parent] ?: 0) <= 0) nextCandidates.add(parent)
+            }
+        }
+        frontier = nextCandidates.filterNot { it in visited }
+    }
+
+    // Defensive: any gid never resolved (should not happen on a true DAG) still gets emitted so no
+    // WO is silently dropped.
+    for (gid in gidInfo.keys) {
+        if (gid in consolidatedGidByGid) continue
+        val info = gidInfo.getValue(gid)
+        val cgid = nextWoGroupId()
+        consolidatedGidByGid[gid] = cgid
+        val st = pendingStart[gid] ?: info.nativeStart
+        val row = singletonRow(gid, info, st, st, cgid)
+        consolidatedOut.add(row)
+        consolidatedLotCountByGid[gid] = (row["lot_count"] as? Number)?.toInt() ?: 1
+        consolidatedWaveCountByGid[gid] = 1
+        if (st != null) { consolidatedStartByGid[gid] = st; consolidatedEndByGid[gid] = st }
+    }
+
+    // ── Phase F: native output — one row per ORIGINAL occurrence, carrying its own native timing
+    // (the orchestrator patches native timing to match the FINAL consolidated/arbitrated timing in
+    // a later step), tagged with the consolidated_group_id it rolled into. ────────────────────────
+    val nativeOut = occurrences.map { occ ->
+        val cgid = consolidatedGidByGid[occ.gid]
+        buildMap<String, Any?> {
+            put("product_id", occ.pid)
+            put("location_id", occ.lid)
+            put("quantity", occ.qty)
+            put("start_time", formatDate(occ.nativeStart))
+            put("end_time", formatDate(occ.nativeEnd))
+            put("method", occ.method)
+            put("location_source", occ.locationSource)
+            put("demand_id", occ.demandId)
+            put("prod_area", getProdArea(occ.pid, occ.lid, data))
+            put("override_active", occ.overrideActive)
+            put("wo_group_id", occ.originalGid)
+            put("lot_count", 1)
+            put("max_lot_size", occ.nativeMaxLotSize)
+            put("wave_index", 0)
+            if (occ.members != null) put("consolidated_demand_ids", occ.members)
+            put("consolidated_group_id", cgid)
+        }
+    }
+
+    // ── Phase G: rewrite the pegging trees with final (wave-pushed) timings, and roll the result up
+    // into each demand/supply/purchase node's commit_time bottom-up — single pass, no fixed-point
+    // iteration needed since the wave loop above already established globally-consistent timings.
+    val rewrittenTrees = rewritePeggingTimings(
+        peggingTrees, consolidatedStartByGid, consolidatedEndByGid,
+        consolidatedLotCountByGid, consolidatedWaveCountByGid,
+    )
+
+    return WaveConsolidationResult(rewrittenTrees, WoConsolidation(consolidatedOut, nativeOut))
 }
 
 /**
- * Pass 2b — iterative timing readjustment.
+ * Rewrite pegging-tree WO node timings from per-`wo_group_id` final start/end maps, rolling the
+ * result up into each demand/supply/purchase node's `commit_time` bottom-up. Shared by
+ * [consolidateByWaves] (wave-computed timings) and the main orchestrator (post-arbitration
+ * capacity-shifted timings) so both timing-correction passes write back into the trees the same
+ * way.
  *
- * After cross-demand batching, a consolidated WO's start_time = min(native starts). If any
- * constituent demand's WO actually starts LATER (e.g. because its upstream BOM is delayed),
- * the batch cannot begin until that later date. This function propagates those constraints:
- *
- * invariant: lead_time = consolidated_wo.end_time − consolidated_wo.start_time is preserved.
- * When start_time is pushed, end_time = new_start + lead_time.
- *
- * Traversal: bottom-up within each demand's pegging tree so child WO delays cascade to
- * parent WOs in the same pass. The outer do-while iterates until no consolidated WO
- * changes (convergence guaranteed by BOM depth).
+ * `lotCountByGid`/`waveCountByGid` are optional (only [consolidateByWaves] supplies them) — they
+ * keep the tree node's `lot_count`/`wave_count` in sync with whatever lot/wave packing actually
+ * produced `startByGid`/`endByGid`'s span. Without this, a WO trimmed by `reconcile()` across a
+ * lot-size boundary keeps its PRE-trim lot_count/wave_count on the tree while start/end reflect
+ * the POST-trim (shorter) span, so the soundness checker's expected-duration formula
+ * (perLotLead × waveCount, read from the same node) disagrees with the actual span it itself wrote.
+ * The post-arbitration call (orchestrator) omits them deliberately — arbitration/resequence only
+ * shift a WO's start+end by the same delta (`pushUp`), preserving its already-correct lot/wave count.
  */
-internal fun readjustConsolidatedWoTiming(
+internal fun rewritePeggingTimings(
     peggingTrees: List<Map<String, Any?>>,
-    woConsolidation: WoConsolidation,
-): ReadjustResult {
-    val consolidatedState = mutableMapOf<String, ConsolidatedWoState>()
-    for (c in woConsolidation.consolidated) {
-        val cgid  = c["consolidated_group_id"] as? String ?: continue
-        val start = parseDate(c["start_time"] as? String) ?: continue
-        val end   = parseDate(c["end_time"]   as? String) ?: continue
-        consolidatedState[cgid] = ConsolidatedWoState(start, end.toEpochDay() - start.toEpochDay())
-    }
-    val woGidToCgid = mutableMapOf<String, String>()
-    for (n in woConsolidation.native) {
-        val woGid = n["wo_group_id"] as? String ?: continue
-        val cgid  = n["consolidated_group_id"] as? String ?: continue
-        woGidToCgid[woGid] = cgid
-    }
-
-    var workingTrees = peggingTrees
-    var changed = false
-    val updatedEnd = mutableMapOf<String, LocalDate>()
-
+    startByGid: Map<String, LocalDate>,
+    endByGid: Map<String, LocalDate>,
+    lotCountByGid: Map<String, Int> = emptyMap(),
+    waveCountByGid: Map<String, Int> = emptyMap(),
+): List<Map<String, Any?>> {
     @Suppress("UNCHECKED_CAST")
-    fun walkNode(node: Map<String, Any?>): Map<String, Any?> {
+    fun rewriteNode(node: Map<String, Any?>, depth: Int): Map<String, Any?> {
+        if (depth > 80) return node
         if (node["type"] == "work_order" && node["failed"] == true) return node
-
         val origChildren = node["children"] as? List<Map<String, Any?>>
-        val newChildren  = origChildren?.map { walkNode(it) }
-        val origChildrenNN = origChildren ?: emptyList()
+        val newChildren = origChildren?.map { rewriteNode(it, depth + 1) }
         val childrenChanged = newChildren != null &&
-            newChildren.indices.any { i -> newChildren[i] !== origChildrenNN[i] }
+            newChildren.indices.any { i -> newChildren[i] !== origChildren!![i] }
 
-        if (node["type"] != "work_order") {
-            return if (childrenChanged) node.toMutableMap().also { it["children"] = newChildren }
-                   else node
+        if (node["type"] == "work_order") {
+            val gid = (node["wo_group_id"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+            val newStart = gid?.let { startByGid[it] }
+            val newEnd = gid?.let { endByGid[it] }
+            val newLotCount = gid?.let { lotCountByGid[it] }
+            val newWaveCount = gid?.let { waveCountByGid[it] }
+            val startChanged = newStart != null && formatDate(newStart) != node["start_time"]
+            val endChanged = newEnd != null && formatDate(newEnd) != node["end_time"]
+            val lotCountChanged = newLotCount != null && newLotCount != (node["lot_count"] as? Number)?.toInt()
+            val waveCountChanged = newWaveCount != null && newWaveCount != (node["wave_count"] as? Number)?.toInt()
+            return if (startChanged || endChanged || lotCountChanged || waveCountChanged || childrenChanged) {
+                node.toMutableMap().also { m ->
+                    if (startChanged) m["start_time"] = formatDate(newStart)
+                    if (endChanged) m["end_time"] = formatDate(newEnd)
+                    if (lotCountChanged) m["lot_count"] = newLotCount
+                    if (waveCountChanged) m["wave_count"] = newWaveCount
+                    if (childrenChanged) m["children"] = newChildren
+                }
+            } else node
         }
 
-        val woGid = node["wo_group_id"] as? String
-        val cgid  = if (woGid != null) woGidToCgid[woGid] else null
-        val state = if (cgid != null) consolidatedState[cgid] else null
-
-        val directWoChildren = newChildren?.filter { it["type"] == "work_order" && it["failed"] != true }
-        val effectiveStart: LocalDate? = if (!directWoChildren.isNullOrEmpty()) {
-            directWoChildren.mapNotNull { child ->
-                val cGid = child["wo_group_id"] as? String
-                if (cGid != null) updatedEnd[cGid] else parseDate(child["end_time"] as? String)
+        if (node["type"] == "demand" || node["type"] == "supply" || node["type"] == "purchase") {
+            val newCommit = (newChildren ?: emptyList()).mapNotNull { ch ->
+                val r = ch["commit_reason"] as? String
+                if (r == "cycle_stopped" || r == "cycle_detected" || isHardPlanningFailure(r)) return@mapNotNull null
+                when (ch["type"] as? String) {
+                    "work_order" -> parseDate(ch["end_time"] as? String)
+                    "demand", "supply", "purchase" -> parseDate(ch["commit_time"] as? String)
+                    else -> null
+                }
             }.maxOrNull()
-        } else {
-            parseDate(node["start_time"] as? String)
+            val current = parseDate(node["commit_time"] as? String)
+            val commitChanged = newCommit != null && newCommit != current
+            return if (commitChanged || childrenChanged) {
+                node.toMutableMap().also { m ->
+                    if (childrenChanged) m["children"] = newChildren
+                    if (commitChanged) m["commit_time"] = formatDate(newCommit)
+                }
+            } else node
         }
 
-        if (state != null && effectiveStart != null && effectiveStart > state.startTime) {
-            state.startTime = effectiveStart   // endTime auto-updates: startTime + leadTime
-            changed = true
-        }
-
-        val newStart = state?.startTime
-        val newEnd   = state?.endTime
-        if (woGid != null && newEnd != null) updatedEnd[woGid] = newEnd
-
-        val startChanged = newStart != null && formatDate(newStart) != node["start_time"]
-        val endChanged   = newEnd   != null && formatDate(newEnd)   != node["end_time"]
-
-        return if (startChanged || endChanged || childrenChanged) {
-            node.toMutableMap().also { m ->
-                if (startChanged)    m["start_time"] = formatDate(newStart)
-                if (endChanged)      m["end_time"]   = formatDate(newEnd)
-                if (childrenChanged) m["children"]   = newChildren
-            }
-        } else node
+        return if (childrenChanged) node.toMutableMap().also { it["children"] = newChildren } else node
     }
 
-    var iter = 0
-    do {
-        changed = false
-        updatedEnd.clear()
-        iter++
-        @Suppress("UNCHECKED_CAST")
-        workingTrees = workingTrees.map { entry ->
-            val tree    = entry["tree"] as? Map<String, Any?> ?: return@map entry
-            val newTree = walkNode(tree)
-            if (newTree === tree) entry
-            else entry.toMutableMap().also { it["tree"] = newTree }
-        }
-        log.info("readjustConsolidatedWoTiming iter={} changed={} trees={}", iter, changed, workingTrees.size)
-    } while (changed)
-
-    val adjustedConsolidated = woConsolidation.consolidated.map { c ->
-        val cgid     = c["consolidated_group_id"] as? String ?: return@map c
-        val state    = consolidatedState[cgid] ?: return@map c
-        val newStart = formatDate(state.startTime)
-        val newEnd   = formatDate(state.endTime)
-        if (newStart == c["start_time"] && newEnd == c["end_time"]) c
-        else c.toMutableMap().also { it["start_time"] = newStart; it["end_time"] = newEnd }
+    return peggingTrees.map { entry ->
+        val tree = entry["tree"] as? Map<String, Any?> ?: return@map entry
+        val newTree = rewriteNode(tree, 0)
+        if (newTree === tree) entry else entry.toMutableMap().also { it["tree"] = newTree }
     }
-    return ReadjustResult(workingTrees, adjustedConsolidated)
+}
+
+/**
+ * Clone pegging trees with each WO node's `wo_group_id` swapped to its consolidated group id, so
+ * [buildPeggingDag]/[resequenceFromPegging] can compute cross-batch capacity-cascade dependencies
+ * at the CONSOLIDATED granularity (matching a flat lots list keyed by `consolidated_group_id`).
+ * Used only as scratch input for that DAG walk — never returned as final output.
+ */
+internal fun relabelTreesToConsolidatedGids(
+    peggingTrees: List<Map<String, Any?>>,
+    gidToCgid: Map<String, String>,
+): List<Map<String, Any?>> {
+    @Suppress("UNCHECKED_CAST")
+    fun rewrite(node: Map<String, Any?>): Map<String, Any?> {
+        val children = node["children"] as? List<Map<String, Any?>>
+        val newChildren = children?.map { rewrite(it) }
+        val base = if (newChildren != null) node.toMutableMap().apply { put("children", newChildren) } else node
+        if (base["type"] == "work_order") {
+            val gid = base["wo_group_id"] as? String
+            val cgid = gid?.let { gidToCgid[it] }
+            if (cgid != null) return base.toMutableMap().apply { put("wo_group_id", cgid) }
+        }
+        return base
+    }
+    return peggingTrees.map { entry ->
+        val tree = entry["tree"] as? Map<String, Any?> ?: return@map entry
+        entry.toMutableMap().apply { put("tree", rewrite(tree)) }
+    }
 }
 
 private fun buildWoNode(
@@ -4241,48 +4797,15 @@ fun runPlanning(
     // Release pruned trees; timingFix holds the timing-adjusted copies.
     allPegging = emptyList()
 
-    // Phase-1 cross-WO arbitration. Opt-in via planning config flag — the
-    // feature shifts WO start times when shared resources are contended, so
-    // existing baselines and KB snapshots stay unchanged until the user
-    // explicitly enables it. When pushedCount > 0 we re-run the cascade
-    // step (resequenceFromPegging) so the pushed lots propagate up the DAG
-    // and the pegging tree's WO/demand timings re-sync.
-    // Default ON — flipped from the opt-in default after Phase A validation.
-    // Explicit false (saved configs from before the flip) still disables it.
-    val enableGlobalScheduling = config?.get("enable_global_scheduling") != false
-    var resourceContentionPushed = 0
-    val finalTimings = if (enableGlobalScheduling) {
-        val mutableLots: List<MutableMap<String, Any?>> = timingFix.workOrders.map {
-            (it as? MutableMap<String, Any?>) ?: it.toMutableMap()
-        }
-        val priorityMap = (data["demand"] ?: emptyList()).mapNotNull { d ->
-            val id = (d["demand_id"] as? String)?.trim() ?: return@mapNotNull null
-            val pri = (d["priority"] as? Number)?.toInt() ?: 0
-            id to pri
-        }.toMap()
-        val dueMap = (data["demand"] ?: emptyList()).mapNotNull { d ->
-            val id = (d["demand_id"] as? String)?.trim() ?: return@mapNotNull null
-            val due = (d["request_due_time"] as? String)?.let { runCatching { java.time.LocalDate.parse(it.take(10)) }.getOrNull() }
-            id to due
-        }.toMap()
-        resourceContentionPushed = ResourceScheduler.arbitrate(mutableLots, data, priorityMap, dueMap)
-        if (resourceContentionPushed > 0) {
-            resequenceFromPegging(mutableLots, timingFix.peggingTrees)
-        } else {
-            timingFix
-        }
-    } else {
-        timingFix
-    }
-
-    // ── Phase 3 — bottom-up COMMITMENT aggregate over the FINAL pegging (after the timing fix, so
-    // nothing downstream re-derives it). The closing step of the quantity pass in the mental model:
-    // a parent commits min over children of (child_commit / bom_rate) — "least supplied dominates".
-    // Top-down planning commits greedily, so cross-demand inventory contention can leave a make
-    // committed ABOVE what its children actually supply (the R4/R8 break). `reconcile` trims those
-    // (a no-op for already-consistent trees); the work orders flatten from the trimmed trees.
+    // ── Phase 3 — bottom-up COMMITMENT aggregate over the timing-fixed pegging. The closing step
+    // of the quantity pass in the mental model: a parent commits min over children of
+    // (child_commit / bom_rate) — "least supplied dominates". Top-down planning commits greedily,
+    // so cross-demand inventory contention can leave a make committed ABOVE what its children
+    // actually supply (the R4/R8 break). `reconcile` trims those (a no-op for already-consistent
+    // trees). Runs here (before consolidation/arbitration) since it only trims quantities — that's
+    // orthogonal to timing/capacity, so there's no need to wait for either.
     val reconciledByDemand = mutableMapOf<String, Double>()
-    val reconciledTrees = finalTimings.peggingTrees.map { entry ->
+    val reconciledTrees = timingFix.peggingTrees.map { entry ->
         val tree = entry["tree"] as? Map<String, Any?> ?: return@map entry
         val rootReq = (tree["quantity"] as? Number)?.toDouble() ?: 0.0
         val (reconciled, after) = reconcile(tree, rootReq, data)
@@ -4321,53 +4844,130 @@ fun runPlanning(
         committedDemands.clear(); committedDemands.addAll(synced)
     }
 
-    // ── Pass 2 — WO consolidation + timing ────────────────────────────────────
-    // Mental model: Pass 1 builds the per-demand pegging SKELETON (BOM explosion +
-    // alternative selection + quantities); Pass 2 derives the work orders FROM it. The
-    // default WO-consolidation collapses the per-node lot-explosion into one WO per
-    // skeleton node (flattenPeggingToWorkOrders), so the output stays in sync with the
-    // per-demand pegging BY CONSTRUCTION — every WO resolves back to its node (pegging /
-    // supplies / predecessor-successor drill-down all work).
-    //
-    // ON by default when consolidation is enabled (opt out with consolidate_wos=false): it
-    // batches ACROSS demands (same product/location/method/window) into fewer, larger orders —
-    // e.g. one purchase order per raw material instead of one per sub-assembly per demand. The
-    // cost is per-demand linkage: batched orders are demand_id=null and no longer map to a
-    // single pegging node, so per-WO drill-down degrades (the order still lists its competing
-    // demands). Window = UI "Bucket (days)" (period_days); explicit wo_window_days overrides;
-    // 0 ⇒ one batch per component across the horizon.
+    // ── Pass 2 — WO consolidation + timing, bottom-up wave propagation ─────────────────────────
+    // consolidateByWaves walks the global WO dependency graph one layer at a time, bucketing and
+    // recomputing duration per wave BEFORE propagating timing to parents — so a parent is never
+    // bucketed/timed until every live dependency has been finalized (replaces the old
+    // consolidate-once-then-patch design, which could leave a pushed WO merged with stale
+    // bucket-mates). OFF path (consolidate_wos=false): each node-level WO acts as its own
+    // consolidated group (1:1, no cross-demand merging) — stamped with consolidated_group_id =
+    // wo_group_id so the downstream capacity-patch step below applies uniformly either way.
     @Suppress("UNCHECKED_CAST")
     val consolidationCfg = config?.get("consolidation") as? Map<String, Any?>
-    val nodeLevelWos = flattenPeggingToWorkOrders(reconciledTrees, data)
-    val consolidateWos = consolidationConfig.enabled && consolidationCfg?.get("consolidate_wos") != false
-    // consolidated.consolidated = the merged procurement view; consolidated.native = the same input
-    // per-demand WOs, each tagged with `consolidated_group_id` so every native belongs to EXACTLY ONE
-    // consolidated WO (a strict partition — no native lost, no double-count across the two tabs).
-    val consolidation = if (consolidateWos) {
-        val windowDays = (consolidationCfg?.get("wo_window_days") as? Number)?.toInt() ?: consolidationConfig.periodDays
-        val merged = consolidateWorkOrdersByTiming(nodeLevelWos, data, windowDays)
-        log.info("Pass 2 cross-demand WO batch (window={}d): {} native → {} consolidated work orders", windowDays, nodeLevelWos.size, merged.consolidated.size)
-        merged
+    val globalScale = consolidationCfg?.get("wo_batch_scale")?.toString()
+    val makeBatchScale     = (consolidationCfg?.get("make_batch_scale")?.toString() ?: globalScale) ?: "weekly"
+    val moveBatchScale     = (consolidationCfg?.get("move_batch_scale")?.toString() ?: globalScale) ?: "weekly"
+    val purchaseBatchScale = (consolidationCfg?.get("purchase_batch_scale")?.toString() ?: globalScale) ?: "weekly"
+    val consolidateWos = consolidationConfig.enabled
+        && consolidationCfg?.get("consolidate_wos") != false
+        && listOf(makeBatchScale, moveBatchScale, purchaseBatchScale).any { it != "none" }
+    val waveResult = if (consolidateWos) {
+        val legacyWindowDays = (consolidationCfg?.get("wo_window_days") as? Number)?.toInt()
+            ?: consolidationConfig.periodDays
+        val woBatchConfig = WoBatchConfig(
+            make     = makeBatchScale,
+            move     = moveBatchScale,
+            purchase = purchaseBatchScale,
+            legacyWindowDays = legacyWindowDays,
+        )
+        val r = consolidateByWaves(reconciledTrees, data, legacyWindowDays, woBatchConfig)
+        val merged = crossWaveCalendarMerge(r.consolidation, legacyWindowDays, data, woBatchConfig)
+        log.info("Pass 2 WO batch (make={} move={} purchase={}): {} native → {} consolidated → {} after cross-wave merge",
+            makeBatchScale, moveBatchScale, purchaseBatchScale,
+            r.consolidation.native.size, r.consolidation.consolidated.size, merged.consolidated.size)
+        WaveConsolidationResult(r.peggingTrees, merged)
     } else {
+        val nodeLevelWos = flattenPeggingToWorkOrders(reconciledTrees, data)
+            .map { it + ("consolidated_group_id" to it["wo_group_id"]) }
         log.info("Pass 2 WO-consolidation OFF: {} node-level work orders (1:1 with per-demand pegging)", nodeLevelWos.size)
-        WoConsolidation(nodeLevelWos, nodeLevelWos)
+        WaveConsolidationResult(reconciledTrees, WoConsolidation(nodeLevelWos, nodeLevelWos))
     }
 
-    // Pass 2b — iterative timing readjustment: if any constituent demand's WO starts later
-    // than the consolidated batch's start_time, push the batch forward (preserving lead_time)
-    // and cascade up the BOM until convergence.
-    val (adjustedTrees, adjustedConsolidated) = if (consolidateWos)
-        readjustConsolidatedWoTiming(reconciledTrees, consolidation)
-    else ReadjustResult(reconciledTrees, consolidation.consolidated)
+    // Phase-1 cross-WO arbitration, now over the CONSOLIDATED (post-merge) lots so capacity is
+    // checked against the real production-lot count instead of an inflated per-demand count that
+    // gets collapsed afterward. Opt-in via planning config flag — the feature shifts WO start
+    // times when shared resources are contended, so existing baselines and KB snapshots stay
+    // unchanged until the user explicitly enables it.
+    // Default ON — flipped from the opt-in default after Phase A validation.
+    // Explicit false (saved configs from before the flip) still disables it.
+    val enableGlobalScheduling = config?.get("enable_global_scheduling") != false
+    var resourceContentionPushed = 0
+    // consolidateByWaves builds its rows via buildMap{}, which is sealed read-only after
+    // construction (it still satisfies `is MutableMap` structurally, so an `as?` cast would
+    // wrongly succeed and skip the copy) — always force a genuine mutable copy here.
+    val mutableLots: List<MutableMap<String, Any?>> = waveResult.consolidation.consolidated.map {
+        it.toMutableMap()
+    }
+    var adjustedTrees = waveResult.peggingTrees
+    if (enableGlobalScheduling) {
+        val priorityMap = (data["demand"] ?: emptyList()).mapNotNull { d ->
+            val id = (d["demand_id"] as? String)?.trim() ?: return@mapNotNull null
+            val pri = (d["priority"] as? Number)?.toInt() ?: 0
+            id to pri
+        }.toMap()
+        val dueMap = (data["demand"] ?: emptyList()).mapNotNull { d ->
+            val id = (d["demand_id"] as? String)?.trim() ?: return@mapNotNull null
+            val due = (d["request_due_time"] as? String)?.let { runCatching { java.time.LocalDate.parse(it.take(10)) }.getOrNull() }
+            id to due
+        }.toMap()
+        resourceContentionPushed = ResourceScheduler.arbitrate(mutableLots, data, priorityMap, dueMap)
+        if (resourceContentionPushed > 0) {
+            // Cascade the capacity-driven shift into the wave algorithm's pegging trees: relabel
+            // WO nodes to their consolidated_group_id so resequenceFromPegging's DAG walk operates
+            // at the same (merged-batch) granularity as mutableLots, then read the final per-cgid
+            // timing back off mutableLots (resequenceFromPegging mutates it in place via shared
+            // references) and write that onto the ORIGINAL (non-relabeled) trees — cgid isn't
+            // invertible 1:1 back to original gids, so we go through mutableLots rather than the
+            // relabeled trees' own (still cgid-keyed) output.
+            val gidToCgid = waveResult.consolidation.native.mapNotNull { n ->
+                val g = n["wo_group_id"] as? String
+                val c = n["consolidated_group_id"] as? String
+                if (g != null && c != null) g to c else null
+            }.toMap()
+            val relabeledTrees = relabelTreesToConsolidatedGids(waveResult.peggingTrees, gidToCgid)
+            // resequenceFromPegging's DAG keys lots by wo_group_id, but singleton consolidated
+            // rows (singletonRow) keep wo_group_id = their original native gid — only merged rows
+            // (mergedRow) use cgid there — while relabeledTrees' WO nodes are always relabeled to
+            // cgid. That mismatch makes singleton parents invisible to lotsByGroup, so a capacity
+            // push on a child never reaches them (silent `lotsByGroup[parentGid] ?: continue`).
+            // Use a scratch copy keyed uniformly by cgid for the cascade DAG walk, then patch the
+            // resolved timing back onto mutableLots explicitly (no shared-reference mutation since
+            // these are clones).
+            val cgidLots: List<MutableMap<String, Any?>> = mutableLots.map { lot ->
+                val cgid = lot["consolidated_group_id"] as? String ?: return@map lot
+                lot.toMutableMap().also { it["wo_group_id"] = cgid }
+            }
+            resequenceFromPegging(cgidLots, relabeledTrees)
+            val startByCgid = cgidLots.mapNotNull { l ->
+                val cgid = l["consolidated_group_id"] as? String ?: return@mapNotNull null
+                val start = parseDate(l["start_time"] as? String) ?: return@mapNotNull null
+                cgid to start
+            }.toMap()
+            val endByCgid = cgidLots.mapNotNull { l ->
+                val cgid = l["consolidated_group_id"] as? String ?: return@mapNotNull null
+                val end = parseDate(l["end_time"] as? String) ?: return@mapNotNull null
+                cgid to end
+            }.toMap()
+            for (lot in mutableLots) {
+                val cgid = lot["consolidated_group_id"] as? String ?: continue
+                startByCgid[cgid]?.let { lot["start_time"] = formatDate(it) }
+                endByCgid[cgid]?.let { lot["end_time"] = formatDate(it) }
+            }
+            val startByOriginalGid = gidToCgid.mapNotNull { (g, c) -> startByCgid[c]?.let { g to it } }.toMap()
+            val endByOriginalGid = gidToCgid.mapNotNull { (g, c) -> endByCgid[c]?.let { g to it } }.toMap()
+            adjustedTrees = rewritePeggingTimings(waveResult.peggingTrees, startByOriginalGid, endByOriginalGid)
+        }
+    }
+    val adjustedConsolidated: List<Map<String, Any?>> = mutableLots
 
-    // Patch native WO timings to match the adjusted consolidated WO for each group.
-    // Preserve original per-demand start and lead before overwriting with consolidated timing so
-    // the frontend can show per-demand vs. batch-timing deltas.
+    // Patch native WO timings to match the FINAL (post-arbitration) consolidated WO for each
+    // group. Preserve original per-demand start and lead before overwriting with consolidated
+    // timing so the frontend can show per-demand vs. batch-timing deltas.
     val adjustedTimingByCgid = adjustedConsolidated.associate { c ->
         (c["consolidated_group_id"] as? String ?: "") to
         Pair(c["start_time"] as? String, c["end_time"] as? String)
     }
-    val adjustedNative = consolidation.native.map { n ->
+    val adjustedNative = waveResult.consolidation.native.map { n ->
         val cgid = n["consolidated_group_id"] as? String ?: return@map n
         val (newStart, newEnd) = adjustedTimingByCgid[cgid] ?: return@map n
         val origStart = n["start_time"] as? String
@@ -4690,6 +5290,105 @@ internal fun verifyWoConservation(
 }
 
 /**
+ * R10: inventory-priority check. For each (product_id, location_id) where the plan
+ * created new work orders, verify that all timely physical supply inventory at that
+ * component was consumed before resorting to new production.
+ *
+ * "Timely" means the supply lot's [supply_date] is on or before the earliest WO
+ * [start_time] at the same component — i.e., the inventory was available when the
+ * WO would have started and should have been drawn instead.
+ *
+ * Violations indicate the planner under-consumed existing stock and created
+ * unnecessary WOs, which over-states production load and inflates WO count.
+ *
+ * Skipped when [inventoryLeftover] or [workOrders] is empty (R7e snapshots not
+ * available for historical runs, or a plan with no work orders).
+ *
+ * @param inventoryLeftover   Compact inventory snapshot after all planning passes
+ *        (supply_id + qty only, as persisted to [PlanRuns.inventoryLeftover]).
+ * @param workOrders          Consolidated work orders from the plan output.
+ * @param supplies            Full supply rows from case data ([data["supply"]]).
+ *        Required to look up (product_id, location_id, supply_date) from supply_id.
+ */
+internal fun verifyInventoryPriority(
+    inventoryLeftover: List<Map<String, Any?>>,
+    workOrders: List<Map<String, Any?>>,
+    supplies: List<Map<String, Any?>>,
+    tolerance: Double = 1e-6,
+): List<String> {
+    if (inventoryLeftover.isEmpty() || workOrders.isEmpty()) return emptyList()
+
+    // supply_id → (product_id, location_id, supply_date)
+    data class SupplyMeta(val pid: String, val lid: String, val supplyDate: java.time.LocalDate?)
+    val supplyMeta = mutableMapOf<String, SupplyMeta>()
+    for (s in supplies) {
+        val sid = s["supply_id"]?.toString() ?: continue
+        val pid = (s["product_id"] as? String)?.trim() ?: continue
+        val lid = (s["location_id"] as? String)?.trim() ?: continue
+        val supplyDate = (s["supply_date"] as? String)?.let {
+            runCatching { java.time.LocalDate.parse(it) }.getOrNull()
+        }
+        supplyMeta[sid] = SupplyMeta(pid, lid, supplyDate)
+    }
+
+    // Leftover qty by supply_id, skipping consolidated synthetic buckets.
+    // Demand-tagged buckets ARE included — if a demand's tagged supply sits
+    // unused while that demand also has WOs, that is a genuine priority violation:
+    // the planner should have consumed the reserved inventory before creating WOs.
+    val leftoverBySupply = mutableMapOf<String, Double>()
+    for (inv in inventoryLeftover) {
+        val sid = inv["supply_id"]?.toString() ?: continue
+        if (sid.startsWith("consolidated_")) continue
+        val qty = (inv["qty"] as? Number)?.toDouble() ?: 0.0
+        if (qty > tolerance) leftoverBySupply.merge(sid, qty, Double::plus)
+    }
+    if (leftoverBySupply.isEmpty()) return emptyList()
+
+    // Earliest WO start_time per component (pid|lid). Skip zero-qty, failed, and move WOs.
+    // Move WOs deliver supply to location_id (they create, not consume, inventory there), so they
+    // are irrelevant to the inventory-priority check: leftover stock at the destination does not
+    // imply the move was unnecessary — it may have been needed for a different downstream demand.
+    val woEarliestStart = mutableMapOf<String, java.time.LocalDate>()
+    for (wo in workOrders) {
+        val pid = (wo["product_id"] as? String)?.trim() ?: continue
+        val lid = (wo["location_id"] as? String)?.trim() ?: continue
+        if (wo["method"] == "move") continue
+        if ((wo["quantity"] as? Number)?.toDouble() ?: 0.0 <= 0.0) continue
+        if (wo["failed"] == true) continue
+        val start = (wo["start_time"] as? String)?.let {
+            runCatching { java.time.LocalDate.parse(it) }.getOrNull()
+        } ?: continue
+        val key = "$pid|$lid"
+        val cur = woEarliestStart[key]
+        if (cur == null || start.isBefore(cur)) woEarliestStart[key] = start
+    }
+    if (woEarliestStart.isEmpty()) return emptyList()
+
+    // Accumulate timely leftover by component: leftover lots whose supply_date ≤ earliest WO start.
+    val timelyLeftoverByComponent = mutableMapOf<String, Double>()
+    for ((sid, leftover) in leftoverBySupply) {
+        val meta = supplyMeta[sid] ?: continue
+        val compKey = "${meta.pid}|${meta.lid}"
+        val woStart = woEarliestStart[compKey] ?: continue   // no WO at this component → skip
+        // Supply is "timely" if it was available on or before the WO's start date.
+        // A null supply_date is treated as earliest possible (e.g. on-hand stock) → always timely.
+        if (meta.supplyDate != null && meta.supplyDate.isAfter(woStart)) continue
+        timelyLeftoverByComponent.merge(compKey, leftover, Double::plus)
+    }
+
+    val violations = mutableListOf<String>()
+    for ((compKey, leftover) in timelyLeftoverByComponent.entries.sortedBy { it.key }) {
+        val (pid, lid) = compKey.split("|", limit = 2)
+        val woStart = woEarliestStart[compKey]
+        violations.add(
+            "R10: $pid@$lid — %.4f units of inventory available before earliest WO ($woStart) were not consumed. Existing stock should be exhausted before new WOs are issued.".format(leftover)
+        )
+        log.warn("inventory-priority violation — R10: {}@{} leftover={} woStart={}", pid, lid, leftover, woStart)
+    }
+    return violations
+}
+
+/**
  * Post-processing pass: enforce
  *   start_time(parent WO) >= max(end_time(direct-child WOs))
  * across the assembled work-order list.
@@ -4771,6 +5470,14 @@ private fun fixTimingFromPegging(
     // taggedChildPeggings under blocked AND-bottleneck nodes, so a single
     // physical WO can have many tree-positions.
     val emittedPlanningGids = mutableSetOf<String>()
+    // Cross-tree gid consistency: when the same physical WO (same planningGid) appears in
+    // multiple pegging trees as an OR-group member, each tree would otherwise mint a fresh
+    // orGroupId, leaving all but the first tree with an orphaned gid (no lots in mutableLots).
+    // resequenceFromPegging's pushUp can't propagate through orphaned gids, so parent WOs in
+    // those trees (e.g. VIRTUAL consolidation WOs) are never pushed when ResourceScheduler
+    // shifts the underlying real WOs.  Fix: record the finalGid assigned the first time each
+    // planningGid is processed and reuse it in all subsequent trees.
+    val planningGidToFinalGid = mutableMapOf<String, String>()
     var dedupSkipped = 0
 
     fun emitLotsForWo(
@@ -4881,7 +5588,16 @@ private fun fixTimingFromPegging(
                 ch["type"] == "work_order" && ch["failed"] != true
             }
             val isOrGroup = nonFailedWoChildren.size > 1
-            val orGroupId = if (isOrGroup) nextWoGroupId() else null
+            // For OR-groups: reuse the finalGid from the first tree that processed any of these
+            // children.  Without this, each tree mints a fresh orGroupId; only the first gets
+            // lots, and subsequent trees' nodes are orphaned — pushUp in resequenceFromPegging
+            // can't propagate through them.
+            val existingOrGid = if (isOrGroup) {
+                nonFailedWoChildren.mapNotNull { (_, ch) ->
+                    (ch["wo_group_id"] as? String)?.let { planningGidToFinalGid[it] }
+                }.firstOrNull()
+            } else null
+            val orGroupId = if (isOrGroup) existingOrGid ?: nextWoGroupId() else null
             val altIndexByChild = if (isOrGroup) {
                 nonFailedWoChildren.withIndex()
                     .associate { (altIndex, idxAndCh) -> idxAndCh.index to altIndex }
@@ -4890,8 +5606,10 @@ private fun fixTimingFromPegging(
             val newChildren = children.mapIndexed { i, ch ->
                 if (ch["type"] == "work_order" && ch["failed"] != true) {
                     val planningGid = ch["wo_group_id"] as? String
-                    val finalGid = orGroupId ?: planningGid
+                    val finalGid = orGroupId ?: planningGidToFinalGid[planningGid] ?: planningGid
                     val altIndex = altIndexByChild[i]
+                    // Record the mapping so subsequent trees reuse the same finalGid.
+                    if (planningGid != null && finalGid != null) planningGidToFinalGid[planningGid] = finalGid
                     if (finalGid != null) {
                         emitLotsForWo(ch, finalGid, altIndex, ownerDemandId)
                     }
@@ -5042,87 +5760,85 @@ internal fun resequenceFromPegging(
         lotsByGroup.size, peggingTrees.size, allGroups.size, leaves.size, leafConstraintShifts, shiftCount)
 
     // ── Step 3: Write corrected timings back into the pegging trees ───────────
-    // Same skip-failed discipline as regenWalk: failed=true WO nodes carry
-    // first-pass diagnostic stubs whose gids were never emitted as lots.
-    // Recursing into them and trying to update timing produces ~20k spurious
-    // "no lots" hits and (worse) leaves the tree in an inconsistent state.
-    var rewriteWoUpdated = 0
-    var rewriteWoNoLots = 0
-    var rewriteWoNoGid = 0
-    val rewriteMissSamples = mutableListOf<String>()
-    @Suppress("UNCHECKED_CAST")
-    fun rewriteTree(node: Map<String, Any?>, depth: Int, path: String): Map<String, Any?> {
-        if (depth > 60) return node
-        // Skip the entire subtree of any failed=true WO node.
-        if (node["type"] == "work_order" && node["failed"] == true) return node
-        val originalChildren = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
-        val newChildren = originalChildren.mapIndexed { i, ch -> rewriteTree(ch, depth + 1, "$path-$i") }
-        val updated = node.toMutableMap()
-        if (originalChildren.isNotEmpty()) updated["children"] = newChildren
-        when (node["type"] as? String) {
-            "work_order" -> {
-                val gid = node["wo_group_id"] as? String
-                val altIndex = node["method_slot_index"] as? Int
-                if (gid == null) {
-                    rewriteWoNoGid++
-                    if (rewriteMissSamples.size < 10) {
-                        rewriteMissSamples.add("no_gid: ${node["product_id"]}@${node["location_id"]}/${node["method"]} path=$path start=${node["start_time"]}")
-                    }
-                } else {
-                    val ownLots = lotsByGroup[gid]?.filter {
-                        (it["method_slot_index"] as? Int) == altIndex
-                    } ?: emptyList()
-                    if (ownLots.isNotEmpty()) {
-                        ownLots.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull()
-                            ?.let { updated["start_time"] = formatDate(it) }
-                        ownLots.mapNotNull { parseDate(it["end_time"] as? String) }.maxOrNull()
-                            ?.let { updated["end_time"] = formatDate(it) }
-                        rewriteWoUpdated++
-                    } else {
-                        rewriteWoNoLots++
-                        if (rewriteMissSamples.size < 10) {
-                            val bucketSize = lotsByGroup[gid]?.size ?: 0
-                            rewriteMissSamples.add("no_lots: ${node["product_id"]}@${node["location_id"]}/${node["method"]} gid=$gid altIdx=$altIndex bucket_size=$bucketSize path=$path start=${node["start_time"]}")
-                        }
-                    }
-                }
-            }
-            "demand" -> {
-                // Recompute commit_time from children that ACTUALLY produced
-                // something — exclude hard-planning-failure children whose
-                // commit_time is the wishful request_time (no real
-                // fulfillment, so they don't constrain the parent's start).
-                val newCommit = newChildren.mapNotNull { ch ->
-                    val r = ch["commit_reason"] as? String
-                    if (r == "cycle_stopped" || r == "cycle_detected") return@mapNotNull null
-                    if (isHardPlanningFailure(r)) return@mapNotNull null
-                    when (ch["type"] as? String) {
-                        "work_order" -> parseDate(ch["end_time"] as? String)
-                        "demand", "supply", "purchase" -> parseDate(ch["commit_time"] as? String)
-                        else -> null
-                    }
-                }.maxOrNull()
-                val current = parseDate(node["commit_time"] as? String)
-                if (newCommit != null && (current == null || newCommit > current)) {
-                    updated["commit_time"] = formatDate(newCommit)
-                }
-            }
-        }
-        return updated
-    }
     val finalTrees = peggingTrees.map { entry ->
         @Suppress("UNCHECKED_CAST")
         val tree = entry["tree"] as? Map<String, Any?> ?: return@map entry
-        entry.toMutableMap().apply { put("tree", rewriteTree(tree, 0, "0")) }
-    }
-    log.info("resequenceFromPegging.rewriteTree: wo_updated={} wo_no_lots={} wo_no_gid={}",
-        rewriteWoUpdated, rewriteWoNoLots, rewriteWoNoGid)
-    if (rewriteMissSamples.isNotEmpty()) {
-        log.warn("resequenceFromPegging.rewriteTree miss samples (first {}):", rewriteMissSamples.size)
-        for (sample in rewriteMissSamples) log.warn("  rewrite-miss: {}", sample)
+        entry.toMutableMap().apply { put("tree", rewriteTreeFromWorkOrders(tree, lotsByGroup)) }
     }
 
     return TimingFixResult(mutableLots, finalTrees)
+}
+
+/**
+ * Rewrite all timing in a single pegging tree node (and its descendants) using
+ * the scheduled lots in [wosByGid] as the single authoritative source.
+ *
+ * Processing is bottom-up: children are rewritten first, then each node's
+ * timestamps are derived from the already-corrected children.
+ *
+ * - **WO nodes**: `start_time`/`end_time` stamped from the matching lots in
+ *   [wosByGid] (filtered by `method_slot_index`). Nodes with no matching lots
+ *   (failed stubs, orphaned gids) are left unchanged.
+ * - **Supply / purchase nodes**: `commit_time` set to the max `end_time` of
+ *   any child WO, or the max `commit_time` of any nested demand/supply child.
+ *   Physical supply with no sub-tree is left unchanged.
+ * - **Demand nodes**: `commit_time` set to the max of child WO `end_time` /
+ *   child demand `commit_time`, skipping hard-failure children.
+ *
+ * This makes each demand's pegging tree self-contained: every node's timing
+ * reflects the post-scheduling reality, so R5 (predecessor_sequencing) within
+ * the tree is sufficient for timing soundness — no cross-tree checks needed.
+ */
+@Suppress("UNCHECKED_CAST")
+internal fun rewriteTreeFromWorkOrders(
+    node: Map<String, Any?>,
+    wosByGid: Map<String, List<Map<String, Any?>>>,
+    depth: Int = 0,
+): Map<String, Any?> {
+    if (depth > 60) return node
+    if (node["type"] == "work_order" && node["failed"] == true) return node
+    val originalChildren = (node["children"] as? List<Map<String, Any?>>) ?: emptyList()
+    val newChildren = originalChildren.map { rewriteTreeFromWorkOrders(it, wosByGid, depth + 1) }
+    val updated = node.toMutableMap()
+    if (originalChildren.isNotEmpty()) updated["children"] = newChildren
+    when (node["type"] as? String) {
+        "work_order" -> {
+            val gid = node["wo_group_id"] as? String ?: return updated
+            val altIndex = node["method_slot_index"] as? Int
+            val wos = (wosByGid[gid] ?: emptyList()).filter { (it["method_slot_index"] as? Int) == altIndex }
+            if (wos.isNotEmpty()) {
+                wos.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull()
+                    ?.let { updated["start_time"] = formatDate(it) }
+                wos.mapNotNull { parseDate(it["end_time"] as? String) }.maxOrNull()
+                    ?.let { updated["end_time"] = formatDate(it) }
+            }
+        }
+        "demand" -> {
+            val newCommit = newChildren.mapNotNull { ch ->
+                val r = ch["commit_reason"] as? String
+                if (r == "cycle_stopped" || r == "cycle_detected" || isHardPlanningFailure(r)) return@mapNotNull null
+                when (ch["type"] as? String) {
+                    "work_order" -> parseDate(ch["end_time"] as? String)
+                    "demand", "supply", "purchase" -> parseDate(ch["commit_time"] as? String)
+                    else -> null
+                }
+            }.maxOrNull()
+            val current = parseDate(node["commit_time"] as? String)
+            if (newCommit != null && (current == null || newCommit > current)) updated["commit_time"] = formatDate(newCommit)
+        }
+        "supply", "purchase" -> {
+            val newCommit = newChildren.mapNotNull { ch ->
+                when (ch["type"] as? String) {
+                    "work_order" -> parseDate(ch["end_time"] as? String)
+                    "demand", "supply", "purchase" -> parseDate(ch["commit_time"] as? String)
+                    else -> null
+                }
+            }.maxOrNull()
+            val current = parseDate(node["commit_time"] as? String)
+            if (newCommit != null && (current == null || newCommit > current)) updated["commit_time"] = formatDate(newCommit)
+        }
+    }
+    return updated
 }
 
 /** Result of [fixTimingFromPegging] / [resequenceFromPegging]: the corrected
@@ -5203,6 +5919,13 @@ internal fun buildPeggingDag(
                         leafConstraintByGid.merge(currentParent, commit) { a, b -> if (b > a) b else a }
                     }
                 }
+                // Recurse into children: when a supply lot is *produced* by a WO (sub-tree exists),
+                // we must add that producing WO into the DAG as a child of currentParent so pushUp
+                // propagates the producing WO's end_time up to the parent WO's start constraint.
+                // Without this, ResourceScheduler shifts (e.g. 500-4212/1000 pushed to Oct) are
+                // invisible to the parent (F30__888 stays at Aug because its leafConstraint is
+                // derived from the supply node's stale pre-arbitration commit_time).
+                for (c in nodeChildren) walk(c, currentParent, depth + 1)
             }
             else -> {
                 for (c in nodeChildren) walk(c, currentParent, depth + 1)

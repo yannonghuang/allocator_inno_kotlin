@@ -143,7 +143,17 @@ class SoundnessCheckerTest : FunSpec({
         val data = mapOf<String, List<Map<String, Any?>>>(
             "supply" to listOf(supply("S1", "FG", "VIRTUAL", 10.0)),
         )
-        val report = checkRunSoundness(planningPegging = emptyList(), demands = demands, data = data)
+        // R0_no_tree only fires when planningPegging is non-empty — that signals
+        // pegging WAS generated but D1's tree is genuinely missing (engine bug),
+        // vs. an empty list meaning pegging wasn't stored (historical run, fine).
+        val phantomEntry = mapOf(
+            "demand_id" to "D_OTHER",
+            "tree" to mapOf("type" to "demand", "product_id" to "X", "location_id" to "VIRTUAL",
+                "quantity" to 0.0, "committed_qty" to 0.0, "children" to emptyList<Any>()),
+        )
+        val report = checkRunSoundness(
+            planningPegging = listOf(phantomEntry), demands = demands, data = data,
+        )
         report.overallSound shouldBe false
         report.demands shouldHaveSize 1
         report.demands[0].sound shouldBe false
@@ -747,6 +757,62 @@ class SoundnessCheckerTest : FunSpec({
         v.actual shouldBe 150.0
         v.message stringShouldContain "consolidator's allocation"
     }
+
+    // ── R11: wo_group_id orphan check ────────────────────────────────────────────
+
+    test("R11: orphan gid — WO node in tree has no lot in work_orders") {
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0,
+            children = listOf(
+                makeWO("FG", "L1", qty = 10.0).toMutableMap().also { it["wo_group_id"] = "WOG-1" }
+            ))
+        val data = mapOf("method_make" to listOf(mk("FG", "L1")), "bom" to emptyList<Map<String, Any?>>())
+        // work_orders list doesn't contain WOG-1
+        val workOrders = listOf(
+            mapOf("product_id" to "FG", "location_id" to "L1", "quantity" to 10.0,
+                "start_time" to "2024-11-01", "end_time" to "2024-11-01", "wo_group_id" to "WOG-OTHER")
+        )
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", tree)),
+            demands = demands, data = data, workOrders = workOrders,
+        )
+        report.woGidOrphanViolations.map { it.rule } shouldContain "R11_wo_gid_orphan"
+        report.overallSound shouldBe false
+    }
+
+    test("R11: no violation when all tree gids have lots in work_orders") {
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0,
+            children = listOf(
+                makeWO("FG", "L1", qty = 10.0).toMutableMap().also { it["wo_group_id"] = "WOG-1" }
+            ))
+        val data = mapOf("method_make" to listOf(mk("FG", "L1")), "bom" to emptyList<Map<String, Any?>>())
+        val workOrders = listOf(
+            mapOf("product_id" to "FG", "location_id" to "L1", "quantity" to 10.0,
+                "start_time" to "2024-11-01", "end_time" to "2024-11-01", "wo_group_id" to "WOG-1")
+        )
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", tree)),
+            demands = demands, data = data, workOrders = workOrders,
+        )
+        report.woGidOrphanViolations shouldHaveSize 0
+    }
+
+    test("R11: skipped when work_orders is empty") {
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0,
+            children = listOf(
+                makeWO("FG", "L1", qty = 10.0).toMutableMap().also { it["wo_group_id"] = "WOG-ORPHAN" }
+            ))
+        val data = mapOf("method_make" to listOf(mk("FG", "L1")), "bom" to emptyList<Map<String, Any?>>())
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", tree)),
+            demands = demands, data = data, workOrders = emptyList(),
+        )
+        report.woGidOrphanViolations shouldHaveSize 0
+    }
+
+    // ── R7c skipped when no consolidator entries are present ──────────────────
 
     test("R7c skipped when no consolidator entries are present") {
         // Pure non-consolidation run: no consolidated/passthrough entries.

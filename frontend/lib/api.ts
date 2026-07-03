@@ -257,6 +257,7 @@ export type PlanningPeggingNode = {
   pre_process_time?: number | null;
   post_process_time?: number | null;
   prod_area?: string | null;
+  wo_group_id?: string | null;
   /** resource nodes: per-unit consumption rate and the available pool size at this location. */
   resource_rate?: number | null;
   size?: number | null;
@@ -423,8 +424,14 @@ export type PlanningConfig = {
   /** Consolidate shared component demands within a time bucket before planning. */
   consolidation?: {
     enabled?: boolean;
-    /** Width of the time bucket in days (0–365). 0 (default) collapses every demand into a single bucket regardless of due date. */
+    /** Width of the supply-side time bucket in days (0–365). */
     period_days?: number;
+    /** Legacy global WO batch scale — used as fallback when per-type scales are absent. */
+    wo_batch_scale?: 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
+    /** Per-type WO batch scales. Override wo_batch_scale when present. */
+    make_batch_scale?:     'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
+    move_batch_scale?:     'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
+    purchase_batch_scale?: 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
   };
   /**
    * Post-plan UI behavior toggles. These do not affect planner output — they
@@ -451,6 +458,7 @@ export type PlanSupplyAllocation = {
   supply_id: string;
   demand_id: string | null;
   qty_consumed: number;
+  qty_allocated?: number;
 };
 
 /**

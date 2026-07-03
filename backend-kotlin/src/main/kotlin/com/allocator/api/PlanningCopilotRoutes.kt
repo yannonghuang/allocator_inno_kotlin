@@ -114,11 +114,16 @@ Intent → config mapping (interpret any phrasing that conveys the same intent):
 8) **Disable WO batching (consolidation)** (e.g. "disable consolidation", "no batching", "禁用合并", "关闭合并", "不合并")
    → consolidation: { "enabled": false }.
 
-9) **Set the WO batch window to N days** (e.g. "30 day batch window", "60天窗口", "period 90 days", "single bucket", "全部合并")
-   → consolidation: { "period_days": N } (clamp 0..365). 0 = single bucket.
+9) **Set WO batch window scale** — make/move/buy can each have independent scales.
+   To set all at once: "weekly batches", "bi-weekly", "monthly window", "no batching", "all together", "每周批次", "每两周", "每月窗口", "不合并工单", "全部合并"
+   → consolidation: { "make_batch_scale": "...", "move_batch_scale": "...", "purchase_batch_scale": "..." }
+   To set per type: "set make monthly", "move orders weekly", "don't batch purchases", "制造每月", "调拨每周", "采购不合并"
+   → consolidation: { "<type>_batch_scale": "none"|"weekly"|"biweekly"|"monthly"|"all" }
+   Always also set "period_days" to the matching value (0/7/14/30/0) for supply-side consistency.
+   Numeric requests (e.g. "30 day window") map to the nearest named scale: ≤7 → weekly, ≤14 → biweekly, else → monthly.
 
 10) **Reset / clear / default** → full defaults:
-    method_selection: { "multiple": false, "mode": "preference", "depth": 1 }, purchase_allowed: false, consolidation: { "enabled": true, "period_days": 30 }, analyze_criticality: false, check_soundness: true.
+    method_selection: { "multiple": false, "mode": "preference", "depth": 1 }, purchase_allowed: false, consolidation: { "enabled": true, "make_batch_scale": "weekly", "move_batch_scale": "weekly", "purchase_batch_scale": "weekly", "period_days": 7 }, analyze_criticality: false, check_soundness: true.
 
 14) **Enable criticality analysis after plan** (e.g. "analyze criticality", "criticality on", "open criticality", "启用关键度", "做关键度分析", "开启临界分析")
     → analyze_criticality: true. Auto-saves the run and runs criticality after each plan.
@@ -136,7 +141,7 @@ Valid config_update keys:
 - method_selection: object with optional "multiple" (bool), "mode" ("preference" | "elaborate"), "depth" (int ≥ 1), "max_methods" (int ≥ 1; default 2; waterfall cap), "max_bom_depth" (int 1..10; default 3; make-fallback admission cap), "score_weights" ({ commit_time, inventory_consumed, purchase } — numeric, backend normalizes).
 - purchase_allowed: boolean (top-level, not nested).
 - purchasable_materials: array of product_id strings (top-level). Empty ⇒ all raw materials buyable (default). Non-empty ⇒ strict whitelist; only listed raw materials may be bought. Resolve only against the supplied catalog.
-- consolidation: object with optional "enabled" (bool), "period_days" (int 0..365; 0 = single bucket).
+- consolidation: object with optional "enabled" (bool), "make_batch_scale", "move_batch_scale", "purchase_batch_scale" (each "none"|"weekly"|"biweekly"|"monthly"|"all"; per-type scales), "wo_batch_scale" (legacy global fallback), "period_days" (int 0..365; supply-side bucket width; 0 = single bucket).
 - analyze_criticality: boolean (top-level). Post-plan UI toggle, does not affect the planner itself.
 - check_soundness: boolean (top-level). Post-plan UI toggle, does not affect the planner itself.
 
@@ -235,7 +240,7 @@ private suspend fun llmParse(
         val ac = cu["analyze_criticality"]?.jsonPrimitive?.booleanOrNull
         val sc = cu["check_soundness"]?.jsonPrimitive?.booleanOrNull
         val msOk = ms?.let { "multiple" in it || "elaborate" in it || "mode" in it || "depth" in it || "max_methods" in it || "max_bom_depth" in it || "score_weights" in it } == true
-        val csOk = cs?.let { "enabled" in it || "period_days" in it } == true
+        val csOk = cs?.let { "enabled" in it || "period_days" in it || "wo_batch_scale" in it || "make_batch_scale" in it || "move_batch_scale" in it || "purchase_batch_scale" in it } == true
         val paOk = pa != null
         val acOk = ac != null
         val scOk = sc != null
@@ -378,12 +383,20 @@ private fun ruleBasedParse(
         if (csEnabled == false) {
             parts.add(if (zh) "工单批量合并关闭" else "WO batching off")
         } else {
-            val days = cs["period_days"]?.jsonPrimitive?.intOrNull ?: 30
-            val bucketLabel = if (zh) {
-                if (days == 0) "单桶" else "${days}天窗口"
-            } else {
-                if (days == 0) "single bucket" else "$days-day window"
+            val globalScale = cs["wo_batch_scale"]?.jsonPrimitive?.contentOrNull
+            val days = cs["period_days"]?.jsonPrimitive?.intOrNull ?: 7
+            fun scaleLabel(key: String): String {
+                val scale = cs[key]?.jsonPrimitive?.contentOrNull ?: globalScale
+                return when (scale) {
+                    "none"     -> if (zh) "不合并" else "none"
+                    "weekly"   -> if (zh) "每周" else "weekly"
+                    "biweekly" -> if (zh) "每两周" else "bi-weekly"
+                    "monthly"  -> if (zh) "每月" else "monthly"
+                    "all"      -> if (zh) "全部" else "all"
+                    else       -> if (zh) { if (days == 0) "单桶" else "${days}天" } else { if (days == 0) "single bucket" else "${days}d" }
+                }
             }
+            val bucketLabel = "make:${scaleLabel("make_batch_scale")} move:${scaleLabel("move_batch_scale")} buy:${scaleLabel("purchase_batch_scale")}"
             parts.add(if (zh) "工单批量合并开启（$bucketLabel）" else "WO batching on ($bucketLabel)")
         }
         val analyzeCriticality = current["analyze_criticality"]?.jsonPrimitive?.booleanOrNull == true
@@ -544,9 +557,16 @@ private fun ruleBasedParse(
     if (Regex("enable consolidat|turn on consolidat|batch work order|enable.*batch|wo batch").containsMatchIn(t) ||
         Regex("启用合并|开启合并|批量合并工单|开启批量").containsMatchIn(raw)
     ) {
-        val days = cs["period_days"]?.jsonPrimitive?.intOrNull ?: 30
-        val bucketLabel = if (days == 0) "single-bucket" else "$days-day window"
-        val zhBucketLabel = if (days == 0) "单桶" else "${days}天窗口"
+        val scale = cs["wo_batch_scale"]?.jsonPrimitive?.contentOrNull
+        val days = cs["period_days"]?.jsonPrimitive?.intOrNull ?: 7
+        val bucketLabel = when (scale) {
+            "weekly" -> "weekly"; "biweekly" -> "bi-weekly"; "monthly" -> "monthly"
+            "all" -> "all (single bucket)"; else -> if (days == 0) "single-bucket" else "$days-day window"
+        }
+        val zhBucketLabel = when (scale) {
+            "weekly" -> "每周"; "biweekly" -> "每两周"; "monthly" -> "每月"
+            "all" -> "全部（单桶）"; else -> if (days == 0) "单桶" else "${days}天窗口"
+        }
         return bi(
             "Enabling WO batching ($bucketLabel). Same-component work orders within the window will be merged into fewer larger orders. Re-run plan to apply.",
             "已启用工单批量合并（$zhBucketLabel）。同一时间窗口内同一组件的工单将合并为更少的大订单。请重新运行计划以生效。",
@@ -554,18 +574,76 @@ private fun ruleBasedParse(
         ) to mergeConsolidation(current, mapOf("enabled" to JsonPrimitive(true)))
     }
 
-    // ── Consolidation single-bucket / period_days = 0 ──
-    if (Regex("single (bucket|period)|one (bucket|period)|no (bucket|period)|merge all|consolidate all").containsMatchIn(t) ||
-        Regex("单桶|单一桶|不分桶|全部合并|合并所有").containsMatchIn(raw)
-    ) {
+    // ── WO batch scale — per-type patterns ──
+    data class TypeMatch(val type: String, val enPattern: String, val zhPattern: String, val configKey: String, val zhLabel: String)
+    val perTypeMatches = listOf(
+        TypeMatch("make",     "make|manufactur|production", "制造|生产",   "make_batch_scale",     "制造"),
+        TypeMatch("move",     "move|transfer|transit",      "调拨|移库",   "move_batch_scale",     "调拨"),
+        TypeMatch("purchase", "purchas|buy|procurement",    "采购|外购",   "purchase_batch_scale", "采购"),
+    )
+    val scaleLower = t.lowercase()
+    val combined = scaleLower + " " + raw
+    for (tm in perTypeMatches) {
+        if (!Regex(tm.enPattern).containsMatchIn(scaleLower) && !Regex(tm.zhPattern).containsMatchIn(raw)) continue
+        val typeScale: String? = when {
+            Regex("\\bnone\\b|no.?batch|不合并").containsMatchIn(combined) -> "none"
+            Regex("\\ball\\b|全部").containsMatchIn(combined)              -> "all"
+            Regex("bi.?weekly|every\\s+two\\s+weeks|每\\s*两\\s*周|双周").containsMatchIn(combined) -> "biweekly"
+            Regex("\\bweekly\\b|每\\s*周").containsMatchIn(combined)      -> "weekly"
+            Regex("\\bmonthly\\b|每\\s*月").containsMatchIn(combined)     -> "monthly"
+            else -> null
+        } ?: continue
+        val days = when (typeScale) { "weekly" -> 7; "biweekly" -> 14; "monthly" -> 30; else -> 0 }
+        val labelEn = mapOf("none" to "none", "weekly" to "weekly", "biweekly" to "bi-weekly", "monthly" to "monthly", "all" to "all")[typeScale]!!
+        val labelZh = mapOf("none" to "不合并", "weekly" to "每周", "biweekly" to "每两周", "monthly" to "每月", "all" to "全部")[typeScale]!!
         return bi(
-            "Setting consolidation to single-bucket (period_days=0): every demand collapses into one bucket regardless of due date. Re-run plan to apply.",
-            "已将合并设为单桶（period_days=0）：所有需求合并为同一桶，不区分到期日。请重新运行计划以生效。",
+            "Setting ${tm.type} WO batch window to $labelEn. Re-run plan to apply.",
+            "已将${tm.zhLabel}工单批量窗口设为${labelZh}。请重新运行计划以生效。",
             raw,
-        ) to mergeConsolidation(current, mapOf("period_days" to JsonPrimitive(0)))
+        ) to mergeConsolidation(current, mapOf(
+            tm.configKey to JsonPrimitive(typeScale),
+            "period_days" to JsonPrimitive(days),
+        ))
     }
 
-    // ── Consolidation bucket / period_days ──
+    // ── WO batch scale — named calendar scale (sets all types at once) ──
+    val woBatchScale: String? = when {
+        Regex("\\bnone\\b|no.?batch|不合并工单").containsMatchIn(combined) -> "none"
+        Regex("\\ball\\b|全部合并|合并所有|单桶|单一桶|不分桶").containsMatchIn(combined) -> "all"
+        Regex("bi.?weekly|every\\s+two\\s+weeks|每\\s*两\\s*周|双周").containsMatchIn(combined) -> "biweekly"
+        Regex("\\bweekly\\b|每\\s*周").containsMatchIn(combined) -> "weekly"
+        Regex("\\bmonthly\\b|每\\s*月").containsMatchIn(combined) -> "monthly"
+        else -> null
+    }
+    if (woBatchScale != null) {
+        val days = when (woBatchScale) { "weekly" -> 7; "biweekly" -> 14; "monthly" -> 30; else -> 0 }
+        val labelEn = mapOf("none" to "none", "weekly" to "weekly", "biweekly" to "bi-weekly", "monthly" to "monthly", "all" to "all (single bucket)")[woBatchScale]!!
+        val labelZh = mapOf("none" to "不合并", "weekly" to "每周", "biweekly" to "每两周", "monthly" to "每月", "all" to "全部（单桶）")[woBatchScale]!!
+        return bi(
+            "Setting all WO batch windows to $labelEn (make + move + buy). Re-run plan to apply.",
+            "已将所有工单批量窗口（制造/调拨/采购）设为${labelZh}。请重新运行计划以生效。",
+            raw,
+        ) to mergeConsolidation(current, mapOf(
+            "make_batch_scale"     to JsonPrimitive(woBatchScale),
+            "move_batch_scale"     to JsonPrimitive(woBatchScale),
+            "purchase_batch_scale" to JsonPrimitive(woBatchScale),
+            "period_days"          to JsonPrimitive(days),
+        ))
+    }
+
+    // ── Consolidation single-bucket / period_days = 0 (legacy pattern — now handled by "all" above) ──
+    if (Regex("single (bucket|period)|one (bucket|period)|no (bucket|period)|merge all|consolidate all").containsMatchIn(t)) {
+        return bi(
+            "Setting consolidation to single-bucket (all WOs in one batch). Re-run plan to apply.",
+            "已将合并设为单桶（全部工单合并为一批）。请重新运行计划以生效。",
+            raw,
+        ) to mergeConsolidation(current, mapOf(
+            "make_batch_scale" to JsonPrimitive("all"), "move_batch_scale" to JsonPrimitive("all"),
+            "purchase_batch_scale" to JsonPrimitive("all"), "period_days" to JsonPrimitive(0),
+        ))
+    }
+
+    // ── Consolidation bucket / period_days (numeric, legacy) ──
     val periodMatch = Regex("(\\d+)\\s*(?:-\\s*)?days?\\s*(?:bucket|period|window)").find(t)
     val zhPeriodMatch = Regex("(\\d+)\\s*天(?:桶|窗口|周期)?").find(raw)
     val bucketMatch = Regex("(?:bucket|period)\\D*(\\d+)|时间桶\\D*(\\d+)").find(t + " " + raw)
@@ -575,13 +653,19 @@ private fun ruleBasedParse(
             ?: bucketMatch?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }
             ?: "0").toIntOrNull() ?: 0
         val days = n.coerceIn(0, 365)
+        val snappedScale = if (days == 0) "all" else if (days <= 7) "weekly" else if (days <= 14) "biweekly" else "monthly"
         val msg = if (days == 0) "single-bucket" else "$days day${if (days == 1) "" else "s"}"
         val zhMsg = if (days == 0) "单桶" else "${days}天"
         return bi(
-            "Setting consolidation bucket to $msg. Demands within that window may share work orders. Re-run plan to apply.",
-            "已将合并时间桶设为 $zhMsg。同一时间窗口内的需求可共用生产订单。请重新运行计划以生效。",
+            "Setting consolidation bucket to $msg (→ $snappedScale, all WO types). Demands within that window may share work orders. Re-run plan to apply.",
+            "已将合并时间桶设为 $zhMsg（→ $snappedScale，所有工单类型）。同一时间窗口内的需求可共用生产订单。请重新运行计划以生效。",
             raw,
-        ) to mergeConsolidation(current, mapOf("period_days" to JsonPrimitive(days)))
+        ) to mergeConsolidation(current, mapOf(
+            "make_batch_scale" to JsonPrimitive(snappedScale),
+            "move_batch_scale" to JsonPrimitive(snappedScale),
+            "purchase_batch_scale" to JsonPrimitive(snappedScale),
+            "period_days" to JsonPrimitive(days),
+        ))
     }
 
     // ── Post-plan UI toggles: analyze_criticality ──
@@ -642,14 +726,17 @@ private fun ruleBasedParse(
             put("purchase_allowed", false)
             put("consolidation", buildJsonObject {
                 put("enabled", true)
-                put("period_days", 30)
+                put("make_batch_scale", "weekly")
+                put("move_batch_scale", "weekly")
+                put("purchase_batch_scale", "weekly")
+                put("period_days", 7)
             })
             put("analyze_criticality", false)
             put("check_soundness", true)
         }
         return bi(
-            "Reset to defaults: method by preference (cascade), max methods 2, max BOM depth 3, purchase disabled, WO batching on (30-day window), criticality off, soundness check on.",
-            "已重置为默认：按偏好方法（级联）、最多 2 个方法、最大 BOM 深度 3、禁用采购、工单批量合并开启（30 天窗口）、关键度关闭、完整性校验开启。",
+            "Reset to defaults: method by preference (cascade), max methods 2, max BOM depth 3, purchase disabled, WO batching on (weekly), criticality off, soundness check on.",
+            "已重置为默认：按偏好方法（级联）、最多 2 个方法、最大 BOM 深度 3、禁用采购、工单批量合并开启（每周）、关键度关闭、完整性校验开启。",
             raw,
         ) to patch
     }

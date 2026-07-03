@@ -32,6 +32,7 @@ class SupplyGuidedPlanningTest : FunSpec({
         methodMove: List<Map<String, Any?>> = emptyList(),
         bom: List<Map<String, Any?>> = emptyList(),
         demands: List<Map<String, Any?>> = emptyList(),
+        productlocation: List<Map<String, Any?>> = emptyList(),
     ): Map<String, List<Map<String, Any?>>> = mapOf(
         "supply" to supplies,
         "method_make" to methodMake,
@@ -40,6 +41,7 @@ class SupplyGuidedPlanningTest : FunSpec({
         "bom" to bom,
         "demand" to demands,
         "overrides" to emptyList(),
+        "productlocation" to productlocation,
     )
 
     val supplyGuidedConfig = mapOf(
@@ -255,22 +257,30 @@ class SupplyGuidedPlanningTest : FunSpec({
 
     // ── D. End-to-end: supply-guided routing in runPlanning ──────────────────
 
-    test("supply-guided: two competing demands share a single supply proportionally by demand qty") {
-        // FG made from R1 (1:1). Supply R1=60. D1 needs 10 FG, D2 needs 30 FG.
-        // demand_qty allocation: D1 gets 60×(10/40)=15, D2 gets 60×(30/40)=45.
-        // Both should commit fully (15 ≤ 10 needs only 10, but budget=15 so 10 consumed;
-        // D2 needs 30, budget=45 ≥ 30 so fully committed).
+    test("supply-guided: proportional budget is binding constraint (3:1 demand ratio, supply=50% of total)") {
+        // FG made from R1 (1:1). Supply R1=20. D1 needs 30, D2 needs 10 → total demand 40.
+        // R1 qualifies as critical: in method_buy (UI purchasable-list candidate) + prod_area='raw'
+        // + NOT in purchasable_materials config (unselected/unchecked by user).
+        // demand_qty: D1 budget = 30/40 × 20 = 15; D2 budget = 10/40 × 20 = 5.
+        // Both budgets are BELOW actual demand → budgets are the binding constraint.
+        // Without supply-guided (FIFO, D1 listed first): D1 gets 20, D2 gets 0.
         val data = mkData(
-            supplies = listOf(supply("R1", "L", 60.0)),
+            supplies = listOf(supply("R1", "L", 20.0)),
             methodMake = listOf(
                 mapOf("bom_id" to "BOM1", "product_id" to "FG", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+            ),
+            methodBuy = listOf(
+                mapOf("product_id" to "R1", "location_id" to "L", "preference" to 1),
             ),
             bom = listOf(
                 mapOf("bom_id" to "BOM1", "parent_id" to "FG", "child_id" to "R1", "rate" to 1.0, "alt_group" to null),
             ),
             demands = listOf(
-                demand("D1", "FG", "L", qty = 10.0, priority = 0),
-                demand("D2", "FG", "L", qty = 30.0, priority = 1),
+                demand("D1", "FG", "L", qty = 30.0),
+                demand("D2", "FG", "L", qty = 10.0),
+            ),
+            productlocation = listOf(
+                mapOf("product_id" to "R1", "location_id" to "L", "prod_area" to "raw"),
             ),
         )
         val result = runPlanning(data, supplyGuidedConfig)
@@ -282,20 +292,22 @@ class SupplyGuidedPlanningTest : FunSpec({
         val d2Total = committed.filter { it["demand_id"] == "D2" }
             .sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
 
-        // D1 committed exactly its demand (10 ≤ budget 15)
-        d1Total shouldBe (10.0 plusOrMinus 1e-6)
-        // D2 committed exactly its demand (30 ≤ budget 45)
-        d2Total shouldBe (30.0 plusOrMinus 1e-6)
+        d1Total shouldBe (15.0 plusOrMinus 1e-6)
+        d2Total shouldBe (5.0 plusOrMinus 1e-6)
     }
 
     test("supply-guided: scarce supply shared fairly, both demands partially filled") {
         // R1=30. D1 needs 20, D2 needs 40 → total need 60 > supply 30.
         // demand_qty: D1=20/(20+40)=1/3 → 10; D2=40/60=2/3 → 20.
-        // After commit: D1 commits 10, D2 commits 20 (both partial).
+        // R1 qualifies as critical: in method_buy (UI purchasable-list candidate) + prod_area='raw'
+        // + NOT in purchasable_materials config (unselected/unchecked by user).
         val data = mkData(
             supplies = listOf(supply("R1", "L", 30.0)),
             methodMake = listOf(
                 mapOf("bom_id" to "BOM1", "product_id" to "FG", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+            ),
+            methodBuy = listOf(
+                mapOf("product_id" to "R1", "location_id" to "L", "preference" to 1),
             ),
             bom = listOf(
                 mapOf("bom_id" to "BOM1", "parent_id" to "FG", "child_id" to "R1", "rate" to 1.0, "alt_group" to null),
@@ -303,6 +315,9 @@ class SupplyGuidedPlanningTest : FunSpec({
             demands = listOf(
                 demand("D1", "FG", "L", qty = 20.0),
                 demand("D2", "FG", "L", qty = 40.0),
+            ),
+            productlocation = listOf(
+                mapOf("product_id" to "R1", "location_id" to "L", "prod_area" to "raw"),
             ),
         )
         val result = runPlanning(data, supplyGuidedConfig)
