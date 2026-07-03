@@ -10497,9 +10497,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               // Move + purchase WOs: show manifest (demand × component × qty) instead of accordion/pegging.
               // crossWaveCalendarMerge flatMaps move_components from singletonRow outputs that had none,
               // producing [] (truthy but empty). Treat empty move_components as absent so the synthesis runs.
-              const rawMoveComponents = row.move_components as { product_id: string; quantity: number; demand_ids?: string[] }[] | undefined;
-              const effectiveMoveComponents: { product_id: string; quantity: number; demand_ids: string[] }[] | null =
-                (rawMoveComponents?.length ? rawMoveComponents as { product_id: string; quantity: number; demand_ids: string[] }[] : null) ?? (() => {
+              type MoveComp = { product_id: string; quantity: number; demand_ids?: string[]; demand_splits?: { demand_id: string; quantity: number }[] };
+              const rawMoveComponents = row.move_components as MoveComp[] | undefined;
+              const effectiveMoveComponents: MoveComp[] | null =
+                (rawMoveComponents?.length ? rawMoveComponents : null) ?? (() => {
                   if (row.method === 'move') {
                     const pid = row.product_id ?? null;
                     if (!pid) return null;
@@ -10516,27 +10517,32 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               if ((effectiveMoveComponents?.length ?? 0) >= 1) {
                 const comps = effectiveMoveComponents!;
                 const committedDemandIds = new Set(planResult?.committed_demands.map((d) => d.demand_id) ?? []);
-                // One row per component. For move WOs, move_components has no per-demand qty split,
-                // so expanding per demand would duplicate the physical quantity. For purchase WOs the
-                // comps already come from splitDetails (one entry per demand with its own qty).
-                const manifestRows: { demands: string[]; comp: string; qty: number }[] = [];
+                // One row per (demand, component). When demand_splits is present use it for per-demand
+                // quantities; otherwise fall back to one row per component with total qty.
+                const manifestRows: { demand: string | null; comp: string; qty: number }[] = [];
                 for (const c of comps) {
-                  // Filter to only real committed demands; skip virtual / non-committed IDs.
-                  const realDemands = (c.demand_ids ?? []).filter((d) => d && committedDemandIds.has(d));
-                  manifestRows.push({ demands: realDemands, comp: c.product_id, qty: Number(c.quantity) });
+                  if (c.demand_splits && c.demand_splits.length > 0) {
+                    for (const s of c.demand_splits) {
+                      if (committedDemandIds.has(s.demand_id)) {
+                        manifestRows.push({ demand: s.demand_id, comp: c.product_id, qty: s.quantity });
+                      }
+                    }
+                  } else {
+                    // No per-demand split: one row per component, first committed demand as key.
+                    const realDemands = (c.demand_ids ?? []).filter((d) => d && committedDemandIds.has(d));
+                    manifestRows.push({ demand: realDemands[0] ?? null, comp: c.product_id, qty: Number(c.quantity) });
+                  }
                 }
-                // Apply sort (key by first demand or '–' when none)
-                const demandKey = (r2: { demands: string[] }) => r2.demands[0] ?? '–';
+                const demandKey = (r2: { demand: string | null }) => r2.demand ?? '–';
                 const dir = manifestSortDir === 'asc' ? 1 : -1;
                 manifestRows.sort((a, b) => {
                   if (manifestSortCol === 'qty') return dir * (a.qty - b.qty);
                   if (manifestSortCol === 'comp') return dir * (a.comp.localeCompare(b.comp) || demandKey(a).localeCompare(demandKey(b)));
                   return dir * (demandKey(a).localeCompare(demandKey(b)) || a.comp.localeCompare(b.comp));
                 });
-                const allManifestDemands = new Set(manifestRows.flatMap((r2) => r2.demands));
-                const distinctDemands = allManifestDemands.size;
-                const distinctComps = new Set(comps.map((c) => c.product_id)).size;
-                const totalQty = comps.reduce((s, c) => s + Number(c.quantity), 0);
+                const distinctDemands = new Set(manifestRows.map((r2) => r2.demand).filter(Boolean)).size;
+                const distinctComps = new Set(manifestRows.map((r2) => r2.comp)).size;
+                const totalQty = manifestRows.reduce((s, r2) => s + r2.qty, 0);
                 const thStyle = (col: typeof manifestSortCol, align: 'left' | 'right' = 'left'): React.CSSProperties => ({
                   textAlign: align, padding: '5px 14px 5px 0', fontWeight: 500, cursor: 'pointer',
                   userSelect: 'none', color: manifestSortCol === col ? '#e4e4e7' : '#71717a',
@@ -10559,36 +10565,32 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         </tr>
                       </thead>
                       <tbody>
-                        {manifestRows.map((r2, i) => (
+                        {manifestRows.map((r2, i) => {
+                          const demandRow = r2.demand ? (planResult?.committed_demands.find((cd) => cd.demand_id === r2.demand) ?? null) : null;
+                          return (
                             <tr key={i} style={{ borderBottom: '1px solid #27272a' }}>
                               <td style={{ padding: '5px 14px 5px 0', wordBreak: 'break-all', fontSize: '0.8rem' }}>
-                                {r2.demands.length === 0 ? (
+                                {!r2.demand ? (
                                   <span style={{ color: '#a1a1aa' }}>–</span>
+                                ) : demandRow ? (
+                                  <button type="button"
+                                    style={{ background: 'none', border: 'none', padding: 0, color: '#60a5fa', cursor: 'pointer', textDecoration: 'underline', fontSize: 'inherit', textAlign: 'left', wordBreak: 'break-all' }}
+                                    onClick={() => {
+                                      setPreviousManifestWoRow(row);
+                                      setPlanPeggingContext({ type: 'demand', row: demandRow });
+                                      setWoPeggingRowKey(`demand|${r2.demand}|${demandRow.product_id ?? ''}|${demandRow.location_id ?? ''}`);
+                                      setPlanWorkOrderPeggingError(null);
+                                    }}
+                                  >{r2.demand}</button>
                                 ) : (
-                                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                                    {r2.demands.map((d) => {
-                                      const demandRow = planResult?.committed_demands.find((cd) => cd.demand_id === d) ?? null;
-                                      return demandRow ? (
-                                        <button key={d} type="button"
-                                          style={{ background: 'none', border: 'none', padding: 0, color: '#60a5fa', cursor: 'pointer', textDecoration: 'underline', fontSize: 'inherit', textAlign: 'left', wordBreak: 'break-all' }}
-                                          onClick={() => {
-                                            setPreviousManifestWoRow(row);
-                                            setPlanPeggingContext({ type: 'demand', row: demandRow });
-                                            setWoPeggingRowKey(`demand|${d}|${demandRow.product_id ?? ''}|${demandRow.location_id ?? ''}`);
-                                            setPlanWorkOrderPeggingError(null);
-                                          }}
-                                        >{d}</button>
-                                      ) : (
-                                        <span key={d} style={{ color: '#a1a1aa' }}>{d}</span>
-                                      );
-                                    })}
-                                  </div>
+                                  <span style={{ color: '#a1a1aa' }}>{r2.demand}</span>
                                 )}
                               </td>
                               <td style={{ padding: '5px 14px 5px 0', color: '#e4e4e7', fontFamily: 'monospace', fontSize: '0.8rem' }}>{r2.comp}</td>
                               <td style={{ padding: '5px 0', textAlign: 'right', color: '#fafafa', fontVariantNumeric: 'tabular-nums' }}>{qtyFmt(r2.qty)}</td>
                             </tr>
-                          ))}
+                          );
+                        })}
 
                       </tbody>
                       <tfoot>

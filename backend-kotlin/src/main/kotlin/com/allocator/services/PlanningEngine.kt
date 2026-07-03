@@ -3372,8 +3372,14 @@ internal fun crossWaveCalendarMerge(
         val mergedEnd = dateAddDays(mergedStart, leadDays) ?: mergedStart
 
         // Merge competing demands + split details from all constituent rows.
+        // Singleton rows only set demand_id (not wo_competing_demands); fall back to it so
+        // cross-wave merges of singletons still produce a non-empty consolidated_demand_ids.
         @Suppress("UNCHECKED_CAST")
-        val allDemands = rows.flatMap { (it["wo_competing_demands"] as? List<String>) ?: emptyList() }.distinct()
+        val allDemands = rows.flatMap { row ->
+            val fromCompeting = (row["wo_competing_demands"] as? List<String>) ?: emptyList()
+            val fromDemandId  = (row["demand_id"] as? String)?.takeIf { it.isNotBlank() }?.let { listOf(it) } ?: emptyList()
+            fromCompeting.ifEmpty { fromDemandId }
+        }.distinct()
         @Suppress("UNCHECKED_CAST")
         val mergedSplit = rows.flatMap { (it["consolidation_split_details"] as? List<Map<String, Any?>>) ?: emptyList() }
             .groupBy { it["demand_id"] as? String }
@@ -3415,14 +3421,22 @@ internal fun crossWaveCalendarMerge(
                 @Suppress("UNCHECKED_CAST")
                 val moveComponents = rows.flatMap { (it["move_components"] as? List<Map<String, Any?>>) ?: emptyList() }
                     .groupBy { it["product_id"] as? String }
-                    .map { (p, comps) -> mapOf(
-                        "product_id" to p,
-                        "quantity"   to comps.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 },
-                        "demand_ids" to comps.flatMap {
-                            @Suppress("UNCHECKED_CAST")
-                            (it["demand_ids"] as? List<String>) ?: emptyList()
-                        }.distinct(),
-                    ) }.sortedBy { it["product_id"] as? String ?: "" }
+                    .map { (p, comps) ->
+                        @Suppress("UNCHECKED_CAST")
+                        val splitMap = comps.flatMap { c ->
+                            (c["demand_splits"] as? List<Map<String, Any?>>) ?: emptyList()
+                        }.groupBy { it["demand_id"] as? String }
+                         .mapValues { (_, es) -> es.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 } }
+                        val demandSplits = splitMap.entries
+                            .sortedBy { it.key ?: "" }
+                            .map { (d, qty) -> mapOf("demand_id" to d, "quantity" to qty) }
+                        mapOf(
+                            "product_id"    to p,
+                            "quantity"      to comps.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 },
+                            "demand_ids"    to demandSplits.map { it["demand_id"] as String },
+                            "demand_splits" to demandSplits,
+                        )
+                    }.sortedBy { it["product_id"] as? String ?: "" }
                 put("move_components", moveComponents)
             }
         }
@@ -3630,17 +3644,26 @@ internal fun consolidateByWaves(
         put("wave_index", 0)
         if (info.method == "move") {
             put("lot_count", 1)
+            val demandSplits = info.demandQty.entries.map { (d, qty) ->
+                mapOf("demand_id" to d, "quantity" to qty)
+            }
             put("move_components", listOf(mapOf(
-                "product_id" to info.pid,
-                "quantity"   to info.totalQty,
-                "demand_ids" to info.demandQty.keys.toList(),
+                "product_id"   to info.pid,
+                "quantity"     to info.totalQty,
+                "demand_ids"   to info.demandQty.keys.toList(),
+                "demand_splits" to demandSplits,
             )))
+            // crossWaveCalendarMerge aggregates allDemands from wo_competing_demands;
+            // singleton rows must emit it so their demand IDs survive the merge.
+            put("wo_competing_demands", info.demandQty.keys.toList())
+            if (info.sampleMembers != null) put("consolidated_demand_ids", info.sampleMembers)
+            else put("consolidated_demand_ids", info.demandQty.keys.toList())
         } else {
             val lotSize = (maxLotSize(info.pid, info.lid, data)?.takeIf { it > 0 } ?: info.totalQty).coerceAtLeast(1e-9)
             put("lot_count", Math.ceil(info.totalQty / lotSize).toInt().coerceAtLeast(1))
             put("max_lot_size", lotSize)
         }
-        if (info.sampleMembers != null) put("consolidated_demand_ids", info.sampleMembers)
+        if (info.method != "move" && info.sampleMembers != null) put("consolidated_demand_ids", info.sampleMembers)
     }
 
     fun mergedRow(gids: List<String>, mergedStart: LocalDate, mergedEnd: LocalDate, cgid: String): Map<String, Any?> {
@@ -3659,11 +3682,21 @@ internal fun consolidateByWaves(
         }
         if (first.method == "move") {
             val moveComponents = gids.groupBy { gidInfo.getValue(it).pid }
-                .map { (p, gs) -> mapOf(
-                    "product_id" to p,
-                    "quantity"   to gs.sumOf { gidInfo.getValue(it).totalQty },
-                    "demand_ids" to gs.flatMap { gidInfo.getValue(it).demandQty.keys }.distinct(),
-                ) }
+                .map { (p, gs) ->
+                    val splitMap = gs.flatMap { g ->
+                        gidInfo.getValue(g).demandQty.entries.map { (d, qty) -> d to qty }
+                    }.groupBy({ it.first }, { it.second })
+                     .mapValues { it.value.sum() }
+                    val demandSplits = splitMap.entries
+                        .sortedBy { it.key }
+                        .map { (d, qty) -> mapOf("demand_id" to d, "quantity" to qty) }
+                    mapOf(
+                        "product_id"    to p,
+                        "quantity"      to gs.sumOf { gidInfo.getValue(it).totalQty },
+                        "demand_ids"    to demandSplits.map { it["demand_id"] as String },
+                        "demand_splits" to demandSplits,
+                    )
+                }
                 .sortedBy { (it["product_id"] as? String) ?: "" }
             return mapOf(
                 "product_id" to null,
