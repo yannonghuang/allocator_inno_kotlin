@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 import { createPortal } from 'react-dom';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
@@ -1280,6 +1280,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // Which WO list the table shows: the consolidated procurement view, or the native per-demand
   // view (1:1 with the pegging). Kept as separate tables so aggregates never double-count.
   const [woTableTab, setWoTableTab] = useState<'consolidated' | 'native'>('consolidated');
+  const woRefreshingRef = useRef<HTMLDivElement>(null);
+  // Tracks when a new plan result is being applied to the UI.
+  // resultPending=true while React renders the expensive 26k-row WO table in a non-blocking transition.
+  const [resultPending, startResultTransition] = useTransition();
   const activeWorkOrders = useMemo<WorkOrder[]>(() =>
     woTableTab === 'native'
       ? (planResult?.work_orders_native ?? planResult?.work_orders ?? [])
@@ -1835,10 +1839,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         if (st.progress) setPlanProgress(st.progress);
         if (st.status === 'completed' && st.result) {
           const freshId = st.plan_run_id ?? null;
-          setPlanResult(st.result);
-          setPlanRunSaveError(null);
-          setPlanWorkOrderPeggingCache({});
-          setSupplyCriticalityMap({});
+          // Stop polling immediately — prevents a concurrent interval tick while we await below.
+          if (planPollRef.current) { clearInterval(planPollRef.current); planPollRef.current = null; }
           try { sessionStorage.removeItem(`criticality-case-${id}`); } catch { /* ignore */ }
           // Soundness needs a persisted run_id; criticality also requires save. If either
           // toggle is on, save first, then trigger their respective async work.
@@ -1886,14 +1888,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             setCurrentPlanRunId(null);
             setFreshPlanRunId(freshId);
           }
+          // Clear loading indicators urgently so the progress bar disappears now.
           setPlanJobId(null);
           setPlanLoading(false);
           setPlanProgress(null);
           setPlanError(null);
-          if (planPollRef.current) {
-            clearInterval(planPollRef.current);
-            planPollRef.current = null;
-          }
+          // Apply the large result in a concurrent transition so the 26k-row WO
+          // table re-renders in non-blocking chunks. resultPending=true shows a
+          // banner while React renders in the background, keeping the UI responsive.
+          const newResult = st.result!;
+          startResultTransition(() => {
+            setPlanResult(newResult);
+            setPlanRunSaveError(null);
+            setPlanWorkOrderPeggingCache({});
+            setSupplyCriticalityMap({});
+          });
           return;
         }
         if (st.status === 'failed') {
@@ -3129,6 +3138,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     }
     return { ancestors, descendants };
   }, [planResult, woPegHighlightRow, woPegHighlightSets, peggedRowKindFor, woRowGroupKey, planWorkOrderHideDummyProdArea]);
+
+  // After the expensive IIFE has run and the new table is committed, hide the refreshing banner.
+  useEffect(() => { if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'none'; }, [woTableTab, planWorkOrderHideDummyProdArea]);
 
   // Clear highlight if the highlighted row no longer exists in the new plan run.
   useEffect(() => {
@@ -5236,6 +5248,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             </div>
           </div>
         )}
+        {resultPending && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '6px 14px', marginTop: '0.5rem', background: 'rgba(59,130,246,0.12)', border: '1px solid rgba(59,130,246,0.35)', borderRadius: 5, color: '#93c5fd', fontSize: '0.85rem', fontWeight: 700 }}>
+            ↻ Applying plan results…
+          </div>
+        )}
         {planResult && !planLoading && (
           <>
             {(() => {
@@ -5780,7 +5797,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         <button
                           key={tab}
                           type="button"
-                          onClick={() => setWoTableTab(tab)}
+                          onClick={() => { if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'flex'; requestAnimationFrame(() => requestAnimationFrame(() => setWoTableTab(tab))); }}
                           style={{
                             fontSize: '0.82rem',
                             padding: '4px 14px',
@@ -5908,7 +5925,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <input
                         type="checkbox"
                         checked={planWorkOrderHideDummyProdArea}
-                        onChange={(e) => setPlanWorkOrderHideDummyProdArea(e.target.checked)}
+                        onChange={(e) => { const v = e.target.checked; if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'flex'; requestAnimationFrame(() => requestAnimationFrame(() => setPlanWorkOrderHideDummyProdArea(v))); }}
                         style={{ accentColor: '#71717a' }}
                       />
                       <span>{tP('workOrders.hideDummy')}</span>
@@ -5928,14 +5945,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         {mode === 'none' ? 'None' : mode === 'prod_area' ? 'PROD_AREA' : mode === 'location' ? 'Location' : 'PROD_AREA › Location'}
                       </button>
                     ))}
-                    <button
-                      type="button"
-                      className={planWoPivot === 'demand' ? '' : 'secondary'}
-                      style={{ fontSize: '0.75rem', padding: '2px 10px' }}
-                      onClick={() => { setPlanWoPivot('demand'); setPlanWoPivotExpanded(new Set()); setPlanWoPivotSubExpanded(new Set()); }}
-                    >
-                      Demand
-                    </button>
                   </div>
                   {/* ── Layout selector (Data / Split / Timeline) ── */}
                   <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
@@ -5979,6 +5988,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         >{tc('clear')}</button>
                       </span>
                     )}
+                  </div>
+                  {/* Refreshing banner — shown via DOM ref BEFORE the expensive table re-render,
+                      bypassing React's synchronous render cycle so the browser paints it first. */}
+                  <div ref={woRefreshingRef} style={{ display: 'none', alignItems: 'center', gap: '0.5rem', padding: '6px 14px', marginBottom: '0.5rem', background: 'rgba(251,191,36,0.18)', border: '1px solid rgba(251,191,36,0.5)', borderRadius: 5, color: '#fbbf24', fontSize: '0.85rem', fontWeight: 700 }}>
+                    ↻ Refreshing…
                   </div>
                   {planResult.work_orders.length > 0 && (() => {
                     const workOrdersFiltered = planWorkOrderHideDummyProdArea

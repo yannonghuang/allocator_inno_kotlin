@@ -4033,20 +4033,30 @@ internal fun relabelTreesToConsolidatedGids(
     gidToCgid: Map<String, String>,
 ): List<Map<String, Any?>> {
     @Suppress("UNCHECKED_CAST")
+    // Returns original reference when nothing in the subtree needs to change —
+    // avoids cloning every ancestor node on the path to each work_order, which
+    // previously caused OOM on large consolidations (200 trees × 62K lots).
     fun rewrite(node: Map<String, Any?>): Map<String, Any?> {
         val children = node["children"] as? List<Map<String, Any?>>
         val newChildren = children?.map { rewrite(it) }
-        val base = if (newChildren != null) node.toMutableMap().apply { put("children", newChildren) } else node
-        if (base["type"] == "work_order") {
-            val gid = base["wo_group_id"] as? String
-            val cgid = gid?.let { gidToCgid[it] }
-            if (cgid != null) return base.toMutableMap().apply { put("wo_group_id", cgid) }
-        }
-        return base
+        val childrenChanged = newChildren != null &&
+            newChildren.indices.any { newChildren[it] !== children!![it] }
+
+        val cgid = if (node["type"] == "work_order") {
+            (node["wo_group_id"] as? String)?.let { gidToCgid[it] }
+        } else null
+
+        if (!childrenChanged && cgid == null) return node  // nothing changed — reuse reference
+
+        val copy = node.toMutableMap()
+        if (childrenChanged) copy["children"] = newChildren
+        if (cgid != null) copy["wo_group_id"] = cgid
+        return copy
     }
     return peggingTrees.map { entry ->
         val tree = entry["tree"] as? Map<String, Any?> ?: return@map entry
-        entry.toMutableMap().apply { put("tree", rewrite(tree)) }
+        val newTree = rewrite(tree)
+        if (newTree === tree) entry else entry.toMutableMap().also { it["tree"] = newTree }
     }
 }
 

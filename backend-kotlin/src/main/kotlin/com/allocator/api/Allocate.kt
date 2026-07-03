@@ -1621,7 +1621,26 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
             }
         } else emptyList()
         val soundnessConfig = com.allocator.services.SoundnessConfig(deepCheck = deepCheck)
-        if (inlinePegging != null) {
+        // If pegging save is still in-flight, use the in-memory transit trees directly.
+        // This avoids competing heap pressure from JSON re-parsing while serialization runs
+        // (the two concurrent operations together can OOM a 9g heap on large 200+ demand plans).
+        val transitPegging = planPeggingTransit[runId]
+        if (transitPegging != null) {
+            log.info("[soundness] using in-transit pegging for run={} ({} entries)", runId, transitPegging.size)
+            com.allocator.services.checkRunSoundness(
+                planningPegging = transitPegging,
+                demands = demands,
+                data = data,
+                config = soundnessConfig,
+                workOrders = workOrders,
+                workOrdersNative = workOrdersNative,
+                committedDemands = committedDemandsForCheck,
+                overrideIndex = overrideIndexForCheck,
+                inventoryEffectiveInitial = inventoryInitial,
+                inventoryLeftover = inventoryLeftover,
+                supplyAllocations = supplyAllocations,
+            )
+        } else if (inlinePegging != null) {
             // In-transit run: pegging is embedded inline — use normal list-based check.
             com.allocator.services.checkRunSoundness(
                 planningPegging = inlinePegging,
@@ -1836,7 +1855,10 @@ private fun serializeResultOrNull(enriched: Map<String, Any?>): String? =
 // TCP-buffer deadlock: PostgreSQL fills its send buffer while the JVM's receive buffer is full
 // (JVM is busy serializing the next bind parameters and not reading).  The workaround is to
 // split the inserts into small chunks so each round-trip stays within the socket buffer limits.
-private const val PEGGING_CHUNK_SIZE = 5
+// Chunk size 1: serialize one entry at a time so only one tree→String is live simultaneously.
+// With 200 entries at ~600 MB each in peak, size 5 could spike 3 GB on top of the already-live
+// transit trees; serializing one at a time caps the incremental alloc to a single entry's string.
+private const val PEGGING_CHUNK_SIZE = 1
 
 // Called OUTSIDE the main save transaction so a pegging failure never rolls back the committed
 // plan result.  Manages its own transactions internally.
