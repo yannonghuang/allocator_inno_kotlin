@@ -94,19 +94,23 @@ object ResourceScheduler {
             val borRows = borRowsFor(productId, locationId, data)
             if (borRows.isEmpty()) continue
 
-            // Per-wave duration: a wave = the set of lots that share start/end.
-            // Sample one lot to read perWaveDays, then derive waveCount from
-            // lotCount + cap. Sequential WOs collapse to perWaveDays == per-lot.
+            // Each consolidated WO arrives as exactly ONE row in mutableLots; lots.size==1.
+            // The actual concurrent-lot count comes from the "lot_count" field; the stored
+            // start/end span covers ALL waves (numWaves × perWaveLead). Derive perWaveDays
+            // by dividing the total span by the recomputed wave count.
             val sample = lots.minByOrNull { parseDay(it["start_time"])?.toEpochDay() ?: Long.MAX_VALUE } ?: continue
             val sampleStart = parseDay(sample["start_time"]) ?: continue
             val sampleEnd = parseDay(sample["end_time"]) ?: continue
-            val perWaveDays = (sampleEnd.toEpochDay() - sampleStart.toEpochDay()).coerceAtLeast(0L)
-            if (perWaveDays <= 0) continue  // zero-duration WO, nothing to reserve
+            val totalSpan = (sampleEnd.toEpochDay() - sampleStart.toEpochDay()).coerceAtLeast(0L)
+            if (totalSpan <= 0L) continue  // zero-duration WO, nothing to reserve
 
             val originalGroupStart = lots.minOf { parseDay(it["start_time"])?.toEpochDay() ?: Long.MAX_VALUE }
             val origStartDt = LocalDate.ofEpochDay(originalGroupStart)
-            val lotCount = lots.size
+            // For consolidated rows (lots.size==1) the true lot count is stored in the field.
+            val lotCount = if (lots.size > 1) lots.size
+                           else (first["lot_count"] as? Number)?.toInt()?.coerceAtLeast(1) ?: 1
             val waveCount = kotlin.math.ceil(lotCount.toDouble() / cap.toDouble()).toInt().coerceAtLeast(1)
+            val perWaveDays = if (waveCount > 1) totalSpan / waveCount else totalSpan
 
             val newStart = findEarliestFit(
                 origStartDt = origStartDt,
