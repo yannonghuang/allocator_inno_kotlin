@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, startTransition, useState, useTransition } from 'react';
 import { createPortal } from 'react-dom';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
@@ -2230,8 +2230,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           const row = planPeggingContext.row as WorkOrder;
           // All null-demand consolidated WOs (single or multi-demand) use per-demand accordion; no single woPeggingKey.
           if (row.demand_id == null && (row.consolidated_demand_ids?.length ?? 0) >= 1) return null;
-          // Move and purchase WOs always show the component manifest; suppress pegging tree fetch.
-          if (row.method === 'move' || row.method === 'purchase') return null;
+          // In consolidated view, move/purchase WOs show the manifest — suppress pegging tree fetch.
+          // In native view they have demand_id set; fetch the pegging tree like any other WO.
+          if ((row.method === 'move' || row.method === 'purchase') && woTableTab === 'consolidated') return null;
           const isConsolidated = row.demand_id == null;
           const demandPart = isConsolidated ? '' : String(woPeggingActiveDemandId ?? row.demand_id ?? '').trim();
           // start_time is part of the cache key — different lots (same demand/
@@ -3140,7 +3141,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   }, [planResult, woPegHighlightRow, woPegHighlightSets, peggedRowKindFor, woRowGroupKey, planWorkOrderHideDummyProdArea]);
 
   // After the expensive IIFE has run and the new table is committed, hide the refreshing banner.
-  useEffect(() => { if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'none'; }, [woTableTab, planWorkOrderHideDummyProdArea]);
+  useEffect(() => { if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'none'; }, [woTableTab, planWorkOrderHideDummyProdArea, planDemandRealMakeOnly, planDemandBuyOnly, planDemandRealMoveOnly, planWoDemandedByMultiple, planWoMultiSupply, planWoMakeOnly, planWoMoveOnly, planWoPurchaseOnly, planWoHasOverride]);
 
   // Clear highlight if the highlighted row no longer exists in the new plan run.
   useEffect(() => {
@@ -5797,7 +5798,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         <button
                           key={tab}
                           type="button"
-                          onClick={() => { if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'flex'; requestAnimationFrame(() => requestAnimationFrame(() => setWoTableTab(tab))); }}
+                          onClick={() => { if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'flex'; startTransition(() => setWoTableTab(tab)); }}
                           style={{
                             fontSize: '0.82rem',
                             padding: '4px 14px',
@@ -5822,7 +5823,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <input
                         type="checkbox"
                         checked={planDemandRealMakeOnly}
-                        onChange={(e) => setPlanDemandRealMakeOnly(e.target.checked)}
+                        onChange={(e) => { const v = e.target.checked; if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'flex'; startTransition(() => setPlanDemandRealMakeOnly(v)); }}
                       />
                       <span>{tP('workOrders.filterRealMake')}</span>
                     </label>
@@ -5830,7 +5831,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <input
                         type="checkbox"
                         checked={planDemandBuyOnly}
-                        onChange={(e) => setPlanDemandBuyOnly(e.target.checked)}
+                        onChange={(e) => { const v = e.target.checked; if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'flex'; startTransition(() => setPlanDemandBuyOnly(v)); }}
                       />
                       <span>{tP('workOrders.filterBuy')}</span>
                     </label>
@@ -5838,7 +5839,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <input
                         type="checkbox"
                         checked={planDemandRealMoveOnly}
-                        onChange={(e) => setPlanDemandRealMoveOnly(e.target.checked)}
+                        onChange={(e) => { const v = e.target.checked; if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'flex'; startTransition(() => setPlanDemandRealMoveOnly(v)); }}
                       />
                       <span>{tP('workOrders.filterRealMove')}</span>
                     </label>
@@ -5846,7 +5847,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <input
                         type="checkbox"
                         checked={planWoDemandedByMultiple}
-                        onChange={(e) => setPlanWoDemandedByMultiple(e.target.checked)}
+                        onChange={(e) => { const v = e.target.checked; if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'flex'; startTransition(() => setPlanWoDemandedByMultiple(v)); }}
                       />
                       <span>{tP('workOrders.filterMultipleDemands')}</span>
                     </label>
@@ -5854,7 +5855,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <input
                         type="checkbox"
                         checked={planWoMultiSupply}
-                        onChange={(e) => setPlanWoMultiSupply(e.target.checked)}
+                        onChange={(e) => { const v = e.target.checked; if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'flex'; startTransition(() => setPlanWoMultiSupply(v)); }}
                       />
                       <span>{tP('workOrders.filterMultiSupply')}</span>
                     </label>
@@ -5862,7 +5863,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <input
                         type="checkbox"
                         checked={planWoMakeOnly}
-                        onChange={(e) => setPlanWoMakeOnly(e.target.checked)}
+                        onChange={(e) => { const v = e.target.checked; if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'flex'; startTransition(() => setPlanWoMakeOnly(v)); }}
                       />
                       <span>{tP('workOrders.filterMakeOnly')}</span>
                     </label>
@@ -5870,7 +5871,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <input
                         type="checkbox"
                         checked={planWoMoveOnly}
-                        onChange={(e) => setPlanWoMoveOnly(e.target.checked)}
+                        onChange={(e) => { const v = e.target.checked; if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'flex'; startTransition(() => setPlanWoMoveOnly(v)); }}
                       />
                       <span>{tP('workOrders.filterMoveOnly')}</span>
                     </label>
@@ -5878,7 +5879,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <input
                         type="checkbox"
                         checked={planWoPurchaseOnly}
-                        onChange={(e) => setPlanWoPurchaseOnly(e.target.checked)}
+                        onChange={(e) => { const v = e.target.checked; if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'flex'; startTransition(() => setPlanWoPurchaseOnly(v)); }}
                       />
                       <span>{tP('workOrders.filterPurchaseOnly')}</span>
                     </label>
@@ -5886,7 +5887,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <input
                         type="checkbox"
                         checked={planWoHasOverride}
-                        onChange={(e) => setPlanWoHasOverride(e.target.checked)}
+                        onChange={(e) => { const v = e.target.checked; if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'flex'; startTransition(() => setPlanWoHasOverride(v)); }}
                       />
                       <span>{tP('workOrders.filterHasOverride')}</span>
                     </label>
@@ -5925,7 +5926,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <input
                         type="checkbox"
                         checked={planWorkOrderHideDummyProdArea}
-                        onChange={(e) => { const v = e.target.checked; if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'flex'; requestAnimationFrame(() => requestAnimationFrame(() => setPlanWorkOrderHideDummyProdArea(v))); }}
+                        onChange={(e) => { const v = e.target.checked; if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'flex'; startTransition(() => setPlanWorkOrderHideDummyProdArea(v)); }}
                         style={{ accentColor: '#71717a' }}
                       />
                       <span>{tP('workOrders.hideDummy')}</span>
@@ -6431,7 +6432,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       } },
                       { key: 'location_source', label: tP('workOrders.columns.locationSource'), sortable: true, render: (r) => r.location_source ?? '–' },
                       { key: '_peg_order', label: tP('workOrders.columns.pegging'), sortable: true, render: (r) => {
-                        const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
+                        const k = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}|${r.wo_group_id ?? r.consolidated_group_id ?? ''}`;
                         // isPeggingActive: this WO's pegging is the direct content of the panel.
                         const isPeggingActive = woPeggingRowKey === k;
                         // isHighlightRow: this row is the woPegHighlightRow — it stays true even
@@ -6457,7 +6458,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         );
                       } },
                       { key: '_explain', label: tP('workOrders.columns.explain'), sortable: false, render: (r) => {
-                        const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
+                        const k = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}|${r.wo_group_id ?? r.consolidated_group_id ?? ''}`;
                         const isSelected = woExplainKey === k;
                         if (!(r.wo_explanation_method || (r.wo_competing_demands?.length ?? 0) > 0 || (r.wo_consolidation_split_details?.length ?? 0) > 1))
                           return <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>;
@@ -6571,7 +6572,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       : [];
                     const woRowStyle = (r: WoEnrichedRow) => {
                       if (r._is_inventory) return { background: 'rgba(34,197,94,0.08)', color: '#16a34a', fontStyle: 'italic' as const };
-                      const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
+                      const k = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}|${r.wo_group_id ?? r.consolidated_group_id ?? ''}`;
                       if (woExplainKey === k) return { background: 'rgba(167,139,250,0.15)', outline: '1px solid rgba(167,139,250,0.4)' };
                       if (woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
                       // Pegging-graph highlight (driven by woPegHighlightRow / bar click or Show button).
@@ -6822,7 +6823,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             defaultSortKey="start_time"
                             stickyHeader
                             rowStyle={(r) => {
-                              const k = `${r.demand_id ?? ''}|${r.product_id}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}`;
+                              const k = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id}|${r.method ?? ''}|${r.start_time ?? ''}|${r.wo_group_id ?? r.consolidated_group_id ?? ''}`;
                               if (woExplainKey === k) return { background: 'rgba(167,139,250,0.15)', outline: '1px solid rgba(167,139,250,0.4)' };
                               if (woPeggingRowKey === k) return { background: 'rgba(56,189,248,0.12)', outline: '1px solid rgba(56,189,248,0.35)' };
                               // Amber tint for rows whose product@location matches the
@@ -10300,7 +10301,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   type="button"
                   onClick={() => {
                     setPlanPeggingContext({ type: 'work_order', row: previousManifestWoRow });
-                    setWoPeggingRowKey(`${previousManifestWoRow.demand_id ?? ''}|${previousManifestWoRow.product_id ?? ''}|${previousManifestWoRow.location_id}|${previousManifestWoRow.method ?? ''}|${previousManifestWoRow.start_time ?? ''}`);
+                    setWoPeggingRowKey(`${previousManifestWoRow.demand_id ?? ''}|${previousManifestWoRow.product_id ?? ''}|${previousManifestWoRow.location_id}|${previousManifestWoRow.method ?? ''}|${previousManifestWoRow.start_time ?? ''}|${previousManifestWoRow.wo_group_id ?? previousManifestWoRow.consolidated_group_id ?? ''}`);
                     setPlanWorkOrderPeggingError(null);
                     setPreviousManifestWoRow(null);
                   }}
@@ -10515,9 +10516,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             })()}
             {planPeggingContext.type === 'work_order' && (() => {
               const row = planPeggingContext.row as WorkOrder;
-              // For non-move WOs, skip if this is a native single-demand row (demand_id present = no consolidation accordion needed).
-              // Move WOs always proceed so the manifest can render even for singletons.
-              if (row.method !== 'move' && row.method !== 'purchase' && row.demand_id != null) return null;
+              // In native view, all demand_id-set rows use the pegging tree — skip the manifest block entirely.
+              // In consolidated view, non-move/purchase singletons (demand_id present) also skip — no accordion needed.
+              if (row.demand_id != null && (woTableTab === 'native' || (row.method !== 'move' && row.method !== 'purchase'))) return null;
               // Merge split_details (has per-demand qty) with consolidated_demand_ids
               // (populated for virtual-demand WOs where split_details may be empty).
               const splitDetails = (row.wo_consolidation_split_details ?? [])
@@ -10692,12 +10693,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               <PlanningPeggingTreeView
                                 tree={tree}
                                 expanded={sectionExpanded}
-                                onToggle={(path) => setWoConsolidatedExpanded((prev) => {
+                                onToggle={(path) => startTransition(() => setWoConsolidatedExpanded((prev) => {
                                   const cur = prev[cacheKey] ?? new Set(['0']);
                                   const next = new Set(cur);
                                   if (next.has(path)) next.delete(path); else next.add(path);
                                   return { ...prev, [cacheKey]: next };
-                                })}
+                                }))}
                                 contextDemandId={did}
                                 hideLotCount={true}
                                 consolidatedSourceResolver={(embeddedDemandId, pid) => {
@@ -10730,11 +10731,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             })()}
             {planPeggingContext.type !== 'supply' && (() => {
               // All null-demand consolidated WOs (single or multi-demand) are handled by the accordion above.
-              // Move WOs are handled by the manifest table above.
+              // Consolidated-view move/purchase WOs show the manifest above — skip tree.
+              // Native-view move/purchase WOs have demand_id set → show the pegging tree here.
               if (planPeggingContext.type === 'work_order') {
                 const _row = planPeggingContext.row as WorkOrder;
                 if (_row.demand_id == null && (_row.consolidated_demand_ids?.length ?? 0) >= 1) return null;
-                if (_row.method === 'move' || _row.method === 'purchase') return null;
+                if ((_row.method === 'move' || _row.method === 'purchase') && woTableTab === 'consolidated') return null;
               }
               let tree: PlanningPeggingNode | null = null;
               const isWoPeggingView = planPeggingContext.type === 'work_order';
@@ -11000,20 +11002,20 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <PlanningPeggingTreeView
                         tree={tree}
                         expanded={planPeggingExpanded}
-                        onToggle={(p) => setPlanPeggingExpanded((prev) => {
+                        onToggle={(p) => startTransition(() => setPlanPeggingExpanded((prev) => {
                           const next = new Set(prev);
                           if (next.has(p)) next.delete(p); else next.add(p);
                           return next;
-                        })}
+                        }))}
                         matchPath={planPeggingMatchPath}
                         matchPaths={planPeggingMatchPaths}
                         criticalPathSet={criticalPathSet}
                         explanationExpanded={planExplanationExpanded}
-                        onToggleExplanation={(p) => setPlanExplanationExpanded((prev) => {
+                        onToggleExplanation={(p) => startTransition(() => setPlanExplanationExpanded((prev) => {
                           const next = new Set(prev);
                           if (next.has(p)) next.delete(p); else next.add(p);
                           return next;
-                        })}
+                        }))}
                         workOrderRootQty={planPeggingContext?.type === 'work_order'
                           ? Number((planPeggingContext.row as WorkOrder).quantity ?? 0)
                           : null}
@@ -11289,12 +11291,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 graph={peggingGraph}
                 expanded={peggingExpanded}
                 onExpand={(pathKey, isExpanding) => {
-                  setPeggingExpanded((prev) => {
+                  startTransition(() => setPeggingExpanded((prev) => {
                     const next = new Set(prev);
                     if (next.has(pathKey)) next.delete(pathKey);
                     else next.add(pathKey);
                     return next;
-                  });
+                  }));
                   if (isExpanding) {
                     setPeggingChildrenAllowedFor((prev) => new Set(prev).add(pathKey));
                   }
