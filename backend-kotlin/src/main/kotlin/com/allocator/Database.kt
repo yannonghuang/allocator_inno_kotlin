@@ -107,7 +107,7 @@ private fun createTables() {
         Demands, MethodBuys, MethodMakes, ProductLocations,
         Operations, Bors, Resources,
         Supplies, MethodMoves, AllocationRuns, AllocationActions,
-        ManualOverrides, PlanRuns, MaterialEvents, WoScheduleEvents, MaterialImpactAssessments,
+        PlanRuns, MaterialEvents, WoScheduleEvents, MaterialImpactAssessments,
         PlanPegging, PlanSupplyAllocations, CaseAllocations, NegotiationWaits, PlanRunEvents, AgentMemory,
         KbRecords
     )
@@ -133,7 +133,6 @@ private fun cascadeFkMigrations(): Array<String> {
         Triple("supply",         "fk_supply_case_id__id",         "cases"),
         Triple("method_move",    "fk_method_move_case_id__id",    "cases"),
         Triple("allocation_run", "fk_allocation_run_case_id__id", "cases"),
-        Triple("manual_override","fk_manual_override_case_id__id","cases"),
     )
     val actionFk = Triple("allocation_action", "fk_allocation_action_run_id__id", "allocation_run")
 
@@ -174,20 +173,6 @@ private fun migrateSchema() {
             WHERE table_schema = 'public' AND table_name = 'transportation'
           ) THEN
             ALTER TABLE transportation RENAME TO method_move;
-          END IF;
-        END
-        ${'$'}${'$'};
-        """.trimIndent(),
-        // Unique constraint on (case_id, entity_type, entity_key) for upsert semantics
-        """
-        DO ${'$'}${'$'}
-        BEGIN
-          IF NOT EXISTS (
-            SELECT 1 FROM information_schema.table_constraints
-            WHERE constraint_name = 'uq_override_case_type_key' AND table_name = 'manual_override'
-          ) THEN
-            ALTER TABLE manual_override
-              ADD CONSTRAINT uq_override_case_type_key UNIQUE (case_id, entity_type, entity_key);
           END IF;
         END
         ${'$'}${'$'};
@@ -249,7 +234,10 @@ private fun migrateSchema() {
         // Proportional lot entitlement alongside consumed qty
         "ALTER TABLE plan_supply_allocation ADD COLUMN IF NOT EXISTS qty_allocated DOUBLE PRECISION",
         // Fix FK constraints to use ON DELETE CASCADE (idempotent: drop if exists, re-add)
-        *cascadeFkMigrations()
+        *cascadeFkMigrations(),
+        // Phase-out: drop manual override table and its snapshot column on plan_run
+        "ALTER TABLE plan_run DROP COLUMN IF EXISTS override_snapshot",
+        "DROP TABLE IF EXISTS manual_override",
     )
     val conn = org.jetbrains.exposed.sql.transactions.TransactionManager.current().connection
     stmts.forEach { sql ->

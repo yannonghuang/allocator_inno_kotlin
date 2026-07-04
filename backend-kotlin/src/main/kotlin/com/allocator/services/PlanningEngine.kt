@@ -1398,14 +1398,11 @@ internal fun planMethodSlot(
     path: Set<Pair<String, String>>,
     config: Map<String, Any?>?,
     preferDemandId: Any?,
-    overrideIndex: Map<String, Map<String, Any?>>,
     budget: MutableMap<String, Double>?,
     useSingleVariant: Boolean,
     scoreWeights: Map<String, Any?>?,
     topN: Int?,
-    variantOverride: Map<String, Any?>?,
     methodChoiceExplanation: String,
-    overrideActive: Boolean,
     feasibilityCache: MutableMap<Pair<String, String>, Int>? = null,
     structuralFailedMakes: MutableMap<Pair<String, String>, String>? = null,
     initialBudget: Map<String, Double>? = null,
@@ -1428,14 +1425,7 @@ internal fun planMethodSlot(
             //     + (location blank/"*" or this productionLocation);
             //  3) else all variants (automatic best-score / equal-split downstream).
             var constraintChild: String? = null
-            val variants = if (variantOverride != null) {
-                val forcedAltGroup = variantOverride["alt_group"]?.toString()
-                rawVariants.filter { (altKey, _) -> forcedAltGroup == null || altKey == forcedAltGroup }
-                    .ifEmpty {
-                        log.warn("variant_selection override alt_group={} for {}@{} matched nothing; using all", forcedAltGroup, productId, productionLocation)
-                        rawVariants
-                    }
-            } else {
+            val variants = run {
                 val cust = demand["customer_id"]?.toString()?.trim()
                 val match = if (cust.isNullOrEmpty()) null else parseConstraints(config).firstOrNull { c ->
                     c.customerId == cust && c.parent == productId.trim() &&
@@ -1461,7 +1451,6 @@ internal fun planMethodSlot(
                 woChildrenRelation = "and"
             }
             val veAnnotated = when {
-                variantOverride != null -> "$ve [variant override active]"
                 constraintChild != null -> "$ve [constraint child=$constraintChild]"
                 else -> ve
             }
@@ -1540,7 +1529,7 @@ internal fun planMethodSlot(
             // Inherit the originating demand's customer so customer-specific constraints
             // apply to sub-components, not just the finished good.
             "customer_id" to demand["customer_id"], "customer" to demand["customer"])
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, overrideIndex = overrideIndex, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint)
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint)
         val effectiveQty = solvedList.sumOf { s ->
             val r = s["commit_reason"] as? String
             if (r == "cycle_stopped" || r == "cycle_detected") 0.0
@@ -1709,7 +1698,6 @@ internal fun planMethodSlot(
                 "$methodChoiceExplanation — blocked: deepest child $deepPid@$deepLoc ($terminalCause)",
                 variantExplanation, woChildrenRelation,
                 taggedChildPeggings,
-                overrideActive,
                 failed = true,
                 data = data,
             )
@@ -1875,7 +1863,7 @@ internal fun planMethodSlot(
 
     // 5) Timing + work orders
     val startDt = computeStartDt(reqDt, leadDays, commitTimes)
-    val woResult = buildWorkOrders(productId, productionLocation, achievableParentQty, leadDays, startDt, m, demandId, data, overrideActive)
+    val woResult = buildWorkOrders(productId, productionLocation, achievableParentQty, leadDays, startDt, m, demandId, data)
     val wos = woResult.wos
     val lotCount = woResult.lotCount
     val lastEnd = woResult.lastEnd
@@ -1885,7 +1873,7 @@ internal fun planMethodSlot(
     // so surface the vendor as their identifier in the supply-leaf table.
     val woChildren = if (methodType == "purchase") listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to roundQty(achievableParentQty), "vendor_id" to m["vendor_id"], "start_time" to formatDate(startDt), "end_time" to formatDate(lastEnd), "children" to emptyList<Any>()))
                      else childPeggingNodes
-    val methodPeggingNode = buildWoNode(productId, productionLocation, achievableParentQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodChoiceExplanation, variantExplanation, woChildrenRelation, woChildren, overrideActive, woGroupId = woResult.woGroupId, data = data)
+    val methodPeggingNode = buildWoNode(productId, productionLocation, achievableParentQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodChoiceExplanation, variantExplanation, woChildrenRelation, woChildren, woGroupId = woResult.woGroupId, data = data)
 
     return MethodSlotResult(
         achievableQty = achievableParentQty,
@@ -2051,7 +2039,6 @@ fun plan(
     planningPath: Set<Pair<String, String>> = emptySet(),
     config: Map<String, Any?>? = null,
     preferDemandId: Any? = null,
-    overrideIndex: Map<String, Map<String, Any?>> = emptyMap(),
     /**
      * Optional per-component budget map keyed by `"$productId|$locationId"`. When supplied,
      * each call to [consumeFromInventory] caps the take at the remaining budget for the
@@ -2126,7 +2113,6 @@ fun plan(
             planningPath     = planningPath,
             config           = config,
             preferDemandId   = preferDemandId,
-            overrideIndex    = overrideIndex,
             budget           = budget,
             feasibilityCache = feasibilityCache,
             structuralFailedMakes = structuralFailedMakes,
@@ -2357,30 +2343,15 @@ fun plan(
     val scoreWeights = variantCfg.scoreWeights
     val topN = variantCfg.topN
 
-    // ── Override lookup for this (product, location, demand) ──────────────────
-    // Exact match only: demand-specific WOs match demand-scoped keys; null-demand WOs match
-    // location-level keys. No fallback — prevents a location-level override (saved for a
-    // consolidated/null-demand WO) from leaking to unrelated demand-specific WOs.
-    val demandIdStr = demandId?.toString()?.trim() ?: ""
-    val methodOverride = if (demandIdStr.isNotBlank())
-        overrideIndex["method_selection|$productId|$locationId|$demandIdStr"]
-    else
-        overrideIndex["method_selection|$productId|$locationId"]
-    val variantOverride = if (demandIdStr.isNotBlank())
-        overrideIndex["variant_selection|$productId|$locationId|$demandIdStr"]
-    else
-        overrideIndex["variant_selection|$productId|$locationId"]
-    // Filter to the override-specified method if one is configured
     // ── Customer constraint at the METHOD level ──────────────────────────────
     // BOM alternatives are frequently distinct make methods (one bom_id per child),
     // chosen by preference. When a constraint matches (customer, parent, and the make
     // method's location — blank/"*" = any), drop the make methods that DON'T produce the
     // constrained child so the planner is forced onto the pinned route. Non-make methods
-    // are untouched; if no make method produces the child, fall back to all (warn). An
-    // explicit method_selection override takes precedence (constraint only applies below).
+    // are untouched; if no make method produces the child, fall back to all (warn).
     // (The within-method alt_group case is additionally narrowed in planMethodSlot.)
     val cust = demand["customer_id"]?.toString()?.trim()
-    val constraintRules = if (methodOverride != null || cust.isNullOrEmpty()) emptyList()
+    val constraintRules = if (cust.isNullOrEmpty()) emptyList()
         else parseConstraints(config).filter { it.customerId == cust && it.parent == productId.trim() }
     val constrainedMethods = if (constraintRules.isEmpty()) methods else {
         val filtered = methods.filter { m ->
@@ -2396,18 +2367,6 @@ fun plan(
         }
     }
 
-    val overrideFilteredMethods = if (methodOverride != null) {
-        val forcedType = (methodOverride["method"] ?: methodOverride["method_type"])?.toString()
-        val forcedPref = (methodOverride["preference"] as? Number)?.toInt()
-        methods.filter { m ->
-            (forcedType == null || m["type"]?.toString() == forcedType) &&
-            (forcedPref == null || (m["preference"] as? Number)?.toInt() == forcedPref)
-        }.ifEmpty {
-            log.warn("method_selection override for {}@{} matched no methods; using all", productId, locationId)
-            methods
-        }
-    } else constrainedMethods
-
     // ── Cycle-aware method pruning ───────────────────────────────────────────
     // Drop methods whose chain can't structurally bottom out (a self-cycle — e.g.
     // make/move X ultimately needs X again, with no inventory/buy base case) WHEN at
@@ -2418,17 +2377,17 @@ fun plan(
     // stock path. If NO method is feasible, keep them all so the genuine failure (and its
     // diagnostic) still surfaces. Only runs when the feasibility cache is available and
     // there's an actual choice to make.
-    val effectiveMethods = if (feasibilityCache != null && overrideFilteredMethods.size > 1) {
+    val effectiveMethods = if (feasibilityCache != null && constrainedMethods.size > 1) {
         val inProgress = mutableSetOf(Pair(productId, locationId))
-        val feasible = overrideFilteredMethods.filter { mm ->
+        val feasible = constrainedMethods.filter { mm ->
             methodStructuralDepth(productId, locationId, mm, data, purchaseAllowed, feasibilityCache, inProgress, purchasable) < Int.MAX_VALUE
         }
-        if (feasible.isNotEmpty() && feasible.size < overrideFilteredMethods.size) {
+        if (feasible.isNotEmpty() && feasible.size < constrainedMethods.size) {
             log.info("cycle-aware: {}@{} pruned {} self-cycling/dead-end method(s); {} feasible remain",
-                productId, locationId, overrideFilteredMethods.size - feasible.size, feasible.size)
+                productId, locationId, constrainedMethods.size - feasible.size, feasible.size)
             feasible
-        } else overrideFilteredMethods
-    } else overrideFilteredMethods
+        } else constrainedMethods
+    } else constrainedMethods
 
     val elaborateAtThisLevel = shouldElaborateAtDepth(depth, methodCfg.depth)
 
@@ -2474,12 +2433,6 @@ fun plan(
             else -> effectiveMethods.sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
         }
 
-        // Override-active determination for waterfall: only "did override narrow
-        // the candidate set" applies, since waterfall doesn't pick a single
-        // method that could "differ from auto-selection".
-        val methodOverrideActiveW = methodOverride != null && overrideFilteredMethods.size < methods.size
-        val overrideActiveW = methodOverrideActiveW || variantOverride != null
-
         val cap = methodCfg.maxMethods.coerceAtMost(ranked.size)
         var residual = demandNetQty
         var latestCommit: LocalDate? = null
@@ -2512,12 +2465,10 @@ fun plan(
                 inventory = inventory, data = data,
                 depth = depth, path = path,
                 config = config, preferDemandId = preferDemandId,
-                overrideIndex = overrideIndex, budget = budget,
+                budget = budget,
                 useSingleVariant = useSingleVariant,
                 scoreWeights = scoreWeights, topN = topN,
-                variantOverride = variantOverride,
                 methodChoiceExplanation = slotLabel,
-                overrideActive = overrideActiveW,
                 feasibilityCache = feasibilityCache,
                 structuralFailedMakes = structuralFailedMakes,
                 initialBudget = initialBudget,
@@ -2572,22 +2523,12 @@ fun plan(
         }
         effectiveMethods.size == 1 -> {
             val m = effectiveMethods[0]; val loc = (m["location_id"] ?: m["to_location_id"] ?: "").toString()
-            val base = "Only option: ${m["type"]} @ $loc."
-            Pair(m, if (methodOverride != null) "$base [method override active]" else base)
+            Pair(m, "Only option: ${m["type"]} @ $loc.")
         }
         useElaborateMethod && elaborateAtThisLevel ->
             getPreferredMethodElaborate(effectiveMethods, demand, inventory, data, requestTimeDt, config, depth, path)
         else -> getPreferredMethodCascade(effectiveMethods, demand, inventory, data, requestTimeDt, config, depth, path)
     }
-
-    // Override is active only when it actually changed the selected method vs auto-selection.
-    // For elaborate mode (expensive), fall back to checking whether choices were restricted.
-    val methodOverrideActive = methodOverride != null && when {
-        blueprintMethod != null        -> overrideFilteredMethods.size < methods.size
-        useElaborateMethod && elaborateAtThisLevel -> overrideFilteredMethods.size < methods.size
-        else -> getPreferredMethod(methods).first?.get("type")?.toString() != m?.get("type")?.toString()
-    }
-    val overrideActive = methodOverrideActive || variantOverride != null
 
     if (m == null) {
         demandFulfilledList.add(committedRow(demandNetQty, reqTimeStr, "no_preferred_method"))
@@ -2687,12 +2628,10 @@ fun plan(
             inventory = inventory, data = data,
             depth = depth, path = path,
             config = config, preferDemandId = preferDemandId,
-            overrideIndex = overrideIndex, budget = budget,
+            budget = budget,
             useSingleVariant = useSingleVariant,
             scoreWeights = scoreWeights, topN = topN,
-            variantOverride = variantOverride,
             methodChoiceExplanation = labelPrefix,
-            overrideActive = overrideActive,
             feasibilityCache = feasibilityCache,
             structuralFailedMakes = structuralFailedMakes,
             initialBudget = initialBudget,
@@ -2892,7 +2831,6 @@ private fun buildWorkOrders(
     m: Map<String, Any?>,
     demandId: Any?,
     data: Map<String, List<Map<String, Any?>>>,
-    overrideActive: Boolean = false,
 ): WorkOrderResult {
     val lotSizeVal = maxLotSize(productId, productionLocation, data)?.takeIf { it > 0 } ?: qty
     val lotSize = max(1e-9, lotSizeVal)
@@ -2940,7 +2878,6 @@ private fun buildWorkOrders(
                 "location_source" to (if (methodType == "move") m["from_location_id"] else null),
                 "demand_id" to demandId,
                 "prod_area" to prodArea,
-                "override_active" to overrideActive,
                 "wo_group_id" to woGroupId,
                 "wave_index" to waveIndex,
             ))
@@ -3165,7 +3102,6 @@ private fun flattenPeggingToWorkOrders(
                 put("location_source", n["location_source"])
                 put("demand_id", demandId)
                 put("prod_area", getProdArea(pid, lid, data))
-                put("override_active", n["override_active"] ?: false)
                 put("wo_group_id", n["wo_group_id"])
                 put("lot_count", 1)            // capacity/lot-size splitting deferred to WO consolidation
                 put("max_lot_size", n["max_lot_size"])
@@ -3384,8 +3320,6 @@ internal fun crossWaveCalendarMerge(
         val mergedSplit = rows.flatMap { (it["consolidation_split_details"] as? List<Map<String, Any?>>) ?: emptyList() }
             .groupBy { it["demand_id"] as? String }
             .map { (d, es) -> mapOf("demand_id" to d, "allocated_qty" to es.sumOf { (it["allocated_qty"] as? Number)?.toDouble() ?: 0.0 }) }
-        val overrideActive = rows.any { it["override_active"] == true }
-
         val newCgid = rows[0]["consolidated_group_id"] as? String ?: nextWoGroupId()
         for (r in rows) { val c = r["consolidated_group_id"] as? String; if (c != null) cgidRemap[c] = newCgid }
 
@@ -3404,7 +3338,6 @@ internal fun crossWaveCalendarMerge(
             put("location_source", locSrc)
             put("demand_id", null)
             put("prod_area", first["prod_area"])
-            put("override_active", overrideActive)
             put("wo_group_id", newCgid)
             put("consolidated_group_id", newCgid)
             put("wave_index", 0)
@@ -3497,7 +3430,6 @@ internal fun consolidateByWaves(
         val nativeStart: LocalDate?,
         val nativeEnd: LocalDate?,
         val demandId: String?,
-        val overrideActive: Boolean,
         val nativeMaxLotSize: Any?,
         val members: List<String>?,
     )
@@ -3510,7 +3442,6 @@ internal fun consolidateByWaves(
         var totalQty: Double = 0.0
         var occurrenceCount: Int = 0
         var nativeStart: LocalDate? = null
-        var overrideActive: Boolean = false
         var nativeDuration: Double? = null
         val demandQty: LinkedHashMap<String, Double> = LinkedHashMap()
         var sampleMembers: List<String>? = null
@@ -3552,7 +3483,6 @@ internal fun consolidateByWaves(
                     nativeStart = nativeStart,
                     nativeEnd = nativeEnd,
                     demandId = demandId?.toString()?.takeIf { it.isNotBlank() },
-                    overrideActive = n["override_active"] == true,
                     nativeMaxLotSize = n["max_lot_size"],
                     members = members,
                 ))
@@ -3596,7 +3526,6 @@ internal fun consolidateByWaves(
         info.totalQty += occ.qty
         info.occurrenceCount++
         if (occ.nativeStart != null && (info.nativeStart == null || occ.nativeStart < info.nativeStart!!)) info.nativeStart = occ.nativeStart
-        if (occ.overrideActive) info.overrideActive = true
         if (occ.nativeStart != null && occ.nativeEnd != null) {
             val dur = (occ.nativeEnd.toEpochDay() - occ.nativeStart.toEpochDay()).toDouble()
             if (info.nativeDuration == null || dur > info.nativeDuration!!) info.nativeDuration = dur
@@ -3643,7 +3572,6 @@ internal fun consolidateByWaves(
         put("location_source", info.locationSource)
         put("demand_id", info.demandQty.keys.firstOrNull())
         put("prod_area", getProdArea(info.pid, info.lid, data))
-        put("override_active", info.overrideActive)
         put("wo_group_id", gid)
         put("consolidated_group_id", cgid)
         put("wave_index", 0)
@@ -3678,7 +3606,6 @@ internal fun consolidateByWaves(
         val splitDetails = gids.flatMap { g -> gidInfo.getValue(g).demandQty.entries.map { it.key to it.value } }
             .groupBy({ it.first }, { it.second })
             .map { (d, qtys) -> mapOf("demand_id" to d, "allocated_qty" to qtys.sum()) }
-        val overrideActive = gids.any { gidInfo.getValue(it).overrideActive }
         // When constituent WOs came from virtual/null-demand pegging entries their demandId is null,
         // so demandQty is empty and demands=[]. Fall back to sampleMembers (real demand IDs carried
         // on the virtual entry's consolidated_demand_ids) so the frontend can still show the accordion.
@@ -3713,7 +3640,6 @@ internal fun consolidateByWaves(
                 "location_source" to first.locationSource,
                 "demand_id" to null,
                 "prod_area" to getProdArea(first.pid, first.lid, data),
-                "override_active" to overrideActive,
                 "wo_group_id" to cgid,
                 "consolidated_group_id" to cgid,
                 "wave_index" to 0,
@@ -3740,7 +3666,6 @@ internal fun consolidateByWaves(
             "location_source" to first.locationSource,
             "demand_id" to null,
             "prod_area" to getProdArea(first.pid, first.lid, data),
-            "override_active" to overrideActive,
             "wo_group_id" to cgid,
             "consolidated_group_id" to cgid,
             "wave_index" to 0,
@@ -3918,7 +3843,6 @@ internal fun consolidateByWaves(
             put("location_source", occ.locationSource)
             put("demand_id", occ.demandId)
             put("prod_area", getProdArea(occ.pid, occ.lid, data))
-            put("override_active", occ.overrideActive)
             put("wo_group_id", occ.originalGid)
             put("lot_count", 1)
             put("max_lot_size", occ.nativeMaxLotSize)
@@ -4074,7 +3998,6 @@ private fun buildWoNode(
     variantExpl: String,
     childrenRelation: String?,
     woChildren: List<Map<String, Any?>>,
-    overrideActive: Boolean = false,
     failed: Boolean = false,
     woGroupId: String? = null,
     data: Map<String, List<Map<String, Any?>>>? = null,
@@ -4092,7 +4015,6 @@ private fun buildWoNode(
     put("children_relation", childrenRelation)
     put("lot_count", if (lotCount > 0) lotCount else null)
     put("max_lot_size", lotSizeVal)
-    put("override_active", overrideActive)
 
     // Wave structure for make WOs under the operation override. cap >= 1 means
     // the WO compresses its lots into ceil(lot_count / cap) sequential waves;
@@ -4474,7 +4396,6 @@ internal fun legacyCommit(
     inventory: MutableList<MutableMap<String, Any?>>,
     data: Map<String, List<Map<String, Any?>>>,
     config: Map<String, Any?>?,
-    overrideIndex: Map<String, Map<String, Any?>>,
     useTaggedLookup: Boolean,
     progressCallback: ((Map<String, Any?>) -> Unit)?,
     /**
@@ -4562,7 +4483,7 @@ internal fun legacyCommit(
         }
         val (solvedList, wos, peggingNode) = plan(
             d, indexedInventory, planData, reqDt,
-            config = config, preferDemandId = prefId, overrideIndex = overrideIndex,
+            config = config, preferDemandId = prefId,
             budget = demandBudget,
             feasibilityCache = feasibilityCache,
             structuralFailedMakes = structuralFailedMakes,
@@ -4636,49 +4557,6 @@ fun runPlanning(
     val workOrders = mutableListOf<Map<String, Any?>>()
     val planningPegging = mutableListOf<Map<String, Any?>>()
 
-    // Build override index once — passed through to all plan() calls. Mutable so consolidation
-    // can merge synthetic method_selection entries (computed from collectDeepNeeds' cascade walk)
-    // before the main planning loop runs, ensuring consolidation's pre-allocation path matches
-    // main plan's actual path.
-    @Suppress("UNCHECKED_CAST")
-    val overrideIndex: MutableMap<String, Map<String, Any?>> =
-        buildOverrideIndex((data["overrides"] ?: emptyList()) as List<Map<String, Any?>>).toMutableMap()
-
-    // Supply-split overrides: split affected inventory buckets into demand-tagged
-    // sub-buckets so the existing preferDemandId/demand_tag two-pass consumption
-    // logic enforces per-(supply,demand) caps during planning.
-    val supplyCapMap = buildSupplyCapMap(overrideIndex, data["supply"] ?: emptyList(), demands)
-    if (supplyCapMap.isNotEmpty()) {
-        for ((supplyId, caps) in supplyCapMap) {
-            val buckets = inventory.filter { it["supply_id"]?.toString() == supplyId }
-            if (buckets.isEmpty()) continue
-            val originalQty = buckets.sumOf { (it["qty"] as? Number)?.toDouble() ?: 0.0 }
-            val totalCaps = caps.values.sumOf { if (it > 1e-12) it else 0.0 }
-            if (totalCaps > originalQty + 1e-6) {
-                log.warn(
-                    "supply-split override: supply_id {} Σcaps {:.4f} > original_qty {:.4f} — " +
-                    "demands will compete for more than the physical supply",
-                    supplyId, totalCaps, originalQty,
-                )
-            }
-            val template = buckets.first()
-            val productId = template["product_id"]
-            val locationId = template["location_id"]
-            val supplyDate = template["supply_date"]
-            inventory.removeAll(buckets.toSet())
-            for ((demandId, cap) in caps) {
-                if (cap <= 1e-12) continue
-                inventory.add(mutableMapOf(
-                    "product_id"  to productId,
-                    "location_id" to locationId,
-                    "supply_date" to supplyDate,
-                    "supply_id"   to supplyId,
-                    "qty"         to cap,
-                    "demand_tag"  to demandId,
-                ))
-            }
-        }
-    }
     // Conservation baseline: after supply-split overrides so that demand-tagged sub-buckets
     // (Σcaps ≤ original_qty) are the reference, not the raw input buckets.
     val inventoryEffectiveInitial: List<Map<String, Any?>> = inventory.map { it.toMap() }
@@ -4710,7 +4588,6 @@ fun runPlanning(
         inventory         = inventory,
         data              = data,
         config            = config,
-        overrideIndex     = overrideIndex,
         useTaggedLookup   = false,
         progressCallback  = progressCallback,
         budgets           = sgAllocation.perLotBudgets,
@@ -4769,51 +4646,6 @@ fun runPlanning(
         verifyComponentConservation(producedByComponent, allPegging, servedDemandIds = servedDemandIds)
     else emptyList<String>()
     // R7g computed after adjustedConsolidated is available (below the timing-readjust block).
-
-    // Supply-split override soft-warn: any demand in an override that commits short
-    // of its request is flagged as potentially impacted by the override.
-    // Commit qty is measured from real supply/purchase allocations — committed_demands
-    // rows with hard-failure reasons (no_methods, etc.) record shortfall, not commit.
-    val overrideWarnings = if (supplyCapMap.isEmpty()) emptyList() else {
-        val requestedByDemand = mutableMapOf<String, Double>()
-        for (d in demands) {
-            val did = d["demand_id"]?.toString() ?: continue
-            val q = (d["quantity"] as? Number)?.toDouble() ?: 0.0
-            requestedByDemand[did] = (requestedByDemand[did] ?: 0.0) + q
-        }
-        val committedByDemand = mutableMapOf<String, Double>()
-        for (row in committedDemands) {
-            val reason = row["commit_reason"] as? String
-            if (isHardPlanningFailure(reason)) continue
-            val did = row["demand_id"]?.toString() ?: continue
-            val q = (row["quantity"] as? Number)?.toDouble() ?: 0.0
-            committedByDemand[did] = (committedByDemand[did] ?: 0.0) + q
-        }
-        val warnings = mutableListOf<Map<String, Any?>>()
-        for ((supplyId, caps) in supplyCapMap) {
-            val affected = mutableListOf<Map<String, Any?>>()
-            for ((did, _) in caps) {
-                val req = requestedByDemand[did] ?: continue
-                val com = committedByDemand[did] ?: 0.0
-                val shortfall = req - com
-                if (shortfall > 1e-6) {
-                    affected.add(mapOf(
-                        "demand_id" to did,
-                        "shortfall" to roundQty(shortfall),
-                        "requested" to roundQty(req),
-                        "committed" to roundQty(com),
-                    ))
-                }
-            }
-            if (affected.isNotEmpty()) {
-                warnings.add(mapOf(
-                    "supply_id"        to supplyId,
-                    "affected_demands" to affected,
-                ))
-            }
-        }
-        warnings
-    }
 
     val timingFix = fixTimingFromPegging(workOrders, allPegging, data)
     // Release pruned trees; timingFix holds the timing-adjusted copies.
@@ -5030,7 +4862,6 @@ fun runPlanning(
         "component_conservation_violations" to componentConservationViolations,
         "wo_conservation_violations" to woConservationViolations,
         "budget_released_by_component" to releasedByComponent,
-        "override_warnings"      to overrideWarnings,
         // Number of WO groups whose start was pushed by ResourceScheduler
         // to wait for contended resources. Zero when the feature flag is
         // off; > 0 when global scheduling actually moved at least one WO.
@@ -5480,7 +5311,7 @@ private fun fixTimingFromPegging(
     }
     val consolidationFieldKeys = listOf(
         "consolidated", "consolidation_split_mode", "consolidation_total_planned",
-        "consolidation_split_details", "consolidation_override_active",
+        "consolidation_split_details",
     )
 
     val regenLots = mutableListOf<MutableMap<String, Any?>>()
@@ -5529,7 +5360,6 @@ private fun fixTimingFromPegging(
             ?: maxLotSize(pid, lid, data) ?: totalQty
         val lotSize = max(1e-9, maxLotSize)
         val locationSource = woNode["location_source"] as? String
-        val overrideActive = woNode["override_active"] as? Boolean ?: false
         val prodArea = getProdArea(pid, lid, data)
         val originalLot = planningGid?.let { originalLotByPlanningGid[it] }
 
@@ -5569,7 +5399,6 @@ private fun fixTimingFromPegging(
                 "location_source" to locationSource,
                 "demand_id" to ownerDemandId,
                 "prod_area" to prodArea,
-                "override_active" to overrideActive,
                 "wo_group_id" to finalGid,
                 "wave_index" to waveIdx.toInt(),
             )

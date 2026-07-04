@@ -151,16 +151,6 @@ object CaseLoader {
             mapOf("vendor_id" to it[Vendors.vendorId])
         }
 
-        val overrides = ManualOverrides.selectAll().where { ManualOverrides.caseId eq caseId }.map {
-            val payloadJson = runCatching { Json.parseToJsonElement(it[ManualOverrides.payload]).jsonObject }
-                .getOrElse { kotlinx.serialization.json.JsonObject(emptyMap()) }
-            mapOf(
-                "entity_type" to it[ManualOverrides.entityType],
-                "entity_key" to it[ManualOverrides.entityKey],
-                "payload" to payloadJson,
-            )
-        }
-
         mapOf(
             "bom" to boms,
             "customer" to customers,
@@ -176,7 +166,6 @@ object CaseLoader {
             "supply" to supplies,
             "method_move" to methodMove,
             "vendor" to vendors,
-            "overrides" to overrides,
         )
     }
 }

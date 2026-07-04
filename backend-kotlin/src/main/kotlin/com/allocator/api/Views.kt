@@ -378,27 +378,6 @@ fun Routing.viewRoutes() {
                         }
                     }
 
-                    // Supply-split overrides + their shortfall warnings from this plan run
-                    val overridesBySupply = mutableMapOf<String, JsonElement>()
-                    ManualOverrides.selectAll().where {
-                        (ManualOverrides.caseId eq caseId) and (ManualOverrides.entityType eq "supply_split")
-                    }.forEach { row ->
-                        val sid = row[ManualOverrides.entityKey]
-                        val payload = runCatching { jViews.parseToJsonElement(row[ManualOverrides.payload]) }.getOrNull()
-                        if (payload != null) overridesBySupply[sid] = payload
-                    }
-                    val warningSupplyIds = mutableSetOf<String>()
-                    val resultJson = planRow[PlanRuns.result]
-                    if (resultJson != null) {
-                        runCatching {
-                            val warnings = jViews.parseToJsonElement(resultJson).jsonObject["override_warnings"]?.jsonArray
-                            warnings?.forEach { w ->
-                                val sid = w.jsonObject["supply_id"]?.jsonPrimitive?.contentOrNull
-                                if (!sid.isNullOrBlank()) warningSupplyIds.add(sid)
-                            }
-                        }
-                    }
-
                     supplies.map { s ->
                         val sid = s[Supplies.supplyId]
                         val initRow = s[Supplies.qty]
@@ -406,14 +385,6 @@ fun Routing.viewRoutes() {
                         val residualRow = maxOf(0.0, initRow - consumedRow)
                         val utilRate = if (initRow > 0) consumedRow / initRow else null
                         val peggedDemands = demandsBySupplyKey[sid]?.size ?: 0
-                        val overridePayload = overridesBySupply[sid]
-                        val overrideEntry: JsonElement? = if (overridePayload != null) {
-                            val allocs = overridePayload.jsonObject["allocations"] ?: JsonArray(emptyList())
-                            buildJsonObject {
-                                put("allocations", allocs)
-                                put("warning", sid in warningSupplyIds)
-                            }
-                        } else null
                         mapOf(
                             "id" to s[Supplies.id],
                             "component_key" to "${s[Supplies.productId]}|${s[Supplies.locationId] ?: ""}",
@@ -427,7 +398,7 @@ fun Routing.viewRoutes() {
                             "utilization_rate" to if (utilRate != null) Math.round(utilRate * 10000).toDouble() / 10000.0 else null,
                             "pegged_demands" to peggedDemands,
                             "total_pegged_qty" to roundQty(consumedRow),
-                            "override" to overrideEntry,
+                            "override" to null,
                         )
                     }
                 }
@@ -930,13 +901,7 @@ fun Routing.viewRoutes() {
                     bomRate.putIfAbsent(b[Boms.parentId] to b[Boms.childId], b[Boms.rate] ?: 1.0)
                 }
 
-                val supplyAdj = mutableMapOf<String, Double>()
-                ManualOverrides.selectAll().where { ManualOverrides.caseId eq caseId }.forEach { o ->
-                    if (o[ManualOverrides.entityType] == "supply") {
-                        val payload = try { jViews.parseToJsonElement(o[ManualOverrides.payload]).jsonObject } catch (_: Exception) { return@forEach }
-                        if (payload.containsKey("quantity")) supplyAdj[o[ManualOverrides.entityKey]] = payload["quantity"]!!.jsonPrimitive.double
-                    }
-                }
+                val supplyAdj = emptyMap<String, Double>()
 
                 var basketInitialOut: List<Map<String, Any?>> = emptyList()
                 var basketDeltasOut: List<Map<String, Any?>> = emptyList()
@@ -1111,13 +1076,7 @@ fun Routing.viewRoutes() {
                 Boms.selectAll().where { Boms.caseId eq caseId }.forEach { b ->
                     bomRate.putIfAbsent(b[Boms.parentId] to b[Boms.childId], b[Boms.rate] ?: 1.0)
                 }
-                val supplyAdj = mutableMapOf<String, Double>()
-                ManualOverrides.selectAll().where { ManualOverrides.caseId eq caseId }.forEach { o ->
-                    if (o[ManualOverrides.entityType] == "supply") {
-                        val p = try { jViews.parseToJsonElement(o[ManualOverrides.payload]).jsonObject } catch (_: Exception) { return@forEach }
-                        if (p.containsKey("quantity")) supplyAdj[o[ManualOverrides.entityKey]] = p["quantity"]!!.jsonPrimitive.double
-                    }
-                }
+                val supplyAdj = emptyMap<String, Double>()
                 val rep = if (actions.isNotEmpty()) replayBasketSnapshots(
                     supplies, actions, bomRate, leadTimeByVariant, moveTransit, dateToPeriod, sortedDates, supplyAdj, MAX_ACTIONS_ALLOCATION_VIEW
                 ) else BasketReplayResult(emptyList(), emptyList(), emptyMap(), emptyMap(), emptyList())

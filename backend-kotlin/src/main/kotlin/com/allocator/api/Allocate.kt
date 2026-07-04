@@ -922,7 +922,7 @@ fun Routing.allocateRoutes() {
             // backfill) lazy-fetch `result` below for the KPI fallback.
             val listColumns = listOf(
                 PlanRuns.id, PlanRuns.caseId, PlanRuns.jobId, PlanRuns.status,
-                PlanRuns.config, PlanRuns.overrideSnapshot, PlanRuns.metadata,
+                PlanRuns.config, PlanRuns.metadata,
                 PlanRuns.name, PlanRuns.notes,
                 PlanRuns.createdAt, PlanRuns.finishedAt,
                 PlanRuns.chosenDepth, PlanRuns.attempts,
@@ -953,10 +953,6 @@ fun Routing.allocateRoutes() {
                 } ?: emptyMap()
             }
             rows.map { row ->
-                val snapshot = row[PlanRuns.overrideSnapshot]
-                val parsedSnapshot = snapshot?.let { runCatching { Json.parseToJsonElement(it) as? JsonArray }.getOrNull() }
-                val overrideCount = parsedSnapshot?.size ?: 0
-                val preview: JsonElement? = parsedSnapshot?.take(3)?.let { JsonArray(it) }
                 val runId = row[PlanRuns.id]
                 val startedInstant = row[PlanRuns.createdAt]
                 val finishedInstant = row[PlanRuns.finishedAt]
@@ -972,8 +968,6 @@ fun Routing.allocateRoutes() {
                     jobId = row[PlanRuns.jobId],
                     status = row[PlanRuns.status],
                     config = configRaw?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
-                    overrideCount = overrideCount,
-                    overrideSnapshotPreview = preview,
                     name = row[PlanRuns.name],
                     notes = row[PlanRuns.notes],
                     isInitial = (runId == initialRunId),
@@ -1048,7 +1042,6 @@ fun Routing.allocateRoutes() {
             jobId = null,
             status = "ready",
             config = readyRow.config?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
-            overrideSnapshot = null,
             result = runCatching { anyToJson(inMemory) }.getOrNull(),
             error = null,
             name = readyRow.name,
@@ -1070,7 +1063,7 @@ fun Routing.allocateRoutes() {
 
         data class RawRow(
             val id: Int, val caseId: Int, val jobId: String?, val status: String,
-            val config: String?, val overrideSnapshot: String?,
+            val config: String?,
             val result: String?, val error: String?,
             val name: String?, val notes: String?,
             val createdAt: kotlinx.datetime.Instant,
@@ -1085,7 +1078,7 @@ fun Routing.allocateRoutes() {
             RawRow(
                 id = row[PlanRuns.id], caseId = row[PlanRuns.caseId],
                 jobId = row[PlanRuns.jobId], status = row[PlanRuns.status],
-                config = row[PlanRuns.config], overrideSnapshot = row[PlanRuns.overrideSnapshot],
+                config = row[PlanRuns.config],
                 result = row[PlanRuns.result], error = row[PlanRuns.error],
                 name = row[PlanRuns.name], notes = row[PlanRuns.notes],
                 createdAt = row[PlanRuns.createdAt],
@@ -1161,7 +1154,6 @@ fun Routing.allocateRoutes() {
             jobId = raw.jobId,
             status = raw.status,
             config = raw.config?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
-            overrideSnapshot = raw.overrideSnapshot?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() },
             result = resultElement,
             error = raw.error,
             name = raw.name,
@@ -1279,13 +1271,11 @@ fun Routing.allocateRoutes() {
                 return@post
             }
             val newConfig = runRow[PlanRuns.config]
-            val newOverrideSnapshot = runRow[PlanRuns.overrideSnapshot]
 
             transaction {
                 PlanRuns.update({ PlanRuns.id eq targetRunId }) {
                     it[PlanRuns.result] = resultJson
                     it[PlanRuns.config] = newConfig
-                    it[PlanRuns.overrideSnapshot] = newOverrideSnapshot
                     if (nameArg != null) it[PlanRuns.name] = nameArg.ifBlank { null }
                     if (notesArg != null) it[PlanRuns.notes] = notesArg.ifBlank { null }
                 }
@@ -1564,7 +1554,6 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
     val report = try {
         data class SoundnessInputs(
             val resultJson: String?,
-            val overrideSnapshotJson: String?,
             val invInitialJson: String?,
             val invLeftoverJson: String?,
         )
@@ -1572,7 +1561,6 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
             val row = PlanRuns.selectAll().where { PlanRuns.id eq runId }.single()
             SoundnessInputs(
                 resultJson = row[PlanRuns.result],
-                overrideSnapshotJson = row[PlanRuns.overrideSnapshot],
                 invInitialJson = row[PlanRuns.inventoryEffectiveInitial],
                 invLeftoverJson = row[PlanRuns.inventoryLeftover],
             )
@@ -1590,14 +1578,6 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
         val workOrdersNative = (resultMap["work_orders_native"] as? List<Map<String, Any?>>) ?: emptyList()
         @Suppress("UNCHECKED_CAST")
         val committedDemandsForCheck = (resultMap["committed_demands"] as? List<Map<String, Any?>>) ?: emptyList()
-        @Suppress("UNCHECKED_CAST")
-        val overrideRows: List<Map<String, Any?>> = inputs.overrideSnapshotJson?.let {
-            runCatching {
-                val parsed = Json.parseToJsonElement(it)
-                (jsonElementToNative(parsed) as? List<Map<String, Any?>>) ?: emptyList()
-            }.getOrElse { emptyList() }
-        } ?: emptyList()
-        val overrideIndexForCheck = com.allocator.services.buildOverrideIndex(overrideRows)
         val data = transaction { CaseLoader.load(caseId) }
         @Suppress("UNCHECKED_CAST")
         val demands = (data["demand"] as? List<Map<String, Any?>>) ?: emptyList()
@@ -1635,7 +1615,6 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
                 workOrders = workOrders,
                 workOrdersNative = workOrdersNative,
                 committedDemands = committedDemandsForCheck,
-                overrideIndex = overrideIndexForCheck,
                 inventoryEffectiveInitial = inventoryInitial,
                 inventoryLeftover = inventoryLeftover,
                 supplyAllocations = supplyAllocations,
@@ -1650,7 +1629,6 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
                 workOrders = workOrders,
                 workOrdersNative = workOrdersNative,
                 committedDemands = committedDemandsForCheck,
-                overrideIndex = overrideIndexForCheck,
                 inventoryEffectiveInitial = inventoryInitial,
                 inventoryLeftover = inventoryLeftover,
                 supplyAllocations = supplyAllocations,
@@ -1689,7 +1667,6 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
                 workOrders = workOrders,
                 workOrdersNative = workOrdersNative,
                 committedDemands = committedDemandsForCheck,
-                overrideIndex = overrideIndexForCheck,
                 inventoryEffectiveInitial = inventoryInitial,
                 inventoryLeftover = inventoryLeftover,
                 supplyAllocations = supplyAllocations,
@@ -2261,9 +2238,6 @@ private fun enrichWorkOrders(
             "wo_consolidation_total_planned" to (wo["consolidation_total_planned"] as? Number)?.toDouble(),
             @Suppress("UNCHECKED_CAST")
             "wo_consolidation_split_details" to (wo["consolidation_split_details"] as? List<Map<String, Any?>>),
-            // Override active flags — propagated from planning/consolidation engines
-            "override_active" to (wo["override_active"] as? Boolean ?: false),
-            "consolidation_override_active" to (wo["consolidation_override_active"] as? Boolean ?: false),
         )
     }
 }
@@ -2490,8 +2464,6 @@ private fun enrichPlanResultWithData(
             "wo_explanation_method"       to consolidated["wo_explanation_method"],
             "wo_explanation_variant"      to consolidated["wo_explanation_variant"],
             "wo_competing_demands"        to consolidated["wo_competing_demands"],
-            "override_active"             to (n["override_active"] as? Boolean ?: false),
-            "consolidation_override_active" to (n["consolidation_override_active"] as? Boolean ?: false),
         )
     }
     val enrichedCommitted = enrichCommittedDemands(
@@ -2541,30 +2513,17 @@ internal suspend fun runPlanBackground(
     config: Map<String, Any?>?,
     autoSave: Boolean = false,
 ) {
-    // Insert plan_run record at start, capturing current override snapshot
+    // Insert plan_run record at start
     val planRunId = transaction {
-        val overrides = ManualOverrides.selectAll().where { ManualOverrides.caseId eq caseId }
-            .map { row ->
-                buildJsonObject {
-                    put("id", row[ManualOverrides.id])
-                    put("case_id", row[ManualOverrides.caseId])
-                    put("entity_type", row[ManualOverrides.entityType])
-                    put("entity_key", row[ManualOverrides.entityKey])
-                    put("payload", runCatching { Json.parseToJsonElement(row[ManualOverrides.payload]) }.getOrElse { JsonNull })
-                }
-            }
-        val overrideSnapshotJson = JsonArray(overrides).toString()
         val configJson = resolveEffectiveConfig(config).toString()
         val insertedId = PlanRuns.insert {
             it[PlanRuns.caseId] = caseId
             it[PlanRuns.jobId] = jobId
             it[PlanRuns.status] = "running"
             it[PlanRuns.config] = configJson
-            it[PlanRuns.overrideSnapshot] = overrideSnapshotJson
         }[PlanRuns.id]
         com.allocator.services.emitPlanRunEvent(caseId, insertedId, "created", buildJsonObject {
             put("source", "plan")
-            put("override_count", JsonPrimitive(overrides.size))
         })
         insertedId
     }
@@ -2801,31 +2760,18 @@ private suspend fun runOneBootstrapPreset(
         ?: throw IllegalStateException("Failed to convert bootstrap preset config to Map")
 
     val planRunId = transaction {
-        val overrides = ManualOverrides.selectAll().where { ManualOverrides.caseId eq caseId }
-            .map { row ->
-                buildJsonObject {
-                    put("id", row[ManualOverrides.id])
-                    put("case_id", row[ManualOverrides.caseId])
-                    put("entity_type", row[ManualOverrides.entityType])
-                    put("entity_key", row[ManualOverrides.entityKey])
-                    put("payload", runCatching { Json.parseToJsonElement(row[ManualOverrides.payload]) }.getOrElse { JsonNull })
-                }
-            }
-        val overrideSnapshotJson = JsonArray(overrides).toString()
         val configJson = resolveEffectiveConfig(configMap).toString()
         val metadataJson = com.allocator.services.CaseBootstrap.metadataFor(preset).toString()
         val insertedId = PlanRuns.insert {
             it[PlanRuns.caseId] = caseId
             it[PlanRuns.status] = "running"
             it[PlanRuns.config] = configJson
-            it[PlanRuns.overrideSnapshot] = overrideSnapshotJson
             it[PlanRuns.metadata] = metadataJson
             it[PlanRuns.name] = preset.label
         }[PlanRuns.id]
         com.allocator.services.emitPlanRunEvent(caseId, insertedId, "created", buildJsonObject {
             put("source", "bootstrap")
             put("preset_id", preset.presetId)
-            put("override_count", JsonPrimitive(overrides.size))
         })
         insertedId
     }

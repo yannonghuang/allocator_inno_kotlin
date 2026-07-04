@@ -6,7 +6,6 @@ import com.allocator.api.assessmentRoutes
 import com.allocator.api.bomGraphRoutes
 import com.allocator.api.caseRoutes
 import com.allocator.api.explanationRoutes
-import com.allocator.api.overrideRoutes
 import com.allocator.api.peggingRoutes
 import com.allocator.api.resourceUtilizationRoutes
 import com.allocator.api.materialImpactRoutes
@@ -101,7 +100,6 @@ fun Application.configureRouting() {
             call.respond(mapOf("status" to "ok"))
         }
         caseRoutes()
-        overrideRoutes()
         allocationRoutes()
         allocateRoutes()
         peggingRoutes()

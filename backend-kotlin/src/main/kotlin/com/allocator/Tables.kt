@@ -197,15 +197,6 @@ object AllocationActions : Table("allocation_action") {
     override val primaryKey = PrimaryKey(id)
 }
 
-object ManualOverrides : Table("manual_override") {
-    val id = integer("id").autoIncrement()
-    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
-    val entityType = varchar("entity_type", 64)   // "supply" | "demand" | "component_split" | "method_selection" | "variant_selection"
-    val entityKey = varchar("entity_key", 512)
-    val payload = text("payload")                 // JSON blob
-    override val primaryKey = PrimaryKey(id)
-}
-
 /** Persisted material supply update events for manual impact analysis. */
 object MaterialEvents : Table("material_event") {
     val id          = integer("id").autoIncrement()
@@ -233,14 +224,13 @@ object WoScheduleEvents : Table("wo_schedule_event") {
     override val primaryKey = PrimaryKey(id)
 }
 
-/** Persisted planning run: config + override snapshot + result JSON so state is restorable. */
+/** Persisted planning run: config + result JSON so state is restorable. */
 object PlanRuns : Table("plan_run") {
     val id = integer("id").autoIncrement()
     val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
     val jobId = varchar("job_id", 64).nullable()
     val status = varchar("status", 16).default("running")       // "running" | "success" | "failed" | "contingent"
     val config = text("config").nullable()                       // JSON: PlanningConfig sent with request
-    val overrideSnapshot = text("override_snapshot").nullable()  // JSON: overrides active at run time
     val result = text("result").nullable()                       // JSON: enriched plan result
     val error = text("error").nullable()
     val metadata = text("metadata").nullable()                   // JSON: {"type":"contingent","supplyId":"...","deliveryDelayDays":N,"quantityDecreasePct":N,"baselinePlanRunId":M}
