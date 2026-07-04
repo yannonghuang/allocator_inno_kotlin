@@ -2841,18 +2841,18 @@ private fun buildWorkOrders(
     // Concurrency cap: how many lots may share a wave (same start/end) at this
     // location. Subsequent waves start at the previous wave's end, so the cap
     // controls how far the lot series marches forward in time.
-    //   • make     → resource-limited: parallelismCap lots per wave, the rest
-    //                cascade forward one lead-time per wave (capacity is real).
-    //   • purchase → no modeled cadence (cycle_days_supply is 0 across the data),
-    //                so all POs are placeable at once. A single wave keeps every
-    //                lot at (due − lead); without this a large consolidated
-    //                quantity split by max_lot_size marches decades into the
-    //                future (one lead-time per lot). [cycle_days_supply > 0 spacing
-    //                is a future enhancement.]
-    //   • move     → no modeled transport-capacity limit, so likewise concurrent.
-    val cap = if (methodType == "make")
-        OperationLookup.parallelismCap(productId, productionLocation, data).coerceAtLeast(1)
-    else Int.MAX_VALUE
+    //   • make/BOR present → resource-limited: parallelismCap lots per wave.
+    //   • make/no BOR data → parallelismCap returns 0, meaning no resource
+    //                constraint is modelled (e.g. subcon). Treat as unconstrained
+    //                parallel (Int.MAX_VALUE) so lots don't stack sequentially —
+    //                same rationale as purchase/move below.
+    //   • purchase → no modelled cadence, so all POs are placeable at once.
+    //                A single wave keeps every lot at (due − lead); without this
+    //                a large consolidated qty split by max_lot_size marches
+    //                decades into the future (one lead-time per lot).
+    //   • move     → no modelled transport-capacity limit, likewise concurrent.
+    val rawCap = if (methodType == "make") OperationLookup.parallelismCap(productId, productionLocation, data) else Int.MAX_VALUE
+    val cap = if (rawCap > 0) rawCap else Int.MAX_VALUE
 
     val wos = mutableListOf<Map<String, Any?>>()
     var left = qty
@@ -3292,7 +3292,8 @@ internal fun crossWaveCalendarMerge(
                 val methodRow = getMethods(pid, lid, data).firstOrNull { it["type"] == method }
                 val lotSize   = (maxLotSize(pid, lid, data)?.takeIf { it > 0 } ?: totalQty).coerceAtLeast(1e-9)
                 val lotCount  = Math.ceil(totalQty / lotSize).toInt().coerceAtLeast(1)
-                val cap       = if (method == "make") OperationLookup.parallelismCap(pid, lid, data).coerceAtLeast(1) else Int.MAX_VALUE
+                val rawCap    = if (method == "make") OperationLookup.parallelismCap(pid, lid, data) else Int.MAX_VALUE
+                val cap       = if (rawCap > 0) rawCap else Int.MAX_VALUE
                 val numWaves  = Math.ceil(lotCount.toDouble() / cap.toDouble()).toInt().coerceAtLeast(1)
                 val perWave   = methodRow?.let { leadDaysForMethod(it, pid, lid, totalQty, data) }
                     ?: rows.mapNotNull { r ->
@@ -3774,7 +3775,8 @@ internal fun consolidateByWaves(
             } else {
                 val lotSize = (maxLotSize(first.pid, first.lid, data)?.takeIf { it > 0 } ?: totalQty).coerceAtLeast(1e-9)
                 val lotCount = Math.ceil(totalQty / lotSize).toInt().coerceAtLeast(1)
-                val cap = if (first.method == "make") OperationLookup.parallelismCap(first.pid, first.lid, data).coerceAtLeast(1) else Int.MAX_VALUE
+                val rawCap = if (first.method == "make") OperationLookup.parallelismCap(first.pid, first.lid, data) else Int.MAX_VALUE
+                val cap = if (rawCap > 0) rawCap else Int.MAX_VALUE
                 val numWaves = Math.ceil(lotCount.toDouble() / cap.toDouble()).toInt().coerceAtLeast(1)
                 val perWaveLead = mRow?.let { leadDaysForMethod(it, first.pid, first.lid, totalQty, data) }
                     ?: gids.mapNotNull { gidInfo.getValue(it).nativeDuration }.maxOrNull() ?: 0.0
@@ -4016,12 +4018,11 @@ private fun buildWoNode(
     put("lot_count", if (lotCount > 0) lotCount else null)
     put("max_lot_size", lotSizeVal)
 
-    // Wave structure for make WOs under the operation override. cap >= 1 means
-    // the WO compresses its lots into ceil(lot_count / cap) sequential waves;
-    // outside the override cap=1 and wave_count == lot_count (today's behavior).
-    val cap = if (methodType == "make" && data != null)
-        OperationLookup.parallelismCap(productId, productionLocation, data).coerceAtLeast(1)
-    else 1
+    // Wave structure for make WOs. cap > 0 (BOR present) → resource-limited;
+    // cap == 0 (no BOR data, e.g. subcon) → unconstrained parallel (wave_count=1),
+    // consistent with buildWorkOrders which also treats cap=0 as Int.MAX_VALUE.
+    val rawCapNode = if (methodType == "make" && data != null) OperationLookup.parallelismCap(productId, productionLocation, data) else 0
+    val cap = if (rawCapNode > 0) rawCapNode else Int.MAX_VALUE
     if (cap > 1) put("parallelism_cap", cap)
     if (lotCount > 0) {
         val waveCount = kotlin.math.ceil(lotCount.toDouble() / cap.toDouble()).toInt()
@@ -4764,31 +4765,26 @@ fun runPlanning(
             val due = (d["request_due_time"] as? String)?.let { runCatching { java.time.LocalDate.parse(it.take(10)) }.getOrNull() }
             id to due
         }.toMap()
-        resourceContentionPushed = ResourceScheduler.arbitrate(mutableLots, data, priorityMap, dueMap)
-        if (resourceContentionPushed > 0) {
-            // Cascade the capacity-driven shift into the wave algorithm's pegging trees: relabel
-            // WO nodes to their consolidated_group_id so resequenceFromPegging's DAG walk operates
-            // at the same (merged-batch) granularity as mutableLots, then read the final per-cgid
-            // timing back off mutableLots (resequenceFromPegging mutates it in place via shared
-            // references) and write that onto the ORIGINAL (non-relabeled) trees — cgid isn't
-            // invertible 1:1 back to original gids, so we go through mutableLots rather than the
-            // relabeled trees' own (still cgid-keyed) output.
-            val gidToCgid = waveResult.consolidation.native.mapNotNull { n ->
-                val g = n["wo_group_id"] as? String
-                val c = n["consolidated_group_id"] as? String
-                if (g != null && c != null) g to c else null
-            }.toMap()
-            val relabeledTrees = relabelTreesToConsolidatedGids(waveResult.peggingTrees, gidToCgid)
-            // resequenceFromPegging's DAG keys lots by wo_group_id, but singleton consolidated
-            // rows (singletonRow) keep wo_group_id = their original native gid — only merged rows
-            // (mergedRow) use cgid there — while relabeledTrees' WO nodes are always relabeled to
-            // cgid. That mismatch makes singleton parents invisible to lotsByGroup, so a capacity
-            // push on a child never reaches them (silent `lotsByGroup[parentGid] ?: continue`).
-            // Use a scratch copy keyed uniformly by cgid for the cascade DAG walk, then patch the
-            // resolved timing back onto mutableLots explicitly (no shared-reference mutation since
-            // these are clones).
+
+        // Static: cgid mapping and relabeled trees don't change between passes.
+        // Relabel WO nodes to their consolidated_group_id so resequenceFromPegging's
+        // DAG walk operates at the same (merged-batch) granularity as mutableLots.
+        // Singleton consolidated rows keep wo_group_id = original native gid; merged
+        // rows use cgid — relabeling both to cgid makes them uniformly visible.
+        val gidToCgid = waveResult.consolidation.native.mapNotNull { n ->
+            val g = n["wo_group_id"] as? String
+            val c = n["consolidated_group_id"] as? String
+            if (g != null && c != null) g to c else null
+        }.toMap()
+        val relabeledTrees = relabelTreesToConsolidatedGids(waveResult.peggingTrees, gidToCgid)
+
+        // Cascade a resource-push into the pegging DAG: shifts parent WOs later when
+        // a resource-pushed child now ends later than the parent's original start.
+        // Rebuilds a scratch cgidLots copy (keyed uniformly by cgid) each time so the
+        // DAG walk is clean; writes corrected timings back onto mutableLots in place.
+        fun cascadePush() {
             val cgidLots: List<MutableMap<String, Any?>> = mutableLots.map { lot ->
-                val cgid = lot["consolidated_group_id"] as? String ?: return@map lot
+                val cgid = lot["consolidated_group_id"] as? String ?: return@map lot.toMutableMap()
                 lot.toMutableMap().also { it["wo_group_id"] = cgid }
             }
             resequenceFromPegging(cgidLots, relabeledTrees)
@@ -4807,8 +4803,35 @@ fun runPlanning(
                 startByCgid[cgid]?.let { lot["start_time"] = formatDate(it) }
                 endByCgid[cgid]?.let { lot["end_time"] = formatDate(it) }
             }
-            val startByOriginalGid = gidToCgid.mapNotNull { (g, c) -> startByCgid[c]?.let { g to it } }.toMap()
-            val endByOriginalGid = gidToCgid.mapNotNull { (g, c) -> endByCgid[c]?.let { g to it } }.toMap()
+        }
+
+        // Two-pass arbitration: the cascade from Pass 1 can land parent WOs on dates
+        // that conflict with other already-placed WOs (e.g. a child is pushed to Jul28
+        // → parent cascades to Jul29, but Jul29 is already fully booked). Pass 2 runs
+        // ResourceScheduler again on those post-cascade positions to resolve the new
+        // conflicts. A second cascade propagates any Pass-2 pushes upward.
+        resourceContentionPushed = ResourceScheduler.arbitrate(mutableLots, data, priorityMap, dueMap)
+        if (resourceContentionPushed > 0) {
+            cascadePush()
+            val pushed2 = ResourceScheduler.arbitrate(mutableLots, data, priorityMap, dueMap)
+            if (pushed2 > 0) {
+                resourceContentionPushed += pushed2
+                cascadePush()
+            }
+
+            // Update the pegging trees to reflect final WO timings after all passes.
+            val finalStartByCgid = mutableLots.mapNotNull { l ->
+                val cgid = l["consolidated_group_id"] as? String ?: return@mapNotNull null
+                val start = parseDate(l["start_time"] as? String) ?: return@mapNotNull null
+                cgid to start
+            }.toMap()
+            val finalEndByCgid = mutableLots.mapNotNull { l ->
+                val cgid = l["consolidated_group_id"] as? String ?: return@mapNotNull null
+                val end = parseDate(l["end_time"] as? String) ?: return@mapNotNull null
+                cgid to end
+            }.toMap()
+            val startByOriginalGid = gidToCgid.mapNotNull { (g, c) -> finalStartByCgid[c]?.let { g to it } }.toMap()
+            val endByOriginalGid = gidToCgid.mapNotNull { (g, c) -> finalEndByCgid[c]?.let { g to it } }.toMap()
             adjustedTrees = rewritePeggingTimings(waveResult.peggingTrees, startByOriginalGid, endByOriginalGid)
         }
     }

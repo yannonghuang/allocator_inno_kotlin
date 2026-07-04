@@ -144,9 +144,20 @@ private fun computeResourceUtilization(caseId: Int, runId: Int): Map<String, Any
         val did = (wo["demand_id"] as? String)?.trim().orEmpty()
         val key = "$gid|$did|$productId|$locationId"
         val qtyAdd = (wo["quantity"] as? Number)?.toDouble() ?: 0.0
-        // Pass-2 batched WOs carry many concurrent lots in one row (lot_count > 1);
-        // plain WOs are a single lot (absent → 1).
-        val lotCnt = (wo["lot_count"] as? Number)?.toInt()?.coerceAtLeast(1) ?: 1
+        // Effective concurrent lots = min(lot_count, parallelism_cap).
+        // A consolidated WO has lot_count = total lots across all waves, but at
+        // any given day only cap lots run simultaneously. Using total lot_count
+        // overstates the load by a factor of wave_count, producing phantom
+        // overloads that ResourceScheduler (which reserves cap×rate per day)
+        // cannot prevent. Cap comes from the same BOR data already validated above.
+        val rawLotCnt = (wo["lot_count"] as? Number)?.toInt()?.coerceAtLeast(1) ?: 1
+        val parallelCap = borRows.minOfOrNull { br ->
+            val rid = (br["resource_id"] as? String)?.trim() ?: return@minOfOrNull Int.MAX_VALUE
+            val bRate = (br["resource_rate"] as? Number)?.toDouble() ?: return@minOfOrNull Int.MAX_VALUE
+            val sz = sizeByResLoc[rid to locationId] ?: return@minOfOrNull Int.MAX_VALUE
+            if (bRate <= 0.0 || sz <= 0.0) Int.MAX_VALUE else Math.floor(sz / bRate).toInt()
+        }?.coerceAtLeast(1) ?: Int.MAX_VALUE
+        val lotCnt = minOf(rawLotCnt, parallelCap)
         val existing = woSummaries[key]
         if (existing == null) {
             woSummaries[key] = WoSummary(

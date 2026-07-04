@@ -1188,12 +1188,12 @@ private class WalkContext(
             staticLeadTime
         }
         // Wave compression: total span = ceil(lot_count / cap) * per-lot.
-        // Fall back to lot_count when the override is inapplicable (cap defaults
-        // to 1) — matches the old "duration ≥ per-lot lead" check exactly when
-        // lot_count == 1.
+        // cap=0 (no BOR data, e.g. subcon) → unconstrained parallel → waveCount=1,
+        // consistent with how buildWorkOrders and consolidateByWaves treat this case.
         val lotCount = (node["lot_count"] as? Number)?.toInt()?.takeIf { it > 0 } ?: 1
-        val parallelismCap = OperationLookup.parallelismCap(pid, lid, data).coerceAtLeast(1)
-        val waveCount = kotlin.math.ceil(lotCount.toDouble() / parallelismCap.toDouble()).toInt()
+        val rawCap = OperationLookup.parallelismCap(pid, lid, data)
+        val parallelismCap = if (rawCap > 0) rawCap else Int.MAX_VALUE
+        val waveCount = kotlin.math.ceil(lotCount.toDouble() / parallelismCap.toDouble()).toInt().coerceAtLeast(1)
         val leadTime = perLotLead * waveCount
         val startTime = parseDateLocal(node["start_time"]?.toString())
         val endTime = parseDateLocal(node["end_time"]?.toString())
@@ -1203,7 +1203,7 @@ private class WalkContext(
                 violations.add(Violation(
                     rule = "R5_lead_time",
                     nodePath = path,
-                    message = "Make WO duration (end - start = $duration days) shorter than expected $leadTime days (= $perLotLead per-lot × $waveCount wave(s) at cap $parallelismCap).",
+                    message = "Make WO duration (end - start = $duration days) shorter than expected $leadTime days (= $perLotLead per-lot × $waveCount wave(s) at cap ${if (parallelismCap == Int.MAX_VALUE) "∞" else parallelismCap}).",
                     expected = leadTime,
                     actual = duration.toDouble(),
                 ))
