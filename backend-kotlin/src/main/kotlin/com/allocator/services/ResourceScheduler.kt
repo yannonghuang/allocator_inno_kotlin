@@ -88,11 +88,26 @@ object ResourceScheduler {
             val productId = (first["product_id"] as? String)?.trim() ?: continue
             val locationId = (first["location_id"] as? String)?.trim() ?: continue
 
-            val cap = OperationLookup.parallelismCap(productId, locationId, data)
-            if (cap < 1) continue  // override inapplicable → nothing to arbitrate
-
             val borRows = borRowsFor(productId, locationId, data)
             if (borRows.isEmpty()) continue
+
+            // Compute cap from the BOR rows directly, matching ResourceUtilization.kt:
+            // resources missing at this location or with zero rate are unconstrained
+            // (don't limit parallelism — don't skip the WO on their account).
+            // OperationLookup.parallelismCap returns 0 if ANY resource fails the lookup,
+            // causing the whole WO to be skipped and leaving its slots un-reserved in the
+            // shared calendar, which lets other WOs book the same days → real overload.
+            var minCap = Int.MAX_VALUE
+            for (br in borRows) {
+                val rid = (br["resource_id"] as? String)?.trim() ?: continue
+                val bRate = (br["resource_rate"] as? Number)?.toDouble()?.takeIf { it > 0.0 } ?: continue
+                val sz = sizeByResLoc[rid to locationId] ?: continue
+                if (sz <= 0.0) continue
+                val c = Math.floor(sz / bRate).toInt()
+                if (c > 0 && c < minCap) minCap = c
+            }
+            if (minCap == Int.MAX_VALUE) continue  // all resources unconstrained — nothing to arbitrate
+            val cap = minCap
 
             // Each consolidated WO arrives as exactly ONE row in mutableLots; lots.size==1.
             // The actual concurrent-lot count comes from the "lot_count" field; the stored
