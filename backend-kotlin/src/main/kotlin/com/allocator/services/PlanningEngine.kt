@@ -2841,18 +2841,18 @@ private fun buildWorkOrders(
     // Concurrency cap: how many lots may share a wave (same start/end) at this
     // location. Subsequent waves start at the previous wave's end, so the cap
     // controls how far the lot series marches forward in time.
-    //   • make     → resource-limited: parallelismCap lots per wave, the rest
-    //                cascade forward one lead-time per wave (capacity is real).
-    //   • purchase → no modeled cadence (cycle_days_supply is 0 across the data),
-    //                so all POs are placeable at once. A single wave keeps every
-    //                lot at (due − lead); without this a large consolidated
-    //                quantity split by max_lot_size marches decades into the
-    //                future (one lead-time per lot). [cycle_days_supply > 0 spacing
-    //                is a future enhancement.]
-    //   • move     → no modeled transport-capacity limit, so likewise concurrent.
-    val cap = if (methodType == "make")
-        OperationLookup.parallelismCap(productId, productionLocation, data).coerceAtLeast(1)
-    else Int.MAX_VALUE
+    //   • make/BOR present → resource-limited: parallelismCap lots per wave.
+    //   • make/no BOR data → parallelismCap returns 0, meaning no resource
+    //                constraint is modelled (e.g. subcon). Treat as unconstrained
+    //                parallel (Int.MAX_VALUE) so lots don't stack sequentially —
+    //                same rationale as purchase/move below.
+    //   • purchase → no modelled cadence, so all POs are placeable at once.
+    //                A single wave keeps every lot at (due − lead); without this
+    //                a large consolidated qty split by max_lot_size marches
+    //                decades into the future (one lead-time per lot).
+    //   • move     → no modelled transport-capacity limit, likewise concurrent.
+    val rawCap = if (methodType == "make") OperationLookup.parallelismCap(productId, productionLocation, data) else Int.MAX_VALUE
+    val cap = if (rawCap > 0) rawCap else Int.MAX_VALUE
 
     val wos = mutableListOf<Map<String, Any?>>()
     var left = qty
@@ -3292,7 +3292,8 @@ internal fun crossWaveCalendarMerge(
                 val methodRow = getMethods(pid, lid, data).firstOrNull { it["type"] == method }
                 val lotSize   = (maxLotSize(pid, lid, data)?.takeIf { it > 0 } ?: totalQty).coerceAtLeast(1e-9)
                 val lotCount  = Math.ceil(totalQty / lotSize).toInt().coerceAtLeast(1)
-                val cap       = if (method == "make") OperationLookup.parallelismCap(pid, lid, data).coerceAtLeast(1) else Int.MAX_VALUE
+                val rawCap    = if (method == "make") OperationLookup.parallelismCap(pid, lid, data) else Int.MAX_VALUE
+                val cap       = if (rawCap > 0) rawCap else Int.MAX_VALUE
                 val numWaves  = Math.ceil(lotCount.toDouble() / cap.toDouble()).toInt().coerceAtLeast(1)
                 val perWave   = methodRow?.let { leadDaysForMethod(it, pid, lid, totalQty, data) }
                     ?: rows.mapNotNull { r ->
@@ -3774,7 +3775,8 @@ internal fun consolidateByWaves(
             } else {
                 val lotSize = (maxLotSize(first.pid, first.lid, data)?.takeIf { it > 0 } ?: totalQty).coerceAtLeast(1e-9)
                 val lotCount = Math.ceil(totalQty / lotSize).toInt().coerceAtLeast(1)
-                val cap = if (first.method == "make") OperationLookup.parallelismCap(first.pid, first.lid, data).coerceAtLeast(1) else Int.MAX_VALUE
+                val rawCap = if (first.method == "make") OperationLookup.parallelismCap(first.pid, first.lid, data) else Int.MAX_VALUE
+                val cap = if (rawCap > 0) rawCap else Int.MAX_VALUE
                 val numWaves = Math.ceil(lotCount.toDouble() / cap.toDouble()).toInt().coerceAtLeast(1)
                 val perWaveLead = mRow?.let { leadDaysForMethod(it, first.pid, first.lid, totalQty, data) }
                     ?: gids.mapNotNull { gidInfo.getValue(it).nativeDuration }.maxOrNull() ?: 0.0
@@ -4016,12 +4018,11 @@ private fun buildWoNode(
     put("lot_count", if (lotCount > 0) lotCount else null)
     put("max_lot_size", lotSizeVal)
 
-    // Wave structure for make WOs under the operation override. cap >= 1 means
-    // the WO compresses its lots into ceil(lot_count / cap) sequential waves;
-    // outside the override cap=1 and wave_count == lot_count (today's behavior).
-    val cap = if (methodType == "make" && data != null)
-        OperationLookup.parallelismCap(productId, productionLocation, data).coerceAtLeast(1)
-    else 1
+    // Wave structure for make WOs. cap > 0 (BOR present) → resource-limited;
+    // cap == 0 (no BOR data, e.g. subcon) → unconstrained parallel (wave_count=1),
+    // consistent with buildWorkOrders which also treats cap=0 as Int.MAX_VALUE.
+    val rawCapNode = if (methodType == "make" && data != null) OperationLookup.parallelismCap(productId, productionLocation, data) else 0
+    val cap = if (rawCapNode > 0) rawCapNode else Int.MAX_VALUE
     if (cap > 1) put("parallelism_cap", cap)
     if (lotCount > 0) {
         val waveCount = kotlin.math.ceil(lotCount.toDouble() / cap.toDouble()).toInt()
