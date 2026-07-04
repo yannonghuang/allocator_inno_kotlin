@@ -4,7 +4,7 @@ export type Case = { id: number; name: string; created_at: string; demand_count?
 export type AllocationRun = { id: number; case_id: number; created_at: string; status: string; config?: Record<string, unknown> };
 export type AllocationAction = { id: number; run_id: number; variant_key: string; req_component_ids: string[]; qty: number; demand_id?: string; target_product_id?: string; target_location_id?: string };
 export type FeasibleDemand = { demand_id: string; customer_id?: string | null; customer?: string | null; product_id: string; requested_qty: number; allocated_qty: number; fulfillment_rate?: number | null; status: string; suggested_revision?: string; request_due_time?: string | null; revised_time?: string | null };
-export type SupplyViewRow = { id?: number; component_key: string; supply_id: string; supply_date?: string | null; product_id: string; location_id: string; initial_qty: number; consumed_qty: number; residual_qty: number; utilization_rate?: number | null; pegged_demands?: number; total_pegged_qty?: number; override?: { allocations: { demand_id: string; qty: number }[]; warning: boolean } | null };
+export type SupplyViewRow = { id?: number; component_key: string; supply_id: string; supply_date?: string | null; product_id: string; location_id: string; initial_qty: number; consumed_qty: number; residual_qty: number; utilization_rate?: number | null; pegged_demands?: number; total_pegged_qty?: number };
 export type AllocationViewCandidate = {
   to_inventory_id: string;
   to_inventory_display: string;
@@ -50,7 +50,6 @@ export type AllocationViewRow = {
   /** Step index after this row (sometimes provided by backend). */
   after_step?: number | null;
 };
-export type ManualOverride = { id: number; case_id: number; entity_type: string; entity_key: string; payload: Record<string, unknown> };
 
 export async function listCases(): Promise<Case[]> {
   const r = await fetch(`${API}/cases`);
@@ -219,10 +218,6 @@ export type WorkOrder = {
     allocated_qty: number;
     priority: number;
   }> | null;
-  /** True if a user override (method_selection) was applied for this WO. */
-  override_active?: boolean;
-  /** True if a user override (component_split) was applied during consolidation for this WO. */
-  consolidation_override_active?: boolean;
   /** Stable canonical id assigned during planning regen — same id across all lots emitted from the same planMethodSlot decision. Used as the selector for WO schedule-impact analysis. */
   wo_group_id?: string | null;
   /** Within an OR-merged wo_group_id, distinguishes alternatives (0, 1, …). null/undefined for non-OR (single-alt) WOs. */
@@ -800,45 +795,12 @@ export async function listActivePlanJobs(caseId: number): Promise<ActivePlanJob[
   return (body?.jobs ?? []) as ActivePlanJob[];
 }
 
-export async function listOverrides(caseId: number): Promise<ManualOverride[]> {
-  const r = await fetch(`${API}/cases/${caseId}/overrides`);
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
-}
-
-export async function addOverride(caseId: number, entityType: string, entityKey: string, payload: Record<string, unknown>): Promise<ManualOverride> {
-  const r = await fetch(`${API}/cases/${caseId}/overrides`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ entity_type: entityType, entity_key: entityKey, payload }) });
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
-}
-
-export async function deleteOverride(caseId: number, overrideId: number): Promise<void> {
-  const r = await fetch(`${API}/cases/${caseId}/overrides/${overrideId}`, { method: 'DELETE' });
-  if (!r.ok) throw new Error(await r.text());
-}
-
-/** Upsert override by (entityType, entityKey) — creates or updates in a single call. */
-export async function upsertOverride(caseId: number, entityType: string, entityKey: string, payload: Record<string, unknown>): Promise<ManualOverride> {
-  const r = await fetch(`${API}/cases/${caseId}/overrides/upsert`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ entity_type: entityType, entity_key: entityKey, payload }) });
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
-}
-
-/** Update an existing override by id. */
-export async function updateOverride(caseId: number, overrideId: number, data: { entity_type: string; entity_key: string; payload: Record<string, unknown> }): Promise<ManualOverride> {
-  const r = await fetch(`${API}/cases/${caseId}/overrides/${overrideId}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
-}
-
 export type PlanRun = {
   id: number;
   case_id: number;
   job_id: string | null;
   status: 'running' | 'success' | 'failed' | 'contingent';
   config: Record<string, unknown> | null;
-  override_count: number;
-  override_snapshot_preview: ManualOverride[] | null;
   name: string | null;
   notes: string | null;
   is_initial?: boolean;
@@ -898,7 +860,6 @@ export type PlanRunEvent = {
 };
 
 export type PlanRunFull = PlanRun & {
-  override_snapshot: ManualOverride[] | null;
   result: PlanResult | null;
   error: string | null;
   events?: PlanRunEvent[];
@@ -1261,15 +1222,6 @@ export type SupplySplitInfo = {
   policySource?: 'wo' | 'config';
 };
 
-/** Per-demand allocation entry inside a supply_split override. */
-export type SupplyOverrideAllocation = { demand_id: string; qty: number };
-
-/** Supply-split override view: active manual allocations + soft-warn flag from last plan run. */
-export type SupplyOverrideInfo = {
-  allocations: SupplyOverrideAllocation[];
-  warning: boolean;
-};
-
 /** Enriched supply row for the Plan Supply View table (supply metadata + pegging aggregates). */
 export type PlanSupplyViewRow = CaseSupplyRow & {
   consumedQty: number;
@@ -1291,7 +1243,6 @@ export type PlanSupplyViewRow = CaseSupplyRow & {
    * absent from this map consumed via the main-loop (direct walk, no consolidation).
    */
   demandPath: Record<string, string>;
-  override?: SupplyOverrideInfo | null;
 };
 
 /** Fetch all supply records for a case (flat table scan, no run context needed). */

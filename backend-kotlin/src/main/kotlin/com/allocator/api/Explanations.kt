@@ -193,17 +193,7 @@ fun Routing.explanationRoutes() {
                 demandListRaw.map { mapOf("request_due_time" to it["request_due_time"]) }
             )
 
-            val overrides = data["overrides"] ?: emptyList()
-            val demandAdj = mutableMapOf<String, Double>()
-            for (o in overrides) {
-                if ((o["entity_type"] as? String) != "demand") continue
-                val payloadStr = o["payload"] as? String ?: continue
-                val payload = try { jEx.parseToJsonElement(payloadStr).jsonObject } catch (_: Exception) { continue }
-                if (!payload.containsKey("quantity")) continue
-                var key = (o["entity_key"] as? String) ?: ""
-                if (!key.startsWith("demand|")) key = "demand|$key"
-                demandAdj[key] = payload["quantity"]!!.jsonPrimitive.double
-            }
+            val demandAdj = emptyMap<String, Double>()
 
             // unmet per (variant, customer)
             data class VCKey(val pid: String, val loc: String, val cust: String)
@@ -285,22 +275,12 @@ fun Routing.explanationRoutes() {
                 "Split of component = (target_weight / total_target_weight) × available."
 
             // Simulate available and collect steps
-            val supplyAdj = mutableMapOf<String, Double>()
-            for (o in overrides) {
-                if ((o["entity_type"] as? String) != "supply") continue
-                val payloadStr = o["payload"] as? String ?: continue
-                val payload = try { jEx.parseToJsonElement(payloadStr).jsonObject } catch (_: Exception) { continue }
-                if (!payload.containsKey("quantity")) continue
-                val key = (o["entity_key"] as? String) ?: ""
-                supplyAdj[key] = payload["quantity"]!!.jsonPrimitive.double
-            }
-
             val (available, actions, totalAvailable, availableDuringRun, steps) = transaction {
                 val supplies = Supplies.selectAll().where { Supplies.caseId eq caseId }.toList()
                 val avail = mutableMapOf<String, Double>()
                 for (s in supplies) {
                     val k = "${s[Supplies.productId]}|${s[Supplies.locationId] ?: ""}"
-                    avail[k] = (avail[k] ?: 0.0) + s[Supplies.qty] + (supplyAdj[k] ?: 0.0)
+                    avail[k] = (avail[k] ?: 0.0) + s[Supplies.qty]
                 }
                 val acts = AllocationActions.selectAll().where { AllocationActions.runId eq runId }.toList()
                 val sortedActs = acts.sortedWith(compareBy(
@@ -309,7 +289,7 @@ fun Routing.explanationRoutes() {
                 ))
                 val totalAvail = supplies.filter { s ->
                     "${s[Supplies.productId]}|${s[Supplies.locationId] ?: ""}" == componentKey
-                }.sumOf { s -> s[Supplies.qty] + (supplyAdj["${s[Supplies.productId]}|${s[Supplies.locationId] ?: ""}"] ?: 0.0) }
+                }.sumOf { s -> s[Supplies.qty] }
 
                 val availDuringRun = totalAvail + sortedActs.sumOf { a ->
                     if (a[AllocationActions.variantKey] == componentKey) a[AllocationActions.qty] else 0.0

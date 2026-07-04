@@ -263,23 +263,6 @@
     "info": "需求到供应计划：接收客户需求，输出已承诺需求（含 commit_time）和计划生产订单。使用",
     "infoConfigureLink": "配置计划（副驾驶）",
     "infoSuffix": "来设置方法选择方式（按偏好级联或精细评分）、采购以及工单批量窗口。",
-    "overridesPanel": {
-      "title": "用户手工覆盖",
-      "info": "覆盖允许您手动控制：方法选择（制造/调拨/采购）或需求竞争时的组件拆分配置。活跃的覆盖将在下次计划运行时应用。",
-      "noOverrides": "未设置覆盖。请在结果表中点击生产订单的「手工覆盖」按钮创建。",
-      "columns": {
-        "type": "类型",
-        "entityKey": "实体键",
-        "payload": "载荷"
-      },
-      "addManually": "手动添加覆盖（JSON）",
-      "entityKeyPlaceholder": "实体键（例如 PROD|LOC 或 PROD|LOC|DEMAND）",
-      "payloadPlaceholder": "载荷 JSON（例如 {\"method\":\"make\"}）",
-      "errors": {
-        "failedAdd": "添加覆盖失败",
-        "failedDelete": "删除失败"
-      }
-    },
     "config": {
       "groupMethodSelection": "计划配置",
       "subheadMethod": "方法",
@@ -553,7 +536,6 @@
       "filterPurchaseOnly": "仅采购订单（方法 = 采购）",
       "filterMakeOnly": "仅生产订单（方法 = 制造）",
       "filterMoveOnly": "仅调拨订单（方法 = 调拨）",
-      "filterHasOverride": "仅显示有手工覆盖的生产订单",
       "filterPeggedOnly": "仅相关订单",
       "filterPeggedOnlyTooltip": "仅显示选中的生产订单及其上下游相关订单",
       "filterPlaceholder": "按产品、地点、方法筛选…",
@@ -578,8 +560,7 @@
         "shortage": "缺口",
         "locationSource": "地点来源",
         "pegging": "详情",
-        "explain": "解释",
-        "override": "覆盖"
+        "explain": "解释"
       },
       "moveManifest": {
         "demand": "需求",
@@ -603,8 +584,6 @@
         "splitTooltip": "数据列和排程并列显示",
         "timelineTooltip": "隐藏数据列；排程占满全宽"
       },
-      "overrideMethod": "方法",
-      "overrideSplit": "拆分",
       "nComponents": "{n} 个组件",
       "consolidatedOnly": "仅合并工单",
       "tabConsolidated": "合并",
@@ -765,12 +744,10 @@
     "woExplain": {
       "title": "生产订单说明",
       "methodSelection": "方法选择",
-      "override": "手工覆盖",
       "demandCompetition": "需求竞争（BOM 图）",
       "oneDemand": "只有一个需求产品需要此组件 — 无竞争。",
       "multipleDemands": "个需求产品在 BOM 图中需要此组件：",
       "consolidationSplit": "合并拆分",
-      "overrideSplit": "手工覆盖拆分",
       "consolidatedFor": "此生产订单已为",
       "demandsTotal": "个需求合并（总计划：",
       "splitMode": "拆分模式：",
@@ -797,8 +774,6 @@
       "customerLabel": "客户",
       "qtyLabel": "数量",
       "splitFair": "公平",
-      "policySourceOverridePre": "拆分来自此组上的手动",
-      "policySourceOverridePost": "覆盖，而非默认策略。",
       "policySourceConfigPre": "策略继承自规划配置中的",
       "policySourceConfigMid": "。使用",
       "policySourceConfigSuffix": "为此组设置每个需求的数量。"
@@ -853,13 +828,7 @@
       "splitPolicySourceConfigPost": "。",
       "splitPerDemandHeading": "本组中每个需求的分配（决定份额%）：",
       "splitColAllocated": "分配数量",
-      "splitColWeight": "权重",
-      "overrideHeading": "手动覆盖",
-      "overrideEdit": "编辑",
-      "overrideSummarySuffix": "个手动分配生效",
-      "overrideWarn": "警告：拆分与规划器不一致",
-      "overrideColDemand": "需求",
-      "overrideColQty": "数量"
+      "splitColWeight": "权重"
     },
     "peggingPanel": {
       "title": "计划追溯：",
@@ -974,7 +943,6 @@
       "empty": "未找到已持久化的计划运行。使用异步模式运行计划以持久化结果。",
       "runLabel": "运行 #{id}",
       "jobSuffix": " · 任务 {job}…",
-      "overrideCount": "{n} 条覆盖",
       "elapsedTitle": "耗时（开始 → 完成）",
       "namePlaceholder": "名称（可选）",
       "notesPlaceholder": "备注（可选）",
@@ -998,17 +966,11 @@
       },
       "tabs": {
         "config": "配置",
-        "overrides": "覆盖",
-        "overridesWithCount": "覆盖 ({count})",
         "events": "事件"
       },
       "details": {
         "noConfig": "未记录配置。",
-        "noOverrides": "此运行启动时没有活动的覆盖。",
-        "noEvents": "未记录事件。",
-        "overrideHeaderType": "类型",
-        "overrideHeaderKey": "键",
-        "overrideHeaderPayload": "数据"
+        "noEvents": "未记录事件。"
       },
       "events": {
         "created": "已创建",
@@ -1087,6 +1049,7 @@
       "filterUnusedOnly": "仅未使用",
       "filterPartialOnly": "已消耗",
       "filterHideDummy": "隐藏虚拟供应",
+      "filterCriticalOnly": "仅关键物料",
       "loading": "加载供应数据…",
       "showing": "显示 {shown} / {total} 条供应。",
       "overallUtilization": "整体利用率：{pct}%（{consumed} / {initial}）",

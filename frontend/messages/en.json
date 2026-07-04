@@ -263,23 +263,6 @@
     "info": "Demand-to-supply planning: takes customer demands and outputs committed demands (with commit_time) and planned work orders. Use",
     "infoConfigureLink": "Configure planning (copilot)",
     "infoSuffix": "to set how methods are chosen (preference cascade or scored elaborate), purchase, and WO batch window.",
-    "overridesPanel": {
-      "title": "User overrides",
-      "info": "Overrides let you manually control: method selection (make/move/buy) or component split allocation among competing demands. Active overrides are applied on the next plan run.",
-      "noOverrides": "No overrides set. Use the \"Override\" button on a work order in the results table to create one.",
-      "columns": {
-        "type": "Type",
-        "entityKey": "Entity key",
-        "payload": "Payload"
-      },
-      "addManually": "Add override manually (JSON)",
-      "entityKeyPlaceholder": "entity_key (e.g. PROD|LOC or PROD|LOC|DEMAND)",
-      "payloadPlaceholder": "payload JSON (e.g. {\"method\":\"make\"})",
-      "errors": {
-        "failedAdd": "Failed to add override",
-        "failedDelete": "Failed to delete"
-      }
-    },
     "config": {
       "groupMethodSelection": "Configurations",
       "subheadMethod": "Method",
@@ -553,7 +536,6 @@
       "filterPurchaseOnly": "Purchase orders only (method = buy/purchase)",
       "filterMakeOnly": "Make orders only (method = make)",
       "filterMoveOnly": "Move orders only (method = move)",
-      "filterHasOverride": "Only work orders with a saved override",
       "filterPeggedOnly": "Pegged only",
       "filterPeggedOnlyTooltip": "Show only the selected work order and its upstream/downstream pegged work orders",
       "filterPlaceholder": "Filter by product, location, method…",
@@ -578,8 +560,7 @@
         "shortage": "Shortage",
         "locationSource": "Location source",
         "pegging": "Detail",
-        "explain": "Explain",
-        "override": "Override"
+        "explain": "Explain"
       },
       "moveManifest": {
         "demand": "Demand",
@@ -603,8 +584,6 @@
         "splitTooltip": "Show data columns and Schedule side-by-side",
         "timelineTooltip": "Hide data columns; show Schedule full width"
       },
-      "overrideMethod": "Method",
-      "overrideSplit": "Split",
       "nComponents": "{n} components",
       "consolidatedOnly": "Consolidated only",
       "tabConsolidated": "Consolidated",
@@ -765,12 +744,10 @@
     "woExplain": {
       "title": "Work order explanation",
       "methodSelection": "Method selection",
-      "override": "Override",
       "demandCompetition": "Demand competition (BOM graph)",
       "oneDemand": "Only one demand product requires this component — no competition.",
       "multipleDemands": "demand product(s) require this component per the BOM graph:",
       "consolidationSplit": "Consolidation split",
-      "overrideSplit": "Override split",
       "consolidatedFor": "This work order was consolidated for",
       "demandsTotal": "demands (total planned:",
       "splitMode": "Split mode:",
@@ -797,8 +774,6 @@
       "customerLabel": "customer",
       "qtyLabel": "qty",
       "splitFair": "Fair",
-      "policySourceOverridePre": "Split came from a manual",
-      "policySourceOverridePost": "override on this group, not the default policy.",
       "policySourceConfigPre": "Policy inherited from",
       "policySourceConfigMid": "in the planning configuration. Use",
       "policySourceConfigSuffix": "to set per-demand quantities for this group."
@@ -853,13 +828,7 @@
       "splitPolicySourceConfigPost": "in the planning configuration.",
       "splitPerDemandHeading": "Per-demand allocation in this group (drives the share %):",
       "splitColAllocated": "Allocated qty",
-      "splitColWeight": "Weight",
-      "overrideHeading": "Manual override",
-      "overrideEdit": "Edit",
-      "overrideSummarySuffix": "manual allocation(s) active",
-      "overrideWarn": "warning: split disagrees with planner",
-      "overrideColDemand": "Demand",
-      "overrideColQty": "Qty"
+      "splitColWeight": "Weight"
     },
     "peggingPanel": {
       "title": "Pegging:",
@@ -974,7 +943,6 @@
       "empty": "No persisted plan runs found. Run a plan with async mode to persist results.",
       "runLabel": "Run #{id}",
       "jobSuffix": " · job {job}…",
-      "overrideCount": "{n, plural, one {# override} other {# overrides}}",
       "elapsedTitle": "Elapsed time (run start → finish)",
       "namePlaceholder": "Name (optional)",
       "notesPlaceholder": "Notes (optional)",
@@ -998,17 +966,11 @@
       },
       "tabs": {
         "config": "Config",
-        "overrides": "Overrides",
-        "overridesWithCount": "Overrides ({count})",
         "events": "Events"
       },
       "details": {
         "noConfig": "No config recorded.",
-        "noOverrides": "No overrides were active when this run started.",
-        "noEvents": "No events recorded.",
-        "overrideHeaderType": "type",
-        "overrideHeaderKey": "key",
-        "overrideHeaderPayload": "payload"
+        "noEvents": "No events recorded."
       },
       "events": {
         "created": "Created",
@@ -1087,6 +1049,7 @@
       "filterUnusedOnly": "Unused only",
       "filterPartialOnly": "Consumed (any)",
       "filterHideDummy": "Hide dummy",
+      "filterCriticalOnly": "Critical material only",
       "loading": "Loading supplies…",
       "showing": "Showing {shown} of {total} supplies.",
       "overallUtilization": "Overall utilization: {pct}% ({consumed} / {initial})",

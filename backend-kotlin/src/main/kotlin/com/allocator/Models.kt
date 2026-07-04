@@ -62,22 +62,6 @@ data class AllocationActionResponse(
 )
 
 @Serializable
-data class ManualOverrideCreate(
-    @SerialName("entity_type") val entityType: String,
-    @SerialName("entity_key") val entityKey: String,
-    val payload: JsonElement,
-)
-
-@Serializable
-data class ManualOverrideResponse(
-    val id: Int,
-    @SerialName("case_id") val caseId: Int,
-    @SerialName("entity_type") val entityType: String,
-    @SerialName("entity_key") val entityKey: String,
-    val payload: JsonElement,
-)
-
-@Serializable
 data class FeasibleDemandSummary(
     val demandId: String,
     val productId: String,
@@ -99,8 +83,6 @@ data class PlanRunResponse(
     @SerialName("job_id") val jobId: String? = null,
     val status: String,
     val config: JsonElement? = null,
-    @SerialName("override_count") val overrideCount: Int = 0,
-    @SerialName("override_snapshot_preview") val overrideSnapshotPreview: JsonElement? = null,
     val name: String? = null,
     val notes: String? = null,
     @SerialName("is_initial") val isInitial: Boolean = false,
@@ -174,7 +156,6 @@ data class PlanRunFullResponse(
     @SerialName("job_id") val jobId: String? = null,
     val status: String,
     val config: JsonElement? = null,
-    @SerialName("override_snapshot") val overrideSnapshot: JsonElement? = null,
     val result: JsonElement? = null,
     val error: String? = null,
     val name: String? = null,

@@ -113,9 +113,6 @@ fun synthesizeConsolidatedWOs(
             put("consolidation_split_mode", mode)
             put("consolidation_total_planned", roundQty(totalQty))
             put("consolidation_split_details", splitDetails)
-            // Drop demand-specific override marker; consolidated WOs have their
-            // own override semantics (handled by the supply-split override path).
-            put("override_active", false)
         }
         result.add(consolidated)
     }

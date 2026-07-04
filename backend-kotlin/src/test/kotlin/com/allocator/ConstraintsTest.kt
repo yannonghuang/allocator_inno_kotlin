@@ -90,13 +90,6 @@ class ConstraintsTest : FunSpec({
         (wos.any { it["product_id"] == "P" && it["method"] == "make" }) shouldBe true   // demand still made
     }
 
-    test("precedence: saved per-WO variant override beats a constraint") {
-        val overrideIndex = mapOf("variant_selection|P|L|D" to mapOf<String, Any?>("alt_group" to "A1"))
-        val (_, wos, _) = plan(demandC("X"), inv(), data, requestTimeDt = null,
-            config = cfg(listOf(rule("X", "C2"))), overrideIndex = overrideIndex)
-        purchasedChildren(wos) shouldBe setOf("C1")                 // override (A1 ⇒ C1) wins over constraint (C2)
-    }
-
     // ── Multi-method alternatives (distinct bom_id per child — the common real shape) ──
     // P has two MAKE METHODS (different bom_ids), B1→C1 (preferred) and B2→C2; the planner
     // normally picks B1 by preference. A constraint must force the method that yields C2.

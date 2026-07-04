@@ -5,7 +5,6 @@ import com.allocator.Boms
 import com.allocator.Cases
 import com.allocator.config
 import com.allocator.Demands
-import com.allocator.ManualOverrides
 import com.allocator.MethodBuys
 import com.allocator.MethodMakes
 import com.allocator.MethodMoves
@@ -1400,7 +1399,7 @@ internal val TOOLS: List<LlmTool> = listOf(
         "Return the planning config and override snapshot that produced a specific plan run. " +
             "Use this BEFORE comparing two runs' KPIs — to confirm they share the same config (so " +
             "any KPI delta is attributable to a single load-bearing knob, not a confound). Returns " +
-            "{config, override_snapshot}.",
+            "{config}.",
         buildJsonObject {
             put("type", "object")
             putJsonObject("properties") {
@@ -3331,21 +3330,6 @@ private fun toolGetLeafCompetition(caseId: Int, args: JsonObject, locale: String
     val periodDays = consolidationConfig["period_days"]?.jsonPrimitive?.intOrNull ?: 30
     val consolidationEnabled = consolidationConfig["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
 
-    // Manual overrides on supplies at this (pid, lid) — surfaces when a
-    // component_split override has zeroed a demand's share at a specific
-    // supply_id under this leaf.
-    val activeOverrides: List<Pair<String, JsonObject>> = transaction {
-        ManualOverrides.selectAll()
-            .where { (ManualOverrides.caseId eq caseId) and (ManualOverrides.entityType eq "supply") }
-            .mapNotNull { row ->
-                val key = row[ManualOverrides.entityKey]
-                val payload = runCatching {
-                    jsonParser.parseToJsonElement(row[ManualOverrides.payload]).jsonObject
-                }.getOrNull() ?: return@mapNotNull null
-                key to payload
-            }
-    }
-
     // Classify each candidate: drawer (full / partial), zero-share (with
     // presumed reason), or walk_skipped (false positive of BOM containment).
     val drawerPriorities = candidates
@@ -3390,19 +3374,6 @@ private fun toolGetLeafCompetition(caseId: Int, args: JsonObject, locale: String
         if (!consolidationEnabled) {
             return "zero_share" to "consolidation disabled — share elimination didn't happen at this leaf; check upstream methods"
         }
-        // Manual override check: any active override on a supply at this
-        // (pid, lid) that names this demand_id explicitly with qty=0?
-        val overrideHit = activeOverrides.any { (_, payload) ->
-            val allocs = payload["allocations"] as? JsonArray ?: return@any false
-            allocs.any { el ->
-                val obj = el as? JsonObject ?: return@any false
-                val did = obj["demand_id"]?.jsonPrimitive?.contentOrNull
-                val qty = obj["qty"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
-                did == d.demandId && (qty ?: 0.0) <= 1e-9
-            }
-        }
-        if (overrideHit) return "override_blocked" to "manual_override component_split set qty=0 for this demand at this supply"
-
         if (allocationMode == "priority_first" && drawerMinPriority != null && d.priority != null && d.priority > drawerMinPriority) {
             return "priority_filtered" to "policy=priority_first; this demand's priority ${d.priority} > top drawers' priority $drawerMinPriority"
         }
@@ -4241,18 +4212,15 @@ private fun toolTraceDemandToSupply(caseId: Int, args: JsonObject, locale: Strin
 private fun toolGetRunConfig(caseId: Int, args: JsonObject, locale: String): ToolResult {
     val runId = args["run_id"]?.jsonPrimitive?.intOrNull
         ?: return toolError("`run_id` is required", locale)
-    val (config, override) = transaction {
+    val config = transaction {
         val row = PlanRuns.selectAll()
             .where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }
             .singleOrNull() ?: return@transaction null
-        Pair(row[PlanRuns.config], row[PlanRuns.overrideSnapshot])
+        row[PlanRuns.config]
     } ?: return toolError("plan run $runId not found for case $caseId", locale)
-    val configJson: JsonElement = config?.let { raw ->
+    val configJson: JsonElement = config.let { raw ->
         runCatching { jsonParser.parseToJsonElement(raw) }.getOrElse { JsonPrimitive(raw) }
-    } ?: JsonObject(emptyMap())
-    val overrideJson: JsonElement = override?.let { raw ->
-        runCatching { jsonParser.parseToJsonElement(raw) }.getOrElse { JsonPrimitive(raw) }
-    } ?: JsonObject(emptyMap())
+    }
     val configKeys = (configJson as? JsonObject)?.keys?.joinToString(", ").orEmpty()
     val keysDisplay = configKeys.ifBlank { loc("no top-level keys", "无顶层键", locale) }
     return ToolResult(
@@ -4264,7 +4232,6 @@ private fun toolGetRunConfig(caseId: Int, args: JsonObject, locale: String): Too
         payload = buildJsonObject {
             put("run_id", runId)
             put("config", configJson)
-            put("override_snapshot", overrideJson)
         },
     )
 }

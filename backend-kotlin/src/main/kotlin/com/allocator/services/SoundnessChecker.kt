@@ -164,10 +164,6 @@ data class SoundnessReport(
  *        that each demand's reported committed quantity matches its pegging
  *        tree's root.committed_qty. Pass an empty list to skip the consistency
  *        check.
- * @param overrideIndex the run's override index (built from the run's
- *        override_snapshot via [buildOverrideIndex]). Used by R9 to check that
- *        each WO honors the user's method_selection override. Pass an empty
- *        map to skip override conformance.
  */
 fun checkRunSoundness(
     planningPegging: List<Map<String, Any?>>,
@@ -177,9 +173,8 @@ fun checkRunSoundness(
     workOrders: List<Map<String, Any?>> = emptyList(),
     workOrdersNative: List<Map<String, Any?>> = emptyList(),
     committedDemands: List<Map<String, Any?>> = emptyList(),
-    overrideIndex: Map<String, Map<String, Any?>> = emptyMap(),
     /**
-     * R7e: inventory snapshot taken AFTER supply-split overrides, BEFORE planning.
+     * R7e: inventory snapshot taken BEFORE planning.
      * Pass [RunPlanningResult.inventoryEffectiveInitial]. Leave empty to skip the
      * conservation check (e.g. when verifying a DB-loaded historical run).
      */
@@ -366,7 +361,6 @@ fun checkRunSoundness(
             methodMoves = methodMoves,
             supplyById = supplyById,
             config = config,
-            overrideIndex = overrideIndex,
             data = data,
         )
         ctx.walkRoot(tree)
@@ -565,8 +559,6 @@ private class WalkContext(
     val methodMoves: List<Map<String, Any?>>,
     val supplyById: Map<String, Map<String, Any?>>,
     val config: SoundnessConfig,
-    /** Override index keyed by "$entityType|$entityKey" — see buildOverrideIndex. */
-    val overrideIndex: Map<String, Map<String, Any?>>,
     /** Full dataset — needed by R5_lead_time to consult OperationLookup
      *  (productlocation + operation + bor + resource) instead of the static
      *  method_make.lead_time. */
@@ -914,32 +906,6 @@ private class WalkContext(
                     expected = 0.0,
                     actual = leafSum,
                 ))
-            }
-        }
-        // R9 — method-selection override conformance. If the user configured a
-        // method_selection override for this (pid, lid) — either demand-scoped
-        // or location-level — the WO's method must match. Mirrors plan()'s
-        // override lookup at PlanningEngine.kt:1146-1150 (demand-scoped key
-        // wins; falls back to location-level). Skipped when overrideIndex is
-        // empty (no overrides in the run).
-        if (overrideIndex.isNotEmpty() && method.isNotBlank()) {
-            val pid = (node["product_id"] as? String)?.trim() ?: ""
-            val lid = (node["location_id"] as? String)?.trim() ?: ""
-            if (pid.isNotBlank() && lid.isNotBlank()) {
-                val ovr = overrideIndex["method_selection|$pid|$lid|$demandId"]
-                    ?: overrideIndex["method_selection|$pid|$lid"]
-                if (ovr != null) {
-                    val forced = (ovr["method"] ?: ovr["method_type"])?.toString()?.trim()
-                    if (!forced.isNullOrBlank() && forced != method) {
-                        violations.add(Violation(
-                            rule = "R9_method_override_violated",
-                            nodePath = path,
-                            message = "WO at $pid@$lid uses method='$method' but a method_selection override forces '$forced'.",
-                            expected = forced,
-                            actual = method,
-                        ))
-                    }
-                }
             }
         }
         // Recurse into children regardless of method (purchase has no children).
@@ -1415,7 +1381,6 @@ internal fun checkRunSoundnessStreaming(
     workOrders: List<Map<String, Any?>> = emptyList(),
     workOrdersNative: List<Map<String, Any?>> = emptyList(),
     committedDemands: List<Map<String, Any?>> = emptyList(),
-    overrideIndex: Map<String, Map<String, Any?>> = emptyMap(),
     inventoryEffectiveInitial: List<Map<String, Any?>> = emptyList(),
     inventoryLeftover: List<Map<String, Any?>> = emptyList(),
     supplyAllocations: List<Map<String, Any?>> = emptyList(),
@@ -1518,7 +1483,6 @@ internal fun checkRunSoundnessStreaming(
             methodMoves = methodMoves,
             supplyById  = supplyById,
             config      = config,
-            overrideIndex = overrideIndex,
             data        = data,
         )
         ctx.walkRoot(tree)
