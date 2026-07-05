@@ -1367,7 +1367,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // Buyable raw materials for the selective-purchase whitelist dropdown + copilot /raw picker.
   const [purchasableOptions, setPurchasableOptions] = useState<PurchasableRawMaterial[]>([]);
   const [constraintOptions, setConstraintOptions] = useState<ConstraintOptions>({ customers: [], parents: [] });
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' }, purchase_allowed: false, purchasable_materials: [], constraints: [], analyze_criticality: false, check_soundness: true, enable_global_scheduling: true });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' }, purchase_allowed: false, purchasable_materials: [], constraints: [], analyze_criticality: false, check_soundness: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1524,7 +1524,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     purchase_allowed: false,
     analyze_criticality: false,
     check_soundness: true,
-    enable_global_scheduling: true,
   });
   /** Build a full PlanningConfig from baseline + a single axis-value override.
    *  Mirrors the Kotlin buildConfigForAxisValue. The axis names must match
@@ -4836,24 +4835,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   )}
                 </div>
               )}
-            </div>
-
-            {/* ── Scheduling ── */}
-            <div style={{ marginTop: '0.65rem', borderTop: '1px solid #27272a', paddingTop: '0.4rem' }}>
-              <div style={{ fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.3rem' }}>
-                {tP('config.subheadScheduling')}
-              </div>
-              <label
-                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}
-                title={tP('config.enableGlobalSchedulingTooltip')}
-              >
-                <input
-                  type="checkbox"
-                  checked={planningConfig.enable_global_scheduling !== false}
-                  onChange={(e) => setPlanningConfig((c) => ({ ...c, enable_global_scheduling: e.target.checked }))}
-                />
-                <span style={{ fontSize: '0.875rem' }}>{tP('config.enableGlobalScheduling')}</span>
-              </label>
             </div>
 
             {/* ── Constraints ── */}
@@ -8596,6 +8577,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   {soundnessReportOpen.report.sound_count} / {soundnessReportOpen.report.demand_count} demands sound
                   {soundnessReportOpen.report.deep_check && ' · deep check'}
                   {soundnessReportOpen.report.cross_demand_violations.length > 0 && ` · ${soundnessReportOpen.report.cross_demand_violations.length} cross-demand violation(s)`}
+                  {(soundnessReportOpen.report.resource_overload_violations?.length ?? 0) > 0 && ` · ${soundnessReportOpen.report.resource_overload_violations!.length} resource overload(s)`}
                 </p>
               </div>
               <button type="button" onClick={() => setSoundnessReportOpen(null)} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
@@ -8611,6 +8593,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       {(v.expected !== undefined || v.actual !== undefined) && (
                         <div style={{ color: '#a1a1aa', marginTop: 2, fontSize: '0.74rem' }}>
                           expected: {String(v.expected)} · actual: {String(v.actual)}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {(soundnessReportOpen.report.resource_overload_violations?.length ?? 0) > 0 && (
+                <div style={{ marginBottom: '1rem' }}>
+                  <h4 style={{ margin: '0 0 0.5rem', fontSize: '0.85rem', color: '#fca5a5' }}>Resource overload violations</h4>
+                  {soundnessReportOpen.report.resource_overload_violations!.map((v, i) => (
+                    <div key={i} style={{ background: '#2d1818', border: '1px solid #7f1d1d', borderRadius: 6, padding: '8px 10px', marginBottom: 6, fontSize: '0.8rem' }}>
+                      <div style={{ fontWeight: 600, color: '#fca5a5' }}>{v.rule} · <span style={{ color: '#a1a1aa', fontWeight: 400 }}>{v.node_path}</span></div>
+                      <div style={{ color: '#e4e4e7', marginTop: 2 }}>{v.message}</div>
+                      {(v.expected !== undefined || v.actual !== undefined) && (
+                        <div style={{ color: '#a1a1aa', marginTop: 2, fontSize: '0.74rem' }}>
+                          capacity: {String(v.expected)} · peak: {String(v.actual)}
                         </div>
                       )}
                     </div>

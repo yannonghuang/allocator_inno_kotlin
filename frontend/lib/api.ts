@@ -438,15 +438,6 @@ export type PlanningConfig = {
   analyze_criticality?: boolean;
   /** When true, automatically run the soundness check (always deep) after each successful plan. Default: true. */
   check_soundness?: boolean;
-  /**
-   * Cross-WO arbitration on shared resource calendars. Default true. When
-   * false, each WO's parallelism is capped only by its own operation + BOR
-   * and concurrent WOs at the same location can stack rates past pool size.
-   * When true (default), the planner runs a post-pass that walks WOs in
-   * (priority desc, due-date asc, original-start asc) order and pushes
-   * starts later when shared resources are already reserved.
-   */
-  enable_global_scheduling?: boolean;
 };
 
 export type PlanSupplyAllocation = {
@@ -489,8 +480,7 @@ export type PlanResult = {
    *  panel can read fill_rate_pct etc. when a pending plan completes. */
   plan_kpis?: PlanKpis;
   /** Number of WO groups whose start was pushed by ResourceScheduler.arbitrate
-   *  to wait for contended resources. Zero unless enable_global_scheduling
-   *  is on AND at least one WO was actually shifted. */
+   *  to wait for contended resources. Zero when nothing was contended. */
   resource_contention_pushed_wos?: number;
 };
 
@@ -850,6 +840,8 @@ export type SoundnessReport = {
     violations: SoundnessViolation[];
   }>;
   cross_demand_violations: SoundnessViolation[];
+  wo_gid_orphan_violations?: SoundnessViolation[];
+  resource_overload_violations?: SoundnessViolation[];
 };
 
 export type PlanRunEvent = {

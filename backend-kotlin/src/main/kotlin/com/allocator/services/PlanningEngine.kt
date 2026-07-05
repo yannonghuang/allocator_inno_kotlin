@@ -4740,12 +4740,8 @@ fun runPlanning(
 
     // Phase-1 cross-WO arbitration, now over the CONSOLIDATED (post-merge) lots so capacity is
     // checked against the real production-lot count instead of an inflated per-demand count that
-    // gets collapsed afterward. Opt-in via planning config flag — the feature shifts WO start
-    // times when shared resources are contended, so existing baselines and KB snapshots stay
-    // unchanged until the user explicitly enables it.
-    // Default ON — flipped from the opt-in default after Phase A validation.
-    // Explicit false (saved configs from before the flip) still disables it.
-    val enableGlobalScheduling = config?.get("enable_global_scheduling") != false
+    // gets collapsed afterward. The scheduling pass is always on — the config toggle has been
+    // removed. The `run {}` block is kept to avoid reindenting the body.
     var resourceContentionPushed = 0
     // consolidateByWaves builds its rows via buildMap{}, which is sealed read-only after
     // construction (it still satisfies `is MutableMap` structurally, so an `as?` cast would
@@ -4754,7 +4750,7 @@ fun runPlanning(
         it.toMutableMap()
     }
     var adjustedTrees = waveResult.peggingTrees
-    if (enableGlobalScheduling) {
+    run {
         val priorityMap = (data["demand"] ?: emptyList()).mapNotNull { d ->
             val id = (d["demand_id"] as? String)?.trim() ?: return@mapNotNull null
             val pri = (d["priority"] as? Number)?.toInt() ?: 0
