@@ -94,8 +94,10 @@ import {
   type BootstrapPreview,
   type BootstrapJobStatus,
   type BootstrapCriterion,
+  getResourceUtilization,
+  type ResourceUtilization,
 } from '@/lib/api';
-import { computeHorizon, ScheduleBar, ScheduleHorizonRuler, methodColor } from './_workOrderSchedule';
+import { computeHorizon, ScheduleBar, ScheduleHorizonRuler, methodColor, BorMiniTimeline, BorTimelineRuler } from './_workOrderSchedule';
 import { WoScheduleImpactPanel, WoScheduleQuickModal } from './_woScheduleImpact';
 import type { PlanResult } from '../../../lib/api';
 
@@ -1346,6 +1348,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planWoPivotExpanded, setPlanWoPivotExpanded] = useState<Set<string>>(new Set());
   const [planWoPivotSubExpanded, setPlanWoPivotSubExpanded] = useState<Set<string>>(new Set());
   const [woExpandedKeys, setWoExpandedKeys] = useState<Set<string>>(new Set());
+  const [resourceUtilCache, setResourceUtilCache] = useState<Map<number, ResourceUtilization>>(new Map());
+  const resourceUtilFetchingRef = useRef(false);
   const [woExplainOpen, setWoExplainOpen] = useState(false);
   const [woExplainRow, setWoExplainRow] = useState<WorkOrder | null>(null);
   const [woExplainKey, setWoExplainKey] = useState<string | null>(null);
@@ -3440,6 +3444,34 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
 
     return map;
   }, [planResult, planningConfig]);
+
+  /** Inverted index: wo_group_id → list of resources this WO consumes, with daily load arrays.
+   *  Built from cached resource-utilization data; empty map until the first BOR expand triggers fetch. */
+  const borByWogid = useMemo(() => {
+    type BorEntry = { resource_id: string; location_id: string; size: number; rate: number; buckets: string[]; load: number[] };
+    const empty = new Map<string, BorEntry[]>();
+    const runId = currentPlanRunId ?? freshPlanRunId;
+    if (!runId) return empty;
+    const util = resourceUtilCache.get(runId);
+    if (!util) return empty;
+    const map = new Map<string, BorEntry[]>();
+    for (const row of util.rows) {
+      for (const c of row.contributors ?? []) {
+        const wogid = c.wo_group_id;
+        if (!wogid) continue;
+        if (!map.has(wogid)) map.set(wogid, []);
+        map.get(wogid)!.push({
+          resource_id: row.resource_id,
+          location_id: row.location_id,
+          size: row.size,
+          rate: c.rate ?? 1,
+          buckets: util.buckets,
+          load: row.load,
+        });
+      }
+    }
+    return map;
+  }, [resourceUtilCache, currentPlanRunId, freshPlanRunId]);
 
   /**
    * Map (supplyId, demandId) → "<groupPid>@<groupLid>" describing the consolidation path
@@ -6597,22 +6629,32 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               return undefined;
                             }}
                             expandedKeys={woExpandedKeys}
-                            onToggleExpand={(key) => setWoExpandedKeys((prev) => {
-                              const next = new Set(prev);
-                              prev.has(key) ? next.delete(key) : next.add(key);
-                              return next;
-                            })}
+                            onToggleExpand={(key) => {
+                              setWoExpandedKeys((prev) => {
+                                const next = new Set(prev);
+                                prev.has(key) ? next.delete(key) : next.add(key);
+                                return next;
+                              });
+                              // Lazily fetch resource-utilization for BOR rows on first expand.
+                              const runId = currentPlanRunId ?? freshPlanRunId;
+                              if (runId && !resourceUtilCache.has(runId) && !resourceUtilFetchingRef.current) {
+                                resourceUtilFetchingRef.current = true;
+                                getResourceUtilization(Number(id), runId)
+                                  .then(data => setResourceUtilCache(prev => new Map(prev).set(runId, data)))
+                                  .catch(() => {})
+                                  .finally(() => { resourceUtilFetchingRef.current = false; });
+                              }
+                            }}
                             canExpandRow={(r) => {
-                              // Show the inline ▶ only when the row actually has supplies to show.
-                              // Cross-demand consolidated orders (demand_id=null) have no per-WO
-                              // supplies map entry — their breakdown is the pegging drill-down — so
-                              // their toggle would open empty; hide it.
-                              const woKey = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
-                              const consolidatedWoKey = `|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
-                              const sup = woSuppliesMap.get(woKey) ?? woSuppliesMap.get(consolidatedWoKey) ?? [];
-                              const isMake = sup.length > 0 && sup[0].type === 'demand';
-                              const direct = isMake ? (woCrossEntrySupplyMap.get(`${r.demand_id ?? ''}|${r.product_id ?? ''}`) ?? []) : [];
-                              if (sup.length === 0 && direct.length === 0) return false;
+                              // Make WOs always get the expand toggle (BOR section).
+                              // Non-make WOs only get it when they have supply rows.
+                              const isMakeWo = r.method?.toLowerCase() === 'make';
+                              if (!isMakeWo) {
+                                const woKey = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
+                                const consolidatedWoKey = `|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
+                                const sup = woSuppliesMap.get(woKey) ?? woSuppliesMap.get(consolidatedWoKey) ?? [];
+                                if (sup.length === 0) return false;
+                              }
                               // When a WO is highlighted, component WOs are already visible as
                               // top-level rows. The ▶ expand would duplicate them inline —
                               // suppress it so the list is the single source of truth.
@@ -6630,11 +6672,66 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               const directSupplies = isMakeExpand
                                 ? (woCrossEntrySupplyMap.get(`${r.demand_id ?? ''}|${r.product_id ?? ''}`) ?? [])
                                 : [];
-                              if (woSupplies.length === 0 && directSupplies.length === 0) return null;
+                              const isMakeWo = r.method?.toLowerCase() === 'make';
+                              const wogid = r.wo_group_id ?? r.consolidated_group_id ?? '';
+                              const borResources = wogid ? borByWogid.get(wogid) : undefined;
+                              const runId = currentPlanRunId ?? freshPlanRunId;
+                              const borLoading = isMakeWo && runId && !resourceUtilCache.has(runId);
+                              if (woSupplies.length === 0 && directSupplies.length === 0 && !isMakeWo) return null;
                               const supplyRowStyle: React.CSSProperties = { borderTop: '1px solid #3f3f46' };
                               const cellP: React.CSSProperties = { paddingRight: '1.25rem', paddingTop: '0.15rem', paddingBottom: '0.15rem' };
                               return (
                                 <div style={{ padding: '0.3rem 1.75rem 0.5rem', background: 'rgba(59,130,246,0.04)', borderTop: '1px dashed #3f3f46' }}>
+                                  {/* BOR (Bill of Resources) section — make WOs only */}
+                                  {isMakeWo && (
+                                    <div style={{ marginBottom: woSupplies.length > 0 || directSupplies.length > 0 ? '0.6rem' : 0 }}>
+                                      <div style={{ fontSize: '0.7rem', color: '#a78bfa', marginBottom: '0.2rem', fontWeight: 500 }}>
+                                        Resources (BOR)
+                                      </div>
+                                      {borLoading ? (
+                                        <div style={{ fontSize: '0.72rem', color: '#71717a', paddingTop: '0.1rem' }}>Loading…</div>
+                                      ) : borResources && borResources.length > 0 ? (
+                                        <table style={{ fontSize: '0.78rem', borderCollapse: 'collapse', width: '100%' }}>
+                                          <thead>
+                                            <tr style={{ color: '#71717a' }}>
+                                              <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1rem', paddingBottom: '0.15rem' }}>Resource</th>
+                                              <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1rem' }}>Location</th>
+                                              <th style={{ textAlign: 'right', fontWeight: 400, paddingRight: '1rem' }}>Rate</th>
+                                              <th style={{ textAlign: 'right', fontWeight: 400, paddingRight: '1rem' }}>Capacity</th>
+                                              <th style={{ textAlign: 'left', fontWeight: 400, minWidth: 120, verticalAlign: 'bottom', paddingBottom: '0.15rem' }}>
+                                                <BorTimelineRuler
+                                                  buckets={borResources[0].buckets}
+                                                  woStart={r.start_time}
+                                                  woEnd={r.end_time}
+                                                />
+                                              </th>
+                                            </tr>
+                                          </thead>
+                                          <tbody>
+                                            {borResources.map((res, ri) => (
+                                              <tr key={ri} style={{ borderTop: '1px solid #3f3f46' }}>
+                                                <td style={{ paddingRight: '1rem', paddingTop: '0.15rem', paddingBottom: '0.15rem', fontFamily: 'monospace', fontSize: '0.72rem' }}>{res.resource_id}</td>
+                                                <td style={{ paddingRight: '1rem', color: '#a3a3a3' }}>{res.location_id}</td>
+                                                <td style={{ textAlign: 'right', paddingRight: '1rem', color: '#d4d4d8' }}>{res.rate}</td>
+                                                <td style={{ textAlign: 'right', paddingRight: '1rem', color: '#d4d4d8' }}>{res.size}</td>
+                                                <td style={{ minWidth: 100, paddingTop: '0.1rem', paddingBottom: '0.1rem' }}>
+                                                  <BorMiniTimeline
+                                                    buckets={res.buckets}
+                                                    load={res.load}
+                                                    size={res.size}
+                                                    woStart={r.start_time}
+                                                    woEnd={r.end_time}
+                                                  />
+                                                </td>
+                                              </tr>
+                                            ))}
+                                          </tbody>
+                                        </table>
+                                      ) : (
+                                        <div style={{ fontSize: '0.72rem', color: '#52525b' }}>No resource data</div>
+                                      )}
+                                    </div>
+                                  )}
                                   {/* Direct supply section (make WOs only): inventory pre-fulfillment */}
                                   {directSupplies.length > 0 && (
                                     <div style={{ marginBottom: woSupplies.length > 0 ? '0.5rem' : 0 }}>
