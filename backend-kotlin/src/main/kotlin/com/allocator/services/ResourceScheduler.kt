@@ -79,29 +79,17 @@ object ResourceScheduler {
 
         val orderedGroups = groups.entries.sortedBy { keyFor(it.value) }
 
-        val debugGids = setOf("wog1345815", "wog1346512", "wog1346458")
-        for (dgid in debugGids) {
-            if (dgid !in groups) log.info("TRACE {} absent from groups (wo_group_id not set or blank in mutableLots)", dgid)
-        }
-
         var pushedCount = 0
-        for ((gid, lots) in orderedGroups) {
-            val isDebug = gid in debugGids
+        for ((_, lots) in orderedGroups) {
             val first = lots.firstOrNull() ?: continue
             val methodType = (first["method"] as? String)?.lowercase() ?: ""
-            if (methodType != "make") {
-                if (isDebug) log.info("TRACE {} skip: not make (method={})", gid, methodType)
-                continue
-            }
+            if (methodType != "make") continue
 
             val productId = (first["product_id"] as? String)?.trim() ?: continue
             val locationId = (first["location_id"] as? String)?.trim() ?: continue
 
             val borRows = borRowsFor(productId, locationId, data)
-            if (borRows.isEmpty()) {
-                if (isDebug) log.info("TRACE {} skip: borRows empty pid={} lid={}", gid, productId, locationId)
-                continue
-            }
+            if (borRows.isEmpty()) continue
 
             // Compute cap from the BOR rows directly, matching ResourceUtilization.kt:
             // resources missing at this location or with zero rate are unconstrained
@@ -116,13 +104,9 @@ object ResourceScheduler {
                 val sz = sizeByResLoc[rid to locationId] ?: continue
                 if (sz <= 0.0) continue
                 val c = Math.floor(sz / bRate).toInt()
-                if (isDebug) log.info("TRACE {} borRow: rid={} rate={} sz={} c={}", gid, rid, bRate, sz, c)
                 if (c > 0 && c < minCap) minCap = c
             }
-            if (minCap == Int.MAX_VALUE) {
-                if (isDebug) log.info("TRACE {} skip: all BOR resources unconstrained at lid={}", gid, locationId)
-                continue
-            }
+            if (minCap == Int.MAX_VALUE) continue
             val cap = minCap
 
             // Each consolidated WO arrives as exactly ONE row in mutableLots; lots.size==1.
@@ -133,10 +117,7 @@ object ResourceScheduler {
             val sampleStart = parseDay(sample["start_time"]) ?: continue
             val sampleEnd = parseDay(sample["end_time"]) ?: continue
             val totalSpan = (sampleEnd.toEpochDay() - sampleStart.toEpochDay()).coerceAtLeast(0L)
-            if (totalSpan <= 0L) {
-                if (isDebug) log.info("TRACE {} skip: zero-duration start={} end={}", gid, sampleStart, sampleEnd)
-                continue
-            }
+            if (totalSpan <= 0L) continue
 
             val originalGroupStart = lots.minOf { parseDay(it["start_time"])?.toEpochDay() ?: Long.MAX_VALUE }
             val origStartDt = LocalDate.ofEpochDay(originalGroupStart)
@@ -145,11 +126,6 @@ object ResourceScheduler {
                            else (first["lot_count"] as? Number)?.toInt()?.coerceAtLeast(1) ?: 1
             val waveCount = kotlin.math.ceil(lotCount.toDouble() / cap.toDouble()).toInt().coerceAtLeast(1)
             val perWaveDays = if (waveCount > 1) totalSpan / waveCount else totalSpan
-
-            if (isDebug) log.info(
-                "TRACE {}: pid={} lid={} cap={} lotCount={} waveCount={} totalSpan={} perWaveDays={} origStart={}",
-                gid, productId, locationId, cap, lotCount, waveCount, totalSpan, perWaveDays, origStartDt
-            )
 
             val newStart = findEarliestFit(
                 origStartDt = origStartDt,
@@ -161,8 +137,6 @@ object ResourceScheduler {
                 sizeByResLoc = sizeByResLoc,
                 calendars = calendars,
             )
-
-            if (isDebug) log.info("TRACE {} newStart={} shiftDays={}", gid, newStart, newStart.toEpochDay() - originalGroupStart)
 
             // Reserve the WO's slots on each BOR resource. Last wave may have
             // fewer than cap lots; fitsAt was pessimistic on this (it checked
@@ -180,7 +154,6 @@ object ResourceScheduler {
                     val slots = lotsThisWave * rate
                     val size = sizeByResLoc[rid to locationId] ?: continue
                     val cal = calendars.getOrPut(rid to locationId) { ResourceCalendar(size) }
-                    if (isDebug) log.info("TRACE {} reserve wave={} start={} end={} rid={} slots={}", gid, waveIdx, waveStart, waveEnd, rid, slots)
                     cal.reserve(waveStart, waveEnd, slots)
                 }
             }

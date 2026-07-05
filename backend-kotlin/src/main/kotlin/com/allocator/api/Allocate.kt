@@ -1734,6 +1734,15 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
                 put("actual", anyToJson(v.actual))
             }
         }
+        putJsonArray("resource_overload_violations") {
+            for (v in report.resourceOverloadViolations) addJsonObject {
+                put("rule", v.rule)
+                put("node_path", v.nodePath)
+                put("message", v.message)
+                put("expected", anyToJson(v.expected))
+                put("actual", anyToJson(v.actual))
+            }
+        }
     }
     transaction {
         PlanRuns.update({ (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }) {
@@ -3015,11 +3024,6 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
                 }
             }
         }
-        // Cross-WO arbitration flag — persist so replan + post-run reload
-        // restore the user's checkbox state. Default ON after Phase A
-        // validation; explicit false (older saved configs / opt-outs) still
-        // disables the post-pass.
-        put("enable_global_scheduling", c["enable_global_scheduling"] as? Boolean ?: true)
         putJsonObject("method_selection") {
             put("mode",      methodCfg.mode)
             put("depth",     methodCfg.depth)

@@ -55,6 +55,11 @@ import kotlin.math.abs
  *      start_time must have been consumed. Leftover timely inventory while WOs
  *      run indicates the planner created unnecessary production. Gates overallSound.
  *      Skipped when inventoryLeftover snapshots are not provided.
+ *   R12 resource overload — no (resource_id, location_id) pair is loaded beyond
+ *      its declared size on any day. Daily load = Σ over concurrent make WOs of
+ *      min(lot_count, parallelCap) × resource_rate, where parallelCap comes from
+ *      the operation's BOR (floor(size/rate)). Gates overallSound.
+ *      Skipped when work_orders is not provided.
  *
  * The checker is a pure function — it neither mutates inputs nor consults the
  * database. Callers feed it the persisted plan-run state plus the case data.
@@ -146,6 +151,13 @@ data class SoundnessReport(
      * ResourceScheduler shifts the underlying real WOs. Empty when work_orders was not passed.
      */
     val woGidOrphanViolations: List<Violation> = emptyList(),
+    /**
+     * R12 resource-overload violations: one entry per (resource_id, location_id) pair whose
+     * daily concurrent load exceeds its declared size on at least one day. Daily load uses
+     * min(lot_count, parallelCap) × rate, matching ResourceScheduler's arbitration model.
+     * Empty when work_orders was not passed (cannot compute load without WO data).
+     */
+    val resourceOverloadViolations: List<Violation> = emptyList(),
 )
 
 /**
@@ -521,17 +533,23 @@ fun checkRunSoundness(
         if (workOrders.isNotEmpty()) verifyWoGidOrphans(planningPegging, workOrders, workOrdersNative)
         else emptyList()
 
+    // R12: resource overload — only when work_orders is available.
+    val resourceOverloadViolations: List<Violation> =
+        if (workOrders.isNotEmpty()) verifyResourceOverload(workOrders, data)
+        else emptyList()
+
     val soundCount = demandReports.count { it.sound }
     // R7f (component conservation) and R7g (WO conservation) are efficiency signals:
     // they fire at max_iterations=1 by design (budget leakage is expected and reclaimed
     // naturally at higher iter counts). They do NOT gate overallSound so that sound plans
     // can still be promoted to KB even when single-pass allocation leaves some slack.
-    // R10/R11 gate overallSound: scheduling errors are planning bugs.
+    // R10/R11/R12 gate overallSound: scheduling errors are planning bugs.
     val overallSound = soundCount == demandReports.size &&
         crossViolations.isEmpty() &&
         conservationViolations.isEmpty() &&
         inventoryPriorityViolations.isEmpty() &&
-        woGidOrphanViolations.isEmpty()
+        woGidOrphanViolations.isEmpty() &&
+        resourceOverloadViolations.isEmpty()
 
     return SoundnessReport(
         overallSound = overallSound,
@@ -545,6 +563,7 @@ fun checkRunSoundness(
         woConservationViolations = woConservationViolations,
         inventoryPriorityViolations = inventoryPriorityViolations,
         woGidOrphanViolations = woGidOrphanViolations,
+        resourceOverloadViolations = resourceOverloadViolations,
     )
 }
 
@@ -1345,6 +1364,110 @@ internal fun verifyWoGidOrphans(
     return violations
 }
 
+/**
+ * R12: resource overload check.
+ *
+ * For every make WO, compute the daily concurrent load on each BOR resource using
+ * min(lot_count, parallelCap) × rate — matching ResourceScheduler's arbitration
+ * model exactly. Any (resource_id, location_id) pair whose load exceeds its
+ * declared size on at least one day produces one violation.
+ *
+ * Only WOs whose entire BOR (all resources) is resolvable at the WO's location
+ * are included — same applicability gate as ResourceUtilization.kt and
+ * ResourceScheduler.arbitrate so the rule is consistent with what the scheduler
+ * actually controls.
+ */
+internal fun verifyResourceOverload(
+    workOrders: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+): List<Violation> {
+    val operations = data["operation"] ?: emptyList()
+    val bors = data["bor"] ?: emptyList()
+    val resources = data["resource"] ?: emptyList()
+    val productLocations = data["productlocation"] ?: emptyList()
+
+    val operationByProdArea = operations.associateBy { (it["prod_area"] as? String)?.trim() ?: "" }
+    val borsById = bors.groupBy { (it["bor_id"] as? String)?.trim() ?: "" }
+    val sizeByResLoc = resources.associate {
+        val rid = (it["resource_id"] as? String)?.trim() ?: ""
+        val lid = (it["location_id"] as? String)?.trim() ?: ""
+        (rid to lid) to ((it["size"] as? Number)?.toDouble() ?: 0.0)
+    }
+    val prodAreaByPidLid = productLocations.associate {
+        val pid = (it["product_id"] as? String)?.trim() ?: ""
+        val lid = (it["location_id"] as? String)?.trim() ?: ""
+        (pid to lid) to ((it["prod_area"] as? String)?.trim() ?: "")
+    }
+
+    // Daily load accumulator keyed by (resource_id, location_id).
+    val loadMap = mutableMapOf<Pair<String, String>, MutableMap<LocalDate, Double>>()
+
+    for (wo in workOrders) {
+        if ((wo["method"] as? String)?.lowercase() != "make") continue
+        val pid = (wo["product_id"] as? String)?.trim() ?: continue
+        val lid = (wo["location_id"] as? String)?.trim() ?: continue
+        val startDt = parseDateLocal(wo["start_time"] as? String) ?: continue
+        val endDt   = parseDateLocal(wo["end_time"]   as? String) ?: continue
+        if (!endDt.isAfter(startDt)) continue
+
+        val prodArea = prodAreaByPidLid[pid to lid]?.takeIf { it.isNotBlank() } ?: continue
+        val op = operationByProdArea[prodArea] ?: continue
+        val borId = (op["bor_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: continue
+        val borRows = borsById[borId] ?: continue
+        if (borRows.isEmpty()) continue
+        // Applicability gate: skip WOs where any BOR resource has no size entry at this location.
+        val allPresent = borRows.all { br ->
+            val rid = (br["resource_id"] as? String)?.trim() ?: return@all false
+            sizeByResLoc.containsKey(rid to lid)
+        }
+        if (!allPresent) continue
+
+        val rawLotCnt = (wo["lot_count"] as? Number)?.toInt()?.coerceAtLeast(1) ?: 1
+        val parallelCap = borRows.minOfOrNull { br ->
+            val rid   = (br["resource_id"]   as? String)?.trim() ?: return@minOfOrNull Int.MAX_VALUE
+            val bRate = (br["resource_rate"] as? Number)?.toDouble() ?: return@minOfOrNull Int.MAX_VALUE
+            val sz    = sizeByResLoc[rid to lid] ?: return@minOfOrNull Int.MAX_VALUE
+            if (bRate <= 0.0 || sz <= 0.0) Int.MAX_VALUE
+            else Math.floor(sz / bRate).toInt()
+        }?.coerceAtLeast(1) ?: Int.MAX_VALUE
+        val lotCnt = minOf(rawLotCnt, parallelCap)
+
+        for (br in borRows) {
+            val rid  = (br["resource_id"]   as? String)?.trim() ?: continue
+            val rate = (br["resource_rate"] as? Number)?.toDouble() ?: continue
+            val key  = rid to lid
+            val bucket = loadMap.getOrPut(key) { mutableMapOf() }
+            val dayLoad = rate * lotCnt
+            var d = startDt
+            while (d.isBefore(endDt)) {
+                bucket[d] = (bucket[d] ?: 0.0) + dayLoad
+                d = d.plusDays(1)
+            }
+        }
+    }
+
+    // Emit one violation per overloaded (resource, location); report worst day + overload count.
+    val violations = mutableListOf<Violation>()
+    for ((key, dayLoad) in loadMap) {
+        val (rid, lid) = key
+        val size = sizeByResLoc[key] ?: continue
+        if (size <= 0.0) continue
+        val overloaded = dayLoad.entries.filter { (_, v) -> v > size + 1e-9 }
+        if (overloaded.isEmpty()) continue
+        val (worstDay, worstLoad) = overloaded.maxByOrNull { (_, v) -> v }!!
+        violations.add(Violation(
+            rule     = "R12_resource_overload",
+            nodePath = "resource:$rid@$lid",
+            message  = "$rid at location $lid exceeds capacity on $worstDay: " +
+                       "load=${String.format("%.1f", worstLoad)} > size=${size.toInt()} " +
+                       "(${overloaded.size} day(s) overloaded).",
+            expected = size,
+            actual   = worstLoad,
+        ))
+    }
+    return violations.sortedByDescending { (it.actual as? Double ?: 0.0) - (it.expected as? Double ?: 0.0) }
+}
+
 private fun parseDateLocal(s: String?): LocalDate? {
     if (s.isNullOrBlank()) return null
     return try {
@@ -1588,12 +1711,18 @@ internal fun checkRunSoundnessStreaming(
         vs
     } else emptyList()
 
+    // R12: resource overload — only when work_orders is available.
+    val resourceOverloadViolations: List<Violation> =
+        if (workOrders.isNotEmpty()) verifyResourceOverload(workOrders, data)
+        else emptyList()
+
     val soundCount = demandReports.count { it.sound }
     val overallSound = soundCount == demandReports.size &&
         crossViolations.isEmpty() &&
         conservationViolations.isEmpty() &&
         inventoryPriorityViolations.isEmpty() &&
-        woGidOrphanViolations.isEmpty()
+        woGidOrphanViolations.isEmpty() &&
+        resourceOverloadViolations.isEmpty()
 
     return SoundnessReport(
         overallSound  = overallSound,
@@ -1607,5 +1736,6 @@ internal fun checkRunSoundnessStreaming(
         woConservationViolations        = emptyList(),  // not applicable for DB-loaded runs
         inventoryPriorityViolations     = inventoryPriorityViolations,
         woGidOrphanViolations           = woGidOrphanViolations,
+        resourceOverloadViolations      = resourceOverloadViolations,
     )
 }
