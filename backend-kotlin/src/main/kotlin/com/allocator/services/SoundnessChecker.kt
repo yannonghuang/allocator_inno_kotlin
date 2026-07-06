@@ -1425,18 +1425,27 @@ internal fun verifyResourceOverload(
             if (bRate <= 0.0 || sz <= 0.0) Int.MAX_VALUE
             else Math.floor(sz / bRate).toInt()
         }?.coerceAtLeast(1) ?: Int.MAX_VALUE
-        val lotCnt = minOf(rawLotCnt, parallelCap)
+        // Split into per-wave windows (every wave except the last runs `cap` concurrent
+        // lots; the last, often-partial wave runs fewer) instead of a single flat
+        // min(lot_count, cap) across the whole span — the flat model overstates load on
+        // the tail wave's days and can both under- and over-trigger this rule relative
+        // to what ResourceScheduler.arbitrate actually reserved.
+        val perWaveDaysHint = (wo["per_wave_days"] as? Number)?.toLong()
+        val waveWindows = OperationLookup.waveLotWindows(startDt, endDt, rawLotCnt, parallelCap, perWaveDaysHint)
+            .ifEmpty { listOf(Triple(startDt, endDt, minOf(rawLotCnt, parallelCap))) }
 
         for (br in borRows) {
             val rid  = (br["resource_id"]   as? String)?.trim() ?: continue
             val rate = (br["resource_rate"] as? Number)?.toDouble() ?: continue
             val key  = rid to lid
             val bucket = loadMap.getOrPut(key) { mutableMapOf() }
-            val dayLoad = rate * lotCnt
-            var d = startDt
-            while (d.isBefore(endDt)) {
-                bucket[d] = (bucket[d] ?: 0.0) + dayLoad
-                d = d.plusDays(1)
+            for ((waveStart, waveEnd, lotsThisWave) in waveWindows) {
+                val dayLoad = rate * lotsThisWave
+                var d = waveStart
+                while (d.isBefore(waveEnd)) {
+                    bucket[d] = (bucket[d] ?: 0.0) + dayLoad
+                    d = d.plusDays(1)
+                }
             }
         }
     }

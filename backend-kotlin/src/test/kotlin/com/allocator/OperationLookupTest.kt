@@ -267,4 +267,52 @@ class OperationLookupTest : FunSpec({
         result.source shouldBe "method_make"
         result.days shouldBe 5.0
     }
+
+    // ── waveLotWindows ────────────────────────────────────────────────────────
+
+    test("waveLotWindows splits a tail-partial wave into its own, lighter window") {
+        // 3 lots at cap=2 (e.g. 2110 units / max_lot_size ~1000 -> 3 lots; oe-machine2
+        // floor(5/2)=2 concurrent): wave 0 runs 2 lots for 3 days, wave 1 runs only
+        // the remaining 1 lot for the next 3 days — not 2 lots for both waves.
+        val start = java.time.LocalDate.parse("2024-10-25")
+        val end = java.time.LocalDate.parse("2024-10-31")
+        val windows = OperationLookup.waveLotWindows(start, end, lotCount = 3, cap = 2, perWaveDaysHint = 3L)
+        windows shouldBe listOf(
+            Triple(java.time.LocalDate.parse("2024-10-25"), java.time.LocalDate.parse("2024-10-28"), 2),
+            Triple(java.time.LocalDate.parse("2024-10-28"), java.time.LocalDate.parse("2024-10-31"), 1),
+        )
+    }
+
+    test("waveLotWindows: lots that divide evenly into cap produce uniform full-cap waves") {
+        // 4 lots at cap=2 -> 2 waves of exactly 2 lots each, no tail remainder.
+        val start = java.time.LocalDate.parse("2024-01-01")
+        val end = java.time.LocalDate.parse("2024-01-05")
+        val windows = OperationLookup.waveLotWindows(start, end, lotCount = 4, cap = 2, perWaveDaysHint = 2L)
+        windows.map { it.third } shouldBe listOf(2, 2)
+        windows.sumOf { it.third } shouldBe 4
+    }
+
+    test("waveLotWindows: unconstrained cap (Int.MAX_VALUE) collapses to a single full-span wave") {
+        val start = java.time.LocalDate.parse("2024-01-01")
+        val end = java.time.LocalDate.parse("2024-01-04")
+        val windows = OperationLookup.waveLotWindows(start, end, lotCount = 5, cap = Int.MAX_VALUE, perWaveDaysHint = null)
+        windows shouldBe listOf(Triple(start, end, 5))
+    }
+
+    test("waveLotWindows: falls back to splitting the observed span evenly when no per_wave_days hint") {
+        // No hint -> perWaveDays = totalSpanDays / waveCount = 6/2 = 3.
+        val start = java.time.LocalDate.parse("2024-01-01")
+        val end = java.time.LocalDate.parse("2024-01-07")
+        val windows = OperationLookup.waveLotWindows(start, end, lotCount = 3, cap = 2, perWaveDaysHint = null)
+        windows[0] shouldBe Triple(start, java.time.LocalDate.parse("2024-01-04"), 2)
+        // Last wave always ends exactly at the WO's real end_time, not start+perWaveDays.
+        windows[1] shouldBe Triple(java.time.LocalDate.parse("2024-01-04"), end, 1)
+    }
+
+    test("waveLotWindows returns empty for a degenerate span (end <= start) or non-positive inputs") {
+        val d = java.time.LocalDate.parse("2024-01-01")
+        OperationLookup.waveLotWindows(d, d, lotCount = 3, cap = 2, perWaveDaysHint = 1L) shouldBe emptyList()
+        OperationLookup.waveLotWindows(d, d.plusDays(1), lotCount = 0, cap = 2, perWaveDaysHint = 1L) shouldBe emptyList()
+        OperationLookup.waveLotWindows(d, d.plusDays(1), lotCount = 3, cap = 0, perWaveDaysHint = 1L) shouldBe emptyList()
+    }
 })

@@ -180,4 +180,47 @@ object OperationLookup {
         }
         return if (minCap == Int.MAX_VALUE) 0 else minCap
     }
+
+    /**
+     * Split a make WO's [start, end) span into per-wave sub-windows carrying each
+     * wave's TRUE concurrent-lot count — matching ResourceScheduler.arbitrate's
+     * actual reservation model exactly: every wave except the last runs `cap`
+     * concurrent lots; the last (often partial) wave runs
+     * `lotCount - (waveCount-1)*cap` lots, which is always <= cap.
+     *
+     * Callers that instead apply a single flat `min(lotCount, cap)` across the
+     * WHOLE span (as ResourceUtilization.kt and SoundnessChecker's R12 both used
+     * to) overstate load on the tail wave's days — e.g. 3 lots at cap=2 is 2
+     * waves (2 lots, then 1 lot), not "2 lots for both waves".
+     *
+     * `perWaveDaysHint` should be the WO row's persisted `per_wave_days` field
+     * when present (the authoritative single-wave calendar lead time, set by
+     * consolidateByWaves/crossWaveCalendarMerge and persisted by
+     * ResourceScheduler after its first arbitration pass) — falls back to
+     * splitting the observed span evenly across waveCount when absent (e.g.
+     * native, single-wave WOs that never went through consolidation).
+     */
+    fun waveLotWindows(
+        startDt: java.time.LocalDate,
+        endDt: java.time.LocalDate,
+        lotCount: Int,
+        cap: Int,
+        perWaveDaysHint: Long?,
+    ): List<Triple<java.time.LocalDate, java.time.LocalDate, Int>> {
+        if (cap <= 0 || lotCount <= 0 || !endDt.isAfter(startDt)) return emptyList()
+        val waveCount = kotlin.math.ceil(lotCount.toDouble() / cap.toDouble()).toInt().coerceAtLeast(1)
+        val totalSpanDays = endDt.toEpochDay() - startDt.toEpochDay()
+        val perWaveDays = (perWaveDaysHint?.takeIf { it > 0 } ?: (totalSpanDays / waveCount)).coerceAtLeast(1L)
+        val lotsInLastWave = lotCount - (waveCount - 1) * cap
+        val windows = mutableListOf<Triple<java.time.LocalDate, java.time.LocalDate, Int>>()
+        for (waveIdx in 0 until waveCount) {
+            val waveStart = startDt.plusDays(waveIdx * perWaveDays)
+            // Last wave ends exactly at endDt (not waveStart+perWaveDays) so integer-division
+            // remainders in the fallback branch don't leave a gap or overrun the WO's real span.
+            val waveEnd = if (waveIdx == waveCount - 1) endDt else waveStart.plusDays(perWaveDays)
+            val lotsThisWave = if (waveIdx == waveCount - 1) lotsInLastWave else cap
+            windows.add(Triple(waveStart, waveEnd, lotsThisWave))
+        }
+        return windows
+    }
 }
