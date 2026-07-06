@@ -157,7 +157,7 @@ export function ScheduleBar({
           const eClamped = Math.max(hStart, Math.min(hEnd, ed.getTime() + DAY_MS));
           const xPct = ((sClamped - hStart) / hSpan) * 100;
           const wPct = ((eClamped - sClamped) / hSpan) * 100;
-          const durationDays = Math.max(0, Math.round((ed.getTime() - sd.getTime()) / DAY_MS)) + 1;
+          const durationDays = Math.max(0, Math.round((ed.getTime() - sd.getTime()) / DAY_MS));
           const tooltip = `${formatDate(sd, locale)} → ${formatDate(ed, locale)} (${durationDays}d)`;
           return sd.getTime() === ed.getTime() ? (
             <line key={i} x1={`${xPct}%`} x2={`${xPct}%`} y1={0} y2={10}
@@ -315,17 +315,20 @@ export function BorTimelineRuler({
   const woStartMs = woS.getTime();
   const woEndMs = woE.getTime();
 
+  // end_time is exclusive (d..d+1 occupies exactly day d, matching the backend's
+  // ResourceScheduler/ResourceCalendar convention) — a bucket landing exactly on
+  // woEnd belongs to the NEXT WO's window, not this one.
   const filtered: string[] = [];
   for (const b of buckets) {
     const d = parseIso(b);
     if (!d) continue;
     const ms = d.getTime();
-    if (ms >= woStartMs && ms <= woEndMs) filtered.push(b);
+    if (ms >= woStartMs && ms < woEndMs) filtered.push(b);
   }
   if (filtered.length === 0) return null;
 
   const n = filtered.length;
-  const spanDays = Math.round((woEndMs - woStartMs) / DAY_MS) + 1;
+  const spanDays = Math.round((woEndMs - woStartMs) / DAY_MS);
 
   // Collect intermediate ticks based on span length.
   const ticks: { xPct: number; label: string }[] = [];
@@ -406,12 +409,13 @@ export function BorMiniTimeline({
   const woStartMs = woS.getTime();
   const woEndMs = woE.getTime();
 
+  // end_time is exclusive — see the matching comment in BorTimelineRuler above.
   const filtered: { loadVal: number; date: string }[] = [];
   for (let i = 0; i < buckets.length; i++) {
     const d = parseIso(buckets[i]);
     if (!d) continue;
     const ms = d.getTime();
-    if (ms >= woStartMs && ms <= woEndMs) {
+    if (ms >= woStartMs && ms < woEndMs) {
       filtered.push({ loadVal: load[i] ?? 0, date: buckets[i] });
     }
   }
