@@ -1196,24 +1196,19 @@ private class WalkContext(
         // so expected total duration = wave_count * per-lot. Fall back to the
         // method_make minimum (existing behavior) when the override doesn't
         // apply.
+        // R5: WO duration must be ≥ waveCount × lead_time (the calendar constraint).
+        // consolidateByWaves emits span = lead_time; ResourceScheduler extends to waveCount × lead_time.
+        // Checking against lead_time directly (not UPH-derived perLotLead) makes R5 a direct
+        // enforcement of the calendar contract.
         val staticLeadTime = matchingMakes
             .mapNotNull { (it["lead_time"] as? Number)?.toDouble() }
             .minOrNull()
             ?: 0.0
-        val woQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
-        val perLotLead = if (woQty > 0.0) {
-            OperationLookup.effectiveLeadDays(pid, lid, woQty, staticLeadTime, data).days
-        } else {
-            staticLeadTime
-        }
-        // Wave compression: total span = ceil(lot_count / cap) * per-lot.
-        // cap=0 (no BOR data, e.g. subcon) → unconstrained parallel → waveCount=1,
-        // consistent with how buildWorkOrders and consolidateByWaves treat this case.
         val lotCount = (node["lot_count"] as? Number)?.toInt()?.takeIf { it > 0 } ?: 1
         val rawCap = OperationLookup.parallelismCap(pid, lid, data)
         val parallelismCap = if (rawCap > 0) rawCap else Int.MAX_VALUE
         val waveCount = kotlin.math.ceil(lotCount.toDouble() / parallelismCap.toDouble()).toInt().coerceAtLeast(1)
-        val leadTime = perLotLead * waveCount
+        val leadTime = staticLeadTime * waveCount
         val startTime = parseDateLocal(node["start_time"]?.toString())
         val endTime = parseDateLocal(node["end_time"]?.toString())
         if (startTime != null && endTime != null) {
@@ -1222,7 +1217,7 @@ private class WalkContext(
                 violations.add(Violation(
                     rule = "R5_lead_time",
                     nodePath = path,
-                    message = "Make WO duration (end - start = $duration days) shorter than expected $leadTime days (= $perLotLead per-lot × $waveCount wave(s) at cap ${if (parallelismCap == Int.MAX_VALUE) "∞" else parallelismCap}).",
+                    message = "Make WO duration (end - start = $duration days) shorter than expected $leadTime days (= $staticLeadTime lead_time × $waveCount wave(s) at cap ${if (parallelismCap == Int.MAX_VALUE) "∞" else parallelismCap}).",
                     expected = leadTime,
                     actual = duration.toDouble(),
                 ))

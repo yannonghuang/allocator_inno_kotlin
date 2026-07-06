@@ -252,11 +252,14 @@ class Pass2WoConsolidationTest : FunSpec({
         res.consolidation.native.all { it["consolidated_group_id"] == cgid } shouldBe true
     }
 
-    test("lot_count and duration recompute together across a lot-size boundary") {
+    test("lot_count recomputes across a lot-size boundary; duration stays a single calendar wave") {
         // FG1@L: max_lot_size=100, lead_time=3d/wave, no operation/bor fixture so parallelismCap
-        // falls back to 0 → coerced to a cap of 1 lot per wave. Two 80-unit make WOs, each under
-        // the lot-size cap alone (1 lot, 3d), merge to 160 units → lot_count=ceil(160/100)=2,
-        // numWaves=ceil(2/1)=2, duration=2*3d=6d — neither value matches either constituent alone.
+        // falls back to 0 → treated as UNCONSTRAINED parallel (matching buildWorkOrders' documented
+        // fallback: no BOR data models no resource constraint, so lots don't stack sequentially).
+        // Two 80-unit make WOs merge to 160 units → lot_count=ceil(160/100)=2, but with cap=∞ both
+        // lots still fit in a single wave. consolidateByWaves emits span = calendar lead_time only
+        // (3d) — resource-capacity wave sequencing (waveCount × lead_time) is exclusively
+        // ResourceScheduler's job, run after consolidation, so it plays no part here.
         val fgData: Map<String, List<Map<String, Any?>>> = mapOf(
             "productlocation" to listOf(
                 mapOf("product_id" to "FG1", "location_id" to "L", "max_lot_size" to 100.0),
@@ -276,7 +279,7 @@ class Pass2WoConsolidationTest : FunSpec({
         qtyOf(c) shouldBe (160.0 plusOrMinus 1e-6)
         c["lot_count"] shouldBe 2
         c["start_time"] shouldBe "2024-05-01"
-        c["end_time"] shouldBe "2024-05-07"   // May01 + 2 waves * 3d
+        c["end_time"] shouldBe "2024-05-04"   // May01 + 1 wave * 3d lead_time
     }
 
     test("failed=true subtrees are excluded uniformly — AND (BOM) child and OR (alt-method) sibling") {

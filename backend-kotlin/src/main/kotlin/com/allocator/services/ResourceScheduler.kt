@@ -110,9 +110,13 @@ object ResourceScheduler {
             val cap = minCap
 
             // Each consolidated WO arrives as exactly ONE row in mutableLots; lots.size==1.
-            // The actual concurrent-lot count comes from the "lot_count" field; the stored
-            // start/end span covers ALL waves (numWaves × perWaveLead). Derive perWaveDays
-            // by dividing the total span by the recomputed wave count.
+            // The actual concurrent-lot count comes from the "lot_count" field. On the row's
+            // FIRST pass through this scheduler its span is a single wave's raw lead time
+            // (wave sequencing across a cap is this scheduler's job, matching SoundnessChecker's
+            // R5_lead_time = perLotLead × ceil(lot_count/cap)), so totalSpan == one wave. On any
+            // later pass the row's span has already been extended to cover all waves — the
+            // `per_wave_days` fallback below (persisted after the first pass) is what keeps
+            // perWaveDays correct instead of re-deriving it from that extended span.
             val sample = lots.minByOrNull { parseDay(it["start_time"])?.toEpochDay() ?: Long.MAX_VALUE } ?: continue
             val sampleStart = parseDay(sample["start_time"]) ?: continue
             val sampleEnd = parseDay(sample["end_time"]) ?: continue
@@ -125,7 +129,12 @@ object ResourceScheduler {
             val lotCount = if (lots.size > 1) lots.size
                            else (first["lot_count"] as? Number)?.toInt()?.coerceAtLeast(1) ?: 1
             val waveCount = kotlin.math.ceil(lotCount.toDouble() / cap.toDouble()).toInt().coerceAtLeast(1)
-            val perWaveDays = if (waveCount > 1) totalSpan / waveCount else totalSpan
+            // Prefer the stable per-wave lead time persisted by a prior pass (see the
+            // lots.size==1 branch below) over the row's current span. Pass 1 extends a
+            // consolidated row's end_time to waveCount × perWaveDays; without this, Pass 2
+            // would re-derive perWaveDays from that already-extended span and multiply by
+            // waveCount again, doubling the true duration.
+            val perWaveDays = (first["per_wave_days"] as? Number)?.toLong() ?: totalSpan
 
             val newStart = findEarliestFit(
                 origStartDt = origStartDt,
@@ -159,8 +168,18 @@ object ResourceScheduler {
             }
 
             val shiftDays = newStart.toEpochDay() - originalGroupStart
-            if (shiftDays > 0) {
-                pushedCount++
+            if (shiftDays > 0) pushedCount++
+
+            if (lots.size == 1) {
+                // Consolidated row: rewrite the single row's span to cover ALL waves
+                // serially (waveCount × perWaveDays) — consolidateByWaves only gave us
+                // one wave's worth, and unlike the shift-only path below this must
+                // happen even with zero contention (cap alone can force multiple waves).
+                val trueDurationDays = waveCount * perWaveDays
+                lots[0]["start_time"] = formatDay(newStart)
+                lots[0]["end_time"] = formatDay(newStart.plusDays(trueDurationDays))
+                lots[0]["per_wave_days"] = perWaveDays
+            } else if (shiftDays > 0) {
                 for (lot in lots) {
                     parseDay(lot["start_time"])?.let { lot["start_time"] = formatDay(it.plusDays(shiftDays)) }
                     parseDay(lot["end_time"])?.let { lot["end_time"] = formatDay(it.plusDays(shiftDays)) }

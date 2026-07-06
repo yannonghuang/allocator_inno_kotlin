@@ -2838,58 +2838,35 @@ private fun buildWorkOrders(
     val methodType = m["type"] as? String ?: ""
     val woGroupId = nextWoGroupId()
 
-    // Concurrency cap: how many lots may share a wave (same start/end) at this
-    // location. Subsequent waves start at the previous wave's end, so the cap
-    // controls how far the lot series marches forward in time.
-    //   • make/BOR present → resource-limited: parallelismCap lots per wave.
-    //   • make/no BOR data → parallelismCap returns 0, meaning no resource
-    //                constraint is modelled (e.g. subcon). Treat as unconstrained
-    //                parallel (Int.MAX_VALUE) so lots don't stack sequentially —
-    //                same rationale as purchase/move below.
-    //   • purchase → no modelled cadence, so all POs are placeable at once.
-    //                A single wave keeps every lot at (due − lead); without this
-    //                a large consolidated qty split by max_lot_size marches
-    //                decades into the future (one lead-time per lot).
-    //   • move     → no modelled transport-capacity limit, likewise concurrent.
-    val rawCap = if (methodType == "make") OperationLookup.parallelismCap(productId, productionLocation, data) else Int.MAX_VALUE
-    val cap = if (rawCap > 0) rawCap else Int.MAX_VALUE
+    // All lots share the same calendar window [startDt, startDt+leadDays] regardless of
+    // resource capacity. Resource-capacity wave sequencing (waveCount × lead_time) is
+    // ResourceScheduler's exclusive responsibility and runs after consolidation. The native
+    // pegging tree built from these lots therefore reflects only the calendar constraint,
+    // not resource-sequential boundaries.
+    val waveEnd = dateAddDays(startDt, leadDays)
 
     val wos = mutableListOf<Map<String, Any?>>()
     var left = qty
-    var waveStart: LocalDate? = startDt
-    var lastEnd: LocalDate? = null
     var lotCount = 0
-    var waveIndex = 0
-    while (left > 1e-9 && waveStart != null) {
-        val waveEnd = dateAddDays(waveStart, leadDays)
-        // Each wave runs up to `cap` lots in parallel — all share waveStart /
-        // waveEnd. Subsequent waves start at the previous wave's end (today's
-        // sequential lots become cap=1, identical to old behavior).
-        var lotsThisWave = 0
-        while (lotsThisWave < cap && left > 1e-9) {
-            val lotQty = min(lotSize, left)
-            wos.add(mapOf(
-                "product_id" to productId,
-                "location_id" to productionLocation,
-                "quantity" to roundQty(lotQty),
-                "start_time" to formatDate(waveStart),
-                "end_time" to formatDate(waveEnd),
-                "method" to methodType,
-                "location_source" to (if (methodType == "move") m["from_location_id"] else null),
-                "demand_id" to demandId,
-                "prod_area" to prodArea,
-                "wo_group_id" to woGroupId,
-                "wave_index" to waveIndex,
-            ))
-            left -= lotQty
-            lotsThisWave++
-            lotCount++
-        }
-        lastEnd = waveEnd
-        waveIndex++
-        waveStart = if (left > 1e-9) waveEnd else null
+    while (left > 1e-9) {
+        val lotQty = min(lotSize, left)
+        wos.add(mapOf(
+            "product_id" to productId,
+            "location_id" to productionLocation,
+            "quantity" to roundQty(lotQty),
+            "start_time" to formatDate(startDt),
+            "end_time" to formatDate(waveEnd),
+            "method" to methodType,
+            "location_source" to (if (methodType == "move") m["from_location_id"] else null),
+            "demand_id" to demandId,
+            "prod_area" to prodArea,
+            "wo_group_id" to woGroupId,
+            "wave_index" to 0,
+        ))
+        left -= lotQty
+        lotCount++
     }
-    return WorkOrderResult(wos, lotCount, lastEnd, lotSizeVal, woGroupId)
+    return WorkOrderResult(wos, lotCount, waveEnd, lotSizeVal, woGroupId)
 }
 
 /**
@@ -3290,19 +3267,14 @@ internal fun crossWaveCalendarMerge(
             }
             pid != null -> {
                 val methodRow = getMethods(pid, lid, data).firstOrNull { it["type"] == method }
-                val lotSize   = (maxLotSize(pid, lid, data)?.takeIf { it > 0 } ?: totalQty).coerceAtLeast(1e-9)
-                val lotCount  = Math.ceil(totalQty / lotSize).toInt().coerceAtLeast(1)
-                val rawCap    = if (method == "make") OperationLookup.parallelismCap(pid, lid, data) else Int.MAX_VALUE
-                val cap       = if (rawCap > 0) rawCap else Int.MAX_VALUE
-                val numWaves  = Math.ceil(lotCount.toDouble() / cap.toDouble()).toInt().coerceAtLeast(1)
-                val perWave   = methodRow?.let { leadDaysForMethod(it, pid, lid, totalQty, data) }
+                // Span = calendar lead_time only. Resource-capacity wave sequencing is
+                // ResourceScheduler's job, which runs after consolidation.
+                (methodRow?.get("lead_time") as? Number)?.toDouble()
                     ?: rows.mapNotNull { r ->
                         val s = parseDate(r["start_time"] as? String)
                         val e = parseDate(r["end_time"]   as? String)
-                        val wc = (r["wave_count"] as? Number)?.toInt()?.coerceAtLeast(1) ?: 1
-                        if (s != null && e != null) (e.toEpochDay() - s.toEpochDay()).toDouble() / wc else null
+                        if (s != null && e != null) (e.toEpochDay() - s.toEpochDay()).toDouble() else null
                     }.maxOrNull() ?: 0.0
-                numWaves * perWave
             }
             else -> 0.0
         }
@@ -3345,6 +3317,10 @@ internal fun crossWaveCalendarMerge(
             put("lot_count", lotCount)
             if (pid != null) maxLotSize(pid, lid, data)?.let { put("max_lot_size", it) }
             put("consolidated", true)
+            // Calendar lead_time for one wave — stored once so ResourceScheduler can use it
+            // as the stable per-wave floor across both arbitration passes (Pass 2 would
+            // otherwise read the already-extended totalSpan and double the duration).
+            put("per_wave_days", leadDays.toLong())
             put("wo_competing_demands", allDemands)
             put("consolidation_split_details", mergedSplit)
             put("consolidated_demand_ids", allDemands)
@@ -3775,14 +3751,13 @@ internal fun consolidateByWaves(
             } else {
                 val lotSize = (maxLotSize(first.pid, first.lid, data)?.takeIf { it > 0 } ?: totalQty).coerceAtLeast(1e-9)
                 val lotCount = Math.ceil(totalQty / lotSize).toInt().coerceAtLeast(1)
-                val rawCap = if (first.method == "make") OperationLookup.parallelismCap(first.pid, first.lid, data) else Int.MAX_VALUE
-                val cap = if (rawCap > 0) rawCap else Int.MAX_VALUE
-                val numWaves = Math.ceil(lotCount.toDouble() / cap.toDouble()).toInt().coerceAtLeast(1)
-                val perWaveLead = mRow?.let { leadDaysForMethod(it, first.pid, first.lid, totalQty, data) }
+                // Span = calendar lead_time only. Resource-capacity wave sequencing (waveCount × perWave)
+                // belongs exclusively to ResourceScheduler, which runs after consolidation.
+                val span = (mRow?.get("lead_time") as? Number)?.toDouble()
                     ?: gids.mapNotNull { gidInfo.getValue(it).nativeDuration }.maxOrNull() ?: 0.0
                 bucketLotCount = lotCount
-                bucketWaveCount = numWaves
-                numWaves * perWaveLead
+                // bucketWaveCount stays 1 — ResourceScheduler computes waveCount from lot_count and cap
+                span
             }
             val mergedEnd = dateAddDays(mergedStart, leadDays) ?: mergedStart
 
@@ -4807,29 +4782,31 @@ fun runPlanning(
         // ResourceScheduler again on those post-cascade positions to resolve the new
         // conflicts. A second cascade propagates any Pass-2 pushes upward.
         resourceContentionPushed = ResourceScheduler.arbitrate(mutableLots, data, priorityMap, dueMap)
-        if (resourceContentionPushed > 0) {
+        // Always cascade: ResourceScheduler extends end_time for multi-wave consolidated WOs even
+        // when no start is shifted (lots.size==1 branch fires unconditionally). Parent WOs must
+        // be re-sequenced to start after the extended child end_time regardless of push count.
+        cascadePush()
+        val pushed2 = ResourceScheduler.arbitrate(mutableLots, data, priorityMap, dueMap)
+        if (pushed2 > 0) {
+            resourceContentionPushed += pushed2
             cascadePush()
-            val pushed2 = ResourceScheduler.arbitrate(mutableLots, data, priorityMap, dueMap)
-            if (pushed2 > 0) {
-                resourceContentionPushed += pushed2
-                cascadePush()
-            }
-
-            // Update the pegging trees to reflect final WO timings after all passes.
-            val finalStartByCgid = mutableLots.mapNotNull { l ->
-                val cgid = l["consolidated_group_id"] as? String ?: return@mapNotNull null
-                val start = parseDate(l["start_time"] as? String) ?: return@mapNotNull null
-                cgid to start
-            }.toMap()
-            val finalEndByCgid = mutableLots.mapNotNull { l ->
-                val cgid = l["consolidated_group_id"] as? String ?: return@mapNotNull null
-                val end = parseDate(l["end_time"] as? String) ?: return@mapNotNull null
-                cgid to end
-            }.toMap()
-            val startByOriginalGid = gidToCgid.mapNotNull { (g, c) -> finalStartByCgid[c]?.let { g to it } }.toMap()
-            val endByOriginalGid = gidToCgid.mapNotNull { (g, c) -> finalEndByCgid[c]?.let { g to it } }.toMap()
-            adjustedTrees = rewritePeggingTimings(waveResult.peggingTrees, startByOriginalGid, endByOriginalGid)
         }
+        // Always sync pegging trees from final mutableLots. ResourceScheduler extends consolidated
+        // WO end_time to waveCount × perWaveDays even when no WO is pushed (the lots.size==1 branch
+        // in ResourceScheduler fires unconditionally), so the pegging tree must always be updated.
+        val finalStartByCgid = mutableLots.mapNotNull { l ->
+            val cgid = l["consolidated_group_id"] as? String ?: return@mapNotNull null
+            val start = parseDate(l["start_time"] as? String) ?: return@mapNotNull null
+            cgid to start
+        }.toMap()
+        val finalEndByCgid = mutableLots.mapNotNull { l ->
+            val cgid = l["consolidated_group_id"] as? String ?: return@mapNotNull null
+            val end = parseDate(l["end_time"] as? String) ?: return@mapNotNull null
+            cgid to end
+        }.toMap()
+        val startByOriginalGid = gidToCgid.mapNotNull { (g, c) -> finalStartByCgid[c]?.let { g to it } }.toMap()
+        val endByOriginalGid = gidToCgid.mapNotNull { (g, c) -> finalEndByCgid[c]?.let { g to it } }.toMap()
+        adjustedTrees = rewritePeggingTimings(waveResult.peggingTrees, startByOriginalGid, endByOriginalGid)
     }
     val adjustedConsolidated: List<Map<String, Any?>> = mutableLots
 
