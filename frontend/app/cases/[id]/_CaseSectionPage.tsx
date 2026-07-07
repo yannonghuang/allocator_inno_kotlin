@@ -777,9 +777,9 @@ function formatCommitReason(reason: string, purchaseAllowed: boolean): { label: 
 import { PeggingTree, pathKeyFromPath, type PeggingGraph } from '@/app/components/PeggingTree';
 import BomGraphTab from '@/app/components/BomGraphTab';
 import { ResourceUtilizationView } from '@/app/components/ResourceUtilizationView';
-import { PlanningPeggingTreeView } from '@/app/components/PlanningPeggingTreeView';
 import { ConsolidatedWoAccordion } from '@/app/components/ConsolidatedWoAccordion';
 import { WoManifestTable } from '@/app/components/WoManifestTable';
+import { SinglePeggingTreePanel } from '@/app/components/SinglePeggingTreePanel';
 import { qtyFmt } from '@/app/lib/format';
 
 // ── Assessment criteria helpers ────────────────────────────────────────────────
@@ -1208,24 +1208,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     | { type: 'supply'; supplyId: string; peggedDemands: PeggedDemandEntry[]; initialQty: number; consumedQty: number }
     | null
   >(null);
-  const [planPeggingExpanded, setPlanPeggingExpanded] = useState<Set<string>>(new Set(['0']));
-  const [planPeggingSearch, setPlanPeggingSearch] = useState('');
-  const [planPeggingMatchPath, setPlanPeggingMatchPath] = useState<string | null>(null);
-  const [planPeggingMatchIndex, setPlanPeggingMatchIndex] = useState(0);
   // Per-demand pegging cache — populated lazily when user opens a demand's pegging panel.
   // Keys are demand_id strings; values are the fetched PlanningPeggingEntry or 'loading'/'error'.
   const [demandPeggingCache, setDemandPeggingCache] = useState<Record<string, PlanningPeggingEntry | 'loading' | 'error'>>({});
-  const [planPeggingMatchPaths, setPlanPeggingMatchPaths] = useState<string[]>([]);
-  useEffect(() => {
-    setPlanPeggingSearch('');
-    setPlanPeggingMatchPath(null);
-    setPlanPeggingMatchPaths([]);
-    setPlanPeggingMatchIndex(0);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [planPeggingContext?.type === 'work_order' ? (planPeggingContext.row as WorkOrder).demand_id ?? '' : null,
-      planPeggingContext?.type === 'demand' ? (planPeggingContext.row as CommittedDemand).demand_id ?? '' : null,
-      planPeggingContext?.type === 'supply' ? planPeggingContext.supplyId : null]);
-  const [planExplanationExpanded, setPlanExplanationExpanded] = useState<Set<string>>(new Set());
   const [planPeggingPanelWidth, setPlanPeggingPanelWidth] = useState(420);
   const [planWorkOrderPeggingCache, setPlanWorkOrderPeggingCache] = useState<Record<string, PlanningPeggingNode>>({});
   // Active demand for WO pegging panel; null = use the row's own demand_id (default)
@@ -2021,92 +2006,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   }, [id]);
 
   // Reset active-demand selection and the manifest/pegging toggle when the user opens pegging
-  // for a different WO. The consolidated accordion's own open/expand state resets via its `key`
-  // prop remounting it (see the ConsolidatedWoAccordion render site) instead of here.
+  // for a different WO. The consolidated accordion's and the single pegging tree panel's own
+  // expand/search state reset via their own `key` prop remounting them instead of here.
   useEffect(() => {
     setWoPeggingActiveDemandId(null);
     setManifestViewMode('manifest');
   }, [planPeggingContext]);
-
-  // When the pegging panel opens for a demand, auto-expand the critical-path
-  // chain so the gold-tagged transit nodes are visible without the user
-  // hunting through collapsed AND-children. Mirrors the Kotlin
-  // `traceCriticalPath` algorithm.
-  useEffect(() => {
-    if (!planPeggingContext || planPeggingContext.type === 'supply' || !planResult) return;
-    const demandIdNorm = String(planPeggingContext.row.demand_id ?? '').trim();
-    if (!demandIdNorm) return;
-    const matchingEntries = planResult.planning_pegging?.filter(
-      (e) => String(e.demand_id ?? '').trim() === demandIdNorm,
-    ) ?? [];
-    const entry = matchingEntries.length > 0 ? matchingEntries[matchingEntries.length - 1] : undefined;
-    const tree = entry?.tree;
-    if (!tree) return;
-
-    const hasFlaggedDescendant = (n: PlanningPeggingNode): boolean => {
-      if (n.is_bottleneck || n.is_root_bottleneck) return true;
-      return (n.children ?? []).some(hasFlaggedDescendant);
-    };
-    const ratio = (c: PlanningPeggingNode): number => {
-      const q = Number(c.quantity ?? 0);
-      const cq = Number((c as { committed_qty?: number | null }).committed_qty ?? q);
-      return q < 1e-9 ? 0 : cq / q;
-    };
-    const contributed = (c: PlanningPeggingNode): boolean => {
-      const q = Number(c.quantity ?? 0);
-      const cq = Number((c as { committed_qty?: number | null }).committed_qty ?? q);
-      return q > 1e-9 || cq > 1e-9;
-    };
-    const relationOf = (n: PlanningPeggingNode): 'and' | 'or' => {
-      const explicit = (n as { children_relation?: string | null }).children_relation;
-      if (explicit === 'and' || explicit === 'or') return explicit;
-      return n.type === 'work_order' ? 'and' : 'or';
-    };
-    const paths = new Set<string>();
-    const walk = (n: PlanningPeggingNode | null, p: string): void => {
-      if (!n) return;
-      paths.add(p);
-      const kids = n.children ?? [];
-      if (kids.length === 0) return;
-      const contributingKids = kids
-        .map((c, i) => ({ c, i }))
-        .filter(({ c }) => contributed(c));
-      if (contributingKids.length === 0) return;
-      if (relationOf(n) === 'or') {
-        contributingKids.forEach(({ c, i }) => walk(c, `${p}-${i}`));
-        return;
-      }
-      const flagged = contributingKids.filter(({ c }) => c.is_bottleneck || c.is_root_bottleneck);
-      let pick: { c: PlanningPeggingNode; i: number } | null = null;
-      if (flagged.length > 0) {
-        flagged.sort((a, b) => {
-          const ra = ratio(a.c);
-          const rb = ratio(b.c);
-          if (Math.abs(ra - rb) > 1e-9) return ra - rb;
-          return a.i - b.i;
-        });
-        pick = flagged[0];
-      } else {
-        const transit = contributingKids.filter(({ c }) => hasFlaggedDescendant(c));
-        if (transit.length === 0) return;
-        transit.sort((a, b) => {
-          const ra = ratio(a.c);
-          const rb = ratio(b.c);
-          if (Math.abs(ra - rb) > 1e-9) return ra - rb;
-          return a.i - b.i;
-        });
-        pick = transit[0];
-      }
-      walk(pick.c, `${p}-${pick.i}`);
-    };
-    walk(tree, '0');
-    if (paths.size <= 1) return;
-    setPlanPeggingExpanded((prev) => {
-      const next = new Set(prev);
-      paths.forEach((p) => next.add(p));
-      return next;
-    });
-  }, [planPeggingContext, planResult]);
 
   // Lazily fetch per-demand pegging tree when user opens the pegging panel and the
   // tree is not in planResult.planning_pegging (bulk load is disabled — trees are too large).
@@ -10086,261 +9991,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 }
               }
 
-              // Critical path = the dominator SUB-TREE of the pegging tree.
-              //   - AND junction (work_order parents): single AND-min child.
-              //     Planner pre-flags it via is_bottleneck / is_root_bottleneck;
-              //     break ties by smallest committed_qty/quantity ratio, then
-              //     tree order. If no direct child is flagged but a descendant
-              //     is, descend through the transit child with smallest ratio
-              //     (method WO between BOM levels carries no flag).
-              //   - OR junction (demand parents, alternative paths): every
-              //     contributing child (qty>0 OR committed_qty>0) is a
-              //     dominator. The path BRANCHES.
-              // Mirrors the backend `traceCriticalPath` Kotlin helper exactly.
-              const criticalPathSet = new Set<string>();
-              const hasFlaggedDescendant = (n: PlanningPeggingNode): boolean => {
-                if (n.is_bottleneck || n.is_root_bottleneck) return true;
-                return (n.children ?? []).some(hasFlaggedDescendant);
-              };
-              const ratio = (c: PlanningPeggingNode): number => {
-                const q = Number(c.quantity ?? 0);
-                const cq = Number((c as { committed_qty?: number | null }).committed_qty ?? q);
-                return q < 1e-9 ? 0 : cq / q;
-              };
-              const contributed = (c: PlanningPeggingNode): boolean => {
-                const q = Number(c.quantity ?? 0);
-                const cq = Number((c as { committed_qty?: number | null }).committed_qty ?? q);
-                return q > 1e-9 || cq > 1e-9;
-              };
-              const relationOf = (n: PlanningPeggingNode): 'and' | 'or' => {
-                const explicit = (n as { children_relation?: string | null }).children_relation;
-                if (explicit === 'and' || explicit === 'or') return explicit;
-                return n.type === 'work_order' ? 'and' : 'or';
-              };
-              const buildCriticalPath = (n: PlanningPeggingNode | null, path: string): void => {
-                if (!n) return;
-                // Consumer-attribution nodes (which demand draws from a consolidated PO) are not
-                // part of the demand→source supply chain, so they don't belong on the critical path.
-                if ((n as { consolidated_consumer?: boolean }).consolidated_consumer) return;
-                criticalPathSet.add(path);
-                const kids = n.children ?? [];
-                if (kids.length === 0) return;
-                // Universal rule: exclude children (and subtrees) with 0
-                // contribution. Critical path traces actual flow.
-                const contributingKids = kids
-                  .map((c, i) => ({ c, i }))
-                  .filter(({ c }) => contributed(c));
-                if (contributingKids.length === 0) return;
-                if (relationOf(n) === 'or') {
-                  contributingKids.forEach(({ c, i }) => buildCriticalPath(c, `${path}-${i}`));
-                  return;
-                }
-                // AND: single dominator.
-                const flagged = contributingKids.filter(({ c }) => c.is_bottleneck || c.is_root_bottleneck);
-                let pick: { c: PlanningPeggingNode; i: number } | null = null;
-                if (flagged.length > 0) {
-                  flagged.sort((a, b) => {
-                    const ra = ratio(a.c);
-                    const rb = ratio(b.c);
-                    if (Math.abs(ra - rb) > 1e-9) return ra - rb;
-                    return a.i - b.i;
-                  });
-                  pick = flagged[0];
-                } else {
-                  const transit = contributingKids.filter(({ c }) => hasFlaggedDescendant(c));
-                  if (transit.length === 0) return;
-                  transit.sort((a, b) => {
-                    const ra = ratio(a.c);
-                    const rb = ratio(b.c);
-                    if (Math.abs(ra - rb) > 1e-9) return ra - rb;
-                    return a.i - b.i;
-                  });
-                  pick = transit[0];
-                }
-                buildCriticalPath(pick.c, `${path}-${pick.i}`);
-              };
-              buildCriticalPath(tree, '0');
-
-              const runSearch = (query: string) => {
-                const q = query.trim().toLowerCase();
-                if (!q || !tree) {
-                  setPlanPeggingMatchPaths([]);
-                  setPlanPeggingMatchPath(null);
-                  setPlanPeggingMatchIndex(0);
-                  return;
-                }
-                const matches: string[] = [];
-                const ancestors = new Set<string>();
-                const nodeMatches = (n: PlanningPeggingNode): boolean => {
-                  if (n.type === 'demand') {
-                    return [n.product_id, n.location_id].some(
-                      (f) => typeof f === 'string' && f.toLowerCase().includes(q)
-                    );
-                  }
-                  if (n.type === 'supply') {
-                    const pid = n.product_id;
-                    const sid = n.supply_id;
-                    if (typeof pid !== 'string' || typeof sid !== 'string') return false;
-                    // Standard lot supply_id = "pid_loc_lot" — sid starts with pid+"_".
-                    // These are detail nodes; the parent demand already covers this product
-                    // occurrence. Only consolidated/named supplies (e.g.
-                    // "consolidated_260-0141-02_2000") add a distinct occurrence.
-                    if (sid.toLowerCase().startsWith(pid.toLowerCase() + '_')) return false;
-                    return pid.toLowerCase().includes(q) || sid.toLowerCase().includes(q);
-                  }
-                  // work_order, purchase, operation, resource:
-                  // match only on location and method — NOT product_id (handled by demand
-                  // branch above) and NOT demand_id (it may embed the product_id string).
-                  return [n.location_id, n.method].some(
-                    (f) => typeof f === 'string' && f.toLowerCase().includes(q)
-                  );
-                };
-                // Mirror PlanningPeggingTreeView's child filtering so paths stay in sync.
-                const childContrib = (c: PlanningPeggingNode): number => {
-                  const cc = (c as { committed_qty?: number | null }).committed_qty;
-                  return Number((cc != null ? cc : c.quantity) ?? 0);
-                };
-                const visibleChildren = (n: PlanningPeggingNode): PlanningPeggingNode[] => {
-                  const raw = n.children ?? [];
-                  const isLegacyBlockedWo = n.type === 'work_order'
-                    && !n.failed
-                    && Number(n.quantity ?? 0) <= 1e-9
-                    && raw.length > 0;
-                  if (isLegacyBlockedWo) return [];
-                  if (n.children_relation === 'or' && raw.length > 1) {
-                    const contribCount = raw.filter(c => childContrib(c) > 1e-9).length;
-                    if (contribCount > 0 && contribCount < raw.length)
-                      return raw.filter(c => childContrib(c) > 1e-9);
-                  }
-                  return raw;
-                };
-                const walk = (n: PlanningPeggingNode, path: string, chain: string[]): void => {
-                  const nextChain = [...chain, path];
-                  if (nodeMatches(n)) {
-                    matches.push(path);
-                    chain.forEach((p) => ancestors.add(p));
-                  }
-                  visibleChildren(n).forEach((c, i) => walk(c, `${path}-${i}`, nextChain));
-                };
-                walk(tree, '0', []);
-                setPlanPeggingMatchPaths(matches);
-                setPlanPeggingMatchIndex(0);
-                setPlanPeggingMatchPath(matches[0] ?? null);
-                if (matches.length > 0) {
-                  setPlanPeggingExpanded((prev) => {
-                    const next = new Set(prev);
-                    ancestors.forEach((p) => next.add(p));
-                    // Also expand the first match itself so its children are visible
-                    next.add(matches[0]);
-                    return next;
-                  });
-                }
-              };
-              const stepMatch = (delta: number) => {
-                if (planPeggingMatchPaths.length === 0) return;
-                const nextIdx = (planPeggingMatchIndex + delta + planPeggingMatchPaths.length) % planPeggingMatchPaths.length;
-                setPlanPeggingMatchIndex(nextIdx);
-                const nextPath = planPeggingMatchPaths[nextIdx];
-                setPlanPeggingMatchPath(nextPath);
-                // Make sure ancestors of the new match are expanded
-                setPlanPeggingExpanded((prev) => {
-                  const next = new Set(prev);
-                  const parts = nextPath.split('-');
-                  for (let i = 1; i <= parts.length; i++) next.add(parts.slice(0, i).join('-'));
-                  next.add(nextPath);
-                  return next;
-                });
-              };
-
-              return (
-                <>
-                  <div style={{
-                    display: 'flex', alignItems: 'center', gap: 6,
-                    marginTop: '0.25rem', marginBottom: '0.5rem',
-                    padding: '4px 6px', background: '#1c1c1e',
-                    border: '1px solid #3d3d40', borderRadius: 4,
-                  }}>
-                    <input
-                      type="text"
-                      value={planPeggingSearch}
-                      onChange={(e) => setPlanPeggingSearch(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          e.preventDefault();
-                          if (planPeggingMatchPaths.length > 0) stepMatch(e.shiftKey ? -1 : 1);
-                          else runSearch(planPeggingSearch);
-                        } else if (e.key === 'Escape') {
-                          setPlanPeggingSearch('');
-                          setPlanPeggingMatchPaths([]);
-                          setPlanPeggingMatchPath(null);
-                          setPlanPeggingMatchIndex(0);
-                        } else {
-                          // Any edit invalidates prior matches; user presses Enter/Find to re-search.
-                          if (planPeggingMatchPaths.length > 0) {
-                            setPlanPeggingMatchPaths([]);
-                            setPlanPeggingMatchPath(null);
-                            setPlanPeggingMatchIndex(0);
-                          }
-                        }
-                      }}
-                      placeholder="Find in pegging (product / location / supply / demand id)…"
-                      style={{ flex: 1, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem' }}
-                    />
-                    <button type="button" onClick={() => runSearch(planPeggingSearch)}
-                      style={{ padding: '3px 8px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, cursor: 'pointer', fontSize: '0.78rem' }}>
-                      Find
-                    </button>
-                    <button type="button" onClick={() => stepMatch(-1)} disabled={planPeggingMatchPaths.length === 0}
-                      style={{ padding: '3px 8px', background: '#2d2d30', color: planPeggingMatchPaths.length === 0 ? '#52525b' : '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, cursor: planPeggingMatchPaths.length === 0 ? 'default' : 'pointer', fontSize: '0.78rem' }}>
-                      ↑
-                    </button>
-                    <button type="button" onClick={() => stepMatch(1)} disabled={planPeggingMatchPaths.length === 0}
-                      style={{ padding: '3px 8px', background: '#2d2d30', color: planPeggingMatchPaths.length === 0 ? '#52525b' : '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, cursor: planPeggingMatchPaths.length === 0 ? 'default' : 'pointer', fontSize: '0.78rem' }}>
-                      ↓
-                    </button>
-                    <span style={{ fontSize: '0.72rem', color: '#a1a1aa', minWidth: 60, textAlign: 'right' }}>
-                      {planPeggingMatchPaths.length === 0
-                        ? (planPeggingSearch.trim() ? 'no match' : '')
-                        : `${planPeggingMatchIndex + 1} / ${planPeggingMatchPaths.length}`}
-                    </span>
-                  </div>
-                  <div style={{ flex: 1, overflow: 'auto', minHeight: 0, marginTop: '0.5rem' }}>
-                    {tree ? (
-                      <PlanningPeggingTreeView
-                        tree={tree}
-                        expanded={planPeggingExpanded}
-                        onToggle={(p) => startTransition(() => setPlanPeggingExpanded((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(p)) next.delete(p); else next.add(p);
-                          return next;
-                        }))}
-                        matchPath={planPeggingMatchPath}
-                        matchPaths={planPeggingMatchPaths}
-                        criticalPathSet={criticalPathSet}
-                        explanationExpanded={planExplanationExpanded}
-                        onToggleExplanation={(p) => startTransition(() => setPlanExplanationExpanded((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(p)) next.delete(p); else next.add(p);
-                          return next;
-                        }))}
-                        workOrderRootQty={planPeggingContext?.type === 'work_order'
-                          ? Number((planPeggingContext.row as WorkOrder).quantity ?? 0)
-                          : null}
-                        contextDemandId={contextDemandId}
-                        consolidatedSourceResolver={(embeddedDemandId, pid) => {
-                          const allEntries = (planResult?.planning_pegging ?? []).filter(
-                            (e) => String(e.demand_id ?? '').trim() === embeddedDemandId
-                          );
-                          return allEntries
-                            .slice(0, -1)
-                            .map((e) => e.tree)
-                            .filter((t): t is PlanningPeggingNode => t != null && t.product_id === pid);
-                        }}
-                      />
-                    ) : null}
-                  </div>
-                </>
-              );
+              return tree ? (
+                <SinglePeggingTreePanel
+                  key={woPeggingRowKey ?? ''}
+                  tree={tree}
+                  contextDemandId={contextDemandId}
+                  workOrderRootQty={planPeggingContext.type === 'work_order'
+                    ? Number((planPeggingContext.row as WorkOrder).quantity ?? 0)
+                    : null}
+                  planningPegging={planResult?.planning_pegging ?? []}
+                />
+              ) : null;
             })()}
           </div>
         </div>,

@@ -14,8 +14,8 @@ import {
   type WorkOrder,
 } from '@/lib/api';
 import { ScheduleHorizonRuler, type Horizon, type ScheduleGranularity } from '../cases/[id]/_workOrderSchedule';
-import { PlanningPeggingTreeView } from './PlanningPeggingTreeView';
 import { ConsolidatedWoAccordion } from './ConsolidatedWoAccordion';
+import { SinglePeggingTreePanel } from './SinglePeggingTreePanel';
 
 type Props = {
   caseId: number;
@@ -112,23 +112,6 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
   const [woTrees, setWoTrees] = useState<Map<string, PlanningPeggingNode>>(new Map());
   const [woTreesLoading, setWoTreesLoading] = useState(false);
   const [woTreesError, setWoTreesError] = useState<string | null>(null);
-
-  // Expand state for the shared planning-pegging tree component — switching
-  // WOs means the user starts from "root expanded".
-  const [treeExpanded, setTreeExpanded] = useState<Set<string>>(() => new Set(['0']));
-  const toggleTreePath = useCallback((p: string) => {
-    setTreeExpanded((prev) => {
-      const next = new Set(prev);
-      if (next.has(p)) next.delete(p); else next.add(p);
-      return next;
-    });
-  }, []);
-
-  // Reset expansion when we switch which tree is being viewed so stale
-  // paths from a previous tree don't carry over visually.
-  useEffect(() => {
-    setTreeExpanded(new Set(['0']));
-  }, [peggingWo]);
 
   // Slide-in width (px). Drag-resizable via a handle on its left edge.
   // Persisted to localStorage, sanitized on read to the same bounds the
@@ -513,8 +496,6 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
           woTrees={woTrees}
           woTreesLoading={woTreesLoading}
           woTreesError={woTreesError}
-          treeExpanded={treeExpanded}
-          onToggleTreePath={toggleTreePath}
           slideInWidth={slideInWidth}
           onResizeMouseDown={onSlideInResizeMouseDown}
           onClose={() => {
@@ -678,9 +659,6 @@ function LoadStrip({
   );
 }
 
-/** Group contributors by demand_id so the list mode shows one row per
- *  user demand, summarizing the WO contributions. Entries without a
- *  demand_id fall under the "(unattributed)" bucket. */
 function BreakdownSlideIn({
   caseId,
   planRunId,
@@ -691,8 +669,6 @@ function BreakdownSlideIn({
   woTrees,
   woTreesLoading,
   woTreesError,
-  treeExpanded,
-  onToggleTreePath,
   slideInWidth,
   onResizeMouseDown,
   onClose,
@@ -709,8 +685,6 @@ function BreakdownSlideIn({
   woTrees: Map<string, PlanningPeggingNode>;
   woTreesLoading: boolean;
   woTreesError: string | null;
-  treeExpanded: Set<string>;
-  onToggleTreePath: (path: string) => void;
   slideInWidth: number;
   onResizeMouseDown: (e: React.MouseEvent) => void;
   onClose: () => void;
@@ -811,12 +785,12 @@ function BreakdownSlideIn({
                   {!woTreesLoading && !woTreesError && !woTree && (
                     <p style={{ color: '#a1a1aa' }}>{t('peggingWoNotFound')}</p>
                   )}
-                  {woTree && (
-                    <PlanningPeggingTreeView
+                  {woTree && peggingWo && (
+                    <SinglePeggingTreePanel
+                      key={woCacheKey(peggingWo)}
                       tree={woTree}
-                      expanded={treeExpanded}
-                      onToggle={onToggleTreePath}
-                      contextDemandId={peggingWo?.demandId || null}
+                      contextDemandId={peggingWo.demandId || null}
+                      planningPegging={accordionData?.planningPegging ?? []}
                     />
                   )}
                 </>
