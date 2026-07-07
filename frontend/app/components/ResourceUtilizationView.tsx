@@ -7,12 +7,15 @@ import {
   getPlanRun,
   getResourceUtilization,
   getWorkOrderPegging,
+  type PlanningPeggingEntry,
   type PlanningPeggingNode,
   type ResourceUtilization,
   type ResourceUtilizationRow,
+  type WorkOrder,
 } from '@/lib/api';
 import { ScheduleHorizonRuler, type Horizon, type ScheduleGranularity } from '../cases/[id]/_workOrderSchedule';
 import { PlanningPeggingTreeView } from './PlanningPeggingTreeView';
+import { ConsolidatedWoAccordion } from './ConsolidatedWoAccordion';
 
 type Props = {
   caseId: number;
@@ -43,11 +46,13 @@ const COL_WIDTHS_STORAGE_KEY = 'allocator.resourceUtilization.colWidths.v1';
 const SLIDE_IN_WIDTH_STORAGE_KEY = 'allocator.resourceUtilization.slideInWidth.v1';
 const DEFAULT_SLIDE_IN_WIDTH = 640;
 
-type BreakdownMode = 'list' | 'pegging' | 'wo_pegging';
+type BreakdownMode = 'list' | 'wo_pegging';
 
 /** WO context the user clicked into. Carries everything getWorkOrderPegging
  *  needs (demand_id, product_id, location_id, method) plus a label for the
- *  slide-in title. */
+ *  slide-in title. `demandId` is '' for a cross-demand consolidated batch,
+ *  rendered by ConsolidatedWoAccordion (fed by woGroupId alone) instead of a
+ *  single fetched tree. */
 type WoContext = {
   demandId: string;
   productId: string;
@@ -96,24 +101,20 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
   const [colWidths, setColWidths] = useState<Record<ColKey, number>>(DEFAULT_COL_WIDTHS);
 
   // Breakdown slide-in: which resource is being explored, which mode is
-  // active (demand list / demand pegging / WO pegging), and the relevant
-  // identifier. Demand pegging data is derived from a single plan-run
-  // fetch cached for the slide-in's lifetime; WO pegging is fetched
-  // per-click and cached by a stable WO key.
+  // active (flat WO list / single-WO pegging), and the relevant identifier.
+  // WO pegging is fetched per-click and cached by a stable WO key.
   const [breakdownRow, setBreakdownRow] = useState<ResourceUtilizationRow | null>(null);
   const [breakdownMode, setBreakdownMode] = useState<BreakdownMode>('list');
-  const [peggingDemandId, setPeggingDemandId] = useState<string | null>(null);
   const [peggingWo, setPeggingWo] = useState<WoContext | null>(null);
-  const [planTrees, setPlanTrees] = useState<Map<string, PlanningPeggingNode>>(new Map());
-  const [planTreesLoading, setPlanTreesLoading] = useState(false);
-  const [planTreesError, setPlanTreesError] = useState<string | null>(null);
+  // work_orders_native + planning_pegging from a plan-run fetch, needed by
+  // ConsolidatedWoAccordion for a cross-demand batch WO (see the wo_pegging fetch effect below).
+  const [accordionData, setAccordionData] = useState<{ workOrdersNative: WorkOrder[]; planningPegging: PlanningPeggingEntry[] } | null>(null);
   const [woTrees, setWoTrees] = useState<Map<string, PlanningPeggingNode>>(new Map());
   const [woTreesLoading, setWoTreesLoading] = useState(false);
   const [woTreesError, setWoTreesError] = useState<string | null>(null);
 
-  // Expand state for the shared planning-pegging tree component. One set
-  // shared across both demand-pegging and WO-pegging modes — switching
-  // trees just means the user starts from "root expanded".
+  // Expand state for the shared planning-pegging tree component — switching
+  // WOs means the user starts from "root expanded".
   const [treeExpanded, setTreeExpanded] = useState<Set<string>>(() => new Set(['0']));
   const toggleTreePath = useCallback((p: string) => {
     setTreeExpanded((prev) => {
@@ -127,7 +128,7 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
   // paths from a previous tree don't carry over visually.
   useEffect(() => {
     setTreeExpanded(new Set(['0']));
-  }, [peggingDemandId, peggingWo]);
+  }, [peggingWo]);
 
   // Slide-in width (px). Drag-resizable via a handle on its left edge.
   // Persisted to localStorage, sanitized on read to the same bounds the
@@ -210,46 +211,44 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
     }
   }, [colWidths]);
 
-  // Fetch the plan-run on first transition into pegging mode and cache the
-  // demand→tree map for the slide-in's lifetime. Subsequent demand picks
-  // hit the cache. Resets when planRunId changes.
+  // Fetch the plan-run (once) on transition into wo_pegging mode for a
+  // cross-demand batch WO — that mode needs work_orders_native/planning_pegging
+  // to feed ConsolidatedWoAccordion. Resets when planRunId changes.
   useEffect(() => {
-    setPlanTrees(new Map());
-    setPlanTreesError(null);
+    setAccordionData(null);
   }, [planRunId]);
 
   useEffect(() => {
-    // Deps intentionally exclude planTrees/planTreesLoading: the setState
-    // calls inside this effect would otherwise re-trigger it, cleanup would
-    // flip `cancelled` before the fetch lands, and the loading state would
-    // stay true forever. Cache hits are handled by the closure-captured
-    // planTrees (refreshed every time peggingDemandId or planRunId changes).
-    if (breakdownMode !== 'pegging' || planRunId == null) return;
-    if (planTrees.size > 0) return;
+    // Deps intentionally exclude accordionData: the setState call inside this
+    // effect would otherwise re-trigger it, cleanup would flip `cancelled`
+    // before the fetch lands. Cache hits are handled by the closure-captured
+    // accordionData (refreshed every time peggingWo or planRunId changes).
+    const needsAccordionData = breakdownMode === 'wo_pegging' && peggingWo?.demandId === '';
+    if (!needsAccordionData || planRunId == null) return;
+    if (accordionData != null) return;
     let cancelled = false;
-    setPlanTreesLoading(true);
-    setPlanTreesError(null);
     getPlanRun(caseId, planRunId)
       .then((pr) => {
         if (cancelled) return;
-        const m = new Map<string, PlanningPeggingNode>();
-        (pr.result?.planning_pegging ?? []).forEach((entry) => {
-          if (entry.demand_id) m.set(entry.demand_id, entry.tree);
+        setAccordionData({
+          workOrdersNative: pr.result?.work_orders_native ?? [],
+          planningPegging: pr.result?.planning_pegging ?? [],
         });
-        setPlanTrees(m);
       })
       .catch((e: unknown) => {
-        if (!cancelled) setPlanTreesError(e instanceof Error ? e.message : String(e));
-      })
-      .finally(() => { if (!cancelled) setPlanTreesLoading(false); });
+        if (!cancelled && typeof console !== 'undefined' && console.error)
+          console.error('[ResourceUtilizationView] accordion data fetch failed', e);
+      });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [breakdownMode, caseId, planRunId]);
+  }, [breakdownMode, caseId, planRunId, peggingWo]);
 
   // Fetch WO-scoped pegging on transition to wo_pegging mode. Same exhaustive-
   // deps caveat as the demand-pegging effect above — see comment there.
   useEffect(() => {
-    if (breakdownMode !== 'wo_pegging' || !peggingWo || planRunId == null) return;
+    // Cross-demand batches (demandId === '') are rendered by ConsolidatedWoAccordion instead,
+    // fed by the accordionData fetch above — skip this single-tree fetch for that case.
+    if (breakdownMode !== 'wo_pegging' || !peggingWo || peggingWo.demandId === '' || planRunId == null) return;
     const k = woCacheKey(peggingWo);
     if (woTrees.has(k)) return;
     let cancelled = false;
@@ -261,6 +260,7 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
       location_id: peggingWo.locationId,
       method: peggingWo.method,
       start_time: peggingWo.startTime ?? undefined,
+      wo_group_id: peggingWo.woGroupId ?? undefined,
       run_id: planRunId,
     })
       .then((res) => { if (!cancelled) setWoTrees((prev) => new Map(prev).set(k, res.tree)); })
@@ -422,16 +422,16 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
                 {t('columnPeakLoad')}
                 <ResizeGrip onMouseDown={onResizeMouseDown('peak')} title={t('resizeHandleTooltip')} />
               </th>
-              <th style={{ padding: '0.4rem 0.6rem', width: colWidths.breakdown, minWidth: colWidths.breakdown, position: 'relative' }}>
-                {t('columnBreakdown')}
-                <ResizeGrip onMouseDown={onResizeMouseDown('breakdown')} title={t('resizeHandleTooltip')} />
-              </th>
               <th
                 style={{ padding: '0.4rem 0.6rem', width: colWidths.schedule, minWidth: colWidths.schedule, position: 'relative' }}
                 title={t('columnUtilizationTooltip', { granularity: granularityNoun(t, granularity) })}
               >
                 <ScheduleHorizonRuler horizon={horizon} locale={locale} />
                 <ResizeGrip onMouseDown={onResizeMouseDown('schedule')} title={t('resizeHandleTooltip')} />
+              </th>
+              <th style={{ padding: '0.4rem 0.6rem', width: colWidths.breakdown, minWidth: colWidths.breakdown, position: 'relative' }}>
+                {t('columnBreakdown')}
+                <ResizeGrip onMouseDown={onResizeMouseDown('breakdown')} title={t('resizeHandleTooltip')} />
               </th>
             </tr>
           </thead>
@@ -474,19 +474,6 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
                   {peak.toFixed(2)}
                   {overloaded && <span style={{ marginLeft: 4 }}>⚠</span>}
                 </td>
-                <td style={{ padding: '0.35rem 0.6rem', width: colWidths.breakdown, minWidth: colWidths.breakdown }}>
-                  {(r.contributors?.length ?? 0) > 0 ? (
-                    <button
-                      type="button"
-                      className="secondary"
-                      style={breakdownRow === r ? { background: 'rgba(167,139,250,0.25)', borderColor: '#a78bfa' } : undefined}
-                      onClick={() => {
-                        if (breakdownRow === r) { setBreakdownRow(null); setBreakdownMode('list'); setPeggingDemandId(null); }
-                        else { setBreakdownRow(r); setBreakdownMode('list'); setPeggingDemandId(null); }
-                      }}
-                    >{t('show')}</button>
-                  ) : <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>}
-                </td>
                 <td style={{ padding: '0.35rem 0.6rem', width: colWidths.schedule, minWidth: colWidths.schedule }}>
                   <LoadStrip
                     horizon={horizon}
@@ -496,6 +483,19 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
                     t={t}
                   />
                 </td>
+                <td style={{ padding: '0.35rem 0.6rem', width: colWidths.breakdown, minWidth: colWidths.breakdown }}>
+                  {(r.contributors?.length ?? 0) > 0 ? (
+                    <button
+                      type="button"
+                      className="secondary"
+                      style={breakdownRow === r ? { background: 'rgba(167,139,250,0.25)', borderColor: '#a78bfa' } : undefined}
+                      onClick={() => {
+                        if (breakdownRow === r) { setBreakdownRow(null); setBreakdownMode('list'); }
+                        else { setBreakdownRow(r); setBreakdownMode('list'); }
+                      }}
+                    >{t('show')}</button>
+                  ) : <span style={{ color: '#52525b', fontSize: '0.75rem' }}>–</span>}
+                </td>
               </tr>
               );
             })}
@@ -504,13 +504,12 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
       </div>
       {breakdownRow && typeof document !== 'undefined' && createPortal(
         <BreakdownSlideIn
+          caseId={caseId}
+          planRunId={planRunId}
+          accordionData={accordionData}
           row={breakdownRow}
           mode={breakdownMode}
-          peggingDemandId={peggingDemandId}
           peggingWo={peggingWo}
-          planTrees={planTrees}
-          planTreesLoading={planTreesLoading}
-          planTreesError={planTreesError}
           woTrees={woTrees}
           woTreesLoading={woTreesLoading}
           woTreesError={woTreesError}
@@ -521,12 +520,10 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
           onClose={() => {
             setBreakdownRow(null);
             setBreakdownMode('list');
-            setPeggingDemandId(null);
             setPeggingWo(null);
           }}
-          onOpenDemandPegging={(demandId) => { setPeggingDemandId(demandId); setPeggingWo(null); setBreakdownMode('pegging'); }}
-          onOpenWoPegging={(ctx) => { setPeggingWo(ctx); setPeggingDemandId(null); setBreakdownMode('wo_pegging'); }}
-          onBackToList={() => { setBreakdownMode('list'); setPeggingDemandId(null); setPeggingWo(null); }}
+          onOpenWoPegging={(ctx) => { setPeggingWo(ctx); setBreakdownMode('wo_pegging'); }}
+          onBackToList={() => { setBreakdownMode('list'); setPeggingWo(null); }}
           t={t}
         />,
         document.body,
@@ -684,33 +681,13 @@ function LoadStrip({
 /** Group contributors by demand_id so the list mode shows one row per
  *  user demand, summarizing the WO contributions. Entries without a
  *  demand_id fall under the "(unattributed)" bucket. */
-function groupContributorsByDemand(
-  contributors: NonNullable<ResourceUtilizationRow['contributors']>,
-): Array<{ demandId: string | null; totalRate: number; wos: typeof contributors }> {
-  const m = new Map<string, { demandId: string | null; totalRate: number; wos: typeof contributors }>();
-  for (const c of contributors) {
-    const key = c.demand_id ?? '__unattributed__';
-    const entry = m.get(key) ?? { demandId: c.demand_id ?? null, totalRate: 0, wos: [] };
-    entry.totalRate += c.rate ?? 0;
-    entry.wos.push(c);
-    m.set(key, entry);
-  }
-  // Stable order: real demand_ids alphabetic, unattributed last.
-  return Array.from(m.values()).sort((a, b) => {
-    if (a.demandId == null) return 1;
-    if (b.demandId == null) return -1;
-    return a.demandId.localeCompare(b.demandId);
-  });
-}
-
 function BreakdownSlideIn({
+  caseId,
+  planRunId,
+  accordionData,
   row,
   mode,
-  peggingDemandId,
   peggingWo,
-  planTrees,
-  planTreesLoading,
-  planTreesError,
   woTrees,
   woTreesLoading,
   woTreesError,
@@ -719,18 +696,16 @@ function BreakdownSlideIn({
   slideInWidth,
   onResizeMouseDown,
   onClose,
-  onOpenDemandPegging,
   onOpenWoPegging,
   onBackToList,
   t,
 }: {
+  caseId: number;
+  planRunId: number | null;
+  accordionData: { workOrdersNative: WorkOrder[]; planningPegging: PlanningPeggingEntry[] } | null;
   row: ResourceUtilizationRow;
   mode: BreakdownMode;
-  peggingDemandId: string | null;
   peggingWo: WoContext | null;
-  planTrees: Map<string, PlanningPeggingNode>;
-  planTreesLoading: boolean;
-  planTreesError: string | null;
   woTrees: Map<string, PlanningPeggingNode>;
   woTreesLoading: boolean;
   woTreesError: string | null;
@@ -739,20 +714,15 @@ function BreakdownSlideIn({
   slideInWidth: number;
   onResizeMouseDown: (e: React.MouseEvent) => void;
   onClose: () => void;
-  onOpenDemandPegging: (demandId: string) => void;
   onOpenWoPegging: (ctx: WoContext) => void;
   onBackToList: () => void;
   t: ReturnType<typeof useTranslations>;
 }): JSX.Element {
-  const groups = useMemo(() => groupContributorsByDemand(row.contributors ?? []), [row.contributors]);
-  const demandTree = peggingDemandId ? planTrees.get(peggingDemandId) : null;
   const woTree = peggingWo ? woTrees.get(woCacheKey(peggingWo)) : null;
 
   const title = mode === 'list'
     ? t('breakdownTitle')
-    : mode === 'pegging'
-      ? t('breakdownPeggingTitle', { demandId: peggingDemandId ?? '' })
-      : t('breakdownWoPeggingTitle', { product: peggingWo?.productId ?? '', location: peggingWo?.locationId ?? '' });
+    : t('breakdownWoPeggingTitle', { product: peggingWo?.productId ?? '', location: peggingWo?.locationId ?? '' });
 
   return (
     <div
@@ -800,35 +770,10 @@ function BreakdownSlideIn({
         <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
           {mode === 'list' && (
             <BreakdownList
-              groups={groups}
-              onOpenDemandPegging={onOpenDemandPegging}
+              contributors={row.contributors ?? []}
               onOpenWoPegging={onOpenWoPegging}
               t={t}
             />
-          )}
-          {mode === 'pegging' && (
-            <>
-              <button
-                type="button"
-                onClick={onBackToList}
-                style={{ background: 'none', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '0.78rem', padding: 0, marginBottom: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.3rem' }}
-              >
-                ← {t('breakdownBackToList')}
-              </button>
-              {planTreesLoading && <p style={{ color: '#a1a1aa' }}>{t('peggingLoading')}</p>}
-              {planTreesError && <p style={{ color: '#f87171' }}>{planTreesError}</p>}
-              {!planTreesLoading && !planTreesError && !demandTree && (
-                <p style={{ color: '#a1a1aa' }}>{t('peggingNotFound', { demandId: peggingDemandId ?? '' })}</p>
-              )}
-              {demandTree && (
-                <PlanningPeggingTreeView
-                  tree={demandTree}
-                  expanded={treeExpanded}
-                  onToggle={onToggleTreePath}
-                  contextDemandId={peggingDemandId}
-                />
-              )}
-            </>
           )}
           {mode === 'wo_pegging' && (
             <>
@@ -839,23 +784,45 @@ function BreakdownSlideIn({
               >
                 ← {t('breakdownBackToList')}
               </button>
-              {peggingWo && (
+              {peggingWo && peggingWo.demandId !== '' && (
                 <p style={{ margin: '0 0 0.5rem', fontSize: '0.75rem', color: '#71717a', fontFamily: 'monospace' }}>
                   {peggingWo.demandId} · {peggingWo.method} · {peggingWo.startTime ?? '–'}
                 </p>
               )}
-              {woTreesLoading && <p style={{ color: '#a1a1aa' }}>{t('peggingLoading')}</p>}
-              {woTreesError && <p style={{ color: '#f87171' }}>{woTreesError}</p>}
-              {!woTreesLoading && !woTreesError && !woTree && (
-                <p style={{ color: '#a1a1aa' }}>{t('peggingWoNotFound')}</p>
-              )}
-              {woTree && (
-                <PlanningPeggingTreeView
-                  tree={woTree}
-                  expanded={treeExpanded}
-                  onToggle={onToggleTreePath}
-                  contextDemandId={peggingWo?.demandId ?? null}
-                />
+              {peggingWo?.demandId === '' ? (
+                // Cross-demand consolidated batch — same accordion _CaseSectionPage.tsx uses for
+                // its own "Consolidated" WO table drill-down, so both surfaces render identically.
+                !accordionData ? (
+                  <p style={{ color: '#a1a1aa' }}>{t('peggingLoading')}</p>
+                ) : (
+                  <ConsolidatedWoAccordion
+                    key={peggingWo.woGroupId ?? ''}
+                    caseId={caseId}
+                    planRunId={planRunId}
+                    productId={peggingWo.productId}
+                    locationId={peggingWo.locationId}
+                    method={peggingWo.method}
+                    woGroupId={peggingWo.woGroupId ?? ''}
+                    workOrdersNative={accordionData.workOrdersNative}
+                    planningPegging={accordionData.planningPegging}
+                  />
+                )
+              ) : (
+                <>
+                  {woTreesLoading && <p style={{ color: '#a1a1aa' }}>{t('peggingLoading')}</p>}
+                  {woTreesError && <p style={{ color: '#f87171' }}>{woTreesError}</p>}
+                  {!woTreesLoading && !woTreesError && !woTree && (
+                    <p style={{ color: '#a1a1aa' }}>{t('peggingWoNotFound')}</p>
+                  )}
+                  {woTree && (
+                    <PlanningPeggingTreeView
+                      tree={woTree}
+                      expanded={treeExpanded}
+                      onToggle={onToggleTreePath}
+                      contextDemandId={peggingWo?.demandId || null}
+                    />
+                  )}
+                </>
               )}
             </>
           )}
@@ -866,102 +833,128 @@ function BreakdownSlideIn({
 }
 
 /** Stable cache key for a WO's pegging request — the WO is identified by
- *  (demand, product, location, method, start_time). start_time disambiguates
- *  multi-lot WOs that share the same product/location/method. */
+ *  (demand, product, location, method, start_time, wo_group_id). start_time
+ *  disambiguates multi-lot WOs that share the same product/location/method;
+ *  wo_group_id further disambiguates cross-demand batches (demandId is ''
+ *  for all of them, so product/location/method/start_time alone could collide
+ *  across two distinct batches). */
 function woCacheKey(ctx: WoContext): string {
-  return `${ctx.demandId}|${ctx.productId}|${ctx.locationId}|${ctx.method}|${ctx.startTime ?? ''}`;
+  return `${ctx.demandId}|${ctx.productId}|${ctx.locationId}|${ctx.method}|${ctx.startTime ?? ''}|${ctx.woGroupId ?? ''}`;
+}
+
+type WoSortCol = 'product' | 'location' | 'start' | 'end';
+
+/** Sort WO rows by the active column, with product/start/end as a stable
+ *  tie-break (in that order, skipping the active column) so rows still read
+ *  as a coherent timeline rather than jumping around on equal keys. */
+function sortWos(
+  wos: NonNullable<ResourceUtilizationRow['contributors']>,
+  col: WoSortCol,
+  dir: 'asc' | 'desc',
+): typeof wos {
+  const keyOf = (w: (typeof wos)[number], c: WoSortCol) => (
+    c === 'product' ? w.product_id
+      : c === 'location' ? w.location_id
+      : c === 'start' ? w.start_time
+      : w.end_time
+  ) ?? '';
+  const tieBreakOrder: WoSortCol[] = ['product', 'start', 'end'].filter((c) => c !== col) as WoSortCol[];
+  const d = dir === 'asc' ? 1 : -1;
+  return [...wos].sort((a, b) => (
+    d * keyOf(a, col).localeCompare(keyOf(b, col))
+    || tieBreakOrder.reduce((acc, c) => acc || keyOf(a, c).localeCompare(keyOf(b, c)), 0)
+  ));
 }
 
 function BreakdownList({
-  groups,
-  onOpenDemandPegging,
+  contributors,
   onOpenWoPegging,
   t,
 }: {
-  groups: ReturnType<typeof groupContributorsByDemand>;
-  onOpenDemandPegging: (demandId: string) => void;
+  contributors: NonNullable<ResourceUtilizationRow['contributors']>;
   onOpenWoPegging: (ctx: WoContext) => void;
   t: ReturnType<typeof useTranslations>;
 }): JSX.Element {
-  if (groups.length === 0) return <p style={{ color: '#a1a1aa' }}>{t('breakdownEmpty')}</p>;
+  const [sortCol, setSortCol] = useState<WoSortCol>('product');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
+  const toggleSort = (col: WoSortCol) => {
+    if (sortCol === col) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else { setSortCol(col); setSortDir('asc'); }
+  };
+  const sortIcon = (col: WoSortCol) => (sortCol === col ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '');
+  const thStyle = (col: WoSortCol, align: 'left' | 'right' = 'left'): React.CSSProperties => ({
+    paddingBottom: 2, textAlign: align, cursor: 'pointer', userSelect: 'none',
+    color: sortCol === col ? '#e4e4e7' : '#71717a',
+  });
+
+  if (contributors.length === 0) return <p style={{ color: '#a1a1aa' }}>{t('breakdownEmpty')}</p>;
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-      {groups.map((g, gi) => (
-        <section key={g.demandId ?? `unattributed-${gi}`} style={{ border: '1px solid #3d3d40', borderRadius: 6, padding: '0.6rem 0.8rem' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
-            <div style={{ fontFamily: 'monospace', fontSize: '0.85rem' }}>
-              {g.demandId ?? <span style={{ color: '#71717a', fontStyle: 'italic' }}>{t('breakdownUnattributed')}</span>}
-            </div>
-            {g.demandId && (
-              <button
-                type="button"
-                className="secondary"
-                style={{ fontSize: '0.74rem', padding: '2px 8px' }}
-                onClick={() => onOpenDemandPegging(g.demandId!)}
-              >{t('breakdownViewPegging')}</button>
-            )}
-          </div>
-          <p style={{ margin: '0 0 0.4rem', fontSize: '0.75rem', color: '#a1a1aa' }}>
-            {g.wos.length} {t('breakdownWoSuffix')} · Σ rate {g.totalRate.toFixed(2)}
-          </p>
-          <table style={{ width: '100%', fontSize: '0.74rem', borderCollapse: 'collapse' }}>
-            <thead>
-              <tr style={{ color: '#71717a', textAlign: 'left' }}>
-                <th style={{ paddingBottom: 2 }}>{t('breakdownColProduct')}</th>
-                <th style={{ paddingBottom: 2 }}>{t('breakdownColStart')}</th>
-                <th style={{ paddingBottom: 2 }}>{t('breakdownColEnd')}</th>
-                <th style={{ paddingBottom: 2, textAlign: 'right' }}>{t('breakdownColQty')}</th>
-                <th style={{ paddingBottom: 2, textAlign: 'right' }}>{t('breakdownColRate')}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {g.wos.map((wo, wi) => {
-                // WO pegging is keyed by (demand_id, product_id, location_id, method).
-                // The breakdown only emits make-WO contributors, but read method off
-                // the row when present so future non-make rows still resolve.
-                const peggable = !!(g.demandId && wo.product_id && wo.location_id);
-                return (
-                  <tr key={`${wo.wo_group_id ?? ''}-${wi}`} style={{ borderTop: '1px solid #27272a' }}>
-                    <td style={{ padding: '2px 6px 2px 0', fontFamily: 'monospace' }}>
-                      {peggable ? (
-                        <button
-                          type="button"
-                          onClick={() => onOpenWoPegging({
-                            demandId: g.demandId!,
-                            productId: wo.product_id!,
-                            locationId: wo.location_id!,
-                            method: 'make',
-                            woGroupId: wo.wo_group_id ?? null,
-                            startTime: wo.start_time ?? null,
-                          })}
-                          title={t('breakdownOpenWoPegging')}
-                          style={{
-                            background: 'none', border: 'none', padding: 0, cursor: 'pointer',
-                            color: '#60a5fa', fontFamily: 'monospace', fontSize: 'inherit',
-                            textDecoration: 'underline', textUnderlineOffset: 2,
-                          }}
-                        >{wo.product_id}</button>
-                      ) : (
-                        <span>{wo.product_id}</span>
-                      )}
-                    </td>
-                    <td style={{ padding: '2px 6px 2px 0' }}>{wo.start_time ?? '–'}</td>
-                    <td style={{ padding: '2px 6px 2px 0' }}>
-                      {wo.end_time ?? '–'}
-                      {wo.lot_count && wo.lot_count > 1 && (
-                        <span style={{ color: '#71717a', marginLeft: 4 }}>· {wo.lot_count} lots</span>
-                      )}
-                    </td>
-                    <td style={{ padding: '2px 0 2px 6px', textAlign: 'right' }}>{wo.quantity ?? '–'}</td>
-                    <td style={{ padding: '2px 0 2px 6px', textAlign: 'right' }}>{wo.rate?.toFixed(2) ?? '–'}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </section>
-      ))}
-    </div>
+    <table style={{ width: '100%', fontSize: '0.74rem', borderCollapse: 'collapse' }}>
+      <thead>
+        <tr style={{ color: '#71717a', textAlign: 'left' }}>
+          <th style={thStyle('product')} onClick={() => toggleSort('product')}>{t('breakdownColProduct')}{sortIcon('product')}</th>
+          <th style={thStyle('location')} onClick={() => toggleSort('location')}>{t('breakdownColLocation')}{sortIcon('location')}</th>
+          <th style={thStyle('start')} onClick={() => toggleSort('start')}>{t('breakdownColStart')}{sortIcon('start')}</th>
+          <th style={thStyle('end')} onClick={() => toggleSort('end')}>{t('breakdownColEnd')}{sortIcon('end')}</th>
+          <th style={{ paddingBottom: 2, textAlign: 'right' }}>{t('breakdownColQty')}</th>
+          <th style={{ paddingBottom: 2, textAlign: 'right' }}>{t('breakdownColPeakLoad')}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {sortWos(contributors, sortCol, sortDir).map((wo, wi) => {
+          // WO pegging is keyed by (demand_id, product_id, location_id, method) for a
+          // single-demand WO, or (demand_ids, win_start, win_end, product_id, location_id,
+          // method) for a cross-demand consolidated batch (wo.demand_id is null but the WO
+          // still carries the set of demands it serves in demand_ids). The breakdown only
+          // emits make-WO contributors, but read method off the row when present so future
+          // non-make rows still resolve.
+          const hasDemandIds = !!(wo.demand_ids && wo.demand_ids.length > 0);
+          const peggable = !!(wo.product_id && wo.location_id && (wo.demand_id || hasDemandIds));
+          return (
+            <tr key={`${wo.wo_group_id ?? ''}-${wi}`} style={{ borderTop: '1px solid #27272a' }}>
+              <td style={{ padding: '2px 6px 2px 0', fontFamily: 'monospace' }}>
+                {peggable ? (
+                  <button
+                    type="button"
+                    onClick={() => onOpenWoPegging({
+                      // '' for a cross-demand consolidated batch — rendered by
+                      // ConsolidatedWoAccordion, which derives its own demand/lot
+                      // breakdown from work_orders_native + woGroupId alone.
+                      demandId: wo.demand_id ?? '',
+                      productId: wo.product_id!,
+                      locationId: wo.location_id!,
+                      method: 'make',
+                      woGroupId: wo.wo_group_id ?? null,
+                      startTime: wo.start_time ?? null,
+                    })}
+                    title={t('breakdownOpenWoPegging')}
+                    style={{
+                      background: 'none', border: 'none', padding: 0, cursor: 'pointer',
+                      color: '#60a5fa', fontFamily: 'monospace', fontSize: 'inherit',
+                      textDecoration: 'underline', textUnderlineOffset: 2,
+                    }}
+                  >{wo.product_id}</button>
+                ) : (
+                  <span>{wo.product_id}</span>
+                )}
+              </td>
+              <td style={{ padding: '2px 6px 2px 0' }}>{wo.location_id ?? '–'}</td>
+              <td style={{ padding: '2px 6px 2px 0' }}>{wo.start_time ?? '–'}</td>
+              <td style={{ padding: '2px 6px 2px 0' }}>
+                {wo.end_time ?? '–'}
+                {wo.lot_count && wo.lot_count > 1 && (
+                  <span style={{ color: '#71717a', marginLeft: 4 }}>· {wo.lot_count} lots</span>
+                )}
+              </td>
+              <td style={{ padding: '2px 0 2px 6px', textAlign: 'right' }}>
+                {wo.quantity != null ? wo.quantity.toLocaleString(undefined, { maximumFractionDigits: 2 }) : '–'}
+              </td>
+              <td style={{ padding: '2px 0 2px 6px', textAlign: 'right' }}>{wo.peak_load?.toFixed(2) ?? '–'}</td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
   );
 }
 

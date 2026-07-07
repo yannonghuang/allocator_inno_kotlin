@@ -555,6 +555,10 @@ export type ResourceUtilizationRow = {
   contributors?: Array<{
     wo_group_id?: string | null;
     demand_id?: string | null;
+    /** Every demand this WO serves. For a cross-demand consolidated batch
+     *  (demand_id null), pass this as `demand_ids` to getWorkOrderPegging —
+     *  there's no single demand_id to key pegging resolution off. */
+    demand_ids?: string[];
     product_id?: string;
     location_id?: string;
     quantity?: number;
@@ -564,6 +568,10 @@ export type ResourceUtilizationRow = {
      *  rows by wo_group_id so a multi-lot WO is a single row. */
     lot_count?: number;
     rate?: number;
+    /** This WO's own peak contribution to the resource's daily load (busiest
+     *  wave's concurrent-lot count × rate) — more meaningful than `rate` alone,
+     *  which is a per-lot constant that doesn't vary by row. */
+    peak_load?: number;
   }>;
 };
 

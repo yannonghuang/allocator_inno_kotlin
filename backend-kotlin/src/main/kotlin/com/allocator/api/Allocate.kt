@@ -737,7 +737,16 @@ fun Routing.allocateRoutes() {
             val jpath = "\$.** ? (@.type == \"work_order\" && @.product_id == \$prod && @.location_id == \$loc && @.method == \$meth)"
             transaction {
                 exec(
-                    "SELECT p.demand_id, jsonb_path_query(p.entry::jsonb, '$jpath'::jsonpath, " +
+                    // DISTINCT: "$.**"'s recursive descent can revisit and return the exact same
+                    // matching node more than once for a single plan_pegging row (verified against
+                    // live data: every distinct work_order match came back doubled, even though the
+                    // stored JSON embeds each node exactly once — a jsonpath execution artifact, not
+                    // a data duplication). A genuinely distinct WO occurrence (different
+                    // wo_group_id/quantity/timing) has different jsonb content and survives DISTINCT;
+                    // only byte-for-byte duplicates of the same match collapse. Without this, callers
+                    // that sum multiple matches (the wo_group_id disambiguation path, and the
+                    // cross-demand batch aggregate) silently double-count.
+                    "SELECT DISTINCT p.demand_id, jsonb_path_query(p.entry::jsonb, '$jpath'::jsonpath, " +
                     "jsonb_build_object('prod', ?, 'loc', ?, 'meth', ?)) AS wo_node " +
                     "FROM plan_pegging p " +
                     "WHERE p.plan_run_id = ? AND p.demand_id IN ($idsLiteral)",
@@ -885,7 +894,27 @@ fun Routing.allocateRoutes() {
                         )
                     }
                 } else {
-                    node["children"] = windowed.map { it - "__src_demand" }
+                    // Group by the demand each occurrence came from — matches the "Demand
+                    // breakdown" panel's own grouping — instead of a flat OR-alternatives list.
+                    // These are additive per-demand shares of one consolidated batch, not
+                    // alternative supply paths, so wrap each demand's own WO node(s) under a
+                    // "demand" header (marked consolidated_consumer so the tree renders the
+                    // "required in the following demands" label instead of the OR-supply one —
+                    // unlike the purchase case above, these demand nodes keep their own real
+                    // children, i.e. each demand's full WO sub-tree, not a terminal attribution).
+                    val byDemand = windowed.groupBy { (it["__src_demand"] as? String) ?: "" }.filterKeys { it.isNotBlank() }
+                    node["children"] = byDemand.map { (did, nodes) ->
+                        mapOf(
+                            "type" to "demand",
+                            "product_id" to productId,
+                            "location_id" to locationId,
+                            "demand_id" to did,
+                            "quantity" to nodes.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 },
+                            "committed_qty" to nodes.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 },
+                            "consolidated_consumer" to true,
+                            "children" to nodes.map { it - "__src_demand" },
+                        )
+                    }
                 }
                 node
             } else {
