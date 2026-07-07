@@ -3280,9 +3280,12 @@ internal fun crossWaveCalendarMerge(
         }
         val mergedEnd = dateAddDays(mergedStart, leadDays) ?: mergedStart
 
-        // Merge competing demands + split details from all constituent rows.
-        // Singleton rows only set demand_id (not wo_competing_demands); fall back to it so
-        // cross-wave merges of singletons still produce a non-empty consolidated_demand_ids.
+        // Merge competing demands + split details from all constituent rows. Both
+        // singletonRow() and mergedRow() always set wo_competing_demands /
+        // consolidation_split_details now, but fall back to demand_id / (demand_id, quantity)
+        // defensively in case some other row-producer ever omits them — same shape of fallback
+        // for both, so the two lists can't silently diverge the way they used to when only
+        // wo_competing_demands had a fallback and consolidation_split_details didn't.
         @Suppress("UNCHECKED_CAST")
         val allDemands = rows.flatMap { row ->
             val fromCompeting = (row["wo_competing_demands"] as? List<String>) ?: emptyList()
@@ -3290,9 +3293,23 @@ internal fun crossWaveCalendarMerge(
             fromCompeting.ifEmpty { fromDemandId }
         }.distinct()
         @Suppress("UNCHECKED_CAST")
-        val mergedSplit = rows.flatMap { (it["consolidation_split_details"] as? List<Map<String, Any?>>) ?: emptyList() }
+        val mergedSplit = rows.flatMap { row ->
+            val fromSplit = (row["consolidation_split_details"] as? List<Map<String, Any?>>) ?: emptyList()
+            val fromDemandId = (row["demand_id"] as? String)?.takeIf { it.isNotBlank() }?.let { d ->
+                listOf(mapOf("demand_id" to d, "allocated_qty" to ((row["quantity"] as? Number)?.toDouble() ?: 0.0)))
+            } ?: emptyList()
+            fromSplit.ifEmpty { fromDemandId }
+        }
             .groupBy { it["demand_id"] as? String }
             .map { (d, es) -> mapOf("demand_id" to d, "allocated_qty" to es.sumOf { (it["allocated_qty"] as? Number)?.toDouble() ?: 0.0 }) }
+        // Regression guard: every demand counted in allDemands should have a matching split entry
+        // (and the splits should sum to totalQty) — should never fire after the fallback above.
+        val splitIds = mergedSplit.mapNotNull { it["demand_id"] as? String }.toSet()
+        val missingFromSplit = allDemands.filterNot { it in splitIds }
+        if (missingFromSplit.isNotEmpty()) {
+            log.warn("[wo-consolidation] {} demand(s) in wo_competing_demands but missing from consolidation_split_details for product={} location={} method={}: {}",
+                missingFromSplit.size, pid, lid, method, missingFromSplit)
+        }
         val newCgid = rows[0]["consolidated_group_id"] as? String ?: nextWoGroupId()
         for (r in rows) { val c = r["consolidated_group_id"] as? String; if (c != null) cgidRemap[c] = newCgid }
 
@@ -3563,17 +3580,22 @@ internal fun consolidateByWaves(
                 "demand_ids"   to info.demandQty.keys.toList(),
                 "demand_splits" to demandSplits,
             )))
-            // crossWaveCalendarMerge aggregates allDemands from wo_competing_demands;
-            // singleton rows must emit it so their demand IDs survive the merge.
-            put("wo_competing_demands", info.demandQty.keys.toList())
-            if (info.sampleMembers != null) put("consolidated_demand_ids", info.sampleMembers)
-            else put("consolidated_demand_ids", info.demandQty.keys.toList())
         } else {
             val lotSize = (maxLotSize(info.pid, info.lid, data)?.takeIf { it > 0 } ?: info.totalQty).coerceAtLeast(1e-9)
             put("lot_count", Math.ceil(info.totalQty / lotSize).toInt().coerceAtLeast(1))
             put("max_lot_size", lotSize)
         }
-        if (info.method != "move" && info.sampleMembers != null) put("consolidated_demand_ids", info.sampleMembers)
+        // crossWaveCalendarMerge aggregates allDemands from wo_competing_demands (falling back to
+        // demand_id only when this list is absent) and separately sums consolidation_split_details
+        // by demand_id — always emit both consistently here, matching mergedRow()'s shape exactly,
+        // so a singleton row that later cross-wave-merges with other demands' rows doesn't silently
+        // drop its own demand's quantity from the merged split (it would still count toward the
+        // merged row's total quantity, so the visible per-demand splits would stop summing to it).
+        put("wo_competing_demands", info.demandQty.keys.toList())
+        put("consolidated_demand_ids", info.sampleMembers ?: info.demandQty.keys.toList())
+        if (info.demandQty.isNotEmpty()) {
+            put("consolidation_split_details", info.demandQty.entries.map { (d, q) -> mapOf("demand_id" to d, "allocated_qty" to q) })
+        }
     }
 
     fun mergedRow(gids: List<String>, mergedStart: LocalDate, mergedEnd: LocalDate, cgid: String): Map<String, Any?> {

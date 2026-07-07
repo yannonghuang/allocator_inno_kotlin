@@ -581,10 +581,13 @@ export async function getResourceUtilization(caseId: number, runId: number): Pro
 
 /** Fetch work-order pegging on demand: how this WO is fulfilled by its supplies (all levels). Requires a prior plan run.
  *  `start_time` disambiguates which slot/lot to return when a (demand, product, location, method) tuple
- *  has multiple matches (waterfall slots or multi-lot WOs). Pass the WO row's start_time. */
+ *  has multiple matches (waterfall slots or multi-lot WOs). Pass the WO row's start_time.
+ *  `wo_group_id` disambiguates further: two separate lots for the same demand can share an
+ *  identical start_time, which start_time alone can't tell apart — pass the lot's own native
+ *  wo_group_id (unique per physical lot) when known. */
 export async function getWorkOrderPegging(
   caseId: number,
-  params: { demand_id: string; product_id: string; location_id: string; method: string; start_time?: string | null; run_id?: number; demand_ids?: string[]; win_start?: string | null; win_end?: string | null }
+  params: { demand_id: string; product_id: string; location_id: string; method: string; start_time?: string | null; wo_group_id?: string | null; run_id?: number; demand_ids?: string[]; win_start?: string | null; win_end?: string | null }
 ): Promise<{ tree: PlanningPeggingNode }> {
   const sp = new URLSearchParams({
     demand_id: params.demand_id,
@@ -593,6 +596,7 @@ export async function getWorkOrderPegging(
     method: params.method,
   });
   if (params.start_time) sp.set('start_time', params.start_time);
+  if (params.wo_group_id) sp.set('wo_group_id', params.wo_group_id);
   if (params.run_id != null) sp.set('run_id', String(params.run_id));
   // For a cross-demand batched WO (demand_id blank), forward its constituent demands so the
   // endpoint can aggregate the original per-demand pegging nodes.

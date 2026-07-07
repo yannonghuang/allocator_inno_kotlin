@@ -125,6 +125,17 @@ class Pass2WoConsolidationTest : FunSpec({
         out.size shouldBe 1
         out[0]["product_id"] shouldBe "RAW1"
         out.none { it["consolidated"] == true } shouldBe true
+        // A singleton row must carry the same wo_competing_demands / consolidation_split_details
+        // shape a merged row does — otherwise a later cross-wave merge with other demands' rows
+        // would silently drop this demand's quantity from the merged split while still counting
+        // it in the merged total (the accordion "missing count" bug: demand shown, no qty next to it).
+        @Suppress("UNCHECKED_CAST")
+        (out[0]["wo_competing_demands"] as List<String>) shouldContainExactlyInAnyOrder listOf("D1")
+        @Suppress("UNCHECKED_CAST")
+        val splitDetails = out[0]["consolidation_split_details"] as List<Map<String, Any?>>
+        splitDetails.size shouldBe 1
+        splitDetails[0]["demand_id"] shouldBe "D1"
+        (splitDetails[0]["allocated_qty"] as Number).toDouble() shouldBe (100.0 plusOrMinus 1e-6)
     }
 
     test("PARTITION invariant — every native belongs to EXACTLY ONE consolidated WO; qty conserved") {
