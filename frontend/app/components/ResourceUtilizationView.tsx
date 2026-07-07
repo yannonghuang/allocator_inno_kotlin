@@ -799,9 +799,6 @@ function BreakdownSlideIn({
                     key={peggingWo.woGroupId ?? ''}
                     caseId={caseId}
                     planRunId={planRunId}
-                    productId={peggingWo.productId}
-                    locationId={peggingWo.locationId}
-                    method={peggingWo.method}
                     woGroupId={peggingWo.woGroupId ?? ''}
                     workOrdersNative={accordionData.workOrdersNative}
                     planningPegging={accordionData.planningPegging}

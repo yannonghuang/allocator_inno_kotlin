@@ -1351,10 +1351,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [woExplainOpen, setWoExplainOpen] = useState(false);
   const [woExplainRow, setWoExplainRow] = useState<WorkOrder | null>(null);
   const [woExplainKey, setWoExplainKey] = useState<string | null>(null);
-  // Make WOs offer both a manifest table and the pegging accordion — which one
-  // is showing for the currently-open WO row. Resets to 'manifest' whenever the
-  // pegging panel's context changes (see the reset effect near planPeggingContext).
-  const [makeWoViewMode, setMakeWoViewMode] = useState<'manifest' | 'pegging'>('manifest');
+  // Make WOs, and single-product move WOs, offer both a manifest table and the pegging
+  // accordion — which one is showing for the currently-open WO row. Resets to 'manifest'
+  // whenever the pegging panel's context changes (see the reset effect near planPeggingContext).
+  const [manifestViewMode, setManifestViewMode] = useState<'manifest' | 'pegging'>('manifest');
   const [woScheduleModalRow, setWoScheduleModalRow] = useState<WorkOrder | null>(null);
   const [supExplainOpen, setSupExplainOpen] = useState(false);
   const [supExplainRow, setSupExplainRow] = useState<PlanSupplyViewRow | null>(null);
@@ -2020,12 +2020,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return () => { cancelled = true; };
   }, [id]);
 
-  // Reset active-demand selection and the make-WO manifest/pegging toggle when the user opens
-  // pegging for a different WO. The consolidated accordion's own open/expand state resets via
-  // its `key` prop remounting it (see the ConsolidatedWoAccordion render site) instead of here.
+  // Reset active-demand selection and the manifest/pegging toggle when the user opens pegging
+  // for a different WO. The consolidated accordion's own open/expand state resets via its `key`
+  // prop remounting it (see the ConsolidatedWoAccordion render site) instead of here.
   useEffect(() => {
     setWoPeggingActiveDemandId(null);
-    setMakeWoViewMode('manifest');
+    setManifestViewMode('manifest');
   }, [planPeggingContext]);
 
   // When the pegging panel opens for a demand, auto-expand the critical-path
@@ -9920,8 +9920,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 ? consolidatedDemandIds
                 : (row.demand_id ? [row.demand_id] : []);
               if (row.method !== 'move' && row.method !== 'purchase' && allDemandIds.length === 0) return null;
-              // Move + purchase + make WOs: show a manifest (demand × component × qty). Make WOs
-              // additionally offer the pegging accordion via a toggle (manifest is the default).
+              // Move + purchase + make WOs: show a manifest (demand × component × qty). Make and
+              // move WOs additionally offer the pegging accordion via a toggle (manifest is the
+              // default) — the accordion traces each native lot against its own product, so a
+              // mixed-cargo move batch works the same as a single-product one.
               // crossWaveCalendarMerge flatMaps move_components from singletonRow outputs that had none,
               // producing [] (truthy but empty). Treat empty move_components as absent so the synthesis runs.
               type MoveComp = { product_id: string; quantity: number; demand_ids?: string[]; demand_splits?: { demand_id: string; quantity: number }[] };
@@ -9941,14 +9943,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   }
                   return null;
                 })();
+              const canTogglePegging = row.method === 'make' || row.method === 'move';
               const accordion = (
                 <ConsolidatedWoAccordion
                   key={row.wo_group_id ?? ''}
                   caseId={Number(id)}
                   planRunId={currentPlanRunId}
-                  productId={String(row.product_id ?? '').trim()}
-                  locationId={String(row.location_id ?? '').trim()}
-                  method={String(row.method ?? '').trim()}
                   woGroupId={row.wo_group_id ?? ''}
                   workOrdersNative={planResult?.work_orders_native ?? []}
                   planningPegging={planResult?.planning_pegging ?? []}
@@ -10001,22 +10001,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     }}
                   />
                 );
-                if (row.method !== 'make') return manifestTable;
+                if (!canTogglePegging) return manifestTable;
                 return (
                   <div style={{ flex: 1, overflow: 'hidden', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
                     <div style={{ display: 'flex', gap: 6, marginBottom: '0.6rem', flexShrink: 0 }}>
                       <button type="button"
-                        className={makeWoViewMode === 'manifest' ? undefined : 'secondary'}
+                        className={manifestViewMode === 'manifest' ? undefined : 'secondary'}
                         style={{ fontSize: '0.78rem', padding: '3px 10px' }}
-                        onClick={() => setMakeWoViewMode('manifest')}
+                        onClick={() => setManifestViewMode('manifest')}
                       >{tP('workOrders.moveManifest.viewManifest')}</button>
                       <button type="button"
-                        className={makeWoViewMode === 'pegging' ? undefined : 'secondary'}
+                        className={manifestViewMode === 'pegging' ? undefined : 'secondary'}
                         style={{ fontSize: '0.78rem', padding: '3px 10px' }}
-                        onClick={() => setMakeWoViewMode('pegging')}
+                        onClick={() => setManifestViewMode('pegging')}
                       >{tP('workOrders.moveManifest.viewPegging')}</button>
                     </div>
-                    {makeWoViewMode === 'manifest' ? manifestTable : accordion}
+                    {manifestViewMode === 'manifest' ? manifestTable : accordion}
                   </div>
                 );
               }
