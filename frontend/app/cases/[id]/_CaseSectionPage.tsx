@@ -6137,9 +6137,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         );
                       }},
                     ];
-                    // Consolidated tab: remove per-demand action columns that don't apply.
+                    // Consolidated tab: remove per-demand columns that don't apply — a consolidated
+                    // row can serve multiple demands (view them via the manifest/pegging accordion
+                    // instead of a single "Demand" column) and has no per-row schedule-impact action.
                     if (woTableTab === 'consolidated') {
-                      const hide = new Set(['_woschedule']);
+                      const hide = new Set(['_woschedule', '_demand_label']);
                       for (let i = woColumns.length - 1; i >= 0; i--) {
                         if (hide.has(woColumns[i].key as string)) woColumns.splice(i, 1);
                       }
