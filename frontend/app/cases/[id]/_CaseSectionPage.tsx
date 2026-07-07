@@ -779,6 +779,7 @@ import BomGraphTab from '@/app/components/BomGraphTab';
 import { ResourceUtilizationView } from '@/app/components/ResourceUtilizationView';
 import { PlanningPeggingTreeView } from '@/app/components/PlanningPeggingTreeView';
 import { ConsolidatedWoAccordion } from '@/app/components/ConsolidatedWoAccordion';
+import { WoManifestTable } from '@/app/components/WoManifestTable';
 import { qtyFmt } from '@/app/lib/format';
 
 // ── Assessment criteria helpers ────────────────────────────────────────────────
@@ -1350,8 +1351,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [woExplainOpen, setWoExplainOpen] = useState(false);
   const [woExplainRow, setWoExplainRow] = useState<WorkOrder | null>(null);
   const [woExplainKey, setWoExplainKey] = useState<string | null>(null);
-  const [manifestSortCol, setManifestSortCol] = useState<'demand' | 'comp' | 'qty'>('demand');
-  const [manifestSortDir, setManifestSortDir] = useState<'asc' | 'desc'>('asc');
+  // Make WOs offer both a manifest table and the pegging accordion — which one
+  // is showing for the currently-open WO row. Resets to 'manifest' whenever the
+  // pegging panel's context changes (see the reset effect near planPeggingContext).
+  const [makeWoViewMode, setMakeWoViewMode] = useState<'manifest' | 'pegging'>('manifest');
   const [woScheduleModalRow, setWoScheduleModalRow] = useState<WorkOrder | null>(null);
   const [supExplainOpen, setSupExplainOpen] = useState(false);
   const [supExplainRow, setSupExplainRow] = useState<PlanSupplyViewRow | null>(null);
@@ -2017,11 +2020,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return () => { cancelled = true; };
   }, [id]);
 
-  // Reset active-demand selection when the user opens pegging for a different WO. The
-  // consolidated accordion's own open/expand state resets via its `key` prop remounting it
-  // (see the ConsolidatedWoAccordion render site) instead of an effect here.
+  // Reset active-demand selection and the make-WO manifest/pegging toggle when the user opens
+  // pegging for a different WO. The consolidated accordion's own open/expand state resets via
+  // its `key` prop remounting it (see the ConsolidatedWoAccordion render site) instead of here.
   useEffect(() => {
     setWoPeggingActiveDemandId(null);
+    setMakeWoViewMode('manifest');
   }, [planPeggingContext]);
 
   // When the pegging panel opens for a demand, auto-expand the critical-path
@@ -9916,7 +9920,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 ? consolidatedDemandIds
                 : (row.demand_id ? [row.demand_id] : []);
               if (row.method !== 'move' && row.method !== 'purchase' && allDemandIds.length === 0) return null;
-              // Move + purchase WOs: show manifest (demand × component × qty) instead of accordion/pegging.
+              // Move + purchase + make WOs: show a manifest (demand × component × qty). Make WOs
+              // additionally offer the pegging accordion via a toggle (manifest is the default).
               // crossWaveCalendarMerge flatMaps move_components from singletonRow outputs that had none,
               // producing [] (truthy but empty). Treat empty move_components as absent so the synthesis runs.
               type MoveComp = { product_id: string; quantity: number; demand_ids?: string[]; demand_splits?: { demand_id: string; quantity: number }[] };
@@ -9928,7 +9933,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     if (!pid) return null;
                     return [{ product_id: pid, quantity: row.quantity as number, demand_ids: allDemandIds }];
                   }
-                  if (row.method === 'purchase' && row.product_id) {
+                  if ((row.method === 'purchase' || row.method === 'make') && row.product_id) {
                     if (splitDetails.length > 0) {
                       return splitDetails.map((d) => ({ product_id: row.product_id!, quantity: d.allocated_qty, demand_ids: [d.demand_id] }));
                     }
@@ -9936,6 +9941,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   }
                   return null;
                 })();
+              const accordion = (
+                <ConsolidatedWoAccordion
+                  key={row.wo_group_id ?? ''}
+                  caseId={Number(id)}
+                  planRunId={currentPlanRunId}
+                  productId={String(row.product_id ?? '').trim()}
+                  locationId={String(row.location_id ?? '').trim()}
+                  method={String(row.method ?? '').trim()}
+                  woGroupId={row.wo_group_id ?? ''}
+                  workOrdersNative={planResult?.work_orders_native ?? []}
+                  planningPegging={planResult?.planning_pegging ?? []}
+                />
+              );
               if ((effectiveMoveComponents?.length ?? 0) >= 1) {
                 const comps = effectiveMoveComponents!;
                 const committedDemandIds = new Set(planResult?.committed_demands.map((d) => d.demand_id) ?? []);
@@ -9961,94 +9979,51 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     manifestRows.push({ demand: committedDemands[0] ?? null, comp: c.product_id, qty: Number(c.quantity) });
                   }
                 }
-                const demandKey = (r2: { demand: string | null }) => r2.demand ?? '–';
-                const dir = manifestSortDir === 'asc' ? 1 : -1;
-                manifestRows.sort((a, b) => {
-                  if (manifestSortCol === 'qty') return dir * (a.qty - b.qty);
-                  if (manifestSortCol === 'comp') return dir * (a.comp.localeCompare(b.comp) || demandKey(a).localeCompare(demandKey(b)));
-                  return dir * (demandKey(a).localeCompare(demandKey(b)) || a.comp.localeCompare(b.comp));
-                });
-                const distinctDemands = new Set(manifestRows.map((r2) => r2.demand).filter(Boolean)).size;
-                const distinctComps = new Set(manifestRows.map((r2) => r2.comp)).size;
                 // Physical total from components (includes units serving virtual/consolidated demands).
                 const totalQty = comps.reduce((s, c) => s + Number(c.quantity), 0);
-                const thStyle = (col: typeof manifestSortCol, align: 'left' | 'right' = 'left'): React.CSSProperties => ({
-                  textAlign: align, padding: '5px 14px 5px 0', fontWeight: 500, cursor: 'pointer',
-                  userSelect: 'none', color: manifestSortCol === col ? '#e4e4e7' : '#71717a',
-                  ...(align === 'right' ? { paddingRight: 0 } : {}),
-                });
-                const sortIcon = (col: typeof manifestSortCol) =>
-                  manifestSortCol === col ? (manifestSortDir === 'asc' ? ' ▲' : ' ▼') : '';
-                const toggleSort = (col: typeof manifestSortCol) => {
-                  if (manifestSortCol === col) setManifestSortDir((d) => d === 'asc' ? 'desc' : 'asc');
-                  else { setManifestSortCol(col); setManifestSortDir('asc'); }
-                };
+                const manifestTable = (
+                  <WoManifestTable
+                    rows={manifestRows}
+                    totalQty={totalQty}
+                    committedDemands={planResult?.committed_demands ?? []}
+                    onOpenDemandPegging={(demandRow, demandId) => {
+                      setPreviousManifestWoRow(row);
+                      setPlanPeggingContext({ type: 'demand', row: demandRow });
+                      setWoPeggingRowKey(`demand|${demandId}|${demandRow.product_id ?? ''}|${demandRow.location_id ?? ''}`);
+                      setPlanWorkOrderPeggingError(null);
+                    }}
+                    labels={{
+                      demand: tP('workOrders.moveManifest.demand'),
+                      component: tP('workOrders.moveManifest.component'),
+                      qty: tP('workOrders.moveManifest.qty'),
+                      footerDemands: tP('workOrders.moveManifest.footerDemands'),
+                      footerComponents: tP('workOrders.moveManifest.footerComponents'),
+                    }}
+                  />
+                );
+                if (row.method !== 'make') return manifestTable;
                 return (
-                  <div style={{ flex: 1, overflow: 'auto', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' }}>
-                      <thead>
-                        <tr style={{ borderBottom: '2px solid #3f3f46', position: 'sticky', top: 0, background: '#1c1c1e' }}>
-                          <th style={thStyle('demand')} onClick={() => toggleSort('demand')}>{tP('workOrders.moveManifest.demand')}{sortIcon('demand')}</th>
-                          <th style={thStyle('comp')} onClick={() => toggleSort('comp')}>{tP('workOrders.moveManifest.component')}{sortIcon('comp')}</th>
-                          <th style={{ ...thStyle('qty', 'right'), paddingRight: 0 }} onClick={() => toggleSort('qty')}>{tP('workOrders.moveManifest.qty')}{sortIcon('qty')}</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {manifestRows.map((r2, i) => {
-                          const demandRow = r2.demand ? (planResult?.committed_demands.find((cd) => cd.demand_id === r2.demand) ?? null) : null;
-                          return (
-                            <tr key={i} style={{ borderBottom: '1px solid #27272a' }}>
-                              <td style={{ padding: '5px 14px 5px 0', wordBreak: 'break-all', fontSize: '0.8rem' }}>
-                                {!r2.demand ? (
-                                  <span style={{ color: '#a1a1aa' }}>–</span>
-                                ) : demandRow ? (
-                                  <button type="button"
-                                    style={{ background: 'none', border: 'none', padding: 0, color: '#60a5fa', cursor: 'pointer', textDecoration: 'underline', fontSize: 'inherit', textAlign: 'left', wordBreak: 'break-all' }}
-                                    onClick={() => {
-                                      setPreviousManifestWoRow(row);
-                                      setPlanPeggingContext({ type: 'demand', row: demandRow });
-                                      setWoPeggingRowKey(`demand|${r2.demand}|${demandRow.product_id ?? ''}|${demandRow.location_id ?? ''}`);
-                                      setPlanWorkOrderPeggingError(null);
-                                    }}
-                                  >{r2.demand}</button>
-                                ) : (
-                                  <span style={{ color: '#a1a1aa' }}>{r2.demand}</span>
-                                )}
-                              </td>
-                              <td style={{ padding: '5px 14px 5px 0', color: '#e4e4e7', fontFamily: 'monospace', fontSize: '0.8rem' }}>{r2.comp}</td>
-                              <td style={{ padding: '5px 0', textAlign: 'right', color: '#fafafa', fontVariantNumeric: 'tabular-nums' }}>{qtyFmt(r2.qty)}</td>
-                            </tr>
-                          );
-                        })}
-
-                      </tbody>
-                      <tfoot>
-                        <tr style={{ borderTop: '2px solid #3f3f46', color: '#a1a1aa', fontSize: '0.78rem' }}>
-                          <td style={{ padding: '5px 14px 5px 0' }}>{distinctDemands} {tP('workOrders.moveManifest.footerDemands')}</td>
-                          <td style={{ padding: '5px 14px 5px 0' }}>{distinctComps} {tP('workOrders.moveManifest.footerComponents')}</td>
-                          <td style={{ padding: '5px 0', textAlign: 'right', color: '#fafafa', fontVariantNumeric: 'tabular-nums' }}>{qtyFmt(totalQty)}</td>
-                        </tr>
-                      </tfoot>
-                    </table>
+                  <div style={{ flex: 1, overflow: 'hidden', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                    <div style={{ display: 'flex', gap: 6, marginBottom: '0.6rem', flexShrink: 0 }}>
+                      <button type="button"
+                        className={makeWoViewMode === 'manifest' ? undefined : 'secondary'}
+                        style={{ fontSize: '0.78rem', padding: '3px 10px' }}
+                        onClick={() => setMakeWoViewMode('manifest')}
+                      >{tP('workOrders.moveManifest.viewManifest')}</button>
+                      <button type="button"
+                        className={makeWoViewMode === 'pegging' ? undefined : 'secondary'}
+                        style={{ fontSize: '0.78rem', padding: '3px 10px' }}
+                        onClick={() => setMakeWoViewMode('pegging')}
+                      >{tP('workOrders.moveManifest.viewPegging')}</button>
+                    </div>
+                    {makeWoViewMode === 'manifest' ? manifestTable : accordion}
                   </div>
                 );
               }
-              // Single-product consolidated WO: accordion — one section per logical WO.
+              // Single-product consolidated WO with no synthesizable manifest: accordion only.
               // Shared with ResourceUtilizationView's own "Consolidated" drill-down so both
               // surfaces render this identically instead of two independently-drifting copies.
-              return (
-                <ConsolidatedWoAccordion
-                  key={row.wo_group_id ?? ''}
-                  caseId={Number(id)}
-                  planRunId={currentPlanRunId}
-                  productId={String(row.product_id ?? '').trim()}
-                  locationId={String(row.location_id ?? '').trim()}
-                  method={String(row.method ?? '').trim()}
-                  woGroupId={row.wo_group_id ?? ''}
-                  workOrdersNative={planResult?.work_orders_native ?? []}
-                  planningPegging={planResult?.planning_pegging ?? []}
-                />
-              );
+              return accordion;
             })()}
             {planPeggingContext.type === 'work_order' && (() => {
               const row = planPeggingContext.row as WorkOrder;

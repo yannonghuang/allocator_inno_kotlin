@@ -561,7 +561,9 @@
         "qty": "Qty",
         "footerDemands": "demands",
         "footerComponents": "components",
-        "backToManifest": "Back to manifest"
+        "backToManifest": "Back to manifest",
+        "viewManifest": "Manifest",
+        "viewPegging": "Pegging"
       },
       "scheduleHorizon": {
         "weekly": "Weekly",
