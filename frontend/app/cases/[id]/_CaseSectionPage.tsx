@@ -1452,10 +1452,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     const ms = (config.method_selection ?? {}) as Record<string, unknown>;
     const cs = (config.consolidation ?? {}) as Record<string, unknown>;
     const diffs: string[] = [];
-    if (ms.mode !== 'preference') diffs.push(`mode: preference → ${ms.mode}`);
     if (Number(ms.max_methods) !== 1) diffs.push(`max_methods: 1 → ${ms.max_methods}`);
     if (Number(ms.depth) !== 1) diffs.push(`depth: 1 → ${ms.depth}`);
-    if (ms.max_bom_depth != null && Number(ms.max_bom_depth) !== 3) diffs.push(`max_bom_depth: 3 → ${ms.max_bom_depth}`);
     const defaultScale = 'weekly';
     const globalFb = (cs.wo_batch_scale as string) ?? defaultScale;
     (['make', 'move', 'purchase'] as const).forEach((k) => {
@@ -1475,15 +1473,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const presetConfigSummary = (config: Record<string, unknown>): string => {
     const ms = (config.method_selection ?? {}) as Record<string, unknown>;
     const cs = (config.consolidation ?? {}) as Record<string, unknown>;
-    const sw = (ms.score_weights ?? {}) as Record<string, number>;
     const parts: string[] = [];
-    parts.push(`m=${ms.mode ?? 'preference'}`);
     parts.push(`max=${ms.max_methods ?? 2}`);
     parts.push(`d=${ms.depth ?? 1}`);
-    parts.push(`bom=${ms.max_bom_depth ?? 3}`);
-    if (sw && (sw.commit_time != null || sw.inventory_consumed != null || sw.purchase != null)) {
-      parts.push(`w=(${Number(sw.commit_time ?? 0)}, ${Number(sw.inventory_consumed ?? 0)}, ${Number(sw.purchase ?? 0)})`);
-    }
     parts.push(`wo_batch=${cs.enabled === false ? 'off' : 'on'}`);
     const globalFb = (cs.wo_batch_scale as string) ?? 'weekly';
     const mScale  = ((cs as Record<string, unknown>).make_batch_scale as string) ?? globalFb;
@@ -1500,7 +1492,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       depth: 1,
       multiple: false,
       max_methods: 1,
-      max_bom_depth: 3,
     },
     consolidation: {
       enabled: true,
@@ -1535,22 +1526,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         break;
       }
       case 'purchase_allowed':    cfg.purchase_allowed = value; break;
-      case 'mode':
-        ms.mode = value;
-        break;
-      // Compound axis: scoring profile implies mode=elaborate + a weight triple.
-      case 'score_weights': {
-        ms.mode = 'elaborate';
-        ms.elaborate = true;
-        const profile = String(value);
-        const weights: Record<string, number> =
-          profile === 'commit'    ? { commit_time: 1, inventory_consumed: 0, purchase: 0 } :
-          profile === 'inventory' ? { commit_time: 0, inventory_consumed: 1, purchase: 0 } :
-          profile === 'purchase'  ? { commit_time: 0, inventory_consumed: 0, purchase: 1 } :
-                                     { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 }; // balanced
-        ms.score_weights = weights;
-        break;
-      }
     }
     return cfg;
   };
@@ -4645,42 +4620,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 title={tP('config.methodMaxCountTooltip')}
               >
                 <span style={{ color: '#a1a1aa' }}>{tP('config.methodMaxCount')}</span>
-                <select
+                <input
+                  type="number"
+                  min={1}
                   value={(() => {
                     const ms = planningConfig.method_selection;
-                    if (typeof ms?.max_methods === 'number') return Math.max(1, Math.min(4, Math.trunc(ms.max_methods)));
+                    if (typeof ms?.max_methods === 'number') return Math.max(1, Math.trunc(ms.max_methods));
                     if (ms?.multiple === false) return 1;
                     return 2;
                   })()}
                   onChange={(e) => setPlanningConfig((c) => {
-                    const v = Math.max(1, Math.min(4, parseInt(e.target.value, 10) || 2));
+                    const v = Math.max(1, parseInt(e.target.value, 10) || 2);
                     // Drop legacy `multiple` on save; backend resolution prefers max_methods anyway.
                     const { multiple: _drop, ...rest } = c.method_selection ?? {};
                     void _drop;
                     return { ...c, method_selection: { ...rest, max_methods: v } };
                   })}
-                  style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
-                >
-                  <option value={1}>1</option>
-                  <option value={2}>2</option>
-                  <option value={3}>3</option>
-                  <option value={4}>4</option>
-                </select>
-              </label>
-              <label
-                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }}
-                title={tP('config.maxBomDepthHint')}
-              >
-                <span style={{ color: '#a1a1aa' }}>{tP('config.maxBomDepth')}</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={10}
-                  value={planningConfig.method_selection?.max_bom_depth ?? 3}
-                  onChange={(e) => {
-                    const v = Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 3));
-                    setPlanningConfig((c) => ({ ...c, method_selection: { ...c.method_selection, max_bom_depth: v } }));
-                  }}
                   style={{ width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
                 />
               </label>
@@ -4840,10 +4795,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             onClick={() => setPlanningConfig({
               method_selection: {
                 multiple: false,
-                elaborate: false,
-                depth: 1,
-                max_bom_depth: 3,
-                score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 },
               },
               purchase_allowed: false,
               constraints: [],
@@ -7805,17 +7756,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                       style={{ ...inputStyle, width: 56 }} />
                                   </label>
                                   <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editMaxBomDepth')}</span>
-                                    <input type="number" min={1} max={10}
-                                      value={Number(ms.max_bom_depth ?? 3)}
-                                      onChange={(e) => updateConfig((c) => {
-                                        const m = (c.method_selection ?? {}) as Record<string, unknown>;
-                                        m.max_bom_depth = Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 3));
-                                        c.method_selection = m;
-                                      })}
-                                      style={{ ...inputStyle, width: 56 }} />
-                                  </label>
-                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                                     <input type="checkbox" checked={effectiveConfig.purchase_allowed === true}
                                       onChange={(e) => updateConfig((c) => { c.purchase_allowed = e.target.checked; })} />
                                     <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editPurchase')}</span>
@@ -9267,9 +9207,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               <p style={{ margin: 0, fontSize: '0.8rem', color: '#a1a1aa' }}>
                 <strong>{tP('copilot.methods')}</strong> {planningConfig.method_selection?.multiple === true
                   ? tP('copilot.equalSplit')
-                  : planningConfig.method_selection?.elaborate === true
-                    ? tP('copilot.oneByScoreWithDepth', { depth: planningConfig.method_selection?.depth ?? 1 })
-                    : tP('copilot.oneByPreference')}.{' '}
+                  : tP('copilot.oneByPreference')}.{' '}
                 <strong>{tP('copilot.purchase')}</strong> {planningConfig.purchase_allowed === false ? tP('copilot.disabled') : tP('copilot.allowed')}.{' '}
                 <strong>{tP('copilot.consolidation')}</strong> {planningConfig.consolidation?.enabled === true
                   ? (() => {

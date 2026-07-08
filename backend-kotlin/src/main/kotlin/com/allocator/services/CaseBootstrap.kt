@@ -37,12 +37,13 @@ import org.jetbrains.exposed.sql.transactions.transaction
  *
  * Library design: each preset varies one load-bearing knob off a clean
  * baseline (preference, max=1, leaf-only, fair, no purchase, consolidation
- * on). Generation 1 covers the baseline + max-method sweep + max BOM
- * depth; generation 2 covers allocation modes + consolidation + first
- * elaborate; generation 3 fills the elaborate weight space + combined
- * variants. The agent's evidence-grounding tactic depends on having pairs
- * that differ in exactly one knob, so the matrix is intentionally
- * single-axis.
+ * on). Generation 1 covers the baseline + max-method sweep; generation 2
+ * covers allocation modes + consolidation. (Elaborate/scored method
+ * selection and its max_bom_depth admission cap were retired — the planner
+ * is preference-ranked waterfall only, so those axes no longer produce a
+ * behavioral difference and were dropped from the library.) The agent's
+ * evidence-grounding tactic depends on having pairs that differ in exactly
+ * one knob, so the matrix is intentionally single-axis.
  *
  * Persistence: each plan_run produced by bootstrap carries
  * `metadata.bootstrap = true` along with `preset_id` / `preset_label` /
@@ -120,10 +121,8 @@ object CaseBootstrap {
     private const val AXIS_BASELINE   = "baseline"
     private const val AXIS_MAX        = "max_methods"
     private const val AXIS_DEPTH      = "depth"
-    private const val AXIS_BOM_DEPTH  = "max_bom_depth"
     private const val AXIS_CONSOLID   = "consolidation"
     private const val AXIS_PURCHASE   = "purchase"
-    private const val AXIS_ELABORATE  = "elaborate"
 
     /**
      * The library — every entry is a **single-axis variation off the
@@ -159,24 +158,12 @@ object CaseBootstrap {
         // depth axis: planner recursion depth.
         for (d in listOf(2, 3, 4)) add("depth=$d", AXIS_DEPTH, cfg(depth = d))
 
-        // max_bom_depth axis: make-fallback admission cap. Default is 3, so we
-        // include 1 (no make-fallback), 2, 4, 5 to bracket sensitivity.
-        for (n in listOf(1, 2, 4, 5)) add("bom_depth=$n", AXIS_BOM_DEPTH, cfg(maxBomDepth = n))
-
         // Consolidation axis.
         add("consolidation=off", AXIS_CONSOLID, cfg(consolidationEnabled = false))
         for (p in listOf(7, 14, 30, 60)) add("period=$p", AXIS_CONSOLID, cfg(periodDays = p))
 
         // Purchase axis.
         add("purchase=on", AXIS_PURCHASE, cfg(purchaseAllowed = true))
-
-        // Mode axis: elaborate scoring (with all other knobs at default).
-        // Note: weight variations are deliberately NOT included here as
-        // standalone presets — weights only have effect in elaborate mode,
-        // so a "weight" preset would need to also flip mode → multi-axis.
-        // The elaborate baseline (default weights) IS included as a clean
-        // single-axis test of mode change.
-        add("mode=elaborate", AXIS_ELABORATE, cfg(mode = "elaborate"))
 
         presets
     }
@@ -264,10 +251,6 @@ object CaseBootstrap {
                     ms.entries.forEach { (k, v) -> if (k != "depth") put(k, v) }
                     put("depth", JsonPrimitive((parsedValue as? Number)?.toInt() ?: 1))
                 }
-                "max_bom_depth" -> putJsonObject("method_selection") {
-                    ms.entries.forEach { (k, v) -> if (k != "max_bom_depth") put(k, v) }
-                    put("max_bom_depth", JsonPrimitive((parsedValue as? Number)?.toInt() ?: 3))
-                }
                 "consolidation_enabled" -> putJsonObject("consolidation") {
                     cs.entries.forEach { (k, v) -> if (k != "enabled") put(k, v) }
                     put("enabled", JsonPrimitive((parsedValue as? Boolean) ?: true))
@@ -277,26 +260,6 @@ object CaseBootstrap {
                     put("period_days", JsonPrimitive((parsedValue as? Number)?.toInt() ?: 30))
                 }
                 "purchase_allowed" -> put("purchase_allowed", JsonPrimitive((parsedValue as? Boolean) ?: false))
-                "mode" -> putJsonObject("method_selection") {
-                    ms.entries.forEach { (k, v) -> if (k != "mode" && k != "elaborate") put(k, v) }
-                    val modeStr = (parsedValue as? String) ?: "preference"
-                    put("mode", JsonPrimitive(modeStr))
-                    put("elaborate", JsonPrimitive(modeStr == "elaborate"))
-                }
-                "score_weights" -> putJsonObject("method_selection") {
-                    ms.entries.forEach { (k, v) -> if (k != "mode" && k != "elaborate" && k != "score_weights") put(k, v) }
-                    put("mode", JsonPrimitive("elaborate"))
-                    put("elaborate", JsonPrimitive(true))
-                    val profile = (parsedValue as? String) ?: "balanced"
-                    putJsonObject("score_weights") {
-                        when (profile) {
-                            "commit"    -> { put("commit_time", JsonPrimitive(1.0)); put("inventory_consumed", JsonPrimitive(0.0)); put("purchase", JsonPrimitive(0.0)) }
-                            "inventory" -> { put("commit_time", JsonPrimitive(0.0)); put("inventory_consumed", JsonPrimitive(1.0)); put("purchase", JsonPrimitive(0.0)) }
-                            "purchase"  -> { put("commit_time", JsonPrimitive(0.0)); put("inventory_consumed", JsonPrimitive(0.0)); put("purchase", JsonPrimitive(1.0)) }
-                            else        -> { put("commit_time", JsonPrimitive(0.4)); put("inventory_consumed", JsonPrimitive(0.35)); put("purchase", JsonPrimitive(0.25)) }
-                        }
-                    }
-                }
             }
         }
     }
@@ -355,28 +318,6 @@ object CaseBootstrap {
             variations = listOf(2, 3, 4).map { JsonPrimitive(it) },
             group = GROUP_METHOD,
         ),
-        AxisSpec(
-            name = "mode", label = "Mode",
-            description = "preference (lookup) vs elaborate (multi-objective scoring with default weights).",
-            valueType = "enum", enumValues = listOf("preference", "elaborate"),
-            baselineValue = JsonPrimitive("preference"),
-            defaultSeed = JsonPrimitive("elaborate"),
-            variations = listOf("elaborate").map { JsonPrimitive(it) },
-            group = GROUP_METHOD,
-        ),
-        // Compound axis: each value implies mode=elaborate AND a specific
-        // score-weight triple. Lets users explore different elaborate-mode
-        // scoring profiles without rolling their own JSON.
-        AxisSpec(
-            name = "score_weights", label = "Elaborate score weights",
-            description = "Multi-objective scoring profile (sets mode=elaborate plus the named weights).",
-            valueType = "enum",
-            enumValues = listOf("balanced", "commit", "inventory", "purchase"),
-            baselineValue = JsonPrimitive("balanced"),
-            defaultSeed = JsonPrimitive("commit"),
-            variations = listOf("commit", "inventory", "purchase").map { JsonPrimitive(it) },
-            group = GROUP_METHOD,
-        ),
         // ── Consolidation cluster ────────────────────────────────────────
         // consolidation_enabled is the cluster's "primary" knob;
         // scope and period_days are sub-knobs that live
@@ -391,15 +332,6 @@ object CaseBootstrap {
             group = GROUP_CONSOLID,
         ),
         AxisSpec(
-            name = "max_bom_depth", label = "Max BOM depth",
-            description = "Make-fallback admission cap. Caps the recursion depth admitted at the reactive make-fallback site; deeper makes are skipped.",
-            valueType = "int", enumValues = emptyList(),
-            baselineValue = JsonPrimitive(3),
-            defaultSeed = JsonPrimitive(2),
-            variations = listOf(1, 2, 4, 5).map { JsonPrimitive(it) },
-            group = GROUP_METHOD,
-        ),
-        AxisSpec(
             name = "period_days", label = "Period (days)",
             description = "Consolidation window in days. 0 = collapse all dates into one bucket.",
             valueType = "int", enumValues = emptyList(),
@@ -410,7 +342,7 @@ object CaseBootstrap {
         ),
         // Purchase is a method-selection knob (it permits purchase orders
         // as a fulfillment method) — supply-side strategy, same as
-        // max_methods / mode / score_weights.
+        // max_methods / depth.
         AxisSpec(
             name = "purchase_allowed", label = "Allow purchase",
             description = "Permit purchase orders as a fulfillment method.",
@@ -435,21 +367,9 @@ object CaseBootstrap {
         return when (axisName) {
             "max_methods" -> cfg(maxMethods = (parsedValue as? Number)?.toInt() ?: 1)
             "depth" -> cfg(depth = (parsedValue as? Number)?.toInt() ?: 1)
-            "max_bom_depth" -> cfg(maxBomDepth = (parsedValue as? Number)?.toInt() ?: 3)
             "consolidation_enabled" -> cfg(consolidationEnabled = (parsedValue as? Boolean) ?: true)
             "period_days" -> cfg(periodDays = (parsedValue as? Number)?.toInt() ?: 30)
             "purchase_allowed" -> cfg(purchaseAllowed = (parsedValue as? Boolean) ?: false)
-            "mode" -> cfg(mode = (parsedValue as? String) ?: "preference")
-            // Compound axis: profile name implies mode=elaborate plus the
-            // named weight triple. "balanced" uses default weights so the
-            // resulting config equals cfg(mode="elaborate") — same shape
-            // as the simple mode axis with value "elaborate".
-            "score_weights" -> when ((parsedValue as? String) ?: "balanced") {
-                "commit"    -> cfg(mode = "elaborate", weights = Triple(1.0, 0.0, 0.0))
-                "inventory" -> cfg(mode = "elaborate", weights = Triple(0.0, 1.0, 0.0))
-                "purchase"  -> cfg(mode = "elaborate", weights = Triple(0.0, 0.0, 1.0))
-                else        -> cfg(mode = "elaborate")  // balanced (default weights)
-            }
             else -> cfg()  // unknown axis → baseline
         }
     }

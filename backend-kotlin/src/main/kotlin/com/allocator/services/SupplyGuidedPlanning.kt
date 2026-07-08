@@ -422,8 +422,8 @@ private fun methodAchievableInto(
 /**
  * Per-node result of the sketch phase.
  * Captures the achievable quantity AND the pre-selected BOM method so the commit
- * phase can bypass [getPreferredMethodCascade] — reducing per-node overhead from
- * O(methods × probeChildren) to O(1) at every BOM depth during planning.
+ * phase can bypass the unified waterfall's candidate expansion/ranking entirely —
+ * reducing per-node overhead to O(1) at every BOM depth during planning.
  */
 data class NodeBlueprint(
     /** Maximum qty this node can satisfy given its per-lot budget caps. */
@@ -444,7 +444,7 @@ typealias PlanBlueprint   = Map<Any?, DemandBlueprint>
  * Sketch phase: one read-only BOM walk per demand that:
  *  1. Computes achievable quantity at every node (same logic as [computeAchievableQtyMaps]).
  *  2. Records the FIRST feasible BOM method by preference so the commit phase can
- *     skip [getPreferredMethodCascade] entirely (no probeChildren calls per node).
+ *     skip the unified waterfall's candidate expansion/ranking entirely.
  *
  * Supersedes [computeAchievableQtyMaps] in the supply-guided pipeline.
  */
