@@ -145,7 +145,9 @@ export function SortFilterTable<T extends Record<string, unknown>>({
                 if (col.width) baseStyle.width = col.width;
                 const headerContent = col.headerRender ? col.headerRender() : col.label;
                 const isSortable = col.sortable !== false;
-                const sortIndicator = sortKey === col.key ? (sortDir === 'asc' ? '↑' : '↓') : '';
+                // Active column gets a solid arrow; other sortable columns get a faint ↕ so
+                // sortability is visually discoverable instead of looking like plain text.
+                const sortIndicator = sortKey === col.key ? (sortDir === 'asc' ? '↑' : '↓') : (isSortable ? '↕' : '');
                 if (col.headerRender) {
                   // Custom header (e.g. schedule ruler): render at full th width via a
                   // block-level wrapper div (avoids `position: relative` on the table-cell
@@ -159,7 +161,11 @@ export function SortFilterTable<T extends Record<string, unknown>>({
                       >
                         {headerContent}
                         {isSortable && sortIndicator && (
-                          <span style={{ position: 'absolute', top: 0, right: 4, fontSize: 11, fontWeight: 'bold' }}>{sortIndicator}</span>
+                          <span style={{
+                            position: 'absolute', top: 0, right: 4, fontSize: 11,
+                            fontWeight: sortKey === col.key ? 'bold' : 'normal',
+                            opacity: sortKey === col.key ? 1 : 0.45,
+                          }}>{sortIndicator}</span>
                         )}
                       </div>
                     </th>
@@ -180,7 +186,7 @@ export function SortFilterTable<T extends Record<string, unknown>>({
                           fontWeight: sortKey === col.key ? 'bold' : 'normal',
                         }}
                       >
-                        {headerContent} {sortIndicator}
+                        {headerContent} <span style={{ opacity: sortKey === col.key ? 1 : 0.45 }}>{sortIndicator}</span>
                       </button>
                     ) : (
                       headerContent
