@@ -203,6 +203,21 @@ internal fun resolveVariantSelection(config: Map<String, Any?>?): VariantSelecti
  *  MUST NOT be passed through this helper. */
 internal fun roundQty(x: Double): Double = Math.round(x).toDouble()
 
+/** Universal "is this WO effectively zero" check — the single definition of "zero" a WO
+ *  quantity must clear everywhere in the pipeline to count as a real, fully-fledged work
+ *  order: whether it gets a row in work_orders/work_orders_native (flattenPeggingToWorkOrders,
+ *  consolidateByWaves), whether its wo_group_id is expected to resolve to a lot (R11 orphan
+ *  check, SoundnessChecker.verifyWoGidOrphans/checkRunSoundnessStreaming), and whether it's
+ *  scrutinized as a real WO subject to full lead-time/duration scheduling (SoundnessChecker's
+ *  R4/R5/R6 make/move validation). A WO below this threshold is uniformly treated as zero
+ *  everywhere — no lot, no orphan expectation, no scheduling scrutiny; a WO at or above it is
+ *  a fully-fledged WO everywhere, including taking its full lead time.
+ *
+ *  Threshold is 0.5, not a tiny epsilon: the frontend's qtyFmt() rounds to the nearest
+ *  integer, so any quantity below 0.5 already displays as a bare "0" to the user — making it
+ *  indistinguishable from a genuine zero regardless of what it's stored as internally. */
+internal fun isZeroQty(quantity: Any?): Boolean = ((quantity as? Number)?.toDouble() ?: 0.0) < 0.5
+
 /** True for commit reasons that signal a genuine planning failure — the child contributed
  *  nothing (or nothing useful) to the parent's supply chain.  Benign cycle-detection
  *  reasons and the "partial" success reason are excluded: they still count toward the
@@ -3062,10 +3077,10 @@ private fun flattenPeggingToWorkOrders(
         // The pegging tree keeps these nodes for diagnostics; the WO list must not. (Soundness
         // likewise skips failed=true subtrees.)
         if (n["failed"] == true) return
-        // Also skip a make that produced ~0: it built nothing, so anything beneath it is an
-        // orphan (the under-consumption the soundness checker flags as R7d). Not real output.
-        if (n["type"] == "work_order" && n["method"] == "make" &&
-            ((n["quantity"] as? Number)?.toDouble() ?: 0.0) < 1e-6) return
+        // Also skip a WO that isZeroQty(): it built/moved/bought nothing meaningful, so anything
+        // beneath it is an orphan (the under-consumption the soundness checker flags as R7d).
+        // Not real output — applies to purchase/move just as much as make.
+        if (n["type"] == "work_order" && isZeroQty(n["quantity"])) return
         if (n["type"] == "work_order") {
             val pid = (n["product_id"] as? String)?.trim() ?: ""
             val lid = (n["location_id"] as? String)?.trim() ?: ""
@@ -3460,7 +3475,10 @@ internal fun consolidateByWaves(
         val nodeChildren = (n["children"] as? List<*>) ?: emptyList<Any?>()
         when (n["type"] as? String) {
             "work_order" -> {
-                if (n["method"] == "make" && ((n["quantity"] as? Number)?.toDouble() ?: 0.0) < 1e-6) return
+                // Skip a WO that isZeroQty(), regardless of method — a purchase/move trimmed to
+                // nothing by an upstream AND-bottleneck is just as much a non-real occurrence as
+                // a zero-qty make.
+                if (isZeroQty(n["quantity"])) return
                 val pid = (n["product_id"] as? String)?.trim() ?: ""
                 val lid = (n["location_id"] as? String)?.trim() ?: ""
                 val realGid = (n["wo_group_id"] as? String)?.trim()?.takeIf { it.isNotBlank() }

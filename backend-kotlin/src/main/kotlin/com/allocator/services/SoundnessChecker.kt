@@ -1106,13 +1106,15 @@ private class WalkContext(
         //     rate (engine), the OPPOSITE of spec.md's "child = parent / rate".
         //     The engine is the authority since the soundness check exists to
         //     verify what plan() actually emits.
-        //   - Failed-parent skip: when parent.quantity == 0 the WO didn't
-        //     produce anything; child committed_qty values can reflect stale
-        //     first-pass exploratory commitments and aren't tied to this WO.
-        //     Skip R4 in that case (the tree is internally inconsistent but
-        //     the inconsistency isn't a quantity-propagation violation).
+        //   - isZeroQty parent skip: a WO below the universal zero threshold isn't a
+        //     fully-fledged WO anywhere in the pipeline (no lot, no wave-scheduling —
+        //     see isZeroQty's doc) — its child committed_qty values can reflect stale
+        //     first-pass exploratory commitments and aren't tied to this WO, and its own
+        //     start/end were never properly wave-scheduled. Skip R4/R5/R6-adjacent qty/
+        //     duration checks in that case (the tree is internally inconsistent but the
+        //     inconsistency isn't a quantity-propagation or lead-time violation).
         val parentQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
-        if (parentQty <= config.tolerance) return  // failed make WO; child commitments orphaned
+        if (isZeroQty(parentQty)) return
         val childrenRelation = (node["children_relation"] as? String)?.trim()
         // Tolerance: max(1.0, 10% of expected). Accommodates two kinds of
         // engine noise:
@@ -1248,6 +1250,12 @@ private class WalkContext(
             return
         }
 
+        // isZeroQty parent skip: same rationale as validateMakeWO — a WO below the universal
+        // zero threshold isn't a fully-fledged WO anywhere in the pipeline (no lot, no
+        // wave-scheduling), so its child commitments and its own start/end are not meaningful
+        // to check against R4/R5_transit_time here.
+        if (isZeroQty(node["quantity"])) return
+
         // R4: qty conserved at move WOs (parent qty == single child committed_qty).
         // Same rationale as the make case: child's committed_qty is the
         // delivered amount through this edge; quantity is the requested amount
@@ -1325,6 +1333,10 @@ internal fun verifyWoGidOrphans(
         if (depth > 60) return
         if (node["failed"] == true) return  // mirror flattenPeggingToWorkOrders: skip entire failed subtree
         if (node["type"] == "work_order") {
+            // Mirror flattenPeggingToWorkOrders/consolidateByWaves: an isZeroQty() WO (any
+            // method, not just make) isn't flattened into work_orders, so its gid — and anything
+            // beneath it — isn't expected to resolve to a lot either.
+            if (isZeroQty(node["quantity"])) return
             val gid = (node["wo_group_id"] as? String)?.trim()
             if (!gid.isNullOrBlank() && gid !in gidsInLots) orphans.add(gid)
         }
@@ -1586,6 +1598,10 @@ internal fun checkRunSoundnessStreaming(
                 if (depth > 60) return
                 if (node["failed"] == true) return  // mirror flattenPeggingToWorkOrders: skip entire failed subtree
                 if (node["type"] == "work_order") {
+                    // Mirror flattenPeggingToWorkOrders/consolidateByWaves: an isZeroQty() WO
+                    // (any method, not just make) isn't flattened into work_orders, so its gid —
+                    // and anything beneath it — isn't expected to resolve to a lot either.
+                    if (isZeroQty(node["quantity"])) return
                     val gid = (node["wo_group_id"] as? String)?.trim()
                     if (!gid.isNullOrBlank() && gid !in gidsInLots) orphanGids.add(gid)
                 }
