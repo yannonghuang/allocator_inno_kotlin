@@ -94,8 +94,10 @@ import {
   type BootstrapPreview,
   type BootstrapJobStatus,
   type BootstrapCriterion,
+  getResourceUtilization,
+  type ResourceUtilization,
 } from '@/lib/api';
-import { computeHorizon, ScheduleBar, ScheduleHorizonRuler, methodColor } from './_workOrderSchedule';
+import { computeHorizon, ScheduleBar, ScheduleHorizonRuler, methodColor, BorMiniTimeline, BorTimelineRuler } from './_workOrderSchedule';
 import { WoScheduleImpactPanel, WoScheduleQuickModal } from './_woScheduleImpact';
 import type { PlanResult } from '../../../lib/api';
 
@@ -775,7 +777,9 @@ function formatCommitReason(reason: string, purchaseAllowed: boolean): { label: 
 import { PeggingTree, pathKeyFromPath, type PeggingGraph } from '@/app/components/PeggingTree';
 import BomGraphTab from '@/app/components/BomGraphTab';
 import { ResourceUtilizationView } from '@/app/components/ResourceUtilizationView';
-import { PlanningPeggingTreeView } from '@/app/components/PlanningPeggingTreeView';
+import { ConsolidatedWoAccordion } from '@/app/components/ConsolidatedWoAccordion';
+import { WoManifestTable } from '@/app/components/WoManifestTable';
+import { SinglePeggingTreePanel } from '@/app/components/SinglePeggingTreePanel';
 import { qtyFmt } from '@/app/lib/format';
 
 // ── Assessment criteria helpers ────────────────────────────────────────────────
@@ -1204,24 +1208,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     | { type: 'supply'; supplyId: string; peggedDemands: PeggedDemandEntry[]; initialQty: number; consumedQty: number }
     | null
   >(null);
-  const [planPeggingExpanded, setPlanPeggingExpanded] = useState<Set<string>>(new Set(['0']));
-  const [planPeggingSearch, setPlanPeggingSearch] = useState('');
-  const [planPeggingMatchPath, setPlanPeggingMatchPath] = useState<string | null>(null);
-  const [planPeggingMatchIndex, setPlanPeggingMatchIndex] = useState(0);
   // Per-demand pegging cache — populated lazily when user opens a demand's pegging panel.
   // Keys are demand_id strings; values are the fetched PlanningPeggingEntry or 'loading'/'error'.
   const [demandPeggingCache, setDemandPeggingCache] = useState<Record<string, PlanningPeggingEntry | 'loading' | 'error'>>({});
-  const [planPeggingMatchPaths, setPlanPeggingMatchPaths] = useState<string[]>([]);
-  useEffect(() => {
-    setPlanPeggingSearch('');
-    setPlanPeggingMatchPath(null);
-    setPlanPeggingMatchPaths([]);
-    setPlanPeggingMatchIndex(0);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [planPeggingContext?.type === 'work_order' ? (planPeggingContext.row as WorkOrder).demand_id ?? '' : null,
-      planPeggingContext?.type === 'demand' ? (planPeggingContext.row as CommittedDemand).demand_id ?? '' : null,
-      planPeggingContext?.type === 'supply' ? planPeggingContext.supplyId : null]);
-  const [planExplanationExpanded, setPlanExplanationExpanded] = useState<Set<string>>(new Set());
   const [planPeggingPanelWidth, setPlanPeggingPanelWidth] = useState(420);
   const [planWorkOrderPeggingCache, setPlanWorkOrderPeggingCache] = useState<Record<string, PlanningPeggingNode>>({});
   // Active demand for WO pegging panel; null = use the row's own demand_id (default)
@@ -1240,10 +1229,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [previousManifestWoRow, setPreviousManifestWoRow] = useState<WorkOrder | null>(null);
   const [planWorkOrderPeggingLoading, setPlanWorkOrderPeggingLoading] = useState<string | null>(null);
   const [planWorkOrderPeggingError, setPlanWorkOrderPeggingError] = useState<string | null>(null);
-  // Consolidated WO accordion: which demand sections are open + per-section tree expansion
-  const [woConsolidatedOpenSections, setWoConsolidatedOpenSections] = useState<Set<string>>(new Set());
-  const [woConsolidatedExpanded, setWoConsolidatedExpanded] = useState<Record<string, Set<string>>>({});
-  const woConsolidatedFetchingRef = useRef<Set<string>>(new Set());
   const planPeggingResizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [planPeggingResizing, setPlanPeggingResizing] = useState(false);
   const [planResultTab, setPlanResultTab] = useState<'demands' | 'work_orders' | 'supplies' | 'resourceUtilization'>('demands');
@@ -1346,11 +1331,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planWoPivotExpanded, setPlanWoPivotExpanded] = useState<Set<string>>(new Set());
   const [planWoPivotSubExpanded, setPlanWoPivotSubExpanded] = useState<Set<string>>(new Set());
   const [woExpandedKeys, setWoExpandedKeys] = useState<Set<string>>(new Set());
+  const [resourceUtilCache, setResourceUtilCache] = useState<Map<number, ResourceUtilization>>(new Map());
+  const resourceUtilFetchingRef = useRef(false);
   const [woExplainOpen, setWoExplainOpen] = useState(false);
   const [woExplainRow, setWoExplainRow] = useState<WorkOrder | null>(null);
   const [woExplainKey, setWoExplainKey] = useState<string | null>(null);
-  const [manifestSortCol, setManifestSortCol] = useState<'demand' | 'comp' | 'qty'>('demand');
-  const [manifestSortDir, setManifestSortDir] = useState<'asc' | 'desc'>('asc');
+  // Make WOs, and single-product move WOs, offer both a manifest table and the pegging
+  // accordion — which one is showing for the currently-open WO row. Resets to 'manifest'
+  // whenever the pegging panel's context changes (see the reset effect near planPeggingContext).
+  const [manifestViewMode, setManifestViewMode] = useState<'manifest' | 'pegging'>('manifest');
   const [woScheduleModalRow, setWoScheduleModalRow] = useState<WorkOrder | null>(null);
   const [supExplainOpen, setSupExplainOpen] = useState(false);
   const [supExplainRow, setSupExplainRow] = useState<PlanSupplyViewRow | null>(null);
@@ -2016,92 +2005,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return () => { cancelled = true; };
   }, [id]);
 
-  // Reset active-demand selection and consolidated accordion when the user opens pegging for a different WO
+  // Reset active-demand selection and the manifest/pegging toggle when the user opens pegging
+  // for a different WO. The consolidated accordion's and the single pegging tree panel's own
+  // expand/search state reset via their own `key` prop remounting them instead of here.
   useEffect(() => {
     setWoPeggingActiveDemandId(null);
-    setWoConsolidatedOpenSections(new Set());
-    setWoConsolidatedExpanded({});
+    setManifestViewMode('manifest');
   }, [planPeggingContext]);
-
-  // When the pegging panel opens for a demand, auto-expand the critical-path
-  // chain so the gold-tagged transit nodes are visible without the user
-  // hunting through collapsed AND-children. Mirrors the Kotlin
-  // `traceCriticalPath` algorithm.
-  useEffect(() => {
-    if (!planPeggingContext || planPeggingContext.type === 'supply' || !planResult) return;
-    const demandIdNorm = String(planPeggingContext.row.demand_id ?? '').trim();
-    if (!demandIdNorm) return;
-    const matchingEntries = planResult.planning_pegging?.filter(
-      (e) => String(e.demand_id ?? '').trim() === demandIdNorm,
-    ) ?? [];
-    const entry = matchingEntries.length > 0 ? matchingEntries[matchingEntries.length - 1] : undefined;
-    const tree = entry?.tree;
-    if (!tree) return;
-
-    const hasFlaggedDescendant = (n: PlanningPeggingNode): boolean => {
-      if (n.is_bottleneck || n.is_root_bottleneck) return true;
-      return (n.children ?? []).some(hasFlaggedDescendant);
-    };
-    const ratio = (c: PlanningPeggingNode): number => {
-      const q = Number(c.quantity ?? 0);
-      const cq = Number((c as { committed_qty?: number | null }).committed_qty ?? q);
-      return q < 1e-9 ? 0 : cq / q;
-    };
-    const contributed = (c: PlanningPeggingNode): boolean => {
-      const q = Number(c.quantity ?? 0);
-      const cq = Number((c as { committed_qty?: number | null }).committed_qty ?? q);
-      return q > 1e-9 || cq > 1e-9;
-    };
-    const relationOf = (n: PlanningPeggingNode): 'and' | 'or' => {
-      const explicit = (n as { children_relation?: string | null }).children_relation;
-      if (explicit === 'and' || explicit === 'or') return explicit;
-      return n.type === 'work_order' ? 'and' : 'or';
-    };
-    const paths = new Set<string>();
-    const walk = (n: PlanningPeggingNode | null, p: string): void => {
-      if (!n) return;
-      paths.add(p);
-      const kids = n.children ?? [];
-      if (kids.length === 0) return;
-      const contributingKids = kids
-        .map((c, i) => ({ c, i }))
-        .filter(({ c }) => contributed(c));
-      if (contributingKids.length === 0) return;
-      if (relationOf(n) === 'or') {
-        contributingKids.forEach(({ c, i }) => walk(c, `${p}-${i}`));
-        return;
-      }
-      const flagged = contributingKids.filter(({ c }) => c.is_bottleneck || c.is_root_bottleneck);
-      let pick: { c: PlanningPeggingNode; i: number } | null = null;
-      if (flagged.length > 0) {
-        flagged.sort((a, b) => {
-          const ra = ratio(a.c);
-          const rb = ratio(b.c);
-          if (Math.abs(ra - rb) > 1e-9) return ra - rb;
-          return a.i - b.i;
-        });
-        pick = flagged[0];
-      } else {
-        const transit = contributingKids.filter(({ c }) => hasFlaggedDescendant(c));
-        if (transit.length === 0) return;
-        transit.sort((a, b) => {
-          const ra = ratio(a.c);
-          const rb = ratio(b.c);
-          if (Math.abs(ra - rb) > 1e-9) return ra - rb;
-          return a.i - b.i;
-        });
-        pick = transit[0];
-      }
-      walk(pick.c, `${p}-${pick.i}`);
-    };
-    walk(tree, '0');
-    if (paths.size <= 1) return;
-    setPlanPeggingExpanded((prev) => {
-      const next = new Set(prev);
-      paths.forEach((p) => next.add(p));
-      return next;
-    });
-  }, [planPeggingContext, planResult]);
 
   // Lazily fetch per-demand pegging tree when user opens the pegging panel and the
   // tree is not in planResult.planning_pegging (bulk load is disabled — trees are too large).
@@ -2264,62 +2174,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         setPlanWorkOrderPeggingLoading(null);
       });
   }, [id, woPeggingKey, planPeggingContext?.type]);
-
-  // Multi-demand consolidated WO: fetch one pegging tree per contributing logical WO.
-  // Each fetch uses the native WO's start_time (found via consolidated_group_id linkage)
-  // so the backend locates the exact per-demand WO node rather than the merged one.
-  useEffect(() => {
-    if (!planPeggingOpen || planPeggingContext?.type !== 'work_order' || !id || !planResult) return;
-    const row = planPeggingContext.row as WorkOrder;
-    if (row.demand_id != null) return;
-    // Merge demand IDs from split_details (has per-demand qty) and consolidated_demand_ids
-    // (populated even for virtual-demand WOs where split_details is empty).
-    const splitDetails = (row.wo_consolidation_split_details ?? [])
-      .filter((d) => !!d.demand_id && d.demand_id !== '') as Array<{ demand_id: string; allocated_qty: number }>;
-    const splitIds = new Set(splitDetails.map((d) => d.demand_id));
-    const allDemandIds = [
-      ...splitDetails.map((d) => d.demand_id),
-      ...(row.consolidated_demand_ids ?? []).filter((d) => !!d && d !== '' && !splitIds.has(d)),
-    ];
-    if (allDemandIds.length === 0) return;
-    const product_id = String(row.product_id ?? '').trim();
-    const location_id = String(row.location_id ?? '').trim();
-    const method = String(row.method ?? '').trim();
-    if (!product_id || !location_id || !method) return;
-    // Open all sections on first open
-    setWoConsolidatedOpenSections((prev) => {
-      if (prev.size > 0) return prev;
-      return new Set(allDemandIds);
-    });
-    for (const did of allDemandIds) {
-      // Locate the native WO for this demand in this consolidated batch
-      const nativeWo = (planResult.work_orders_native ?? [])
-        .filter((w) => w.consolidated_group_id === row.wo_group_id && w.demand_id === did)
-        .sort((a, b) => (a.start_time ?? '').localeCompare(b.start_time ?? ''))[0];
-      const start_time = nativeWo?.start_time ?? undefined;
-      const cacheKey = `${did}|${product_id}|${location_id}|${method}|${start_time ?? ''}`;
-      if (planWorkOrderPeggingCache[cacheKey]) {
-        setWoConsolidatedExpanded((prev) => prev[cacheKey] ? prev : { ...prev, [cacheKey]: new Set(['0']) });
-        continue;
-      }
-      if (woConsolidatedFetchingRef.current.has(cacheKey)) continue;
-      woConsolidatedFetchingRef.current.add(cacheKey);
-      getWorkOrderPegging(Number(id), {
-        demand_id: did, product_id, location_id, method,
-        start_time: start_time ?? undefined,
-        ...(currentPlanRunId != null ? { run_id: currentPlanRunId } : {}),
-      })
-        .then((res) => {
-          setPlanWorkOrderPeggingCache((prev) => ({ ...prev, [cacheKey]: res.tree }));
-          setWoConsolidatedExpanded((prev) => ({ ...prev, [cacheKey]: new Set(['0']) }));
-        })
-        .catch((err) => {
-          if (typeof console !== 'undefined' && console.error)
-            console.error('[WO consolidated pegging]', did, parseApiError(err));
-        })
-        .finally(() => { woConsolidatedFetchingRef.current.delete(cacheKey); });
-    }
-  }, [planPeggingContext, planPeggingOpen, planResult, id, currentPlanRunId]);
 
   const basketInitialKeys = new Set(basketInitial.map((b) => b.key));
 
@@ -3440,6 +3294,34 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
 
     return map;
   }, [planResult, planningConfig]);
+
+  /** Inverted index: wo_group_id → list of resources this WO consumes, with daily load arrays.
+   *  Built from cached resource-utilization data; empty map until the first BOR expand triggers fetch. */
+  const borByWogid = useMemo(() => {
+    type BorEntry = { resource_id: string; location_id: string; size: number; rate: number; buckets: string[]; load: number[] };
+    const empty = new Map<string, BorEntry[]>();
+    const runId = currentPlanRunId ?? freshPlanRunId;
+    if (!runId) return empty;
+    const util = resourceUtilCache.get(runId);
+    if (!util) return empty;
+    const map = new Map<string, BorEntry[]>();
+    for (const row of util.rows) {
+      for (const c of row.contributors ?? []) {
+        const wogid = c.wo_group_id;
+        if (!wogid) continue;
+        if (!map.has(wogid)) map.set(wogid, []);
+        map.get(wogid)!.push({
+          resource_id: row.resource_id,
+          location_id: row.location_id,
+          size: row.size,
+          rate: c.rate ?? 1,
+          buckets: util.buckets,
+          load: row.load,
+        });
+      }
+    }
+    return map;
+  }, [resourceUtilCache, currentPlanRunId, freshPlanRunId]);
 
   /**
    * Map (supplyId, demandId) → "<groupPid>@<groupLid>" describing the consolidation path
@@ -6255,9 +6137,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         );
                       }},
                     ];
-                    // Consolidated tab: remove per-demand action columns that don't apply.
+                    // Consolidated tab: remove per-demand columns that don't apply — a consolidated
+                    // row can serve multiple demands (view them via the manifest/pegging accordion
+                    // instead of a single "Demand" column) and has no per-row schedule-impact action.
                     if (woTableTab === 'consolidated') {
-                      const hide = new Set(['_woschedule']);
+                      const hide = new Set(['_woschedule', '_demand_label']);
                       for (let i = woColumns.length - 1; i >= 0; i--) {
                         if (hide.has(woColumns[i].key as string)) woColumns.splice(i, 1);
                       }
@@ -6597,22 +6481,32 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               return undefined;
                             }}
                             expandedKeys={woExpandedKeys}
-                            onToggleExpand={(key) => setWoExpandedKeys((prev) => {
-                              const next = new Set(prev);
-                              prev.has(key) ? next.delete(key) : next.add(key);
-                              return next;
-                            })}
+                            onToggleExpand={(key) => {
+                              setWoExpandedKeys((prev) => {
+                                const next = new Set(prev);
+                                prev.has(key) ? next.delete(key) : next.add(key);
+                                return next;
+                              });
+                              // Lazily fetch resource-utilization for BOR rows on first expand.
+                              const runId = currentPlanRunId ?? freshPlanRunId;
+                              if (runId && !resourceUtilCache.has(runId) && !resourceUtilFetchingRef.current) {
+                                resourceUtilFetchingRef.current = true;
+                                getResourceUtilization(Number(id), runId)
+                                  .then(data => setResourceUtilCache(prev => new Map(prev).set(runId, data)))
+                                  .catch(() => {})
+                                  .finally(() => { resourceUtilFetchingRef.current = false; });
+                              }
+                            }}
                             canExpandRow={(r) => {
-                              // Show the inline ▶ only when the row actually has supplies to show.
-                              // Cross-demand consolidated orders (demand_id=null) have no per-WO
-                              // supplies map entry — their breakdown is the pegging drill-down — so
-                              // their toggle would open empty; hide it.
-                              const woKey = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
-                              const consolidatedWoKey = `|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
-                              const sup = woSuppliesMap.get(woKey) ?? woSuppliesMap.get(consolidatedWoKey) ?? [];
-                              const isMake = sup.length > 0 && sup[0].type === 'demand';
-                              const direct = isMake ? (woCrossEntrySupplyMap.get(`${r.demand_id ?? ''}|${r.product_id ?? ''}`) ?? []) : [];
-                              if (sup.length === 0 && direct.length === 0) return false;
+                              // Make WOs always get the expand toggle (BOR section).
+                              // Non-make WOs only get it when they have supply rows.
+                              const isMakeWo = r.method?.toLowerCase() === 'make';
+                              if (!isMakeWo) {
+                                const woKey = `${r.demand_id ?? ''}|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
+                                const consolidatedWoKey = `|${r.product_id ?? ''}|${r.location_id ?? ''}|${r.method ?? ''}`;
+                                const sup = woSuppliesMap.get(woKey) ?? woSuppliesMap.get(consolidatedWoKey) ?? [];
+                                if (sup.length === 0) return false;
+                              }
                               // When a WO is highlighted, component WOs are already visible as
                               // top-level rows. The ▶ expand would duplicate them inline —
                               // suppress it so the list is the single source of truth.
@@ -6630,11 +6524,66 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               const directSupplies = isMakeExpand
                                 ? (woCrossEntrySupplyMap.get(`${r.demand_id ?? ''}|${r.product_id ?? ''}`) ?? [])
                                 : [];
-                              if (woSupplies.length === 0 && directSupplies.length === 0) return null;
+                              const isMakeWo = r.method?.toLowerCase() === 'make';
+                              const wogid = r.wo_group_id ?? r.consolidated_group_id ?? '';
+                              const borResources = wogid ? borByWogid.get(wogid) : undefined;
+                              const runId = currentPlanRunId ?? freshPlanRunId;
+                              const borLoading = isMakeWo && runId && !resourceUtilCache.has(runId);
+                              if (woSupplies.length === 0 && directSupplies.length === 0 && !isMakeWo) return null;
                               const supplyRowStyle: React.CSSProperties = { borderTop: '1px solid #3f3f46' };
                               const cellP: React.CSSProperties = { paddingRight: '1.25rem', paddingTop: '0.15rem', paddingBottom: '0.15rem' };
                               return (
                                 <div style={{ padding: '0.3rem 1.75rem 0.5rem', background: 'rgba(59,130,246,0.04)', borderTop: '1px dashed #3f3f46' }}>
+                                  {/* BOR (Bill of Resources) section — make WOs only */}
+                                  {isMakeWo && (
+                                    <div style={{ marginBottom: woSupplies.length > 0 || directSupplies.length > 0 ? '0.6rem' : 0 }}>
+                                      <div style={{ fontSize: '0.7rem', color: '#a78bfa', marginBottom: '0.2rem', fontWeight: 500 }}>
+                                        Resources (BOR)
+                                      </div>
+                                      {borLoading ? (
+                                        <div style={{ fontSize: '0.72rem', color: '#71717a', paddingTop: '0.1rem' }}>Loading…</div>
+                                      ) : borResources && borResources.length > 0 ? (
+                                        <table style={{ fontSize: '0.78rem', borderCollapse: 'collapse', width: '100%' }}>
+                                          <thead>
+                                            <tr style={{ color: '#71717a' }}>
+                                              <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1rem', paddingBottom: '0.15rem' }}>Resource</th>
+                                              <th style={{ textAlign: 'left', fontWeight: 400, paddingRight: '1rem' }}>Location</th>
+                                              <th style={{ textAlign: 'right', fontWeight: 400, paddingRight: '1rem' }}>Rate</th>
+                                              <th style={{ textAlign: 'right', fontWeight: 400, paddingRight: '1rem' }}>Capacity</th>
+                                              <th style={{ textAlign: 'left', fontWeight: 400, minWidth: 120, verticalAlign: 'bottom', paddingBottom: '0.15rem' }}>
+                                                <BorTimelineRuler
+                                                  buckets={borResources[0].buckets}
+                                                  woStart={r.start_time}
+                                                  woEnd={r.end_time}
+                                                />
+                                              </th>
+                                            </tr>
+                                          </thead>
+                                          <tbody>
+                                            {borResources.map((res, ri) => (
+                                              <tr key={ri} style={{ borderTop: '1px solid #3f3f46' }}>
+                                                <td style={{ paddingRight: '1rem', paddingTop: '0.15rem', paddingBottom: '0.15rem', fontFamily: 'monospace', fontSize: '0.72rem' }}>{res.resource_id}</td>
+                                                <td style={{ paddingRight: '1rem', color: '#a3a3a3' }}>{res.location_id}</td>
+                                                <td style={{ textAlign: 'right', paddingRight: '1rem', color: '#d4d4d8' }}>{res.rate}</td>
+                                                <td style={{ textAlign: 'right', paddingRight: '1rem', color: '#d4d4d8' }}>{res.size}</td>
+                                                <td style={{ minWidth: 100, paddingTop: '0.1rem', paddingBottom: '0.1rem' }}>
+                                                  <BorMiniTimeline
+                                                    buckets={res.buckets}
+                                                    load={res.load}
+                                                    size={res.size}
+                                                    woStart={r.start_time}
+                                                    woEnd={r.end_time}
+                                                  />
+                                                </td>
+                                              </tr>
+                                            ))}
+                                          </tbody>
+                                        </table>
+                                      ) : (
+                                        <div style={{ fontSize: '0.72rem', color: '#52525b' }}>No resource data</div>
+                                      )}
+                                    </div>
+                                  )}
                                   {/* Direct supply section (make WOs only): inventory pre-fulfillment */}
                                   {directSupplies.length > 0 && (
                                     <div style={{ marginBottom: woSupplies.length > 0 ? '0.5rem' : 0 }}>
@@ -9878,7 +9827,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 ? consolidatedDemandIds
                 : (row.demand_id ? [row.demand_id] : []);
               if (row.method !== 'move' && row.method !== 'purchase' && allDemandIds.length === 0) return null;
-              // Move + purchase WOs: show manifest (demand × component × qty) instead of accordion/pegging.
+              // Move + purchase + make WOs: show a manifest (demand × component × qty). Make and
+              // move WOs additionally offer the pegging accordion via a toggle (manifest is the
+              // default) — the accordion traces each native lot against its own product, so a
+              // mixed-cargo move batch works the same as a single-product one.
               // crossWaveCalendarMerge flatMaps move_components from singletonRow outputs that had none,
               // producing [] (truthy but empty). Treat empty move_components as absent so the synthesis runs.
               type MoveComp = { product_id: string; quantity: number; demand_ids?: string[]; demand_splits?: { demand_id: string; quantity: number }[] };
@@ -9890,7 +9842,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     if (!pid) return null;
                     return [{ product_id: pid, quantity: row.quantity as number, demand_ids: allDemandIds }];
                   }
-                  if (row.method === 'purchase' && row.product_id) {
+                  if ((row.method === 'purchase' || row.method === 'make') && row.product_id) {
                     if (splitDetails.length > 0) {
                       return splitDetails.map((d) => ({ product_id: row.product_id!, quantity: d.allocated_qty, demand_ids: [d.demand_id] }));
                     }
@@ -9898,6 +9850,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   }
                   return null;
                 })();
+              const canTogglePegging = row.method === 'make' || row.method === 'move';
+              const accordion = (
+                <ConsolidatedWoAccordion
+                  key={row.wo_group_id ?? ''}
+                  caseId={Number(id)}
+                  planRunId={currentPlanRunId}
+                  woGroupId={row.wo_group_id ?? ''}
+                  workOrdersNative={planResult?.work_orders_native ?? []}
+                  planningPegging={planResult?.planning_pegging ?? []}
+                />
+              );
               if ((effectiveMoveComponents?.length ?? 0) >= 1) {
                 const comps = effectiveMoveComponents!;
                 const committedDemandIds = new Set(planResult?.committed_demands.map((d) => d.demand_id) ?? []);
@@ -9923,145 +9886,51 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     manifestRows.push({ demand: committedDemands[0] ?? null, comp: c.product_id, qty: Number(c.quantity) });
                   }
                 }
-                const demandKey = (r2: { demand: string | null }) => r2.demand ?? '–';
-                const dir = manifestSortDir === 'asc' ? 1 : -1;
-                manifestRows.sort((a, b) => {
-                  if (manifestSortCol === 'qty') return dir * (a.qty - b.qty);
-                  if (manifestSortCol === 'comp') return dir * (a.comp.localeCompare(b.comp) || demandKey(a).localeCompare(demandKey(b)));
-                  return dir * (demandKey(a).localeCompare(demandKey(b)) || a.comp.localeCompare(b.comp));
-                });
-                const distinctDemands = new Set(manifestRows.map((r2) => r2.demand).filter(Boolean)).size;
-                const distinctComps = new Set(manifestRows.map((r2) => r2.comp)).size;
                 // Physical total from components (includes units serving virtual/consolidated demands).
                 const totalQty = comps.reduce((s, c) => s + Number(c.quantity), 0);
-                const thStyle = (col: typeof manifestSortCol, align: 'left' | 'right' = 'left'): React.CSSProperties => ({
-                  textAlign: align, padding: '5px 14px 5px 0', fontWeight: 500, cursor: 'pointer',
-                  userSelect: 'none', color: manifestSortCol === col ? '#e4e4e7' : '#71717a',
-                  ...(align === 'right' ? { paddingRight: 0 } : {}),
-                });
-                const sortIcon = (col: typeof manifestSortCol) =>
-                  manifestSortCol === col ? (manifestSortDir === 'asc' ? ' ▲' : ' ▼') : '';
-                const toggleSort = (col: typeof manifestSortCol) => {
-                  if (manifestSortCol === col) setManifestSortDir((d) => d === 'asc' ? 'desc' : 'asc');
-                  else { setManifestSortCol(col); setManifestSortDir('asc'); }
-                };
+                const manifestTable = (
+                  <WoManifestTable
+                    rows={manifestRows}
+                    totalQty={totalQty}
+                    committedDemands={planResult?.committed_demands ?? []}
+                    onOpenDemandPegging={(demandRow, demandId) => {
+                      setPreviousManifestWoRow(row);
+                      setPlanPeggingContext({ type: 'demand', row: demandRow });
+                      setWoPeggingRowKey(`demand|${demandId}|${demandRow.product_id ?? ''}|${demandRow.location_id ?? ''}`);
+                      setPlanWorkOrderPeggingError(null);
+                    }}
+                    labels={{
+                      demand: tP('workOrders.moveManifest.demand'),
+                      component: tP('workOrders.moveManifest.component'),
+                      qty: tP('workOrders.moveManifest.qty'),
+                      footerDemands: tP('workOrders.moveManifest.footerDemands'),
+                      footerComponents: tP('workOrders.moveManifest.footerComponents'),
+                    }}
+                  />
+                );
+                if (!canTogglePegging) return manifestTable;
                 return (
-                  <div style={{ flex: 1, overflow: 'auto', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' }}>
-                      <thead>
-                        <tr style={{ borderBottom: '2px solid #3f3f46', position: 'sticky', top: 0, background: '#1c1c1e' }}>
-                          <th style={thStyle('demand')} onClick={() => toggleSort('demand')}>{tP('workOrders.moveManifest.demand')}{sortIcon('demand')}</th>
-                          <th style={thStyle('comp')} onClick={() => toggleSort('comp')}>{tP('workOrders.moveManifest.component')}{sortIcon('comp')}</th>
-                          <th style={{ ...thStyle('qty', 'right'), paddingRight: 0 }} onClick={() => toggleSort('qty')}>{tP('workOrders.moveManifest.qty')}{sortIcon('qty')}</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {manifestRows.map((r2, i) => {
-                          const demandRow = r2.demand ? (planResult?.committed_demands.find((cd) => cd.demand_id === r2.demand) ?? null) : null;
-                          return (
-                            <tr key={i} style={{ borderBottom: '1px solid #27272a' }}>
-                              <td style={{ padding: '5px 14px 5px 0', wordBreak: 'break-all', fontSize: '0.8rem' }}>
-                                {!r2.demand ? (
-                                  <span style={{ color: '#a1a1aa' }}>–</span>
-                                ) : demandRow ? (
-                                  <button type="button"
-                                    style={{ background: 'none', border: 'none', padding: 0, color: '#60a5fa', cursor: 'pointer', textDecoration: 'underline', fontSize: 'inherit', textAlign: 'left', wordBreak: 'break-all' }}
-                                    onClick={() => {
-                                      setPreviousManifestWoRow(row);
-                                      setPlanPeggingContext({ type: 'demand', row: demandRow });
-                                      setWoPeggingRowKey(`demand|${r2.demand}|${demandRow.product_id ?? ''}|${demandRow.location_id ?? ''}`);
-                                      setPlanWorkOrderPeggingError(null);
-                                    }}
-                                  >{r2.demand}</button>
-                                ) : (
-                                  <span style={{ color: '#a1a1aa' }}>{r2.demand}</span>
-                                )}
-                              </td>
-                              <td style={{ padding: '5px 14px 5px 0', color: '#e4e4e7', fontFamily: 'monospace', fontSize: '0.8rem' }}>{r2.comp}</td>
-                              <td style={{ padding: '5px 0', textAlign: 'right', color: '#fafafa', fontVariantNumeric: 'tabular-nums' }}>{qtyFmt(r2.qty)}</td>
-                            </tr>
-                          );
-                        })}
-
-                      </tbody>
-                      <tfoot>
-                        <tr style={{ borderTop: '2px solid #3f3f46', color: '#a1a1aa', fontSize: '0.78rem' }}>
-                          <td style={{ padding: '5px 14px 5px 0' }}>{distinctDemands} {tP('workOrders.moveManifest.footerDemands')}</td>
-                          <td style={{ padding: '5px 14px 5px 0' }}>{distinctComps} {tP('workOrders.moveManifest.footerComponents')}</td>
-                          <td style={{ padding: '5px 0', textAlign: 'right', color: '#fafafa', fontVariantNumeric: 'tabular-nums' }}>{qtyFmt(totalQty)}</td>
-                        </tr>
-                      </tfoot>
-                    </table>
+                  <div style={{ flex: 1, overflow: 'hidden', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                    <div style={{ display: 'flex', gap: 6, marginBottom: '0.6rem', flexShrink: 0 }}>
+                      <button type="button"
+                        className={manifestViewMode === 'manifest' ? undefined : 'secondary'}
+                        style={{ fontSize: '0.78rem', padding: '3px 10px' }}
+                        onClick={() => setManifestViewMode('manifest')}
+                      >{tP('workOrders.moveManifest.viewManifest')}</button>
+                      <button type="button"
+                        className={manifestViewMode === 'pegging' ? undefined : 'secondary'}
+                        style={{ fontSize: '0.78rem', padding: '3px 10px' }}
+                        onClick={() => setManifestViewMode('pegging')}
+                      >{tP('workOrders.moveManifest.viewPegging')}</button>
+                    </div>
+                    {manifestViewMode === 'manifest' ? manifestTable : accordion}
                   </div>
                 );
               }
-              // Single-product consolidated WO: accordion — one section per logical WO
-              const product_id = String(row.product_id ?? '').trim();
-              const location_id = String(row.location_id ?? '').trim();
-              const method = String(row.method ?? '').trim();
-              return (
-                <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
-                  <div style={{ fontSize: '0.75rem', color: '#a1a1aa', marginBottom: 6 }}>
-                    Physical WO fulfilling {allDemandIds.length} logical WO{allDemandIds.length !== 1 ? 's' : ''}:
-                  </div>
-                  {allDemandIds.map((did) => {
-                    const qty = splitDetails.find((d) => d.demand_id === did)?.allocated_qty ?? null;
-                    const nativeWo = (planResult?.work_orders_native ?? [])
-                      .filter((w) => w.consolidated_group_id === row.wo_group_id && w.demand_id === did)
-                      .sort((a, b) => (a.start_time ?? '').localeCompare(b.start_time ?? ''))[0];
-                    const start_time = nativeWo?.start_time ?? undefined;
-                    const cacheKey = `${did}|${product_id}|${location_id}|${method}|${start_time ?? ''}`;
-                    const tree = planWorkOrderPeggingCache[cacheKey] ?? null;
-                    const isOpen = woConsolidatedOpenSections.has(did);
-                    const sectionExpanded = woConsolidatedExpanded[cacheKey] ?? new Set(['0']);
-                    return (
-                      <div key={did} style={{ borderTop: '1px solid #3d3d40' }}>
-                        <button type="button"
-                          onClick={() => setWoConsolidatedOpenSections((prev) => {
-                            const next = new Set(prev);
-                            if (next.has(did)) next.delete(did); else next.add(did);
-                            return next;
-                          })}
-                          style={{ width: '100%', textAlign: 'left', background: 'none', border: 'none', padding: '6px 2px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, color: 'inherit' }}
-                        >
-                          <span style={{ color: '#a1a1aa', fontSize: '0.7rem', flexShrink: 0 }}>{isOpen ? '▾' : '▸'}</span>
-                          <span style={{ color: '#60a5fa', fontSize: '0.8rem', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{did}</span>
-                          {qty != null && <span style={{ color: '#a78bfa', fontSize: '0.75rem', flexShrink: 0, marginLeft: 'auto' }}>{qtyFmt(qty)}</span>}
-                        </button>
-                        {isOpen && (
-                          <div style={{ paddingLeft: 8, paddingBottom: 8 }}>
-                            {!tree ? (
-                              <p style={{ color: '#a1a1aa', fontSize: '0.82rem', margin: '4px 0' }}>
-                                {woConsolidatedFetchingRef.current.has(cacheKey) ? 'Loading…' : 'No pegging tree.'}
-                              </p>
-                            ) : (
-                              <PlanningPeggingTreeView
-                                tree={tree}
-                                expanded={sectionExpanded}
-                                onToggle={(path) => startTransition(() => setWoConsolidatedExpanded((prev) => {
-                                  const cur = prev[cacheKey] ?? new Set(['0']);
-                                  const next = new Set(cur);
-                                  if (next.has(path)) next.delete(path); else next.add(path);
-                                  return { ...prev, [cacheKey]: next };
-                                }))}
-                                contextDemandId={did}
-                                hideLotCount={true}
-                                consolidatedSourceResolver={(embeddedDemandId, pid) => {
-                                  const allEntries = (planResult?.planning_pegging ?? []).filter(
-                                    (e) => String(e.demand_id ?? '').trim() === embeddedDemandId
-                                  );
-                                  return allEntries.slice(0, -1).map((e) => e.tree)
-                                    .filter((t): t is PlanningPeggingNode => t != null && t.product_id === pid);
-                                }}
-                              />
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              );
+              // Single-product consolidated WO with no synthesizable manifest: accordion only.
+              // Shared with ResourceUtilizationView's own "Consolidated" drill-down so both
+              // surfaces render this identically instead of two independently-drifting copies.
+              return accordion;
             })()}
             {planPeggingContext.type === 'work_order' && (() => {
               const row = planPeggingContext.row as WorkOrder;
@@ -10124,261 +9993,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 }
               }
 
-              // Critical path = the dominator SUB-TREE of the pegging tree.
-              //   - AND junction (work_order parents): single AND-min child.
-              //     Planner pre-flags it via is_bottleneck / is_root_bottleneck;
-              //     break ties by smallest committed_qty/quantity ratio, then
-              //     tree order. If no direct child is flagged but a descendant
-              //     is, descend through the transit child with smallest ratio
-              //     (method WO between BOM levels carries no flag).
-              //   - OR junction (demand parents, alternative paths): every
-              //     contributing child (qty>0 OR committed_qty>0) is a
-              //     dominator. The path BRANCHES.
-              // Mirrors the backend `traceCriticalPath` Kotlin helper exactly.
-              const criticalPathSet = new Set<string>();
-              const hasFlaggedDescendant = (n: PlanningPeggingNode): boolean => {
-                if (n.is_bottleneck || n.is_root_bottleneck) return true;
-                return (n.children ?? []).some(hasFlaggedDescendant);
-              };
-              const ratio = (c: PlanningPeggingNode): number => {
-                const q = Number(c.quantity ?? 0);
-                const cq = Number((c as { committed_qty?: number | null }).committed_qty ?? q);
-                return q < 1e-9 ? 0 : cq / q;
-              };
-              const contributed = (c: PlanningPeggingNode): boolean => {
-                const q = Number(c.quantity ?? 0);
-                const cq = Number((c as { committed_qty?: number | null }).committed_qty ?? q);
-                return q > 1e-9 || cq > 1e-9;
-              };
-              const relationOf = (n: PlanningPeggingNode): 'and' | 'or' => {
-                const explicit = (n as { children_relation?: string | null }).children_relation;
-                if (explicit === 'and' || explicit === 'or') return explicit;
-                return n.type === 'work_order' ? 'and' : 'or';
-              };
-              const buildCriticalPath = (n: PlanningPeggingNode | null, path: string): void => {
-                if (!n) return;
-                // Consumer-attribution nodes (which demand draws from a consolidated PO) are not
-                // part of the demand→source supply chain, so they don't belong on the critical path.
-                if ((n as { consolidated_consumer?: boolean }).consolidated_consumer) return;
-                criticalPathSet.add(path);
-                const kids = n.children ?? [];
-                if (kids.length === 0) return;
-                // Universal rule: exclude children (and subtrees) with 0
-                // contribution. Critical path traces actual flow.
-                const contributingKids = kids
-                  .map((c, i) => ({ c, i }))
-                  .filter(({ c }) => contributed(c));
-                if (contributingKids.length === 0) return;
-                if (relationOf(n) === 'or') {
-                  contributingKids.forEach(({ c, i }) => buildCriticalPath(c, `${path}-${i}`));
-                  return;
-                }
-                // AND: single dominator.
-                const flagged = contributingKids.filter(({ c }) => c.is_bottleneck || c.is_root_bottleneck);
-                let pick: { c: PlanningPeggingNode; i: number } | null = null;
-                if (flagged.length > 0) {
-                  flagged.sort((a, b) => {
-                    const ra = ratio(a.c);
-                    const rb = ratio(b.c);
-                    if (Math.abs(ra - rb) > 1e-9) return ra - rb;
-                    return a.i - b.i;
-                  });
-                  pick = flagged[0];
-                } else {
-                  const transit = contributingKids.filter(({ c }) => hasFlaggedDescendant(c));
-                  if (transit.length === 0) return;
-                  transit.sort((a, b) => {
-                    const ra = ratio(a.c);
-                    const rb = ratio(b.c);
-                    if (Math.abs(ra - rb) > 1e-9) return ra - rb;
-                    return a.i - b.i;
-                  });
-                  pick = transit[0];
-                }
-                buildCriticalPath(pick.c, `${path}-${pick.i}`);
-              };
-              buildCriticalPath(tree, '0');
-
-              const runSearch = (query: string) => {
-                const q = query.trim().toLowerCase();
-                if (!q || !tree) {
-                  setPlanPeggingMatchPaths([]);
-                  setPlanPeggingMatchPath(null);
-                  setPlanPeggingMatchIndex(0);
-                  return;
-                }
-                const matches: string[] = [];
-                const ancestors = new Set<string>();
-                const nodeMatches = (n: PlanningPeggingNode): boolean => {
-                  if (n.type === 'demand') {
-                    return [n.product_id, n.location_id].some(
-                      (f) => typeof f === 'string' && f.toLowerCase().includes(q)
-                    );
-                  }
-                  if (n.type === 'supply') {
-                    const pid = n.product_id;
-                    const sid = n.supply_id;
-                    if (typeof pid !== 'string' || typeof sid !== 'string') return false;
-                    // Standard lot supply_id = "pid_loc_lot" — sid starts with pid+"_".
-                    // These are detail nodes; the parent demand already covers this product
-                    // occurrence. Only consolidated/named supplies (e.g.
-                    // "consolidated_260-0141-02_2000") add a distinct occurrence.
-                    if (sid.toLowerCase().startsWith(pid.toLowerCase() + '_')) return false;
-                    return pid.toLowerCase().includes(q) || sid.toLowerCase().includes(q);
-                  }
-                  // work_order, purchase, operation, resource:
-                  // match only on location and method — NOT product_id (handled by demand
-                  // branch above) and NOT demand_id (it may embed the product_id string).
-                  return [n.location_id, n.method].some(
-                    (f) => typeof f === 'string' && f.toLowerCase().includes(q)
-                  );
-                };
-                // Mirror PlanningPeggingTreeView's child filtering so paths stay in sync.
-                const childContrib = (c: PlanningPeggingNode): number => {
-                  const cc = (c as { committed_qty?: number | null }).committed_qty;
-                  return Number((cc != null ? cc : c.quantity) ?? 0);
-                };
-                const visibleChildren = (n: PlanningPeggingNode): PlanningPeggingNode[] => {
-                  const raw = n.children ?? [];
-                  const isLegacyBlockedWo = n.type === 'work_order'
-                    && !n.failed
-                    && Number(n.quantity ?? 0) <= 1e-9
-                    && raw.length > 0;
-                  if (isLegacyBlockedWo) return [];
-                  if (n.children_relation === 'or' && raw.length > 1) {
-                    const contribCount = raw.filter(c => childContrib(c) > 1e-9).length;
-                    if (contribCount > 0 && contribCount < raw.length)
-                      return raw.filter(c => childContrib(c) > 1e-9);
-                  }
-                  return raw;
-                };
-                const walk = (n: PlanningPeggingNode, path: string, chain: string[]): void => {
-                  const nextChain = [...chain, path];
-                  if (nodeMatches(n)) {
-                    matches.push(path);
-                    chain.forEach((p) => ancestors.add(p));
-                  }
-                  visibleChildren(n).forEach((c, i) => walk(c, `${path}-${i}`, nextChain));
-                };
-                walk(tree, '0', []);
-                setPlanPeggingMatchPaths(matches);
-                setPlanPeggingMatchIndex(0);
-                setPlanPeggingMatchPath(matches[0] ?? null);
-                if (matches.length > 0) {
-                  setPlanPeggingExpanded((prev) => {
-                    const next = new Set(prev);
-                    ancestors.forEach((p) => next.add(p));
-                    // Also expand the first match itself so its children are visible
-                    next.add(matches[0]);
-                    return next;
-                  });
-                }
-              };
-              const stepMatch = (delta: number) => {
-                if (planPeggingMatchPaths.length === 0) return;
-                const nextIdx = (planPeggingMatchIndex + delta + planPeggingMatchPaths.length) % planPeggingMatchPaths.length;
-                setPlanPeggingMatchIndex(nextIdx);
-                const nextPath = planPeggingMatchPaths[nextIdx];
-                setPlanPeggingMatchPath(nextPath);
-                // Make sure ancestors of the new match are expanded
-                setPlanPeggingExpanded((prev) => {
-                  const next = new Set(prev);
-                  const parts = nextPath.split('-');
-                  for (let i = 1; i <= parts.length; i++) next.add(parts.slice(0, i).join('-'));
-                  next.add(nextPath);
-                  return next;
-                });
-              };
-
-              return (
-                <>
-                  <div style={{
-                    display: 'flex', alignItems: 'center', gap: 6,
-                    marginTop: '0.25rem', marginBottom: '0.5rem',
-                    padding: '4px 6px', background: '#1c1c1e',
-                    border: '1px solid #3d3d40', borderRadius: 4,
-                  }}>
-                    <input
-                      type="text"
-                      value={planPeggingSearch}
-                      onChange={(e) => setPlanPeggingSearch(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          e.preventDefault();
-                          if (planPeggingMatchPaths.length > 0) stepMatch(e.shiftKey ? -1 : 1);
-                          else runSearch(planPeggingSearch);
-                        } else if (e.key === 'Escape') {
-                          setPlanPeggingSearch('');
-                          setPlanPeggingMatchPaths([]);
-                          setPlanPeggingMatchPath(null);
-                          setPlanPeggingMatchIndex(0);
-                        } else {
-                          // Any edit invalidates prior matches; user presses Enter/Find to re-search.
-                          if (planPeggingMatchPaths.length > 0) {
-                            setPlanPeggingMatchPaths([]);
-                            setPlanPeggingMatchPath(null);
-                            setPlanPeggingMatchIndex(0);
-                          }
-                        }
-                      }}
-                      placeholder="Find in pegging (product / location / supply / demand id)…"
-                      style={{ flex: 1, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem' }}
-                    />
-                    <button type="button" onClick={() => runSearch(planPeggingSearch)}
-                      style={{ padding: '3px 8px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, cursor: 'pointer', fontSize: '0.78rem' }}>
-                      Find
-                    </button>
-                    <button type="button" onClick={() => stepMatch(-1)} disabled={planPeggingMatchPaths.length === 0}
-                      style={{ padding: '3px 8px', background: '#2d2d30', color: planPeggingMatchPaths.length === 0 ? '#52525b' : '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, cursor: planPeggingMatchPaths.length === 0 ? 'default' : 'pointer', fontSize: '0.78rem' }}>
-                      ↑
-                    </button>
-                    <button type="button" onClick={() => stepMatch(1)} disabled={planPeggingMatchPaths.length === 0}
-                      style={{ padding: '3px 8px', background: '#2d2d30', color: planPeggingMatchPaths.length === 0 ? '#52525b' : '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, cursor: planPeggingMatchPaths.length === 0 ? 'default' : 'pointer', fontSize: '0.78rem' }}>
-                      ↓
-                    </button>
-                    <span style={{ fontSize: '0.72rem', color: '#a1a1aa', minWidth: 60, textAlign: 'right' }}>
-                      {planPeggingMatchPaths.length === 0
-                        ? (planPeggingSearch.trim() ? 'no match' : '')
-                        : `${planPeggingMatchIndex + 1} / ${planPeggingMatchPaths.length}`}
-                    </span>
-                  </div>
-                  <div style={{ flex: 1, overflow: 'auto', minHeight: 0, marginTop: '0.5rem' }}>
-                    {tree ? (
-                      <PlanningPeggingTreeView
-                        tree={tree}
-                        expanded={planPeggingExpanded}
-                        onToggle={(p) => startTransition(() => setPlanPeggingExpanded((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(p)) next.delete(p); else next.add(p);
-                          return next;
-                        }))}
-                        matchPath={planPeggingMatchPath}
-                        matchPaths={planPeggingMatchPaths}
-                        criticalPathSet={criticalPathSet}
-                        explanationExpanded={planExplanationExpanded}
-                        onToggleExplanation={(p) => startTransition(() => setPlanExplanationExpanded((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(p)) next.delete(p); else next.add(p);
-                          return next;
-                        }))}
-                        workOrderRootQty={planPeggingContext?.type === 'work_order'
-                          ? Number((planPeggingContext.row as WorkOrder).quantity ?? 0)
-                          : null}
-                        contextDemandId={contextDemandId}
-                        consolidatedSourceResolver={(embeddedDemandId, pid) => {
-                          const allEntries = (planResult?.planning_pegging ?? []).filter(
-                            (e) => String(e.demand_id ?? '').trim() === embeddedDemandId
-                          );
-                          return allEntries
-                            .slice(0, -1)
-                            .map((e) => e.tree)
-                            .filter((t): t is PlanningPeggingNode => t != null && t.product_id === pid);
-                        }}
-                      />
-                    ) : null}
-                  </div>
-                </>
-              );
+              return tree ? (
+                <SinglePeggingTreePanel
+                  key={woPeggingRowKey ?? ''}
+                  tree={tree}
+                  contextDemandId={contextDemandId}
+                  workOrderRootQty={planPeggingContext.type === 'work_order'
+                    ? Number((planPeggingContext.row as WorkOrder).quantity ?? 0)
+                    : null}
+                  planningPegging={planResult?.planning_pegging ?? []}
+                />
+              ) : null;
             })()}
           </div>
         </div>,

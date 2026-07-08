@@ -682,6 +682,11 @@ fun Routing.allocateRoutes() {
         // multiple slot matches (waterfall) or multiple lots, start_time picks
         // the exact one the user clicked. Blank → "any" (caller didn't pass it).
         val startTime = call.request.queryParameters["start_time"]?.trim().orEmpty()
+        // Optional, more precise disambiguator: the physical lot's own native wo_group_id.
+        // Two separate lots for the same demand can share an identical start_time (both
+        // snapped to the same final consolidated wave) — start_time alone can't tell them
+        // apart, but wo_group_id is unique per lot by construction. Blank → no extra filter.
+        val woGroupId = call.request.queryParameters["wo_group_id"]?.trim().orEmpty()
         val runIdParam = call.request.queryParameters["run_id"]?.toIntOrNull()
         if (productId.isBlank() || locationId.isBlank() || method.isBlank()) {
             throw IllegalArgumentException("product_id, location_id, method required")
@@ -732,7 +737,16 @@ fun Routing.allocateRoutes() {
             val jpath = "\$.** ? (@.type == \"work_order\" && @.product_id == \$prod && @.location_id == \$loc && @.method == \$meth)"
             transaction {
                 exec(
-                    "SELECT p.demand_id, jsonb_path_query(p.entry::jsonb, '$jpath'::jsonpath, " +
+                    // DISTINCT: "$.**"'s recursive descent can revisit and return the exact same
+                    // matching node more than once for a single plan_pegging row (verified against
+                    // live data: every distinct work_order match came back doubled, even though the
+                    // stored JSON embeds each node exactly once — a jsonpath execution artifact, not
+                    // a data duplication). A genuinely distinct WO occurrence (different
+                    // wo_group_id/quantity/timing) has different jsonb content and survives DISTINCT;
+                    // only byte-for-byte duplicates of the same match collapse. Without this, callers
+                    // that sum multiple matches (the wo_group_id disambiguation path, and the
+                    // cross-demand batch aggregate) silently double-count.
+                    "SELECT DISTINCT p.demand_id, jsonb_path_query(p.entry::jsonb, '$jpath'::jsonpath, " +
                     "jsonb_build_object('prod', ?, 'loc', ?, 'meth', ?)) AS wo_node " +
                     "FROM plan_pegging p " +
                     "WHERE p.plan_run_id = ? AND p.demand_id IN ($idsLiteral)",
@@ -781,13 +795,19 @@ fun Routing.allocateRoutes() {
                 log.warn("[WO pegging] First tree root type={} children types={}", firstTree?.get("type"), childTypes)
             }
             // Collect every matching WO node across all matching trees, then
-            // narrow by start_time when supplied so the caller gets the exact
-            // slot/lot they clicked. Without start_time, multiple matches still
-            // collapse to the first (via mergeAlternativeWoNodes) for back-compat.
+            // narrow by wo_group_id when supplied — the physical lot's own unique identity,
+            // so at most one node can match (two lots for the same demand can otherwise share
+            // an identical start_time, which start_time filtering alone can't disambiguate) —
+            // and by start_time when supplied so the caller gets the exact slot/lot they
+            // clicked. Without either, multiple matches still collapse to the first (via
+            // mergeAlternativeWoNodes) for back-compat.
             val rawMatches = matchingEntries.flatMap { entry ->
                 findAllWoNodes(entry["tree"], productId, locationId, method)
             }
-            val allMatches = filterByStartTime(rawMatches, startTime)
+            val byGid = if (woGroupId.isNotBlank()) {
+                rawMatches.filter { (it["wo_group_id"] as? String)?.trim() == woGroupId }
+            } else rawMatches
+            val allMatches = filterByStartTime(byGid, startTime)
             if (allMatches.isEmpty() && matchingEntries.isNotEmpty()) {
                 val allWoKeys = matchingEntries.flatMap { entry -> collectAllWoKeys(entry["tree"]) }
                 log.warn("[WO pegging] Tree found for demand={} but WO {}@{}/{} (start={}) not in it. All WO keys in tree: {}", demandId, productId, locationId, method, startTime, allWoKeys)
@@ -874,7 +894,27 @@ fun Routing.allocateRoutes() {
                         )
                     }
                 } else {
-                    node["children"] = windowed.map { it - "__src_demand" }
+                    // Group by the demand each occurrence came from — matches the "Demand
+                    // breakdown" panel's own grouping — instead of a flat OR-alternatives list.
+                    // These are additive per-demand shares of one consolidated batch, not
+                    // alternative supply paths, so wrap each demand's own WO node(s) under a
+                    // "demand" header (marked consolidated_consumer so the tree renders the
+                    // "required in the following demands" label instead of the OR-supply one —
+                    // unlike the purchase case above, these demand nodes keep their own real
+                    // children, i.e. each demand's full WO sub-tree, not a terminal attribution).
+                    val byDemand = windowed.groupBy { (it["__src_demand"] as? String) ?: "" }.filterKeys { it.isNotBlank() }
+                    node["children"] = byDemand.map { (did, nodes) ->
+                        mapOf(
+                            "type" to "demand",
+                            "product_id" to productId,
+                            "location_id" to locationId,
+                            "demand_id" to did,
+                            "quantity" to nodes.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 },
+                            "committed_qty" to nodes.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 },
+                            "consolidated_consumer" to true,
+                            "children" to nodes.map { it - "__src_demand" },
+                        )
+                    }
                 }
                 node
             } else {
@@ -883,7 +923,14 @@ fun Routing.allocateRoutes() {
             }
         }
 
-        // Align quantity with work_orders list sum
+        // Align quantity with work_orders list sum. Skipped when wo_group_id was supplied and
+        // used to scope the match above: that already picked the one exact physical lot the
+        // caller wanted, so its own `quantity` is authoritative. Without this skip, a demand
+        // that has MORE THAN ONE separate consolidated batch for the same (product, location,
+        // method) — e.g. two physically distinct production runs weeks apart — would have this
+        // sum match whichever OTHER batch also carries demand_id == demandId (its own,
+        // unrelated, single-demand batch), silently overwriting the correctly-fetched lot's
+        // quantity with a different lot's number while leaving its start/end time untouched.
         @Suppress("UNCHECKED_CAST")
         val workOrders = result["work_orders"] as? List<Map<String, Any?>> ?: emptyList()
         val woQtySum = workOrders.filter { wo ->
@@ -897,7 +944,7 @@ fun Routing.allocateRoutes() {
         // Only re-align a PER-DEMAND node to the work-order list. For the consolidated/batched case
         // (demandId blank) the synthetic node already carries the correct windowed PO quantity;
         // summing all demand_id=null work orders here would add up every window's batch.
-        val finalTree = if (woQtySum > 0 && demandId.isNotBlank() && treeJson is JsonObject) {
+        val finalTree = if (woGroupId.isBlank() && woQtySum > 0 && demandId.isNotBlank() && treeJson is JsonObject) {
             buildJsonObject {
                 treeJson.forEach { (k, v) -> if (k == "quantity") put("quantity", roundQty(woQtySum)) else put(k, v) }
             }

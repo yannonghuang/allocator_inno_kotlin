@@ -1106,13 +1106,15 @@ private class WalkContext(
         //     rate (engine), the OPPOSITE of spec.md's "child = parent / rate".
         //     The engine is the authority since the soundness check exists to
         //     verify what plan() actually emits.
-        //   - Failed-parent skip: when parent.quantity == 0 the WO didn't
-        //     produce anything; child committed_qty values can reflect stale
-        //     first-pass exploratory commitments and aren't tied to this WO.
-        //     Skip R4 in that case (the tree is internally inconsistent but
-        //     the inconsistency isn't a quantity-propagation violation).
+        //   - isZeroQty parent skip: a WO below the universal zero threshold isn't a
+        //     fully-fledged WO anywhere in the pipeline (no lot, no wave-scheduling —
+        //     see isZeroQty's doc) — its child committed_qty values can reflect stale
+        //     first-pass exploratory commitments and aren't tied to this WO, and its own
+        //     start/end were never properly wave-scheduled. Skip R4/R5/R6-adjacent qty/
+        //     duration checks in that case (the tree is internally inconsistent but the
+        //     inconsistency isn't a quantity-propagation or lead-time violation).
         val parentQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
-        if (parentQty <= config.tolerance) return  // failed make WO; child commitments orphaned
+        if (isZeroQty(parentQty)) return
         val childrenRelation = (node["children_relation"] as? String)?.trim()
         // Tolerance: max(1.0, 10% of expected). Accommodates two kinds of
         // engine noise:
@@ -1196,24 +1198,19 @@ private class WalkContext(
         // so expected total duration = wave_count * per-lot. Fall back to the
         // method_make minimum (existing behavior) when the override doesn't
         // apply.
+        // R5: WO duration must be ≥ waveCount × lead_time (the calendar constraint).
+        // consolidateByWaves emits span = lead_time; ResourceScheduler extends to waveCount × lead_time.
+        // Checking against lead_time directly (not UPH-derived perLotLead) makes R5 a direct
+        // enforcement of the calendar contract.
         val staticLeadTime = matchingMakes
             .mapNotNull { (it["lead_time"] as? Number)?.toDouble() }
             .minOrNull()
             ?: 0.0
-        val woQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
-        val perLotLead = if (woQty > 0.0) {
-            OperationLookup.effectiveLeadDays(pid, lid, woQty, staticLeadTime, data).days
-        } else {
-            staticLeadTime
-        }
-        // Wave compression: total span = ceil(lot_count / cap) * per-lot.
-        // cap=0 (no BOR data, e.g. subcon) → unconstrained parallel → waveCount=1,
-        // consistent with how buildWorkOrders and consolidateByWaves treat this case.
         val lotCount = (node["lot_count"] as? Number)?.toInt()?.takeIf { it > 0 } ?: 1
         val rawCap = OperationLookup.parallelismCap(pid, lid, data)
         val parallelismCap = if (rawCap > 0) rawCap else Int.MAX_VALUE
         val waveCount = kotlin.math.ceil(lotCount.toDouble() / parallelismCap.toDouble()).toInt().coerceAtLeast(1)
-        val leadTime = perLotLead * waveCount
+        val leadTime = staticLeadTime * waveCount
         val startTime = parseDateLocal(node["start_time"]?.toString())
         val endTime = parseDateLocal(node["end_time"]?.toString())
         if (startTime != null && endTime != null) {
@@ -1222,7 +1219,7 @@ private class WalkContext(
                 violations.add(Violation(
                     rule = "R5_lead_time",
                     nodePath = path,
-                    message = "Make WO duration (end - start = $duration days) shorter than expected $leadTime days (= $perLotLead per-lot × $waveCount wave(s) at cap ${if (parallelismCap == Int.MAX_VALUE) "∞" else parallelismCap}).",
+                    message = "Make WO duration (end - start = $duration days) shorter than expected $leadTime days (= $staticLeadTime lead_time × $waveCount wave(s) at cap ${if (parallelismCap == Int.MAX_VALUE) "∞" else parallelismCap}).",
                     expected = leadTime,
                     actual = duration.toDouble(),
                 ))
@@ -1252,6 +1249,12 @@ private class WalkContext(
             ))
             return
         }
+
+        // isZeroQty parent skip: same rationale as validateMakeWO — a WO below the universal
+        // zero threshold isn't a fully-fledged WO anywhere in the pipeline (no lot, no
+        // wave-scheduling), so its child commitments and its own start/end are not meaningful
+        // to check against R4/R5_transit_time here.
+        if (isZeroQty(node["quantity"])) return
 
         // R4: qty conserved at move WOs (parent qty == single child committed_qty).
         // Same rationale as the make case: child's committed_qty is the
@@ -1330,6 +1333,10 @@ internal fun verifyWoGidOrphans(
         if (depth > 60) return
         if (node["failed"] == true) return  // mirror flattenPeggingToWorkOrders: skip entire failed subtree
         if (node["type"] == "work_order") {
+            // Mirror flattenPeggingToWorkOrders/consolidateByWaves: an isZeroQty() WO (any
+            // method, not just make) isn't flattened into work_orders, so its gid — and anything
+            // beneath it — isn't expected to resolve to a lot either.
+            if (isZeroQty(node["quantity"])) return
             val gid = (node["wo_group_id"] as? String)?.trim()
             if (!gid.isNullOrBlank() && gid !in gidsInLots) orphans.add(gid)
         }
@@ -1430,18 +1437,27 @@ internal fun verifyResourceOverload(
             if (bRate <= 0.0 || sz <= 0.0) Int.MAX_VALUE
             else Math.floor(sz / bRate).toInt()
         }?.coerceAtLeast(1) ?: Int.MAX_VALUE
-        val lotCnt = minOf(rawLotCnt, parallelCap)
+        // Split into per-wave windows (every wave except the last runs `cap` concurrent
+        // lots; the last, often-partial wave runs fewer) instead of a single flat
+        // min(lot_count, cap) across the whole span — the flat model overstates load on
+        // the tail wave's days and can both under- and over-trigger this rule relative
+        // to what ResourceScheduler.arbitrate actually reserved.
+        val perWaveDaysHint = (wo["per_wave_days"] as? Number)?.toLong()
+        val waveWindows = OperationLookup.waveLotWindows(startDt, endDt, rawLotCnt, parallelCap, perWaveDaysHint)
+            .ifEmpty { listOf(Triple(startDt, endDt, minOf(rawLotCnt, parallelCap))) }
 
         for (br in borRows) {
             val rid  = (br["resource_id"]   as? String)?.trim() ?: continue
             val rate = (br["resource_rate"] as? Number)?.toDouble() ?: continue
             val key  = rid to lid
             val bucket = loadMap.getOrPut(key) { mutableMapOf() }
-            val dayLoad = rate * lotCnt
-            var d = startDt
-            while (d.isBefore(endDt)) {
-                bucket[d] = (bucket[d] ?: 0.0) + dayLoad
-                d = d.plusDays(1)
+            for ((waveStart, waveEnd, lotsThisWave) in waveWindows) {
+                val dayLoad = rate * lotsThisWave
+                var d = waveStart
+                while (d.isBefore(waveEnd)) {
+                    bucket[d] = (bucket[d] ?: 0.0) + dayLoad
+                    d = d.plusDays(1)
+                }
             }
         }
     }
@@ -1582,6 +1598,10 @@ internal fun checkRunSoundnessStreaming(
                 if (depth > 60) return
                 if (node["failed"] == true) return  // mirror flattenPeggingToWorkOrders: skip entire failed subtree
                 if (node["type"] == "work_order") {
+                    // Mirror flattenPeggingToWorkOrders/consolidateByWaves: an isZeroQty() WO
+                    // (any method, not just make) isn't flattened into work_orders, so its gid —
+                    // and anything beneath it — isn't expected to resolve to a lot either.
+                    if (isZeroQty(node["quantity"])) return
                     val gid = (node["wo_group_id"] as? String)?.trim()
                     if (!gid.isNullOrBlank() && gid !in gidsInLots) orphanGids.add(gid)
                 }

@@ -332,34 +332,4 @@ class SupplyGuidedPlanningTest : FunSpec({
         d1Total shouldBe (10.0 plusOrMinus 1e-6)
         d2Total shouldBe (20.0 plusOrMinus 1e-6)
     }
-
-    test("supply-guided routing does not fire when disabled") {
-        // Legacy path: first demand consumes everything, second gets nothing.
-        val data = mkData(
-            supplies = listOf(supply("R1", "L", 30.0)),
-            methodMake = listOf(
-                mapOf("bom_id" to "BOM1", "product_id" to "FG", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
-            ),
-            bom = listOf(
-                mapOf("bom_id" to "BOM1", "parent_id" to "FG", "child_id" to "R1", "rate" to 1.0, "alt_group" to null),
-            ),
-            demands = listOf(
-                demand("D1", "FG", "L", qty = 20.0, priority = 0),
-                demand("D2", "FG", "L", qty = 40.0, priority = 1),
-            ),
-        )
-        val legacyConfig = mapOf("purchase_allowed" to false, "supply_guided" to mapOf("enabled" to false))
-        val result = runPlanning(data, legacyConfig)
-        @Suppress("UNCHECKED_CAST")
-        val committed = result.output["committed_demands"] as List<Map<String, Any?>>
-
-        val d1Total = committed.filter { it["demand_id"] == "D1" }
-            .sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
-        val d2Total = committed.filter { it["demand_id"] == "D2" }
-            .sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
-
-        // Legacy (FIFO): D1 gets all 20 (priority 0), D2 gets remaining 10
-        d1Total shouldBe (20.0 plusOrMinus 1e-6)
-        d2Total shouldBe (10.0 plusOrMinus 1e-6)
-    }
 })

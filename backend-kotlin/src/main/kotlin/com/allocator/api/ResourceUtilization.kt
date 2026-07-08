@@ -2,6 +2,7 @@ package com.allocator.api
 
 import com.allocator.*
 import com.allocator.services.CaseLoader
+import com.allocator.services.OperationLookup
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.response.*
@@ -117,6 +118,11 @@ private fun computeResourceUtilization(caseId: Int, runId: Int): Map<String, Any
         // many concurrent lots in one row. Each lot loads the resource at `rate`, so
         // load must be weighted by lotCount or batched WOs under-count utilization.
         val lotWindows: MutableList<Triple<LocalDate, LocalDate, Int>>,
+        // Every demand this WO serves. For a cross-demand consolidated batch
+        // (demand_id blank), this is consolidated_demand_ids — the UI needs it to
+        // resolve pegging via /work-order-pegging?demand_ids=… since there's no
+        // single demand_id to key off.
+        val demandIds: MutableSet<String>,
     )
     val woSummaries = mutableMapOf<String, WoSummary>()
     for (wo in workOrders) {
@@ -144,12 +150,20 @@ private fun computeResourceUtilization(caseId: Int, runId: Int): Map<String, Any
         val did = (wo["demand_id"] as? String)?.trim().orEmpty()
         val key = "$gid|$did|$productId|$locationId"
         val qtyAdd = (wo["quantity"] as? Number)?.toDouble() ?: 0.0
-        // Effective concurrent lots = min(lot_count, parallelism_cap).
-        // A consolidated WO has lot_count = total lots across all waves, but at
-        // any given day only cap lots run simultaneously. Using total lot_count
-        // overstates the load by a factor of wave_count, producing phantom
-        // overloads that ResourceScheduler (which reserves cap×rate per day)
-        // cannot prevent. Cap comes from the same BOR data already validated above.
+        @Suppress("UNCHECKED_CAST")
+        val demandIdsAdd: Set<String> = ((wo["consolidated_demand_ids"] as? List<String>)
+            ?: (wo["wo_competing_demands"] as? List<String>)
+            ?: emptyList())
+            .mapNotNull { it.trim().takeIf { s -> s.isNotBlank() } }
+            .toSet()
+            .ifEmpty { setOfNotNull(did.takeIf { it.isNotBlank() }) }
+        // A consolidated WO's lot_count is the TOTAL across all waves, but at any
+        // given day only `cap` lots run concurrently (fewer on the final, often-
+        // partial wave). Split into per-wave windows via OperationLookup.waveLotWindows
+        // (matching ResourceScheduler.arbitrate's actual reservation model) instead of
+        // applying a single flat min(lot_count, cap) across the whole span — that would
+        // overstate load on the tail wave's days (e.g. 3 lots at cap=2 is 2 lots for the
+        // first wave then 1 for the second, not 2 for both).
         val rawLotCnt = (wo["lot_count"] as? Number)?.toInt()?.coerceAtLeast(1) ?: 1
         val parallelCap = borRows.minOfOrNull { br ->
             val rid = (br["resource_id"] as? String)?.trim() ?: return@minOfOrNull Int.MAX_VALUE
@@ -157,7 +171,9 @@ private fun computeResourceUtilization(caseId: Int, runId: Int): Map<String, Any
             val sz = sizeByResLoc[rid to locationId] ?: return@minOfOrNull Int.MAX_VALUE
             if (bRate <= 0.0 || sz <= 0.0) Int.MAX_VALUE else Math.floor(sz / bRate).toInt()
         }?.coerceAtLeast(1) ?: Int.MAX_VALUE
-        val lotCnt = minOf(rawLotCnt, parallelCap)
+        val perWaveDaysHint = (wo["per_wave_days"] as? Number)?.toLong()
+        val waveWindows = OperationLookup.waveLotWindows(startDt, endDt, rawLotCnt, parallelCap, perWaveDaysHint)
+            .ifEmpty { listOf(Triple(startDt, endDt, minOf(rawLotCnt, parallelCap))) }
         val existing = woSummaries[key]
         if (existing == null) {
             woSummaries[key] = WoSummary(
@@ -168,13 +184,15 @@ private fun computeResourceUtilization(caseId: Int, runId: Int): Map<String, Any
                 minStart = startDt,
                 maxEnd = endDt,
                 totalQty = qtyAdd,
-                lotWindows = mutableListOf(Triple(startDt, endDt, lotCnt)),
+                lotWindows = waveWindows.toMutableList(),
+                demandIds = demandIdsAdd.toMutableSet(),
             )
         } else {
             if (startDt < existing.minStart) existing.minStart = startDt
             if (endDt > existing.maxEnd) existing.maxEnd = endDt
             existing.totalQty += qtyAdd
-            existing.lotWindows.add(Triple(startDt, endDt, lotCnt))
+            existing.lotWindows.addAll(waveWindows)
+            existing.demandIds.addAll(demandIdsAdd)
         }
     }
 
@@ -218,6 +236,10 @@ private fun computeResourceUtilization(caseId: Int, runId: Int): Map<String, Any
             contributors.getOrPut(key) { mutableListOf() }.add(mapOf(
                 "wo_group_id" to summary.woGroupId,
                 "demand_id" to summary.demandId,
+                // Every demand this WO serves — lets the UI resolve pegging for a
+                // cross-demand consolidated batch (demand_id null) via demand_ids,
+                // since there's no single demand to key off.
+                "demand_ids" to summary.demandIds.sorted(),
                 "product_id" to summary.productId,
                 "location_id" to summary.locationId,
                 "quantity" to summary.totalQty,
@@ -228,6 +250,11 @@ private fun computeResourceUtilization(caseId: Int, runId: Int): Map<String, Any
                 "end_time" to summary.maxEnd.toString(),
                 "lot_count" to summary.lotWindows.sumOf { it.third },
                 "rate" to rate,
+                // This WO's own peak contribution to the resource's daily load — the busiest
+                // wave's concurrent-lot count × rate, not lot_count × rate (which would repeat
+                // the tail-wave overstatement fixed elsewhere: the final, often-partial wave runs
+                // fewer concurrent lots than earlier full waves).
+                "peak_load" to (summary.lotWindows.maxOfOrNull { it.third } ?: 0) * rate,
             ))
         }
     }

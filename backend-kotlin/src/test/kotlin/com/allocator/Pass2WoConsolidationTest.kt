@@ -125,6 +125,17 @@ class Pass2WoConsolidationTest : FunSpec({
         out.size shouldBe 1
         out[0]["product_id"] shouldBe "RAW1"
         out.none { it["consolidated"] == true } shouldBe true
+        // A singleton row must carry the same wo_competing_demands / consolidation_split_details
+        // shape a merged row does — otherwise a later cross-wave merge with other demands' rows
+        // would silently drop this demand's quantity from the merged split while still counting
+        // it in the merged total (the accordion "missing count" bug: demand shown, no qty next to it).
+        @Suppress("UNCHECKED_CAST")
+        (out[0]["wo_competing_demands"] as List<String>) shouldContainExactlyInAnyOrder listOf("D1")
+        @Suppress("UNCHECKED_CAST")
+        val splitDetails = out[0]["consolidation_split_details"] as List<Map<String, Any?>>
+        splitDetails.size shouldBe 1
+        splitDetails[0]["demand_id"] shouldBe "D1"
+        (splitDetails[0]["allocated_qty"] as Number).toDouble() shouldBe (100.0 plusOrMinus 1e-6)
     }
 
     test("PARTITION invariant — every native belongs to EXACTLY ONE consolidated WO; qty conserved") {
@@ -252,11 +263,14 @@ class Pass2WoConsolidationTest : FunSpec({
         res.consolidation.native.all { it["consolidated_group_id"] == cgid } shouldBe true
     }
 
-    test("lot_count and duration recompute together across a lot-size boundary") {
+    test("lot_count recomputes across a lot-size boundary; duration stays a single calendar wave") {
         // FG1@L: max_lot_size=100, lead_time=3d/wave, no operation/bor fixture so parallelismCap
-        // falls back to 0 → coerced to a cap of 1 lot per wave. Two 80-unit make WOs, each under
-        // the lot-size cap alone (1 lot, 3d), merge to 160 units → lot_count=ceil(160/100)=2,
-        // numWaves=ceil(2/1)=2, duration=2*3d=6d — neither value matches either constituent alone.
+        // falls back to 0 → treated as UNCONSTRAINED parallel (matching buildWorkOrders' documented
+        // fallback: no BOR data models no resource constraint, so lots don't stack sequentially).
+        // Two 80-unit make WOs merge to 160 units → lot_count=ceil(160/100)=2, but with cap=∞ both
+        // lots still fit in a single wave. consolidateByWaves emits span = calendar lead_time only
+        // (3d) — resource-capacity wave sequencing (waveCount × lead_time) is exclusively
+        // ResourceScheduler's job, run after consolidation, so it plays no part here.
         val fgData: Map<String, List<Map<String, Any?>>> = mapOf(
             "productlocation" to listOf(
                 mapOf("product_id" to "FG1", "location_id" to "L", "max_lot_size" to 100.0),
@@ -276,7 +290,7 @@ class Pass2WoConsolidationTest : FunSpec({
         qtyOf(c) shouldBe (160.0 plusOrMinus 1e-6)
         c["lot_count"] shouldBe 2
         c["start_time"] shouldBe "2024-05-01"
-        c["end_time"] shouldBe "2024-05-07"   // May01 + 2 waves * 3d
+        c["end_time"] shouldBe "2024-05-04"   // May01 + 1 wave * 3d lead_time
     }
 
     test("failed=true subtrees are excluded uniformly — AND (BOM) child and OR (alt-method) sibling") {

@@ -14,6 +14,11 @@ const DAY_MS = 86_400_000;
 
 function parseIso(s: string | null | undefined): Date | null {
   if (!s) return null;
+  // Date-only strings (YYYY-MM-DD) are treated as UTC midnight by the spec,
+  // but we display in local time — causing off-by-one in timezones behind UTC.
+  // Parse them as local-midnight instead so display and arithmetic are consistent.
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s.trim());
+  if (m) return new Date(+m[1], +m[2] - 1, +m[3]);
   const d = new Date(s);
   return Number.isNaN(d.getTime()) ? null : d;
 }
@@ -149,7 +154,7 @@ export function ScheduleBar({
       <svg width="100%" height={10} preserveAspectRatio="none" style={{ display: 'block' }}>
         {spans.map(({ sd, ed }, i) => {
           const sClamped = Math.max(hStart, Math.min(hEnd, sd.getTime()));
-          const eClamped = Math.max(hStart, Math.min(hEnd, ed.getTime()));
+          const eClamped = Math.max(hStart, Math.min(hEnd, ed.getTime() + DAY_MS));
           const xPct = ((sClamped - hStart) / hSpan) * 100;
           const wPct = ((eClamped - sClamped) / hSpan) * 100;
           const durationDays = Math.max(0, Math.round((ed.getTime() - sd.getTime()) / DAY_MS));
@@ -287,6 +292,163 @@ export function ScheduleHorizonRuler({
           })}
         </svg>
       </div>
+    </div>
+  );
+}
+
+/** Date-ruler for the BOR "Load" column header — tick marks + labels aligned to the same
+ *  percentage x-axis as BorMiniTimeline bars, using CSS absolute positioning so text is
+ *  never distorted by SVG stretching. */
+export function BorTimelineRuler({
+  buckets,
+  woStart,
+  woEnd,
+}: {
+  buckets: string[];
+  woStart: string | null | undefined;
+  woEnd: string | null | undefined;
+}): JSX.Element | null {
+  const woS = parseIso(woStart);
+  const woE = parseIso(woEnd);
+  if (!woS || !woE || buckets.length === 0) return null;
+
+  const woStartMs = woS.getTime();
+  const woEndMs = woE.getTime();
+
+  // end_time is exclusive (d..d+1 occupies exactly day d, matching the backend's
+  // ResourceScheduler/ResourceCalendar convention) — a bucket landing exactly on
+  // woEnd belongs to the NEXT WO's window, not this one.
+  const filtered: string[] = [];
+  for (const b of buckets) {
+    const d = parseIso(b);
+    if (!d) continue;
+    const ms = d.getTime();
+    if (ms >= woStartMs && ms < woEndMs) filtered.push(b);
+  }
+  if (filtered.length === 0) return null;
+
+  const n = filtered.length;
+  const spanDays = Math.round((woEndMs - woStartMs) / DAY_MS);
+
+  // Collect intermediate ticks based on span length.
+  const ticks: { xPct: number; label: string }[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < filtered.length; i++) {
+    // First and last days are already shown as start/end anchors — skip to avoid duplicates.
+    if (i === 0 || i === filtered.length - 1) continue;
+    const d = parseIso(filtered[i]);
+    if (!d) continue;
+    let label = '';
+    if (spanDays > 30) {
+      if (d.getDate() === 1)
+        label = new Intl.DateTimeFormat('en', { month: 'short' }).format(d);
+    } else if (spanDays > 7) {
+      if (d.getDay() === 1)
+        label = filtered[i].slice(5, 10); // MM-DD
+    } else {
+      label = filtered[i].slice(5, 10);
+    }
+    if (label && !seen.has(label)) {
+      seen.add(label);
+      ticks.push({ xPct: ((i + 0.5) / n) * 100, label });
+    }
+  }
+
+  const startLabel = woStart ? woStart.slice(0, 10) : '';
+  const endLabel = woEnd ? woEnd.slice(0, 10) : '';
+
+  return (
+    <div style={{ position: 'relative', width: '100%', height: 18, minWidth: 80, overflow: 'visible' }}>
+      {/* baseline */}
+      <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, height: 1, background: '#3f3f46' }} />
+      {/* start anchor */}
+      <span style={{ position: 'absolute', left: 0, bottom: 2, fontSize: '0.6rem', color: '#52525b', lineHeight: 1 }}>
+        {startLabel}
+      </span>
+      {/* end anchor */}
+      <span style={{ position: 'absolute', right: 0, bottom: 2, fontSize: '0.6rem', color: '#52525b', lineHeight: 1, transform: 'translateX(0)' }}>
+        {endLabel}
+      </span>
+      {/* intermediate ticks */}
+      {ticks.map((t, i) => (
+        <React.Fragment key={i}>
+          <div style={{ position: 'absolute', left: `${t.xPct}%`, bottom: 0, width: 1, height: 4, background: '#52525b' }} />
+          <span style={{
+            position: 'absolute', left: `${t.xPct}%`, bottom: 5,
+            fontSize: '0.6rem', color: '#71717a', lineHeight: 1,
+            transform: 'translateX(-50%)', whiteSpace: 'nowrap',
+          }}>
+            {t.label}
+          </span>
+        </React.Fragment>
+      ))}
+    </div>
+  );
+}
+
+/** Mini histogram showing daily resource load vs. capacity, scoped to a WO's [start, end] window.
+ *  Each bar represents one bucket-day; colour codes load fraction: green < 60%, amber 60-90%, red ≥ 90%. */
+export function BorMiniTimeline({
+  buckets,
+  load,
+  size,
+  woStart,
+  woEnd,
+}: {
+  buckets: string[];
+  load: number[];
+  size: number;
+  woStart: string | null | undefined;
+  woEnd: string | null | undefined;
+}): JSX.Element | null {
+  const maxH = 24;
+  const woS = parseIso(woStart);
+  const woE = parseIso(woEnd);
+  if (!woS || !woE || size <= 0 || buckets.length === 0) return null;
+
+  const woStartMs = woS.getTime();
+  const woEndMs = woE.getTime();
+
+  // end_time is exclusive — see the matching comment in BorTimelineRuler above.
+  const filtered: { loadVal: number; date: string }[] = [];
+  for (let i = 0; i < buckets.length; i++) {
+    const d = parseIso(buckets[i]);
+    if (!d) continue;
+    const ms = d.getTime();
+    if (ms >= woStartMs && ms < woEndMs) {
+      filtered.push({ loadVal: load[i] ?? 0, date: buckets[i] });
+    }
+  }
+  if (filtered.length === 0) return <span style={{ color: '#52525b', fontSize: '0.7rem' }}>—</span>;
+
+  const n = filtered.length;
+  const barW = 100 / n;
+
+  return (
+    <div style={{ minWidth: 80, width: '100%' }}>
+      <svg width="100%" height={maxH + 4} preserveAspectRatio="none" style={{ display: 'block' }}>
+        {/* capacity ceiling */}
+        <line x1="0%" x2="100%" y1={2} y2={2} stroke="#52525b" strokeWidth={1} strokeDasharray="3 2" />
+        {filtered.map(({ loadVal, date }, i) => {
+          const frac = size > 0 ? Math.min(loadVal / size, 1.2) : 0;
+          const barH = Math.max(1, Math.min(frac, 1.0) * maxH);
+          const y = maxH + 2 - barH;
+          const color = frac < 0.6 ? '#4ade80' : frac < 0.9 ? '#fbbf24' : '#f87171';
+          return (
+            <rect
+              key={i}
+              x={`${i * barW}%`}
+              y={y}
+              width={`${Math.max(0.5, barW - 0.3)}%`}
+              height={barH}
+              fill={color}
+              opacity={0.85}
+            >
+              <title>{date}: load {loadVal.toFixed(1)} / {size}</title>
+            </rect>
+          );
+        })}
+      </svg>
     </div>
   );
 }
