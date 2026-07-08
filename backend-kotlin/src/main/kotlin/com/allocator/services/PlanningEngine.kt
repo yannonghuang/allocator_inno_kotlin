@@ -698,6 +698,26 @@ internal fun expandWaterfallCandidates(
     }
 }
 
+/**
+ * Preferences KB lookup for one waterfall candidate: consults [preferenceKb] (built by
+ * [buildPreferenceKb] in PreferenceBuilder.kt, keyed the same way via [preferenceMethodKey])
+ * before falling back to the raw CSV `preference` column — the per-alternative fallback the
+ * Preferences feature is built around, so partial KB coverage degrades gracefully rather than
+ * all-or-nothing per case. `preferenceKb == null` (no KB for this case) preserves today's
+ * exact raw-preference behavior.
+ */
+internal fun kbPreference(
+    productId: String,
+    locationId: String,
+    method: Map<String, Any?>,
+    altKey: String?,
+    preferenceKb: Map<Triple<String, String, String>, Int>?,
+): Int {
+    val fallback = (method["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE
+    if (preferenceKb == null) return fallback
+    return preferenceKb[Triple(productId, locationId, preferenceMethodKey(method, altKey))] ?: fallback
+}
+
 // ── Method selection ───────────────────────────────────────────────────────────
 
 /**
@@ -1070,6 +1090,7 @@ internal fun planMethodSlot(
     initialBudget: Map<String, Double>? = null,
     nodeQtyCaps: Map<Pair<String, String>, Double>? = null,
     demandBlueprint: DemandBlueprint? = null,
+    preferenceKb: Map<Triple<String, String, String>, Int>? = null,
 ): MethodSlotResult {
     val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
     val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
@@ -1167,7 +1188,7 @@ internal fun planMethodSlot(
             // Inherit the originating demand's customer so customer-specific constraints
             // apply to sub-components, not just the finished good.
             "customer_id" to demand["customer_id"], "customer" to demand["customer"])
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint)
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb)
         val effectiveQty = solvedList.sumOf { s ->
             val r = s["commit_reason"] as? String
             if (r == "cycle_stopped" || r == "cycle_detected") 0.0
@@ -1601,10 +1622,20 @@ fun plan(
      * Optional per-demand BOM blueprint from [computePlanBlueprint].
      * When present and the current (productId, locationId) has a blueprint entry whose
      * method is still in effectiveMethods, the commit phase uses it directly — skipping
-     * [getPreferredMethodCascade] and its probeChildren overhead.
+     * the unified waterfall's own candidate expansion/ranking.
      * Threaded through all recursive plan() / planMethodSlot() calls.
      */
     demandBlueprint: DemandBlueprint? = null,
+    /**
+     * Optional Preferences KB override: (productId, locationId, methodKey) → canonical
+     * preference (10, 20, 30, ...), built once via the Preferences page's Generate action
+     * (see [buildPreferenceKb] in PreferenceBuilder.kt). When non-null, [kbPreference]
+     * consults it per-alternative before falling back to the raw CSV `preference` column —
+     * partial coverage degrades gracefully, alternative by alternative. `null` (the default)
+     * preserves today's exact raw-preference behavior. Threaded through all recursive
+     * plan() calls.
+     */
+    preferenceKb: Map<Triple<String, String, String>, Int>? = null,
 ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
 
     val productId = (demand["product_id"] as? String)?.trim() ?: ""
@@ -1930,13 +1961,14 @@ fun plan(
         // alt_group) this yields exactly the same single WaterfallCandidate(blueprintMethod,
         // null) as before — zero behavior change there.
         expandWaterfallCandidates(listOf(blueprintMethod), productId, demand, config, data)
+            .sortedBy { kbPreference(productId, locationId, it.method, it.altKey, preferenceKb) }
     } else {
         expandWaterfallCandidates(effectiveMethods, productId, demand, config, data)
             // A make candidate already proven structurally dead at this (pid, lid) by a
             // prior demand this run: skip re-attempting it (cheap memoization), matching
             // structuralFailedMakes's role below. A diagnostic stub covers it instead.
             .let { if (cachedMakeFailureReason != null) it.filterNot { c -> c.method["type"] == "make" } else it }
-            .sortedBy { (it.method["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
+            .sortedBy { kbPreference(productId, locationId, it.method, it.altKey, preferenceKb) }
     }
 
     if (candidates.isEmpty()) {
@@ -1993,6 +2025,7 @@ fun plan(
             initialBudget = initialBudget,
             nodeQtyCaps = nodeQtyCaps,
             demandBlueprint = demandBlueprint,
+            preferenceKb = preferenceKb,
         )
         // Always record the attempt's pegging node so the UI shows every candidate tried
         // (including blocked ones with zero qty) — informative for the user even when a
@@ -3732,6 +3765,9 @@ internal fun legacyCommit(
      * selection is bypassed for nodes that have a pre-selected method in the sketch.
      */
     planBlueprint: PlanBlueprint? = null,
+    /** Optional Preferences KB override, see [plan]'s `preferenceKb` param. Passed through
+     *  unchanged to every demand's [plan] call. */
+    preferenceKb: Map<Triple<String, String, String>, Int>? = null,
 ): LegacyCommitResult {
     val committedDemands = mutableListOf<Map<String, Any?>>()
     val workOrders = mutableListOf<Map<String, Any?>>()
@@ -3785,6 +3821,7 @@ internal fun legacyCommit(
             initialBudget = iter0Allocation?.get(demandId),
             nodeQtyCaps = achievableQtyMaps?.get(demandId),
             demandBlueprint = planBlueprint?.get(demandId),
+            preferenceKb = preferenceKb,
         )
         committedDemands.addAll(solvedList)
         workOrders.addAll(wos)
@@ -3833,6 +3870,9 @@ fun runPlanning(
     progressCallback: ((Map<String, Any?>) -> Unit)? = null,
     /** Pre-computed case-level allocation budgets (demandId → lotKey → qty). When non-null, overrides the internal SupplyAllocator step while keeping the BOM graph computed fresh. */
     precomputedBudgets: Map<Any?, MutableMap<String, Double>>? = null,
+    /** Optional Preferences KB override, see [plan]'s `preferenceKb` param. `null` when no
+     *  Preferences KB exists for this case — preserves today's exact raw-preference behavior. */
+    preferenceKb: Map<Triple<String, String, String>, Int>? = null,
 ): RunPlanningResult {
     val inventory: MutableList<MutableMap<String, Any?>> = (data["supply"] ?: emptyList()).map { s ->
         mutableMapOf(
@@ -3873,7 +3913,7 @@ fun runPlanning(
     // AND pre-selects the first-feasible BOM method per node per demand.
     // Replaces computeAchievableQtyMaps; eliminates getPreferredMethodCascade overhead
     // (probeChildren per node) from the commit phase entirely.
-    val planBlueprint = computePlanBlueprint(demands, sgAllocation, data)
+    val planBlueprint = computePlanBlueprint(demands, sgAllocation, data, preferenceKb)
     val achievableQtyMaps = planBlueprint.mapValues { (_, db) ->
         db.mapValues { (_, nb) -> nb.achievable }
     }
@@ -3888,6 +3928,7 @@ fun runPlanning(
         budgets           = sgAllocation.perLotBudgets,
         achievableQtyMaps = achievableQtyMaps,
         planBlueprint     = planBlueprint,
+        preferenceKb      = preferenceKb,
     )
     // Post-planning trace + compensation-pass telemetry (opt-in: trace_lots=true).
     if (sgAllocation.sgConfig.traceLots)

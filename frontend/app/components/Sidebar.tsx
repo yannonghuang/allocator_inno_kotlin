@@ -18,6 +18,7 @@ export function Sidebar({ open, onToggle }: { open: boolean; onToggle: () => voi
   const inCases = pathname === '/cases' || pathname === '/';
   const inPlanning = !!caseId && pathname.startsWith(`/cases/${caseId}/planning`);
   const inAllocation = !!caseId && pathname.startsWith(`/cases/${caseId}/allocation`);
+  const inPreferences = !!caseId && pathname.startsWith(`/cases/${caseId}/preferences`);
   const inBom = !!caseId && pathname.startsWith(`/cases/${caseId}/bom`);
   const inMaterial = !!caseId && pathname.startsWith(`/cases/${caseId}/material-impact`);
   const inEvents = inMaterial && !pathname.startsWith(`/cases/${caseId}/material-impact/criteria`);
@@ -109,6 +110,17 @@ export function Sidebar({ open, onToggle }: { open: boolean; onToggle: () => voi
             </Link>
           ) : (
             <span style={link(false, true)}>{t('allocation')}</span>
+          )}
+        </div>
+
+        {/* Preferences */}
+        <div style={{ marginTop: '0.125rem' }}>
+          {caseId ? (
+            <Link href={`/cases/${caseId}/preferences`} style={link(inPreferences)}>
+              {t('preferences')}
+            </Link>
+          ) : (
+            <span style={link(false, true)}>{t('preferences')}</span>
           )}
         </div>
 

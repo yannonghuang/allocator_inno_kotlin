@@ -452,6 +452,9 @@ internal fun computePlanBlueprint(
     demands: List<Map<String, Any?>>,
     allocation: SupplyAllocationResult,
     data: Map<String, List<Map<String, Any?>>>,
+    /** Optional Preferences KB override, see [plan]'s `preferenceKb` param. `null` preserves
+     *  today's exact raw-preference behavior. */
+    preferenceKb: Map<Triple<String, String, String>, Int>? = null,
 ): PlanBlueprint {
     val result = mutableMapOf<Any?, DemandBlueprint>()
     for (demand in demands) {
@@ -461,7 +464,7 @@ internal fun computePlanBlueprint(
         val qty  = (demand["quantity"]    as? Number)?.toDouble() ?: continue
         if (qty <= 0.0) { result[demandId] = emptyMap(); continue }
         val nodeMap = mutableMapOf<Pair<String, String>, NodeBlueprint>()
-        nodeSketchInto(pid, lid, qty, demandId, allocation, data, mutableSetOf(), nodeMap)
+        nodeSketchInto(pid, lid, qty, demandId, allocation, data, mutableSetOf(), nodeMap, preferenceKb)
         result[demandId] = nodeMap
         val rootAq = nodeMap[pid to lid]?.achievable ?: qty
         if (rootAq < qty - 1e-9) {
@@ -480,6 +483,7 @@ private fun nodeSketchInto(
     data: Map<String, List<Map<String, Any?>>>,
     visited: MutableSet<Pair<String, String>>,
     into: MutableMap<Pair<String, String>, NodeBlueprint>,
+    preferenceKb: Map<Triple<String, String, String>, Int>? = null,
 ): Double {
     if (needed <= 1e-9) return 0.0
     val key = pid to lid
@@ -502,16 +506,18 @@ private fun nodeSketchInto(
 
         val residual = needed - supplyQty
 
-        // First feasible method by preference (ascending int = higher priority).
+        // First feasible method by preference (ascending int = higher priority) — the
+        // Preferences KB overrides this ranking per-alternative when present (see
+        // kbPreferenceForMethod), falling back to raw CSV preference otherwise.
         // Takes the first method with achievable > 0 — no backtracking in commit phase.
         val methods = getMethods(pid, lid, data)
-            .sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
+            .sortedBy { kbPreferenceForMethod(pid, lid, it, preferenceKb, data) }
 
         var selectedMethod: Map<String, Any?>? = null
         var selectedAchievable = 0.0
 
         for (method in methods) {
-            val ma = methodAchievableForSketch(method, pid, lid, residual, demandId, allocation, data, visited, into)
+            val ma = methodAchievableForSketch(method, pid, lid, residual, demandId, allocation, data, visited, into, preferenceKb)
             if (ma > 1e-9) {
                 selectedMethod = method
                 selectedAchievable = ma
@@ -527,6 +533,30 @@ private fun nodeSketchInto(
     }
 }
 
+/**
+ * Preferences KB lookup for a "raw" (unsplit-by-alt_group) method as seen by the sketch
+ * phase: for `move`/`purchase`, a direct [kbPreference] lookup (no alt_group concept); for
+ * `make` with multiple BOM alt_groups, the MIN KB preference across that method's alt_groups
+ * (its best-case rank) — so this method-level pre-selection stays consistent with the
+ * finer-grained alt_group waterfall the commit phase runs afterward. Falls back to raw CSV
+ * `preference` exactly like today when [preferenceKb] is null or has no entries for this node.
+ */
+internal fun kbPreferenceForMethod(
+    pid: String, lid: String,
+    method: Map<String, Any?>,
+    preferenceKb: Map<Triple<String, String, String>, Int>?,
+    data: Map<String, List<Map<String, Any?>>>,
+): Int {
+    if (preferenceKb == null) return (method["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE
+    if (method["type"] == "make") {
+        val variants = variantsForMake(pid, lid, 1.0, method, data)
+        if (variants.size > 1) {
+            return variants.minOf { (altKey, _) -> kbPreference(pid, lid, method, altKey, preferenceKb) }
+        }
+    }
+    return kbPreference(pid, lid, method, null, preferenceKb)
+}
+
 // Same arithmetic as methodAchievableInto but recurses via nodeSketchInto to populate blueprint entries.
 private fun methodAchievableForSketch(
     method: Map<String, Any?>, pid: String, lid: String, needed: Double,
@@ -535,33 +565,46 @@ private fun methodAchievableForSketch(
     data: Map<String, List<Map<String, Any?>>>,
     visited: MutableSet<Pair<String, String>>,
     into: MutableMap<Pair<String, String>, NodeBlueprint>,
+    preferenceKb: Map<Triple<String, String, String>, Int>? = null,
 ): Double {
     return when (method["type"] as? String) {
         "purchase" -> needed
         "move" -> {
             val fromLid = (method["from_location_id"] as? String)?.trim() ?: return 0.0
-            nodeSketchInto(pid, fromLid, needed, demandId, allocation, data, visited, into)
+            nodeSketchInto(pid, fromLid, needed, demandId, allocation, data, visited, into, preferenceKb)
         }
         "make" -> {
             val variants = variantsForMake(pid, lid, needed, method, data)
             if (variants.isEmpty()) return 0.0
-            val nVariants = variants.size.toDouble()
+            // Waterfall across alt_group variants — mirrors the commit phase's unified
+            // waterfall (best variant by preference/KB ranking gets the full residual; only
+            // spill to the next if it can't fully cover). Replaces the old equal-split-
+            // across-all-variants estimate, which diluted `needed` by 1/nVariants regardless
+            // of which variant was actually best — systematically under-predicting
+            // achievable qty for a KB/preference-favored variant and, since this feeds
+            // nodeQtyCaps, artificially capping the commit phase below what its own
+            // alt_group-aware waterfall could otherwise draw.
+            val ranked = variants.sortedBy { (altKey, _) -> kbPreference(pid, lid, method, altKey, preferenceKb) }
+            var residual = needed
             var total = 0.0
-            for ((_, children) in variants) {
-                val perVariant = needed / nVariants
-                if (children.isEmpty()) { total += perVariant; continue }
-                var variantAchievable = perVariant
+            for ((_, children) in ranked) {
+                if (residual <= 1e-9) break
+                if (children.isEmpty()) { total += residual; residual = 0.0; continue }
+                var variantAchievable = residual
                 for (child in children) {
                     val cPid        = (child["product_id"] as? String)?.trim() ?: continue
                     val cLid        = (child["location_id"] as? String)?.trim() ?: continue
+                    // variantsForMake scaled each child's "quantity" by the full `needed` qty
+                    // (rate * needed) — rescale to this iteration's residual share.
                     val cNeededFull = (child["quantity"]    as? Number)?.toDouble() ?: continue
-                    val cNeeded = cNeededFull / nVariants
+                    val cNeeded = if (needed > 1e-9) cNeededFull * (residual / needed) else 0.0
                     if (cNeeded <= 1e-9) continue
-                    val cAch      = nodeSketchInto(cPid, cLid, cNeeded, demandId, allocation, data, visited, into)
-                    val fromChild = cAch / (cNeeded / perVariant)
+                    val cAch      = nodeSketchInto(cPid, cLid, cNeeded, demandId, allocation, data, visited, into, preferenceKb)
+                    val fromChild = cAch / (cNeeded / residual)
                     if (fromChild < variantAchievable) variantAchievable = fromChild
                 }
                 total += variantAchievable
+                residual -= variantAchievable
             }
             total
         }
