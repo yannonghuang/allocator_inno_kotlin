@@ -13,10 +13,12 @@ import io.kotest.matchers.shouldBe
  * `customer` resolves `parent` as a make (location blank/"*" = any).
  *
  * Test fixture: parent P (make at L) with two single-child alternatives
- * P→C1 (alt_group A1) and P→C2 (alt_group A2); C1 and C2 are both buyable. The planner
- * waterfalls across alt_groups by preference (ties keep BOM declaration order): an
- * unconstrained demand fully satisfies from the first-declared alternative (C1) alone;
- * a matching constraint narrows the candidate list to the one forced child.
+ * P→C1 (alt_group A1) and P→C2 (alt_group A2); C1 and C2 are both buyable. At the root
+ * (P's demand is the top-level demand here), an unconstrained demand with more than one
+ * candidate alternative defaults to an even split across them (C1 and C2, 50/50 of the
+ * quantity) — the root-only proportional/equal-split behavior; a matching constraint
+ * narrows the candidate list down to the one forced child, which (being the sole
+ * remaining candidate) is never split.
  */
 class ConstraintsTest : FunSpec({
 
@@ -49,6 +51,9 @@ class ConstraintsTest : FunSpec({
     // Which child products end up purchased (i.e. which alternative the make resolved to).
     fun purchasedChildren(wos: List<Map<String, Any?>>): Set<String> =
         wos.filter { it["method"] == "purchase" }.mapNotNull { it["product_id"] as? String }.toSet()
+    fun purchasedQty(wos: List<Map<String, Any?>>, pid: String): Double =
+        wos.filter { it["method"] == "purchase" && it["product_id"] == pid }
+            .sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
 
     // ── parsing ───────────────────────────────────────────────────────────────
     test("parseConstraints: absent / empty / incomplete ⇒ empty; well-formed + aliases parse") {
@@ -70,23 +75,28 @@ class ConstraintsTest : FunSpec({
         purchasedChildren(wos) shouldBe setOf("C2")
     }
 
-    test("different customer ⇒ default selection (first alternative by declaration order), constraint not applied") {
+    test("different customer ⇒ default selection (root equal-split across both alternatives), constraint not applied") {
         val (_, wos, _) = plan(demandC("Y"), inv(), data, requestTimeDt = null, config = cfg(listOf(rule("X", "C2"))))
-        purchasedChildren(wos) shouldBe setOf("C1")
+        purchasedChildren(wos) shouldBe setOf("C1", "C2")
+        purchasedQty(wos, "C1") shouldBe 50.0
+        purchasedQty(wos, "C2") shouldBe 50.0
     }
 
     test("location wildcard applies; non-matching explicit location does not") {
-        // blank location ⇒ any location ⇒ applies
+        // blank location ⇒ any location ⇒ applies ⇒ constraint narrows to the sole forced
+        // candidate (C2), which — being the only candidate — is never split.
         val (_, wosBlank, _) = plan(demandC("X"), inv(), data, requestTimeDt = null, config = cfg(listOf(rule("X", "C2", ""))))
         purchasedChildren(wosBlank) shouldBe setOf("C2")
-        // explicit non-matching location ⇒ does not apply ⇒ default (first alternative, C1)
+        // explicit non-matching location ⇒ does not apply ⇒ default (root equal-split, both alternatives)
         val (_, wosOther, _) = plan(demandC("X"), inv(), data, requestTimeDt = null, config = cfg(listOf(rule("X", "C2", "LX"))))
-        purchasedChildren(wosOther) shouldBe setOf("C1")
+        purchasedChildren(wosOther) shouldBe setOf("C1", "C2")
+        purchasedQty(wosOther, "C1") shouldBe 50.0
+        purchasedQty(wosOther, "C2") shouldBe 50.0
     }
 
     test("constrained child not an alternative ⇒ ignored, plan normally") {
         val (_, wos, _) = plan(demandC("X"), inv(), data, requestTimeDt = null, config = cfg(listOf(rule("X", "C9"))))
-        purchasedChildren(wos) shouldBe setOf("C1")           // unfiltered ⇒ default (first alternative)
+        purchasedChildren(wos) shouldBe setOf("C1", "C2")     // unfiltered ⇒ default (root equal-split)
         (wos.any { it["product_id"] == "P" && it["method"] == "make" }) shouldBe true   // demand still made
     }
 
@@ -108,9 +118,11 @@ class ConstraintsTest : FunSpec({
         "supply" to emptyList<Map<String, Any?>>(),
     )
 
-    test("multi-method: default picks the preferred method (C1)") {
+    test("multi-method: default is a root equal-split across both methods (C1 and C2)") {
         val (_, wos, _) = plan(demandC("X"), inv(), multiMethod, requestTimeDt = null, config = cfg(emptyList()))
-        purchasedChildren(wos) shouldBe setOf("C1")
+        purchasedChildren(wos) shouldBe setOf("C1", "C2")
+        purchasedQty(wos, "C1") shouldBe 50.0
+        purchasedQty(wos, "C2") shouldBe 50.0
     }
 
     test("multi-method: constraint forces the make method that produces the child (C2)") {

@@ -2631,10 +2631,9 @@ internal suspend fun runPlanBackground(
             log.info("[plan] case {} has {} case_allocation rows — using as budget override", caseId, caseAllocRows.size)
             buildBudgetsFromCaseAlloc(caseAllocRows, data["supply"] ?: emptyList())
         } else null
-        val casePrefRows = loadCasePreferenceRows(caseId)
-        val preferenceKb = casePrefRows?.let { buildPreferenceKbMap(it) }
+        val preferenceKb = loadPreferenceKb(caseId)
         if (preferenceKb != null) {
-            log.info("[plan] case {} has {} case_preference rows — using as method/variant ranking override", caseId, casePrefRows.size)
+            log.info("[plan] case {} has {} case_preference rows — using as method/variant ranking override", caseId, preferenceKb.entries.size)
         }
         val raw = runPlanning(data, config = config, progressCallback = progressCb, precomputedBudgets = precomputedBudgets, preferenceKb = preferenceKb)
         log.info("[plan] runPlanning done for run {}", planRunId)

@@ -454,7 +454,7 @@ internal fun computePlanBlueprint(
     data: Map<String, List<Map<String, Any?>>>,
     /** Optional Preferences KB override, see [plan]'s `preferenceKb` param. `null` preserves
      *  today's exact raw-preference behavior. */
-    preferenceKb: Map<Triple<String, String, String>, Int>? = null,
+    preferenceKb: PreferenceKb? = null,
 ): PlanBlueprint {
     val result = mutableMapOf<Any?, DemandBlueprint>()
     for (demand in demands) {
@@ -483,7 +483,7 @@ private fun nodeSketchInto(
     data: Map<String, List<Map<String, Any?>>>,
     visited: MutableSet<Pair<String, String>>,
     into: MutableMap<Pair<String, String>, NodeBlueprint>,
-    preferenceKb: Map<Triple<String, String, String>, Int>? = null,
+    preferenceKb: PreferenceKb? = null,
 ): Double {
     if (needed <= 1e-9) return 0.0
     val key = pid to lid
@@ -544,7 +544,7 @@ private fun nodeSketchInto(
 internal fun kbPreferenceForMethod(
     pid: String, lid: String,
     method: Map<String, Any?>,
-    preferenceKb: Map<Triple<String, String, String>, Int>?,
+    preferenceKb: PreferenceKb?,
     data: Map<String, List<Map<String, Any?>>>,
 ): Int {
     if (preferenceKb == null) return (method["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE
@@ -565,7 +565,7 @@ private fun methodAchievableForSketch(
     data: Map<String, List<Map<String, Any?>>>,
     visited: MutableSet<Pair<String, String>>,
     into: MutableMap<Pair<String, String>, NodeBlueprint>,
-    preferenceKb: Map<Triple<String, String, String>, Int>? = null,
+    preferenceKb: PreferenceKb? = null,
 ): Double {
     return when (method["type"] as? String) {
         "purchase" -> needed

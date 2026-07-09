@@ -5,6 +5,8 @@ import com.allocator.CasePreferences
 import com.allocator.Cases
 import com.allocator.services.CaseLoader
 import com.allocator.services.PreferenceCandidateRow
+import com.allocator.services.PreferenceKb
+import com.allocator.services.PreferenceKbEntry
 import com.allocator.services.buildPreferenceKb
 import io.ktor.http.*
 import io.ktor.server.application.*
@@ -57,10 +59,24 @@ internal fun loadCasePreferenceRows(caseId: Int): List<CasePreferenceRow>? = tra
     if (rows.isEmpty()) null else rows
 }
 
-/** Converts case_preference rows into the lookup structure threaded into planning:
- *  (product_id, location_id, method_key) -> canonical preference. */
-internal fun buildPreferenceKbMap(rows: List<CasePreferenceRow>): Map<Triple<String, String, String>, Int> =
-    rows.associate { Triple(it.productId, it.locationId, it.methodKey) to it.preference }
+/** Loads the full lookup structure threaded into planning: per-alternative KB entries
+ *  (canonical preference + raw axis scores) plus the delivery/inventory weights used to
+ *  build them — the weights are needed at planning time to reconstruct a candidate's
+ *  continuous combined score for proportional root-level splitting (see
+ *  [com.allocator.services.reconstructNodeScores]). Returns null when no KB exists for
+ *  this case (planning falls back to raw CSV preference values, per-alternative). */
+internal fun loadPreferenceKb(caseId: Int): PreferenceKb? {
+    val rows = loadCasePreferenceRows(caseId) ?: return null
+    val cfg = loadCasePreferenceConfig(caseId)
+    return PreferenceKb(
+        entries = rows.associate { r ->
+            Triple(r.productId, r.locationId, r.methodKey) to
+                PreferenceKbEntry(r.preference, r.inventoryScore, r.deliveryScore)
+        },
+        deliveryWeight = cfg?.deliveryWeight ?: 0.5,
+        inventoryWeight = cfg?.inventoryWeight ?: 0.5,
+    )
+}
 
 private fun toRows(candidates: List<PreferenceCandidateRow>): List<CasePreferenceRow> = candidates.map {
     CasePreferenceRow(it.productId, it.locationId, it.methodType, it.methodKey, it.preference, it.inventoryScore, it.deliveryScore)
@@ -115,7 +131,7 @@ internal fun generateAndSeedCasePreferences(
     return rows
 }
 
-private fun loadCasePreferenceConfig(caseId: Int): CasePreferenceConfig? = transaction {
+internal fun loadCasePreferenceConfig(caseId: Int): CasePreferenceConfig? = transaction {
     CasePreferenceConfigs.selectAll().where { CasePreferenceConfigs.caseId eq caseId }.singleOrNull()?.let {
         CasePreferenceConfig(
             maxBomDepth = it[CasePreferenceConfigs.maxBomDepth],
