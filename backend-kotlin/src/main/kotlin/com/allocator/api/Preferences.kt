@@ -151,7 +151,18 @@ fun Routing.preferenceRoutes() {
             ?: throw NoSuchElementException("Case not found")
     }
 
-    fun rowJson(row: CasePreferenceRow): JsonObject = buildJsonObject {
+    // Read-only context joined onto each row for display/filtering — not persisted, mirrors how
+    // Demand Ordering surfaces request_due_time/priority/product_id/customer_id as context.
+    fun prodAreaByProductLocation(caseId: Int): Map<Pair<String, String>, String?> {
+        val data = transaction { CaseLoader.load(caseId) }
+        return (data["productlocation"] ?: emptyList()).associate { pl ->
+            val pid = pl["product_id"]?.toString() ?: ""
+            val lid = pl["location_id"]?.toString() ?: ""
+            (pid to lid) to (pl["prod_area"] as? String)
+        }
+    }
+
+    fun rowJson(row: CasePreferenceRow, prodAreaByPl: Map<Pair<String, String>, String?> = emptyMap()): JsonObject = buildJsonObject {
         put("product_id", row.productId)
         put("location_id", row.locationId)
         put("method_type", row.methodType)
@@ -159,6 +170,8 @@ fun Routing.preferenceRoutes() {
         put("preference", row.preference)
         if (row.inventoryScore != null) put("inventory_score", row.inventoryScore) else put("inventory_score", JsonNull)
         if (row.deliveryScore != null) put("delivery_score", row.deliveryScore) else put("delivery_score", JsonNull)
+        val prodArea = prodAreaByPl[row.productId to row.locationId]
+        if (prodArea != null) put("prod_area", prodArea) else put("prod_area", JsonNull)
     }
 
     fun configJson(cfg: CasePreferenceConfig): JsonObject = buildJsonObject {
@@ -178,8 +191,9 @@ fun Routing.preferenceRoutes() {
             call.respond(HttpStatusCode.NoContent)
         } else {
             val cfg = loadCasePreferenceConfig(caseId)
+            val prodAreaByPl = prodAreaByProductLocation(caseId)
             call.respond(buildJsonObject {
-                put("rows", JsonArray(rows.map { rowJson(it) }))
+                put("rows", JsonArray(rows.map { rowJson(it, prodAreaByPl) }))
                 if (cfg != null) put("config", configJson(cfg)) else put("config", JsonNull)
             })
         }
@@ -205,7 +219,8 @@ fun Routing.preferenceRoutes() {
         val newRows = generateAndSeedCasePreferences(caseId, data, maxBomDepth, deliveryWeight, inventoryWeight)
         log.info("[preferences] generated {} rows for case {}", newRows.size, caseId)
 
-        call.respond(buildJsonObject { put("rows", JsonArray(newRows.map { rowJson(it) })) })
+        val prodAreaByPl = prodAreaByProductLocation(caseId)
+        call.respond(buildJsonObject { put("rows", JsonArray(newRows.map { rowJson(it, prodAreaByPl) })) })
     }
 
     // ── PUT /cases/{case_id}/preferences ──────────────────────────────────────
@@ -282,7 +297,8 @@ fun Routing.preferenceRoutes() {
                 }
             }
         }
-        call.respond(buildJsonObject { put("rows", JsonArray(rows.map { rowJson(it) })) })
+        val prodAreaByPl = prodAreaByProductLocation(caseId)
+        call.respond(buildJsonObject { put("rows", JsonArray(rows.map { rowJson(it, prodAreaByPl) })) })
     }
 
     // ── GET /cases/{case_id}/preferences/export ───────────────────────────────

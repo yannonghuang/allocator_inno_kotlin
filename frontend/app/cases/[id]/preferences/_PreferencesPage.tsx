@@ -317,6 +317,7 @@ export function PreferencesPage() {
   const columns: Column<TableRow>[] = [
     { key: 'product_id', label: t('colProduct'), sortable: true },
     { key: 'location_id', label: t('colLocation'), sortable: true },
+    { key: 'prod_area', label: t('colProdArea'), sortable: true },
     { key: 'method_type', label: t('colMethodType'), sortable: true },
     { key: 'method_key', label: t('colMethodKey'), sortable: true },
     {
@@ -534,7 +535,7 @@ export function PreferencesPage() {
         <SortFilterTable
           columns={columns}
           rows={tableRows}
-          filterKeys={['product_id', 'location_id', 'method_type', 'method_key']}
+          filterKeys={['product_id', 'location_id', 'prod_area', 'method_type', 'method_key']}
           filterPlaceholder={t('filterPlaceholder')}
           defaultSortKey="preference"
           idKey="_key"

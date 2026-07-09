@@ -2009,6 +2009,7 @@ export type PreferenceRow = {
   preference: number;
   inventory_score: number | null;
   delivery_score: number | null;
+  prod_area: string | null;
 };
 
 export type PreferenceConfig = {
