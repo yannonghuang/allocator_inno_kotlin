@@ -1,10 +1,15 @@
 package com.allocator
 
+import com.allocator.services.PreferenceKb
+import com.allocator.services.PreferenceKbEntry
 import com.allocator.services.buildPreferenceKb
 import com.allocator.services.computeNodeMetrics
 import com.allocator.services.plan
+import com.allocator.services.reconstructNodeScores
 import io.kotest.core.spec.style.FunSpec
+import io.kotest.matchers.doubles.plusOrMinus
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
 
 /**
  * Behavior contract for the Preferences KB build engine (services/PreferenceBuilder.kt) and
@@ -128,17 +133,28 @@ class PreferenceBuilderTest : FunSpec({
         "quantity" to 10.0, "request_due_time" to "2024-01-01",
     )
 
-    test("no Preferences KB (null) preserves raw CSV preference — B1's child is chosen") {
+    fun purchasedQty(wos: List<Map<String, Any?>>, pid: String): Double =
+        wos.filter { it["method"] == "purchase" && it["product_id"] == pid }
+            .sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
+
+    test("no Preferences KB (null) at root with max_methods>1 defaults to an equal split, not 100%-to-best") {
+        // demandFor's default config has no max_methods -> DEFAULT_MAX_METHODS=2, and this is a
+        // root demand -> the root-only equal-split default applies: both of P1's two make
+        // methods get an even share (5 of 10) rather than B1 taking all of it with B2 unused.
         val data = twoAltFixture("P1", "C1", "C2")
         val (_, wos, _) = plan(demandFor("P1", "D1"), mutableListOf(), data, requestTimeDt = null,
             config = mapOf("purchase_allowed" to true), preferenceKb = null)
-        purchasedChildren(wos) shouldBe setOf("C1")
+        purchasedChildren(wos) shouldBe setOf("C1", "C2")
+        purchasedQty(wos, "C1") shouldBe (5.0 plusOrMinus 0.01)
+        purchasedQty(wos, "C2") shouldBe (5.0 plusOrMinus 0.01)
     }
 
-    test("a Preferences KB override wins for its own node; a sibling node with no KB coverage still falls back to raw preference") {
-        // P1 gets a KB override flipping it to B2's child (C2); P2 has NO KB entries at all and
-        // must fall back to raw CSV preference (B1's child, C1-equivalent) — proving the
-        // fallback is per-alternative/per-node, not all-or-nothing once any KB row exists.
+    test("a full-coverage Preferences KB skews the root split toward the higher-scored candidate; a sibling node with no KB coverage still gets the equal-split default") {
+        // P1 gets KB entries for BOTH of its alternatives with a lopsided score (B2 far ahead of
+        // B1) -> the root split should heavily favor C2 over C1, not a flat 50/50. P2 has NO KB
+        // entries at all -> falls back to the plain equal-split default (not a 100% flip either),
+        // proving the "per-node" fallback granularity: a KB existing for one case doesn't imply
+        // coverage for every node in it.
         val dataP1 = twoAltFixture("P1", "C1", "C2")
         val dataP2 = twoAltFixture("P2", "C3", "C4")
         val combined = mapOf(
@@ -149,14 +165,71 @@ class PreferenceBuilderTest : FunSpec({
             "productlocation" to emptyList<Map<String, Any?>>(),
             "supply" to emptyList<Map<String, Any?>>(),
         )
-        val preferenceKb = mapOf(Triple("P1", "L", "B2_P1:__null__") to 0)
+        val preferenceKb = PreferenceKb(
+            entries = mapOf(
+                Triple("P1", "L", "B1_P1:__null__") to PreferenceKbEntry(preference = 20, inventoryScore = 0.0, deliveryScore = 10.0),
+                Triple("P1", "L", "B2_P1:__null__") to PreferenceKbEntry(preference = 10, inventoryScore = 100.0, deliveryScore = 0.0),
+            ),
+            deliveryWeight = 0.5, inventoryWeight = 0.5,
+        )
 
         val (_, wosP1, _) = plan(demandFor("P1", "D1"), mutableListOf(), combined, requestTimeDt = null,
             config = mapOf("purchase_allowed" to true), preferenceKb = preferenceKb)
+        // With this lopsided a score gap, B2's reconstructed score is 1.0 and B1's is 0.0 —
+        // B1's target share is exactly 0, so it commits nothing at all (no C1 purchase WO).
         purchasedChildren(wosP1) shouldBe setOf("C2")
+        purchasedQty(wosP1, "C1") shouldBe (0.0 plusOrMinus 0.01)
+        purchasedQty(wosP1, "C2") shouldBe (10.0 plusOrMinus 0.01)
 
         val (_, wosP2, _) = plan(demandFor("P2", "D2"), mutableListOf(), combined, requestTimeDt = null,
             config = mapOf("purchase_allowed" to true), preferenceKb = preferenceKb)
-        purchasedChildren(wosP2) shouldBe setOf("C3")
+        purchasedChildren(wosP2) shouldBe setOf("C3", "C4")
+        purchasedQty(wosP2, "C3") shouldBe (5.0 plusOrMinus 0.01)
+        purchasedQty(wosP2, "C4") shouldBe (5.0 plusOrMinus 0.01)
+    }
+
+    test("a single-candidate (max_methods=1 equivalent) root demand is never split") {
+        val data = twoAltFixture("P1", "C1", "C2")
+        val (_, wos, _) = plan(demandFor("P1", "D1"), mutableListOf(), data, requestTimeDt = null,
+            config = mapOf("purchase_allowed" to true, "method_selection" to mapOf("max_methods" to 1)), preferenceKb = null)
+        purchasedChildren(wos) shouldBe setOf("C1")
+        purchasedQty(wos, "C1") shouldBe (10.0 plusOrMinus 0.01)
+    }
+
+    test("reconstructNodeScores: recombines persisted raw axis scores back into a comparable 0..1 score, per the same min-max formula scoreNodeCandidates used to rank them") {
+        val data = twoAltFixture("P1", "C1", "C2")
+        val (_, wos, _) = plan(demandFor("P1", "D1"), mutableListOf(), data, requestTimeDt = null,
+            config = mapOf("purchase_allowed" to true, "method_selection" to mapOf("max_methods" to 1)), preferenceKb = null)
+        // (indirectly confirms the fixture plans without error; reconstructNodeScores itself is
+        // exercised directly below against a hand-built WaterfallCandidate list)
+        wos.isNotEmpty() shouldBe true
+
+        val candidates = listOf(
+            com.allocator.services.WaterfallCandidate(mapOf("type" to "make", "bom_id" to "B1", "preference" to 1), null),
+            com.allocator.services.WaterfallCandidate(mapOf("type" to "make", "bom_id" to "B2", "preference" to 2), null),
+            com.allocator.services.WaterfallCandidate(mapOf("type" to "make", "bom_id" to "B3", "preference" to 3), null),
+        )
+        val kb = PreferenceKb(
+            entries = mapOf(
+                Triple("P", "L", "B1:") to PreferenceKbEntry(10, inventoryScore = 100.0, deliveryScore = 0.0),
+                Triple("P", "L", "B2:") to PreferenceKbEntry(20, inventoryScore = 50.0, deliveryScore = 5.0),
+                Triple("P", "L", "B3:") to PreferenceKbEntry(30, inventoryScore = 0.0, deliveryScore = 10.0),
+            ),
+            deliveryWeight = 0.5, inventoryWeight = 0.5,
+        )
+        val scores = reconstructNodeScores("P", "L", candidates, kb)
+        scores shouldNotBe null
+        scores!!.size shouldBe 3
+        // B1: normCov=1.0, normDelivery=1.0 -> score=1.0; B3: normCov=0.0, normDelivery=0.0 -> score=0.0
+        scores[0] shouldBe (1.0 plusOrMinus 0.01)
+        scores[2] shouldBe (0.0 plusOrMinus 0.01)
+        (scores[0] > scores[1] && scores[1] > scores[2]) shouldBe true
+
+        // Missing coverage for one candidate -> null (defer to caller's own fallback).
+        val partialKb = PreferenceKb(
+            entries = mapOf(Triple("P", "L", "B1:") to PreferenceKbEntry(10, 100.0, 0.0)),
+            deliveryWeight = 0.5, inventoryWeight = 0.5,
+        )
+        reconstructNodeScores("P", "L", candidates, partialKb) shouldBe null
     }
 })

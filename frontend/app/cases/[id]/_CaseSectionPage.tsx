@@ -1209,8 +1209,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     | null
   >(null);
   // Per-demand pegging cache — populated lazily when user opens a demand's pegging panel.
-  // Keys are demand_id strings; values are the fetched PlanningPeggingEntry or 'loading'/'error'.
-  const [demandPeggingCache, setDemandPeggingCache] = useState<Record<string, PlanningPeggingEntry | 'loading' | 'error'>>({});
+  // Keys are demand_id strings; values are the fetched PlanningPeggingEntry or 'loading'/'error'/'no-run'.
+  // 'no-run' means the fetch was never attempted because no plan run id was available —
+  // distinct from 'error' (fetch attempted and failed) so the UI can say why, instead of
+  // spinning on "Loading…" forever with no request ever sent.
+  const [demandPeggingCache, setDemandPeggingCache] = useState<Record<string, PlanningPeggingEntry | 'loading' | 'error' | 'no-run'>>({});
   const [planPeggingPanelWidth, setPlanPeggingPanelWidth] = useState(420);
   const [planWorkOrderPeggingCache, setPlanWorkOrderPeggingCache] = useState<Record<string, PlanningPeggingNode>>({});
   // Active demand for WO pegging panel; null = use the row's own demand_id (default)
@@ -1996,9 +1999,24 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (!demandId) return;
     const inResult = planResult?.planning_pegging?.some((e) => String(e.demand_id ?? '').trim() === demandId);
     if (inResult) return;
-    if (demandPeggingCache[demandId]) return;
+    // 'no-run' is not a terminal result (unlike a real entry or 'error') — it just means
+    // no plan run id was available THAT TIME. currentPlanRunId/freshPlanRunId settle into
+    // place asynchronously as the page loads/saves a run, so retry once one appears instead
+    // of permanently freezing this demand's pegging on a transient startup race.
+    if (demandPeggingCache[demandId] && demandPeggingCache[demandId] !== 'no-run') return;
     const planRunId = currentPlanRunId ?? freshPlanRunId;
-    if (!planRunId || !id) return;
+    if (!planRunId || !id) {
+      // No plan run id available to fetch from — mark distinctly so the panel can say why
+      // instead of showing "Loading…" forever with no request ever sent. Guard against
+      // re-setting the same value: setDemandPeggingCache always makes a new object, and
+      // demandPeggingCache is itself a dependency of this effect — re-setting an unchanged
+      // 'no-run' would re-trigger the effect every render in a tight loop while planRunId
+      // stays null.
+      if (demandPeggingCache[demandId] !== 'no-run') {
+        setDemandPeggingCache((prev) => ({ ...prev, [demandId]: 'no-run' }));
+      }
+      return;
+    }
     setDemandPeggingCache((prev) => ({ ...prev, [demandId]: 'loading' }));
     getPlanRunPegging(Number(id), planRunId, demandId)
       .then(({ planning_pegging }) => {
@@ -2021,9 +2039,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (!demandId) return;
     const inResult = planResult?.planning_pegging?.some((e) => String(e.demand_id ?? '').trim() === demandId);
     if (inResult) return;
-    if (demandPeggingCache[demandId]) return;
+    // 'no-run' is not a terminal result (unlike a real entry or 'error') — it just means
+    // no plan run id was available THAT TIME. currentPlanRunId/freshPlanRunId settle into
+    // place asynchronously as the page loads/saves a run, so retry once one appears instead
+    // of permanently freezing this demand's pegging on a transient startup race.
+    if (demandPeggingCache[demandId] && demandPeggingCache[demandId] !== 'no-run') return;
     const planRunId = currentPlanRunId ?? freshPlanRunId;
-    if (!planRunId || !id) return;
+    if (!planRunId || !id) {
+      // See the identical guard in the demand-panel effect above: avoid re-setting an
+      // unchanged 'no-run' value, which would otherwise re-trigger this effect every
+      // render (demandPeggingCache is one of its own dependencies).
+      if (demandPeggingCache[demandId] !== 'no-run') {
+        setDemandPeggingCache((prev) => ({ ...prev, [demandId]: 'no-run' }));
+      }
+      return;
+    }
     setDemandPeggingCache((prev) => ({ ...prev, [demandId]: 'loading' }));
     getPlanRunPegging(Number(id), planRunId, demandId)
       .then(({ planning_pegging }) => {
@@ -9927,6 +9957,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   const cacheState = demandPeggingCache[demandIdNorm];
                   if (cacheState === 'loading') return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>Loading pegging tree…</p>;
                   if (cacheState === 'error') return <p style={{ color: '#f87171', fontSize: '0.9rem' }}>Failed to load pegging tree for this demand.</p>;
+                  if (cacheState === 'no-run') {
+                    return (
+                      <div style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>
+                        <p>No plan run available to load this demand&apos;s pegging from.</p>
+                        <p style={{ fontSize: '0.75rem', marginTop: '0.5rem', color: '#71717a' }}>
+                          Run plan (or reload the page so the latest saved run loads), then reopen this panel.
+                        </p>
+                      </div>
+                    );
+                  }
                   return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>Loading pegging tree…</p>;
                 }
               }

@@ -49,6 +49,30 @@ internal data class PreferenceCandidateRow(
     val deliveryScore: Double?,
 )
 
+/** One persisted alternative's KB row, as consulted at planning time: the canonical ordinal
+ *  [preference] (used everywhere today) plus the raw, pre-normalization axis values that fed
+ *  it — carried through so [reconstructNodeScores] can rebuild the continuous combined score
+ *  a node's alternatives were originally ranked by (needed for proportional splitting; the
+ *  ordinal alone carries no magnitude information).
+ *
+ *  Not `internal`: threaded as a parameter type through the public [plan] function, so Kotlin
+ *  requires it to be at least as visible as [plan] itself. */
+data class PreferenceKbEntry(
+    val preference: Int,
+    val inventoryScore: Double?,
+    val deliveryScore: Double?,
+)
+
+/** Runtime view of a case's Preferences KB: per-alternative entries plus the delivery/inventory
+ *  weights used to build them (needed to recombine [PreferenceKbEntry]'s raw axis values back
+ *  into a comparable score — see [reconstructNodeScores]). Not `internal`, for the same reason
+ *  as [PreferenceKbEntry]. */
+data class PreferenceKb(
+    val entries: Map<Triple<String, String, String>, PreferenceKbEntry>,
+    val deliveryWeight: Double,
+    val inventoryWeight: Double,
+)
+
 /** Sentinel for "unreachable" (a cycle, or no method and no stock) — always ranks last,
  *  never divides by zero, never lets an infeasible branch look artificially good. */
 private const val INFEASIBLE_LEAD_DAYS = Double.MAX_VALUE
@@ -188,8 +212,10 @@ internal fun computeNodeMetrics(
 }
 
 /** Normalize two weights to sum to 1; falls back to an even 0.5/0.5 split when both are
- *  non-positive (mirrors the deleted normalizeScoreWeights precedent). */
-private fun normalizeWeights(deliveryWeight: Double, inventoryWeight: Double): Pair<Double, Double> {
+ *  non-positive (mirrors the deleted normalizeScoreWeights precedent). Internal (not private):
+ *  reused by [reconstructNodeScores] to recombine axes with the exact same formula
+ *  [scoreNodeCandidates] used at build time. */
+internal fun normalizeWeights(deliveryWeight: Double, inventoryWeight: Double): Pair<Double, Double> {
     val total = deliveryWeight + inventoryWeight
     return if (total <= 0.0) Pair(0.5, 0.5) else Pair(deliveryWeight / total, inventoryWeight / total)
 }
@@ -291,5 +317,48 @@ internal fun buildPreferenceKb(
     val cache = mutableMapOf<Pair<Pair<String, String>, Int>, NodeMetrics>()
     return nodes.flatMap { (pid, lid) ->
         scoreNodeCandidates(pid, lid, data, maxBomDepth, deliveryWeight, inventoryWeight, supplyByNode, cache)
+    }
+}
+
+/**
+ * Reconstructs each of [candidates]'s continuous combined score (the same 0..1 value
+ * [scoreNodeCandidates] computed at build time to rank them into the persisted ordinal
+ * `preference`) from [preferenceKb]'s persisted raw axis values — needed because the
+ * continuous score itself is never persisted, only the ordinal. Normalizes across the FULL
+ * `candidates` set passed in (mirrors [scoreNodeCandidates]'s normalization scope: this
+ * node's entire sibling set, not just a top slice a caller might go on to use), so the
+ * reconstructed scores stay consistent with the ranking already visible in `preference`.
+ *
+ * Returns `null` — defer to the caller's own fallback — unless every one of [candidates] has
+ * a KB entry with a non-null [PreferenceKbEntry.inventoryScore] (the "per-alternative
+ * fallback" principle used elsewhere: partial coverage at this node isn't enough to trust a
+ * reconstructed magnitude comparison across candidates).
+ */
+internal fun reconstructNodeScores(
+    productId: String,
+    locationId: String,
+    candidates: List<WaterfallCandidate>,
+    preferenceKb: PreferenceKb,
+): List<Double>? {
+    val entries = candidates.map { c ->
+        preferenceKb.entries[Triple(productId, locationId, preferenceMethodKey(c.method, c.altKey))] ?: return null
+    }
+    if (entries.any { it.inventoryScore == null }) return null
+
+    val covs = entries.map { it.inventoryScore!! }
+    val covMax = covs.max()
+    val covMin = covs.min()
+    val covSpan = (covMax - covMin).let { if (it <= 0.0) 1.0 else it }
+    val leads = entries.map { it.deliveryScore }
+    val finiteLeads = leads.filterNotNull()
+    val leadMax = finiteLeads.maxOrNull() ?: 0.0
+    val leadMin = finiteLeads.minOrNull() ?: 0.0
+    val leadSpan = (leadMax - leadMin).let { if (it <= 0.0) 1.0 else it }
+    val (dw, iw) = normalizeWeights(preferenceKb.deliveryWeight, preferenceKb.inventoryWeight)
+
+    return entries.indices.map { i ->
+        val normCov = ((covs[i] - covMin) / covSpan).coerceIn(0.0, 1.0)
+        val normDelivery = leads[i]?.let { (1.0 - (it - leadMin) / leadSpan).coerceIn(0.0, 1.0) } ?: 0.0
+        dw * normDelivery + iw * normCov
     }
 }

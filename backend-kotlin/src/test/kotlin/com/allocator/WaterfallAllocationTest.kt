@@ -63,8 +63,10 @@ class WaterfallAllocationTest : FunSpec({
         "method_selection" to mapOf("max_methods" to 2, "mode" to "preference", "depth" to 1),
     )
 
-    test("slot 1 fills entire demand → slot 2 not invoked") {
-        // Demand 100, R1 plentiful → BOM_A fills all 100. R2 untouched.
+    test("root demand with both R1 and R2 plentiful: equal split across both slots, not slot-1-only") {
+        // Demand 100, R1 and R2 both plentiful. This is a ROOT demand with max_methods=2, so
+        // the root-only equal-split default applies even though slot 1 alone could satisfy
+        // the whole demand: each of BOM_A/BOM_B gets an even 50/50 share.
         val inventory = mkInv(
             supply("R1", "L", 1000.0, "SUP_R1"),
             supply("R2", "L", 1000.0, "SUP_R2"),
@@ -80,9 +82,11 @@ class WaterfallAllocationTest : FunSpec({
         totalCommitted shouldBe (100.0 plusOrMinus 1e-6)
         (pegging?.get("committed_qty") as? Number)?.toDouble() shouldBe (100.0 plusOrMinus 1e-6)
 
-        // R2 untouched (slot 2 was never invoked because residual hit 0).
+        // Both R1 and R2 consumed 50 each (equal split), not R1=100/R2=0.
+        val r1Remaining = inventory.firstOrNull { it["product_id"] == "R1" }?.get("qty") as? Number
         val r2Remaining = inventory.firstOrNull { it["product_id"] == "R2" }?.get("qty") as? Number
-        r2Remaining?.toDouble() shouldBe (1000.0 plusOrMinus 1e-6)
+        r1Remaining?.toDouble() shouldBe (950.0 plusOrMinus 1e-6)
+        r2Remaining?.toDouble() shouldBe (950.0 plusOrMinus 1e-6)
     }
 
     test("slot 1 partial → slot 2 picks up residual, demand fully filled") {
@@ -212,10 +216,12 @@ class WaterfallAllocationTest : FunSpec({
         r1Remaining?.toDouble() shouldBe (0.0 plusOrMinus 1e-6)
     }
 
-    test("min-residual threshold prevents trivial second slot") {
-        // R1=1000 with demand=100 → slot 1 fills all 100, residual=0 → slot 2 NOT invoked.
-        // Already covered by the first test, but re-asserts the threshold bound by
-        // exercising a cleaner-fill case.
+    test("root equal-split still runs both slots even for a clean, evenly-divisible fill") {
+        // R1=1000, R2=1000, demand=100 → root equal-split targets 50/50, both plentiful, so
+        // both slots commit and both show up in pegging/wos. (MIN_WATERFALL_RESIDUAL still
+        // guards the ordinary sequential/cascade path — e.g. once a slot's target is
+        // satisfied with zero carry-forward and cap is exhausted — but a root demand with
+        // max_methods > 1 always tries every one of its top-`cap` candidates up front.)
         val inventory = mkInv(
             supply("R1", "L", 1000.0, "SUP_R1"),
             supply("R2", "L", 1000.0, "SUP_R2"),
@@ -227,12 +233,14 @@ class WaterfallAllocationTest : FunSpec({
 
         val (_, wos, pegging) = plan(demand, inventory, twoMethodFg, requestTimeDt = null, config = waterfallConfig)
 
-        // Exactly one method-pegging child under the demand (slot 1 only).
+        // Both BOM_A and BOM_B pegging children present under the demand.
         @Suppress("UNCHECKED_CAST")
         val woChildren = (pegging?.get("children") as? List<Map<String, Any?>>) ?: emptyList()
-        woChildren.size shouldBe 1
-        // Only one WO emitted (BOM_A's, no BOM_B WO).
-        wos.count { it["method"] == "make" } shouldBe 1
+        woChildren.size shouldBe 2
+        // Both WOs emitted (BOM_A and BOM_B), 50 each.
+        val makeWos = wos.filter { it["method"] == "make" }
+        makeWos.size shouldBe 2
+        makeWos.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 } shouldBe (100.0 plusOrMinus 1e-6)
     }
 
     test("waterfall does NOT fire when methods.size <= 1") {

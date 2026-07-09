@@ -711,11 +711,11 @@ internal fun kbPreference(
     locationId: String,
     method: Map<String, Any?>,
     altKey: String?,
-    preferenceKb: Map<Triple<String, String, String>, Int>?,
+    preferenceKb: PreferenceKb?,
 ): Int {
     val fallback = (method["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE
     if (preferenceKb == null) return fallback
-    return preferenceKb[Triple(productId, locationId, preferenceMethodKey(method, altKey))] ?: fallback
+    return preferenceKb.entries[Triple(productId, locationId, preferenceMethodKey(method, altKey))]?.preference ?: fallback
 }
 
 // ── Method selection ───────────────────────────────────────────────────────────
@@ -1090,7 +1090,7 @@ internal fun planMethodSlot(
     initialBudget: Map<String, Double>? = null,
     nodeQtyCaps: Map<Pair<String, String>, Double>? = null,
     demandBlueprint: DemandBlueprint? = null,
-    preferenceKb: Map<Triple<String, String, String>, Int>? = null,
+    preferenceKb: PreferenceKb? = null,
 ): MethodSlotResult {
     val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
     val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
@@ -1635,7 +1635,7 @@ fun plan(
      * preserves today's exact raw-preference behavior. Threaded through all recursive
      * plan() calls.
      */
-    preferenceKb: Map<Triple<String, String, String>, Int>? = null,
+    preferenceKb: PreferenceKb? = null,
 ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
 
     val productId = (demand["product_id"] as? String)?.trim() ?: ""
@@ -1999,18 +1999,40 @@ fun plan(
     // type after a partial success — matching the historical root-only waterfall's behavior,
     // which had no such restriction.
     val isRoot = depth == MAX_PLAN_DEPTH
+    // Root-only proportional/equal split among the top `cap` candidates: rather than the
+    // ordinary sequential 100%-then-spillover waterfall, a root demand with cap > 1 always
+    // gets its quantity divided up-front across its top-ranked alternatives — weighted by
+    // each candidate's reconstructed Preferences-KB score when one is fully available for
+    // every candidate in play, otherwise an even split. Never applied below the root (that's
+    // exactly the 2^N fan-out risk the historical proactive waterfall was root-only to avoid).
+    val rootSplitWeights: List<Double>? = if (isRoot && cap > 1) {
+        val scored = preferenceKb?.let { reconstructNodeScores(productId, locationId, candidates, it) }
+            ?.take(cap)?.let { topScores ->
+                val sum = topScores.sum()
+                if (sum > 1e-9) topScores.map { it / sum } else null
+            }
+        scored ?: List(cap) { 1.0 / cap }
+    } else null
+    // Shortfall from a candidate that couldn't reach its rootSplitWeights-derived target rolls
+    // forward onto the next candidate's target — the same residual-cascade idea the ordinary
+    // waterfall already uses, just starting from a split target instead of a 100% target.
+    var carryForward = 0.0
     var priorAttemptWasBlocked = true
     for ((slotIdx, candidate) in candidates.withIndex()) {
         if (slotIdx - cycleEscapes >= cap) break
         if (slotIdx > 0 && residual <= MIN_WATERFALL_RESIDUAL) break
         if (slotIdx > 0 && !priorAttemptWasBlocked && !isRoot && candidate.method["type"] != "make") break
+        // Past the precomputed split (can happen after a cycle escape lets more than `cap`
+        // candidates be tried), degrade to the ordinary sequential residual for the tail.
+        val target = rootSplitWeights?.getOrNull(slotIdx)?.let { it * demandNetQty + carryForward }
+        val slotQty = (target ?: residual).coerceAtMost(residual)
         val mLoc = (candidate.method["location_id"] ?: candidate.method["to_location_id"] ?: "").toString()
         val label = if (slotIdx == 0) "Preference ${candidate.method["preference"] ?: "—"}: ${candidate.method["type"]}@$mLoc" +
             (candidate.altKey?.let { " variant=$it" } ?: "")
             else "Fallback slot ${slotIdx + 1}/$cap: ${candidate.method["type"]}@$mLoc" +
                 (candidate.altKey?.let { " variant=$it" } ?: "") + " (residual=${roundQty(residual).toLong()})"
         val attempt = planMethodSlot(
-            m = candidate.method, slotQty = residual,
+            m = candidate.method, slotQty = slotQty,
             productId = productId, locationId = locationId,
             demand = demand, demandId = demandId,
             requestTimeDt = requestTimeDt, reqTimeStr = reqTimeStr,
@@ -2034,6 +2056,7 @@ fun plan(
         if (attempt.blockedReason != null) {
             priorAttemptWasBlocked = true
             lastBlockedReason = attempt.blockedReason
+            if (target != null) carryForward = target
             if (attempt.achievableQty <= 1e-9 && attempt.blockedReason?.contains("cycle") == true) {
                 cycleEscapes++
             }
@@ -2046,6 +2069,7 @@ fun plan(
             continue
         }
         priorAttemptWasBlocked = false
+        if (target != null) carryForward = (target - attempt.achievableQty).coerceAtLeast(0.0)
         combinedWos.addAll(attempt.wos)
         totalAchievable += attempt.achievableQty
         residual -= attempt.achievableQty
@@ -3767,7 +3791,7 @@ internal fun legacyCommit(
     planBlueprint: PlanBlueprint? = null,
     /** Optional Preferences KB override, see [plan]'s `preferenceKb` param. Passed through
      *  unchanged to every demand's [plan] call. */
-    preferenceKb: Map<Triple<String, String, String>, Int>? = null,
+    preferenceKb: PreferenceKb? = null,
 ): LegacyCommitResult {
     val committedDemands = mutableListOf<Map<String, Any?>>()
     val workOrders = mutableListOf<Map<String, Any?>>()
@@ -3872,7 +3896,7 @@ fun runPlanning(
     precomputedBudgets: Map<Any?, MutableMap<String, Double>>? = null,
     /** Optional Preferences KB override, see [plan]'s `preferenceKb` param. `null` when no
      *  Preferences KB exists for this case — preserves today's exact raw-preference behavior. */
-    preferenceKb: Map<Triple<String, String, String>, Int>? = null,
+    preferenceKb: PreferenceKb? = null,
 ): RunPlanningResult {
     val inventory: MutableList<MutableMap<String, Any?>> = (data["supply"] ?: emptyList()).map { s ->
         mutableMapOf(
