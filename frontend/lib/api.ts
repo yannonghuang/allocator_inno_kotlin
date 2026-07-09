@@ -2079,3 +2079,70 @@ export async function exportPreferencesCsv(caseId: number): Promise<string> {
   if (!r.ok) throw new Error(await r.text());
   return r.text();
 }
+
+// ── Demand Ordering ─────────────────────────────────────────────────────────────
+
+export type DemandOrderRow = {
+  demand_id: string;
+  order: number;
+  request_due_time: string | null;
+  priority: number;
+  product_id: string;
+  customer_id: string;
+};
+
+export type DemandOrderConfig = {
+  generated_at: string;
+};
+
+/** GET /cases/{id}/demand-ordering — null when no Demand Ordering KB exists yet (204). */
+export async function getDemandOrdering(caseId: number): Promise<{ rows: DemandOrderRow[]; config: DemandOrderConfig | null } | null> {
+  const r = await fetch(`${API}/cases/${caseId}/demand-ordering`);
+  if (r.status === 204) return null;
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return { rows: data.rows as DemandOrderRow[], config: (data.config ?? null) as DemandOrderConfig | null };
+}
+
+/** POST /cases/{id}/demand-ordering/generate — builds the order from case data and saves it. */
+export async function generateDemandOrdering(caseId: number): Promise<DemandOrderRow[]> {
+  const r = await fetch(`${API}/cases/${caseId}/demand-ordering/generate`, { method: 'POST' });
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return data.rows as DemandOrderRow[];
+}
+
+/** PUT /cases/{id}/demand-ordering — upsert edited order values by demand_id. */
+export async function updateDemandOrderRows(caseId: number, rows: { demand_id: string; order: number }[]): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/demand-ordering`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rows }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+/** DELETE /cases/{id}/demand-ordering — clear the KB. */
+export async function deleteDemandOrdering(caseId: number): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/demand-ordering`, { method: 'DELETE' });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+/** POST /cases/{id}/demand-ordering/import — upload CSV, replace all rows. */
+export async function importDemandOrderingCsv(caseId: number, csvText: string): Promise<DemandOrderRow[]> {
+  const r = await fetch(`${API}/cases/${caseId}/demand-ordering/import`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: csvText,
+  });
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return data.rows as DemandOrderRow[];
+}
+
+/** GET /cases/{id}/demand-ordering/export — download CSV text. */
+export async function exportDemandOrderingCsv(caseId: number): Promise<string> {
+  const r = await fetch(`${API}/cases/${caseId}/demand-ordering/export`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.text();
+}

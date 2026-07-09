@@ -109,7 +109,8 @@ private fun createTables() {
         Supplies, MethodMoves, AllocationRuns, AllocationActions,
         PlanRuns, MaterialEvents, WoScheduleEvents, MaterialImpactAssessments,
         PlanPegging, PlanSupplyAllocations, CaseAllocations, NegotiationWaits, PlanRunEvents, AgentMemory,
-        KbRecords, CasePreferences, CasePreferenceConfigs
+        KbRecords, CasePreferences, CasePreferenceConfigs,
+        CaseDemandOrders, CaseDemandOrderConfigs
     )
 }
 

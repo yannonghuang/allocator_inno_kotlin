@@ -348,6 +348,34 @@ object CasePreferenceConfigs : Table("case_preference_config") {
     override val primaryKey = PrimaryKey(id)
 }
 
+/**
+ * Precomputed demand processing order — a "Demand Ordering" KB. Built once (via the Generate
+ * action) from case data (request_due_time, tie-broken by priority), independent of any plan run,
+ * and consulted by the planner in place of the raw `(priority, demand_id)` sort when present
+ * (falls back per-demand to that raw sort for any demand_id with no row here).
+ */
+object CaseDemandOrders : Table("case_demand_order") {
+    val id       = integer("id").autoIncrement()
+    val caseId   = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val demandId = varchar("demand_id", 255)
+    val order    = integer("order")   // canonical 10, 20, 30, ... — lower = processed earlier
+    override val primaryKey = PrimaryKey(id)
+    init {
+        index("ix_case_demand_order_case", false, caseId)
+        uniqueIndex("ux_case_demand_order_key", caseId, demandId)
+    }
+}
+
+/** One row per case: when [CaseDemandOrders] was last (re)built — shown when reopening the
+ *  Demand Ordering page. No build params (unlike [CasePreferenceConfigs]) — the ordering rule
+ *  (due_time, then priority) is fixed. */
+object CaseDemandOrderConfigs : Table("case_demand_order_config") {
+    val id          = integer("id").autoIncrement()
+    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE).uniqueIndex()
+    val generatedAt = timestamp("generated_at").defaultExpression(CurrentTimestamp)
+    override val primaryKey = PrimaryKey(id)
+}
+
 /** Persisted material impact assessment results (rating + LLM explanation per supply change). */
 object MaterialImpactAssessments : Table("material_impact_assessment") {
     val id                  = integer("id").autoIncrement()

@@ -3897,6 +3897,13 @@ fun runPlanning(
     /** Optional Preferences KB override, see [plan]'s `preferenceKb` param. `null` when no
      *  Preferences KB exists for this case — preserves today's exact raw-preference behavior. */
     preferenceKb: PreferenceKb? = null,
+    /** Optional Demand Ordering KB override: demand_id -> canonical processing order (10, 20,
+     *  30, ...). When present, demands covered by it sort first (by that order); demands NOT
+     *  covered (e.g. added after the KB was last generated) fall back to today's raw
+     *  `(priority, demand_id)` sort and sort after all covered demands — the same
+     *  per-alternative-not-all-or-nothing fallback principle as [preferenceKb]. `null` (no KB
+     *  for this case) preserves today's exact `(priority, demand_id)` sort. */
+    demandOrder: Map<String, Int>? = null,
 ): RunPlanningResult {
     val inventory: MutableList<MutableMap<String, Any?>> = (data["supply"] ?: emptyList()).map { s ->
         mutableMapOf(
@@ -3908,8 +3915,17 @@ fun runPlanning(
         )
     }.toMutableList()
 
+    // Demand processing order: covered by the Demand Ordering KB (see `demandOrder` doc) sorts
+    // first by its canonical order; anything not covered falls back to the raw (priority,
+    // demand_id) rule and sorts after all covered demands. demandOrder == null (no KB) reduces
+    // the first two comparator keys to no-ops, preserving today's exact sort unchanged.
     val demands = (data["demand"] ?: emptyList()).sortedWith(
-        compareBy({ (it["priority"] as? Number)?.toInt() ?: 0 }, { it["demand_id"]?.toString() ?: "" })
+        compareBy(
+            { d: Map<String, Any?> -> if (demandOrder?.containsKey(d["demand_id"]?.toString()) == true) 0 else 1 },
+            { d: Map<String, Any?> -> demandOrder?.get(d["demand_id"]?.toString()) ?: Int.MAX_VALUE },
+            { d: Map<String, Any?> -> (d["priority"] as? Number)?.toInt() ?: 0 },
+            { d: Map<String, Any?> -> d["demand_id"]?.toString() ?: "" },
+        )
     )
 
     val committedDemands = mutableListOf<Map<String, Any?>>()

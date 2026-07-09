@@ -5,6 +5,7 @@ import com.allocator.api.allocateRoutes
 import com.allocator.api.assessmentRoutes
 import com.allocator.api.bomGraphRoutes
 import com.allocator.api.caseRoutes
+import com.allocator.api.demandOrderingRoutes
 import com.allocator.api.explanationRoutes
 import com.allocator.api.peggingRoutes
 import com.allocator.api.resourceUtilizationRoutes
@@ -103,6 +104,7 @@ fun Application.configureRouting() {
         caseRoutes()
         allocationRoutes()
         preferenceRoutes()
+        demandOrderingRoutes()
         allocateRoutes()
         peggingRoutes()
         resourceUtilizationRoutes()
