@@ -2635,7 +2635,11 @@ internal suspend fun runPlanBackground(
         if (preferenceKb != null) {
             log.info("[plan] case {} has {} case_preference rows — using as method/variant ranking override", caseId, preferenceKb.entries.size)
         }
-        val raw = runPlanning(data, config = config, progressCallback = progressCb, precomputedBudgets = precomputedBudgets, preferenceKb = preferenceKb)
+        val demandOrder = loadDemandOrderMap(caseId)
+        if (demandOrder != null) {
+            log.info("[plan] case {} has {} case_demand_order rows — using as demand processing order override", caseId, demandOrder.size)
+        }
+        val raw = runPlanning(data, config = config, progressCallback = progressCb, precomputedBudgets = precomputedBudgets, preferenceKb = preferenceKb, demandOrder = demandOrder)
         log.info("[plan] runPlanning done for run {}", planRunId)
         // Seed case_allocation only when no user allocation existed.
         // Uses the same generateAndSeedCaseAllocation() function as the Generate endpoint
