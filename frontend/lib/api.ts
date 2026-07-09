@@ -1998,3 +1998,84 @@ export async function exportAllocationCsv(caseId: number): Promise<string> {
   if (!r.ok) throw new Error(await r.text());
   return r.text();
 }
+
+// ── Preferences KB ───────────────────────────────────────────────────────────────
+
+export type PreferenceRow = {
+  product_id: string;
+  location_id: string;
+  method_type: 'make' | 'move' | 'purchase';
+  method_key: string;
+  preference: number;
+  inventory_score: number | null;
+  delivery_score: number | null;
+};
+
+export type PreferenceConfig = {
+  max_bom_depth: number;
+  delivery_weight: number;
+  inventory_weight: number;
+  generated_at: string;
+};
+
+export type PreferenceGenerateParams = {
+  max_bom_depth: number;
+  delivery_weight: number;
+  inventory_weight: number;
+};
+
+/** GET /cases/{id}/preferences — null when no Preferences KB exists yet (204). */
+export async function getPreferences(caseId: number): Promise<{ rows: PreferenceRow[]; config: PreferenceConfig | null } | null> {
+  const r = await fetch(`${API}/cases/${caseId}/preferences`);
+  if (r.status === 204) return null;
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return { rows: data.rows as PreferenceRow[], config: (data.config ?? null) as PreferenceConfig | null };
+}
+
+/** POST /cases/{id}/preferences/generate — builds the KB from case data and saves it. */
+export async function generatePreferences(caseId: number, params: PreferenceGenerateParams): Promise<PreferenceRow[]> {
+  const r = await fetch(`${API}/cases/${caseId}/preferences/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return data.rows as PreferenceRow[];
+}
+
+/** PUT /cases/{id}/preferences — upsert edited preference values by natural key. */
+export async function updatePreferenceRows(caseId: number, rows: PreferenceRow[]): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/preferences`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rows }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+/** DELETE /cases/{id}/preferences — clear the KB. */
+export async function deletePreferences(caseId: number): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/preferences`, { method: 'DELETE' });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+/** POST /cases/{id}/preferences/import — upload CSV, replace all rows. */
+export async function importPreferencesCsv(caseId: number, csvText: string): Promise<PreferenceRow[]> {
+  const r = await fetch(`${API}/cases/${caseId}/preferences/import`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: csvText,
+  });
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return data.rows as PreferenceRow[];
+}
+
+/** GET /cases/{id}/preferences/export — download CSV text. */
+export async function exportPreferencesCsv(caseId: number): Promise<string> {
+  const r = await fetch(`${API}/cases/${caseId}/preferences/export`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.text();
+}

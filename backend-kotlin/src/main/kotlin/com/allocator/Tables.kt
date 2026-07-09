@@ -311,6 +311,43 @@ object CaseAllocations : Table("case_allocation") {
     init { index("ix_case_allocation_case", false, caseId) }
 }
 
+/**
+ * Precomputed method/BOM-variant preference ranking — a "Preferences KB". Built once (via the
+ * Generate action) from case data, independent of any plan run, and consulted by the planner
+ * in place of the raw CSV `preference` column when present (falls back to raw CSV per-alternative
+ * when a (product, location, method) combination has no row here).
+ */
+object CasePreferences : Table("case_preference") {
+    val id           = integer("id").autoIncrement()
+    val caseId       = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val productId    = varchar("product_id", 255)
+    val locationId   = varchar("location_id", 255)
+    val methodType   = varchar("method_type", 16)   // "make" | "move" | "purchase"
+    // Canonical alternative identity within (product_id, location_id, method_type):
+    // make -> "$bomId:$altKey"; move -> from_location_id; purchase -> vendor_id (or "").
+    val methodKey    = varchar("method_key", 255)
+    val preference   = integer("preference")         // canonical 10, 20, 30, ... — lower = more preferred
+    val inventoryScore = double("inventory_score").nullable()
+    val deliveryScore  = double("delivery_score").nullable()
+    override val primaryKey = PrimaryKey(id)
+    init {
+        index("ix_case_preference_case", false, caseId)
+        uniqueIndex("ux_case_preference_key", caseId, productId, locationId, methodType, methodKey)
+    }
+}
+
+/** One row per case: the max_bom_depth/delivery_weight/inventory_weight last used to (re)build
+ *  [CasePreferences] — shown when reopening the Preferences page and carried into CSV export. */
+object CasePreferenceConfigs : Table("case_preference_config") {
+    val id             = integer("id").autoIncrement()
+    val caseId         = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE).uniqueIndex()
+    val maxBomDepth    = integer("max_bom_depth")
+    val deliveryWeight = double("delivery_weight")
+    val inventoryWeight = double("inventory_weight")
+    val generatedAt    = timestamp("generated_at").defaultExpression(CurrentTimestamp)
+    override val primaryKey = PrimaryKey(id)
+}
+
 /** Persisted material impact assessment results (rating + LLM explanation per supply change). */
 object MaterialImpactAssessments : Table("material_impact_assessment") {
     val id                  = integer("id").autoIncrement()

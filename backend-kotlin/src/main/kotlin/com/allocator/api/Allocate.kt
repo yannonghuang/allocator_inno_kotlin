@@ -2164,8 +2164,21 @@ private fun subtreeContainsRealMove(node: Any?, moveTriples: Set<Triple<String, 
 }
 
 @Suppress("UNCHECKED_CAST")
+/**
+ * Sums `quantity` on every "supply" leaf in a pegging (sub)tree — EXCLUDING any subtree
+ * rooted at a `failed=true` node. A blocked/rolled-back waterfall attempt is retained in
+ * the pegging output (so the UI can show *why* that candidate was blocked), but its
+ * inventory takes were restored via [restoreQtys] before the caller moved on to the next
+ * candidate — the supply nodes underneath are a stale, pre-rollback snapshot, not a real
+ * consumption. The soundness checker already treats any `failed=true` subtree as a debug
+ * snapshot and skips it; this KPI must do the same, or it double-counts every rolled-back
+ * attempt on top of whichever candidate actually succeeded (confirmed on case 173 run 1121:
+ * naive sum 2.258B against a real pool of 2.226B — 2.234B of that was inside failed
+ * subtrees; excluding them drops the claimed total to 24.1M, a sound ~1.1%).
+ */
 private fun peggingSupplyConsumed(node: Any?): Double {
     val n = node as? Map<String, Any?> ?: return 0.0
+    if (n["failed"] == true) return 0.0
     var total = if (n["type"] == "supply") (n["quantity"] as? Number ?: 0).toDouble() else 0.0
     for (ch in (n["children"] as? List<*> ?: emptyList<Any?>())) total += peggingSupplyConsumed(ch)
     return total
@@ -2618,7 +2631,11 @@ internal suspend fun runPlanBackground(
             log.info("[plan] case {} has {} case_allocation rows — using as budget override", caseId, caseAllocRows.size)
             buildBudgetsFromCaseAlloc(caseAllocRows, data["supply"] ?: emptyList())
         } else null
-        val raw = runPlanning(data, config = config, progressCallback = progressCb, precomputedBudgets = precomputedBudgets)
+        val preferenceKb = loadPreferenceKb(caseId)
+        if (preferenceKb != null) {
+            log.info("[plan] case {} has {} case_preference rows — using as method/variant ranking override", caseId, preferenceKb.entries.size)
+        }
+        val raw = runPlanning(data, config = config, progressCallback = progressCb, precomputedBudgets = precomputedBudgets, preferenceKb = preferenceKb)
         log.info("[plan] runPlanning done for run {}", planRunId)
         // Seed case_allocation only when no user allocation existed.
         // Uses the same generateAndSeedCaseAllocation() function as the Generate endpoint

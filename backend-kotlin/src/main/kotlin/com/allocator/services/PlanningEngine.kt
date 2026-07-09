@@ -698,6 +698,26 @@ internal fun expandWaterfallCandidates(
     }
 }
 
+/**
+ * Preferences KB lookup for one waterfall candidate: consults [preferenceKb] (built by
+ * [buildPreferenceKb] in PreferenceBuilder.kt, keyed the same way via [preferenceMethodKey])
+ * before falling back to the raw CSV `preference` column — the per-alternative fallback the
+ * Preferences feature is built around, so partial KB coverage degrades gracefully rather than
+ * all-or-nothing per case. `preferenceKb == null` (no KB for this case) preserves today's
+ * exact raw-preference behavior.
+ */
+internal fun kbPreference(
+    productId: String,
+    locationId: String,
+    method: Map<String, Any?>,
+    altKey: String?,
+    preferenceKb: PreferenceKb?,
+): Int {
+    val fallback = (method["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE
+    if (preferenceKb == null) return fallback
+    return preferenceKb.entries[Triple(productId, locationId, preferenceMethodKey(method, altKey))]?.preference ?: fallback
+}
+
 // ── Method selection ───────────────────────────────────────────────────────────
 
 /**
@@ -1070,6 +1090,7 @@ internal fun planMethodSlot(
     initialBudget: Map<String, Double>? = null,
     nodeQtyCaps: Map<Pair<String, String>, Double>? = null,
     demandBlueprint: DemandBlueprint? = null,
+    preferenceKb: PreferenceKb? = null,
 ): MethodSlotResult {
     val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
     val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
@@ -1167,7 +1188,7 @@ internal fun planMethodSlot(
             // Inherit the originating demand's customer so customer-specific constraints
             // apply to sub-components, not just the finished good.
             "customer_id" to demand["customer_id"], "customer" to demand["customer"])
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint)
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb)
         val effectiveQty = solvedList.sumOf { s ->
             val r = s["commit_reason"] as? String
             if (r == "cycle_stopped" || r == "cycle_detected") 0.0
@@ -1601,10 +1622,20 @@ fun plan(
      * Optional per-demand BOM blueprint from [computePlanBlueprint].
      * When present and the current (productId, locationId) has a blueprint entry whose
      * method is still in effectiveMethods, the commit phase uses it directly — skipping
-     * [getPreferredMethodCascade] and its probeChildren overhead.
+     * the unified waterfall's own candidate expansion/ranking.
      * Threaded through all recursive plan() / planMethodSlot() calls.
      */
     demandBlueprint: DemandBlueprint? = null,
+    /**
+     * Optional Preferences KB override: (productId, locationId, methodKey) → canonical
+     * preference (10, 20, 30, ...), built once via the Preferences page's Generate action
+     * (see [buildPreferenceKb] in PreferenceBuilder.kt). When non-null, [kbPreference]
+     * consults it per-alternative before falling back to the raw CSV `preference` column —
+     * partial coverage degrades gracefully, alternative by alternative. `null` (the default)
+     * preserves today's exact raw-preference behavior. Threaded through all recursive
+     * plan() calls.
+     */
+    preferenceKb: PreferenceKb? = null,
 ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
 
     val productId = (demand["product_id"] as? String)?.trim() ?: ""
@@ -1930,13 +1961,14 @@ fun plan(
         // alt_group) this yields exactly the same single WaterfallCandidate(blueprintMethod,
         // null) as before — zero behavior change there.
         expandWaterfallCandidates(listOf(blueprintMethod), productId, demand, config, data)
+            .sortedBy { kbPreference(productId, locationId, it.method, it.altKey, preferenceKb) }
     } else {
         expandWaterfallCandidates(effectiveMethods, productId, demand, config, data)
             // A make candidate already proven structurally dead at this (pid, lid) by a
             // prior demand this run: skip re-attempting it (cheap memoization), matching
             // structuralFailedMakes's role below. A diagnostic stub covers it instead.
             .let { if (cachedMakeFailureReason != null) it.filterNot { c -> c.method["type"] == "make" } else it }
-            .sortedBy { (it.method["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
+            .sortedBy { kbPreference(productId, locationId, it.method, it.altKey, preferenceKb) }
     }
 
     if (candidates.isEmpty()) {
@@ -1967,18 +1999,40 @@ fun plan(
     // type after a partial success — matching the historical root-only waterfall's behavior,
     // which had no such restriction.
     val isRoot = depth == MAX_PLAN_DEPTH
+    // Root-only proportional/equal split among the top `cap` candidates: rather than the
+    // ordinary sequential 100%-then-spillover waterfall, a root demand with cap > 1 always
+    // gets its quantity divided up-front across its top-ranked alternatives — weighted by
+    // each candidate's reconstructed Preferences-KB score when one is fully available for
+    // every candidate in play, otherwise an even split. Never applied below the root (that's
+    // exactly the 2^N fan-out risk the historical proactive waterfall was root-only to avoid).
+    val rootSplitWeights: List<Double>? = if (isRoot && cap > 1) {
+        val scored = preferenceKb?.let { reconstructNodeScores(productId, locationId, candidates, it) }
+            ?.take(cap)?.let { topScores ->
+                val sum = topScores.sum()
+                if (sum > 1e-9) topScores.map { it / sum } else null
+            }
+        scored ?: List(cap) { 1.0 / cap }
+    } else null
+    // Shortfall from a candidate that couldn't reach its rootSplitWeights-derived target rolls
+    // forward onto the next candidate's target — the same residual-cascade idea the ordinary
+    // waterfall already uses, just starting from a split target instead of a 100% target.
+    var carryForward = 0.0
     var priorAttemptWasBlocked = true
     for ((slotIdx, candidate) in candidates.withIndex()) {
         if (slotIdx - cycleEscapes >= cap) break
         if (slotIdx > 0 && residual <= MIN_WATERFALL_RESIDUAL) break
         if (slotIdx > 0 && !priorAttemptWasBlocked && !isRoot && candidate.method["type"] != "make") break
+        // Past the precomputed split (can happen after a cycle escape lets more than `cap`
+        // candidates be tried), degrade to the ordinary sequential residual for the tail.
+        val target = rootSplitWeights?.getOrNull(slotIdx)?.let { it * demandNetQty + carryForward }
+        val slotQty = (target ?: residual).coerceAtMost(residual)
         val mLoc = (candidate.method["location_id"] ?: candidate.method["to_location_id"] ?: "").toString()
         val label = if (slotIdx == 0) "Preference ${candidate.method["preference"] ?: "—"}: ${candidate.method["type"]}@$mLoc" +
             (candidate.altKey?.let { " variant=$it" } ?: "")
             else "Fallback slot ${slotIdx + 1}/$cap: ${candidate.method["type"]}@$mLoc" +
                 (candidate.altKey?.let { " variant=$it" } ?: "") + " (residual=${roundQty(residual).toLong()})"
         val attempt = planMethodSlot(
-            m = candidate.method, slotQty = residual,
+            m = candidate.method, slotQty = slotQty,
             productId = productId, locationId = locationId,
             demand = demand, demandId = demandId,
             requestTimeDt = requestTimeDt, reqTimeStr = reqTimeStr,
@@ -1993,6 +2047,7 @@ fun plan(
             initialBudget = initialBudget,
             nodeQtyCaps = nodeQtyCaps,
             demandBlueprint = demandBlueprint,
+            preferenceKb = preferenceKb,
         )
         // Always record the attempt's pegging node so the UI shows every candidate tried
         // (including blocked ones with zero qty) — informative for the user even when a
@@ -2001,6 +2056,7 @@ fun plan(
         if (attempt.blockedReason != null) {
             priorAttemptWasBlocked = true
             lastBlockedReason = attempt.blockedReason
+            if (target != null) carryForward = target
             if (attempt.achievableQty <= 1e-9 && attempt.blockedReason?.contains("cycle") == true) {
                 cycleEscapes++
             }
@@ -2013,6 +2069,7 @@ fun plan(
             continue
         }
         priorAttemptWasBlocked = false
+        if (target != null) carryForward = (target - attempt.achievableQty).coerceAtLeast(0.0)
         combinedWos.addAll(attempt.wos)
         totalAchievable += attempt.achievableQty
         residual -= attempt.achievableQty
@@ -3732,6 +3789,9 @@ internal fun legacyCommit(
      * selection is bypassed for nodes that have a pre-selected method in the sketch.
      */
     planBlueprint: PlanBlueprint? = null,
+    /** Optional Preferences KB override, see [plan]'s `preferenceKb` param. Passed through
+     *  unchanged to every demand's [plan] call. */
+    preferenceKb: PreferenceKb? = null,
 ): LegacyCommitResult {
     val committedDemands = mutableListOf<Map<String, Any?>>()
     val workOrders = mutableListOf<Map<String, Any?>>()
@@ -3785,6 +3845,7 @@ internal fun legacyCommit(
             initialBudget = iter0Allocation?.get(demandId),
             nodeQtyCaps = achievableQtyMaps?.get(demandId),
             demandBlueprint = planBlueprint?.get(demandId),
+            preferenceKb = preferenceKb,
         )
         committedDemands.addAll(solvedList)
         workOrders.addAll(wos)
@@ -3833,6 +3894,9 @@ fun runPlanning(
     progressCallback: ((Map<String, Any?>) -> Unit)? = null,
     /** Pre-computed case-level allocation budgets (demandId → lotKey → qty). When non-null, overrides the internal SupplyAllocator step while keeping the BOM graph computed fresh. */
     precomputedBudgets: Map<Any?, MutableMap<String, Double>>? = null,
+    /** Optional Preferences KB override, see [plan]'s `preferenceKb` param. `null` when no
+     *  Preferences KB exists for this case — preserves today's exact raw-preference behavior. */
+    preferenceKb: PreferenceKb? = null,
 ): RunPlanningResult {
     val inventory: MutableList<MutableMap<String, Any?>> = (data["supply"] ?: emptyList()).map { s ->
         mutableMapOf(
@@ -3873,7 +3937,7 @@ fun runPlanning(
     // AND pre-selects the first-feasible BOM method per node per demand.
     // Replaces computeAchievableQtyMaps; eliminates getPreferredMethodCascade overhead
     // (probeChildren per node) from the commit phase entirely.
-    val planBlueprint = computePlanBlueprint(demands, sgAllocation, data)
+    val planBlueprint = computePlanBlueprint(demands, sgAllocation, data, preferenceKb)
     val achievableQtyMaps = planBlueprint.mapValues { (_, db) ->
         db.mapValues { (_, nb) -> nb.achievable }
     }
@@ -3888,6 +3952,7 @@ fun runPlanning(
         budgets           = sgAllocation.perLotBudgets,
         achievableQtyMaps = achievableQtyMaps,
         planBlueprint     = planBlueprint,
+        preferenceKb      = preferenceKb,
     )
     // Post-planning trace + compensation-pass telemetry (opt-in: trace_lots=true).
     if (sgAllocation.sgConfig.traceLots)
