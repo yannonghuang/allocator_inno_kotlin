@@ -65,23 +65,11 @@ Intent → config mapping (interpret any phrasing that conveys the same intent):
 2) **Use only one best method per demand / pick one method / by preference / no fallback**
    → method_selection: { "max_methods": 1, "mode": "preference" }. Engine picks one method by the preference number; no second slot.
 
-3) **Elaborate method selection / score methods (make/move/buy) by criteria** (slower run)
-   → method_selection: { "mode": "elaborate" }. Methods are scored rather than picked by preference.
-
-4) **Set the elaborate search depth to N** (e.g. "method depth 3", "search depth 2", "方法深度 3", "深度 2")
-   → method_selection: { "depth": N } (clamp N ≥ 1). Only meaningful when mode is elaborate.
-
-4d) **Set max BOM depth for make-fallback admission to N** (e.g. "max BOM depth 4", "make-fallback depth 2", "最大BOM深度 3")
-    → method_selection: { "max_bom_depth": N } (clamp 1..10). Default 3. Caps the recursion depth admitted at the reactive make-fallback site; deeper makes are skipped without recursing.
-
-4a) **Earliest delivery / fastest commit** (weights-only intent; only meaningful when mode is elaborate)
-    → method_selection: { "score_weights": { "commit_time": 1, "inventory_consumed": 0, "purchase": 0 } }.
-
-4b) **Prioritize existing inventory / use what we have / consume more stock**
-    → method_selection: { "score_weights": { "commit_time": 0, "inventory_consumed": 1, "purchase": 0 } }.
-
-4c) **Minimize new purchases / least additional supply / avoid new buy**
-    → method_selection: { "score_weights": { "commit_time": 0, "inventory_consumed": 0, "purchase": 1 } }.
+Note: "elaborate"/scored method selection, method-selection "depth", "max_bom_depth", and "score_weights"
+have been removed — the planner is preference-ranked waterfall only, at every BOM depth (no separate
+scoring/probing step, no depth restriction). If a user asks for scored/elaborate method selection or
+score weights, explain this was retired in favor of the simpler preference waterfall and do not set
+these keys.
 
 5) **Allow / enable / use / permit purchase (buy)** (e.g. "allow purchase", "enable buy", "可以使用采购", "允许采购", "启用采购", "开启采购")
    → purchase_allowed: true.
@@ -123,7 +111,7 @@ Intent → config mapping (interpret any phrasing that conveys the same intent):
    Numeric requests (e.g. "30 day window") map to the nearest named scale: ≤7 → weekly, ≤14 → biweekly, else → monthly.
 
 10) **Reset / clear / default** → full defaults:
-    method_selection: { "multiple": false, "mode": "preference", "depth": 1 }, purchase_allowed: false, consolidation: { "enabled": true, "make_batch_scale": "weekly", "move_batch_scale": "weekly", "purchase_batch_scale": "weekly", "period_days": 7 }, analyze_criticality: false, check_soundness: true.
+    method_selection: { "multiple": false, "mode": "preference" }, purchase_allowed: false, consolidation: { "enabled": true, "make_batch_scale": "weekly", "move_batch_scale": "weekly", "purchase_batch_scale": "weekly", "period_days": 7 }, analyze_criticality: false, check_soundness: true.
 
 14) **Enable criticality analysis after plan** (e.g. "analyze criticality", "criticality on", "open criticality", "启用关键度", "做关键度分析", "开启临界分析")
     → analyze_criticality: true. Auto-saves the run and runs criticality after each plan.
@@ -138,7 +126,7 @@ Intent → config mapping (interpret any phrasing that conveys the same intent):
     → check_soundness: false.
 
 Valid config_update keys:
-- method_selection: object with optional "multiple" (bool), "mode" ("preference" | "elaborate"), "depth" (int ≥ 1), "max_methods" (int ≥ 1; default 2; waterfall cap), "max_bom_depth" (int 1..10; default 3; make-fallback admission cap), "score_weights" ({ commit_time, inventory_consumed, purchase } — numeric, backend normalizes).
+- method_selection: object with optional "multiple" (bool, legacy), "mode" ("preference" — the only supported mode), "max_methods" (int ≥ 1; default 2; waterfall cap — how many ranked alternatives, across method type and BOM variant, to try before giving up).
 - purchase_allowed: boolean (top-level, not nested).
 - purchasable_materials: array of product_id strings (top-level). Empty ⇒ all raw materials buyable (default). Non-empty ⇒ strict whitelist; only listed raw materials may be bought. Resolve only against the supplied catalog.
 - consolidation: object with optional "enabled" (bool), "make_batch_scale", "move_batch_scale", "purchase_batch_scale" (each "none"|"weekly"|"biweekly"|"monthly"|"all"; per-type scales), "wo_batch_scale" (legacy global fallback), "period_days" (int 0..365; supply-side bucket width; 0 = single bucket).
@@ -321,10 +309,9 @@ private fun ruleBasedParse(
     if (t.isBlank()) {
         return bi(
             "You can tell me how you'd like planning to behave—for example \"max methods 2\", " +
-                "\"max BOM depth 4\", \"use elaborate method selection\", \"check soundness off\", " +
-                "or \"allow purchase\". You can also ask to see the current settings.",
-            "您可以告诉我希望规划如何运行 — 例如「最多方法 2」、「最大 BOM 深度 4」、" +
-                "「使用精细方法选择」、「关闭完整性校验」、或「允许采购」。您也可以让我显示当前配置。",
+                "\"check soundness off\", or \"allow purchase\". You can also ask to see the current settings.",
+            "您可以告诉我希望规划如何运行 — 例如「最多方法 2」、" +
+                "「关闭完整性校验」、或「允许采购」。您也可以让我显示当前配置。",
             raw,
         ) to null
     }
@@ -334,42 +321,16 @@ private fun ruleBasedParse(
     ) {
         val zh = isChineseInput(raw)
         val parts = mutableListOf<String>()
-        val msElaborate = ms["elaborate"]?.jsonPrimitive?.booleanOrNull == true ||
-            ms["mode"]?.jsonPrimitive?.contentOrNull?.lowercase() == "elaborate"
-        val depth = ms["depth"]?.jsonPrimitive?.intOrNull?.coerceAtLeast(1) ?: 1
         val maxMethods = ms["max_methods"]?.jsonPrimitive?.intOrNull?.coerceAtLeast(1)
             ?: if (ms["multiple"]?.jsonPrimitive?.booleanOrNull == false) 1 else 2
-        when {
-            msElaborate -> {
-                val sw = ms["score_weights"] as? JsonObject
-                val wc = sw?.get("commit_time")?.jsonPrimitive?.doubleOrNull
-                val wi = sw?.get("inventory_consumed")?.jsonPrimitive?.doubleOrNull
-                val wp = sw?.get("purchase")?.jsonPrimitive?.doubleOrNull
-                val depthLabel = if (zh) "深度 $depth" else "depth $depth"
-                val label = when {
-                    wc != null && wi != null && wp != null -> {
-                        val weightDesc = if (zh) when {
-                            wc > 0 && wi == 0.0 && wp == 0.0 -> "，最早交付"
-                            wi > 0 && wc == 0.0 && wp == 0.0 -> "，最多库存"
-                            wp > 0 && wc == 0.0 && wi == 0.0 -> "，最少采购"
-                            else -> "，权重 交付=${"%.2f".format(wc)} 库存=${"%.2f".format(wi)} 采购=${"%.2f".format(wp)}"
-                        } else when {
-                            wc > 0 && wi == 0.0 && wp == 0.0 -> ", earliest delivery"
-                            wi > 0 && wc == 0.0 && wp == 0.0 -> ", most inventory"
-                            wp > 0 && wc == 0.0 && wi == 0.0 -> ", least purchase"
-                            else -> ", weights commit=${"%.2f".format(wc)} inv=${"%.2f".format(wi)} purch=${"%.2f".format(wp)}"
-                        }
-                        if (zh) "精细方法选择（$depthLabel$weightDesc）" else "elaborate method selection ($depthLabel$weightDesc)"
-                    }
-                    else -> if (zh) "精细方法选择（$depthLabel）" else "elaborate method selection ($depthLabel)"
-                }
-                parts.add(label)
-            }
-            else -> parts.add(if (zh) "按偏好选择方法（单一最优）" else "method by preference (single best)")
+        val legacyElaborate = ms["elaborate"]?.jsonPrimitive?.booleanOrNull == true ||
+            ms["mode"]?.jsonPrimitive?.contentOrNull?.lowercase() == "elaborate"
+        parts.add(if (zh) "按偏好瀑布式选择方法/BOM变体" else "preference-ranked waterfall (method + BOM variant)")
+        if (legacyElaborate) {
+            parts.add(if (zh) "（配置中残留的「精细」模式已废弃，不再生效）"
+                      else "(a legacy 'elaborate' mode setting in this config is deprecated and has no effect)")
         }
         parts.add(if (zh) "最多方法数 $maxMethods" else "max methods $maxMethods")
-        val maxBomDepth = ms["max_bom_depth"]?.jsonPrimitive?.intOrNull?.coerceIn(1, 10) ?: 3
-        parts.add(if (zh) "最大 BOM 深度 $maxBomDepth" else "max BOM depth $maxBomDepth")
         val whitelist = (current["purchasable_materials"] as? JsonArray)
             ?.mapNotNull { it.jsonPrimitive.contentOrNull?.trim()?.takeIf { s -> s.isNotEmpty() } }
             ?: emptyList()
@@ -408,74 +369,10 @@ private fun ruleBasedParse(
         val sep = if (zh) "、" else ", "
         val desc = if (parts.isEmpty()) (if (zh) "默认" else "default") else parts.joinToString(sep)
         return bi(
-            "Right now we're using $desc. If you'd like to switch, just say so—e.g. \"max methods 2\", \"elaborate methods\", \"method depth 3\", \"max BOM depth 4\", \"allow purchase\", \"set 14-day batch window\", \"check soundness off\", or \"disable WO batching\".",
-            "当前配置：$desc。如需切换，告诉我即可 — 例如「最多方法 2」、「精细方法」、「方法深度 3」、「最大 BOM 深度 4」、「允许采购」、「设置 14 天批量窗口」、「关闭完整性校验」或「禁用工单批量合并」。",
+            "Right now we're using $desc. If you'd like to switch, just say so—e.g. \"max methods 2\", \"allow purchase\", \"set 14-day batch window\", \"check soundness off\", or \"disable WO batching\".",
+            "当前配置：$desc。如需切换，告诉我即可 — 例如「最多方法 2」、「允许采购」、「设置 14 天批量窗口」、「关闭完整性校验」或「禁用工单批量合并」。",
             raw,
         ) to null
-    }
-
-    // ── Max BOM depth (e.g. "max bom depth 4", "make-fallback depth 2", "最大BOM深度 3") ──
-    val bomDepthMatch = Regex("max(?:imum)?\\s*bom\\s*depth\\s*(?:=|:|to)?\\s*(\\d+)|make[- ]fallback\\s*depth\\s*(?:=|:|to)?\\s*(\\d+)").find(t)
-    val zhBomDepthMatch = Regex("最大\\s*BOM\\s*深度\\s*[:=]?\\s*(\\d+)|BOM\\s*深度\\s*[:=]?\\s*(\\d+)").find(raw)
-    if (bomDepthMatch != null || zhBomDepthMatch != null) {
-        val n = (bomDepthMatch?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }
-            ?: zhBomDepthMatch?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }
-            ?: "3").toIntOrNull() ?: 3
-        val d = n.coerceIn(1, 10)
-        return bi(
-            "Setting max BOM depth to $d. Caps the recursion depth admitted at the make-fallback site; deeper makes are skipped. Re-run plan to apply.",
-            "已将最大 BOM 深度设为 $d。该值约束 make-fallback 的递归深度，更深的 make 将被跳过。请重新运行计划以生效。",
-            raw,
-        ) to mergeMethodSelection(current, mapOf("max_bom_depth" to JsonPrimitive(d)))
-    }
-
-    // ── Method depth (e.g. "method depth 3", "depth to 2", "方法深度 3", "深度 2") ──
-    val depthMatch = Regex("(?:method\\s+)?depth\\s*(?:=|:|to)?\\s*(\\d+)").find(t)
-    val zhDepthMatch = Regex("方法深度\\s*[:=]?\\s*(\\d+)|深度\\s*[:=]?\\s*(\\d+)").find(raw)
-    if (depthMatch != null || zhDepthMatch != null) {
-        val n = (depthMatch?.groupValues?.get(1)
-            ?: zhDepthMatch?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }
-            ?: "1").toIntOrNull() ?: 1
-        val d = n.coerceAtLeast(1)
-        return bi(
-            "Setting elaborate method depth to $d. Re-run plan to apply (depth only takes effect when method mode is elaborate).",
-            "已将精细方法深度设为 $d。请重新运行计划以生效（仅在方法模式为「精细」时生效）。",
-            raw,
-        ) to mergeMethodSelection(current, mapOf("depth" to JsonPrimitive(d)))
-    }
-
-    // ── Score weights (only applicable when elaborate mode is on) ──
-    fun scoreWeightsPatch(commit: Double, inv: Double, purchase: Double): JsonElement = JsonObject(mapOf(
-        "commit_time" to JsonPrimitive(commit),
-        "inventory_consumed" to JsonPrimitive(inv),
-        "purchase" to JsonPrimitive(purchase),
-    ))
-    if (Regex("earliest commit|earliest (delivery|fulfillment|time)|fastest|prefer.*earliest|commit time.*(earliest|first)|minim(ize|ise) (commit )?time").containsMatchIn(t) ||
-        Regex("最早交付|最快交付|最早提交").containsMatchIn(raw)
-    ) {
-        return bi(
-            "Weighting elaborate scoring toward earliest commit time (commit=1, inventory=0, purchase=0). Re-run plan to apply (takes effect when method mode is elaborate).",
-            "精细评分权重已设为优先「最早交付」（交付=1，库存=0，采购=0）。请重新运行计划以生效（仅在方法模式为「精细」时生效）。",
-            raw,
-        ) to mergeMethodSelection(current, mapOf("score_weights" to scoreWeightsPatch(1.0, 0.0, 0.0)))
-    }
-    if (Regex("inventor(y|ies)|existing (stock|inventory|supply)|use (what we have|existing|current)|most (existing |current )?inventory|consume (more |existing )?inventory|prefer (existing |current )?stock").containsMatchIn(t) ||
-        Regex("优先(使用)?库存|消耗库存|现有库存").containsMatchIn(raw)
-    ) {
-        return bi(
-            "Weighting elaborate scoring toward most inventory consumed (commit=0, inventory=1, purchase=0). Re-run plan to apply (takes effect when method mode is elaborate).",
-            "精细评分权重已设为优先「使用现有库存」（交付=0，库存=1，采购=0）。请重新运行计划以生效（仅在方法模式为「精细」时生效）。",
-            raw,
-        ) to mergeMethodSelection(current, mapOf("score_weights" to scoreWeightsPatch(0.0, 1.0, 0.0)))
-    }
-    if (Regex("minimum additional (supply|supplies)|minim(ize|ise) (additional |new )?(supply|supplies|purchase|buy)|least (additional |new )?(supply|supplies|purchase)|avoid (new )?purchase|avoid (new )?buy").containsMatchIn(t) ||
-        Regex("最少采购|减少采购|避免采购").containsMatchIn(raw)
-    ) {
-        return bi(
-            "Weighting elaborate scoring toward least purchase (commit=0, inventory=0, purchase=1). Re-run plan to apply (takes effect when method mode is elaborate).",
-            "精细评分权重已设为优先「最少采购」（交付=0，库存=0，采购=1）。请重新运行计划以生效（仅在方法模式为「精细」时生效）。",
-            raw,
-        ) to mergeMethodSelection(current, mapOf("score_weights" to scoreWeightsPatch(0.0, 0.0, 1.0)))
     }
 
     // ── Max methods (waterfall cap) ──
@@ -508,10 +405,10 @@ private fun ruleBasedParse(
         Regex("精细方法|方法评分|按评分选方法|精细模式").containsMatchIn(raw)
     ) {
         return bi(
-            "Turning on elaborate method selection. Methods (make/move/buy) will be scored rather than picked by preference. Re-run plan to apply (this mode is slower).",
-            "已开启精细方法选择。方法（生产/转移/采购）将按评分排序，而非按偏好挑选。请重新运行计划以生效（该模式较慢）。",
+            "Elaborate/scored method selection was retired — the planner now always uses a preference-ranked waterfall (across method type and BOM variant, at every BOM depth), no scoring/probing step. Nothing to change here.",
+            "「精细/评分」方法选择已被移除 — 规划器现在始终采用按偏好排序的瀑布式选择（跨方法类型与 BOM 变体，作用于每一层 BOM），不再有评分/试探步骤。此项无需更改。",
             raw,
-        ) to mergeMethodSelection(current, mapOf("mode" to JsonPrimitive("elaborate")))
+        ) to null
     }
 
     if (Regex("simple method|preference only|methods? by preference|turn off elaborate|disable elaborate|use simple method|prefer methods? by preference|preference mode").containsMatchIn(t) ||
@@ -716,12 +613,6 @@ private fun ruleBasedParse(
             put("method_selection", buildJsonObject {
                 put("multiple", false)
                 put("mode", "preference")
-                put("depth", 1)
-                put("score_weights", buildJsonObject {
-                    put("commit_time", 0.4)
-                    put("inventory_consumed", 0.35)
-                    put("purchase", 0.25)
-                })
             })
             put("purchase_allowed", false)
             put("consolidation", buildJsonObject {
@@ -735,15 +626,15 @@ private fun ruleBasedParse(
             put("check_soundness", true)
         }
         return bi(
-            "Reset to defaults: method by preference (cascade), max methods 2, max BOM depth 3, purchase disabled, WO batching on (weekly), criticality off, soundness check on.",
-            "已重置为默认：按偏好方法（级联）、最多 2 个方法、最大 BOM 深度 3、禁用采购、工单批量合并开启（每周）、关键度关闭、完整性校验开启。",
+            "Reset to defaults: method by preference (waterfall), max methods 2, purchase disabled, WO batching on (weekly), criticality off, soundness check on.",
+            "已重置为默认：按偏好方法（瀑布式）、最多 2 个方法、禁用采购、工单批量合并开启（每周）、关键度关闭、完整性校验开启。",
             raw,
         ) to patch
     }
 
     return bi(
-        "I'm not sure I caught that. I can configure: method selection (preference / elaborate, depth, max methods), purchase allowed, consolidation (on/off, bucket days, split mode), and the post-plan toggles (analyze criticality, check soundness). What would you like?",
-        "我不太理解。我可以配置：方法选择（偏好 / 精细，深度，最多方法数）、是否允许采购、合并（开/关、桶天数、拆分模式），以及计划后开关（关键度分析、完整性校验）。您想做什么？",
+        "I'm not sure I caught that. I can configure: method selection (preference waterfall, max methods), purchase allowed, consolidation (on/off, bucket days, split mode), and the post-plan toggles (analyze criticality, check soundness). What would you like?",
+        "我不太理解。我可以配置：方法选择（按偏好瀑布式，最多方法数）、是否允许采购、合并（开/关、桶天数、拆分模式），以及计划后开关（关键度分析、完整性校验）。您想做什么？",
         raw,
     ) to null
 }

@@ -359,15 +359,16 @@ the plan-form UI, not the agent.
 
 Planner knowledge (from docs/waterfall-allocation.md):
   - max_methods controls waterfall fan-out: 1 = single best method per demand;
-    2-4 = exhaust the best method, then fall back to the next ranked method only
-    if the first hit capacity. Inventory carries forward across slots.
-  - mode = "preference" (lowest preference int wins) | "elaborate" (composite scoring
-    of commit_time / inventory_consumed / purchase; ~3-4× slower wall-time).
-  - method_selection.depth gates elaborate to top N BOM levels (default 1 = root only).
-  - method_selection.max_bom_depth (default 3) caps the recursion depth admitted
-    at the reactive make-fallback site. A make alternative whose precomputed
-    maxMakeDepth exceeds this cap is skipped without recursing — clamps cost
-    on deep BOMs while still admitting structurally feasible fallbacks.
+    2-4 = exhaust the best-ranked alternative, then fall back to the next by
+    preference only if the first left a residual. Ranking is a single flat list
+    across method type (make/move/buy) AND BOM alt_group/variant boundaries —
+    there is no separate "variant selection" step. Inventory carries forward
+    across slots. This runs at every BOM depth, not just the root.
+  - mode = "preference" (lowest preference int wins) is the only supported mode.
+    "elaborate" (composite scoring of commit_time / inventory_consumed / purchase)
+    was retired — a stored config with mode="elaborate" is silently treated as
+    "preference". method_selection.depth, max_bom_depth, and score_weights are
+    legacy no-op fields with no runtime effect.
   - consolidation.allocation_mode = "fair" (priority-first when ample, proportional
     under shortage) | "proportional" | "priority_first". Split policy applies at
     supply-bearing nodes (raw inventory, leftover stock, carry-over WOs).
@@ -978,9 +979,8 @@ internal val TOOLS: List<LlmTool> = listOf(
                 putJsonObject("primary_axis") {
                     put("type", "string")
                     put("description", "Use one of these short axis names — NOT dotted paths: " +
-                        "'mode', 'max_methods', 'depth', 'max_bom_depth', 'score_weights', " +
-                        "'allocation_mode', 'period_days', 'purchase_allowed', " +
-                        "'consolidation_enabled', 'elaborate'. Only runs that bootstrap-" +
+                        "'max_methods', 'depth', 'allocation_mode', 'period_days', " +
+                        "'purchase_allowed', 'consolidation_enabled'. Only runs that bootstrap-" +
                         "varied this axis off baseline.")
                 }
                 putJsonObject("preset_id") { put("type", "string"); put("description", "Filter to a single bootstrap preset id.") }
@@ -4562,9 +4562,6 @@ private fun toolExplainMethodChoice(caseId: Int, args: JsonObject, locale: Strin
             // higher-ranked one and the residual didn't reach this slot.
             amPref != null && chosenMaxPref != null && amPref > chosenMaxPref ->
                 Triple("lower_preference", "preference $amPref > chosen waterfall's max preference $chosenMaxPref; cascade ordering elected the higher-ranked method", "manual method_selection override OR re-rank this method's preference in method_${amType} CSV")
-            // elaborate-mode catch-all for losing alternatives.
-            mode == "elaborate" ->
-                Triple("score_lower", "elaborate composite scoring placed this method below the chosen one (exact rejected score not persisted)", "manual method_selection override OR change method_selection.score_weights to favor the dimension this method is strong on")
             else ->
                 Triple("unknown_not_chosen", "not chosen for an unidentified reason (no preference comparison applies); inspect the run config or the chosen WO's method_choice_explanation", "manual method_selection override at this site")
         }
@@ -4597,19 +4594,14 @@ private fun toolExplainMethodChoice(caseId: Int, args: JsonObject, locale: Strin
         put("available_methods_at_site", anyToJson(classifiedMethods))
         put("selection_mode", JsonPrimitive(mode))
         put("max_methods", JsonPrimitive(maxMethods))
-        put("max_bom_depth", JsonPrimitive(msConfig["max_bom_depth"]?.jsonPrimitive?.intOrNull ?: 3))
         put("purchase_allowed", JsonPrimitive(purchaseAllowed))
         put("purchasable_materials", JsonArray(purchasableMaterials.sorted().map { JsonPrimitive(it) }))
-        msConfig["score_weights"]?.let { put("score_weights", it) }
         put("override_levers", buildJsonArray {
             // Symmetric to get_leaf_competition's override_levers — names the
             // supply-side override paths so the agent can recommend the right
             // one based on the alternative's `status`.
             add(JsonPrimitive("manual_override.method_selection — pin a specific method at this (pid, lid) site"))
-            add(JsonPrimitive("change method_selection.max_methods — admit more waterfall slots"))
-            add(JsonPrimitive("change method_selection.max_bom_depth — admit make alternatives with deeper recipes"))
-            add(JsonPrimitive("change method_selection.mode (preference / elaborate) — switch the selection criterion"))
-            add(JsonPrimitive("change method_selection.score_weights — re-weight commit_time / inventory_consumed / purchase (elaborate only)"))
+            add(JsonPrimitive("change method_selection.max_methods — admit more waterfall slots (across method type AND BOM variant)"))
             add(JsonPrimitive("change purchase_allowed — admit/exclude method_buy"))
             add(JsonPrimitive("change purchasable_materials — selectively whitelist which raw materials may be bought (empty = all)"))
             add(JsonPrimitive("change preference values in method_make/move/buy CSV — re-rank globally"))

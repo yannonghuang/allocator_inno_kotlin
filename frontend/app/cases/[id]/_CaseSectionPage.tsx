@@ -1209,8 +1209,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     | null
   >(null);
   // Per-demand pegging cache — populated lazily when user opens a demand's pegging panel.
-  // Keys are demand_id strings; values are the fetched PlanningPeggingEntry or 'loading'/'error'.
-  const [demandPeggingCache, setDemandPeggingCache] = useState<Record<string, PlanningPeggingEntry | 'loading' | 'error'>>({});
+  // Keys are demand_id strings; values are the fetched PlanningPeggingEntry or 'loading'/'error'/'no-run'.
+  // 'no-run' means the fetch was never attempted because no plan run id was available —
+  // distinct from 'error' (fetch attempted and failed) so the UI can say why, instead of
+  // spinning on "Loading…" forever with no request ever sent.
+  const [demandPeggingCache, setDemandPeggingCache] = useState<Record<string, PlanningPeggingEntry | 'loading' | 'error' | 'no-run'>>({});
   const [planPeggingPanelWidth, setPlanPeggingPanelWidth] = useState(420);
   const [planWorkOrderPeggingCache, setPlanWorkOrderPeggingCache] = useState<Record<string, PlanningPeggingNode>>({});
   // Active demand for WO pegging panel; null = use the row's own demand_id (default)
@@ -1452,10 +1455,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     const ms = (config.method_selection ?? {}) as Record<string, unknown>;
     const cs = (config.consolidation ?? {}) as Record<string, unknown>;
     const diffs: string[] = [];
-    if (ms.mode !== 'preference') diffs.push(`mode: preference → ${ms.mode}`);
     if (Number(ms.max_methods) !== 1) diffs.push(`max_methods: 1 → ${ms.max_methods}`);
     if (Number(ms.depth) !== 1) diffs.push(`depth: 1 → ${ms.depth}`);
-    if (ms.max_bom_depth != null && Number(ms.max_bom_depth) !== 3) diffs.push(`max_bom_depth: 3 → ${ms.max_bom_depth}`);
     const defaultScale = 'weekly';
     const globalFb = (cs.wo_batch_scale as string) ?? defaultScale;
     (['make', 'move', 'purchase'] as const).forEach((k) => {
@@ -1475,15 +1476,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const presetConfigSummary = (config: Record<string, unknown>): string => {
     const ms = (config.method_selection ?? {}) as Record<string, unknown>;
     const cs = (config.consolidation ?? {}) as Record<string, unknown>;
-    const sw = (ms.score_weights ?? {}) as Record<string, number>;
     const parts: string[] = [];
-    parts.push(`m=${ms.mode ?? 'preference'}`);
     parts.push(`max=${ms.max_methods ?? 2}`);
     parts.push(`d=${ms.depth ?? 1}`);
-    parts.push(`bom=${ms.max_bom_depth ?? 3}`);
-    if (sw && (sw.commit_time != null || sw.inventory_consumed != null || sw.purchase != null)) {
-      parts.push(`w=(${Number(sw.commit_time ?? 0)}, ${Number(sw.inventory_consumed ?? 0)}, ${Number(sw.purchase ?? 0)})`);
-    }
     parts.push(`wo_batch=${cs.enabled === false ? 'off' : 'on'}`);
     const globalFb = (cs.wo_batch_scale as string) ?? 'weekly';
     const mScale  = ((cs as Record<string, unknown>).make_batch_scale as string) ?? globalFb;
@@ -1500,7 +1495,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       depth: 1,
       multiple: false,
       max_methods: 1,
-      max_bom_depth: 3,
     },
     consolidation: {
       enabled: true,
@@ -1535,22 +1529,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         break;
       }
       case 'purchase_allowed':    cfg.purchase_allowed = value; break;
-      case 'mode':
-        ms.mode = value;
-        break;
-      // Compound axis: scoring profile implies mode=elaborate + a weight triple.
-      case 'score_weights': {
-        ms.mode = 'elaborate';
-        ms.elaborate = true;
-        const profile = String(value);
-        const weights: Record<string, number> =
-          profile === 'commit'    ? { commit_time: 1, inventory_consumed: 0, purchase: 0 } :
-          profile === 'inventory' ? { commit_time: 0, inventory_consumed: 1, purchase: 0 } :
-          profile === 'purchase'  ? { commit_time: 0, inventory_consumed: 0, purchase: 1 } :
-                                     { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 }; // balanced
-        ms.score_weights = weights;
-        break;
-      }
     }
     return cfg;
   };
@@ -2021,9 +1999,24 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (!demandId) return;
     const inResult = planResult?.planning_pegging?.some((e) => String(e.demand_id ?? '').trim() === demandId);
     if (inResult) return;
-    if (demandPeggingCache[demandId]) return;
+    // 'no-run' is not a terminal result (unlike a real entry or 'error') — it just means
+    // no plan run id was available THAT TIME. currentPlanRunId/freshPlanRunId settle into
+    // place asynchronously as the page loads/saves a run, so retry once one appears instead
+    // of permanently freezing this demand's pegging on a transient startup race.
+    if (demandPeggingCache[demandId] && demandPeggingCache[demandId] !== 'no-run') return;
     const planRunId = currentPlanRunId ?? freshPlanRunId;
-    if (!planRunId || !id) return;
+    if (!planRunId || !id) {
+      // No plan run id available to fetch from — mark distinctly so the panel can say why
+      // instead of showing "Loading…" forever with no request ever sent. Guard against
+      // re-setting the same value: setDemandPeggingCache always makes a new object, and
+      // demandPeggingCache is itself a dependency of this effect — re-setting an unchanged
+      // 'no-run' would re-trigger the effect every render in a tight loop while planRunId
+      // stays null.
+      if (demandPeggingCache[demandId] !== 'no-run') {
+        setDemandPeggingCache((prev) => ({ ...prev, [demandId]: 'no-run' }));
+      }
+      return;
+    }
     setDemandPeggingCache((prev) => ({ ...prev, [demandId]: 'loading' }));
     getPlanRunPegging(Number(id), planRunId, demandId)
       .then(({ planning_pegging }) => {
@@ -2046,9 +2039,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     if (!demandId) return;
     const inResult = planResult?.planning_pegging?.some((e) => String(e.demand_id ?? '').trim() === demandId);
     if (inResult) return;
-    if (demandPeggingCache[demandId]) return;
+    // 'no-run' is not a terminal result (unlike a real entry or 'error') — it just means
+    // no plan run id was available THAT TIME. currentPlanRunId/freshPlanRunId settle into
+    // place asynchronously as the page loads/saves a run, so retry once one appears instead
+    // of permanently freezing this demand's pegging on a transient startup race.
+    if (demandPeggingCache[demandId] && demandPeggingCache[demandId] !== 'no-run') return;
     const planRunId = currentPlanRunId ?? freshPlanRunId;
-    if (!planRunId || !id) return;
+    if (!planRunId || !id) {
+      // See the identical guard in the demand-panel effect above: avoid re-setting an
+      // unchanged 'no-run' value, which would otherwise re-trigger this effect every
+      // render (demandPeggingCache is one of its own dependencies).
+      if (demandPeggingCache[demandId] !== 'no-run') {
+        setDemandPeggingCache((prev) => ({ ...prev, [demandId]: 'no-run' }));
+      }
+      return;
+    }
     setDemandPeggingCache((prev) => ({ ...prev, [demandId]: 'loading' }));
     getPlanRunPegging(Number(id), planRunId, demandId)
       .then(({ planning_pegging }) => {
@@ -4645,42 +4650,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 title={tP('config.methodMaxCountTooltip')}
               >
                 <span style={{ color: '#a1a1aa' }}>{tP('config.methodMaxCount')}</span>
-                <select
+                <input
+                  type="number"
+                  min={1}
                   value={(() => {
                     const ms = planningConfig.method_selection;
-                    if (typeof ms?.max_methods === 'number') return Math.max(1, Math.min(4, Math.trunc(ms.max_methods)));
+                    if (typeof ms?.max_methods === 'number') return Math.max(1, Math.trunc(ms.max_methods));
                     if (ms?.multiple === false) return 1;
                     return 2;
                   })()}
                   onChange={(e) => setPlanningConfig((c) => {
-                    const v = Math.max(1, Math.min(4, parseInt(e.target.value, 10) || 2));
+                    const v = Math.max(1, parseInt(e.target.value, 10) || 2);
                     // Drop legacy `multiple` on save; backend resolution prefers max_methods anyway.
                     const { multiple: _drop, ...rest } = c.method_selection ?? {};
                     void _drop;
                     return { ...c, method_selection: { ...rest, max_methods: v } };
                   })}
-                  style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
-                >
-                  <option value={1}>1</option>
-                  <option value={2}>2</option>
-                  <option value={3}>3</option>
-                  <option value={4}>4</option>
-                </select>
-              </label>
-              <label
-                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }}
-                title={tP('config.maxBomDepthHint')}
-              >
-                <span style={{ color: '#a1a1aa' }}>{tP('config.maxBomDepth')}</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={10}
-                  value={planningConfig.method_selection?.max_bom_depth ?? 3}
-                  onChange={(e) => {
-                    const v = Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 3));
-                    setPlanningConfig((c) => ({ ...c, method_selection: { ...c.method_selection, max_bom_depth: v } }));
-                  }}
                   style={{ width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
                 />
               </label>
@@ -4840,10 +4825,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             onClick={() => setPlanningConfig({
               method_selection: {
                 multiple: false,
-                elaborate: false,
-                depth: 1,
-                max_bom_depth: 3,
-                score_weights: { commit_time: 0.4, inventory_consumed: 0.35, purchase: 0.25 },
               },
               purchase_allowed: false,
               constraints: [],
@@ -7805,17 +7786,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                       style={{ ...inputStyle, width: 56 }} />
                                   </label>
                                   <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editMaxBomDepth')}</span>
-                                    <input type="number" min={1} max={10}
-                                      value={Number(ms.max_bom_depth ?? 3)}
-                                      onChange={(e) => updateConfig((c) => {
-                                        const m = (c.method_selection ?? {}) as Record<string, unknown>;
-                                        m.max_bom_depth = Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 3));
-                                        c.method_selection = m;
-                                      })}
-                                      style={{ ...inputStyle, width: 56 }} />
-                                  </label>
-                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                                     <input type="checkbox" checked={effectiveConfig.purchase_allowed === true}
                                       onChange={(e) => updateConfig((c) => { c.purchase_allowed = e.target.checked; })} />
                                     <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editPurchase')}</span>
@@ -9267,9 +9237,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               <p style={{ margin: 0, fontSize: '0.8rem', color: '#a1a1aa' }}>
                 <strong>{tP('copilot.methods')}</strong> {planningConfig.method_selection?.multiple === true
                   ? tP('copilot.equalSplit')
-                  : planningConfig.method_selection?.elaborate === true
-                    ? tP('copilot.oneByScoreWithDepth', { depth: planningConfig.method_selection?.depth ?? 1 })
-                    : tP('copilot.oneByPreference')}.{' '}
+                  : tP('copilot.oneByPreference')}.{' '}
                 <strong>{tP('copilot.purchase')}</strong> {planningConfig.purchase_allowed === false ? tP('copilot.disabled') : tP('copilot.allowed')}.{' '}
                 <strong>{tP('copilot.consolidation')}</strong> {planningConfig.consolidation?.enabled === true
                   ? (() => {
@@ -9989,6 +9957,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   const cacheState = demandPeggingCache[demandIdNorm];
                   if (cacheState === 'loading') return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>Loading pegging tree…</p>;
                   if (cacheState === 'error') return <p style={{ color: '#f87171', fontSize: '0.9rem' }}>Failed to load pegging tree for this demand.</p>;
+                  if (cacheState === 'no-run') {
+                    return (
+                      <div style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>
+                        <p>No plan run available to load this demand&apos;s pegging from.</p>
+                        <p style={{ fontSize: '0.75rem', marginTop: '0.5rem', color: '#71717a' }}>
+                          Run plan (or reload the page so the latest saved run loads), then reopen this panel.
+                        </p>
+                      </div>
+                    );
+                  }
                   return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>Loading pegging tree…</p>;
                 }
               }

@@ -18,6 +18,7 @@ import com.allocator.api.negotiationRoutes
 import com.allocator.api.planRunRoutes
 import com.allocator.api.planningAgentRoutes
 import com.allocator.api.planningCopilotRoutes
+import com.allocator.api.preferenceRoutes
 import com.allocator.api.productRoutes
 import com.allocator.api.supplyRoutes
 import com.allocator.api.viewRoutes
@@ -101,6 +102,7 @@ fun Application.configureRouting() {
         }
         caseRoutes()
         allocationRoutes()
+        preferenceRoutes()
         allocateRoutes()
         peggingRoutes()
         resourceUtilizationRoutes()

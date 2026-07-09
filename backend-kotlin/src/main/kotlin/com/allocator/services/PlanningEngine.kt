@@ -5,7 +5,6 @@ import org.slf4j.LoggerFactory
 import java.nio.file.Paths
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
-import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
@@ -16,7 +15,6 @@ private val log = LoggerFactory.getLogger("com.allocator.PlanningEngine")
 
 private const val MAX_PLAN_DEPTH = 500
 private val DATE_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd")
-private val DEFAULT_SCORE_WEIGHTS = Triple(0.4, 0.35, 0.25)
 private val BENIGN_REASONS = setOf("cycle_stopped", "cycle_detected", "inventory")
 private val LATE_DATE = LocalDate.of(9999, 12, 31)
 
@@ -349,28 +347,16 @@ private fun computeRootBottleneckKeys(
         .toSet()
 }
 
+/** AND-min: a make's children are ALL required together (one variant's childList — never a
+ *  flattened multi-variant set now that variant selection is a waterfall candidate, not a
+ *  same-call fan-out — see [planMethodSlot]'s "make" branch). */
 private fun computeRawAchievable(
     childPassResults: List<ChildPassResult>,
     demandNetQty: Double,
-    woChildrenRelation: String?,
-): Pair<Double, Boolean> {
-    val isOr = woChildrenRelation == "or" && childPassResults.size > 1
-    val raw = if (isOr) {
-        // Variants are equal-split shares of demand (see getPreferredVariants).
-        // Each variant's parent contribution = success_fraction × variant_share.
-        val perVariantShare = demandNetQty / childPassResults.size
-        childPassResults.sumOf { cr ->
-            if (cr.neededQty > 1e-9) {
-                val frac = (cr.effectiveQty / cr.neededQty).coerceAtMost(1.0)
-                frac * perVariantShare
-            } else perVariantShare
-        }
-    } else {
-        childPassResults.minOf { cr ->
-            if (cr.neededQty > 1e-9) cr.effectiveQty * demandNetQty / cr.neededQty else demandNetQty
-        }
+): Double {
+    return childPassResults.minOf { cr ->
+        if (cr.neededQty > 1e-9) cr.effectiveQty * demandNetQty / cr.neededQty else demandNetQty
     }
-    return Pair(raw, isOr)
 }
 
 // ── BOM real-pair cache ────────────────────────────────────────────────────────
@@ -663,17 +649,74 @@ internal fun variantsForMake(
     return emptyList()
 }
 
-private fun scaleChildMaterials(children: List<Map<String, Any?>>, scale: Double): List<Map<String, Any?>> {
-    if (abs(scale - 1.0) < 1e-12) return children
-    return children.map { c -> c + mapOf("quantity" to ((c["quantity"] as? Number)?.toDouble() ?: 0.0) * scale) }
-}
-
 internal fun childMaterialsForMove(method: Map<String, Any?>, quantity: Double): List<Map<String, Any?>> =
     listOf(mapOf(
         "product_id" to (method["product_id"] ?: ""),
         "location_id" to (method["from_location_id"] ?: ""),
         "quantity" to quantity,
     ))
+
+/** One candidate in the unified waterfall: a method (make/move/purchase), and — for a "make"
+ *  with multiple BOM alt_groups — which alt_group this candidate represents. Null altKey for
+ *  move/purchase (no variant concept) and single-alt_group makes. */
+internal data class WaterfallCandidate(val method: Map<String, Any?>, val altKey: String?)
+
+/**
+ * Expand [methods] into the unified waterfall's flat candidate list: a "make" method with
+ * multiple BOM alt_groups becomes one candidate per alt_group (each inheriting the method's own
+ * `preference` — ranking happens at the call site); move/purchase pass through as a single
+ * candidate each. Customer BOM-alternative constraints (`config.constraints`) are applied here
+ * at alt_group granularity — narrower than the method-level constraint filter already applied to
+ * [methods] upstream, which only drops entire make methods that can't produce the pinned child
+ * anywhere in their BOM.
+ */
+internal fun expandWaterfallCandidates(
+    methods: List<Map<String, Any?>>,
+    productId: String,
+    demand: Map<String, Any?>,
+    config: Map<String, Any?>?,
+    data: Map<String, List<Map<String, Any?>>>,
+): List<WaterfallCandidate> {
+    val cust = demand["customer_id"]?.toString()?.trim()
+    val constraintRules = if (cust.isNullOrEmpty()) emptyList()
+        else parseConstraints(config).filter { it.customerId == cust && it.parent == productId.trim() }
+    return methods.flatMap { m ->
+        if (m["type"] != "make") return@flatMap listOf(WaterfallCandidate(m, null))
+        val mLoc = (m["location_id"] as? String)?.trim() ?: ""
+        // Only the alt_group structure is needed here — quantities are recomputed at the
+        // real residual qty when a candidate is actually attempted (planMethodSlot's "make"
+        // branch calls variantsForMake again with the live slotQty), so a placeholder qty
+        // is fine for discovering which alt_groups exist.
+        val variants = variantsForMake(productId, mLoc, 1.0, m, data)
+        if (variants.size <= 1) return@flatMap listOf(WaterfallCandidate(m, variants.singleOrNull()?.first))
+        val rule = constraintRules.firstOrNull { it.location.isBlank() || it.location == "*" || it.location == mLoc }
+        val admitted = if (rule == null) variants else {
+            val pinned = variants.filter { (_, childList) -> childList.any { c -> (c["product_id"] as? String)?.trim() == rule.child } }
+            pinned.ifEmpty { variants }
+        }
+        admitted.map { (altKey, _) -> WaterfallCandidate(m, altKey) }
+    }
+}
+
+/**
+ * Preferences KB lookup for one waterfall candidate: consults [preferenceKb] (built by
+ * [buildPreferenceKb] in PreferenceBuilder.kt, keyed the same way via [preferenceMethodKey])
+ * before falling back to the raw CSV `preference` column — the per-alternative fallback the
+ * Preferences feature is built around, so partial KB coverage degrades gracefully rather than
+ * all-or-nothing per case. `preferenceKb == null` (no KB for this case) preserves today's
+ * exact raw-preference behavior.
+ */
+internal fun kbPreference(
+    productId: String,
+    locationId: String,
+    method: Map<String, Any?>,
+    altKey: String?,
+    preferenceKb: PreferenceKb?,
+): Int {
+    val fallback = (method["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE
+    if (preferenceKb == null) return fallback
+    return preferenceKb.entries[Triple(productId, locationId, preferenceMethodKey(method, altKey))]?.preference ?: fallback
+}
 
 // ── Method selection ───────────────────────────────────────────────────────────
 
@@ -975,383 +1018,6 @@ internal fun methodStructuralDepth(
     else -> Int.MAX_VALUE
 }
 
-/** Pick best method by preference (lowest number). */
-internal fun getPreferredMethod(methods: List<Map<String, Any?>>): Pair<Map<String, Any?>?, String> {
-    if (methods.isEmpty()) return Pair(null, "No methods available.")
-    val chosen = methods.minBy { (it["preference"] as? Number)?.toInt() ?: 0 }
-    val pref = (chosen["preference"] as? Number)?.toInt() ?: 0
-    val loc = (chosen["location_id"] ?: chosen["to_location_id"] ?: "").toString()
-    if (methods.size <= 1) return Pair(chosen, "Only option: ${chosen["type"]} @ $loc (preference $pref).")
-    val alternatives = methods.filter { it !== chosen }
-        .joinToString("; ") { m -> "${m["type"]} @ ${m["location_id"] ?: m["to_location_id"] ?: ""} (preference ${(m["preference"] as? Number)?.toInt() ?: 0})" }
-    return Pair(chosen, "Chosen: ${chosen["type"]} @ $loc (preference $pref). Alternatives: $alternatives.")
-}
-
-/** Normalize score weights to (commit_time, inventory_consumed, purchase) summing to 1. */
-private fun normalizeScoreWeights(weights: Map<String, Any?>?): Triple<Double, Double, Double> {
-    if (weights == null) return DEFAULT_SCORE_WEIGHTS
-    val wC = (weights["commit_time"] as? Number)?.toDouble() ?: 0.0
-    val wI = (weights["inventory_consumed"] as? Number)?.toDouble() ?: 0.0
-    val wP = (weights["purchase"] as? Number)?.toDouble() ?: 0.0
-    val total = wC + wI + wP
-    if (total <= 0) return DEFAULT_SCORE_WEIGHTS
-    return Triple(wC / total, wI / total, wP / total)
-}
-
-/** Score a variant by simulating planning its child components. Returns (maxCommit, consumed, purchaseQty, anyFailed).
- *
- *  `config` MUST be forwarded to the recursive `plan()` call. Defaulting it to
- *  null is unsafe in this branch: with `parseMaxMethods` defaulting to 2, a
- *  null config flips the deeper plan into multi-method splitting at every
- *  multi-candidate site, which is exponential in BOM depth (case-171 hangs).
- *  Callers pass either the real planner config or a narrowed simConfig
- *  (max_methods=1, split=equal) when this is invoked from the elaborate scorer. */
-private fun scoreVariant(
-    altKey: String,
-    childList: List<Map<String, Any?>>,
-    inventory: List<Map<String, Any?>>,
-    data: Map<String, List<Map<String, Any?>>>,
-    reqDt: LocalDate?,
-    leadDays: Double,
-    planningPath: Set<Pair<String, String>>,
-    depth: Int,
-    config: Map<String, Any?>?,
-): Quadruple<LocalDate?, Double, Double, Boolean> {
-    val invCopy = copyInventory(inventory)
-    val beforeQty = invCopy.sumOf { (it["qty"] as? Number)?.toDouble() ?: 0.0 }
-    var maxCommit: LocalDate? = null
-    var purchaseQty = 0.0
-    var anyFailed = false
-    for (c in childList) {
-        val cReqDt = dateAddDays(reqDt, -leadDays)
-        val cDemand = mapOf(
-            "demand_id" to null,
-            "product_id" to c["product_id"],
-            "location_id" to c["location_id"],
-            "quantity" to c["quantity"],
-            "request_due_time" to formatDate(cReqDt),
-            "request_time" to formatDate(cReqDt),
-        )
-        val (solvedList, cWos, _) = plan(cDemand, invCopy, data, cReqDt, depth = depth - 1, planningPath = planningPath, config = config)
-        for (s in solvedList) {
-            val qty = (s["quantity"] as? Number)?.toDouble() ?: 0.0
-            val ct = s["commit_time"] as? String
-            val reason = s["commit_reason"] as? String ?: ""
-            val hardFailed = ct == null || (reason.isNotBlank() && reason !in BENIGN_REASONS)
-            if (hardFailed) anyFailed = true
-            if (qty <= 0) continue
-            if (ct != null) {
-                val dt = parseDate(ct)
-                if (dt != null && (maxCommit == null || dt > maxCommit)) maxCommit = dt
-            }
-        }
-        for (wo in cWos) {
-            if (wo["method"] == "purchase") purchaseQty += (wo["quantity"] as? Number)?.toDouble() ?: 0.0
-        }
-    }
-    val afterQty = invCopy.sumOf { (it["qty"] as? Number)?.toDouble() ?: 0.0 }
-    val consumed = beforeQty - afterQty
-    if (anyFailed) maxCommit = null
-    return Quadruple(maxCommit, consumed, purchaseQty, anyFailed)
-}
-
-/** Tuple-4 helper (Kotlin lacks built-in quadruple). */
-private data class Quadruple<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
-
-/**
- * Probe-based variant scorer — O(children × inventory buckets), no copies.
- *
- * Returns the same Quadruple shape as [scoreVariant] so callers can swap
- * without structural changes.  `anyFailed` is optimistic (see [probeChildren]
- * for the trade-off).  Use only for *ranking* / *cascade* paths where a
- * wrong pick produces a suboptimal but still-correct commit result.
- * [firstFeasibleMethod] must keep [scoreVariant] for strict consolidation
- * correctness.
- */
-private fun probeVariant(
-    childList: List<Map<String, Any?>>,
-    inventory: List<Map<String, Any?>>,
-    data: Map<String, List<Map<String, Any?>>>,
-    planningPath: Set<Pair<String, String>>,
-): Quadruple<LocalDate?, Double, Double, Boolean> {
-    val r = probeChildren(childList, inventory, data, planningPath)
-    return Quadruple(if (r.anyFailed) null else r.maxCommitDate, r.consumed, r.purchaseQty, r.anyFailed)
-}
-
-/**
- * Return the first method (in ascending preference order) whose root BOM passes cascade's
- * feasibility probe, or null if every method fails.  Mirrors the probe inside
- * [getPreferredMethodCascade]; exposed so consolidation can skip demands whose parent can
- * never roll up (avoids phantom WOs for reachable siblings of an unreachable component).
- */
-internal fun firstFeasibleMethod(
-    methods: List<Map<String, Any?>>,
-    demand: Map<String, Any?>,
-    inventory: List<Map<String, Any?>>,
-    data: Map<String, List<Map<String, Any?>>>,
-    requestTimeDt: LocalDate?,
-    depth: Int,
-    planningPath: Set<Pair<String, String>>,
-    config: Map<String, Any?>? = null,
-): Map<String, Any?>? {
-    if (methods.isEmpty()) return null
-    val productId = demand["product_id"] as? String ?: ""
-    val locationId = demand["location_id"] as? String ?: ""
-    val quantity = (demand["quantity"] as? Number)?.toDouble() ?: 0.0
-    val reqTimeStr = demand["request_due_time"] as? String ?: demand["request_time"] as? String
-    val reqDt = parseDate(reqTimeStr) ?: requestTimeDt
-    val sorted = methods.sortedBy { (it["preference"] as? Number)?.toInt() ?: 0 }
-    for (m in sorted) {
-        val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
-        val leadDays = leadDaysForMethod(m, productId, productionLocation, quantity, data)
-        val failed = when (m["type"]) {
-            "purchase" -> false
-            "move" -> {
-                val children = childMaterialsForMove(m, quantity)
-                scoreVariant("feasibility", children, inventory, data, reqDt, leadDays, planningPath, depth - 1, config).fourth
-            }
-            "make" -> {
-                val variants = variantsForMake(productId, productionLocation, quantity, m, data)
-                variants.isEmpty() || variants.all { (altKey, childList) ->
-                    scoreVariant(altKey, childList, inventory, data, reqDt, leadDays, planningPath, depth - 1, config).fourth
-                }
-            }
-            else -> false
-        }
-        if (!failed) return m
-    }
-    return null
-}
-
-/**
- * Cascade method selection: try each method in ascending preference order.
- * Returns the first method whose children can be successfully planned.
- * Falls back to preference-only when we're past method_selection.depth levels
- * from the root, or when only one method exists.
- */
-internal fun getPreferredMethodCascade(
-    methods: List<Map<String, Any?>>,
-    demand: Map<String, Any?>,
-    inventory: List<Map<String, Any?>>,
-    data: Map<String, List<Map<String, Any?>>>,
-    requestTimeDt: LocalDate?,
-    config: Map<String, Any?>?,
-    depth: Int,
-    planningPath: Set<Pair<String, String>>,
-): Pair<Map<String, Any?>?, String> {
-    if (methods.isEmpty()) return Pair(null, "No methods available.")
-    val cfg = resolveMethodSelection(config)
-    val levels = cfg.depth
-    val pastScope = !shouldElaborateAtDepth(depth, levels)
-    if (pastScope || methods.size <= 1) {
-        val (m, msg) = getPreferredMethod(methods)
-        // When elaborate mode is configured but we've recursed past the
-        // method_selection.depth scope, the message would otherwise just say
-        // "Chosen: <type> @ <loc> (preference X)" with no hint that elaborate
-        // was bypassed. Annotate so the UI's Why panel makes it obvious why
-        // a preference-shaped explanation appears in an elaborate-mode run.
-        if (pastScope && cfg.elaborate && methods.size > 1) {
-            return Pair(m, "$msg [past elaborate scope (method_selection.depth=$levels): preference fallback]")
-        }
-        return Pair(m, msg)
-    }
-
-    val productId = demand["product_id"] as? String ?: ""
-    val locationId = demand["location_id"] as? String ?: ""
-    val quantity = (demand["quantity"] as? Number)?.toDouble() ?: 0.0
-    val reqTimeStr = demand["request_due_time"] as? String ?: demand["request_time"] as? String
-    val reqDt = parseDate(reqTimeStr) ?: requestTimeDt
-
-    val sorted = methods.sortedBy { (it["preference"] as? Number)?.toInt() ?: 0 }
-
-    for (m in sorted) {
-        val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
-        val leadDays = leadDaysForMethod(m, productId, productionLocation, quantity, data)
-
-        val failed = when (m["type"]) {
-            "purchase" -> false
-            "move" -> {
-                val children = childMaterialsForMove(m, quantity)
-                probeChildren(children, inventory, data, planningPath).anyFailed
-            }
-            "make" -> {
-                val variants = variantsForMake(productId, productionLocation, quantity, m, data)
-                variants.isEmpty() || variants.all { (_, childList) ->
-                    probeChildren(childList, inventory, data, planningPath).anyFailed
-                }
-            }
-            else -> false
-        }
-
-        if (!failed) {
-            val loc = (m["location_id"] ?: m["to_location_id"] ?: "").toString()
-            val pref = (m["preference"] as? Number)?.toInt() ?: 0
-            return Pair(m, "Cascade (by preference): ${m["type"]} @ $loc (pref $pref) — first feasible.")
-        }
-    }
-
-    log.debug("cascade: all methods failed for {}@{}, falling back to lowest-preference", productId, locationId)
-    val (m, msg) = getPreferredMethod(methods)
-    return Pair(m, "$msg [cascade probe exhausted: every method reported child failures, took lowest preference]")
-}
-
-/**
- * Elaborate method selection: simulate one planning level per method, score, and pick best.
- * Falls back to preference-only when we're past method_selection.depth levels from the
- * root, or when only one method exists.
- */
-/**
- * Per-method elaborate score, used by the single-method picker
- * (`getPreferredMethodElaborate`) and as the rank source for waterfall
- * allocation when `mode = elaborate`.
- *
- * `score` is in `[0, 1]` for non-failed methods (composite of
- * commit_time / inventory_consumed / purchase normalized by their
- * cross-method spans, weighted by `score_weights`). Failed methods get
- * `-1e9` so callers can sort/filter cleanly.
- */
-internal data class MethodScore(
-    val method: Map<String, Any?>,
-    val score: Double,
-    val failed: Boolean,
-    val ts: Double,
-    val consumed: Double,
-    val purchase: Double,
-)
-
-/**
- * Score every method by simulating each one's BOM children and measuring
- * commit_time / inventory_consumed / purchase. Returns one `MethodScore`
- * per input in the same order. Caller sorts.
- *
- * Extracted from the original inlined scoring inside `getPreferredMethodElaborate`
- * so the multi-method splitter can reuse it without code duplication.
- */
-internal fun scoreMethodsForElaborate(
-    methods: List<Map<String, Any?>>,
-    demand: Map<String, Any?>,
-    inventory: List<Map<String, Any?>>,
-    data: Map<String, List<Map<String, Any?>>>,
-    requestTimeDt: LocalDate?,
-    config: Map<String, Any?>?,
-    depth: Int,
-    planningPath: Set<Pair<String, String>>,
-): List<MethodScore> {
-    val methodCfg = resolveMethodSelection(config)
-    val scoreWeights = methodCfg.scoreWeights
-    val (wCommit, wInv, wPurchase) = normalizeScoreWeights(scoreWeights)
-
-    // The recursive plan() calls below are pure simulations — used to measure
-    // each candidate method's commit_time / inventory_consumed / purchase
-    // metrics, not to commit. Force the simulation to single-method preference
-    // selection so a deep multi-method site doesn't re-enter scoring (the
-    // simulation is cost-only, multi-method semantics aren't useful here).
-    val simConfig: Map<String, Any?> = (config ?: emptyMap()) + mapOf(
-        "method_selection" to (
-            ((config?.get("method_selection") as? Map<*, *>)
-                ?.let { @Suppress("UNCHECKED_CAST") (it as Map<String, Any?>) }
-                ?: emptyMap()) + mapOf(
-                "max_methods" to 1,
-            )
-        ),
-    )
-    val productId = demand["product_id"] as? String ?: ""
-    val locationId = demand["location_id"] as? String ?: ""
-    val quantity = (demand["quantity"] as? Number)?.toDouble() ?: 0.0
-    val reqTimeStr = demand["request_due_time"] as? String ?: demand["request_time"] as? String
-
-    data class Raw(val method: Map<String, Any?>, val ts: Double, val consumed: Double, val purchase: Double, val failed: Boolean)
-
-    val raw = methods.map { m ->
-        val productionLocation = (m["location_id"] ?: m["to_location_id"] ?: locationId) as? String ?: locationId
-        val reqDt = parseDate(reqTimeStr) ?: requestTimeDt
-        val leadDays = when (m["type"]) {
-            "make" -> (m["lead_time"] as? Number)?.toDouble() ?: 0.0
-            "move" -> (m["transit_time"] as? Number)?.toDouble() ?: 0.0
-            "purchase" -> (m["lead_days_supply"] as? Number)?.toDouble() ?: 0.0
-            else -> 0.0
-        }
-
-        val childMaterials = when (m["type"]) {
-            "make" -> {
-                val variants = variantsForMake(productId, productionLocation, quantity, m, data)
-                if (variants.isEmpty()) return@map Raw(m, LATE_DATE.toEpochDay().toDouble(), 0.0, 0.0, true)
-                val (variantList, _) = getPreferredVariants(
-                    variants, inventory, data, reqDt, leadDays, planningPath, depth - 1, quantity,
-                    multiple = false, scoreWeights = scoreWeights, topN = null,
-                    config = simConfig,
-                )
-                variantList.flatMap { (cm, _, _) -> cm }
-            }
-            "move" -> childMaterialsForMove(m, quantity)
-            else -> emptyList()
-        }
-
-        val probe = probeChildren(childMaterials, inventory, data, planningPath)
-        val ts = (if (probe.anyFailed) null else probe.maxCommitDate)
-            ?.toEpochDay()?.toDouble() ?: LATE_DATE.toEpochDay().toDouble()
-        Raw(m, ts, probe.consumed, probe.purchaseQty, probe.anyFailed)
-    }
-
-    val validTs = raw.filter { !it.failed }.map { it.ts }
-    val consList = raw.map { it.consumed }
-    val purchList = raw.map { it.purchase }
-    var spanTs = if (validTs.size >= 2) validTs.max() - validTs.min() else 1.0
-    var spanC = if (consList.isNotEmpty()) consList.max() - consList.min() else 1.0
-    var spanP = if (purchList.isNotEmpty()) purchList.max() - purchList.min() else 1.0
-    if (spanTs <= 0) spanTs = 1.0
-    if (spanC <= 0) spanC = 1.0
-    if (spanP <= 0) spanP = 1.0
-    val tsMax = validTs.maxOrNull() ?: 0.0
-
-    return raw.map { r ->
-        if (r.failed) MethodScore(r.method, -1e9, true, r.ts, r.consumed, r.purchase)
-        else {
-            val normCommit = max(0.0, min(1.0, (tsMax - r.ts) / spanTs))
-            val normInv = max(0.0, min(1.0, (r.consumed - consList.min()) / spanC))
-            val normP = max(0.0, min(1.0, (purchList.max() - r.purchase) / spanP))
-            val s = wCommit * normCommit + wInv * normInv + wPurchase * normP
-            MethodScore(r.method, s, false, r.ts, r.consumed, r.purchase)
-        }
-    }
-}
-
-internal fun getPreferredMethodElaborate(
-    methods: List<Map<String, Any?>>,
-    demand: Map<String, Any?>,
-    inventory: List<Map<String, Any?>>,
-    data: Map<String, List<Map<String, Any?>>>,
-    requestTimeDt: LocalDate?,
-    config: Map<String, Any?>?,
-    depth: Int,
-    planningPath: Set<Pair<String, String>>,
-): Pair<Map<String, Any?>?, String> {
-    if (methods.isEmpty()) return Pair(null, "No methods available.")
-    val methodCfg = resolveMethodSelection(config)
-    if (!shouldElaborateAtDepth(depth, methodCfg.depth) || methods.size <= 1) return getPreferredMethod(methods)
-
-    val scored = scoreMethodsForElaborate(
-        methods, demand, inventory, data, requestTimeDt, config, depth, planningPath,
-    ).sortedWith(
-        // Tiebreaker by preference (asc): when sims are tied — typically when every
-        // candidate hit the same downstream block (e.g. a deep cycle or a missing
-        // raw material), all methods score 0 or -1e9. Stable sort then preserves
-        // input order, which is `[buy, make, move]` from getMethods — making the
-        // planner pick the first iteration order rather than the highest-priority
-        // method. Falling back to preference asc here matches the cascade picker's
-        // tiebreaker and keeps elaborate's "sometimes-tied" behaviour consistent
-        // with operator expectations.
-        compareByDescending<MethodScore> { it.score }
-            .thenBy { (it.method["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
-    )
-
-    val best = scored.first()
-    if (best.failed) return getPreferredMethod(methods)
-    val loc = (best.method["location_id"] ?: best.method["to_location_id"] ?: "").toString()
-    return Pair(best.method, "Chosen (elaborate score): ${best.method["type"]} @ $loc " +
-        "(inventory_consumed=${best.consumed.toLong()}, purchase=${best.purchase.toLong()}).")
-}
-
 // ── Per-method slot planning ──────────────────────────────────────────────────
 
 /**
@@ -1414,15 +1080,17 @@ internal fun planMethodSlot(
     config: Map<String, Any?>?,
     preferDemandId: Any?,
     budget: MutableMap<String, Double>?,
-    useSingleVariant: Boolean,
-    scoreWeights: Map<String, Any?>?,
-    topN: Int?,
+    /** For a "make" method with multiple BOM alt_groups: which one this call plans — chosen
+     *  upstream by the unified waterfall candidate list, one candidate per alt_group. Null
+     *  for move/purchase (no variant concept) and single-alt_group make methods. */
+    selectedAltKey: String?,
     methodChoiceExplanation: String,
     feasibilityCache: MutableMap<Pair<String, String>, Int>? = null,
     structuralFailedMakes: MutableMap<Pair<String, String>, String>? = null,
     initialBudget: Map<String, Double>? = null,
     nodeQtyCaps: Map<Pair<String, String>, Double>? = null,
     demandBlueprint: DemandBlueprint? = null,
+    preferenceKb: PreferenceKb? = null,
 ): MethodSlotResult {
     val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
     val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
@@ -1432,44 +1100,20 @@ internal fun planMethodSlot(
     var woChildrenRelation: String? = null
     val (childMaterials, variantExplanation) = when (m["type"]) {
         "make" -> {
+            // The unified waterfall candidate list (built once per demand, in plan()) already
+            // expanded each BOM alt_group into its own ranked candidate — customer-constraint
+            // filtering included — so this is a direct pick, not a scoring/equal-split step.
+            // selectedAltKey is null only for a single-alt_group make, where there's nothing to
+            // pick among.
             val rawVariants = variantsForMake(productId, productionLocation, slotQty, m, data)
-            // Variant selection, in precedence order:
-            //  1) explicit saved per-WO variant_selection override (force a specific alt_group);
-            //  2) else a customer-specific Constraint (force the alt whose children include the
-            //     constrained child) — config.constraints matched on demand.customer_id + parent
-            //     + (location blank/"*" or this productionLocation);
-            //  3) else all variants (automatic best-score / equal-split downstream).
-            var constraintChild: String? = null
-            val variants = run {
-                val cust = demand["customer_id"]?.toString()?.trim()
-                val match = if (cust.isNullOrEmpty()) null else parseConstraints(config).firstOrNull { c ->
-                    c.customerId == cust && c.parent == productId.trim() &&
-                        (c.location.isBlank() || c.location == "*" || c.location == productionLocation.trim())
-                }
-                if (match != null) {
-                    constraintChild = match.child
-                    rawVariants.filter { (_, childList) ->
-                        childList.any { (it["product_id"] as? String)?.trim() == match.child }
-                    }.ifEmpty {
-                        log.warn("constraint customer={} parent={}@{} child={} matched no variant; using all", cust, productId, productionLocation, match.child)
-                        rawVariants
-                    }
-                } else rawVariants
-            }
-            val (variantList, ve) = getPreferredVariants(variants, inventory, data, reqDt, leadDays, path, depth, slotQty,
-                multiple = if (useSingleVariant) false else null, scoreWeights = scoreWeights, topN = topN, config = config)
-            val cm = variantList.flatMap { (childList, _, _) -> childList }
-            if (variantList.size > 1) {
-                woChildrenRelation = if (variantList.all { (childList, _, _) -> childList.size == 1 }) "or" else "and"
-            } else if (variantList.size == 1 && (variantList[0].first.size) > 1) {
-                // Single variant with multiple BOM children → AND group (all required).
-                woChildrenRelation = "and"
-            }
-            val veAnnotated = when {
-                constraintChild != null -> "$ve [constraint child=$constraintChild]"
-                else -> ve
-            }
-            Pair(cm, veAnnotated)
+            val chosen = if (selectedAltKey != null) rawVariants.filter { (altKey, _) -> altKey == selectedAltKey } else rawVariants
+            val cm = chosen.flatMap { (_, childList) -> childList }
+            // Single variant with multiple BOM children → AND group (all required together).
+            if (chosen.size == 1 && chosen[0].second.size > 1) woChildrenRelation = "and"
+            val ve = chosen.singleOrNull()?.let { (altKey, childList) ->
+                "Variant ALT_GROUP=$altKey (${childList.size} component(s))."
+            } ?: "No matching variant for ALT_GROUP=$selectedAltKey."
+            Pair(cm, ve)
         }
         "move" -> Pair(childMaterialsForMove(m, slotQty), "")
         else -> Pair(emptyList<Map<String, Any?>>(), "")
@@ -1544,7 +1188,7 @@ internal fun planMethodSlot(
             // Inherit the originating demand's customer so customer-specific constraints
             // apply to sub-components, not just the finished good.
             "customer_id" to demand["customer_id"], "customer" to demand["customer"])
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint)
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb)
         val effectiveQty = solvedList.sumOf { s ->
             val r = s["commit_reason"] as? String
             if (r == "cycle_stopped" || r == "cycle_detected") 0.0
@@ -1599,7 +1243,7 @@ internal fun planMethodSlot(
             commitTimes.addAll(cr.cTimes)
         }
     } else {
-        val (rawAchievable, isOrSplit) = computeRawAchievable(childPassResults, activeSlotQty, woChildrenRelation)
+        val rawAchievable = computeRawAchievable(childPassResults, activeSlotQty)
         val capped = if (rawAchievable >= activeSlotQty - 1e-6) activeSlotQty
                      else floor(rawAchievable).coerceIn(0.0, activeSlotQty)
 
@@ -1740,20 +1384,13 @@ internal fun planMethodSlot(
         }
         achievableParentQty = capped
 
-        if (isOrSplit) {
-            childPassResults.forEach { cr ->
-                childWos.addAll(cr.wos)
-                if (cr.pegging != null) childPeggingNodes.add(cr.pegging)
-                commitTimes.addAll(cr.cTimes)
-            }
-        } else {
+        run {
             // ── Identify AND-bottleneck child(ren). Only meaningful when the
             // parent was actually capped by an AND-min (achievableParentQty <
             // slotQty). The bottleneck is the child(ren) whose first-pass
             // ratio (effectiveQty / neededQty) equals the min over all
             // children. Tied children are all flagged. Empty when the parent
-            // delivered its full request (no cap), or under OR-split (no
-            // single bottleneck — supply is summed across variants).
+            // delivered its full request (no cap).
             // First-pass pegging keyed by (pid, lid) for bottleneck children. The
             // first-pass exploration ran at full qty (slotQty) and recursively
             // identified bottlenecks at every deeper level — those flags are
@@ -1900,123 +1537,6 @@ internal fun planMethodSlot(
     )
 }
 
-// ── Variant selection ──────────────────────────────────────────────────────────
-
-/** Result item: (child_materials, alt_key, quantity). */
-typealias VariantResultItem = Triple<List<Map<String, Any?>>, String, Double>
-
-/**
- * Score and select variants.
- * multiple=false → single best. multiple=null → all feasible split equally. topN limits how many.
- */
-fun getPreferredVariants(
-    variants: List<Pair<String, List<Map<String, Any?>>>>,
-    inventory: List<Map<String, Any?>>,
-    data: Map<String, List<Map<String, Any?>>>,
-    reqDt: LocalDate?,
-    leadDays: Double,
-    planningPath: Set<Pair<String, String>>,
-    depth: Int,
-    demandNetQty: Double,
-    multiple: Boolean? = null,
-    scoreWeights: Map<String, Any?>? = null,
-    topN: Int? = null,
-    config: Map<String, Any?>? = null,
-): Pair<List<VariantResultItem>, String> {
-    if (variants.isEmpty()) return Pair(emptyList(), "No variants.")
-    if (variants.size == 1) {
-        val (altKey, childList) = variants[0]
-        return Pair(listOf(Triple(childList, altKey, demandNetQty)),
-            "Single variant (ALT_GROUP=$altKey); ${childList.size} component(s).")
-    }
-    log.info("multi-variant: {} variants alt_groups={}", variants.size, variants.map { it.first })
-
-    val (wCommit, wInv, wPurchase) = normalizeScoreWeights(scoreWeights)
-
-    data class ScoredVariant(
-        val sc: Quadruple<LocalDate?, Double, Double, Boolean>,
-        val altKey: String,
-        val childList: List<Map<String, Any?>>,
-        val failed: Boolean,
-    )
-
-    val needRanking = multiple == false || (topN != null && topN >= 1)
-    val scored = variants.map { (altKey, childList) ->
-        val sc = probeVariant(childList, inventory, data, planningPath)
-        ScoredVariant(sc, altKey, childList, sc.fourth)
-    }
-
-    val rankedScored = if (needRanking) {
-        val commits = scored.map { it.sc.first }
-        val consumedList = scored.map { it.sc.second }
-        val purchaseList = scored.map { it.sc.third }
-        val validTs = commits.filterNotNull().filter { it != LATE_DATE }.map { it.toEpochDay().toDouble() }
-        var spanTs = if (validTs.size >= 2) validTs.max() - validTs.min() else 1.0
-        var spanC = if (consumedList.isNotEmpty()) consumedList.max() - consumedList.min() else 1.0
-        var spanP = if (purchaseList.isNotEmpty()) purchaseList.max() - purchaseList.min() else 1.0
-        if (spanTs <= 0) spanTs = 1.0
-        if (spanC <= 0) spanC = 1.0
-        if (spanP <= 0) spanP = 1.0
-        val tsMaxVal = validTs.maxOrNull() ?: 0.0
-
-        val withScore = scored.mapIndexed { i, sv ->
-            val commitTs = commits[i]?.toEpochDay()?.toDouble() ?: LATE_DATE.toEpochDay().toDouble()
-            val consumed = consumedList[i]
-            val purchase = purchaseList[i]
-            if (sv.failed) Pair(-1e9, sv)
-            else {
-                val normCommit = if (spanTs > 0 && commitTs != LATE_DATE.toEpochDay().toDouble()) max(0.0, min(1.0, (tsMaxVal - commitTs) / spanTs)) else 1.0
-                val normInv = max(0.0, min(1.0, (consumed - consumedList.min()) / spanC))
-                val normPurchase = max(0.0, min(1.0, (purchaseList.max() - purchase) / spanP))
-                Pair(wCommit * normCommit + wInv * normInv + wPurchase * normPurchase, sv)
-            }
-        }.sortedByDescending { it.first }
-        withScore.map { it.second }
-    } else scored
-
-    if (multiple == false) {
-        val best = rankedScored.first()
-        val others = rankedScored.drop(1).map { it.altKey }
-        val (mc, negConsumed, purchase, _) = best.sc
-        return Pair(
-            listOf(Triple(best.childList, best.altKey, demandNetQty)),
-            "Chosen variant ALT_GROUP=${best.altKey} (${best.childList.size} component(s)). " +
-            "Score: commit_time=${if (mc == null || mc == LATE_DATE) "—" else mc.format(DATE_FMT)}, " +
-            "inventory_consumed=${negConsumed.toLong()}, purchase_qty=${purchase.toLong()}. " +
-            "Alternatives: ${others.joinToString(", ")}."
-        )
-    }
-
-    // multiple=null: equal split among feasible, optionally limited to topN
-    var feasible = rankedScored.filter { !it.failed }.map { Pair(it.altKey, it.childList) }
-    if (feasible.isEmpty()) feasible = listOf(Pair(rankedScored[0].altKey, rankedScored[0].childList))
-    if (topN != null && topN >= 1) feasible = feasible.take(topN)
-    val n = feasible.size
-    val demandInt = demandNetQty.toLong()
-    val useIntegerSplit = n > 0 && abs(demandNetQty - demandInt.toDouble()) < 1e-9
-    val qtyPerVariant = if (useIntegerSplit && n > 0) {
-        val base = demandInt / n
-        val remainder = (demandInt % n).toInt()
-        List(remainder) { (base + 1).toDouble() } + List(n - remainder) { base.toDouble() }
-    } else {
-        val qtyEach = if (n > 0) demandNetQty / n else demandNetQty
-        List(n) { qtyEach }
-    }
-    val result = feasible.mapIndexed { i, (altKey, childList) ->
-        val qtyI = qtyPerVariant.getOrElse(i) { if (n > 0) demandNetQty / n else demandNetQty }
-        val scale = if (demandNetQty > 1e-12) qtyI / demandNetQty else 1.0
-        Triple(scaleChildMaterials(childList, scale), altKey, qtyI)
-    }
-    val altKeys = result.map { it.second }
-    val qtyStr = qtyPerVariant.joinToString(", ") { roundQty(it).toLong().toString() }
-    val totalStr = roundQty(demandNetQty).toLong().toString()
-    val expl = if (topN != null && topN >= 1)
-        "Top $n variant(s) (by score): ALT_GROUP=${altKeys.joinToString(", ")}; quantities: $qtyStr (total $totalStr)."
-    else
-        "Multiple variants ($n): ALT_GROUP=${altKeys.joinToString(", ")}; quantities: $qtyStr (total $totalStr)."
-    return Pair(result, expl)
-}
-
 // ── Product location helpers ───────────────────────────────────────────────────
 
 private fun maxLotSize(productId: String, locationId: String, data: Map<String, List<Map<String, Any?>>>): Double? {
@@ -2102,10 +1622,20 @@ fun plan(
      * Optional per-demand BOM blueprint from [computePlanBlueprint].
      * When present and the current (productId, locationId) has a blueprint entry whose
      * method is still in effectiveMethods, the commit phase uses it directly — skipping
-     * [getPreferredMethodCascade] and its probeChildren overhead.
+     * the unified waterfall's own candidate expansion/ranking.
      * Threaded through all recursive plan() / planMethodSlot() calls.
      */
     demandBlueprint: DemandBlueprint? = null,
+    /**
+     * Optional Preferences KB override: (productId, locationId, methodKey) → canonical
+     * preference (10, 20, 30, ...), built once via the Preferences page's Generate action
+     * (see [buildPreferenceKb] in PreferenceBuilder.kt). When non-null, [kbPreference]
+     * consults it per-alternative before falling back to the raw CSV `preference` column —
+     * partial coverage degrades gracefully, alternative by alternative. `null` (the default)
+     * preserves today's exact raw-preference behavior. Threaded through all recursive
+     * plan() calls.
+     */
+    preferenceKb: PreferenceKb? = null,
 ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
 
     val productId = (demand["product_id"] as? String)?.trim() ?: ""
@@ -2352,11 +1882,6 @@ fun plan(
     }
 
     val methodCfg = resolveMethodSelection(config)
-    val variantCfg = resolveVariantSelection(config)
-    val useElaborateMethod = methodCfg.elaborate
-    val useSingleVariant = variantCfg.multiple == false
-    val scoreWeights = variantCfg.scoreWeights
-    val topN = variantCfg.topN
 
     // ── Customer constraint at the METHOD level ──────────────────────────────
     // BOM alternatives are frequently distinct make methods (one bom_id per child),
@@ -2404,239 +1929,110 @@ fun plan(
         } else constrainedMethods
     } else constrainedMethods
 
-    val elaborateAtThisLevel = shouldElaborateAtDepth(depth, methodCfg.depth)
-
-    // ── Blueprint shortcut (preference mode only) ──────────────────────────
-    // Pre-selected in the sketch phase. Applied to BOTH the waterfall path
-    // (collapses to 1 slot) and the cascade/single-method path (bypasses
-    // getPreferredMethodCascade). Not used in elaborate mode.
-    val blueprintEntry = if (!useElaborateMethod) {
-        demandBlueprint?.get(productId to locationId)
-    } else null
+    // ── Blueprint shortcut ──────────────────────────────────────────────────
+    // Pre-selected in the sketch phase: collapse straight to that one method,
+    // skipping candidate expansion/ranking entirely.
+    val blueprintEntry = demandBlueprint?.get(productId to locationId)
     val blueprintMethod = blueprintEntry?.method?.takeIf { bm ->
         effectiveMethods.any { it === bm || it == bm }
     }
 
-    // ── Waterfall multi-method allocation ──────────────────────────────────
-    // Restricted to root via `elaborateAtThisLevel` (gated by
-    // `method_selection.depth=1`). Waterfall does both reactive fallback
-    // and proactive split in one loop, but firing it at every BOM depth
-    // explodes combinatorially even with `maxMethods=2` (observed: 22k
-    // multi-method log lines / 30s on case 171). Reactive fallback at
-    // deeper levels is handled below in the single-method path — cheaper
-    // because it only fires on a hard block, not on every multi-method
-    // site.
-    val useWaterfall = methodCfg.maxMethods > 1 && elaborateAtThisLevel && effectiveMethods.size > 1
-    if (useWaterfall) {
-        // Rank methods once. Preference mode → ascending preference int (cascade
-        // order). Elaborate mode → composite score descending. Failed elaborate
-        // candidates carry score=-1e9 and naturally sink to the bottom.
-        // Blueprint: if a method was pre-selected in the sketch phase, collapse the
-        // waterfall to a single slot — eliminating the second-slot re-traversal.
-        val ranked: List<Map<String, Any?>> = when {
-            blueprintMethod != null -> listOf(blueprintMethod)
-            useElaborateMethod -> {
-                scoreMethodsForElaborate(effectiveMethods, demand, inventory, data, requestTimeDt, config, depth, path)
-                    .sortedWith(
-                        // Tiebreaker by preference asc — see getPreferredMethodElaborate
-                        // for the rationale (tied sims under deep blocks would otherwise
-                        // pick whatever comes first in getMethods's iteration order).
-                        compareByDescending<MethodScore> { it.score }
-                            .thenBy { (it.method["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
-                    ).map { it.method }
-            }
-            else -> effectiveMethods.sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
-        }
-
-        val cap = methodCfg.maxMethods.coerceAtMost(ranked.size)
-        var residual = demandNetQty
-        var latestCommit: LocalDate? = null
-        val allWos = mutableListOf<Map<String, Any?>>()
-        val slotPeggingNodes = mutableListOf<Map<String, Any?>>()
-        var slotsUsed = 0
-        var lastBlockedReason: String? = null
-
-        for (method in ranked) {
-            if (slotsUsed >= cap) break
-            // MIN_RESIDUAL: skip trivial leftovers from lot-size rounding so we
-            // don't burn a slot emitting a 0.x-unit second WO.
-            if (residual <= MIN_WATERFALL_RESIDUAL) break
-            // (Note: a stricter preflight using `firstFeasibleMethod` was tried
-            // and rejected — that probe fails on any partial child commit, which
-            // would skip slots that could legitimately commit some qty under
-            // partial-fulfillment. planMethodSlot itself short-circuits on
-            // capped<=0, and the UI suppresses zero-qty pegging subtrees, so the
-            // remaining cost of a doomed slot is bounded and the noise is
-            // already hidden at render time.)
-
-            val mLoc = (method["location_id"] ?: method["to_location_id"] ?: "").toString()
-            val slotLabel = "Waterfall slot ${slotsUsed + 1}/${cap}: ${method["type"]}@$mLoc " +
-                "(planning ${roundQty(residual).toLong()} of ${demandNetQty.toLong()} residual)"
-            val slot = planMethodSlot(
-                m = method, slotQty = residual,
-                productId = productId, locationId = locationId,
-                demand = demand, demandId = demandId,
-                requestTimeDt = requestTimeDt, reqTimeStr = reqTimeStr,
-                inventory = inventory, data = data,
-                depth = depth, path = path,
-                config = config, preferDemandId = preferDemandId,
-                budget = budget,
-                useSingleVariant = useSingleVariant,
-                scoreWeights = scoreWeights, topN = topN,
-                methodChoiceExplanation = slotLabel,
-                feasibilityCache = feasibilityCache,
-                structuralFailedMakes = structuralFailedMakes,
-                initialBudget = initialBudget,
-                nodeQtyCaps = nodeQtyCaps,
-                demandBlueprint = demandBlueprint,
-            )
-            // Always record the slot's pegging node so the UI shows every attempt
-            // (including blocked ones with zero qty). Hard-failures still consume
-            // a slot — a method that committed 0 is informative for the user.
-            slotPeggingNodes.add(slot.methodPeggingNode)
-            slotsUsed += 1
-            if (slot.blockedReason != null) {
-                lastBlockedReason = slot.blockedReason
-                continue
-            }
-            residual -= slot.achievableQty
-            allWos.addAll(slot.wos)
-            slot.latestCommit?.let { c ->
-                if (latestCommit == null || c > latestCommit) latestCommit = c
-            }
-        }
-
-        val totalCommitted = demandNetQty - residual
-        val partialReason = when {
-            // Nothing committed at all — surface the last slot's hard-fail reason
-            // so downstream KPIs / soundness see a real failure (not "partial").
-            totalCommitted <= 1e-9 -> lastBlockedReason ?: "no_methods_succeeded"
-            // Some committed but residual above the noise floor → partial fulfillment.
-            residual > 1e-9 -> "partial"
-            else -> null
-        }
-        val commitTimeStr = formatDate(latestCommit)
-        demandFulfilledList.add(committedRow(totalCommitted, commitTimeStr ?: reqTimeStr, partialReason))
-        val finalPegging = slotPeggingNodes + peggingChildren
-        // Multi-slot waterfall: siblings under the demand are additive supply
-        // paths (slot 1 + slot 2 each cover part of the demand). Mark OR so the
-        // UI labels them as alternatives, matching the legend.
-        val demandRelation = if (finalPegging.size > 1) "or" else null
-        return Triple(
-            demandFulfilledList,
-            allWos,
-            demandNode(finalPegging, commitTimeStr ?: reqTimeStr, partialReason, committedQty = taken + totalCommitted, childrenRelation = demandRelation),
-        )
+    // ── Unified waterfall: one flat list of alternatives — across method-type
+    // (make/move/purchase) AND BOM alt_group boundaries — ranked purely by
+    // `preference` (ties keep BOM/method declaration order), tried
+    // sequentially at every BOM depth (no root-only restriction): the best
+    // fully, then only the residual to the next. This replaces three
+    // formerly-separate mechanisms (a root-only proactive multi-method
+    // waterfall, a non-root reactive-fallback mini-waterfall, and BOM
+    // alt_group equal-split) with one.
+    //
+    // Why this is safe to run at every depth (the old proactive waterfall
+    // wasn't — see history: 22k multi-method log lines / 30s on case 171):
+    // it's inherently lazy. A candidate is only ever attempted (a real,
+    // possibly-expensive recursive planMethodSlot call) when the prior one
+    // left a residual or blocked — never speculatively in parallel. Cost is
+    // paid once per candidate actually needed, same profile as the old
+    // reactive-fallback (which already ran safely at every depth).
+    val cachedMakeFailureReason = structuralFailedMakes?.get(Pair(productId, locationId))
+    val candidates: List<WaterfallCandidate> = if (blueprintMethod != null) {
+        // Still route through expandWaterfallCandidates for just this one method: a "make"
+        // whose bom_id has multiple alt_groups must pick ONE (or waterfall across them), never
+        // merge all alt_groups' children into a single AND-list. For the common case (≤1
+        // alt_group) this yields exactly the same single WaterfallCandidate(blueprintMethod,
+        // null) as before — zero behavior change there.
+        expandWaterfallCandidates(listOf(blueprintMethod), productId, demand, config, data)
+            .sortedBy { kbPreference(productId, locationId, it.method, it.altKey, preferenceKb) }
+    } else {
+        expandWaterfallCandidates(effectiveMethods, productId, demand, config, data)
+            // A make candidate already proven structurally dead at this (pid, lid) by a
+            // prior demand this run: skip re-attempting it (cheap memoization), matching
+            // structuralFailedMakes's role below. A diagnostic stub covers it instead.
+            .let { if (cachedMakeFailureReason != null) it.filterNot { c -> c.method["type"] == "make" } else it }
+            .sortedBy { kbPreference(productId, locationId, it.method, it.altKey, preferenceKb) }
     }
 
-    // ── Single method selection ────────────────────────────────────────────────
-    val (m, methodChoiceExplanation) = when {
-        blueprintMethod != null -> {
-            val loc  = (blueprintMethod["location_id"] ?: blueprintMethod["to_location_id"] ?: "").toString()
-            val pref = (blueprintMethod["preference"] as? Number)?.toInt() ?: 0
-            Pair(blueprintMethod, "Blueprint: ${blueprintMethod["type"]} @ $loc (pref $pref)")
-        }
-        effectiveMethods.size == 1 -> {
-            val m = effectiveMethods[0]; val loc = (m["location_id"] ?: m["to_location_id"] ?: "").toString()
-            Pair(m, "Only option: ${m["type"]} @ $loc.")
-        }
-        useElaborateMethod && elaborateAtThisLevel ->
-            getPreferredMethodElaborate(effectiveMethods, demand, inventory, data, requestTimeDt, config, depth, path)
-        else -> getPreferredMethodCascade(effectiveMethods, demand, inventory, data, requestTimeDt, config, depth, path)
-    }
-
-    if (m == null) {
+    if (candidates.isEmpty()) {
         demandFulfilledList.add(committedRow(demandNetQty, reqTimeStr, "no_preferred_method"))
         return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, reqTimeStr, "no_preferred_method", committedQty = taken))
     }
 
-    // ── Single-method commit via the shared planMethodSlot helper ───────────
-    // Reactive fallback: if the picked method blocks at 0 achievable, try
-    // alternatives by preference. Two flavours of alternative are admitted:
-    //
-    //  1) Move-to-move (same product, different `from_location`). Catches the
-    //     operator's primary case — tied-preference moves at the same site
-    //     where one source's downstream chain dies but another succeeds
-    //     (e.g. `move 1000→VIRTUAL` blocks via the @1000 chain;
-    //     `move 2000→VIRTUAL` succeeds via @2000). Downstream BOM is the
-    //     same — only the starting location differs, so cost is bounded.
-    //
-    //  2) Real make alternatives gated by [maxMakeDepth] feasibility cache.
-    //     The cache pre-computes the minimum real-make-recursion depth needed
-    //     to source `(productId, locationId)` via any structurally-feasible
-    //     path (moves are free traversals, makes count). A make whose depth
-    //     exceeds `methodCfg.maxBomDepth` (UI knob "Max BOM depth", default 3)
-    //     is skipped without recursing — no wasteful exploration of
-    //     structurally doomed BOM subtrees. Only fires when [feasibilityCache]
-    //     is provided.
-    //
-    // VirtualProduct_* targets are exempt from the make filter (their only
-    // method is make by data-model construction).
-    val isMoveType = m["type"] == "move"
-    val moveAlternatives: List<Map<String, Any?>> = if (isMoveType) {
-        effectiveMethods
-            .filter { it["type"] == "move" && it["from_location_id"] != m["from_location_id"] }
-            .sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
-    } else emptyList()
-
-    val cachedMakeFailureReason = structuralFailedMakes?.get(Pair(productId, locationId))
-    // Track makes that were excluded by the depth gate so we can surface a
-    // diagnostic stub at the end. When the recipe is structurally infeasible
-    // under the current `purchase_allowed` (e.g. transitive children are
-    // buy-only with no inventory), maxMakeDepth returns Int.MAX_VALUE and the
-    // make silently disappears from fallbackOrder — making "why didn't make
-    // fire?" hard to answer from the pegging tree alone.
-    var excludedMakeDepth: Int? = null   // computed depth (Int.MAX_VALUE => structural)
-    val makeAlternatives: List<Map<String, Any?>> = if (feasibilityCache != null && cachedMakeFailureReason == null) {
-        val purchaseAllowedForCache = config?.get("purchase_allowed") != false
-        val purchasableForCache = effectivePurchasableSet(config, data)
-        val rawMakes = effectiveMethods.filter { it["type"] == "make" && it !== m }
-        rawMakes
-            .filter {
-                if (productId.startsWith("VirtualProduct_")) true
-                else {
-                    val mkDepth = maxMakeDepth(productId, locationId, data, purchaseAllowedForCache, feasibilityCache, purchasable = purchasableForCache)
-                    val admitted = mkDepth <= methodCfg.maxBomDepth
-                    if (!admitted && excludedMakeDepth == null) excludedMakeDepth = mkDepth
-                    admitted
-                }
-            }
-            .sortedBy { (it["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE }
-    } else emptyList()
-    val fallbackOrder = listOf(m) + moveAlternatives + makeAlternatives
-    val cap = methodCfg.maxMethods.coerceAtMost(fallbackOrder.size)
-
-    // Mini-waterfall over `fallbackOrder`. Three flavours of advancement:
-    //   • Reactive fallback — slot blocks (achievable=0). `continue` to next.
-    //   • Proactive split into a MAKE — when the previous slot succeeded only
-    //     partially AND the next slot is a make, run it for residual qty.
-    //     Bounded by feasibilityCache having admitted the make in the first
-    //     place (it gates by maxMakeDepth).
-    //   • Otherwise (next slot is move and prev succeeded): break — splitting
-    //     across moves at deep levels causes 2^N compounding (case 171's
-    //     SUB_PCBA-style chains).
+    val cap = methodCfg.maxMethods.coerceAtMost(candidates.size)
     val combinedWos = mutableListOf<Map<String, Any?>>()
     val combinedPegging = mutableListOf<Map<String, Any?>>()
     var residual = demandNetQty
     var totalAchievable = 0.0
-    var anyChildShortAccum = false
     var latestCommit: LocalDate? = null
     var lastBlockedReason: String? = null
     // A slot fully blocked by a self-cycle is structurally UNUSABLE (it contributes 0),
     // not merely capacity-limited — so it does not count against max_methods. Tracking
     // these as "cycle escapes" lets single-method mode (cap=1) fall through from a cyclic
     // make/move to the alternative that actually breaks the loop, instead of dead-ending
-    // on cause=cycle_stopped. The total is still bounded by fallbackOrder.size.
+    // on cause=cycle_stopped. The total is still bounded by candidates.size.
     var cycleEscapes = 0
-    for ((slotIdx, candidate) in fallbackOrder.withIndex()) {
+    // Whether the PRIOR attempt was a full block (0 achieved). Continuing reactively past
+    // a full block is always safe (cost is bounded — nothing was proactively split). But
+    // continuing past a PARTIAL success into another candidate below the root is only safe
+    // when that next candidate is a "make" — move-to-move (or purchase) proactive splitting
+    // at every BOM depth causes 2^N compounding (case 171's SUB_PCBA-style chains). At the
+    // root (depth == MAX_PLAN_DEPTH) a single fan-out never compounds (there's no deeper
+    // level for it to multiply across), so root may proactively split into ANY candidate
+    // type after a partial success — matching the historical root-only waterfall's behavior,
+    // which had no such restriction.
+    val isRoot = depth == MAX_PLAN_DEPTH
+    // Root-only proportional/equal split among the top `cap` candidates: rather than the
+    // ordinary sequential 100%-then-spillover waterfall, a root demand with cap > 1 always
+    // gets its quantity divided up-front across its top-ranked alternatives — weighted by
+    // each candidate's reconstructed Preferences-KB score when one is fully available for
+    // every candidate in play, otherwise an even split. Never applied below the root (that's
+    // exactly the 2^N fan-out risk the historical proactive waterfall was root-only to avoid).
+    val rootSplitWeights: List<Double>? = if (isRoot && cap > 1) {
+        val scored = preferenceKb?.let { reconstructNodeScores(productId, locationId, candidates, it) }
+            ?.take(cap)?.let { topScores ->
+                val sum = topScores.sum()
+                if (sum > 1e-9) topScores.map { it / sum } else null
+            }
+        scored ?: List(cap) { 1.0 / cap }
+    } else null
+    // Shortfall from a candidate that couldn't reach its rootSplitWeights-derived target rolls
+    // forward onto the next candidate's target — the same residual-cascade idea the ordinary
+    // waterfall already uses, just starting from a split target instead of a 100% target.
+    var carryForward = 0.0
+    var priorAttemptWasBlocked = true
+    for ((slotIdx, candidate) in candidates.withIndex()) {
         if (slotIdx - cycleEscapes >= cap) break
         if (slotIdx > 0 && residual <= MIN_WATERFALL_RESIDUAL) break
-        val labelPrefix = if (slotIdx == 0) methodChoiceExplanation
-            else "Fallback slot ${slotIdx + 1}/$cap: " +
-                "${candidate["type"]}@${candidate["location_id"] ?: candidate["to_location_id"] ?: ""}" +
-                " (residual=${roundQty(residual).toLong()})"
+        if (slotIdx > 0 && !priorAttemptWasBlocked && !isRoot && candidate.method["type"] != "make") break
+        // Past the precomputed split (can happen after a cycle escape lets more than `cap`
+        // candidates be tried), degrade to the ordinary sequential residual for the tail.
+        val target = rootSplitWeights?.getOrNull(slotIdx)?.let { it * demandNetQty + carryForward }
+        val slotQty = (target ?: residual).coerceAtMost(residual)
+        val mLoc = (candidate.method["location_id"] ?: candidate.method["to_location_id"] ?: "").toString()
+        val label = if (slotIdx == 0) "Preference ${candidate.method["preference"] ?: "—"}: ${candidate.method["type"]}@$mLoc" +
+            (candidate.altKey?.let { " variant=$it" } ?: "")
+            else "Fallback slot ${slotIdx + 1}/$cap: ${candidate.method["type"]}@$mLoc" +
+                (candidate.altKey?.let { " variant=$it" } ?: "") + " (residual=${roundQty(residual).toLong()})"
         val attempt = planMethodSlot(
-            m = candidate, slotQty = if (slotIdx == 0) demandNetQty else residual,
+            m = candidate.method, slotQty = slotQty,
             productId = productId, locationId = locationId,
             demand = demand, demandId = demandId,
             requestTimeDt = requestTimeDt, reqTimeStr = reqTimeStr,
@@ -2644,150 +2040,90 @@ fun plan(
             depth = depth, path = path,
             config = config, preferDemandId = preferDemandId,
             budget = budget,
-            useSingleVariant = useSingleVariant,
-            scoreWeights = scoreWeights, topN = topN,
-            methodChoiceExplanation = labelPrefix,
+            selectedAltKey = candidate.altKey,
+            methodChoiceExplanation = label,
             feasibilityCache = feasibilityCache,
             structuralFailedMakes = structuralFailedMakes,
             initialBudget = initialBudget,
             nodeQtyCaps = nodeQtyCaps,
             demandBlueprint = demandBlueprint,
+            preferenceKb = preferenceKb,
         )
+        // Always record the attempt's pegging node so the UI shows every candidate tried
+        // (including blocked ones with zero qty) — informative for the user even when a
+        // candidate committed nothing.
         combinedPegging.add(attempt.methodPeggingNode)
         if (attempt.blockedReason != null) {
-            // Reactive fallback: try the next method on hard block.
+            priorAttemptWasBlocked = true
             lastBlockedReason = attempt.blockedReason
-            // Cycle-escape: a self-cycle makes this method structurally unusable (achieved
-            // 0), so grant an extra slot to try the alternative even under a tight cap.
+            if (target != null) carryForward = target
             if (attempt.achievableQty <= 1e-9 && attempt.blockedReason?.contains("cycle") == true) {
                 cycleEscapes++
             }
-            // Memoize structural make failures so future demands skip the
-            // doomed BOM walk. Only memo for actual make slots (slotIdx>0
-            // gating into makeAlternatives), and only when the failure is
-            // structural (no_methods cascade), not state-dependent.
-            if (slotIdx > 0 && candidate["type"] == "make"
-                && structuralFailedMakes != null
-                && attempt.immediateBottleneckTrulyStructural
-            ) {
-                // Only memoize when the make's IMMEDIATE bottleneck child is
-                // genuinely structurally dead — topological dead-end at this
-                // level, no methods + no inventory at the child's own pid/lid.
-                // Capacity-driven cascades where the immediate child has a
-                // method that failed deeper are state-dependent and excluded
-                // (their failure depends on runtime inventory state, not data
-                // topology — caching them across demands is unsound).
+            // Memoize structural make failures so future demands skip the doomed BOM walk.
+            // Only for genuinely structural dead-ends (topological, not capacity/state
+            // dependent) — see MethodSlotResult.immediateBottleneckTrulyStructural's doc.
+            if (candidate.method["type"] == "make" && structuralFailedMakes != null && attempt.immediateBottleneckTrulyStructural) {
                 structuralFailedMakes[Pair(productId, locationId)] = attempt.blockedReason
             }
             continue
         }
+        priorAttemptWasBlocked = false
+        if (target != null) carryForward = (target - attempt.achievableQty).coerceAtLeast(0.0)
         combinedWos.addAll(attempt.wos)
         totalAchievable += attempt.achievableQty
         residual -= attempt.achievableQty
-        if (attempt.anyChildShort) anyChildShortAccum = true
         attempt.latestCommit?.let { c -> if (latestCommit == null || c > latestCommit) latestCommit = c }
-
-        // Proactive split allowed only when the next admitted slot is a make.
-        // Move-to-move split would compound at deep multi-move sites; make
-        // alternatives are gated by feasibilityCache and naturally bounded.
-        val nextIdx = slotIdx + 1
-        if (nextIdx >= fallbackOrder.size) break
-        if (nextIdx - cycleEscapes >= cap) break
-        if (fallbackOrder[nextIdx]["type"] != "make") break
     }
 
-    // Diagnostic stub: when structuralFailedMakes excluded the make from
-    // admission, emit a synthetic blocked work_order pegging node so the user
-    // sees the make was considered (and why it was skipped) without paying
-    // for the recursion. The stub carries qty=0 and the cached failure reason
-    // from the first demand that hit this dead end.
-    if (cachedMakeFailureReason != null) {
-        val stubMakeMethod = effectiveMethods.firstOrNull { it["type"] == "make" }
-        if (stubMakeMethod != null) {
-            // Unwrap the cascade reason to surface the deepest structural cause
-            // (e.g. "child_failed:280-0511-03@2000(no_methods)" → child=280-0511-03,
-            // loc=2000, cause=no_methods). Embed as a synthetic demand-leaf child
-            // so the make stub becomes expandable and the user can see WHICH BOM
-            // child caused the structural failure.
-            val (deepPid, deepLoc, terminalCause) = resolveDeepestCause(cachedMakeFailureReason)
-            val syntheticLeaf = mapOf<String, Any?>(
-                "type" to "demand",
-                "demand_id" to demandId,
-                "product_id" to (if (deepPid == "?") productId else deepPid),
-                "location_id" to (if (deepLoc == "?") locationId else deepLoc),
-                "quantity" to 0,
-                "committed_qty" to 0,
-                "commit_reason" to terminalCause,
-                "children" to emptyList<Any>(),
-            )
-            combinedPegging.add(mapOf(
-                "type" to "work_order",
-                "product_id" to productId,
-                "location_id" to locationId,
-                "quantity" to 0,
-                "method" to "make",
-                "method_choice_explanation" to
-                    "Make skipped: cached structural failure ($cachedMakeFailureReason). " +
-                    "A prior demand attempted make at this product/location and hit a " +
-                    "no_methods cascade; reusing that result here to avoid redundant recursion.",
-                "failed" to true,
-                "children" to listOf(syntheticLeaf),
-            ))
-        }
-    }
-
-    // Diagnostic stub: when the make-fallback feasibility cache excluded the
-    // make from admission (because maxMakeDepth exceeds method_selection.
-    // max_bom_depth, often Int.MAX_VALUE — the recipe is structurally
-    // infeasible under the current `purchase_allowed`), emit a stub so the
-    // user sees the make was considered. Only fires when the structural-
-    // failure stub above didn't already fire (mutually exclusive — the cache
-    // gate runs BEFORE structuralFailedMakes was consulted, so if we got here
-    // with cachedMakeFailureReason != null we already emitted that stub).
-    if (cachedMakeFailureReason == null && excludedMakeDepth != null) {
-        val stubMakeMethod = effectiveMethods.firstOrNull { it["type"] == "make" }
-        if (stubMakeMethod != null) {
-            val depthValue = excludedMakeDepth!!
-            val isStructural = depthValue == Int.MAX_VALUE
-            val purchaseAllowedFlag = config?.get("purchase_allowed") != false
-            val explanation = if (isStructural) {
-                "Make skipped: recipe is structurally infeasible (maxMakeDepth=∞). " +
-                    "Some transitive BOM child has no terminal source under the current " +
-                    "configuration (purchase_allowed=$purchaseAllowedFlag) — typically a " +
-                    "buy-only leaf with no inventory at the needed location. Enable purchase " +
-                    "or provision inventory upstream to admit this make."
-            } else {
-                "Make skipped: maxMakeDepth=$depthValue exceeds method_selection." +
-                    "max_bom_depth=${methodCfg.maxBomDepth}. Raise max_bom_depth to admit " +
-                    "this deeper recipe."
-            }
-            combinedPegging.add(mapOf(
-                "type" to "work_order",
-                "product_id" to productId,
-                "location_id" to locationId,
-                "quantity" to 0,
-                "method" to "make",
-                "method_choice_explanation" to explanation,
-                "failed" to true,
-                "children" to emptyList<Any>(),
-            ))
-        }
+    // Diagnostic stub: when structuralFailedMakes excluded make candidates from this
+    // waterfall, emit a synthetic blocked work_order pegging node so the user sees make
+    // was considered (and why it was skipped) without paying for the recursion again.
+    if (cachedMakeFailureReason != null && effectiveMethods.any { it["type"] == "make" }) {
+        val (deepPid, deepLoc, terminalCause) = resolveDeepestCause(cachedMakeFailureReason)
+        val syntheticLeaf = mapOf<String, Any?>(
+            "type" to "demand",
+            "demand_id" to demandId,
+            "product_id" to (if (deepPid == "?") productId else deepPid),
+            "location_id" to (if (deepLoc == "?") locationId else deepLoc),
+            "quantity" to 0,
+            "committed_qty" to 0,
+            "commit_reason" to terminalCause,
+            "children" to emptyList<Any>(),
+        )
+        combinedPegging.add(mapOf(
+            "type" to "work_order",
+            "product_id" to productId,
+            "location_id" to locationId,
+            "quantity" to 0,
+            "method" to "make",
+            "method_choice_explanation" to
+                "Make skipped: cached structural failure ($cachedMakeFailureReason). " +
+                "A prior demand attempted make at this product/location and hit a " +
+                "no_methods cascade; reusing that result here to avoid redundant recursion.",
+            "failed" to true,
+            "children" to listOf(syntheticLeaf),
+        ))
     }
 
     if (totalAchievable <= 1e-9) {
-        // Every slot blocked. Surface the last failed reason and include all
-        // attempted WOs so the UI shows the full fallback trail.
+        // Every candidate blocked. Surface the last failed reason and include all
+        // attempted WOs so the UI shows the full waterfall trail.
         demandFulfilledList.add(committedRow(0.0, reqTimeStr, lastBlockedReason ?: "no_methods_succeeded"))
         val failedPegging = combinedPegging + peggingChildren
-        return Triple(demandFulfilledList, emptyList(), demandNode(failedPegging, reqTimeStr, lastBlockedReason, committedQty = taken))
+        val rel = if (failedPegging.size > 1) "or" else null
+        return Triple(demandFulfilledList, emptyList(), demandNode(failedPegging, reqTimeStr, lastBlockedReason, committedQty = taken, childrenRelation = rel))
     }
 
-    // Some commit. Combine all attempted WOs (success + blocked) in pegging.
+    // Some commit. Combine all attempted WOs (success + blocked) in pegging. Siblings
+    // under the demand are additive supply paths (candidate 1 + candidate 2 each cover
+    // part of the demand) — mark "or" so the UI labels them as alternatives.
     peggingChildren.addAll(combinedPegging)
-    val partialReason = if ((anyChildShortAccum || combinedPegging.size > 1) && residual > 1e-9) "partial" else null
+    val partialReason = if (residual > 1e-9) "partial" else null
     val commitTimeStr = formatDate(latestCommit)
     demandFulfilledList.add(committedRow(totalAchievable, commitTimeStr, partialReason))
-    return Triple(demandFulfilledList, combinedWos, demandNode(peggingChildren, commitTimeStr ?: reqTimeStr, partialReason, committedQty = taken + totalAchievable))
+    val rel = if (peggingChildren.size > 1) "or" else null
+    return Triple(demandFulfilledList, combinedWos, demandNode(peggingChildren, commitTimeStr ?: reqTimeStr, partialReason, committedQty = taken + totalAchievable, childrenRelation = rel))
 }
 
 // ── Lot-batching helper ────────────────────────────────────────────────────────
@@ -4453,6 +3789,9 @@ internal fun legacyCommit(
      * selection is bypassed for nodes that have a pre-selected method in the sketch.
      */
     planBlueprint: PlanBlueprint? = null,
+    /** Optional Preferences KB override, see [plan]'s `preferenceKb` param. Passed through
+     *  unchanged to every demand's [plan] call. */
+    preferenceKb: PreferenceKb? = null,
 ): LegacyCommitResult {
     val committedDemands = mutableListOf<Map<String, Any?>>()
     val workOrders = mutableListOf<Map<String, Any?>>()
@@ -4506,6 +3845,7 @@ internal fun legacyCommit(
             initialBudget = iter0Allocation?.get(demandId),
             nodeQtyCaps = achievableQtyMaps?.get(demandId),
             demandBlueprint = planBlueprint?.get(demandId),
+            preferenceKb = preferenceKb,
         )
         committedDemands.addAll(solvedList)
         workOrders.addAll(wos)
@@ -4554,6 +3894,9 @@ fun runPlanning(
     progressCallback: ((Map<String, Any?>) -> Unit)? = null,
     /** Pre-computed case-level allocation budgets (demandId → lotKey → qty). When non-null, overrides the internal SupplyAllocator step while keeping the BOM graph computed fresh. */
     precomputedBudgets: Map<Any?, MutableMap<String, Double>>? = null,
+    /** Optional Preferences KB override, see [plan]'s `preferenceKb` param. `null` when no
+     *  Preferences KB exists for this case — preserves today's exact raw-preference behavior. */
+    preferenceKb: PreferenceKb? = null,
 ): RunPlanningResult {
     val inventory: MutableList<MutableMap<String, Any?>> = (data["supply"] ?: emptyList()).map { s ->
         mutableMapOf(
@@ -4594,7 +3937,7 @@ fun runPlanning(
     // AND pre-selects the first-feasible BOM method per node per demand.
     // Replaces computeAchievableQtyMaps; eliminates getPreferredMethodCascade overhead
     // (probeChildren per node) from the commit phase entirely.
-    val planBlueprint = computePlanBlueprint(demands, sgAllocation, data)
+    val planBlueprint = computePlanBlueprint(demands, sgAllocation, data, preferenceKb)
     val achievableQtyMaps = planBlueprint.mapValues { (_, db) ->
         db.mapValues { (_, nb) -> nb.achievable }
     }
@@ -4609,6 +3952,7 @@ fun runPlanning(
         budgets           = sgAllocation.perLotBudgets,
         achievableQtyMaps = achievableQtyMaps,
         planBlueprint     = planBlueprint,
+        preferenceKb      = preferenceKb,
     )
     // Post-planning trace + compensation-pass telemetry (opt-in: trace_lots=true).
     if (sgAllocation.sgConfig.traceLots)

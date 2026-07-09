@@ -13,9 +13,12 @@ import io.kotest.matchers.shouldBe
  * `customer` resolves `parent` as a make (location blank/"*" = any).
  *
  * Test fixture: parent P (make at L) with two single-child alternatives
- * P→C1 (alt_group A1) and P→C2 (alt_group A2); C1 and C2 are both buyable. With the
- * default equal-split variant selection, an unconstrained demand buys BOTH; a matching
- * constraint narrows production to the one forced child.
+ * P→C1 (alt_group A1) and P→C2 (alt_group A2); C1 and C2 are both buyable. At the root
+ * (P's demand is the top-level demand here), an unconstrained demand with more than one
+ * candidate alternative defaults to an even split across them (C1 and C2, 50/50 of the
+ * quantity) — the root-only proportional/equal-split behavior; a matching constraint
+ * narrows the candidate list down to the one forced child, which (being the sole
+ * remaining candidate) is never split.
  */
 class ConstraintsTest : FunSpec({
 
@@ -40,7 +43,6 @@ class ConstraintsTest : FunSpec({
 
     fun cfg(constraints: List<Map<String, Any?>>) = mapOf<String, Any?>(
         "purchase_allowed" to true,
-        "variant_selection" to mapOf("multiple" to true),   // equal-split across alternatives
         "constraints" to constraints,
     )
     fun rule(customer: String, child: String, location: String = "*") =
@@ -49,6 +51,9 @@ class ConstraintsTest : FunSpec({
     // Which child products end up purchased (i.e. which alternative the make resolved to).
     fun purchasedChildren(wos: List<Map<String, Any?>>): Set<String> =
         wos.filter { it["method"] == "purchase" }.mapNotNull { it["product_id"] as? String }.toSet()
+    fun purchasedQty(wos: List<Map<String, Any?>>, pid: String): Double =
+        wos.filter { it["method"] == "purchase" && it["product_id"] == pid }
+            .sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
 
     // ── parsing ───────────────────────────────────────────────────────────────
     test("parseConstraints: absent / empty / incomplete ⇒ empty; well-formed + aliases parse") {
@@ -70,23 +75,28 @@ class ConstraintsTest : FunSpec({
         purchasedChildren(wos) shouldBe setOf("C2")
     }
 
-    test("different customer ⇒ default selection (both alternatives), constraint not applied") {
+    test("different customer ⇒ default selection (root equal-split across both alternatives), constraint not applied") {
         val (_, wos, _) = plan(demandC("Y"), inv(), data, requestTimeDt = null, config = cfg(listOf(rule("X", "C2"))))
         purchasedChildren(wos) shouldBe setOf("C1", "C2")
+        purchasedQty(wos, "C1") shouldBe 50.0
+        purchasedQty(wos, "C2") shouldBe 50.0
     }
 
     test("location wildcard applies; non-matching explicit location does not") {
-        // blank location ⇒ any location ⇒ applies
+        // blank location ⇒ any location ⇒ applies ⇒ constraint narrows to the sole forced
+        // candidate (C2), which — being the only candidate — is never split.
         val (_, wosBlank, _) = plan(demandC("X"), inv(), data, requestTimeDt = null, config = cfg(listOf(rule("X", "C2", ""))))
         purchasedChildren(wosBlank) shouldBe setOf("C2")
-        // explicit non-matching location ⇒ does not apply
+        // explicit non-matching location ⇒ does not apply ⇒ default (root equal-split, both alternatives)
         val (_, wosOther, _) = plan(demandC("X"), inv(), data, requestTimeDt = null, config = cfg(listOf(rule("X", "C2", "LX"))))
         purchasedChildren(wosOther) shouldBe setOf("C1", "C2")
+        purchasedQty(wosOther, "C1") shouldBe 50.0
+        purchasedQty(wosOther, "C2") shouldBe 50.0
     }
 
     test("constrained child not an alternative ⇒ ignored, plan normally") {
         val (_, wos, _) = plan(demandC("X"), inv(), data, requestTimeDt = null, config = cfg(listOf(rule("X", "C9"))))
-        purchasedChildren(wos) shouldBe setOf("C1", "C2")           // unfiltered
+        purchasedChildren(wos) shouldBe setOf("C1", "C2")     // unfiltered ⇒ default (root equal-split)
         (wos.any { it["product_id"] == "P" && it["method"] == "make" }) shouldBe true   // demand still made
     }
 
@@ -108,9 +118,11 @@ class ConstraintsTest : FunSpec({
         "supply" to emptyList<Map<String, Any?>>(),
     )
 
-    test("multi-method: default picks the preferred method (C1)") {
+    test("multi-method: default is a root equal-split across both methods (C1 and C2)") {
         val (_, wos, _) = plan(demandC("X"), inv(), multiMethod, requestTimeDt = null, config = cfg(emptyList()))
-        purchasedChildren(wos) shouldBe setOf("C1")
+        purchasedChildren(wos) shouldBe setOf("C1", "C2")
+        purchasedQty(wos, "C1") shouldBe 50.0
+        purchasedQty(wos, "C2") shouldBe 50.0
     }
 
     test("multi-method: constraint forces the make method that produces the child (C2)") {
@@ -147,5 +159,36 @@ class ConstraintsTest : FunSpec({
         // without the constraint, the sub-component takes its preferred route (C1)
         val (_, wos2, _) = plan(demandFG("X"), inv(), twoLevel, requestTimeDt = null, config = cfg(emptyList()))
         purchasedChildren(wos2) shouldBe setOf("C1")
+    }
+
+    // ── Genuine waterfall spillover: the preferred method commits only part of the demand
+    //    (its child C1 has no fallback beyond a capped inventory lot), so the residual falls
+    //    through to the next method by preference (C2, uncapped purchase) — proving this is a
+    //    real waterfall (best fully, then only the residual to the next), not equal-split.
+    val multiMethodCapped = mapOf(
+        "method_make" to listOf(
+            mapOf<String, Any?>("bom_id" to "B1", "product_id" to "P", "location_id" to "L", "preference" to 1, "lead_time" to 0.0),
+            mapOf<String, Any?>("bom_id" to "B2", "product_id" to "P", "location_id" to "L", "preference" to 2, "lead_time" to 0.0),
+        ),
+        "method_buy"  to listOf(buy("C2")),   // C1 has NO buy method — only its capped inventory lot
+        "method_move" to emptyList(),
+        "bom"         to listOf(
+            mapOf<String, Any?>("bom_id" to "B1", "parent_id" to "P", "child_id" to "C1", "alt_group" to null, "rate" to 1.0),
+            mapOf<String, Any?>("bom_id" to "B2", "parent_id" to "P", "child_id" to "C2", "alt_group" to null, "rate" to 1.0),
+        ),
+        "productlocation" to emptyList<Map<String, Any?>>(),
+        "supply" to emptyList<Map<String, Any?>>(),
+    )
+    fun invWithC1(qty: Double) = mutableListOf<MutableMap<String, Any?>>(
+        mutableMapOf("product_id" to "C1", "location_id" to "L", "qty" to qty, "supply_id" to "S1", "supply_date" to "2024-01-01"),
+    )
+
+    test("waterfall spillover: capped preferred alternative partially satisfies, residual falls to next by preference") {
+        val (_, wos, _) = plan(demandC("Z"), invWithC1(30.0), multiMethodCapped, requestTimeDt = null, config = cfg(emptyList()))
+        val makeWos = wos.filter { it["product_id"] == "P" && it["method"] == "make" }
+        makeWos.size shouldBe 2
+        makeWos.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 } shouldBe 100.0
+        purchasedChildren(wos) shouldBe setOf("C2")
+        (wos.first { it["product_id"] == "C2" && it["method"] == "purchase" }["quantity"] as Number).toDouble() shouldBe 70.0
     }
 })
