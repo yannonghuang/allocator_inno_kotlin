@@ -165,7 +165,7 @@ export async function getFeasibleDemands(caseId: number, runId: number): Promise
 }
 
 /** Demand-to-supply planning: returns committed demands (with commit_time), work orders, and planning pegging trees. */
-export type CommittedDemand = { demand_id?: string | null; customer_id?: string | null; customer?: string | null; product_id: string; location_id: string; quantity: number; requested_qty?: number | null; shortage?: number | null; is_failed?: boolean; request_time?: string | null; commit_time: string | null; commit_reason?: string | null };
+export type CommittedDemand = { demand_id?: string | null; customer_id?: string | null; customer?: string | null; product_id: string; location_id: string; quantity: number; requested_qty?: number | null; shortage?: number | null; is_failed?: boolean; request_time?: string | null; commit_time: string | null; commit_reason?: string | null; time_dominator?: DominatorRef[] | null };
 export type WorkOrder = {
   product_id: string;
   location_id: string;

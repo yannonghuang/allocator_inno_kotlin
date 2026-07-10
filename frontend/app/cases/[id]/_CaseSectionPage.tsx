@@ -96,6 +96,7 @@ import {
   type BootstrapCriterion,
   getResourceUtilization,
   type ResourceUtilization,
+  type DominatorRef,
 } from '@/lib/api';
 import { computeHorizon, ScheduleBar, ScheduleHorizonRuler, methodColor, BorMiniTimeline, BorTimelineRuler } from './_workOrderSchedule';
 import { WoScheduleImpactPanel, WoScheduleQuickModal } from './_woScheduleImpact';
@@ -3113,6 +3114,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return map;
   }, [planResult]);
 
+  /** demand_id → its pegging root's time_dominator (singular by design — see backend
+   *  DominatorRef docs). Last tree per demand wins, matching R0's own convention for which
+   *  tree is authoritative when a demand has more than one entry. Powers the "via {demand}"
+   *  cross-demand badge on the Committed Demands table's Lateness column. */
+  const rootTimeDominatorByDemand = useMemo(() => {
+    const map = new Map<string, DominatorRef>();
+    for (const entry of planResult?.planning_pegging ?? []) {
+      const did = entry.demand_id;
+      if (!did) continue;
+      const dom = entry.tree?.time_dominator?.[0];
+      if (dom) map.set(did, dom); else map.delete(did);
+    }
+    return map;
+  }, [planResult]);
+
   /** Sum of initial_qty per product_id across all supply view rows (unfiltered). */
   const supplyProductTotalMap = useMemo((): Record<string, number> => {
     const m: Record<string, number> = {};
@@ -5432,7 +5448,34 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               render: (r) => {
                                 const v = computeLatenessDays(r.request_time, r.commit_time);
                                 if (v == null) return '–';
-                                if (v > 0) return <span style={{ color: '#fb923c', fontWeight: 600 }}>+{v}d</span>;
+                                // Cross-demand WO consolidation can push this demand's own
+                                // commit time out because of a DIFFERENT demand's consolidated
+                                // work order (see DominatorLink) — flag it the same way here so
+                                // "why is this demand late" doesn't look like a local cause when
+                                // it isn't.
+                                // Prefer the row's own time_dominator (always loaded, synced
+                                // from the final wave-consolidated tree at plan time) — falls
+                                // back to the pegging-tree memo only for older cached runs from
+                                // before that field existed on committed_demands.
+                                const dom = v > 0
+                                  ? (r.time_dominator?.[0] ?? rootTimeDominatorByDemand.get(String(r.demand_id ?? '')))
+                                  : undefined;
+                                const isOtherDemand = dom?.demand_id != null && dom.demand_id !== r.demand_id;
+                                const badge = isOtherDemand && (
+                                  <span
+                                    role={dom?.supply_id ? 'button' : undefined}
+                                    onClick={dom?.supply_id ? (e) => { e.stopPropagation(); handleDominatorSupplyClick(dom.supply_id!); } : undefined}
+                                    title={`${dom!.label} — from a consolidated work order belonging to demand ${dom!.demand_id}, not this one`}
+                                    style={{
+                                      marginLeft: 6, fontSize: '0.72em', color: '#f472b6',
+                                      border: '1px solid rgba(244,114,182,0.4)', borderRadius: 4, padding: '0 4px',
+                                      cursor: dom?.supply_id ? 'pointer' : 'default',
+                                    }}
+                                  >
+                                    via {dom!.demand_id}
+                                  </span>
+                                );
+                                if (v > 0) return <span style={{ color: '#fb923c', fontWeight: 600 }}>+{v}d{badge}</span>;
                                 if (v < 0) return <span style={{ color: '#34d399' }}>{v}d</span>;
                                 return '0d';
                               },

@@ -4672,6 +4672,40 @@ fun runPlanning(
     }
     log.info("[plan] adjustedNative built: native={}", adjustedNative.size)
 
+    // Sync committed_demands' commit_time (and carry along time_dominator) from the FINAL,
+    // wave-consolidated pegging root (adjustedTrees) — same "last tree per demand wins"
+    // convention R0 uses for quantity above. committed_demands.commit_time was previously only
+    // ever set during the initial top-down commit (Phase 2), before wave consolidation (Pass 2)
+    // could push it out further — so a demand delayed by WO batching/cross-demand consolidation
+    // showed its PRE-consolidation date here, silently understating (or entirely hiding) real
+    // lateness in any UI that reads committed_demands directly instead of walking the pegging
+    // tree. time_dominator is attached here too (not just left on the tree) so the UI's lateness
+    // column can show the same "delayed by a different demand" flag without needing the full
+    // pegging tree loaded — committed_demands is always present; planning_pegging is not (large
+    // cases stream it from the DB per-demand, lazily, as the user opens each one).
+    run {
+        val finalCommitTimeByDemand = mutableMapOf<String, String?>()
+        val finalTimeDominatorByDemand = mutableMapOf<String, Any?>()
+        for (entry in adjustedTrees) {
+            val did = entry["demand_id"]?.toString()?.takeIf { it.isNotBlank() } ?: continue
+            @Suppress("UNCHECKED_CAST")
+            val tree = entry["tree"] as? Map<String, Any?> ?: continue
+            finalCommitTimeByDemand[did] = tree["commit_time"] as? String
+            finalTimeDominatorByDemand[did] = tree["time_dominator"]
+        }
+        if (finalCommitTimeByDemand.isNotEmpty()) {
+            val synced = committedDemands.map { row ->
+                val did = row["demand_id"]?.toString() ?: return@map row
+                if (isHardPlanningFailure(row["commit_reason"] as? String)) return@map row
+                val finalCommitTime = finalCommitTimeByDemand[did] ?: return@map row
+                val timeDominator = finalTimeDominatorByDemand[did]
+                (if (finalCommitTime == row["commit_time"]) row else row + ("commit_time" to finalCommitTime)) +
+                    (if (timeDominator != null) mapOf("time_dominator" to timeDominator) else emptyMap())
+            }
+            committedDemands.clear(); committedDemands.addAll(synced)
+        }
+    }
+
     // R7g: WO conservation — post-trim consolidated WO qty vs served-demand consumption.
     // Uses adjustedTrees (final pegging) and adjustedConsolidated (final WO list).
     val woConservationViolations = if (producedByComponent.isNotEmpty())
