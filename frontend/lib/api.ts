@@ -232,6 +232,20 @@ export type WorkOrder = {
   original_lead_days?: number | null;
 };
 
+/** A pointer from a constrained pegging node to the OTHER node currently determining its
+ *  committed quantity or committed time — mirrors the backend's `DominatorRef` (see
+ *  services/PlanningEngine.kt). `label` is precomputed server-side; the UI never re-derives it. */
+export type DominatorRef = {
+  kind: 'bom_child' | 'sibling_wo' | 'method_alternative' | 'wave_peer' | 'shared_supply_budget' | 'resource_contention';
+  product_id?: string | null;
+  location_id?: string | null;
+  demand_id?: string | null;
+  wo_group_id?: string | null;
+  supply_id?: string | null;
+  competing_demand_ids?: string[] | null;
+  label: string;
+};
+
 /** Planning pegging tree node: demand (root) -> work_order -> ... -> supply | purchase (leaves).
  *  Make WOs that have an applicable operation also emit `operation` and `resource` children
  *  carrying the bill-of-resources detail; those don't participate in supply/demand flow. */
@@ -309,6 +323,19 @@ export type PlanningPeggingNode = {
    *  at other locations, or no methods at all. Rendered inline in the
    *  pegging panel in place of the generic "No work orders" copy. */
   failure_explanation?: string | null;
+  /** Committed quantity at this node — always present at runtime even though it was
+   *  previously missing from this type (a pre-existing schema gap). */
+  committed_qty?: number;
+  /** "Least quantity dominates": the other node(s) currently determining this node's
+   *  committed quantity, captured inline at the planner's existing min-collapse points
+   *  (AND-sibling min, bottom-up reconcile, cross-demand shared-supply budget). Absent/empty
+   *  means nothing else currently constrains this node's quantity. */
+  quantity_dominator?: DominatorRef[];
+  /** "Latest time dominates": the other node(s) currently determining this node's committed
+   *  time, captured inline at the planner's existing max-collapse points (BOM child push,
+   *  method-alternative OR, wave consolidation). Absent/empty means nothing else currently
+   *  pushed this node's timing out. */
+  time_dominator?: DominatorRef[];
   children: PlanningPeggingNode[];
 };
 

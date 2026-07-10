@@ -1230,6 +1230,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // When navigating from the move manifest (work_order context) into a demand pegging tree,
   // stores the WO row so the "go back" button can restore the manifest view.
   const [previousManifestWoRow, setPreviousManifestWoRow] = useState<WorkOrder | null>(null);
+  // When a quantity/time dominator link (in a demand's pegging tree) jumps to the raw supply's
+  // own Breakdown (supExplain) panel, stashes the pegging context so a "go back" button in
+  // supExplain can restore exactly the tree the user came from.
+  const [previousDemandPeggingContext, setPreviousDemandPeggingContext] = useState<typeof planPeggingContext>(null);
   const [planWorkOrderPeggingLoading, setPlanWorkOrderPeggingLoading] = useState<string | null>(null);
   const [planWorkOrderPeggingError, setPlanWorkOrderPeggingError] = useState<string | null>(null);
   const planPeggingResizeRef = useRef<{ startX: number; startW: number } | null>(null);
@@ -3421,31 +3425,59 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       supplyDemandPathMap.forEach((v, k) => {
         if (k.startsWith(sidPrefix)) demandPath[k.slice(sidPrefix.length)] = v;
       });
+      // Merge both sources rather than picking one exclusively: pegging.demands (from the
+      // planning_pegging tree cache) is per-demand and only ever as complete as whichever
+      // demand trees the user has already opened this session — for a supply shared across
+      // many demands, that's frequently just one or two, which used to silently look
+      // "complete" (non-empty) and mask the rest. supplyDemandConsumedMap is built from
+      // planResult.supply_allocations — the same global, always-complete source the
+      // Allocation Map uses — so union them: keep pegging.demands' richer entry for any
+      // demand it already knows about, and add whichever OTHER demands only the complete
+      // source knows about.
+      const peggedDemands = (() => {
+        const byDemand = new Map<string, PeggedDemandEntry>();
+        for (const d of pegging?.demands ?? []) byDemand.set(d.demandId, d);
+        const dm = supplyDemandConsumedMap.get(s.supplyId);
+        if (dm) {
+          dm.forEach((qty, demandId) => {
+            if (!byDemand.has(demandId)) {
+              byDemand.set(demandId, { demandId, customer: demandCustomerMap.get(demandId) ?? null, qtyConsumed: qty });
+            }
+          });
+        }
+        return Array.from(byDemand.values());
+      })();
       return {
         ...s,
         consumedQty,
         residualQty,
         utilizationRate,
-        peggedDemandCount: pegging?.demands.length ?? svRow?.pegged_demands ?? 0,
-        totalPeggedQty: pegging?.totalPeggedQty ?? svRow?.total_pegged_qty ?? 0,
-        peggedDemands: pegging?.demands.length
-          ? pegging.demands
-          : (() => {
-              // Fallback when planning_pegging isn't loaded inline (large runs).
-              // Use qty_consumed (not qty_allocated) so non-critical supplies are also shown.
-              const dm = supplyDemandConsumedMap.get(s.supplyId);
-              if (!dm) return [];
-              return Array.from(dm.entries()).map(([demandId, qty]) => ({
-                demandId,
-                customer: demandCustomerMap.get(demandId) ?? null,
-                qtyConsumed: qty,
-              }));
-            })(),
+        peggedDemandCount: peggedDemands.length || svRow?.pegged_demands || 0,
+        totalPeggedQty: peggedDemands.length
+          ? peggedDemands.reduce((sum, d) => sum + d.qtyConsumed, 0)
+          : (svRow?.total_pegged_qty ?? 0),
+        peggedDemands,
         splitInfos: supplySplitInfoMap.get(s.supplyId) ?? [],
         demandPath,
       };
     });
   }, [caseSupplies, supplyPeggingMap, supplyConsumedMap, supplyDemandConsumedMap, lotDemandAllocMap, demandCustomerMap, supplySplitInfoMap, supplyDemandPathMap, supplyViewRowMap]);
+
+  /** Jump from a dominator link (in a demand's pegging tree) straight to that raw supply's own
+   *  Breakdown panel — the same view reached by clicking the supply in the Supplies tab.
+   *  Stashes the current pegging context so supExplain's "go back" button can restore it. */
+  const handleDominatorSupplyClick = (supplyId: string) => {
+    const row = planSupplyViewRows.find((r) => r.supplyId === supplyId);
+    if (!row) return;
+    setPreviousDemandPeggingContext(planPeggingContext);
+    setPlanPeggingOpen(false);
+    setSupExplainRow(row);
+    setSupExplainKey(`supply|${row.supplyId}`);
+    setSupExplainOpen(true);
+    setPeggedSort(null);
+    setPeggedDemandFilter('');
+    setPeggedCustomerFilter('');
+  };
 
   /** Sum of qty per productId across all plan supply view rows (unfiltered). */
   const planSupplyProductTotalMap = useMemo((): Record<string, number> => {
@@ -6911,8 +6943,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                   className="secondary"
                                   style={isSelected ? { background: 'rgba(167,139,250,0.25)', borderColor: '#a78bfa' } : undefined}
                                   onClick={() => {
-                                    if (isSelected) { setSupExplainOpen(false); setSupExplainKey(null); setSupExplainRow(null); }
-                                    else { setSupExplainRow(r); setSupExplainKey(k); setSupExplainOpen(true); setPeggedSort(null); setPeggedDemandFilter(''); setPeggedCustomerFilter(''); }
+                                    if (isSelected) { setSupExplainOpen(false); setSupExplainKey(null); setSupExplainRow(null); setPreviousDemandPeggingContext(null); }
+                                    else { setSupExplainRow(r); setSupExplainKey(k); setSupExplainOpen(true); setPeggedSort(null); setPeggedDemandFilter(''); setPeggedCustomerFilter(''); setPreviousDemandPeggingContext(null); }
                                   }}
                                 >{tc('show')}</button>
                               );
@@ -8709,7 +8741,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         >
           <div
             style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.4)', pointerEvents: 'auto' }}
-            onClick={() => { setSupExplainOpen(false); setSupExplainKey(null); setSupExplainRow(null); }}
+            onClick={() => { setSupExplainOpen(false); setSupExplainKey(null); setSupExplainRow(null); setPreviousDemandPeggingContext(null); }}
             aria-hidden
           />
           <div
@@ -8734,13 +8766,35 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             <div style={{ padding: '1rem 1.25rem', borderBottom: '1px solid #3d3d40', flexShrink: 0 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.25rem' }}>
                 <h3 style={{ margin: 0, color: '#fafafa', fontSize: '1rem' }}>{tP('supExplain.title')}</h3>
-                <button type="button" onClick={() => { setSupExplainOpen(false); setSupExplainKey(null); setSupExplainRow(null); }} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tP('supExplain.close')}</button>
+                <button type="button" onClick={() => { setSupExplainOpen(false); setSupExplainKey(null); setSupExplainRow(null); setPreviousDemandPeggingContext(null); }} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tP('supExplain.close')}</button>
               </div>
               <p style={{ margin: 0, fontSize: '0.8rem', color: '#a1a1aa' }}>
                 <strong>{supExplainRow.supplyId}</strong> · {supExplainRow.productId} @ {supExplainRow.locationId ?? '–'}
                 {supExplainRow.supplyDate && <> · {supExplainRow.supplyDate}</>}
                 {' · '}{tP('woExplain.qtyLabel')} {qtyFmt(Number(supExplainRow.qty))}
               </p>
+              {previousDemandPeggingContext && (
+                <div style={{ marginTop: '0.4rem' }}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSupExplainOpen(false);
+                      setSupExplainKey(null);
+                      setSupExplainRow(null);
+                      setPlanPeggingContext(previousDemandPeggingContext);
+                      setPlanPeggingOpen(true);
+                      setPreviousDemandPeggingContext(null);
+                    }}
+                    style={{ background: 'none', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '0.78rem', padding: 0, display: 'flex', alignItems: 'center', gap: '0.3rem' }}
+                  >
+                    ← {previousDemandPeggingContext.type === 'demand'
+                      ? (previousDemandPeggingContext.row.demand_id ?? '')
+                      : previousDemandPeggingContext.type === 'work_order'
+                        ? `${previousDemandPeggingContext.row.product_id ?? ''}@${previousDemandPeggingContext.row.location_id ?? ''}`
+                        : previousDemandPeggingContext.supplyId}
+                  </button>
+                </div>
+              )}
             </div>
             <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
               {(() => {
@@ -9619,11 +9673,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <>{' '}{tP('peggingPanel.descriptionOrSiblings')}</>
               )}
             </p>
-            {planPeggingContext.type !== 'supply' && (
-              <p style={{ margin: 0, marginBottom: '0.5rem', fontSize: '0.75rem', color: '#a1a1aa' }}>
-                {tP('peggingPanel.legendShortageOrigins')}
-              </p>
-            )}
             {planPeggingContext.type === 'supply' && (() => {
               const ctx = planPeggingContext;
               return (
@@ -9980,6 +10029,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     ? Number((planPeggingContext.row as WorkOrder).quantity ?? 0)
                     : null}
                   planningPegging={planResult?.planning_pegging ?? []}
+                  onNavigateToSupply={handleDominatorSupplyClick}
                 />
               ) : null;
             })()}

@@ -435,6 +435,13 @@ data class NodeBlueprint(
      * null = supply fully covers demand (no method needed).
      */
     val method: Map<String, Any?>? = null,
+    /**
+     * Root-cause pointer(s) for why [achievable] < what was asked of this node, computed
+     * INLINE alongside the same min (AND)/waterfall (OR) arithmetic that produces [achievable]
+     * itself — not a separate reconstruction pass. Empty when this node was fully satisfied.
+     * See [nodeSketchInto] / [methodAchievableForSketch] for exactly where each entry comes from.
+     */
+    val quantityDominator: List<DominatorRef> = emptyList(),
 )
 
 typealias DemandBlueprint = Map<Pair<String, String>, NodeBlueprint>
@@ -476,6 +483,19 @@ internal fun computePlanBlueprint(
     return result
 }
 
+/** Every physical lot of (pid, lid) — each an independent OR-alternative when several exist
+ *  (per-lot fulfillment is itself an OR-group: several lots each partly cover one ask). Used
+ *  only as the terminal cause when this exact (pid, lid) has no method able to relieve it — a
+ *  genuine raw-supply bottleneck, not a (product, location) proxy. */
+private fun rawSupplyLotRefs(pid: String, lid: String, data: Map<String, List<Map<String, Any?>>>): List<DominatorRef> =
+    (data["supply"] ?: emptyList())
+        .filter { (it["product_id"] as? String)?.trim() == pid && (it["location_id"] as? String)?.trim() == lid }
+        .mapNotNull { row ->
+            val sid = (row["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            DominatorRef(kind = "bom_child", productId = pid, locationId = lid, supplyId = sid, label = "$pid@$lid")
+        }
+        .distinct()
+
 private fun nodeSketchInto(
     pid: String, lid: String, needed: Double,
     demandId: Any?,
@@ -515,18 +535,29 @@ private fun nodeSketchInto(
 
         var selectedMethod: Map<String, Any?>? = null
         var selectedAchievable = 0.0
+        var selectedDominator: List<DominatorRef> = emptyList()
 
         for (method in methods) {
-            val ma = methodAchievableForSketch(method, pid, lid, residual, demandId, allocation, data, visited, into, preferenceKb)
-            if (ma > 1e-9) {
+            val ms = methodAchievableForSketch(method, pid, lid, residual, demandId, allocation, data, visited, into, preferenceKb)
+            if (ms.achievable > 1e-9) {
                 selectedMethod = method
-                selectedAchievable = ma
+                selectedAchievable = ms.achievable
+                selectedDominator = ms.dominator
                 break
             }
         }
 
         val aq = supplyQty + selectedAchievable
-        into[key] = NodeBlueprint(achievable = aq, supplyQty = supplyQty, method = selectedMethod)
+        // Genuine shortfall at THIS node: either the chosen method itself fell short of the
+        // residual it was asked for (inherit its own dominator — already the correct AND/OR
+        // result from the recursion above, computed alongside its own achievable qty), or no
+        // method exists/contributed anything at all, in which case the terminal cause IS this
+        // (pid, lid)'s own raw supply — point at its actual physical lot(s) directly.
+        val quantityDominator = if (aq < needed - 1e-9) {
+            if (selectedMethod != null && selectedDominator.isNotEmpty()) selectedDominator
+            else rawSupplyLotRefs(pid, lid, data)
+        } else emptyList()
+        into[key] = NodeBlueprint(achievable = aq, supplyQty = supplyQty, method = selectedMethod, quantityDominator = quantityDominator)
         return aq
     } finally {
         visited.remove(key)
@@ -557,6 +588,10 @@ internal fun kbPreferenceForMethod(
     return kbPreference(pid, lid, method, null, preferenceKb)
 }
 
+/** Paired with [NodeBlueprint.quantityDominator]: the achievable qty AND, computed in the
+ *  same breath, who's to blame if it fell short of what was asked of this method. */
+private data class MethodSketchResult(val achievable: Double, val dominator: List<DominatorRef> = emptyList())
+
 // Same arithmetic as methodAchievableInto but recurses via nodeSketchInto to populate blueprint entries.
 private fun methodAchievableForSketch(
     method: Map<String, Any?>, pid: String, lid: String, needed: Double,
@@ -566,16 +601,21 @@ private fun methodAchievableForSketch(
     visited: MutableSet<Pair<String, String>>,
     into: MutableMap<Pair<String, String>, NodeBlueprint>,
     preferenceKb: PreferenceKb? = null,
-): Double {
+): MethodSketchResult {
     return when (method["type"] as? String) {
-        "purchase" -> needed
+        // Elastic on both quantity and time (can always order more / sooner) — never itself
+        // a dominator, matching the "any purchase is a consequence, never a cause" rule.
+        "purchase" -> MethodSketchResult(needed)
         "move" -> {
-            val fromLid = (method["from_location_id"] as? String)?.trim() ?: return 0.0
-            nodeSketchInto(pid, fromLid, needed, demandId, allocation, data, visited, into, preferenceKb)
+            val fromLid = (method["from_location_id"] as? String)?.trim() ?: return MethodSketchResult(0.0)
+            val ach = nodeSketchInto(pid, fromLid, needed, demandId, allocation, data, visited, into, preferenceKb)
+            // Transparent 1:1 pass-through — move adds no constraint of its own, so it inherits
+            // the source location's own already-computed dominator verbatim (whatever that is).
+            MethodSketchResult(ach, into[pid to fromLid]?.quantityDominator ?: emptyList())
         }
         "make" -> {
             val variants = variantsForMake(pid, lid, needed, method, data)
-            if (variants.isEmpty()) return 0.0
+            if (variants.isEmpty()) return MethodSketchResult(0.0)
             // Waterfall across alt_group variants — mirrors the commit phase's unified
             // waterfall (best variant by preference/KB ranking gets the full residual; only
             // spill to the next if it can't fully cover). Replaces the old equal-split-
@@ -587,10 +627,19 @@ private fun methodAchievableForSketch(
             val ranked = variants.sortedBy { (altKey, _) -> kbPreference(pid, lid, method, altKey, preferenceKb) }
             var residual = needed
             var total = 0.0
+            // OR-group: at most one dominator per alt_group variant actually tried, unioned
+            // (deduped) only from variants that fell short of what THEY were asked — mirrors
+            // exactly which variants the waterfall below actually spilled past.
+            var dominatorUnion: List<DominatorRef> = emptyList()
             for ((_, children) in ranked) {
                 if (residual <= 1e-9) break
+                val askedOfThisVariant = residual
                 if (children.isEmpty()) { total += residual; residual = 0.0; continue }
                 var variantAchievable = residual
+                // AND: exactly one child — whichever pulls variantAchievable down the most —
+                // dominates this variant. Ties keep whichever was found first (min tracking
+                // itself only ever holds one winner at a time).
+                var variantDominator: List<DominatorRef> = emptyList()
                 for (child in children) {
                     val cPid        = (child["product_id"] as? String)?.trim() ?: continue
                     val cLid        = (child["location_id"] as? String)?.trim() ?: continue
@@ -601,14 +650,25 @@ private fun methodAchievableForSketch(
                     if (cNeeded <= 1e-9) continue
                     val cAch      = nodeSketchInto(cPid, cLid, cNeeded, demandId, allocation, data, visited, into, preferenceKb)
                     val fromChild = cAch / (cNeeded / residual)
-                    if (fromChild < variantAchievable) variantAchievable = fromChild
+                    if (fromChild < variantAchievable) {
+                        variantAchievable = fromChild
+                        // Inherit the child's own already-computed dominator (recursively
+                        // resolved — may itself be an OR-group from further below) rather than
+                        // re-deriving it; fall back to a fresh self-reference only if the child
+                        // (unexpectedly) didn't carry one despite falling short.
+                        variantDominator = into[cPid to cLid]?.quantityDominator?.takeIf { it.isNotEmpty() }
+                            ?: listOf(DominatorRef(kind = "bom_child", productId = cPid, locationId = cLid, label = "$cPid@$cLid"))
+                    }
                 }
                 total += variantAchievable
                 residual -= variantAchievable
+                if (variantAchievable < askedOfThisVariant - 1e-9 && variantDominator.isNotEmpty()) {
+                    dominatorUnion = dominatorUnion + variantDominator
+                }
             }
-            total
+            MethodSketchResult(total, dominatorUnion.dedupBySupply())
         }
-        else -> 0.0
+        else -> MethodSketchResult(0.0)
     }
 }
 
