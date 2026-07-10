@@ -82,21 +82,40 @@ type NodeProps = Omit<PlanningPeggingTreeProps, 'tree'> & {
  *  its committed qty/time. Clicking follows the chain one hop; the user can click again on
  *  the node it lands on to keep walking it back to the root cause. */
 export function DominatorLink({
-  kind, dominator, onClick,
+  kind, dominator, onClick, contextDemandId,
 }: {
   kind: 'quantity' | 'time';
   dominator: DominatorRef;
   onClick?: (ref: DominatorRef) => void;
+  /** demand_id of the pegging currently being viewed. Cross-demand WO consolidation (wave
+   *  batching) can shift a WO's timing because of ANOTHER demand's own consolidated work
+   *  order — when dominator.demand_id is set and differs from this, the true cause isn't the
+   *  demand on screen, so it's flagged distinctly rather than looking like a same-tree cause. */
+  contextDemandId?: string | null;
 }): JSX.Element {
   const prefix = kind === 'quantity' ? 'Qty limited by' : 'Delayed by';
   const color = kind === 'quantity' ? '#facc15' : '#38bdf8';
+  const isOtherDemand = dominator.demand_id != null && contextDemandId != null && dominator.demand_id !== contextDemandId;
   const content = (
     <>
       <span style={{ color: '#71717a' }}>{prefix}:</span> {dominator.label}
+      {isOtherDemand && (
+        <span
+          style={{
+            marginLeft: 6, fontSize: '0.72em', color: '#f472b6',
+            border: '1px solid rgba(244,114,182,0.4)', borderRadius: 4, padding: '0 4px',
+          }}
+        >
+          via {dominator.demand_id}
+        </span>
+      )}
     </>
   );
+  const title = isOtherDemand
+    ? `${dominator.label} — from a consolidated work order belonging to demand ${dominator.demand_id}, not this one`
+    : dominator.label;
   if (!onClick) {
-    return <span style={{ color }}>{content}</span>;
+    return <span style={{ color }} title={title}>{content}</span>;
   }
   return (
     <button
@@ -106,7 +125,7 @@ export function DominatorLink({
         background: 'none', border: 'none', padding: 0, cursor: 'pointer',
         color, textDecoration: 'underline', textAlign: 'left', font: 'inherit',
       }}
-      title={dominator.label}
+      title={title}
     >
       {content}
     </button>

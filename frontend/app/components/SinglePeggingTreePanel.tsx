@@ -204,10 +204,10 @@ export function SinglePeggingTreePanel({
           display: 'flex', flexDirection: 'column', gap: 4, fontSize: '0.78rem',
         }}>
           {rootQtyDominators.map((d, i) => (
-            <DominatorLink key={`rq-${i}`} kind="quantity" dominator={d} onClick={handleDominatorClick} />
+            <DominatorLink key={`rq-${i}`} kind="quantity" dominator={d} onClick={handleDominatorClick} contextDemandId={contextDemandId ?? tree.demand_id} />
           ))}
           {rootTimeDominators.map((d, i) => (
-            <DominatorLink key={`rt-${i}`} kind="time" dominator={d} onClick={handleDominatorClick} />
+            <DominatorLink key={`rt-${i}`} kind="time" dominator={d} onClick={handleDominatorClick} contextDemandId={contextDemandId ?? tree.demand_id} />
           ))}
         </div>
       )}

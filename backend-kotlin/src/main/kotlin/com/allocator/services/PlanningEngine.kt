@@ -3359,8 +3359,17 @@ internal fun consolidateByWaves(
     val timeDominatorByGid = mutableMapOf<String, DominatorRef>()
     fun gidDominatorRef(gid: String): DominatorRef {
         val info = gidInfo[gid]
+        // Which demand(s) this wave-peer WO group actually belongs to — cross-demand WO
+        // consolidation can merge another demand's own work order into the same wave bucket,
+        // pushing THIS WO's timing even though the peer's natives come from a different demand
+        // entirely. Carried forward (see resolveWavePeer) onto the final resolved dominator so
+        // the UI can tell "delayed by my own WO" from "delayed by a consolidated peer WO
+        // belonging to a different demand."
+        val peerDemandIds = info?.demandQty?.keys?.toList().orEmpty()
         return DominatorRef(
             kind = "wave_peer", woGroupId = gid, productId = info?.pid, locationId = info?.lid,
+            demandId = peerDemandIds.firstOrNull(),
+            competingDemandIds = if (peerDemandIds.size > 1) peerDemandIds else null,
             label = "${info?.method ?: "wo"} ${info?.pid}@${info?.lid}",
         )
     }
@@ -3612,7 +3621,15 @@ internal fun rewritePeggingTimings(
     // an unresolved WO-to-WO pointer.
     fun resolveWavePeer(ref: DominatorRef): List<DominatorRef> {
         val target = ref.woGroupId?.let { woNodeByGid[it] } ?: return emptyList()
-        return rawDominatorRefs(target, "time_dominator", ref.kind)
+        val resolved = rawDominatorRefs(target, "time_dominator", ref.kind)
+        // Tag with which demand(s) the wave-peer WO that caused this push actually belongs to —
+        // cross-demand WO consolidation can merge another demand's own work order into the same
+        // wave bucket, so the true cause here may not be the demand currently being viewed at
+        // all. Only fills this in when the resolution didn't already carry a more specific one
+        // from further down its own chain (a deeper, already-resolved dominator wins).
+        return resolved.map { r ->
+            if (r.demandId != null) r else r.copy(demandId = ref.demandId, competingDemandIds = ref.competingDemandIds)
+        }
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -3635,7 +3652,7 @@ internal fun rewritePeggingTimings(
             val endChanged = newEnd != null && formatDate(newEnd) != node["end_time"]
             val lotCountChanged = newLotCount != null && newLotCount != (node["lot_count"] as? Number)?.toInt()
             val waveCountChanged = newWaveCount != null && newWaveCount != (node["wave_count"] as? Number)?.toInt()
-            return if (startChanged || endChanged || lotCountChanged || waveCountChanged || childrenChanged) {
+            val result = if (startChanged || endChanged || lotCountChanged || waveCountChanged || childrenChanged) {
                 node.toMutableMap().also { m ->
                     if (startChanged) m["start_time"] = formatDate(newStart)
                     if (endChanged) m["end_time"] = formatDate(newEnd)
@@ -3648,6 +3665,15 @@ internal fun rewritePeggingTimings(
                     }
                 }
             } else node
+            // Keep the cross-reference index current as rewriting proceeds bottom-up, so a
+            // PARENT's own wave_peer resolution (processed immediately after, in the same
+            // recursive call — children are always rewritten before their parent above) sees
+            // this node's freshly-resolved time_dominator instead of a stale pre-rewrite
+            // snapshot with none. This is what lets a two-hop chain (a WO pushed by its OWN
+            // child WO, which was itself pushed by a horizontal wave peer belonging to another
+            // demand) resolve all the way through to the raw supply in one pass.
+            if (gid != null) woNodeByGid[gid] = result
+            return result
         }
 
         if (node["type"] == "demand" || node["type"] == "supply" || node["type"] == "purchase") {

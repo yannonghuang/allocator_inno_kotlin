@@ -259,6 +259,7 @@ class Pass2WoConsolidationTest : FunSpec({
 
         val res = consolidateByWaves(trees, data, windowDays = 30)
 
+        val d1Fg = treeOf(res.peggingTrees[0])
         val d2Fg = treeOf(res.peggingTrees[1])
         d2Fg["start_time"] shouldBe "2024-05-10"  // confirms the push actually happened (pre-existing behavior)
 
@@ -267,6 +268,18 @@ class Pass2WoConsolidationTest : FunSpec({
         d2TimeDominators.isNotEmpty() shouldBe true
         d2TimeDominators.all { it["supply_id"] == "S_RAW1_LATE" } shouldBe true
         d2TimeDominators.none { it["wo_group_id"] == "WG_RAW_D2" } shouldBe true
+        // D2's own tree was delayed by its own WG_RAW_D2 — "same demand" as the tree being viewed.
+        d2TimeDominators.all { it["demand_id"] == "D2" } shouldBe true
+
+        // D1's tree was ALSO pushed to the merged end (2024-05-10) — but the raw material that
+        // actually governs that date belongs to WG_RAW_D2, which is D2's own work order group, not
+        // D1's. The UI needs this to correctly say "delayed by a different demand's consolidated
+        // WO," not attribute it to D1 itself.
+        @Suppress("UNCHECKED_CAST")
+        val d1TimeDominators = (d1Fg["time_dominator"] as? List<Map<String, Any?>>) ?: emptyList()
+        d1TimeDominators.isNotEmpty() shouldBe true
+        d1TimeDominators.all { it["supply_id"] == "S_RAW1_LATE" } shouldBe true
+        d1TimeDominators.all { it["demand_id"] == "D2" } shouldBe true
     }
 
     test("cross-tree shared wo_group_id (F30__888-style): occurrences aggregate before bucketing") {
