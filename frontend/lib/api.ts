@@ -165,7 +165,7 @@ export async function getFeasibleDemands(caseId: number, runId: number): Promise
 }
 
 /** Demand-to-supply planning: returns committed demands (with commit_time), work orders, and planning pegging trees. */
-export type CommittedDemand = { demand_id?: string | null; customer_id?: string | null; customer?: string | null; product_id: string; location_id: string; quantity: number; requested_qty?: number | null; shortage?: number | null; is_failed?: boolean; request_time?: string | null; commit_time: string | null; commit_reason?: string | null };
+export type CommittedDemand = { demand_id?: string | null; customer_id?: string | null; customer?: string | null; product_id: string; location_id: string; quantity: number; requested_qty?: number | null; shortage?: number | null; is_failed?: boolean; request_time?: string | null; commit_time: string | null; commit_reason?: string | null; time_dominator?: DominatorRef[] | null };
 export type WorkOrder = {
   product_id: string;
   location_id: string;
@@ -230,6 +230,20 @@ export type WorkOrder = {
    *  before consolidation merged the group into a shared batch window. Always present alongside
    *  original_start_time. The consolidated batch lead = end_time − start_time. */
   original_lead_days?: number | null;
+};
+
+/** A pointer from a constrained pegging node to the OTHER node currently determining its
+ *  committed quantity or committed time — mirrors the backend's `DominatorRef` (see
+ *  services/PlanningEngine.kt). `label` is precomputed server-side; the UI never re-derives it. */
+export type DominatorRef = {
+  kind: 'bom_child' | 'sibling_wo' | 'method_alternative' | 'wave_peer' | 'shared_supply_budget' | 'resource_contention';
+  product_id?: string | null;
+  location_id?: string | null;
+  demand_id?: string | null;
+  wo_group_id?: string | null;
+  supply_id?: string | null;
+  competing_demand_ids?: string[] | null;
+  label: string;
 };
 
 /** Planning pegging tree node: demand (root) -> work_order -> ... -> supply | purchase (leaves).
@@ -309,6 +323,19 @@ export type PlanningPeggingNode = {
    *  at other locations, or no methods at all. Rendered inline in the
    *  pegging panel in place of the generic "No work orders" copy. */
   failure_explanation?: string | null;
+  /** Committed quantity at this node — always present at runtime even though it was
+   *  previously missing from this type (a pre-existing schema gap). */
+  committed_qty?: number;
+  /** "Least quantity dominates": the other node(s) currently determining this node's
+   *  committed quantity, captured inline at the planner's existing min-collapse points
+   *  (AND-sibling min, bottom-up reconcile, cross-demand shared-supply budget). Absent/empty
+   *  means nothing else currently constrains this node's quantity. */
+  quantity_dominator?: DominatorRef[];
+  /** "Latest time dominates": the other node(s) currently determining this node's committed
+   *  time, captured inline at the planner's existing max-collapse points (BOM child push,
+   *  method-alternative OR, wave consolidation). Absent/empty means nothing else currently
+   *  pushed this node's timing out. */
+  time_dominator?: DominatorRef[];
   children: PlanningPeggingNode[];
 };
 
@@ -666,6 +693,12 @@ export type PlanStatusResponse = {
     iteration?: number;
     /** Max iterations the fixed-point controller will run before giving up and falling back to single-pass trim. */
     iterations_max?: number;
+    /** Machine-readable stage id (e.g. "allocating", "contention", "committing", "consolidating", "scheduling"). Whole-run phase, distinct from current/total which only move during "committing". */
+    phase?: string;
+    /** Human-readable label for `phase`, safe to render directly. */
+    phase_label?: string;
+    /** Coarse whole-run completion estimate, 0-100. Fixed per-phase weights, not a precise measurement — use for a smoothly-advancing bar, not for ETA math. */
+    percent?: number;
   };
   result?: PlanResult;
   error?: string;

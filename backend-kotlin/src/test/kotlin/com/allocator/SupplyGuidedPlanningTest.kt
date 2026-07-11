@@ -332,4 +332,100 @@ class SupplyGuidedPlanningTest : FunSpec({
         d1Total shouldBe (10.0 plusOrMinus 1e-6)
         d2Total shouldBe (20.0 plusOrMinus 1e-6)
     }
+
+    // ── E. Intra-demand sibling contention ("diamond problem") ─────────────────
+
+    // P = make(C1, C2, C3, C4), rate 1 each — a genuine AND, all four required together.
+    // Each Ci = make(X), rate 1 — so each of the 4 siblings independently needs exactly P's
+    // own quantity of the SAME shared critical material X. Demand = 40, X supply = 48 (but a
+    // single demand's own aggregate per-lot cap for a critical material is the raw demand
+    // quantity, not the BOM-rate-amplified total — see buildReachabilityMatrix — so D1's own
+    // ceiling on X is 40, not 48).
+    val diamondConfig = mapOf<String, Any?>("purchase_allowed" to false)
+    fun diamondData() = mkData(
+        supplies = listOf(supply("X", "L", 48.0)),
+        methodMake = listOf(
+            mapOf("bom_id" to "BP", "product_id" to "P", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+            mapOf("bom_id" to "B1", "product_id" to "C1", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+            mapOf("bom_id" to "B2", "product_id" to "C2", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+            mapOf("bom_id" to "B3", "product_id" to "C3", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+            mapOf("bom_id" to "B4", "product_id" to "C4", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+        ),
+        methodBuy = listOf(
+            mapOf("product_id" to "X", "location_id" to "L", "preference" to 1),
+        ),
+        bom = listOf(
+            mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "C1", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "C2", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "C3", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "C4", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "B1", "parent_id" to "C1", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "B2", "parent_id" to "C2", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "B3", "parent_id" to "C3", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "B4", "parent_id" to "C4", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+        ),
+        demands = listOf(demand("D1", "P", "L", qty = 40.0)),
+        productlocation = listOf(
+            mapOf("product_id" to "X", "location_id" to "L", "prod_area" to "raw"),
+        ),
+    )
+
+    test("gatherAndSiblingRequests: finds all 4 AND-siblings requesting the shared critical material") {
+        val data = diamondData()
+        val alloc = buildSupplyAllocation(data["demand"]!!, data, diamondConfig)
+        val reqs = gatherAndSiblingRequests(data["demand"]!!.first(), alloc, data, diamondConfig, null)
+
+        reqs.size shouldBe 4
+        reqs.all { it.cohort == ("P" to "L") } shouldBe true
+        reqs.all { it.supplyKey == SupplyKey("X", "L") } shouldBe true
+        reqs.all { it.requestedQty == 40.0 } shouldBe true
+        reqs.map { it.branch }.toSet() shouldBe setOf("C1", "C2", "C3", "C4").map { BranchKey(it, "L") }.toSet()
+    }
+
+    test("computeAndSiblingCaps: splits D1's own 40-unit X allowance evenly, 10 per sibling") {
+        val data = diamondData()
+        val alloc = buildSupplyAllocation(data["demand"]!!, data, diamondConfig)
+        val caps = computeAndSiblingCaps(data["demand"]!!, alloc, data, diamondConfig, null)
+
+        val d1Caps = caps["D1"]
+        d1Caps shouldNotBe null
+        d1Caps!!.size shouldBe 4
+        for (child in listOf("C1", "C2", "C3", "C4")) {
+            val branchCap = d1Caps[BranchKey(child, "L")]
+            branchCap shouldNotBe null
+            branchCap!!.values.sum() shouldBe (10.0 plusOrMinus 1e-6)
+        }
+    }
+
+    test("diamond: AND-required siblings independently reaching one scarce material split fairly, not sequentially") {
+        // Sequential/greedy exploration draws C1=40 (0 left of D1's own 40-unit cap), C2=0,
+        // C3=0, C4=0 — an AND-min of 0, so P commits NOTHING despite that same 40-unit
+        // allowance being enough to give all four siblings a meaningful (10 each) share. This
+        // is the exact shape of the real F35__444 bug this session traced (a make with several
+        // AND-siblings that all route through one non-purchasable raw material). The
+        // gather-then-allocate fix (computeAndSiblingCaps) should instead give each sibling a
+        // fair, pre-computed 40/4=10-unit cap, so all four succeed at 10 and P commits 10
+        // instead of 0.
+        val data = diamondData()
+        val result = runPlanning(data, config = diamondConfig)
+        @Suppress("UNCHECKED_CAST")
+        val committed = result.output["committed_demands"] as List<Map<String, Any?>>
+        val d1Total = committed.filter { it["demand_id"] == "D1" }
+            .sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
+
+        // The core regression check: a fair split lets the demand commit a genuine partial
+        // quantity instead of zeroing out on the AND-min of an unlucky, sequentially-starved
+        // sibling.
+        (d1Total > 1e-6) shouldBe true
+        d1Total shouldBe (10.0 plusOrMinus 1e-6)
+
+        @Suppress("UNCHECKED_CAST")
+        val workOrders = result.output["work_orders"] as List<Map<String, Any?>>
+        val perChild = listOf("C1", "C2", "C3", "C4").associateWith { pid ->
+            workOrders.filter { it["product_id"] == pid }.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
+        }
+        // All four AND-siblings get a meaningful, roughly equal share — not 1 full + 3 starved.
+        perChild.values.forEach { qty -> (qty > 1e-6) shouldBe true }
+        perChild.values.forEach { qty -> qty shouldBe (10.0 plusOrMinus 1e-6) }
+    }
 })

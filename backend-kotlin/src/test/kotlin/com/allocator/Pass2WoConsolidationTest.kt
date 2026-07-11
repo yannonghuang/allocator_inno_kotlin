@@ -240,6 +240,48 @@ class Pass2WoConsolidationTest : FunSpec({
         d2Fg["start_time"] shouldBe "2024-05-10"
     }
 
+    test("wave-peer time_dominator resolves through to the raw supply beneath the winning peer") {
+        // Same shape as the "multi-wave cascade" test above, but WG_RAW_D2 (the later-arriving
+        // peer whose merged end pushes both FG batches to 2024-05-10) has its own genuine raw
+        // supply leaf beneath it. FG_D2's wave-assigned time_dominator must resolve THROUGH the
+        // WG_RAW_D2 peer down to that supply leaf — a bare pointer at WG_RAW_D2 itself would be
+        // "Delayed by: purchase RAW1@L", an intermediate WO that is itself a consequence, not a
+        // root cause (the exact bug reported against a real case: "Delayed by: move X@VIRTUAL").
+        val rawSupplyLeaf = mapOf<String, Any?>(
+            "type" to "supply", "product_id" to "RAW1", "location_id" to "L",
+            "quantity" to 300.0, "supply_id" to "S_RAW1_LATE",
+        )
+        val rawD1 = woNode("WG_RAW_D1", "RAW1", "L", "purchase", 200.0, "2024-05-01", "2024-05-08")
+        val rawD2 = woNode("WG_RAW_D2", "RAW1", "L", "purchase", 300.0, "2024-05-03", "2024-05-10", children = listOf(rawSupplyLeaf))
+        val fgD1 = woNode("WG_FG_D1", "FG1", "L", "make", 80.0, "2024-05-05", "2024-05-09", children = listOf(rawD1))
+        val fgD2 = woNode("WG_FG_D2", "FG1", "L", "make", 80.0, "2024-05-06", "2024-05-10", children = listOf(rawD2))
+        val trees = listOf(peg("D1", fgD1), peg("D2", fgD2))
+
+        val res = consolidateByWaves(trees, data, windowDays = 30)
+
+        val d1Fg = treeOf(res.peggingTrees[0])
+        val d2Fg = treeOf(res.peggingTrees[1])
+        d2Fg["start_time"] shouldBe "2024-05-10"  // confirms the push actually happened (pre-existing behavior)
+
+        @Suppress("UNCHECKED_CAST")
+        val d2TimeDominators = (d2Fg["time_dominator"] as? List<Map<String, Any?>>) ?: emptyList()
+        d2TimeDominators.isNotEmpty() shouldBe true
+        d2TimeDominators.all { it["supply_id"] == "S_RAW1_LATE" } shouldBe true
+        d2TimeDominators.none { it["wo_group_id"] == "WG_RAW_D2" } shouldBe true
+        // D2's own tree was delayed by its own WG_RAW_D2 — "same demand" as the tree being viewed.
+        d2TimeDominators.all { it["demand_id"] == "D2" } shouldBe true
+
+        // D1's tree was ALSO pushed to the merged end (2024-05-10) — but the raw material that
+        // actually governs that date belongs to WG_RAW_D2, which is D2's own work order group, not
+        // D1's. The UI needs this to correctly say "delayed by a different demand's consolidated
+        // WO," not attribute it to D1 itself.
+        @Suppress("UNCHECKED_CAST")
+        val d1TimeDominators = (d1Fg["time_dominator"] as? List<Map<String, Any?>>) ?: emptyList()
+        d1TimeDominators.isNotEmpty() shouldBe true
+        d1TimeDominators.all { it["supply_id"] == "S_RAW1_LATE" } shouldBe true
+        d1TimeDominators.all { it["demand_id"] == "D2" } shouldBe true
+    }
+
     test("cross-tree shared wo_group_id (F30__888-style): occurrences aggregate before bucketing") {
         // Two SEPARATE pegging trees (e.g. a VIRTUAL consolidation demand and a real demand)
         // referencing the SAME physical WO group, each carrying a partial slice of its quantity.

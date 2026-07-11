@@ -2,6 +2,7 @@ package com.allocator.services
 
 import org.slf4j.LoggerFactory
 import java.time.LocalDate
+import kotlin.math.min
 
 private val log = LoggerFactory.getLogger("com.allocator.SupplyGuidedPlanning")
 
@@ -435,6 +436,13 @@ data class NodeBlueprint(
      * null = supply fully covers demand (no method needed).
      */
     val method: Map<String, Any?>? = null,
+    /**
+     * Root-cause pointer(s) for why [achievable] < what was asked of this node, computed
+     * INLINE alongside the same min (AND)/waterfall (OR) arithmetic that produces [achievable]
+     * itself — not a separate reconstruction pass. Empty when this node was fully satisfied.
+     * See [nodeSketchInto] / [methodAchievableForSketch] for exactly where each entry comes from.
+     */
+    val quantityDominator: List<DominatorRef> = emptyList(),
 )
 
 typealias DemandBlueprint = Map<Pair<String, String>, NodeBlueprint>
@@ -476,6 +484,19 @@ internal fun computePlanBlueprint(
     return result
 }
 
+/** Every physical lot of (pid, lid) — each an independent OR-alternative when several exist
+ *  (per-lot fulfillment is itself an OR-group: several lots each partly cover one ask). Used
+ *  only as the terminal cause when this exact (pid, lid) has no method able to relieve it — a
+ *  genuine raw-supply bottleneck, not a (product, location) proxy. */
+private fun rawSupplyLotRefs(pid: String, lid: String, data: Map<String, List<Map<String, Any?>>>): List<DominatorRef> =
+    (data["supply"] ?: emptyList())
+        .filter { (it["product_id"] as? String)?.trim() == pid && (it["location_id"] as? String)?.trim() == lid }
+        .mapNotNull { row ->
+            val sid = (row["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            DominatorRef(kind = "bom_child", productId = pid, locationId = lid, supplyId = sid, label = "$pid@$lid")
+        }
+        .distinct()
+
 private fun nodeSketchInto(
     pid: String, lid: String, needed: Double,
     demandId: Any?,
@@ -515,18 +536,29 @@ private fun nodeSketchInto(
 
         var selectedMethod: Map<String, Any?>? = null
         var selectedAchievable = 0.0
+        var selectedDominator: List<DominatorRef> = emptyList()
 
         for (method in methods) {
-            val ma = methodAchievableForSketch(method, pid, lid, residual, demandId, allocation, data, visited, into, preferenceKb)
-            if (ma > 1e-9) {
+            val ms = methodAchievableForSketch(method, pid, lid, residual, demandId, allocation, data, visited, into, preferenceKb)
+            if (ms.achievable > 1e-9) {
                 selectedMethod = method
-                selectedAchievable = ma
+                selectedAchievable = ms.achievable
+                selectedDominator = ms.dominator
                 break
             }
         }
 
         val aq = supplyQty + selectedAchievable
-        into[key] = NodeBlueprint(achievable = aq, supplyQty = supplyQty, method = selectedMethod)
+        // Genuine shortfall at THIS node: either the chosen method itself fell short of the
+        // residual it was asked for (inherit its own dominator — already the correct AND/OR
+        // result from the recursion above, computed alongside its own achievable qty), or no
+        // method exists/contributed anything at all, in which case the terminal cause IS this
+        // (pid, lid)'s own raw supply — point at its actual physical lot(s) directly.
+        val quantityDominator = if (aq < needed - 1e-9) {
+            if (selectedMethod != null && selectedDominator.isNotEmpty()) selectedDominator
+            else rawSupplyLotRefs(pid, lid, data)
+        } else emptyList()
+        into[key] = NodeBlueprint(achievable = aq, supplyQty = supplyQty, method = selectedMethod, quantityDominator = quantityDominator)
         return aq
     } finally {
         visited.remove(key)
@@ -557,6 +589,10 @@ internal fun kbPreferenceForMethod(
     return kbPreference(pid, lid, method, null, preferenceKb)
 }
 
+/** Paired with [NodeBlueprint.quantityDominator]: the achievable qty AND, computed in the
+ *  same breath, who's to blame if it fell short of what was asked of this method. */
+private data class MethodSketchResult(val achievable: Double, val dominator: List<DominatorRef> = emptyList())
+
 // Same arithmetic as methodAchievableInto but recurses via nodeSketchInto to populate blueprint entries.
 private fun methodAchievableForSketch(
     method: Map<String, Any?>, pid: String, lid: String, needed: Double,
@@ -566,16 +602,21 @@ private fun methodAchievableForSketch(
     visited: MutableSet<Pair<String, String>>,
     into: MutableMap<Pair<String, String>, NodeBlueprint>,
     preferenceKb: PreferenceKb? = null,
-): Double {
+): MethodSketchResult {
     return when (method["type"] as? String) {
-        "purchase" -> needed
+        // Elastic on both quantity and time (can always order more / sooner) — never itself
+        // a dominator, matching the "any purchase is a consequence, never a cause" rule.
+        "purchase" -> MethodSketchResult(needed)
         "move" -> {
-            val fromLid = (method["from_location_id"] as? String)?.trim() ?: return 0.0
-            nodeSketchInto(pid, fromLid, needed, demandId, allocation, data, visited, into, preferenceKb)
+            val fromLid = (method["from_location_id"] as? String)?.trim() ?: return MethodSketchResult(0.0)
+            val ach = nodeSketchInto(pid, fromLid, needed, demandId, allocation, data, visited, into, preferenceKb)
+            // Transparent 1:1 pass-through — move adds no constraint of its own, so it inherits
+            // the source location's own already-computed dominator verbatim (whatever that is).
+            MethodSketchResult(ach, into[pid to fromLid]?.quantityDominator ?: emptyList())
         }
         "make" -> {
             val variants = variantsForMake(pid, lid, needed, method, data)
-            if (variants.isEmpty()) return 0.0
+            if (variants.isEmpty()) return MethodSketchResult(0.0)
             // Waterfall across alt_group variants — mirrors the commit phase's unified
             // waterfall (best variant by preference/KB ranking gets the full residual; only
             // spill to the next if it can't fully cover). Replaces the old equal-split-
@@ -587,10 +628,19 @@ private fun methodAchievableForSketch(
             val ranked = variants.sortedBy { (altKey, _) -> kbPreference(pid, lid, method, altKey, preferenceKb) }
             var residual = needed
             var total = 0.0
+            // OR-group: at most one dominator per alt_group variant actually tried, unioned
+            // (deduped) only from variants that fell short of what THEY were asked — mirrors
+            // exactly which variants the waterfall below actually spilled past.
+            var dominatorUnion: List<DominatorRef> = emptyList()
             for ((_, children) in ranked) {
                 if (residual <= 1e-9) break
+                val askedOfThisVariant = residual
                 if (children.isEmpty()) { total += residual; residual = 0.0; continue }
                 var variantAchievable = residual
+                // AND: exactly one child — whichever pulls variantAchievable down the most —
+                // dominates this variant. Ties keep whichever was found first (min tracking
+                // itself only ever holds one winner at a time).
+                var variantDominator: List<DominatorRef> = emptyList()
                 for (child in children) {
                     val cPid        = (child["product_id"] as? String)?.trim() ?: continue
                     val cLid        = (child["location_id"] as? String)?.trim() ?: continue
@@ -601,15 +651,352 @@ private fun methodAchievableForSketch(
                     if (cNeeded <= 1e-9) continue
                     val cAch      = nodeSketchInto(cPid, cLid, cNeeded, demandId, allocation, data, visited, into, preferenceKb)
                     val fromChild = cAch / (cNeeded / residual)
-                    if (fromChild < variantAchievable) variantAchievable = fromChild
+                    if (fromChild < variantAchievable) {
+                        variantAchievable = fromChild
+                        // Inherit the child's own already-computed dominator (recursively
+                        // resolved — may itself be an OR-group from further below) rather than
+                        // re-deriving it; fall back to a fresh self-reference only if the child
+                        // (unexpectedly) didn't carry one despite falling short.
+                        variantDominator = into[cPid to cLid]?.quantityDominator?.takeIf { it.isNotEmpty() }
+                            ?: listOf(DominatorRef(kind = "bom_child", productId = cPid, locationId = cLid, label = "$cPid@$cLid"))
+                    }
                 }
                 total += variantAchievable
                 residual -= variantAchievable
+                if (variantAchievable < askedOfThisVariant - 1e-9 && variantDominator.isNotEmpty()) {
+                    dominatorUnion = dominatorUnion + variantDominator
+                }
             }
-            total
+            MethodSketchResult(total, dominatorUnion.dedupBySupply())
         }
-        else -> 0.0
+        else -> MethodSketchResult(0.0)
     }
+}
+
+// ── Intra-demand sibling contention ("diamond problem") ─────────────────────────
+//
+// A demand's own tree can fan out into several SIMULTANEOUSLY-active branches that
+// independently reach the same scarce, critical material: AND-required BOM siblings
+// under one make method, and root-level candidates.take(cap) (rootSplitWeights,
+// PlanningEngine.kt) proportionally splitting the demand's own quantity up front.
+// Both share the property that makes gather-then-allocate tractable: the participant
+// set is fixed and known BEFORE any of them runs (unlike the ordinary sequential
+// waterfall, where whether a second candidate is even tried depends on the first
+// one's outcome). The live commit phase (planMethodSlot/plan) explores these
+// branches sequentially and greedily, so an early branch can exhaust a shared lot
+// before a later, equally-entitled sibling ever gets a look — even when the lot
+// would comfortably cover a FAIR split across all of them. This section computes
+// that fair split up front, in a separate top-down gather pass over the same
+// (already-deterministic, KB-ranked) topology the live commit phase itself walks,
+// so the live phase can enforce it as an additional per-branch cap.
+
+/** Identifies one contending branch. AND-siblings are identified by their own
+ *  (productId, locationId) alone (distinct BOM children of one AND-parent always have
+ *  distinct (pid, lid) in practice). Root-split candidates all share the demand's own
+ *  (productId, locationId) — [slot] disambiguates which top-level candidate/method a
+ *  branch represents. */
+data class BranchKey(
+    val productId: String,
+    val locationId: String,
+    val slot: String? = null,
+)
+
+/** One (contended node, branch, critical supply) request discovered by [gatherAndSiblingRequests]. */
+internal data class AndSiblingRequest(
+    /** The AND-parent's (or root demand's) own (productId, locationId) — groups branches
+     *  that are simultaneously active competitors for the same fanout. */
+    val cohort: Pair<String, String>,
+    val branch: BranchKey,
+    val supplyKey: SupplyKey,
+    val requestedQty: Double,
+)
+
+internal fun slotIdFor(candidate: WaterfallCandidate): String =
+    "${candidate.method["type"]}:${candidate.altKey
+        ?: (candidate.method["location_id"] ?: candidate.method["to_location_id"] ?: "").toString()}"
+
+/**
+ * Phase 1 — pure top-down request gathering for one demand: assumes infinite upstream
+ * supply and deterministic top-choice (KB-ranked) routing at every non-fanout point (the
+ * same simplification [nodeSketchInto] and [computeAchievableQtyMaps] already lean on —
+ * with a precomputed Preferences KB and a preference-ordered-waterfall/root-split
+ * paradigm everywhere else, a pegging tree's shape is already close to deterministic).
+ * No availability checks, no capping — just discovers who would ask for what, IF every
+ * fanout branch got everything it asked for.
+ *
+ * Returns every (cohort, branch, criticalSupply, requestedQty) tuple this demand's tree
+ * would generate. Cheap to call for demands with no critical reach at all — bails via
+ * [SupplyAllocationResult.criticalMatrix]'s already-computed byRow index.
+ */
+internal fun gatherAndSiblingRequests(
+    demand: Map<String, Any?>,
+    allocation: SupplyAllocationResult,
+    data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
+    preferenceKb: PreferenceKb?,
+): List<AndSiblingRequest> {
+    val demandId = demand["demand_id"]
+    if (allocation.criticalMatrix.byRow[demandId].isNullOrEmpty()) return emptyList()
+    val rootPid = (demand["product_id"] as? String)?.trim() ?: return emptyList()
+    val rootLid = (demand["location_id"] as? String)?.trim() ?: return emptyList()
+    val rootQty = (demand["quantity"] as? Number)?.toDouble() ?: return emptyList()
+    if (rootQty <= 1e-9) return emptyList()
+
+    val methodCfg = resolveMethodSelection(config)
+    val out = mutableListOf<AndSiblingRequest>()
+
+    fun rankedCandidates(pid: String, lid: String): List<WaterfallCandidate> {
+        val methods = getMethods(pid, lid, data)
+        if (methods.isEmpty()) return emptyList()
+        return expandWaterfallCandidates(methods, pid, demand, config, data)
+            .sortedBy { kbPreference(pid, lid, it.method, it.altKey, preferenceKb) }
+    }
+
+    // The top-ranked candidate is sometimes a structural dead end regardless of supply — most
+    // commonly a move whose source is the very (pid, lid) frame currently open one level up
+    // (e.g. 260-0141-02@2000 move-from-1000 vs 260-0141-02@1000 move-from-2000, a two-location
+    // cycle). Under "infinite supply" that candidate would still never terminate, so picking it
+    // and stopping (relying on the cycle guard) makes this whole branch silently vanish from the
+    // gather pass instead of falling through to the next candidate — exactly what the live
+    // commit phase's own cycle-aware waterfall does (a blocked candidate never ends the search).
+    // Only a one-hop lookahead: deeper/indirect cycles still terminate via the recursive
+    // visited-guard inside accumulate/discover, same as before.
+    fun firstFeasibleCandidate(pid: String, lid: String, visited: Set<Pair<String, String>>): WaterfallCandidate? =
+        rankedCandidates(pid, lid).firstOrNull { cand ->
+            if (cand.method["type"] != "move") return@firstOrNull true
+            val fromLid = (cand.method["from_location_id"] as? String)?.trim() ?: return@firstOrNull true
+            (pid to fromLid) !in visited
+        }
+
+    // Full recursive tally of everything ONE branch's own subtree needs — AND children
+    // summed (they're all mandatory, no alternative to choose among), the single
+    // deterministic top-choice OR path elsewhere. Terminates at critical leaves (a
+    // critical material's existing supply is its only source — nothing to recurse into).
+    fun accumulate(pid: String, lid: String, needed: Double, branch: BranchKey, cohort: Pair<String, String>, visited: MutableSet<Pair<String, String>>) {
+        if (needed <= 1e-9) return
+        val key = pid to lid
+        if (!visited.add(key)) return
+        try {
+            val sk = SupplyKey(pid, lid)
+            if (sk in allocation.criticalMatrix.byColumn) {
+                out.add(AndSiblingRequest(cohort, branch, sk, needed))
+                return
+            }
+            val best = firstFeasibleCandidate(pid, lid, visited) ?: return
+            when (best.method["type"]) {
+                "move" -> {
+                    val fromLid = (best.method["from_location_id"] as? String)?.trim() ?: return
+                    accumulate(pid, fromLid, needed, branch, cohort, visited)
+                }
+                "make" -> {
+                    val mLoc = (best.method["location_id"] as? String)?.trim() ?: lid
+                    val variants = variantsForMake(pid, mLoc, needed, best.method, data)
+                    val chosen = if (best.altKey != null) variants.filter { it.first == best.altKey } else variants
+                    for ((_, children) in chosen) {
+                        for (child in children) {
+                            val cPid = (child["product_id"] as? String)?.trim() ?: continue
+                            val cLid = (child["location_id"] as? String)?.trim() ?: continue
+                            val cQty = (child["quantity"] as? Number)?.toDouble() ?: continue
+                            if (cQty <= 1e-9) continue
+                            accumulate(cPid, cLid, cQty, branch, cohort, visited)
+                        }
+                    }
+                }
+                // "purchase": elastic (can always order more/sooner) — never itself a
+                // contention source, matches the sketch phase's own treatment.
+            }
+        } finally {
+            visited.remove(key)
+        }
+    }
+
+    // Walks the same topology looking for fanout points (AND-parent with >1 child, or the
+    // root's own rootSplitWeights split). At each one found: computes each branch's own
+    // target qty (rate-based for AND, KB-weighted for root-split — mirroring
+    // PlanningEngine.kt's rootSplitWeights formula exactly), fires one fresh [accumulate]
+    // per branch, and keeps discovering deeper, independent fanouts nested within each
+    // branch's own subtree (each nested fanout gets its own, separate cohort — whether an
+    // outer branch's cap should also constrain a nested inner one is deliberately left
+    // uncomposed in v1; see plan doc).
+    //
+    // `discover` and `routeChildrenForDiscovery` mutually recurse, so both are declared as
+    // lateinit lambdas (plain local `fun`s only see declarations lexically before them —
+    // no forward reference — so genuine two-way local-function recursion needs this).
+    lateinit var discover: (String, String, Double, Boolean, MutableSet<Pair<String, String>>) -> Unit
+    lateinit var routeChildrenForDiscovery: (WaterfallCandidate, String, String, Double) -> Unit
+
+    discover = discover@{ pid: String, lid: String, needed: Double, isRoot: Boolean, visited: MutableSet<Pair<String, String>> ->
+        if (needed <= 1e-9) return@discover
+        val key = pid to lid
+        if (!visited.add(key)) return@discover
+        try {
+            val sk = SupplyKey(pid, lid)
+            if (sk in allocation.criticalMatrix.byColumn) return@discover  // terminal — no fanout beneath a raw critical leaf
+
+            val candidates = rankedCandidates(pid, lid)
+            if (candidates.isEmpty()) return@discover
+            val cap = methodCfg.maxMethods.coerceAtMost(candidates.size)
+
+            if (isRoot && cap > 1) {
+                val cohort = key
+                val top = candidates.take(cap)
+                val scored = preferenceKb?.let { reconstructNodeScores(pid, lid, top, it) }
+                    ?.let { s -> val sum = s.sum(); if (sum > 1e-9) s.map { it / sum } else null }
+                val weights = scored ?: List(top.size) { 1.0 / top.size }
+                for ((idx, cand) in top.withIndex()) {
+                    val target = weights[idx] * needed
+                    if (target <= 1e-9) continue
+                    val branch = BranchKey(pid, lid, slotIdFor(cand))
+                    accumulate(pid, lid, target, branch, cohort, mutableSetOf())
+                    // Step directly into this candidate's own children for nested-fanout
+                    // discovery — cannot re-enter discover(pid, lid, ...) here, that would
+                    // just re-trigger this same root-split fanout again.
+                    routeChildrenForDiscovery(cand, pid, lid, target)
+                }
+                return@discover
+            }
+
+            // Not a fanout here: follow the single deterministic top choice, but keep
+            // looking for fanouts further below. Skips a top choice that would immediately
+            // cycle back to an already-open frame (see firstFeasibleCandidate) — otherwise
+            // a cyclic top preference silently truncates discovery right here, same bug as
+            // in accumulate.
+            val best = firstFeasibleCandidate(pid, lid, visited) ?: return@discover
+            when (best.method["type"]) {
+                "move" -> {
+                    val fromLid = (best.method["from_location_id"] as? String)?.trim() ?: return@discover
+                    discover(pid, fromLid, needed, false, visited)
+                }
+                "make" -> {
+                    val mLoc = (best.method["location_id"] as? String)?.trim() ?: lid
+                    val variants = variantsForMake(pid, mLoc, needed, best.method, data)
+                    val chosen = if (best.altKey != null) variants.filter { it.first == best.altKey } else variants
+                    for ((_, children) in chosen) {
+                        val isAndGroup = children.size > 1
+                        if (isAndGroup) {
+                            val cohort = key
+                            for (child in children) {
+                                val cPid = (child["product_id"] as? String)?.trim() ?: continue
+                                val cLid = (child["location_id"] as? String)?.trim() ?: continue
+                                val cQty = (child["quantity"] as? Number)?.toDouble() ?: continue
+                                if (cQty <= 1e-9) continue
+                                val branch = BranchKey(cPid, cLid)
+                                accumulate(cPid, cLid, cQty, branch, cohort, mutableSetOf())
+                                discover(cPid, cLid, cQty, false, mutableSetOf())
+                            }
+                        } else {
+                            for (child in children) {
+                                val cPid = (child["product_id"] as? String)?.trim() ?: continue
+                                val cLid = (child["location_id"] as? String)?.trim() ?: continue
+                                val cQty = (child["quantity"] as? Number)?.toDouble() ?: continue
+                                if (cQty <= 1e-9) continue
+                                discover(cPid, cLid, cQty, false, visited)
+                            }
+                        }
+                    }
+                }
+            }
+        } finally {
+            visited.remove(key)
+        }
+    }
+
+    routeChildrenForDiscovery = routeChildrenForDiscovery@{ candidate: WaterfallCandidate, pid: String, lid: String, needed: Double ->
+        when (candidate.method["type"]) {
+            "move" -> {
+                val fromLid = (candidate.method["from_location_id"] as? String)?.trim() ?: return@routeChildrenForDiscovery
+                discover(pid, fromLid, needed, false, mutableSetOf())
+            }
+            "make" -> {
+                val mLoc = (candidate.method["location_id"] as? String)?.trim() ?: lid
+                val variants = variantsForMake(pid, mLoc, needed, candidate.method, data)
+                val chosen = if (candidate.altKey != null) variants.filter { it.first == candidate.altKey } else variants
+                for ((_, children) in chosen) {
+                    for (child in children) {
+                        val cPid = (child["product_id"] as? String)?.trim() ?: continue
+                        val cLid = (child["location_id"] as? String)?.trim() ?: continue
+                        val cQty = (child["quantity"] as? Number)?.toDouble() ?: continue
+                        if (cQty <= 1e-9) continue
+                        discover(cPid, cLid, cQty, false, mutableSetOf())
+                    }
+                }
+            }
+        }
+    }
+
+    discover(rootPid, rootLid, rootQty, true, mutableSetOf())
+    return out
+}
+
+/**
+ * Phase 2 — per-(demand, cohort, critical supply) fair allocation among contending
+ * branches discovered by [gatherAndSiblingRequests]. Reuses [allocate] — the same
+ * fair-split primitive already used cross-demand — one level deeper, within a single
+ * demand's own tree.
+ *
+ * Returns demandId → branch → lotKey → capped qty, ready to slice per-demand and thread
+ * into [legacyCommit] as `andSiblingCaps`.
+ */
+internal fun computeAndSiblingCaps(
+    demands: List<Map<String, Any?>>,
+    allocation: SupplyAllocationResult,
+    data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
+    preferenceKb: PreferenceKb?,
+    /** Optional per-demand progress callback (index 1-based, total demand count) — this is the
+     *  single most expensive step in a large plan's pre-processing (a full BOM gather walk per
+     *  demand), so it gets its own sub-progress rather than reporting only once at entry/exit. */
+    onDemandProcessed: ((Int, Int) -> Unit)? = null,
+): Map<Any?, Map<BranchKey, Map<String, Double>>> {
+    val result = mutableMapOf<Any?, Map<BranchKey, Map<String, Double>>>()
+    for ((idx, demand) in demands.withIndex()) {
+        val demandId = demand["demand_id"] ?: continue
+        val requests = gatherAndSiblingRequests(demand, allocation, data, config, preferenceKb)
+        onDemandProcessed?.invoke(idx + 1, demands.size)
+        if (requests.isEmpty()) continue
+        val demandBudgets = allocation.perLotBudgets[demandId] ?: emptyMap()
+        val branchCaps = mutableMapOf<BranchKey, MutableMap<String, Double>>()
+
+        for ((cohortAndSupply, group) in requests.groupBy { it.cohort to it.supplyKey }) {
+            val sk = cohortAndSupply.second
+            val byBranch = group.groupBy { it.branch }
+            if (byBranch.size < 2) continue  // no contention: only one branch reaches this supply
+
+            val prefix = "${sk.productId}|${sk.locationId}|"
+            val lotEntries = demandBudgets.entries.filter { it.key.startsWith(prefix) }.map { it.key to it.value }
+            val availableAgg = lotEntries.sumOf { it.second }
+            if (availableAgg <= 1e-9) continue
+
+            val candidates = byBranch.map { (branch, reqs) ->
+                AllocationCandidate(demandId = branch, neededQty = reqs.sumOf { it.requestedQty }, priority = 0)
+            }
+            // Mode "demand_qty" (the default) gracefully falls back to proportional-by-
+            // neededQty here — AllocationCandidate.demandQty is deliberately left unset
+            // (0.0) since these candidates are branches of ONE demand, not competing
+            // demands; splitting by each branch's own need is exactly the right semantics.
+            val shares = allocate(candidates, availableAgg, allocation.sgConfig.allocationMode)
+
+            // Known v1 limitation: projects one flat ratio onto every one of the demand's
+            // existing per-lot entries for this supply key — doesn't re-check per-lot date
+            // eligibility per branch.
+            for ((branch, share) in shares) {
+                val b = branch as? BranchKey ?: continue
+                if (share <= 1e-9) continue
+                val ratio = share / availableAgg
+                val m = branchCaps.getOrPut(b) { mutableMapOf() }
+                for ((lotKey, lotQty) in lotEntries) {
+                    val cap = lotQty * ratio
+                    // A branch key can legitimately recur across independent cohorts (e.g. a
+                    // shared component appearing under two different AND-parents); take the
+                    // tighter of the two rather than summing — summing could let a branch's
+                    // effective cap exceed what any single cohort's fair split actually granted.
+                    m[lotKey] = m[lotKey]?.let { min(it, cap) } ?: cap
+                }
+            }
+        }
+        if (branchCaps.isNotEmpty()) result[demandId] = branchCaps
+    }
+    return result
 }
 
 // ── Post-planning trace ─────────────────────────────────────────────────────────

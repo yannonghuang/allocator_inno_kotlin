@@ -1,8 +1,8 @@
 'use client';
 
-import React, { startTransition, useMemo, useState } from 'react';
-import type { PlanningPeggingEntry, PlanningPeggingNode } from '@/lib/api';
-import { PlanningPeggingTreeView } from './PlanningPeggingTreeView';
+import React, { startTransition, useState } from 'react';
+import type { DominatorRef, PlanningPeggingEntry, PlanningPeggingNode } from '@/lib/api';
+import { DominatorLink, PlanningPeggingTreeView } from './PlanningPeggingTreeView';
 
 export type SinglePeggingTreePanelProps = {
   tree: PlanningPeggingNode;
@@ -15,15 +15,17 @@ export type SinglePeggingTreePanelProps = {
   /** Full planning_pegging list — resolves "consolidated_*" supply nodes back
    *  to the original per-demand trees that fed the consolidation. */
   planningPegging: PlanningPeggingEntry[];
+  /** Jump straight to a raw supply's own Breakdown view — the destination for dominator links
+   *  that carry a supply_id (the vast majority; every dominator resolves to a genuine raw
+   *  supply lot by design). Omitted refs (e.g. a cross-demand shared_supply_budget tag with no
+   *  single lot) fall back to the same-tree search below instead. */
+  onNavigateToSupply?: (supplyId: string) => void;
 };
 
 /** A single demand's or single work order's pegging tree, with search,
- *  critical-path highlighting, and a "why method" explanation toggle — the
+ *  quantity/time-dominator links, and a "why method" explanation toggle — the
  *  one view used everywhere a single (non-consolidated) pegging tree is
- *  shown. Starts fully collapsed (only the root row shows) — the dominator
- *  sub-tree (critical path) is still gold-highlighted once expanded, but
- *  isn't auto-expanded, since on a long single-chain tree that would expand
- *  almost the whole thing and defeat "collapsed by default".
+ *  shown. Starts fully collapsed (only the root row shows).
  *
  *  Give this component a `key` tied to the identity of what's being viewed
  *  (demand id / WO row key) so React remounts it — and resets all its
@@ -33,6 +35,7 @@ export function SinglePeggingTreePanel({
   contextDemandId,
   workOrderRootQty,
   planningPegging,
+  onNavigateToSupply,
 }: SinglePeggingTreePanelProps): JSX.Element {
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [explanationExpanded, setExplanationExpanded] = useState<Set<string>>(() => new Set());
@@ -41,72 +44,49 @@ export function SinglePeggingTreePanel({
   const [matchPath, setMatchPath] = useState<string | null>(null);
   const [matchIndex, setMatchIndex] = useState(0);
 
-  // Critical path = the dominator SUB-TREE of the pegging tree.
-  //   - AND junction (work_order parents): single AND-min child.
-  //     Planner pre-flags it via is_bottleneck / is_root_bottleneck;
-  //     break ties by smallest committed_qty/quantity ratio, then
-  //     tree order. If no direct child is flagged but a descendant
-  //     is, descend through the transit child with smallest ratio
-  //     (method WO between BOM levels carries no flag).
-  //   - OR junction (demand parents, alternative paths): every
-  //     contributing child (qty>0 OR committed_qty>0) is a
-  //     dominator. The path BRANCHES.
-  // Mirrors the backend `traceCriticalPath` Kotlin helper exactly.
-  const criticalPathSet = useMemo(() => {
-    const result = new Set<string>();
-    const hasFlaggedDescendant = (n: PlanningPeggingNode): boolean => {
-      if (n.is_bottleneck || n.is_root_bottleneck) return true;
-      return (n.children ?? []).some(hasFlaggedDescendant);
-    };
-    const ratio = (c: PlanningPeggingNode): number => {
-      const q = Number(c.quantity ?? 0);
-      const cq = Number((c as { committed_qty?: number | null }).committed_qty ?? q);
-      return q < 1e-9 ? 0 : cq / q;
-    };
-    const contributed = (c: PlanningPeggingNode): boolean => {
-      const q = Number(c.quantity ?? 0);
-      const cq = Number((c as { committed_qty?: number | null }).committed_qty ?? q);
-      return q > 1e-9 || cq > 1e-9;
-    };
-    const relationOf = (n: PlanningPeggingNode): 'and' | 'or' => {
-      const explicit = (n as { children_relation?: string | null }).children_relation;
-      if (explicit === 'and' || explicit === 'or') return explicit;
-      return n.type === 'work_order' ? 'and' : 'or';
-    };
-    const walk = (n: PlanningPeggingNode | null, path: string): void => {
-      if (!n) return;
-      if ((n as { consolidated_consumer?: boolean }).consolidated_consumer) return;
-      result.add(path);
-      const kids = n.children ?? [];
-      if (kids.length === 0) return;
-      const contributingKids = kids.map((c, i) => ({ c, i })).filter(({ c }) => contributed(c));
-      if (contributingKids.length === 0) return;
-      if (relationOf(n) === 'or') {
-        contributingKids.forEach(({ c, i }) => walk(c, `${path}-${i}`));
-        return;
-      }
-      const flagged = contributingKids.filter(({ c }) => c.is_bottleneck || c.is_root_bottleneck);
-      let pick: { c: PlanningPeggingNode; i: number } | null = null;
-      if (flagged.length > 0) {
-        flagged.sort((a, b) => {
-          const ra = ratio(a.c); const rb = ratio(b.c);
-          return Math.abs(ra - rb) > 1e-9 ? ra - rb : a.i - b.i;
-        });
-        pick = flagged[0];
-      } else {
-        const transit = contributingKids.filter(({ c }) => hasFlaggedDescendant(c));
-        if (transit.length === 0) return;
-        transit.sort((a, b) => {
-          const ra = ratio(a.c); const rb = ratio(b.c);
-          return Math.abs(ra - rb) > 1e-9 ? ra - rb : a.i - b.i;
-        });
-        pick = transit[0];
-      }
-      walk(pick.c, `${path}-${pick.i}`);
-    };
-    walk(tree, '0');
-    return result;
-  }, [tree]);
+  // Locates the node a DominatorRef points at, WITHIN THIS tree — the common case (a BOM
+  // sibling, a method alternative, a bottom-up child, all live in the same demand's pegging).
+  // Cross-tree refs (e.g. shared_supply_budget naming a different competing demand, or a
+  // wave_peer WO that belongs to another demand) aren't findable here; the caller degrades
+  // gracefully (the click simply does nothing) rather than attempting a page-level jump —
+  // see PlanningPeggingTreeView's DominatorLink, which still shows the label either way.
+  const findNodePath = (node: PlanningPeggingNode, ref: DominatorRef, path: string): string | null => {
+    const matches =
+      (ref.wo_group_id != null && node.wo_group_id === ref.wo_group_id) ||
+      (ref.supply_id != null && (node as { supply_id?: string | null }).supply_id === ref.supply_id) ||
+      (ref.product_id != null && node.product_id === ref.product_id &&
+        (ref.location_id == null || node.location_id === ref.location_id) &&
+        (ref.demand_id == null || node.demand_id === ref.demand_id || node.type !== 'demand'));
+    if (matches) return path;
+    const kids = node.children ?? [];
+    for (let i = 0; i < kids.length; i++) {
+      const found = findNodePath(kids[i], ref, `${path}-${i}`);
+      if (found) return found;
+    }
+    return null;
+  };
+
+  const handleDominatorClick = (ref: DominatorRef) => {
+    // Every dominator resolves to a genuine raw supply lot by design (see the backend's
+    // rawDominatorRefs) — jump straight to that supply's own Breakdown view rather than
+    // scrolling within this tree, where the raw leaf is often deeply nested and hard to read
+    // in context. Only a ref with no supply_id (e.g. a cross-demand shared_supply_budget tag)
+    // falls back to searching this tree.
+    if (ref.supply_id && onNavigateToSupply) {
+      onNavigateToSupply(ref.supply_id);
+      return;
+    }
+    const found = findNodePath(tree, ref, '0');
+    if (!found) return;
+    setMatchPath(found);
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      const parts = found.split('-');
+      for (let i = 1; i <= parts.length; i++) next.add(parts.slice(0, i).join('-'));
+      next.add(found);
+      return next;
+    });
+  };
 
   const runSearch = (query: string) => {
     const q = query.trim().toLowerCase();
@@ -200,8 +180,37 @@ export function SinglePeggingTreePanel({
     });
   };
 
+  // Defensive dedup by supply identity (the backend already dedupes new pegging trees the same
+  // way, but this also cleans up any already-computed run stored before that fix). Falls back
+  // to (kind, product, location) for the rare ref with no supply_id at all.
+  const dedupBySupply = (refs: DominatorRef[]): DominatorRef[] => {
+    const seen = new Set<string>();
+    return refs.filter((r) => {
+      const key = r.supply_id ?? `${r.kind}|${r.product_id}|${r.location_id}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  };
+  const rootQtyDominators = dedupBySupply(tree.quantity_dominator ?? []);
+  const rootTimeDominators = dedupBySupply(tree.time_dominator ?? []);
+
   return (
     <>
+      {(rootQtyDominators.length > 0 || rootTimeDominators.length > 0) && (
+        <div style={{
+          marginBottom: '0.5rem', padding: '6px 8px', background: '#1c1c1e',
+          border: '1px solid #3d3d40', borderRadius: 4,
+          display: 'flex', flexDirection: 'column', gap: 4, fontSize: '0.78rem',
+        }}>
+          {rootQtyDominators.map((d, i) => (
+            <DominatorLink key={`rq-${i}`} kind="quantity" dominator={d} onClick={handleDominatorClick} contextDemandId={contextDemandId ?? tree.demand_id} />
+          ))}
+          {rootTimeDominators.map((d, i) => (
+            <DominatorLink key={`rt-${i}`} kind="time" dominator={d} onClick={handleDominatorClick} contextDemandId={contextDemandId ?? tree.demand_id} />
+          ))}
+        </div>
+      )}
       <div style={{
         display: 'flex', alignItems: 'center', gap: 6,
         marginTop: '0.25rem', marginBottom: '0.5rem',
@@ -263,7 +272,6 @@ export function SinglePeggingTreePanel({
           }))}
           matchPath={matchPath}
           matchPaths={matchPaths}
-          criticalPathSet={criticalPathSet}
           explanationExpanded={explanationExpanded}
           onToggleExplanation={(p) => startTransition(() => setExplanationExpanded((prev) => {
             const next = new Set(prev);

@@ -2,15 +2,15 @@
 
 import React, { useRef, useEffect } from 'react';
 import { useTranslations } from 'next-intl';
-import type { PlanningPeggingNode } from '@/lib/api';
+import type { DominatorRef, PlanningPeggingNode } from '@/lib/api';
 import { qtyFmt } from '@/app/lib/format';
 
 /** Renders a planning_pegging tree (demand → work_order → supply | purchase)
  *  using the same node visuals the planPegging slide-in uses. All advanced
- *  features (search highlight, critical-path badges, consolidated-supply
- *  unfolding, "why method" expand) are wired through optional props so a
- *  caller that doesn't need them can pass nothing and still get a working
- *  tree. */
+ *  features (search highlight, quantity/time-dominator links,
+ *  consolidated-supply unfolding, "why method" expand) are wired through
+ *  optional props so a caller that doesn't need them can pass nothing and
+ *  still get a working tree. */
 export type PlanningPeggingTreeProps = {
   tree: PlanningPeggingNode;
   /** Path expansion state; lifted to the caller so external buttons (search
@@ -22,8 +22,6 @@ export type PlanningPeggingTreeProps = {
   matchPath?: string | null;
   /** Every search match (subtle gold). */
   matchPaths?: string[];
-  /** Paths on the critical path (bottleneck / root-cause / transit). */
-  criticalPathSet?: Set<string>;
 
   /** "Why method" panel expand state + toggle. When omitted, the
    *  explanation is never shown. */
@@ -61,7 +59,6 @@ export function PlanningPeggingTreeView(props: PlanningPeggingTreeProps): JSX.El
       onToggle={props.onToggle}
       matchPath={props.matchPath}
       matchPaths={props.matchPaths}
-      criticalPathSet={props.criticalPathSet}
       explanationExpanded={props.explanationExpanded}
       onToggleExplanation={props.onToggleExplanation}
       workOrderRootQty={props.workOrderRootQty}
@@ -79,10 +76,66 @@ type NodeProps = Omit<PlanningPeggingTreeProps, 'tree'> & {
   xlink: boolean;
 };
 
+/** "Quantity limited by" / "Delayed by" link — the mechanical, local replacement for the old
+ *  critical-path highlight: instead of pre-computing and highlighting a whole dominator
+ *  sub-tree, each constrained node just names the ONE other node currently responsible for
+ *  its committed qty/time. Clicking follows the chain one hop; the user can click again on
+ *  the node it lands on to keep walking it back to the root cause. */
+export function DominatorLink({
+  kind, dominator, onClick, contextDemandId,
+}: {
+  kind: 'quantity' | 'time';
+  dominator: DominatorRef;
+  onClick?: (ref: DominatorRef) => void;
+  /** demand_id of the pegging currently being viewed. Cross-demand WO consolidation (wave
+   *  batching) can shift a WO's timing because of ANOTHER demand's own consolidated work
+   *  order — when dominator.demand_id is set and differs from this, the true cause isn't the
+   *  demand on screen, so it's flagged distinctly rather than looking like a same-tree cause. */
+  contextDemandId?: string | null;
+}): JSX.Element {
+  const prefix = kind === 'quantity' ? 'Qty limited by' : 'Delayed by';
+  const color = kind === 'quantity' ? '#facc15' : '#38bdf8';
+  const isOtherDemand = dominator.demand_id != null && contextDemandId != null && dominator.demand_id !== contextDemandId;
+  const content = (
+    <>
+      <span style={{ color: '#71717a' }}>{prefix}:</span> {dominator.label}
+      {isOtherDemand && (
+        <span
+          style={{
+            marginLeft: 6, fontSize: '0.72em', color: '#f472b6',
+            border: '1px solid rgba(244,114,182,0.4)', borderRadius: 4, padding: '0 4px',
+          }}
+        >
+          via {dominator.demand_id}
+        </span>
+      )}
+    </>
+  );
+  const title = isOtherDemand
+    ? `${dominator.label} — from a consolidated work order belonging to demand ${dominator.demand_id}, not this one`
+    : dominator.label;
+  if (!onClick) {
+    return <span style={{ color }} title={title}>{content}</span>;
+  }
+  return (
+    <button
+      type="button"
+      onClick={(e) => { e.stopPropagation(); onClick(dominator); }}
+      style={{
+        background: 'none', border: 'none', padding: 0, cursor: 'pointer',
+        color, textDecoration: 'underline', textAlign: 'left', font: 'inherit',
+      }}
+      title={title}
+    >
+      {content}
+    </button>
+  );
+}
+
 function NodeView({
   node, path, depth, xlink,
   expanded, onToggle,
-  matchPath, matchPaths, criticalPathSet,
+  matchPath, matchPaths,
   explanationExpanded, onToggleExplanation,
   workOrderRootQty, contextDemandId,
   consolidatedSourceResolver, hideLotCount,
@@ -255,11 +308,6 @@ function NodeView({
 
   const isActiveMatch = matchPath === path;
   const isAnyMatch = (matchPaths ?? []).includes(path);
-  const onCriticalPath = (criticalPathSet ?? new Set<string>()).has(path);
-  const isTransitOnPath = onCriticalPath
-    && path !== '0'
-    && !node.is_bottleneck
-    && !node.is_root_bottleneck;
 
   const explanationPath = `explain-${path}`;
   const isExplanationOpen = (explanationExpanded ?? new Set<string>()).has(explanationPath);
@@ -290,18 +338,8 @@ function NodeView({
             ? 'rgba(250, 204, 21, 0.28)'
             : isAnyMatch
               ? 'rgba(250, 204, 21, 0.12)'
-              : (onCriticalPath && node.is_root_bottleneck)
-                ? 'rgba(248, 113, 113, 0.12)'
-                : (onCriticalPath && (node.is_bottleneck || isTransitOnPath))
-                  ? 'rgba(250, 204, 21, 0.08)'
-                  : depth % 2 === 0 ? 'rgba(255,255,255,0.04)' : 'transparent',
-          border: isActiveMatch
-            ? '1px solid #facc15'
-            : (onCriticalPath && node.is_root_bottleneck)
-              ? '1px solid rgba(248, 113, 113, 0.55)'
-              : (onCriticalPath && (node.is_bottleneck || isTransitOnPath))
-                ? '1px solid rgba(250, 204, 21, 0.55)'
-                : 'none',
+              : depth % 2 === 0 ? 'rgba(255,255,255,0.04)' : 'transparent',
+          border: isActiveMatch ? '1px solid #facc15' : 'none',
           borderRadius: 4,
           color: '#e4e4e7',
           cursor: expandable ? 'pointer' : 'default',
@@ -311,24 +349,6 @@ function NodeView({
         <span style={{ width: 14, flexShrink: 0 }}>{expandable ? (isExpanded ? '▼' : '▶') : '·'}</span>
         <span style={{ width: 18, flexShrink: 0, fontSize: '0.9em', color: typeColor }} title={typeLabel}>{icon}</span>
         <span style={{ flex: 1, color: typeColor }}>{label}</span>
-        {onCriticalPath && node.is_bottleneck && (
-          <span
-            title="瓶颈 (supply-side limiter on critical path): 此子节点的供应链(BOM/库存/子配方)无法满足需求 — 其首轮可达量与需求量之比在AND兄弟中最小,通过MIN(子份额)封顶父节点的可达量。属供应侧约束。修复方向: 增加库存、启用采购、补充方法行(method_make/move/buy)、或解除更深处配方的阻塞。"
-            style={{ fontSize: '0.7em', color: '#facc15', background: 'rgba(250, 204, 21, 0.16)', padding: '1px 6px', borderRadius: 3, flexShrink: 0 }}
-          >瓶颈</span>
-        )}
-        {onCriticalPath && node.is_root_bottleneck && (
-          <span
-            title="根因 (demand-side allocation origin on critical path): 在iter-0合并阶段,该需求与其他需求竞争此叶子时分到的份额相对其需求量最紧 — 即同一AND层级中, 该需求的(份额/需求)比率最小。与供应是否充足无关 — 即使供应充足,本需求在此叶子上的配额最先吃紧。修复方向: 调整本需求优先级、改变 allocation_mode (fair/proportional/priority_first)、改变合并 period_days、或减少其他需求在此叶子的竞争压力。"
-            style={{ fontSize: '0.7em', color: '#fff', background: 'rgba(220, 38, 38, 0.85)', padding: '1px 6px', borderRadius: 3, flexShrink: 0, fontWeight: 700 }}
-          >根因</span>
-        )}
-        {isTransitOnPath && (
-          <span
-            title="关键路径上的中转节点 (Critical-path transit): 此节点本身不是短缺起源 (无 瓶颈/根因 标志)，但它在从需求到起源的支配链上。"
-            style={{ fontSize: '0.7em', color: '#facc15', background: 'rgba(250, 204, 21, 0.16)', padding: '1px 6px', borderRadius: 3, flexShrink: 0 }}
-          >★ 关键路径</span>
-        )}
       </button>
       {node.type === 'work_order' && node.method_choice_explanation && onToggleExplanation && (
         <div style={{ marginTop: 4, marginLeft: 4, fontSize: '0.75rem', color: '#a1a1aa' }}>
@@ -379,7 +399,6 @@ function NodeView({
                   onToggle={onToggle}
                   matchPath={matchPath}
                   matchPaths={matchPaths}
-                  criticalPathSet={criticalPathSet}
                   explanationExpanded={explanationExpanded}
                   onToggleExplanation={onToggleExplanation}
                   workOrderRootQty={null}
@@ -416,7 +435,6 @@ function NodeView({
                   onToggle={onToggle}
                   matchPath={matchPath}
                   matchPaths={matchPaths}
-                  criticalPathSet={criticalPathSet}
                   explanationExpanded={explanationExpanded}
                   onToggleExplanation={onToggleExplanation}
                   workOrderRootQty={null}
