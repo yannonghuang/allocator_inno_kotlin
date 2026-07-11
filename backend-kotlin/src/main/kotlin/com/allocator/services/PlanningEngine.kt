@@ -1261,6 +1261,12 @@ internal fun planMethodSlot(
     demandBlueprint: DemandBlueprint? = null,
     preferenceKb: PreferenceKb? = null,
     competingDemands: Map<Pair<String, String>, List<String>>? = null,
+    /** See [plan]'s doc — the whole per-demand intra-demand sibling-contention table. */
+    andSiblingCaps: Map<BranchKey, Map<String, Double>>? = null,
+    /** See [plan]'s doc — active cap for the branch this call is currently inside, if any. */
+    branchLotCap: Map<String, Double>? = null,
+    /** See [plan]'s doc — paired, never-restored, per-branch consumption tally. */
+    branchConsumed: MutableMap<String, Double>? = null,
 ): MethodSlotResult {
     val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
     val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
@@ -1361,11 +1367,26 @@ internal fun planMethodSlot(
             // Inherit the originating demand's customer so customer-specific constraints
             // apply to sub-components, not just the finished good.
             "customer_id" to demand["customer_id"], "customer" to demand["customer"])
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, competingDemands = competingDemands)
+        // Intra-demand sibling contention (the "diamond" fix): if this child is one of an
+        // AND-parent's simultaneously-active siblings that Phase 2 (computeAndSiblingCaps)
+        // found contending for a shared critical material, start a fresh per-branch cap and
+        // consumption tally for it. Otherwise inherit whatever branch cap this call is
+        // already inside (an ordinary, non-contending pass-through).
+        val cPid = (c["product_id"] as? String)?.trim() ?: ""
+        val cLid = (c["location_id"] as? String)?.trim() ?: ""
+        val childAndCap = andSiblingCaps?.get(BranchKey(cPid, cLid))
+        val cBranchLotCap = childAndCap ?: branchLotCap
+        val cBranchConsumed = if (childAndCap != null) mutableMapOf<String, Double>() else branchConsumed
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, competingDemands = competingDemands, andSiblingCaps = andSiblingCaps, branchLotCap = cBranchLotCap, branchConsumed = cBranchConsumed)
+        // Prefer the unrounded "quantity_precise" (see committedRow's doc) over the rounded
+        // "quantity" — this feeds the AND-min ratio (computeRawAchievable) below, and reading
+        // the rounded value here would let a genuinely-achieved fractional child (e.g. 0.4999
+        // out of 0.5 needed) register as a hard 0, collapsing the whole AND-group even though
+        // the child came within a rounding hair of fully succeeding.
         val effectiveQty = solvedList.sumOf { s ->
             val r = s["commit_reason"] as? String
             if (r == "cycle_stopped" || r == "cycle_detected") 0.0
-            else if (!isHardPlanningFailure(r)) (s["quantity"] as? Number)?.toDouble() ?: 0.0
+            else if (!isHardPlanningFailure(r)) ((s["quantity_precise"] as? Number) ?: (s["quantity"] as? Number))?.toDouble() ?: 0.0
             else 0.0
         }
         val cTimes = solvedList.mapNotNull { s -> parseDate(s["commit_time"] as? String) }
@@ -1463,6 +1484,14 @@ internal fun planMethodSlot(
                 if (initialBudget != null) {
                     for (key in budget.keys) {
                         val cap = initialBudget[key] ?: continue
+                        val v = budget[key]
+                        if (v != null && v > cap) budget[key] = cap
+                    }
+                }
+                // Same defensive clamp, one level narrower: this branch's own fair-share cap.
+                if (branchLotCap != null) {
+                    for (key in budget.keys) {
+                        val cap = branchLotCap[key] ?: continue
                         val v = budget[key]
                         if (v != null && v > cap) budget[key] = cap
                     }
@@ -1727,7 +1756,7 @@ internal fun planMethodSlot(
     val methodType = m["type"] as? String ?: ""
     // Purchase leaves have no source supply record (they are new procurement),
     // so surface the vendor as their identifier in the supply-leaf table.
-    val woChildren = if (methodType == "purchase") listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to roundQty(achievableParentQty), "vendor_id" to m["vendor_id"], "start_time" to formatDate(startDt), "end_time" to formatDate(lastEnd), "children" to emptyList<Any>()))
+    val woChildren = if (methodType == "purchase") listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to roundQty(achievableParentQty), "quantity_precise" to achievableParentQty, "vendor_id" to m["vendor_id"], "start_time" to formatDate(startDt), "end_time" to formatDate(lastEnd), "children" to emptyList<Any>()))
                      else childPeggingNodes
     val methodPeggingNode = buildWoNode(productId, productionLocation, achievableParentQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodChoiceExplanation, variantExplanation, woChildrenRelation, woChildren, woGroupId = woResult.woGroupId, data = data, quantityDominator = qtyDominatorForWoNode, timeDominator = startDtDominator)
 
@@ -1865,6 +1894,33 @@ fun plan(
      * single sibling WO (see [DominatorRef]). `null` (the default) attaches no such tag.
      */
     competingDemands: Map<Pair<String, String>, List<String>>? = null,
+    /**
+     * Optional intra-demand sibling-contention table from [computeAndSiblingCaps] (the
+     * "diamond problem" fix) — the WHOLE per-demand table, already sliced to this one
+     * demand's own branches by [legacyCommit]. Keyed by [BranchKey]: an AND-parent's own
+     * (productId, locationId) child, or a root-split candidate. When a recursive call
+     * enters one of these branches (see [planMethodSlot]'s AND-loop, and this function's
+     * own root-split waterfall loop), it starts a fresh [branchLotCap]/[branchConsumed]
+     * pair sourced from the matching entry here. Threaded through unchanged to every
+     * recursive plan() / planMethodSlot() call — contention can occur at any depth.
+     */
+    andSiblingCaps: Map<BranchKey, Map<String, Double>>? = null,
+    /**
+     * Active per-lot cap for the branch THIS call is currently inside, if any — composes
+     * with [initialBudget]/[demandConsumed] (a third, tighter `min()` term) so a branch that
+     * Phase 2 fair-split found contending for a shared critical material can't draw past its
+     * own share of the demand-wide cap, even though [initialBudget] alone would allow it
+     * (that cap governs the whole demand, not one branch of it). `null` when this call isn't
+     * inside any capped branch.
+     */
+    branchLotCap: Map<String, Double>? = null,
+    /**
+     * Paired with [branchLotCap]: cumulative, PERMANENT (never snapshot/restored) record of
+     * how much of it this branch has actually consumed so far — same rationale as
+     * [demandConsumed], one level narrower in scope. Freshly created whenever a call enters
+     * a NEW capped branch; inherited unchanged while staying inside the same one.
+     */
+    branchConsumed: MutableMap<String, Double>? = null,
 ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
 
     val productId = (demand["product_id"] as? String)?.trim() ?: ""
@@ -1895,6 +1951,9 @@ fun plan(
             nodeQtyCaps      = nodeQtyCaps,
             demandBlueprint  = demandBlueprint,
             competingDemands = competingDemands,
+            andSiblingCaps   = andSiblingCaps,
+            branchLotCap     = branchLotCap,
+            branchConsumed   = branchConsumed,
         )
         // Top-down (garbage-collection): this node's quantity was capped by a jointly-computed
         // cross-demand shared-supply budget, not a single sibling WO — "least quantity
@@ -1957,6 +2016,12 @@ fun plan(
         put("product_id", productId)
         put("location_id", locationId)
         put("quantity", roundQty(qty))
+        // Unrounded companion to "quantity" — internal-only, read by the AND-min collapse one
+        // level up (see planMethodSlot's effectiveQty) so a genuinely-achieved fractional amount
+        // (e.g. 0.4999 units from a compounding low BOM rate) doesn't get misread as "this child
+        // achieved 0" just because roundQty() rounds it down for physical/display purposes here.
+        // "quantity" itself must stay rounded — it's what final committed_demands/pegging show.
+        put("quantity_precise", qty)
         put("request_time", reqTimeStr)
         put("commit_time", commitTime)
         if (commitReason != null) put("commit_reason", commitReason)
@@ -1977,6 +2042,12 @@ fun plan(
     // 1) Fulfill from inventory (FIFO)
     val componentKey = "$productId|$locationId"
     // Per-lot caps: collect all budget entries whose key starts with "$pid|$lid|".
+    // Paired with perLotBudget: each lot's demand-wide-correct remaining BEFORE branch
+    // narrowing — the write-back below must use THIS, not perLotBudget's own (possibly
+    // branch-narrowed) post-draw value, or one contending branch's private cap would leak
+    // into the shared `budget` map and wrongly starve sibling branches that haven't drawn
+    // anything yet (see write-back comment below).
+    val demandWideRemainingBySid = mutableMapOf<String, Double>()
     val perLotBudget: MutableMap<String, Double>? = budget?.let { b ->
         val prefix = "$componentKey|"
         val lotEntries = b.entries.filter { it.key.startsWith(prefix) }
@@ -1992,7 +2063,15 @@ fun plan(
             val consumedSoFar = demandConsumed?.get(k) ?: 0.0
             val trueRemaining = if (cap != null) (cap - consumedSoFar).coerceAtLeast(0.0) else v
             val bounded = min(v, trueRemaining)
-            k.removePrefix(prefix) to bounded   // supplyId → remaining
+            val sid = k.removePrefix(prefix)
+            demandWideRemainingBySid[sid] = bounded
+            // Third, tighter cap: this branch's own fair share (Phase 2's
+            // computeAndSiblingCaps split), if this call is inside a contending branch.
+            val branchCap = branchLotCap?.get(k)
+            val branchConsumedSoFar = branchConsumed?.get(k) ?: 0.0
+            val boundedForBranch = if (branchCap != null)
+                min(bounded, (branchCap - branchConsumedSoFar).coerceAtLeast(0.0)) else bounded
+            sid to boundedForBranch   // supplyId → remaining
         }
     }
     // Aggregate cap: explicit key, or sum of per-lot entries.
@@ -2021,20 +2100,42 @@ fun plan(
             demandConsumed[lotKey] = (demandConsumed[lotKey] ?: 0.0) + cb.qty
         }
     }
-    // Write back per-lot budget remainders.
+    // Mirror of the above, one level narrower: permanently charge this branch's own cap too.
+    if (branchConsumed != null && perLotBudget != null) {
+        for (cb in consumedBuckets) {
+            val sid = cb.supplyId ?: continue
+            if (sid !in perLotBudget) continue
+            val lotKey = "$componentKey|$sid"
+            branchConsumed[lotKey] = (branchConsumed[lotKey] ?: 0.0) + cb.qty
+        }
+    }
+    // Write back per-lot budget remainders. Sourced from demandWideRemainingBySid (the
+    // pre-branch-narrowing figure), NOT perLotBudget's own post-draw value: when a branch cap
+    // is active, perLotBudget holds the tighter of the demand-wide and branch-local caps, so
+    // its post-draw remaining no longer equals "how much of the WHOLE demand's budget is
+    // left" — naively writing that back would let one contending branch's own narrower
+    // allowance wrongly zero out the shared `budget` map for sibling branches that haven't
+    // drawn anything yet, even though the demand-wide cap still has plenty left for them.
     if (budget != null && perLotBudget != null) {
         val lotCapWasConsumed = (totalLotBudgetBefore - (perLotBudget.values.sum())) > 1e-9
         if (lotCapWasConsumed) {
-            // realPegging: per-lot caps were enforced in-place by consumeFromInventory; write back.
-            for ((sid, remaining) in perLotBudget) {
-                budget["$componentKey|$sid"] = remaining
+            // realPegging: per-lot caps were enforced in-place by consumeFromInventory —
+            // recover the ACTUAL qty taken per lot and subtract it from the demand-wide
+            // (unnarrowed) remaining, rather than trusting perLotBudget's own remaining.
+            val takenBySid = consumedBuckets.groupBy { it.supplyId ?: "" }.mapValues { (_, cbs) -> cbs.sumOf { it.qty } }
+            for (sid in perLotBudget.keys) {
+                val demandWideRemaining = demandWideRemainingBySid[sid] ?: continue
+                val takenHere = takenBySid[sid] ?: 0.0
+                budget["$componentKey|$sid"] = (demandWideRemaining - takenHere).coerceAtLeast(0.0)
             }
         } else if (taken > 1e-9 && totalLotBudgetBefore > 1e-9) {
             // non-realPegging: synthetic supply_id didn't match any lot key, so lot entries
-            // were not mutated. Proportionally reduce all lot entries to track the aggregate.
+            // were not mutated. Proportionally reduce all lot entries (by the demand-wide
+            // remaining, not the branch-narrowed cap) to track the aggregate.
             val consumedFraction = taken.coerceAtMost(totalLotBudgetBefore) / totalLotBudgetBefore
-            for ((sid, cap) in perLotBudget) {
-                budget["$componentKey|$sid"] = (cap * (1.0 - consumedFraction)).coerceAtLeast(0.0)
+            for (sid in perLotBudget.keys) {
+                val demandWideRemaining = demandWideRemainingBySid[sid] ?: continue
+                budget["$componentKey|$sid"] = (demandWideRemaining * (1.0 - consumedFraction)).coerceAtLeast(0.0)
             }
         }
     }
@@ -2326,6 +2427,16 @@ fun plan(
             (candidate.altKey?.let { " variant=$it" } ?: "")
             else "Fallback slot ${slotIdx + 1}/$cap: ${candidate.method["type"]}@$mLoc" +
                 (candidate.altKey?.let { " variant=$it" } ?: "") + " (residual=${roundQty(residual).toLong()})"
+        // Intra-demand sibling contention (the "diamond" fix), root-split side: when this
+        // slot is one of rootSplitWeights' simultaneously-active candidates, look up the
+        // matching branch Phase 2 (computeAndSiblingCaps) computed for it — keyed the same
+        // way gatherAndSiblingRequests built it (BranchKey(productId, locationId, slotId),
+        // slotId = slotIdFor(candidate)). A miss (candidate-set drift between the gather
+        // pass and this live waterfall) degrades safely to the outer branch cap, if any.
+        val rootSplitBranchKey = if (rootSplitWeights != null) BranchKey(productId, locationId, slotIdFor(candidate)) else null
+        val slotAndCap = rootSplitBranchKey?.let { andSiblingCaps?.get(it) }
+        val slotBranchLotCap = slotAndCap ?: branchLotCap
+        val slotBranchConsumed = if (slotAndCap != null) mutableMapOf<String, Double>() else branchConsumed
         val attempt = planMethodSlot(
             m = candidate.method, slotQty = slotQty,
             productId = productId, locationId = locationId,
@@ -2345,6 +2456,9 @@ fun plan(
             demandBlueprint = demandBlueprint,
             preferenceKb = preferenceKb,
             competingDemands = competingDemands,
+            andSiblingCaps = andSiblingCaps,
+            branchLotCap = slotBranchLotCap,
+            branchConsumed = slotBranchConsumed,
         )
         // Always record the attempt's pegging node so the UI shows every candidate tried
         // (including blocked ones with zero qty) — informative for the user even when a
@@ -2603,7 +2717,11 @@ private fun reconcile(
     val allChildren = node["children"] as? List<*> ?: emptyList<Any?>()
     when (node["type"]) {
         "supply", "purchase" -> {
-            val q = (node["quantity"] as? Number)?.toDouble() ?: 0.0
+            // Prefer the unrounded "quantity_precise" when present (see committedRow's doc).
+            // "supply" nodes are already unrounded in "quantity" itself (see the comment where
+            // they're built); "purchase" nodes carry quantity_precise separately since their own
+            // "quantity" is rounded for display.
+            val q = ((node["quantity_precise"] as? Number) ?: (node["quantity"] as? Number))?.toDouble() ?: 0.0
             val supplied = minOf(target, q).coerceAtLeast(0.0)
             return (node + ("quantity" to supplied)) to supplied
         }
@@ -2648,7 +2766,11 @@ private fun reconcile(
             return nn to committed
         }
         "work_order" -> {
-            val curQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
+            // Prefer the unrounded "quantity_precise" (see buildWoNode's doc) — reading the
+            // rounded "quantity" here would let a genuinely-achieved fractional WO (e.g. 0.4999
+            // out of 0.5) register as a hard 0 one level up, the same rounding-cascade class of
+            // bug fixed in planMethodSlot's effectiveQty.
+            val curQty = ((node["quantity_precise"] as? Number) ?: (node["quantity"] as? Number))?.toDouble() ?: 0.0
             val want = minOf(target, curQty).coerceAtLeast(0.0)
             val method = node["method"]
             val demandChildren = allChildren.mapNotNull { it as? Map<String, Any?> }.filter { it["type"] == "demand" }
@@ -3861,6 +3983,10 @@ private fun buildWoNode(
     put("product_id", productId)
     put("location_id", productionLocation)
     put("quantity", roundQty(qty))
+    // Unrounded companion — see committedRow's doc. reconcile() (the bottom-up Phase 3
+    // commitment aggregate) reads this back in preference to "quantity" so a genuinely-achieved
+    // fractional amount doesn't get misread as "delivered 0" one level up.
+    put("quantity_precise", qty)
     put("start_time", formatDate(startDt))
     put("end_time", formatDate(lastEnd))
     put("method", methodType)
@@ -4300,6 +4426,10 @@ internal fun legacyCommit(
      *  `competingDemands` param. Passed through unchanged to every demand's [plan] call
      *  (it's global, not per-demand — it answers "who else needs this (pid,lid)"). */
     competingDemands: Map<Pair<String, String>, List<String>>? = null,
+    /** Optional intra-demand sibling-contention table from [computeAndSiblingCaps] (the
+     *  "diamond problem" fix), keyed by demand_id. Sliced per-demand and passed to [plan]
+     *  as `andSiblingCaps`. */
+    andSiblingCaps: Map<Any?, Map<BranchKey, Map<String, Double>>>? = null,
 ): LegacyCommitResult {
     val committedDemands = mutableListOf<Map<String, Any?>>()
     val workOrders = mutableListOf<Map<String, Any?>>()
@@ -4360,6 +4490,7 @@ internal fun legacyCommit(
             demandBlueprint = planBlueprint?.get(demandId),
             preferenceKb = preferenceKb,
             competingDemands = competingDemands,
+            andSiblingCaps = andSiblingCaps?.get(demandId),
         )
         committedDemands.addAll(solvedList)
         workOrders.addAll(wos)
@@ -4486,6 +4617,15 @@ fun runPlanning(
     // "the dynamic remaining balance may never exceed the static cap" as a hard invariant.
     val pristineBudgetCaps: Map<Any?, Map<String, Double>> =
         sgAllocation.perLotBudgets.mapValues { (_, lotMap) -> lotMap.toMap() }
+    // Intra-demand sibling contention (the "diamond problem"): a demand's own AND-required
+    // BOM siblings, or its root-level rootSplitWeights candidates, can independently reach
+    // the same scarce critical material — the live commit phase explores them sequentially
+    // and greedily, so an early branch can exhaust a shared lot before an equally-entitled
+    // later sibling gets a look even when a fair split across all of them would let more
+    // succeed. Computed once here, up front, via its own top-down gather pass (Phase 1 +
+    // Phase 2, SupplyGuidedPlanning.kt) over the same KB-ranked topology the sketch phase
+    // above already walks — see gatherAndSiblingRequests/computeAndSiblingCaps docs.
+    val andSiblingCaps = computeAndSiblingCaps(demands, sgAllocation, data, config, preferenceKb)
     // Step 3: commit with pre-selected methods, per-node caps, and per-lot budget guards.
     var commitResult = legacyCommit(
         demands           = demands,
@@ -4500,6 +4640,7 @@ fun runPlanning(
         planBlueprint     = planBlueprint,
         preferenceKb      = preferenceKb,
         competingDemands  = competingDemands,
+        andSiblingCaps    = andSiblingCaps,
     )
     // Post-planning trace + compensation-pass telemetry (opt-in: trace_lots=true).
     if (sgAllocation.sgConfig.traceLots)
@@ -5619,10 +5760,31 @@ internal fun rewriteTreeFromWorkOrders(
             val altIndex = node["method_slot_index"] as? Int
             val wos = (wosByGid[gid] ?: emptyList()).filter { (it["method_slot_index"] as? Int) == altIndex }
             if (wos.isNotEmpty()) {
-                wos.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull()
-                    ?.let { updated["start_time"] = formatDate(it) }
-                wos.mapNotNull { parseDate(it["end_time"] as? String) }.maxOrNull()
-                    ?.let { updated["end_time"] = formatDate(it) }
+                val newStart = wos.mapNotNull { parseDate(it["start_time"] as? String) }.minOrNull()
+                var newEnd = wos.mapNotNull { parseDate(it["end_time"] as? String) }.maxOrNull()
+                // Floor: this node's OWN pre-rewrite span (as buildWorkOrders originally, correctly
+                // computed from the method's own transit_time/lead_time) is the physically-required
+                // minimum duration. The group-wide min(start)/max(end) above is meant to WIDEN a
+                // WO's window to cover resource-scheduling shifts across every lot sharing its
+                // wo_group_id — not narrow it. If `wosByGid[gid]` ever contains a peer lot with a
+                // tighter window (e.g. a different product/direction sharing a consolidated group
+                // id, or a stale/short entry from an earlier pass), naively taking the raw min/max
+                // can compress this WO below what it physically needs (R5_transit_time /
+                // R5_lead_time). Re-extend `newEnd` to preserve the original duration if so —
+                // idempotent across repeated resequencing passes since each rewrite only ever
+                // widens relative to its own input, never narrows.
+                if (newStart != null && newEnd != null) {
+                    val originalStart = parseDate(node["start_time"] as? String)
+                    val originalEnd = parseDate(node["end_time"] as? String)
+                    val minRequiredDays = if (originalStart != null && originalEnd != null)
+                        (originalEnd.toEpochDay() - originalStart.toEpochDay()).coerceAtLeast(0L) else 0L
+                    val actualDays = newEnd.toEpochDay() - newStart.toEpochDay()
+                    if (actualDays < minRequiredDays) {
+                        newEnd = newStart.plusDays(minRequiredDays)
+                    }
+                }
+                newStart?.let { updated["start_time"] = formatDate(it) }
+                newEnd?.let { updated["end_time"] = formatDate(it) }
             }
         }
         "demand" -> {
