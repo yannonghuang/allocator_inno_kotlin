@@ -614,8 +614,21 @@ private fun consumeFromInventory(
             val avail = (b["qty"] as? Number)?.toDouble() ?: 0.0
             if (avail <= 0) continue
             val sid = b["supply_id"]?.toString()
-            // perLotBudget caps individual lots present in the map; absent lots are uncapped (non-critical pool).
-            val lotCap = if (perLotBudget != null && sid != null && perLotBudget.containsKey(sid)) perLotBudget[sid] else null
+            // perLotBudget caps individual lots present in the map. A demand only ever gets a
+            // perLotBudget for a (product, location) it's under critical allocation for — so if
+            // this specific lot's supplyId is missing, that's not "this material is uncontrolled,
+            // draw freely" (that's what perLotBudget == null means), it's "this demand was never
+            // granted this specific lot" — most commonly because allocateSuppliesPerLot's own
+            // date-eligibility filter excluded it (e.g. a July-dated demand isn't eligible for
+            // stock that arrives in August). Treating an absent-but-controlled lot as uncapped let
+            // date-ineligible demands fall through to later lots with no limit at all once their
+            // own eligible supply ran out. Forbid it instead — 0, not null.
+            val lotCap = when {
+                perLotBudget == null -> null
+                sid == null -> null
+                perLotBudget.containsKey(sid) -> perLotBudget[sid]
+                else -> 0.0
+            }
             val take = min(avail, if (lotCap != null) min(remaining, lotCap) else remaining)
             if (take <= 0) continue
             b["qty"] = avail - take
@@ -1242,6 +1255,8 @@ internal fun planMethodSlot(
     feasibilityCache: MutableMap<Pair<String, String>, Int>? = null,
     structuralFailedMakes: MutableMap<Pair<String, String>, String>? = null,
     initialBudget: Map<String, Double>? = null,
+    /** See [plan]'s doc — same cumulative, never-restored, demand-wide consumption tracker. */
+    demandConsumed: MutableMap<String, Double>? = null,
     nodeQtyCaps: Map<Pair<String, String>, Double>? = null,
     demandBlueprint: DemandBlueprint? = null,
     preferenceKb: PreferenceKb? = null,
@@ -1346,7 +1361,7 @@ internal fun planMethodSlot(
             // Inherit the originating demand's customer so customer-specific constraints
             // apply to sub-components, not just the finished good.
             "customer_id" to demand["customer_id"], "customer" to demand["customer"])
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, competingDemands = competingDemands)
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, competingDemands = competingDemands)
         val effectiveQty = solvedList.sumOf { s ->
             val r = s["commit_reason"] as? String
             if (r == "cycle_stopped" || r == "cycle_detected") 0.0
@@ -1407,8 +1422,15 @@ internal fun planMethodSlot(
         }
     } else {
         val rawAchievable = computeRawAchievable(childPassResults, activeSlotQty)
+        // No floor() here: this AND-min collapse runs once per intermediate BOM level, and a
+        // deep tree (7-8 levels) compounds each level's fractional loss — flooring at every
+        // level can silently zero out a genuinely-fillable branch (e.g. eight levels each
+        // losing <1 unit) even when nothing is actually out of stock. The physical
+        // lot-quantization (whole-unit WOs) happens exactly once, downstream, in
+        // buildWorkOrders()'s roundQty(lotQty) — that's the only place fractional asks need to
+        // become real, ship-able quantities.
         val capped = if (rawAchievable >= activeSlotQty - 1e-6) activeSlotQty
-                     else floor(rawAchievable).coerceIn(0.0, activeSlotQty)
+                     else rawAchievable.coerceIn(0.0, activeSlotQty)
 
         if (capped <= 1e-9) {
             // Nothing achievable — emit a zero-qty placeholder pegging node so the UI
@@ -1432,6 +1454,19 @@ internal fun planMethodSlot(
             if (budget != null && budgetSnap != null) {
                 budget.clear()
                 budget.putAll(budgetSnap)
+                // Budget (allocation cap) is static; a restore must never resurrect more
+                // remaining allowance than this demand was ever granted for a given lot.
+                // Without this clamp, a blanket snapshot/restore across independent sibling
+                // branches can "un-spend" budget that a different, already-concluded branch
+                // legitimately consumed — letting this demand overdraw a shared, scarce
+                // material well past its fair share.
+                if (initialBudget != null) {
+                    for (key in budget.keys) {
+                        val cap = initialBudget[key] ?: continue
+                        val v = budget[key]
+                        if (v != null && v > cap) budget[key] = cap
+                    }
+                }
             }
             // Keep the first-pass child pegging trees so the UI can show *why*
             // this method was blocked — under-allocated child branches, deeper
@@ -1779,6 +1814,21 @@ fun plan(
      */
     initialBudget: Map<String, Double>? = null,
     /**
+     * Cumulative, PERMANENT record of how much of [initialBudget] this demand has actually
+     * consumed from each lot, across its ENTIRE exploration — deliberately created once per
+     * top-level demand and never included in [planMethodSlot]'s snapshot/restore. `budget`
+     * (the mutable per-branch tracker) is correctly restored on a failed branch's own local
+     * rollback, but when multiple structurally-independent parts of the SAME demand's tree
+     * (e.g. two different sub-assemblies that each happen to route through the same scarce,
+     * non-purchasable material) each succeed on their own, `budget` alone has no way to see
+     * that a sibling branch already spent part of the shared cap — each one's own entry
+     * snapshot legitimately shows the lot at full strength, so each draws independently, and
+     * the sum can exceed the demand's true, single per-lot allocation. This map is the fix:
+     * `initialBudget[lot] - demandConsumed[lot]` is the true, demand-wide remaining allowance,
+     * immune to any branch-local restore. Threaded through unchanged to every recursive call.
+     */
+    demandConsumed: MutableMap<String, Double>? = null,
+    /**
      * Optional per-node achievable quantity caps from the supply-guided probing
      * step ([computeAchievableQtyMaps]).  When the probed achievable at
      * (productId to locationId) is less than [demand]["quantity"], plan() caps
@@ -1841,6 +1891,7 @@ fun plan(
             feasibilityCache = feasibilityCache,
             structuralFailedMakes = structuralFailedMakes,
             initialBudget    = initialBudget,
+            demandConsumed   = demandConsumed,
             nodeQtyCaps      = nodeQtyCaps,
             demandBlueprint  = demandBlueprint,
             competingDemands = competingDemands,
@@ -1931,7 +1982,17 @@ fun plan(
         val lotEntries = b.entries.filter { it.key.startsWith(prefix) }
         if (lotEntries.isEmpty()) null
         else lotEntries.associateTo(mutableMapOf()) { (k, v) ->
-            k.removePrefix(prefix) to v   // supplyId → remaining
+            // True remaining allowance for this lot, demand-wide: the static cap minus
+            // whatever this demand has PERMANENTLY consumed so far from it, across every
+            // independent branch of its own tree — not just `v` (budget's own local,
+            // rollback-scoped view, which legitimately resets to the full cap for every
+            // structurally-separate branch that reaches this lot, letting each one draw
+            // independently past the demand's true, single per-lot allocation).
+            val cap = initialBudget?.get(k)
+            val consumedSoFar = demandConsumed?.get(k) ?: 0.0
+            val trueRemaining = if (cap != null) (cap - consumedSoFar).coerceAtLeast(0.0) else v
+            val bounded = min(v, trueRemaining)
+            k.removePrefix(prefix) to bounded   // supplyId → remaining
         }
     }
     // Aggregate cap: explicit key, or sum of per-lot entries.
@@ -1945,6 +2006,21 @@ fun plan(
         inventory, productId, locationId, quantity, preferDemandId, null, perLotBudget,
     )
     val taken = consumedBuckets.sumOf { it.qty }
+    // Permanently record this draw against the demand-wide cap — deliberately NOT part of
+    // any snapshot/restore scope, so a later, structurally-independent branch of this same
+    // demand's tree can't get a fresh, un-depleted view of a lot this demand already spent
+    // part of its allocation on elsewhere. If the enclosing branch is later abandoned and
+    // `inventory` rolls back, this stays charged — conservative (this demand may end up
+    // slightly under its true allowance in that edge case) rather than allowing the
+    // cross-branch over-draw this is fixing.
+    if (demandConsumed != null && perLotBudget != null) {
+        for (cb in consumedBuckets) {
+            val sid = cb.supplyId ?: continue
+            if (sid !in perLotBudget) continue
+            val lotKey = "$componentKey|$sid"
+            demandConsumed[lotKey] = (demandConsumed[lotKey] ?: 0.0) + cb.qty
+        }
+    }
     // Write back per-lot budget remainders.
     if (budget != null && perLotBudget != null) {
         val lotCapWasConsumed = (totalLotBudgetBefore - (perLotBudget.values.sum())) > 1e-9
@@ -2264,6 +2340,7 @@ fun plan(
             feasibilityCache = feasibilityCache,
             structuralFailedMakes = structuralFailedMakes,
             initialBudget = initialBudget,
+            demandConsumed = demandConsumed,
             nodeQtyCaps = nodeQtyCaps,
             demandBlueprint = demandBlueprint,
             preferenceKb = preferenceKb,
@@ -4267,6 +4344,10 @@ internal fun legacyCommit(
             log.info("[BUDGET] did={} entryCount={} entries={}",
                 demandId, demandBudget.size, entries)
         }
+        // Fresh per demand: the demand-wide, never-restored record of how much of its own
+        // static per-lot cap it has actually spent so far, across every independent branch
+        // of its own tree — see plan()'s doc for why this can't just be derived from `budget`.
+        val demandConsumed = mutableMapOf<String, Double>()
         val (solvedList, wos, peggingNode) = plan(
             d, indexedInventory, planData, reqDt,
             config = config, preferDemandId = prefId,
@@ -4274,6 +4355,7 @@ internal fun legacyCommit(
             feasibilityCache = feasibilityCache,
             structuralFailedMakes = structuralFailedMakes,
             initialBudget = iter0Allocation?.get(demandId),
+            demandConsumed = demandConsumed,
             nodeQtyCaps = achievableQtyMaps?.get(demandId),
             demandBlueprint = planBlueprint?.get(demandId),
             preferenceKb = preferenceKb,
@@ -4396,6 +4478,14 @@ fun runPlanning(
     val competingDemands: Map<Pair<String, String>, List<String>> = sgAllocation.criticalMatrix.byColumn
         .filterValues { it.size > 1 }
         .entries.associate { (sk, byDemand) -> (sk.productId to sk.locationId) to byDemand.keys.map { it.toString() } }
+    // Static per-demand, per-lot allocation cap — a deep, immutable snapshot taken before
+    // `legacyCommit` starts mutating `sgAllocation.perLotBudgets` demand-by-demand. Budget
+    // (the cap) and stock/inventory (the dynamic balance) were previously mixed into one
+    // mutable structure with no read-only reference to fall back on; this snapshot is that
+    // reference, threaded through as `initialBudget` so `plan()`/`planMethodSlot` can enforce
+    // "the dynamic remaining balance may never exceed the static cap" as a hard invariant.
+    val pristineBudgetCaps: Map<Any?, Map<String, Double>> =
+        sgAllocation.perLotBudgets.mapValues { (_, lotMap) -> lotMap.toMap() }
     // Step 3: commit with pre-selected methods, per-node caps, and per-lot budget guards.
     var commitResult = legacyCommit(
         demands           = demands,
@@ -4405,6 +4495,7 @@ fun runPlanning(
         useTaggedLookup   = false,
         progressCallback  = progressCallback,
         budgets           = sgAllocation.perLotBudgets,
+        iter0Allocation   = pristineBudgetCaps,
         achievableQtyMaps = achievableQtyMaps,
         planBlueprint     = planBlueprint,
         preferenceKb      = preferenceKb,
