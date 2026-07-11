@@ -4576,6 +4576,19 @@ fun runPlanning(
         )
     }.toMutableList()
 
+    // Coarse, whole-run progress reporting. The three pre-legacyCommit steps below
+    // (buildSupplyAllocation, computePlanBlueprint, computeAndSiblingCaps) are each a full,
+    // read-only BOM walk over every demand and — since computeAndSiblingCaps's own gather pass
+    // was added — can now dominate total run time on a large case, with legacyCommit's
+    // per-demand callback (the only progress this ever reported) staying frozen at "0/N" the
+    // entire time. These percentages are rough, fixed weights (not measured per-run) — good
+    // enough to turn "looks hung for minutes" into "visibly moving through named stages";
+    // exact proportion isn't load-bearing anywhere else.
+    fun emitPhase(phase: String, label: String, percent: Int) {
+        progressCallback?.invoke(mapOf("phase" to phase, "phase_label" to label, "percent" to percent))
+    }
+    emitPhase("allocating", "Allocating supply across demands…", 0)
+
     // Demand processing order: covered by the Demand Ordering KB (see `demandOrder` doc) sorts
     // first by its canonical order; anything not covered falls back to the raw (priority,
     // demand_id) rule and sorts after all covered demands. demandOrder == null (no KB) reduces
@@ -4614,6 +4627,7 @@ fun runPlanning(
     // AND pre-selects the first-feasible BOM method per node per demand.
     // Replaces computeAchievableQtyMaps; eliminates getPreferredMethodCascade overhead
     // (probeChildren per node) from the commit phase entirely.
+    emitPhase("blueprint", "Computing achievable quantities…", 8)
     val planBlueprint = computePlanBlueprint(demands, sgAllocation, data, preferenceKb)
     val achievableQtyMaps = planBlueprint.mapValues { (_, db) ->
         db.mapValues { (_, nb) -> nb.achievable }
@@ -4641,15 +4655,36 @@ fun runPlanning(
     // succeed. Computed once here, up front, via its own top-down gather pass (Phase 1 +
     // Phase 2, SupplyGuidedPlanning.kt) over the same KB-ranked topology the sketch phase
     // above already walks — see gatherAndSiblingRequests/computeAndSiblingCaps docs.
-    val andSiblingCaps = computeAndSiblingCaps(demands, sgAllocation, data, config, preferenceKb)
+    emitPhase("contention", "Resolving shared-material contention…", 20)
+    var lastContentionPercent = 20
+    val andSiblingCaps = computeAndSiblingCaps(demands, sgAllocation, data, config, preferenceKb) { done, total ->
+        val percent = (20 + (done.toDouble() / total.coerceAtLeast(1)) * 63).toInt().coerceIn(20, 83)
+        if (percent > lastContentionPercent) {
+            lastContentionPercent = percent
+            emitPhase("contention", "Resolving shared-material contention… ($done/$total)", percent)
+        }
+    }
     // Step 3: commit with pre-selected methods, per-node caps, and per-lot budget guards.
+    // Wraps the raw per-demand callback with the overall phase/percent this stage occupies
+    // (83%→95%) so the UI can keep showing "N / total demands" (from legacyCommit's own
+    // payload, passed through unchanged) alongside a moving overall bar, instead of two
+    // disconnected progress notions.
+    val commitProgressCallback: ((Map<String, Any?>) -> Unit)? = progressCallback?.let { cb ->
+        { p: Map<String, Any?> ->
+            val current = (p["current"] as? Number)?.toDouble() ?: 0.0
+            val total = (p["total"] as? Number)?.toDouble()?.takeIf { it > 0 } ?: 1.0
+            val percent = (83 + (current / total) * 12).toInt().coerceIn(83, 95)
+            cb(p + mapOf("phase" to "committing", "phase_label" to "Committing demands…", "percent" to percent))
+        }
+    }
+    emitPhase("committing", "Committing demands…", 83)
     var commitResult = legacyCommit(
         demands           = demands,
         inventory         = inventory,
         data              = data,
         config            = config,
         useTaggedLookup   = false,
-        progressCallback  = progressCallback,
+        progressCallback  = commitProgressCallback,
         budgets           = sgAllocation.perLotBudgets,
         iter0Allocation   = pristineBudgetCaps,
         achievableQtyMaps = achievableQtyMaps,
@@ -4711,6 +4746,7 @@ fun runPlanning(
     else emptyList<String>()
     // R7g computed after adjustedConsolidated is available (below the timing-readjust block).
 
+    emitPhase("verifying", "Verifying supply conservation…", 95)
     val timingFix = fixTimingFromPegging(workOrders, allPegging, data)
     // Release pruned trees; timingFix holds the timing-adjusted copies.
     allPegging = emptyList()
@@ -4722,6 +4758,7 @@ fun runPlanning(
     // actually supply (the R4/R8 break). `reconcile` trims those (a no-op for already-consistent
     // trees). Runs here (before consolidation/arbitration) since it only trims quantities — that's
     // orthogonal to timing/capacity, so there's no need to wait for either.
+    emitPhase("reconciling", "Reconciling commitments…", 96)
     val reconciledByDemand = mutableMapOf<String, Double>()
     val reconciledTrees = timingFix.peggingTrees.map { entry ->
         val tree = entry["tree"] as? Map<String, Any?> ?: return@map entry
@@ -4762,6 +4799,7 @@ fun runPlanning(
         committedDemands.clear(); committedDemands.addAll(synced)
     }
 
+    emitPhase("consolidating", "Consolidating work orders…", 97)
     // ── Pass 2 — WO consolidation + timing, bottom-up wave propagation ─────────────────────────
     // consolidateByWaves walks the global WO dependency graph one layer at a time, bucketing and
     // recomputing duration per wave BEFORE propagating timing to parents — so a parent is never
@@ -4801,6 +4839,7 @@ fun runPlanning(
         WaveConsolidationResult(reconciledTrees, WoConsolidation(nodeLevelWos, nodeLevelWos))
     }
 
+    emitPhase("scheduling", "Scheduling resources…", 98)
     // Phase-1 cross-WO arbitration, now over the CONSOLIDATED (post-merge) lots so capacity is
     // checked against the real production-lot count instead of an inflated per-demand count that
     // gets collapsed afterward. The scheduling pass is always on — the config toggle has been
@@ -4960,6 +4999,7 @@ fun runPlanning(
         verifyWoConservation(producedByComponent, adjustedTrees, adjustedConsolidated, servedDemandIds = servedDemandIds)
     else emptyList<String>()
     log.info("[plan] verifyWoConservation done: violations={}", woConservationViolations.size)
+    emitPhase("finalizing", "Finalizing plan…", 100)
 
     val output: Map<String, Any> = mapOf(
         "committed_demands"      to committedDemands,

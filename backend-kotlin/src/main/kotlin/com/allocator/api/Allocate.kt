@@ -347,7 +347,7 @@ fun Routing.allocateRoutes() {
             planJobs[jobId] = mutableMapOf(
                 "case_id" to caseId,
                 "status" to "running",
-                "progress" to mapOf("current" to 0, "total" to total),
+                "progress" to mapOf("current" to 0, "total" to total, "phase" to "allocating", "phase_label" to "Allocating supply across demands…", "percent" to 0),
                 "result" to null,
                 "error" to null,
             )
@@ -2615,12 +2615,22 @@ internal suspend fun runPlanBackground(
         val progressCb: (Map<String, Any?>) -> Unit = { p ->
             planJobs[jobId]?.let { job ->
                 if (job["status"] == "running") {
+                    @Suppress("UNCHECKED_CAST")
+                    val existing = job["progress"] as? Map<String, Any?>
+                    // Pre/post-processing phase updates (see runPlanning's emitPhase) carry no
+                    // current/total at all — preserve whatever the commit loop last reported so
+                    // the "N / total demands" sub-text doesn't flicker back to 0 once commit has
+                    // actually finished and later phases (consolidation, scheduling, ...) start
+                    // reporting their own phase/percent.
                     val payload = mutableMapOf<String, Any?>(
-                        "current" to (p["current"] ?: 0),
+                        "current" to (p["current"] ?: existing?.get("current") ?: 0),
                         "total" to total,
                     )
                     p["iteration"]?.let { payload["iteration"] = it }
                     p["iterations_max"]?.let { payload["iterations_max"] = it }
+                    p["phase"]?.let { payload["phase"] = it }
+                    p["phase_label"]?.let { payload["phase_label"] = it }
+                    p["percent"]?.let { payload["percent"] = it }
                     job["progress"] = payload
                 }
             }
@@ -2725,7 +2735,7 @@ internal suspend fun runPlanBackground(
             // the result from DB rather than holding the 500MB+ enriched map here forever.
             // Only keep in-memory when serialization failed (result is lost from DB).
             if (!autoSave || serializeFailed) job["result"] = enriched - "planning_pegging"
-            job["progress"] = mapOf("current" to total, "total" to total)
+            job["progress"] = mapOf("current" to total, "total" to total, "phase" to "completed", "phase_label" to "Done", "percent" to 100)
         }
 
         // Persist pegging in background — serializing 1.9GB of trees to the DB takes

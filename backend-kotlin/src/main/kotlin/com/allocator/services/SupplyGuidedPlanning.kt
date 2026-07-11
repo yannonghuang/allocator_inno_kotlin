@@ -943,11 +943,16 @@ internal fun computeAndSiblingCaps(
     data: Map<String, List<Map<String, Any?>>>,
     config: Map<String, Any?>?,
     preferenceKb: PreferenceKb?,
+    /** Optional per-demand progress callback (index 1-based, total demand count) — this is the
+     *  single most expensive step in a large plan's pre-processing (a full BOM gather walk per
+     *  demand), so it gets its own sub-progress rather than reporting only once at entry/exit. */
+    onDemandProcessed: ((Int, Int) -> Unit)? = null,
 ): Map<Any?, Map<BranchKey, Map<String, Double>>> {
     val result = mutableMapOf<Any?, Map<BranchKey, Map<String, Double>>>()
-    for (demand in demands) {
+    for ((idx, demand) in demands.withIndex()) {
         val demandId = demand["demand_id"] ?: continue
         val requests = gatherAndSiblingRequests(demand, allocation, data, config, preferenceKb)
+        onDemandProcessed?.invoke(idx + 1, demands.size)
         if (requests.isEmpty()) continue
         val demandBudgets = allocation.perLotBudgets[demandId] ?: emptyMap()
         val branchCaps = mutableMapOf<BranchKey, MutableMap<String, Double>>()

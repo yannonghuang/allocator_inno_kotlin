@@ -693,6 +693,12 @@ export type PlanStatusResponse = {
     iteration?: number;
     /** Max iterations the fixed-point controller will run before giving up and falling back to single-pass trim. */
     iterations_max?: number;
+    /** Machine-readable stage id (e.g. "allocating", "contention", "committing", "consolidating", "scheduling"). Whole-run phase, distinct from current/total which only move during "committing". */
+    phase?: string;
+    /** Human-readable label for `phase`, safe to render directly. */
+    phase_label?: string;
+    /** Coarse whole-run completion estimate, 0-100. Fixed per-phase weights, not a precise measurement — use for a smoothly-advancing bar, not for ETA math. */
+    percent?: number;
   };
   result?: PlanResult;
   error?: string;

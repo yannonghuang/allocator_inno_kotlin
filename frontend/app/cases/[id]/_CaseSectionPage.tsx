@@ -100,7 +100,7 @@ import {
 } from '@/lib/api';
 import { computeHorizon, ScheduleBar, ScheduleHorizonRuler, methodColor, BorMiniTimeline, BorTimelineRuler } from './_workOrderSchedule';
 import { WoScheduleImpactPanel, WoScheduleQuickModal } from './_woScheduleImpact';
-import type { PlanResult } from '../../../lib/api';
+import type { PlanResult, PlanStatusResponse } from '../../../lib/api';
 
 type SupplySuggestion = {
   id: string;
@@ -1366,7 +1366,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [constraintOptions, setConstraintOptions] = useState<ConstraintOptions>({ customers: [], parents: [] });
   const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' }, purchase_allowed: false, purchasable_materials: [], constraints: [], analyze_criticality: false, check_soundness: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
-  const [planProgress, setPlanProgress] = useState<{ current: number; total: number; iteration?: number; iterations_max?: number } | null>(null);
+  const [planProgress, setPlanProgress] = useState<PlanStatusResponse['progress'] | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [peggingSaveStatus, setPeggingSaveStatus] = useState<PeggingSaveStatus | null>(null);
   const peggingSavePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -4920,21 +4920,33 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             {copilotOpen ? tP('hideCopilot') : tP('configureCopilot')}
           </button>
         </div>
-        {planLoading && planProgress && planProgress.total > 0 && (
+        {planLoading && planProgress && (planProgress.total > 0 || planProgress.percent !== undefined) && (
           <div style={{ marginTop: '0.5rem', maxWidth: 400 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.25rem' }}>
               <span>
-                {tP('planProgress')} {planProgress.current} / {planProgress.total} {tP('demands')}
+                {planProgress.phase_label
+                  ? planProgress.phase_label
+                  : `${tP('planProgress')} ${planProgress.current} / ${planProgress.total} ${tP('demands')}`}
+                {planProgress.phase_label && planProgress.phase === 'committing' && planProgress.total > 0
+                  ? ` — ${planProgress.current} / ${planProgress.total} ${tP('demands')}`
+                  : ''}
                 {planProgress.iteration && planProgress.iterations_max
                   ? ` (iter ${planProgress.iteration}/${planProgress.iterations_max})`
                   : ''}
               </span>
+              {planProgress.percent !== undefined && (
+                <span style={{ color: '#71717a' }}>{planProgress.percent}%</span>
+              )}
             </div>
             <div style={{ height: 8, backgroundColor: '#27272a', borderRadius: 4, overflow: 'hidden' }}>
               <div
                 style={{
                   height: '100%',
-                  width: `${Math.min(100, 100 * planProgress.current / planProgress.total)}%`,
+                  width: `${
+                    planProgress.percent !== undefined
+                      ? Math.min(100, planProgress.percent)
+                      : Math.min(100, 100 * planProgress.current / Math.max(1, planProgress.total))
+                  }%`,
                   backgroundColor: '#3b82f6',
                   transition: 'width 0.2s ease',
                 }}
