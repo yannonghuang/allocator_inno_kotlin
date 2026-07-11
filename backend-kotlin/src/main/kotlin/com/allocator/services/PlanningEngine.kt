@@ -3666,8 +3666,19 @@ internal fun consolidateByWaves(
             var bucketLotCount = 1
             var bucketWaveCount = 1
             val leadDays = if (first.method == "move") {
-                mRow?.let { leadDaysForMethod(it, first.pid, first.lid, totalQty, data) }
-                    ?: gids.mapNotNull { gidInfo.getValue(it).nativeDuration }.maxOrNull() ?: 0.0
+                // Move bucketing (baseKey above) groups by (locationSource, lid, prodArea) —
+                // deliberately WITHOUT product_id, so different products moving the same route can
+                // share one consolidated batch. But transit_time is a per-(product, route) method
+                // property, not a route-wide constant — using only gids[0]'s own transit_time here
+                // would silently compress every OTHER product in the bucket onto a window shorter
+                // than what it physically needs whenever gids[0]'s own transit_time happens to be
+                // the smallest (R5_transit_time). Use the MAX required transit_time across every
+                // member's own product/method instead, so the merged window satisfies all of them.
+                gids.maxOfOrNull { g ->
+                    val gi = gidInfo.getValue(g)
+                    val gRow = methodRowFor(gi.pid, gi.lid, gi.method, gi.locationSource)
+                    gRow?.let { leadDaysForMethod(it, gi.pid, gi.lid, totalQty, data) } ?: gi.nativeDuration ?: 0.0
+                } ?: 0.0
             } else {
                 val lotSize = (maxLotSize(first.pid, first.lid, data)?.takeIf { it > 0 } ?: totalQty).coerceAtLeast(1e-9)
                 val lotCount = Math.ceil(totalQty / lotSize).toInt().coerceAtLeast(1)
