@@ -3668,17 +3668,22 @@ internal fun consolidateByWaves(
             val leadDays = if (first.method == "move") {
                 // Move bucketing (baseKey above) groups by (locationSource, lid, prodArea) —
                 // deliberately WITHOUT product_id, so different products moving the same route can
-                // share one consolidated batch. But transit_time is a per-(product, route) method
-                // property, not a route-wide constant — using only gids[0]'s own transit_time here
-                // would silently compress every OTHER product in the bucket onto a window shorter
-                // than what it physically needs whenever gids[0]'s own transit_time happens to be
-                // the smallest (R5_transit_time). Use the MAX required transit_time across every
-                // member's own product/method instead, so the merged window satisfies all of them.
-                gids.maxOfOrNull { g ->
+                // share one consolidated batch. Using only gids[0]'s own transit_time as the
+                // batch's duration would silently compress every OTHER product in the bucket onto
+                // a window shorter than what it physically needs whenever gids[0]'s own
+                // requirement happens to be the smallest (R5_transit_time). Consolidated transit
+                // time = latest native end − earliest native start across every member in the
+                // bucket — this measures the span each member's own already-correct native window
+                // (established at commit time) actually needs, without re-deriving transit_time
+                // from method tables again (and risking a re-match mismatch).
+                val earliestStart = gids.mapNotNull { gidInfo.getValue(it).nativeStart }.minOrNull()
+                val latestEnd = gids.mapNotNull { g ->
                     val gi = gidInfo.getValue(g)
-                    val gRow = methodRowFor(gi.pid, gi.lid, gi.method, gi.locationSource)
-                    gRow?.let { leadDaysForMethod(it, gi.pid, gi.lid, totalQty, data) } ?: gi.nativeDuration ?: 0.0
-                } ?: 0.0
+                    gi.nativeStart?.let { s -> gi.nativeDuration?.let { d -> s.plusDays(d.toLong()) } }
+                }.maxOrNull()
+                if (earliestStart != null && latestEnd != null)
+                    (latestEnd.toEpochDay() - earliestStart.toEpochDay()).toDouble().coerceAtLeast(0.0)
+                else gids.mapNotNull { gidInfo.getValue(it).nativeDuration }.maxOrNull() ?: 0.0
             } else {
                 val lotSize = (maxLotSize(first.pid, first.lid, data)?.takeIf { it > 0 } ?: totalQty).coerceAtLeast(1e-9)
                 val lotCount = Math.ceil(totalQty / lotSize).toInt().coerceAtLeast(1)
