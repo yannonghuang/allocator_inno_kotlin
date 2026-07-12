@@ -4278,11 +4278,16 @@ private fun prunePhantomLoops(
 internal fun extractSupplyAllocations(
     pegging: List<Map<String, Any?>>,
     supplies: List<Map<String, Any?>>,
-    demands: List<Map<String, Any?>> = emptyList(),
     /** Supply IDs that belong to critical (non-purchasable) lots. When non-null, only these
-     *  lots receive a proportional qty_allocated; all other lots are non-critical (FIFO
-     *  consumption, uncapped) and emit qty_allocated = null so the UI shows "–". */
+     *  lots receive a qty_allocated; all other lots are non-critical (FIFO consumption,
+     *  uncapped) and emit qty_allocated = null so the UI shows "–". */
     criticalSupplyIds: Set<String>? = null,
+    /** Per-demand, per-lot entitlement actually enforced during planning — [SupplyAllocationResult.perLotBudgets],
+     *  keyed `demandId -> "productId|locationId|supplyId" -> qty`. This is the SAME map that caps
+     *  `consumeFromInventory`'s draws (via `initialBudget`/`branchLotCap`), so surfacing it here — rather than
+     *  re-deriving a proportional estimate after the fact — makes the displayed "qty_allocated" the actual
+     *  enforced cap instead of an independently-computed number that can silently diverge from it per lot. */
+    perLotBudgets: Map<Any?, Map<String, Double>>? = null,
 ): List<Map<String, Any?>> {
     val remainingBySupply = mutableMapOf<String, Double>()
     for (s in supplies) {
@@ -4392,49 +4397,34 @@ internal fun extractSupplyAllocations(
         walk(tree, demandId)
     }
 
-    // Post-process: compute qty_allocated = demand's proportional entitlement from each lot.
-    // Only critical lots (those in criticalSupplyIds) receive a proportional entitlement;
-    // non-critical lots are consumed FIFO without allocation — their qty_allocated is null
-    // so the UI renders "–" rather than a misleading proportional figure.
+    // Post-process: qty_allocated = the demand's REAL, planning-time entitlement for this
+    // specific lot — perLotBudgets[demandId]["productId|locationId|supplyId"], the exact
+    // per-lot cap that governed consumeFromInventory during commit (via initialBudget/
+    // branchLotCap). Not re-derived here — just surfaced, so the UI can never show a
+    // "qty_allocated" that silently diverges from what was actually enforced. Only critical
+    // lots (those in criticalSupplyIds) carry an entitlement at all; non-critical lots are
+    // consumed FIFO with no allocation concept, so their qty_allocated is null (UI shows "-").
     // Mutates result records in-place (MutableMap) to avoid allocating a new map per record.
-    val demandQtyMap: Map<String, Double> = demands
-        .mapNotNull { d -> (d["demand_id"] as? String)?.let { id -> id to ((d["quantity"] as? Number)?.toDouble() ?: 0.0) } }
-        .toMap()
-    // lot initial qty lookup (physical lots only — synthetic/consolidated buckets have no entry)
-    val lotInitialQty: Map<String, Double> = supplies
-        .mapNotNull { s -> (s["supply_id"] as? String)?.let { id -> id to ((s["qty"] as? Number)?.toDouble() ?: 0.0) } }
-        .groupBy({ it.first }, { it.second })
-        .mapValues { (_, qtys) -> qtys.sum() }
-
-    // Build per-lot weight totals (critical lots only)
-    data class LotStats(val lotQty: Double, var totalWeight: Double = 0.0)
-    val lotStats = mutableMapOf<String, LotStats>()
-    for (rec in result) {
-        val sid = rec["supply_id"] as? String ?: continue
-        if (criticalSupplyIds != null && sid !in criticalSupplyIds) continue  // non-critical: skip
-        val lotQty = lotInitialQty[sid] ?: continue  // skip synthetic buckets
-        val stats = lotStats.getOrPut(sid) { LotStats(lotQty) }
-        val did = rec["demand_id"] as? String
-        val w = (if (did != null) demandQtyMap[did] else null)
-            ?: (rec["qty_consumed"] as? Number)?.toDouble()
-            ?: 0.0
-        stats.totalWeight += w
-    }
-    // Second pass: write qty_allocated in-place; null for non-critical lots
+    // supply_id -> (productId, locationId) lookup, needed to reconstruct each lot's budget key
+    // (physical lots only — synthetic/consolidated buckets have no entry and no entitlement).
+    val lotPidLid: Map<String, Pair<String, String>> = supplies.mapNotNull { s ->
+        val sid = (s["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        val pid = (s["product_id"] as? String)?.trim() ?: return@mapNotNull null
+        val lid = (s["location_id"] as? String)?.trim() ?: return@mapNotNull null
+        sid to (pid to lid)
+    }.toMap()
     for (rec in result) {
         val sid = rec["supply_id"] as? String
         val isCritical = criticalSupplyIds == null || (sid != null && sid in criticalSupplyIds)
-        val stats = if (sid != null) lotStats[sid] else null
+        val did = rec["demand_id"] as? String
+        val pidLid = sid?.let { lotPidLid[it] }
         val qtyAllocated: Double? = if (!isCritical) {
-            null  // non-critical (purchasable): FIFO consumption, no proportional allocation
-        } else if (stats != null && stats.totalWeight > 1e-12) {
-            val did = rec["demand_id"] as? String
-            val w = (if (did != null) demandQtyMap[did] else null)
-                ?: (rec["qty_consumed"] as? Number)?.toDouble()
-                ?: 0.0
-            stats.lotQty * w / stats.totalWeight
+            null  // non-critical (purchasable): FIFO consumption, no allocation concept
+        } else if (pidLid != null && did != null && perLotBudgets != null) {
+            val lotKey = "${pidLid.first}|${pidLid.second}|$sid"
+            perLotBudgets[did]?.get(lotKey) ?: 0.0
         } else {
-            (rec["qty_consumed"] as? Number)?.toDouble() ?: 0.0
+            0.0
         }
         rec["qty_allocated"] = qtyAllocated
     }
@@ -4796,7 +4786,10 @@ fun runPlanning(
         .flatMap { it.keys }
         .filterTo(mutableSetOf()) { it.count { c -> c == '|' } >= 2 }
         .mapTo(mutableSetOf()) { it.substringAfterLast('|') }
-    val supplyAllocations = extractSupplyAllocations(allPegging, suppliesForCap, demands, criticalSupplyIds)
+    // Use pristineBudgetCaps (the deep snapshot taken before legacyCommit starts mutating
+    // sgAllocation.perLotBudgets in place via write-back) — the live map holds REMAINING
+    // budget by this point, not the original entitlement that was actually enforced.
+    val supplyAllocations = extractSupplyAllocations(allPegging, suppliesForCap, criticalSupplyIds, pristineBudgetCaps)
     val supplyCapViolations = verifySupplyCap(suppliesForCap, supplyAllocations)
     // R7e: physical conservation — only count pegging from served demands (committed > 0).
     // Unserved demands have their inventory restored by plan()'s invCopy rollback; excluding

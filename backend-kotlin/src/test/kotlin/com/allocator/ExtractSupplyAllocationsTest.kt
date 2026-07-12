@@ -10,8 +10,8 @@ import io.kotest.matchers.shouldBe
 
 class ExtractSupplyAllocationsTest : FunSpec({
 
-    fun supplyRow(id: String, qty: Double): Map<String, Any?> =
-        mapOf("supply_id" to id, "qty" to qty)
+    fun supplyRow(id: String, qty: Double, productId: String = "P1", locationId: String = "L1"): Map<String, Any?> =
+        mapOf("supply_id" to id, "qty" to qty, "product_id" to productId, "location_id" to locationId)
 
     fun supplyLeaf(supplyId: String, qty: Double): Map<String, Any?> = mapOf(
         "type" to "supply", "supply_id" to supplyId, "quantity" to qty, "children" to emptyList<Any>(),
@@ -157,5 +157,49 @@ class ExtractSupplyAllocationsTest : FunSpec({
         allocs shouldHaveSize 1
         allocs[0]["demand_id"] shouldBe "D1"
         (allocs[0]["qty_consumed"] as Double) shouldBe (30.0 plusOrMinus 1e-9)
+    }
+
+    // ── qty_allocated: must be the real planning-time entitlement, not a re-derived estimate ──
+
+    test("qty_allocated for a critical lot is the real perLotBudgets entitlement, not a proportional estimate") {
+        val supplies = listOf(supplyRow("S1", 100.0, productId = "160-1153", locationId = "1000"))
+        val pegging = listOf(
+            entry("D1", demandTree("D1", listOf(supplyLeaf("S1", 40.0)))),
+            entry("D2", demandTree("D2", listOf(supplyLeaf("S1", 30.0)))),
+        )
+        // Deliberately NOT proportional to qty_consumed (40/30) or to any requested-qty weighting
+        // — this is exactly the shape of divergence that motivated the fix: D1 consumed less
+        // than its entitlement, D2 consumed more of ITS entitlement than D1 did of its own.
+        val perLotBudgets: Map<Any?, Map<String, Double>> = mapOf(
+            "D1" to mapOf("160-1153|1000|S1" to 55.0),
+            "D2" to mapOf("160-1153|1000|S1" to 45.0),
+        )
+
+        val allocs = extractSupplyAllocations(pegging, supplies, criticalSupplyIds = setOf("S1"), perLotBudgets = perLotBudgets)
+        val byDemand = allocs.associateBy { it["demand_id"] as String }
+        (byDemand["D1"]!!["qty_allocated"] as Double) shouldBe (55.0 plusOrMinus 1e-9)
+        (byDemand["D2"]!!["qty_allocated"] as Double) shouldBe (45.0 plusOrMinus 1e-9)
+        // qty_consumed is untouched by this fix — still the real draw.
+        (byDemand["D1"]!!["qty_consumed"] as Double) shouldBe (40.0 plusOrMinus 1e-9)
+        (byDemand["D2"]!!["qty_consumed"] as Double) shouldBe (30.0 plusOrMinus 1e-9)
+    }
+
+    test("qty_allocated is null for non-critical lots regardless of perLotBudgets") {
+        val supplies = listOf(supplyRow("S1", 100.0, productId = "P1", locationId = "L1"))
+        val pegging = listOf(entry("D1", demandTree("D1", listOf(supplyLeaf("S1", 40.0)))))
+        val perLotBudgets: Map<Any?, Map<String, Double>> = mapOf("D1" to mapOf("P1|L1|S1" to 999.0))
+
+        // S1 not in criticalSupplyIds => non-critical (purchasable/FIFO) => null, even though a
+        // perLotBudgets entry happens to exist.
+        val allocs = extractSupplyAllocations(pegging, supplies, criticalSupplyIds = emptySet(), perLotBudgets = perLotBudgets)
+        allocs[0]["qty_allocated"] shouldBe null
+    }
+
+    test("qty_allocated falls back to 0 when a critical lot has no matching perLotBudgets entry") {
+        val supplies = listOf(supplyRow("S1", 100.0, productId = "P1", locationId = "L1"))
+        val pegging = listOf(entry("D1", demandTree("D1", listOf(supplyLeaf("S1", 40.0)))))
+
+        val allocs = extractSupplyAllocations(pegging, supplies, criticalSupplyIds = setOf("S1"), perLotBudgets = emptyMap())
+        (allocs[0]["qty_allocated"] as Double) shouldBe (0.0 plusOrMinus 1e-9)
     }
 })
