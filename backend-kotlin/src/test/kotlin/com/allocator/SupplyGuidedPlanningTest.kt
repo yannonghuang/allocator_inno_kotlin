@@ -428,4 +428,250 @@ class SupplyGuidedPlanningTest : FunSpec({
         perChild.values.forEach { qty -> (qty > 1e-6) shouldBe true }
         perChild.values.forEach { qty -> qty shouldBe (10.0 plusOrMinus 1e-6) }
     }
+
+    // ── F. Cross-cohort ("cousin") contention ───────────────────────────────────
+
+    // P = make(C1, C2), rate 1 each — a genuine AND. C1 reaches the shared critical
+    // material X directly, making it a branch of cohort P. C2 is itself an AND-parent —
+    // make(C2a, C2b) — so C2a reaches X as a branch of a DIFFERENT cohort (C2), not P.
+    // C1 and C2a are "cousins": both draw from the exact same demand-wide X budget, but
+    // neither is a direct AND-sibling of the other, so a per-cohort split (grouping by
+    // (cohort, supplyKey)) never puts them in the same contention group — each cohort
+    // sees only ONE branch reaching X and skips the fair-split entirely (byBranch.size <
+    // 2), leaving both branches uncapped and free to race for the shared demand-wide
+    // budget. C2b needs an unrelated, abundantly-supplied non-critical material Y so C2's
+    // own AND-min isn't blocked by anything other than the X contention.
+    val cousinConfig = mapOf<String, Any?>("purchase_allowed" to false)
+    fun cousinData() = mkData(
+        supplies = listOf(supply("X", "L", 48.0), supply("Y", "L", 1000.0)),
+        methodMake = listOf(
+            mapOf("bom_id" to "BP", "product_id" to "P", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+            mapOf("bom_id" to "B1", "product_id" to "C1", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+            mapOf("bom_id" to "B2", "product_id" to "C2", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+            mapOf("bom_id" to "B2a", "product_id" to "C2a", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+            mapOf("bom_id" to "B2b", "product_id" to "C2b", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+        ),
+        methodBuy = listOf(
+            mapOf("product_id" to "X", "location_id" to "L", "preference" to 1),
+        ),
+        bom = listOf(
+            mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "C1", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "C2", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "B1", "parent_id" to "C1", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "B2", "parent_id" to "C2", "child_id" to "C2a", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "B2", "parent_id" to "C2", "child_id" to "C2b", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "B2a", "parent_id" to "C2a", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "B2b", "parent_id" to "C2b", "child_id" to "Y", "rate" to 1.0, "alt_group" to null),
+        ),
+        demands = listOf(demand("D1", "P", "L", qty = 40.0)),
+        productlocation = listOf(
+            mapOf("product_id" to "X", "location_id" to "L", "prod_area" to "raw"),
+        ),
+    )
+
+    test("gatherAndSiblingRequests: finds cousin branches from different cohorts reaching the shared critical material") {
+        val data = cousinData()
+        val alloc = buildSupplyAllocation(data["demand"]!!, data, cousinConfig)
+        val reqs = gatherAndSiblingRequests(data["demand"]!!.first(), alloc, data, cousinConfig, null)
+
+        val xReqs = reqs.filter { it.supplyKey == SupplyKey("X", "L") }
+        xReqs.size shouldBe 2
+        // C1 is a top-level AND-sibling of P with nothing enclosing it (slot=null). C2a is
+        // nested one level under C2's own AND-fanout, so its branch carries "C2@L" as its
+        // lineage-derived slot — proof the two cousins stay distinguishable even though
+        // C1's own (pid, lid) alone would already tell them apart here (this fixture's
+        // point is the cross-cohort pooling in the next test, not the key shape itself —
+        // see section G for a case where lineage is the ONLY thing that disambiguates).
+        xReqs.map { it.branch }.toSet() shouldBe setOf(BranchKey("C1", "L", null), BranchKey("C2a", "L", "C2@L"))
+        // Different cohorts — C1's fanout is P, C2a's is C2 — confirming these are genuine
+        // cousins, not direct AND-siblings of one common parent.
+        xReqs.map { it.cohort }.toSet() shouldBe setOf("P" to "L", "C2" to "L")
+    }
+
+    test("computeAndSiblingCaps: pools cousin branches from different cohorts into one fair split") {
+        val data = cousinData()
+        val alloc = buildSupplyAllocation(data["demand"]!!, data, cousinConfig)
+        val caps = computeAndSiblingCaps(data["demand"]!!, alloc, data, cousinConfig, null)
+
+        val d1Caps = caps["D1"]
+        d1Caps shouldNotBe null
+        val c1Cap = d1Caps!![BranchKey("C1", "L", null)]
+        val c2aCap = d1Caps[BranchKey("C2a", "L", "C2@L")]
+        c1Cap shouldNotBe null
+        c2aCap shouldNotBe null
+        // Fair 2-way split of D1's own 40-unit X ceiling, even though C1 and C2a are cousins
+        // from unrelated cohorts, not siblings under one shared AND-parent.
+        c1Cap!!.values.sum() shouldBe (20.0 plusOrMinus 1e-6)
+        c2aCap!!.values.sum() shouldBe (20.0 plusOrMinus 1e-6)
+    }
+
+    test("cousin contention: branches from different AND-parents sharing one scarce material split fairly, not sequentially") {
+        // Without cross-cohort pooling, each cohort sees only one branch touching X and
+        // skips the fair split (no contention detected in isolation) — both C1 and C2a go
+        // uncapped, and whichever is evaluated first in the live commit's tree walk grabs
+        // the whole 40-unit budget, starving the other to 0. That drags C2's own AND-min to
+        // 0 (since C2a would get nothing), and P's own AND-min to 0 — D1 commits nothing
+        // despite the same 40 units being enough to give both cousins a meaningful 20 each.
+        val data = cousinData()
+        val result = runPlanning(data, config = cousinConfig)
+        @Suppress("UNCHECKED_CAST")
+        val committed = result.output["committed_demands"] as List<Map<String, Any?>>
+        val d1Total = committed.filter { it["demand_id"] == "D1" }
+            .sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
+
+        (d1Total > 1e-6) shouldBe true
+        d1Total shouldBe (20.0 plusOrMinus 1e-6)
+    }
+
+    // ── G. Identical-subtree ("shared descendant") contention ──────────────────
+
+    // P = make(C1, C2), rate 1 each — two direct AND-siblings, NOT cousins this time. Both
+    // C1 and C2 independently route through the exact same downstream product S (make(S),
+    // rate 1) — a shared sub-assembly, like two BOM components that happen to both be built
+    // from the same intermediate part. S itself is an AND-parent — make(X, Y) — with X the
+    // shared critical material. Since C1's own instance of (X@L) and C2's own SEPARATE
+    // instance of (X@L) are reached via IDENTICAL (productId, locationId), a plain
+    // BranchKey(X, L) can't tell them apart — without lineage disambiguation, they'd
+    // collapse into ONE branch entry, computeAndSiblingCaps would see no contention
+    // (byBranch.size < 2) and skip the split entirely, leaving X uncapped at the branch
+    // level and free for whichever of C1/C2 is evaluated first to drain in full.
+    val sharedDescendantConfig = mapOf<String, Any?>("purchase_allowed" to false)
+    fun sharedDescendantData() = mkData(
+        supplies = listOf(supply("X", "L", 48.0), supply("Y", "L", 1000.0)),
+        methodMake = listOf(
+            mapOf("bom_id" to "BP", "product_id" to "P", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+            mapOf("bom_id" to "B1", "product_id" to "C1", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+            mapOf("bom_id" to "B2", "product_id" to "C2", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+            mapOf("bom_id" to "BS", "product_id" to "S", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+        ),
+        methodBuy = listOf(
+            mapOf("product_id" to "X", "location_id" to "L", "preference" to 1),
+        ),
+        bom = listOf(
+            mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "C1", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "C2", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "B1", "parent_id" to "C1", "child_id" to "S", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "B2", "parent_id" to "C2", "child_id" to "S", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BS", "parent_id" to "S", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BS", "parent_id" to "S", "child_id" to "Y", "rate" to 1.0, "alt_group" to null),
+        ),
+        demands = listOf(demand("D1", "P", "L", qty = 40.0)),
+        productlocation = listOf(
+            mapOf("product_id" to "X", "location_id" to "L", "prod_area" to "raw"),
+        ),
+    )
+
+    test("gatherAndSiblingRequests: C1's and C2's own separate instances of the shared X touch get distinct lineage-tagged branches") {
+        val data = sharedDescendantData()
+        val alloc = buildSupplyAllocation(data["demand"]!!, data, sharedDescendantConfig)
+        val reqs = gatherAndSiblingRequests(data["demand"]!!.first(), alloc, data, sharedDescendantConfig, null)
+
+        val xReqs = reqs.filter { it.supplyKey == SupplyKey("X", "L") }
+        xReqs.size shouldBe 2
+        // Same (productId, locationId) for both — X@L — but DIFFERENT slots (lineage),
+        // proving they're distinguishable despite being structurally identical otherwise.
+        xReqs.map { it.branch.productId to it.branch.locationId }.toSet() shouldBe setOf("X" to "L")
+        xReqs.map { it.branch.slot }.toSet().size shouldBe 2
+        xReqs.map { it.branch }.toSet().size shouldBe 2
+    }
+
+    test("computeAndSiblingCaps: splits X fairly between C1's and C2's own identical-shaped subtrees") {
+        val data = sharedDescendantData()
+        val alloc = buildSupplyAllocation(data["demand"]!!, data, sharedDescendantConfig)
+        val caps = computeAndSiblingCaps(data["demand"]!!, alloc, data, sharedDescendantConfig, null)
+
+        val d1Caps = caps["D1"]
+        d1Caps shouldNotBe null
+        val xBranches = d1Caps!!.keys.filter { it.productId == "X" && it.locationId == "L" }
+        xBranches.size shouldBe 2
+        for (branch in xBranches) {
+            d1Caps[branch]!!.values.sum() shouldBe (20.0 plusOrMinus 1e-6)
+        }
+    }
+
+    test("shared-descendant contention: two AND-siblings routing through an identical downstream subtree split fairly, not sequentially") {
+        // Without lineage disambiguation, C1's and C2's own separate draws of X collapse to
+        // the same BranchKey — no contention detected, X goes uncapped, and whichever
+        // sibling is evaluated first grabs the whole 40-unit budget. That leaves the other
+        // sibling's own S-instance at 0, dragging P's AND-min to 0 despite the same 40 units
+        // being enough to give both a meaningful 20 each.
+        val data = sharedDescendantData()
+        val result = runPlanning(data, config = sharedDescendantConfig)
+        @Suppress("UNCHECKED_CAST")
+        val committed = result.output["committed_demands"] as List<Map<String, Any?>>
+        val d1Total = committed.filter { it["demand_id"] == "D1" }
+            .sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
+
+        (d1Total > 1e-6) shouldBe true
+        d1Total shouldBe (20.0 plusOrMinus 1e-6)
+    }
+
+    // ── H. Root-split ("OR-alternative") identical-subtree contention ──────────
+
+    // Same shared-descendant shape as section G, but the fanout at P is a root-split — ONE
+    // make method with two alt_group variants (G1 → C1, G2 → C2), proportionally split —
+    // rather than an AND-group's mandatory children. This is the realistic shape root-split
+    // candidates normally take (distinguished by alt_group within one method; slotIdFor
+    // falls back to location only when a candidate has no altKey at all — e.g. purchase/
+    // move — which would collide two candidates at the same location, a separate,
+    // pre-existing slotIdFor gap outside this fix's scope). Root-split candidates all
+    // share the exact same (productId, locationId) — P@L — since they're alternative
+    // ROUTES to building the identical product, not distinct BOM line items. That makes
+    // the lineage-collision risk even more direct than section G's: extending lineage with
+    // plain "P@L" would produce the SAME segment for both alt_group candidates, so the fix
+    // also folds each candidate's own slot identifier in (see the fix's own comment at its
+    // call site).
+    val rootSplitSharedDescendantConfig = mapOf<String, Any?>("purchase_allowed" to false)
+    fun rootSplitSharedDescendantData() = mkData(
+        supplies = listOf(supply("X", "L", 48.0), supply("Y", "L", 1000.0)),
+        methodMake = listOf(
+            mapOf("bom_id" to "BP", "product_id" to "P", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+            mapOf("bom_id" to "B1", "product_id" to "C1", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+            mapOf("bom_id" to "B2", "product_id" to "C2", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+            mapOf("bom_id" to "BS", "product_id" to "S", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+        ),
+        methodBuy = listOf(
+            mapOf("product_id" to "X", "location_id" to "L", "preference" to 1),
+        ),
+        bom = listOf(
+            mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "C1", "rate" to 1.0, "alt_group" to "G1"),
+            mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "C2", "rate" to 1.0, "alt_group" to "G2"),
+            mapOf("bom_id" to "B1", "parent_id" to "C1", "child_id" to "S", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "B2", "parent_id" to "C2", "child_id" to "S", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BS", "parent_id" to "S", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BS", "parent_id" to "S", "child_id" to "Y", "rate" to 1.0, "alt_group" to null),
+        ),
+        demands = listOf(demand("D1", "P", "L", qty = 40.0)),
+        productlocation = listOf(
+            mapOf("product_id" to "X", "location_id" to "L", "prod_area" to "raw"),
+        ),
+    )
+
+    test("gatherAndSiblingRequests: M1's and M2's root-split branches touching the shared X get distinct lineage-tagged keys") {
+        val data = rootSplitSharedDescendantData()
+        val alloc = buildSupplyAllocation(data["demand"]!!, data, rootSplitSharedDescendantConfig)
+        val reqs = gatherAndSiblingRequests(data["demand"]!!.first(), alloc, data, rootSplitSharedDescendantConfig, null)
+
+        val xReqs = reqs.filter { it.supplyKey == SupplyKey("X", "L") }
+        xReqs.size shouldBe 2
+        xReqs.map { it.branch }.toSet().size shouldBe 2
+    }
+
+    test("root-split shared-descendant contention: two OR-alternative candidates routing through an identical downstream subtree both get their fair share") {
+        // Root-split (additive, not AND-min): if the fix correctly gives M1's and M2's own
+        // X-touches their fair, non-colliding share, EACH candidate fully covers its own
+        // 20-unit target and the two contributions sum — D1 commits close to its full 40,
+        // not the "one candidate wins everything, the other gets nothing, total capped at
+        // whichever single candidate's own need" outcome the lineage collision would cause.
+        val data = rootSplitSharedDescendantData()
+        val result = runPlanning(data, config = rootSplitSharedDescendantConfig)
+        @Suppress("UNCHECKED_CAST")
+        val committed = result.output["committed_demands"] as List<Map<String, Any?>>
+        val d1Total = committed.filter { it["demand_id"] == "D1" }
+            .sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
+
+        // Strictly better than the AND-min case's known-partial 20 — both candidates share
+        // the pool fairly instead of one starving the other.
+        (d1Total > 20.0 + 1e-6) shouldBe true
+    }
 })

@@ -1267,6 +1267,9 @@ internal fun planMethodSlot(
     branchLotCap: Map<String, Double>? = null,
     /** See [plan]'s doc — paired, never-restored, per-branch consumption tally. */
     branchConsumed: MutableMap<String, Double>? = null,
+    /** See [plan]'s doc — lineage of enclosing branch identities, for matching
+     *  [andSiblingCaps] lookups against branches nested under a specific outer sibling. */
+    branchLineage: String = "",
 ): MethodSlotResult {
     val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
     val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
@@ -1349,6 +1352,19 @@ internal fun planMethodSlot(
     // across rollbacks — no object replacement, same MutableMaps throughout.
     val inventorySnap = snapshotQtys(inventory)
     val budgetSnap: Map<String, Double>? = budget?.toMap()
+    // Paired with demandConsumed/branchConsumed's restore below: those trackers are
+    // deliberately NOT touched by the inventory/budget restore they sit next to (see that
+    // restore's own comment) — permanent, cross-sibling accounting is the whole point of
+    // demandConsumed. But when THIS candidate method is abandoned wholesale (capped <= 1e-9
+    // below), every draw made while exploring its children — at any depth — must unwind
+    // together, consumed-trackers included, or a later, unrelated candidate/retry at this
+    // same node inherits a phantom demand-wide charge for units that were never actually
+    // committed anywhere. Restoring only inventory+budget while leaving demandConsumed
+    // permanently charged can zero out an entire demand even when a genuinely achievable
+    // draw exists — the abandoned candidate's exploratory consumption silently exhausts the
+    // shared cap before the real, kept candidate ever gets a turn.
+    val demandConsumedSnap: Map<String, Double>? = demandConsumed?.toMap()
+    val branchConsumedSnap: Map<String, Double>? = branchConsumed?.toMap()
 
     // ── First pass: plan all children at activeSlotQty ───────────────────────
     val childPassResults = mutableListOf<ChildPassResult>()
@@ -1374,10 +1390,22 @@ internal fun planMethodSlot(
         // already inside (an ordinary, non-contending pass-through).
         val cPid = (c["product_id"] as? String)?.trim() ?: ""
         val cLid = (c["location_id"] as? String)?.trim() ?: ""
-        val childAndCap = andSiblingCaps?.get(BranchKey(cPid, cLid))
+        // Lookup key always embeds the CURRENT (not-yet-extended) lineage — matches exactly
+        // what gatherAndSiblingRequests used when it created this child's own branch, if any
+        // (see BranchKey/combineSlot's doc). Whether lineage gets EXTENDED for the recursive
+        // call below depends on isAndGroupChild — see that flag's own comment.
+        val childAndCap = andSiblingCaps?.get(BranchKey(cPid, cLid, combineSlot(branchLineage, null)))
         val cBranchLotCap = childAndCap ?: branchLotCap
         val cBranchConsumed = if (childAndCap != null) mutableMapOf<String, Double>() else branchConsumed
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, competingDemands = competingDemands, andSiblingCaps = andSiblingCaps, branchLotCap = cBranchLotCap, branchConsumed = cBranchConsumed)
+        // Only extend lineage descending into a genuine AND-group (>1 children):
+        // gatherAndSiblingRequests's own isAndGroup check gates branch creation
+        // identically, so a single-child pass-through (a "move" method's sole source, or a
+        // "make" with just one BOM child) never got its own branch/lineage segment on the
+        // gather side either — extending lineage here too would desync from what any REAL
+        // nested fanout further down was actually tagged with.
+        val isAndGroupChild = activeChildren.size > 1
+        val cBranchLineage = if (isAndGroupChild) extendLineage(branchLineage, cPid, cLid) else branchLineage
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, competingDemands = competingDemands, andSiblingCaps = andSiblingCaps, branchLotCap = cBranchLotCap, branchConsumed = cBranchConsumed, branchLineage = cBranchLineage)
         // Prefer the unrounded "quantity_precise" (see committedRow's doc) over the rounded
         // "quantity" — this feeds the AND-min ratio (computeRawAchievable) below, and reading
         // the rounded value here would let a genuinely-achieved fractional child (e.g. 0.4999
@@ -1496,6 +1524,20 @@ internal fun planMethodSlot(
                         if (v != null && v > cap) budget[key] = cap
                     }
                 }
+            }
+            // Undo the permanent demand-wide/branch-wide consumption charges this abandoned
+            // candidate's children racked up — see demandConsumedSnap's doc above. Without
+            // this, an earlier candidate/retry at this same node that happened to draw real
+            // budget from a scarce shared material (before failing for an unrelated reason
+            // elsewhere in its own AND-list) permanently poisons that material's remaining
+            // allowance for every later candidate, even the one that ultimately gets kept.
+            if (demandConsumed != null && demandConsumedSnap != null) {
+                demandConsumed.clear()
+                demandConsumed.putAll(demandConsumedSnap)
+            }
+            if (branchConsumed != null && branchConsumedSnap != null) {
+                branchConsumed.clear()
+                branchConsumed.putAll(branchConsumedSnap)
             }
             // Keep the first-pass child pegging trees so the UI can show *why*
             // this method was blocked — under-allocated child branches, deeper
@@ -1921,6 +1963,19 @@ fun plan(
      * a NEW capped branch; inherited unchanged while staying inside the same one.
      */
     branchConsumed: MutableMap<String, Double>? = null,
+    /**
+     * Chain of enclosing branch identities ("pid@lid" segments joined by ">"), built by
+     * [extendLineage] exactly as [gatherAndSiblingRequests] built it on the gather side.
+     * Needed because [BranchKey] alone (productId, locationId, slot) collapses two
+     * structurally identical subtrees reached via DIFFERENT outer AND-siblings — e.g. two
+     * siblings that both happen to route through the same shared sub-assembly — into one
+     * indistinguishable key. `andSiblingCaps` lookups (in [planMethodSlot]'s AND-loop and
+     * this function's own root-split loop) embed the current lineage into the key via
+     * [combineSlot], and extend it via [extendLineage] for whichever child/candidate they're
+     * about to recurse into — mirroring precisely which points the gather phase treats as
+     * "a new branch was created". `""` (the default) at the top of a fresh demand.
+     */
+    branchLineage: String = "",
 ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
 
     val productId = (demand["product_id"] as? String)?.trim() ?: ""
@@ -1954,6 +2009,7 @@ fun plan(
             andSiblingCaps   = andSiblingCaps,
             branchLotCap     = branchLotCap,
             branchConsumed   = branchConsumed,
+            branchLineage    = branchLineage,
         )
         // Top-down (garbage-collection): this node's quantity was capped by a jointly-computed
         // cross-demand shared-supply budget, not a single sibling WO — "least quantity
@@ -2430,13 +2486,25 @@ fun plan(
         // Intra-demand sibling contention (the "diamond" fix), root-split side: when this
         // slot is one of rootSplitWeights' simultaneously-active candidates, look up the
         // matching branch Phase 2 (computeAndSiblingCaps) computed for it — keyed the same
-        // way gatherAndSiblingRequests built it (BranchKey(productId, locationId, slotId),
-        // slotId = slotIdFor(candidate)). A miss (candidate-set drift between the gather
-        // pass and this live waterfall) degrades safely to the outer branch cap, if any.
-        val rootSplitBranchKey = if (rootSplitWeights != null) BranchKey(productId, locationId, slotIdFor(candidate)) else null
+        // way gatherAndSiblingRequests built it: BranchKey(productId, locationId,
+        // combineSlot(lineage, slotIdFor(candidate))), embedding the current branchLineage
+        // exactly as the gather side did at its own root-split creation point. A miss
+        // (candidate-set drift between the gather pass and this live waterfall) degrades
+        // safely to the outer branch cap, if any.
+        val rootSplitBranchKey = if (rootSplitWeights != null)
+            BranchKey(productId, locationId, combineSlot(branchLineage, slotIdFor(candidate))) else null
         val slotAndCap = rootSplitBranchKey?.let { andSiblingCaps?.get(it) }
         val slotBranchLotCap = slotAndCap ?: branchLotCap
         val slotBranchConsumed = if (slotAndCap != null) mutableMapOf<String, Double>() else branchConsumed
+        // Only extend lineage when this candidate is genuinely one of rootSplitWeights'
+        // simultaneously-active branches — mirrors gatherAndSiblingRequests's own
+        // `isRoot && cap > 1` gate for when it extends lineage descending into a root-split
+        // candidate's own children (routeChildrenForDiscovery). Root-split candidates all
+        // share the SAME (productId, locationId) — plain "pid@lid" would produce an
+        // identical segment for every candidate, so fold slotIdFor(candidate) in too,
+        // matching gather's own fix at its mirror-image call site exactly.
+        val slotBranchLineage = if (rootSplitWeights != null)
+            extendLineage(branchLineage, productId, "$locationId#${slotIdFor(candidate)}") else branchLineage
         val attempt = planMethodSlot(
             m = candidate.method, slotQty = slotQty,
             productId = productId, locationId = locationId,
@@ -2459,6 +2527,7 @@ fun plan(
             andSiblingCaps = andSiblingCaps,
             branchLotCap = slotBranchLotCap,
             branchConsumed = slotBranchConsumed,
+            branchLineage = slotBranchLineage,
         )
         // Always record the attempt's pegging node so the UI shows every candidate tried
         // (including blocked ones with zero qty) — informative for the user even when a

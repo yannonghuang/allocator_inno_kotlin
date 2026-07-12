@@ -716,6 +716,22 @@ internal fun slotIdFor(candidate: WaterfallCandidate): String =
         ?: (candidate.method["location_id"] ?: candidate.method["to_location_id"] ?: "").toString()}"
 
 /**
+ * Lineage: the chain of enclosing branch identities ("pid@lid" segments joined by ">")
+ * leading to a fanout. Shared verbatim between [gatherAndSiblingRequests] (which builds
+ * it while discovering branches) and PlanningEngine.kt's `plan()`/`planMethodSlot` (which
+ * must reconstruct the identical value while walking the live commit, so a branch created
+ * mid-tree by two DIFFERENT outer AND-siblings that happen to route through the same
+ * shared sub-assembly doesn't collapse to one indistinguishable BranchKey — see
+ * [gatherAndSiblingRequests]'s own doc for the full rationale. Both sides MUST use these
+ * exact same two functions, or a lookup mismatch silently falls back to "uncapped".
+ */
+internal fun extendLineage(lineage: String, pid: String, lid: String): String =
+    if (lineage.isEmpty()) "$pid@$lid" else "$lineage>$pid@$lid"
+
+internal fun combineSlot(lineage: String, localSlot: String?): String? =
+    listOfNotNull(lineage.ifEmpty { null }, localSlot).joinToString("|").ifEmpty { null }
+
+/**
  * Phase 1 — pure top-down request gathering for one demand: assumes infinite upstream
  * supply and deterministic top-choice (KB-ranked) routing at every non-fanout point (the
  * same simplification [nodeSketchInto] and [computeAchievableQtyMaps] already lean on —
@@ -793,6 +809,19 @@ internal fun gatherAndSiblingRequests(
                     val variants = variantsForMake(pid, mLoc, needed, best.method, data)
                     val chosen = if (best.altKey != null) variants.filter { it.first == best.altKey } else variants
                     for ((_, children) in chosen) {
+                        // A nested AND-fanout (>1 child) partway down this branch's own
+                        // subtree is exactly what `discover` independently finds and handles
+                        // at its own, finer-grained cohort (it's invoked on this same (pid,
+                        // lid) alongside every accumulate call — see both call sites below).
+                        // Flattening through it here too would register a SECOND, coarser
+                        // request for the same underlying critical-material touch — under
+                        // this outer branch's identity rather than the nested branch's own —
+                        // diluting the fair split with a phantom contender that never
+                        // actually draws anything in the live commit (nothing looks up this
+                        // outer branch's cap for a leaf that's really reached through the
+                        // nested fanout's own, more specific branch key). Stop here; the
+                        // nested discover call covers this subtree completely on its own.
+                        if (children.size > 1) return
                         for (child in children) {
                             val cPid = (child["product_id"] as? String)?.trim() ?: continue
                             val cLid = (child["location_id"] as? String)?.trim() ?: continue
@@ -815,17 +844,27 @@ internal fun gatherAndSiblingRequests(
     // target qty (rate-based for AND, KB-weighted for root-split — mirroring
     // PlanningEngine.kt's rootSplitWeights formula exactly), fires one fresh [accumulate]
     // per branch, and keeps discovering deeper, independent fanouts nested within each
-    // branch's own subtree (each nested fanout gets its own, separate cohort — whether an
-    // outer branch's cap should also constrain a nested inner one is deliberately left
-    // uncomposed in v1; see plan doc).
+    // branch's own subtree — each nested fanout gets its own, separate cohort. Two
+    // "cousin" branches from unrelated cohorts that both happen to reach the same scarce
+    // critical material ARE fairly pooled together — [computeAndSiblingCaps] groups by
+    // supplyKey alone, not (cohort, supplyKey), specifically so cousin contention isn't
+    // invisible to the split. What's still left uncomposed: whether an OUTER branch's own
+    // (possibly partial) achievability should further discount an INNER nested fanout's
+    // share — e.g. a branch capped to 30% elsewhere in its own subtree still competes for
+    // an unrelated inner-fanout material as if it will fully succeed. A real but separate,
+    // lower-severity refinement (efficiency, not fair-share correctness) left for later.
+    //
+    // Lineage disambiguates two structurally identical subtrees reached via different
+    // outer AND-siblings — see [extendLineage]/[combineSlot]'s own doc for the full
+    // rationale (shared verbatim with PlanningEngine.kt's live-commit lookup).
     //
     // `discover` and `routeChildrenForDiscovery` mutually recurse, so both are declared as
     // lateinit lambdas (plain local `fun`s only see declarations lexically before them —
     // no forward reference — so genuine two-way local-function recursion needs this).
-    lateinit var discover: (String, String, Double, Boolean, MutableSet<Pair<String, String>>) -> Unit
-    lateinit var routeChildrenForDiscovery: (WaterfallCandidate, String, String, Double) -> Unit
+    lateinit var discover: (String, String, Double, Boolean, MutableSet<Pair<String, String>>, String) -> Unit
+    lateinit var routeChildrenForDiscovery: (WaterfallCandidate, String, String, Double, String) -> Unit
 
-    discover = discover@{ pid: String, lid: String, needed: Double, isRoot: Boolean, visited: MutableSet<Pair<String, String>> ->
+    discover = discover@{ pid: String, lid: String, needed: Double, isRoot: Boolean, visited: MutableSet<Pair<String, String>>, lineage: String ->
         if (needed <= 1e-9) return@discover
         val key = pid to lid
         if (!visited.add(key)) return@discover
@@ -846,12 +885,20 @@ internal fun gatherAndSiblingRequests(
                 for ((idx, cand) in top.withIndex()) {
                     val target = weights[idx] * needed
                     if (target <= 1e-9) continue
-                    val branch = BranchKey(pid, lid, slotIdFor(cand))
+                    val branch = BranchKey(pid, lid, combineSlot(lineage, slotIdFor(cand)))
                     accumulate(pid, lid, target, branch, cohort, mutableSetOf())
                     // Step directly into this candidate's own children for nested-fanout
                     // discovery — cannot re-enter discover(pid, lid, ...) here, that would
                     // just re-trigger this same root-split fanout again.
-                    routeChildrenForDiscovery(cand, pid, lid, target)
+                    //
+                    // Root-split candidates all share the SAME (pid, lid) — they're OR
+                    // alternatives for building the identical product, not distinct BOM
+                    // children — so extending lineage with plain "pid@lid" would produce the
+                    // SAME segment for every candidate, collapsing a nested fanout shared by
+                    // two DIFFERENT root-split candidates exactly like an unqualified
+                    // BranchKey would. Fold the candidate's own slot in too, matching
+                    // `branch`'s own identity, so each candidate's descent stays distinct.
+                    routeChildrenForDiscovery(cand, pid, lid, target, extendLineage(lineage, pid, "$lid#${slotIdFor(cand)}"))
                 }
                 return@discover
             }
@@ -865,7 +912,7 @@ internal fun gatherAndSiblingRequests(
             when (best.method["type"]) {
                 "move" -> {
                     val fromLid = (best.method["from_location_id"] as? String)?.trim() ?: return@discover
-                    discover(pid, fromLid, needed, false, visited)
+                    discover(pid, fromLid, needed, false, visited, lineage)
                 }
                 "make" -> {
                     val mLoc = (best.method["location_id"] as? String)?.trim() ?: lid
@@ -880,9 +927,9 @@ internal fun gatherAndSiblingRequests(
                                 val cLid = (child["location_id"] as? String)?.trim() ?: continue
                                 val cQty = (child["quantity"] as? Number)?.toDouble() ?: continue
                                 if (cQty <= 1e-9) continue
-                                val branch = BranchKey(cPid, cLid)
+                                val branch = BranchKey(cPid, cLid, combineSlot(lineage, null))
                                 accumulate(cPid, cLid, cQty, branch, cohort, mutableSetOf())
-                                discover(cPid, cLid, cQty, false, mutableSetOf())
+                                discover(cPid, cLid, cQty, false, mutableSetOf(), extendLineage(lineage, cPid, cLid))
                             }
                         } else {
                             for (child in children) {
@@ -890,7 +937,7 @@ internal fun gatherAndSiblingRequests(
                                 val cLid = (child["location_id"] as? String)?.trim() ?: continue
                                 val cQty = (child["quantity"] as? Number)?.toDouble() ?: continue
                                 if (cQty <= 1e-9) continue
-                                discover(cPid, cLid, cQty, false, visited)
+                                discover(cPid, cLid, cQty, false, visited, lineage)
                             }
                         }
                     }
@@ -901,11 +948,11 @@ internal fun gatherAndSiblingRequests(
         }
     }
 
-    routeChildrenForDiscovery = routeChildrenForDiscovery@{ candidate: WaterfallCandidate, pid: String, lid: String, needed: Double ->
+    routeChildrenForDiscovery = routeChildrenForDiscovery@{ candidate: WaterfallCandidate, pid: String, lid: String, needed: Double, lineage: String ->
         when (candidate.method["type"]) {
             "move" -> {
                 val fromLid = (candidate.method["from_location_id"] as? String)?.trim() ?: return@routeChildrenForDiscovery
-                discover(pid, fromLid, needed, false, mutableSetOf())
+                discover(pid, fromLid, needed, false, mutableSetOf(), lineage)
             }
             "make" -> {
                 val mLoc = (candidate.method["location_id"] as? String)?.trim() ?: lid
@@ -917,22 +964,27 @@ internal fun gatherAndSiblingRequests(
                         val cLid = (child["location_id"] as? String)?.trim() ?: continue
                         val cQty = (child["quantity"] as? Number)?.toDouble() ?: continue
                         if (cQty <= 1e-9) continue
-                        discover(cPid, cLid, cQty, false, mutableSetOf())
+                        discover(cPid, cLid, cQty, false, mutableSetOf(), lineage)
                     }
                 }
             }
         }
     }
 
-    discover(rootPid, rootLid, rootQty, true, mutableSetOf())
+    discover(rootPid, rootLid, rootQty, true, mutableSetOf(), "")
     return out
 }
 
 /**
- * Phase 2 — per-(demand, cohort, critical supply) fair allocation among contending
- * branches discovered by [gatherAndSiblingRequests]. Reuses [allocate] — the same
- * fair-split primitive already used cross-demand — one level deeper, within a single
- * demand's own tree.
+ * Phase 2 — per-(demand, critical supply) fair allocation among contending branches
+ * discovered by [gatherAndSiblingRequests]. Reuses [allocate] — the same fair-split
+ * primitive already used cross-demand — one level deeper, within a single demand's own
+ * tree.
+ *
+ * Grouped by supplyKey alone, deliberately NOT by (cohort, supplyKey): branches from
+ * different AND-parents ("cousins") competing for the same scarce material draw from the
+ * exact same demand-wide budget and must be split together, not one cohort at a time —
+ * see the grouping loop below for the full rationale.
  *
  * Returns demandId → branch → lotKey → capped qty, ready to slice per-demand and thread
  * into [legacyCommit] as `andSiblingCaps`.
@@ -957,8 +1009,17 @@ internal fun computeAndSiblingCaps(
         val demandBudgets = allocation.perLotBudgets[demandId] ?: emptyMap()
         val branchCaps = mutableMapOf<BranchKey, MutableMap<String, Double>>()
 
-        for ((cohortAndSupply, group) in requests.groupBy { it.cohort to it.supplyKey }) {
-            val sk = cohortAndSupply.second
+        // Group by supplyKey ALONE — not (cohort, supplyKey). Two branches hanging off
+        // different AND-parents ("cousins") that both reach the same scarce critical
+        // material are just as much in contention as two direct AND-siblings: they draw
+        // from the exact same demand-wide budget. Grouping per-cohort would let each
+        // cohort's fair-split run in isolation, blind to the other's claim on the same
+        // pool — worse, a branch with no peer *within its own cohort* would never trip
+        // the size<2 check below and would go uncapped, free to drain the whole
+        // demand-wide budget if evaluated first, starving its cousin(s) down to zero.
+        // For demands where every critical material is reached from a single cohort
+        // (the common case), this produces the exact same groups as before.
+        for ((sk, group) in requests.groupBy { it.supplyKey }) {
             val byBranch = group.groupBy { it.branch }
             if (byBranch.size < 2) continue  // no contention: only one branch reaches this supply
 
