@@ -3159,17 +3159,25 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return m;
   }, [planResult?.committed_demands]);
 
-  // supply_id → demand_id → qty_allocated (demand's proportional entitlement from this lot).
-  // Only critical lots (non-purchasable raw materials) have a qty_allocated; non-critical lots
-  // (purchasable / FIFO) have qty_allocated = null and are excluded from this map so the UI
-  // renders "–" instead of a misleading proportional figure.
+  // supply_id → demand_id → qty_allocated (the demand's real, planning-enforced entitlement
+  // for this lot — see extractSupplyAllocations's own doc). Only critical lots (non-purchasable
+  // raw materials) have a qty_allocated; non-critical lots (purchasable / FIFO) have
+  // qty_allocated = null and are excluded from this map so the UI renders "–" instead of a
+  // misleading figure.
+  //
+  // One (demand, lot) pair can appear as several separate supply_allocations records (one per
+  // physical leaf/consumption event in the pegging tree — qty_consumed is genuinely additive
+  // across them). qty_allocated is NOT: it's the same per-(demand,lot) entitlement value
+  // repeated identically on every one of that demand's records for this lot, so it must be
+  // taken once, not summed — summing would multiply it by however many consumption events
+  // happened to occur (e.g. 4 records × 186 ≈ 745, a phantom number matching nothing real).
   const lotDemandAllocMap = useMemo(() => {
     const m = new Map<string, Map<string, number>>();
     for (const a of planResult?.supply_allocations ?? []) {
       if (!a.demand_id || a.qty_allocated == null) continue;  // non-critical lots: no allocation concept
       let dm = m.get(a.supply_id);
       if (!dm) { dm = new Map(); m.set(a.supply_id, dm); }
-      dm.set(a.demand_id, (dm.get(a.demand_id) ?? 0) + a.qty_allocated);
+      dm.set(a.demand_id, a.qty_allocated);
     }
     return m;
   }, [planResult?.supply_allocations]);

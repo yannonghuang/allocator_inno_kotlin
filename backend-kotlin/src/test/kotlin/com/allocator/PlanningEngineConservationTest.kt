@@ -15,6 +15,9 @@ class PlanningEngineConservationTest : FunSpec({
     fun alloc(id: String, qty: Double): Map<String, Any?> =
         mapOf("supply_id" to id, "qty_consumed" to qty)
 
+    fun allocFor(id: String, demandId: String, qty: Double): Map<String, Any?> =
+        mapOf("supply_id" to id, "demand_id" to demandId, "qty_consumed" to qty)
+
     test("full consumption: initial == pegged, zero leftover — no violation") {
         val initial = listOf(supply("S1", 100.0))
         val leftover = listOf(supply("S1", 0.0))
@@ -94,5 +97,47 @@ class PlanningEngineConservationTest : FunSpec({
 
     test("empty inputs produce no violations") {
         verifyInventoryConservation(emptyList(), emptyList(), emptyList()).shouldBeEmpty()
+    }
+
+    // ── servedDemandIds: "pegged" must mean pegged to a real served demand ─────────────
+
+    test("dead branch: real draw attributed to an unserved demand is excluded from pegged — violation detected") {
+        // D1's own AND-sibling branch genuinely drew 60 units (real, non-rolled-back
+        // physical consumption — leftover correctly reflects it as gone), but D1's
+        // overall committed_qty collapsed to 0 because a different sibling failed.
+        // Without the servedDemandIds filter this balances (100 = 40 + 60) and hides
+        // the fact that 60 units are neither leftover nor helping any served demand.
+        val initial = listOf(supply("S1", 100.0))
+        val leftover = listOf(supply("S1", 40.0))
+        val allocs = listOf(allocFor("S1", "D1", 60.0))
+        val violations = verifyInventoryConservation(initial, leftover, allocs, servedDemandIds = emptySet())
+        violations shouldHaveSize 1
+        violations[0].shouldContain("S1")
+    }
+
+    test("served demand: real draw attributed to a served demand is still counted — no violation") {
+        val initial = listOf(supply("S1", 100.0))
+        val leftover = listOf(supply("S1", 40.0))
+        val allocs = listOf(allocFor("S1", "D1", 60.0))
+        verifyInventoryConservation(initial, leftover, allocs, servedDemandIds = setOf("D1")).shouldBeEmpty()
+    }
+
+    test("mixed: served demand's draw counted, dead branch's draw excluded") {
+        val initial = listOf(supply("S1", 100.0))
+        val leftover = listOf(supply("S1", 10.0))
+        val allocs = listOf(
+            allocFor("S1", "D1", 30.0),  // served — counted
+            allocFor("S1", "D2", 40.0),  // unserved — excluded, so this is the missing 40
+        )
+        val violations = verifyInventoryConservation(initial, leftover, allocs, servedDemandIds = setOf("D1"))
+        violations shouldHaveSize 1
+        violations[0].shouldContain("S1")
+    }
+
+    test("servedDemandIds=null preserves legacy unfiltered behavior") {
+        val initial = listOf(supply("S1", 100.0))
+        val leftover = listOf(supply("S1", 40.0))
+        val allocs = listOf(allocFor("S1", "D1", 60.0))
+        verifyInventoryConservation(initial, leftover, allocs, servedDemandIds = null).shouldBeEmpty()
     }
 })
