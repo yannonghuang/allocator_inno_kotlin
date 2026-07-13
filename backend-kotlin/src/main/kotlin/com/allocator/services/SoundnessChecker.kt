@@ -490,15 +490,21 @@ fun checkRunSoundness(
     // R7e: conservation of mass — only when both inventory snapshots are provided.
     // DB-loaded soundness checks on historical runs pass empty lists and skip this.
     //
-    // No servedDemandIds filter here: supply allocations already represent real
-    // inventory consumption (extractSupplyAllocations skips failed=true subtrees whose
-    // draws were rolled back). Filtering by post-reconcile servedDemandIds would
-    // incorrectly exclude VIRTUAL consolidation demands whose inventory was consumed
-    // pre-reconcile but whose committed_qty was zeroed by reconcile() post-extraction.
+    // servedDemandIds filter applied: "pegged" must mean pegged to a real served demand,
+    // not to a dead branch. `supplyAllocations` is extracted from the pegging tree BEFORE
+    // reconcile() runs, so it can carry a genuine, non-rolled-back physical draw for a
+    // branch whose AND-parent later collapsed to 0 because a DIFFERENT sibling failed —
+    // that draw is real (leftover correctly reflects it as gone) but was never rolled
+    // back, so without this filter it silently counts as "pegged" and the formula
+    // balances despite the supply not actually contributing to any served demand.
+    // servedDemandIds itself is already computed above (line ~486) from the FINAL,
+    // post-reconcile committedDemands — combining pre-reconcile physical truth (pegged)
+    // with post-reconcile served status is exactly what makes this catch the gap.
     val conservationViolations: List<String> =
         if (inventoryEffectiveInitial.isNotEmpty() && inventoryLeftover.isNotEmpty())
             verifyInventoryConservation(
                 inventoryEffectiveInitial, inventoryLeftover, supplyAllocations,
+                servedDemandIds = servedDemandIds,
             )
         else emptyList()
 
@@ -1705,10 +1711,17 @@ internal fun checkRunSoundnessStreaming(
         }
     }
 
-    // R7e conservation — no servedDemandIds filter (see checkRunSoundness comment above)
+    // R7e conservation — servedDemandIds filter applied (see checkRunSoundness's own R7e
+    // comment for the full rationale: "pegged" must mean pegged to a real served demand).
+    val servedDemandIds: Set<String> = committedQtyById
+        .filter { (_, qty) -> qty > 1e-9 }
+        .keys
     val conservationViolations: List<String> =
         if (inventoryEffectiveInitial.isNotEmpty() && inventoryLeftover.isNotEmpty())
-            verifyInventoryConservation(inventoryEffectiveInitial, inventoryLeftover, supplyAllocations)
+            verifyInventoryConservation(
+                inventoryEffectiveInitial, inventoryLeftover, supplyAllocations,
+                servedDemandIds = servedDemandIds,
+            )
         else emptyList()
 
     // R10 inventory priority

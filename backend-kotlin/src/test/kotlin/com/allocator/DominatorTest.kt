@@ -55,6 +55,27 @@ class DominatorTest : FunSpec({
         dominators[0]["product_id"] shouldBe "C1"
     }
 
+    test("quantity_dominator label includes the supply_id — distinguishes same-material lots") {
+        // Same fixture as above: C1's single raw-leaf lot ("S_C1") is the dominator. The label
+        // must embed the supply_id, not just "product@location" — otherwise multiple distinct
+        // physical lots of the same material (e.g. two receipts of C1 at different dates) render
+        // as visually-identical "C1@L" entries with no way to tell them apart in the UI.
+        val data = mapOf(
+            "method_make" to listOf(mapOf<String, Any?>("bom_id" to "B", "product_id" to "P", "location_id" to "L", "preference" to 1, "lead_time" to 0.0)),
+            "method_buy" to emptyList<Map<String, Any?>>(),
+            "method_move" to emptyList<Map<String, Any?>>(),
+            "bom" to listOf(bomChild("B", "C1"), bomChild("B", "C2")),
+            "productlocation" to emptyList<Map<String, Any?>>(),
+            "supply" to listOf(supplyRow("C1", 10.0), supplyRow("C2", 1000.0)),
+        )
+        val (_, _, tree) = plan(demandP(20.0), inv(supplyRow("C1", 10.0), supplyRow("C2", 1000.0)), data, requestTimeDt = null, config = mapOf("purchase_allowed" to false))
+        val wo = children(tree).firstOrNull { it["type"] == "work_order" }
+        val dominators = dominatorEntries(wo, "quantity_dominator")
+        dominators.size shouldBe 1
+        dominators[0]["supply_id"] shouldBe "S_C1"
+        (dominators[0]["label"] as String) shouldBe "C1@L (S_C1)"
+    }
+
     test("no shortage: no quantity_dominator is attached (both children fully supplied)") {
         val data = mapOf(
             "method_make" to listOf(mapOf<String, Any?>("bom_id" to "B", "product_id" to "P", "location_id" to "L", "preference" to 1, "lead_time" to 0.0)),

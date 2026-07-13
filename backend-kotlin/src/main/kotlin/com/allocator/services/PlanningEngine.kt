@@ -372,9 +372,10 @@ internal fun rawDominatorRefs(node: Map<String, Any?>?, key: String, fallbackKin
     if (isRawLeaf(node)) {
         val pid = node["product_id"] as? String
         val lid = node["location_id"] as? String
+        val sid = node["supply_id"] as? String
         return listOf(DominatorRef(
-            kind = fallbackKind, productId = pid, locationId = lid, supplyId = node["supply_id"] as? String,
-            label = "$pid@$lid",
+            kind = fallbackKind, productId = pid, locationId = lid, supplyId = sid,
+            label = if (sid != null) "$pid@$lid ($sid)" else "$pid@$lid",
         ))
     }
     @Suppress("UNCHECKED_CAST")
@@ -389,9 +390,11 @@ internal fun rawDominatorRefs(node: Map<String, Any?>?, key: String, fallbackKin
             listOfNotNull(contributingLeaves.maxByOrNull { parseDate(it["supply_date"] as? String) ?: LocalDate.MIN })
         else contributingLeaves
         return selected.map { l ->
+            val sid = l["supply_id"] as? String
+            val pidLid = "${l["product_id"]}@${l["location_id"]}"
             DominatorRef(
                 kind = fallbackKind, productId = l["product_id"] as? String, locationId = l["location_id"] as? String,
-                supplyId = l["supply_id"] as? String, label = "${l["product_id"]}@${l["location_id"]}",
+                supplyId = sid, label = if (sid != null) "$pidLid ($sid)" else pidLid,
             )
         }
     }
@@ -4791,17 +4794,19 @@ fun runPlanning(
     // budget by this point, not the original entitlement that was actually enforced.
     val supplyAllocations = extractSupplyAllocations(allPegging, suppliesForCap, criticalSupplyIds, pristineBudgetCaps)
     val supplyCapViolations = verifySupplyCap(suppliesForCap, supplyAllocations)
-    // R7e: physical conservation — only count pegging from served demands (committed > 0).
-    // Unserved demands have their inventory restored by plan()'s invCopy rollback; excluding
-    // their pegging avoids false violations from imperfect `failed=true` tagging.
+    // Served demand IDs (committed > 0, excluding hard-planning-failure rows) — used by R7f
+    // below. R7e (mass conservation) used to be computed inline here too, but that result was
+    // never actually read by anything (not the frontend, not any other backend consumer) — the
+    // real, user-facing soundness check always re-computes it independently from persisted data
+    // via SoundnessChecker.kt's checkRunSoundness/checkRunSoundnessStreaming (the /soundness API
+    // endpoint). Having two implementations of the same rule let them silently drift out of
+    // sync (one was correctly servedDemandIds-filtered, the other wasn't) — removed here so
+    // SoundnessChecker.kt is the single source of truth.
     val servedDemandIds: Set<String> = committedDemands
         .filter { !isHardPlanningFailure(it["commit_reason"] as? String) }
         .filter { ((it["quantity"] as? Number)?.toDouble() ?: 0.0) > 1e-9 }
         .mapNotNull { it["demand_id"]?.toString() }
         .toSet()
-    val conservationViolations = verifyInventoryConservation(
-        inventoryEffectiveInitial, inventory, supplyAllocations, servedDemandIds = servedDemandIds,
-    )
     // R7f: component conservation — produced qty (Phase 1 Step 2) vs consumed by served demands.
     val componentConservationViolations = if (producedByComponent.isNotEmpty())
         verifyComponentConservation(producedByComponent, allPegging, servedDemandIds = servedDemandIds)
@@ -5075,7 +5080,6 @@ fun runPlanning(
         "planning_pegging"       to adjustedTrees,
         "supply_allocations"     to supplyAllocations,
         "supply_cap_violations"  to supplyCapViolations,
-        "conservation_violations" to conservationViolations,
         // R7f component conservation: produced vs consumed per merged-leaf component.
         // Non-empty when unserved demands left their Phase 1 allocation unused. Surfaced
         // here so callers can detect budget leakage without running the full soundness checker.
@@ -5149,10 +5153,15 @@ internal fun verifyInventoryConservation(
     supplyAllocations: List<Map<String, Any?>>,
     tolerance: Double = 1e-6,
     /**
-     * When provided, only count supply allocations from these demand IDs.
-     * Unserved demands (committed=0) have their inventory restored by plan()'s
-     * invCopy rollback, so including their pegging would over-count and produce
-     * false conservation violations. Implements the formula:
+     * When provided, only count supply allocations from these demand IDs — i.e.
+     * "pegged" means pegged to a real SERVED demand, not to a dead/collapsed branch.
+     * Without this, `pegged` includes leaves that survive in the pegging tree with a
+     * genuine, non-rolled-back quantity (e.g. one AND-sibling's own branch drew real
+     * inventory successfully) even though the AND-parent's overall committed_qty
+     * collapsed to 0 because a DIFFERENT sibling failed — the formula then balances
+     * using two different notions of "consumed" (physical draw vs. reported-served),
+     * silently hiding supply that's neither leftover nor actually helping any demand.
+     * Implements the formula:
      *   initial = leftover + pegged_to_served_demands
      */
     servedDemandIds: Set<String>? = null,
