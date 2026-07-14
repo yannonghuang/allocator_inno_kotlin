@@ -1,5 +1,8 @@
 package com.allocator
 
+import com.allocator.services.DemandBlueprint
+import com.allocator.services.DominatorRef
+import com.allocator.services.NodeBlueprint
 import com.allocator.services.plan
 import com.allocator.services.runPlanning
 import io.kotest.core.spec.style.FunSpec
@@ -153,5 +156,121 @@ class DominatorTest : FunSpec({
         val rootDominators = dominatorEntries(tree, "quantity_dominator")
         rootDominators.isNotEmpty() shouldBe true
         rootDominators.all { it["product_id"] == "C1" } shouldBe true
+    }
+
+    test("intra-demand per-branch dominator: constrained AND-siblings each get a bom_child ref naming X's own lot, not one arbitrary sibling") {
+        // P = make(C1, C2, C3, C4), rate 1 each — a genuine AND, all four required together.
+        // Each Ci = make(X), rate 1 — so each of the 4 siblings independently needs P's own
+        // quantity of the SAME shared critical material X. Demand = 40, X supply = 48 (but a
+        // single demand's own aggregate per-lot cap for a critical material is the raw demand
+        // quantity, not the BOM-rate-amplified total, so D1's own ceiling on X is 40, not 48) —
+        // combined ask across the 4 siblings (160) massively exceeds that 40-unit ceiling, so
+        // computeAndSiblingCaps's step (c) tags the constrained siblings with a bom_child ref
+        // naming X's own physical lot (never a synthesized "shared budget" abstraction — a
+        // dominator is always one of the raw supply lots) instead of one arbitrary "worst"
+        // sibling the way the pre-fix AND-min logic did. Which other siblings were also drawing
+        // on that lot rides along on competingDemandIds purely for a UI tooltip, so step (c)
+        // firing is only distinguishable from the plain sketch-phase fallback by that field being
+        // populated, not by kind — both are bom_child. The live commit's own tagging site only
+        // prefers step (c)'s ref when the SKETCH phase's independent nodeQtyCaps prediction also
+        // flags a shortfall at that exact node — a documented, accepted gap (see plan's "Known
+        // scope gap" note) since the sketch phase doesn't track cross-branch consumption; for a
+        // sibling where the two predictions don't align, the sketch-phase fallback (bom_child,
+        // itself already correctly scoped to this demand's own entitled lots by the
+        // rawSupplyLotRefs fix) still fires — never nothing.
+        val data = mapOf(
+            "method_make" to listOf(
+                mapOf<String, Any?>("bom_id" to "BP", "product_id" to "P", "location_id" to "L", "preference" to 1, "lead_time" to 0.0),
+                mapOf<String, Any?>("bom_id" to "B1", "product_id" to "C1", "location_id" to "L", "preference" to 1, "lead_time" to 0.0),
+                mapOf<String, Any?>("bom_id" to "B2", "product_id" to "C2", "location_id" to "L", "preference" to 1, "lead_time" to 0.0),
+                mapOf<String, Any?>("bom_id" to "B3", "product_id" to "C3", "location_id" to "L", "preference" to 1, "lead_time" to 0.0),
+                mapOf<String, Any?>("bom_id" to "B4", "product_id" to "C4", "location_id" to "L", "preference" to 1, "lead_time" to 0.0),
+            ),
+            "method_buy" to emptyList<Map<String, Any?>>(),
+            "method_move" to emptyList<Map<String, Any?>>(),
+            "bom" to listOf(
+                bomChild("BP", "C1"), bomChild("BP", "C2"), bomChild("BP", "C3"), bomChild("BP", "C4"),
+                mapOf<String, Any?>("bom_id" to "B1", "parent_id" to "C1", "child_id" to "X", "alt_group" to null, "rate" to 1.0),
+                mapOf<String, Any?>("bom_id" to "B2", "parent_id" to "C2", "child_id" to "X", "alt_group" to null, "rate" to 1.0),
+                mapOf<String, Any?>("bom_id" to "B3", "parent_id" to "C3", "child_id" to "X", "alt_group" to null, "rate" to 1.0),
+                mapOf<String, Any?>("bom_id" to "B4", "parent_id" to "C4", "child_id" to "X", "alt_group" to null, "rate" to 1.0),
+            ),
+            "productlocation" to listOf(mapOf<String, Any?>("product_id" to "X", "location_id" to "L", "prod_area" to "raw")),
+            "supply" to listOf(supplyRow("X", 48.0)),
+            "demand" to listOf(demandP(40.0)),
+        )
+        val result = runPlanning(data, config = mapOf("purchase_allowed" to false))
+        @Suppress("UNCHECKED_CAST")
+        val planningPegging = result.output["planning_pegging"] as List<Map<String, Any?>>
+        @Suppress("UNCHECKED_CAST")
+        val tree = planningPegging.first()["tree"] as Map<String, Any?>
+
+        // Find every C1-C4 DEMAND node (not its work_order child) — plan()'s own tagging site
+        // tags the node IT returns for that call, which represents the demand itself.
+        fun findByProduct(node: Map<String, Any?>, pid: String, acc: MutableList<Map<String, Any?>>) {
+            if (node["product_id"] == pid && node["type"] == "demand") acc.add(node)
+            children(node).forEach { findByProduct(it, pid, acc) }
+        }
+        val siblingWos = mutableListOf<Map<String, Any?>>()
+        for (pid in listOf("C1", "C2", "C3", "C4")) findByProduct(tree, pid, siblingWos)
+        siblingWos.size shouldBe 4
+
+        // The core regression: every sibling correctly names X — never an arbitrary AND-min
+        // "worst" sibling — regardless of whether step (c)'s override or each sibling's own,
+        // already-correct recursive resolution is what actually produced it. Step (c) is a
+        // fallback for when a sibling's own view can't see the cross-branch contention; it must
+        // NEVER overwrite a sibling that already resolved the right answer on its own (a real,
+        // separate bug this fixture doesn't happen to exercise — see the AND-loop's own
+        // dominatorOverride, which now defers to cPegging's existing dominator when present).
+        for (wo in siblingWos) {
+            val dominators = dominatorEntries(wo, "quantity_dominator")
+            dominators.size shouldBe 1
+            // Always a real lot: kind = "bom_child", naming X@L specifically — never a
+            // synthesized aggregate.
+            dominators[0]["kind"] shouldBe "bom_child"
+            dominators[0]["product_id"] shouldBe "X"
+            dominators[0]["location_id"] shouldBe "L"
+        }
+    }
+
+    test("priority ordering: branchDominator wins over the sketch-phase fallback (ownDominator)") {
+        // Direct plan() unit test (not runPlanning) so nodeQtyCaps, demandBlueprint, and
+        // branchDominator can all be supplied explicitly and deliberately made to overlap on
+        // the same node — regression guard for the tagging site's priority order. There is no
+        // cross-demand tier to test against any more: critical materials are fully resolved by
+        // the supply-guided pre-processor before plan() runs, so quantity_dominator never needs
+        // a "who else needs this" tag — only step (c)'s branchDominator (intra-demand, freshest)
+        // and the sketch phase's own ownDominator (generic catch-all) remain.
+        val demand = demandP(10.0)
+        val data = mapOf(
+            "method_make" to emptyList<Map<String, Any?>>(),
+            "method_buy" to listOf(mapOf<String, Any?>("product_id" to "P", "location_id" to "L", "preference" to 1)),
+            "method_move" to emptyList<Map<String, Any?>>(),
+            "bom" to emptyList<Map<String, Any?>>(),
+            "productlocation" to emptyList<Map<String, Any?>>(),
+            "supply" to emptyList<Map<String, Any?>>(),
+        )
+        val nodeQtyCaps = mapOf(("P" to "L") to 5.0)  // below the 10 asked — triggers the tagging block
+        val demandBlueprint: DemandBlueprint = mapOf(
+            ("P" to "L") to NodeBlueprint(
+                achievable = 5.0,
+                quantityDominator = listOf(DominatorRef(
+                    kind = "bom_child", productId = "P", locationId = "L", label = "sketch-phase fallback cause",
+                )),
+            ),
+        )
+        val branchDominatorRef = listOf(DominatorRef(
+            kind = "bom_child", productId = "P", locationId = "L", label = "intra-demand branch cause",
+        ))
+        val (_, _, tree) = plan(
+            demand, inv(), data, requestTimeDt = null,
+            config = mapOf("purchase_allowed" to true),
+            nodeQtyCaps = nodeQtyCaps,
+            demandBlueprint = demandBlueprint,
+            branchDominator = branchDominatorRef,
+        )
+        val dominators = dominatorEntries(tree, "quantity_dominator")
+        dominators.size shouldBe 1
+        dominators[0]["label"] shouldBe "intra-demand branch cause"
     }
 })

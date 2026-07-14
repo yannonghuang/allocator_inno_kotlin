@@ -484,18 +484,27 @@ internal fun computePlanBlueprint(
     return result
 }
 
-/** Every physical lot of (pid, lid) — each an independent OR-alternative when several exist
- *  (per-lot fulfillment is itself an OR-group: several lots each partly cover one ask). Used
- *  only as the terminal cause when this exact (pid, lid) has no method able to relieve it — a
- *  genuine raw-supply bottleneck, not a (product, location) proxy. */
-private fun rawSupplyLotRefs(pid: String, lid: String, data: Map<String, List<Map<String, Any?>>>): List<DominatorRef> =
-    (data["supply"] ?: emptyList())
-        .filter { (it["product_id"] as? String)?.trim() == pid && (it["location_id"] as? String)?.trim() == lid }
-        .mapNotNull { row ->
-            val sid = (row["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            DominatorRef(kind = "bom_child", productId = pid, locationId = lid, supplyId = sid, label = "$pid@$lid")
-        }
-        .distinct()
+/** Every physical lot THIS DEMAND actually has entitlement to at (pid, lid), per its own
+ *  [demandBudgets] slice of perLotBudgets — NOT every physical lot that exists for the
+ *  product@location, which perLotBudgets deliberately fragments across ALL demands sharing a
+ *  critical material (a demand's own entitlement is only ever a subset). Used only as the
+ *  terminal cause when this exact (pid, lid) has no method able to relieve it — a genuine
+ *  raw-supply bottleneck, not a (product, location) proxy, and not a listing of lots this demand
+ *  was never entitled to draw from in the first place. When this demand has no entitlement here
+ *  at all, self-identifies as the sole terminal cause with no supply_id — mirrors
+ *  `rawDominatorRefs`'s "no supply method" terminal case in PlanningEngine.kt for consistency
+ *  across the sketch-phase / live-commit boundary. */
+private fun rawSupplyLotRefs(pid: String, lid: String, demandBudgets: Map<String, Double>): List<DominatorRef> {
+    val prefix = "$pid|$lid|"
+    val ownLots = demandBudgets.keys.filter { it.startsWith(prefix) }
+    if (ownLots.isEmpty()) {
+        return listOf(DominatorRef(kind = "bom_child", productId = pid, locationId = lid, label = "$pid@$lid (no supply)"))
+    }
+    return ownLots.mapNotNull { k ->
+        val sid = k.removePrefix(prefix).takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        DominatorRef(kind = "bom_child", productId = pid, locationId = lid, supplyId = sid, label = "$pid@$lid ($sid)")
+    }
+}
 
 private fun nodeSketchInto(
     pid: String, lid: String, needed: Double,
@@ -556,7 +565,7 @@ private fun nodeSketchInto(
         // (pid, lid)'s own raw supply — point at its actual physical lot(s) directly.
         val quantityDominator = if (aq < needed - 1e-9) {
             if (selectedMethod != null && selectedDominator.isNotEmpty()) selectedDominator
-            else rawSupplyLotRefs(pid, lid, data)
+            else rawSupplyLotRefs(pid, lid, demandBudgets)
         } else emptyList()
         into[key] = NodeBlueprint(achievable = aq, supplyQty = supplyQty, method = selectedMethod, quantityDominator = quantityDominator)
         return aq
@@ -750,6 +759,17 @@ internal fun gatherAndSiblingRequests(
     data: Map<String, List<Map<String, Any?>>>,
     config: Map<String, Any?>?,
     preferenceKb: PreferenceKb?,
+    /** This demand's own slice of [computePlanBlueprint]'s sketch-phase output — reused here
+     *  (not re-derived) to discount a branch's requested share of a shared critical material by
+     *  what the SAME sketch pass already knows that branch can achieve, independent of the
+     *  shared-material fight (nodeSketchInto doesn't track cross-branch consumption of a
+     *  contended material, so its achievable prediction for any OTHER, non-shared constraint
+     *  along the path is exactly the "ignoring this fight" ceiling step (b)'s fair-split is
+     *  missing). Already accounts for max_methods/preferences via the same config/preferenceKb
+     *  this function's own routing (rankedCandidates/kbPreference) already uses — reusing the
+     *  sketch's own achievable value here means this doesn't need its own separate notion of
+     *  achievability. `null` (the default) applies no discount, matching prior behavior. */
+    demandBlueprint: DemandBlueprint? = null,
 ): List<AndSiblingRequest> {
     val demandId = demand["demand_id"]
     if (allocation.criticalMatrix.byRow[demandId].isNullOrEmpty()) return emptyList()
@@ -798,15 +818,23 @@ internal fun gatherAndSiblingRequests(
                 out.add(AndSiblingRequest(cohort, branch, sk, needed))
                 return
             }
+            // Discount by this position's own sketch-computed achievable ceiling — everything
+            // else already known to constrain this path, independent of the shared-material
+            // fight (see this function's own demandBlueprint param doc). Applied AFTER the
+            // critical-leaf check above: capping the leaf's OWN registration by its OWN
+            // sketch-achievable would be circular (that achievable is itself derived from this
+            // demand's fair share of the very material step (b) is about to compute).
+            val cappedNeeded = demandBlueprint?.get(key)?.achievable?.let { min(needed, it) } ?: needed
+            if (cappedNeeded <= 1e-9) return
             val best = firstFeasibleCandidate(pid, lid, visited) ?: return
             when (best.method["type"]) {
                 "move" -> {
                     val fromLid = (best.method["from_location_id"] as? String)?.trim() ?: return
-                    accumulate(pid, fromLid, needed, branch, cohort, visited)
+                    accumulate(pid, fromLid, cappedNeeded, branch, cohort, visited)
                 }
                 "make" -> {
                     val mLoc = (best.method["location_id"] as? String)?.trim() ?: lid
-                    val variants = variantsForMake(pid, mLoc, needed, best.method, data)
+                    val variants = variantsForMake(pid, mLoc, cappedNeeded, best.method, data)
                     val chosen = if (best.altKey != null) variants.filter { it.first == best.altKey } else variants
                     for ((_, children) in chosen) {
                         // A nested AND-fanout (>1 child) partway down this branch's own
@@ -975,19 +1003,95 @@ internal fun gatherAndSiblingRequests(
     return out
 }
 
+/** Bundles [computeAndSiblingCaps]'s two outputs: per-branch numeric caps (step b) and, for
+ *  branches whose group was genuinely constrained, the dominator each should be tagged with
+ *  (step c). Kept as one return type (rather than two separately-invoked top-level functions)
+ *  because both are computed from the exact same per-group fair-split call — see
+ *  [allocateSiblingGroup]. */
+internal data class AndSiblingCapsResult(
+    val caps: Map<Any?, Map<BranchKey, Map<String, Double>>>,
+    val dominators: Map<Any?, Map<BranchKey, List<DominatorRef>>>,
+)
+
+private fun BranchKey.label(): String = "$productId@$locationId" + (slot?.let { " [$it]" } ?: "")
+
+/** One contended-group's fair-split result: per-branch [shares] of [availableAgg] (step b), and
+ *  — when the group's combined need exceeded what was available (the common case: proportional
+ *  scaling across every contending branch, not one clear "worst" one) — the dominator(s) each
+ *  constrained branch should be tagged with (step c).
+ *
+ *  Every branch in the group is drawing on the exact same material `sk` — so, mirroring the
+ *  AND-min rule ("the wo with the least quantity dominates; copy its dominator to every
+ *  sibling") one level up: rather than each branch computing its own reduced-quantity dominator
+ *  independently, [dominatorByBranch] is ONE already-resolved [rawSupplyLotRefs] result for `sk`
+ *  — the same bottom-up resolution every branch would already get from the sketch phase for
+ *  this shared material — copied onto every constrained branch, not recomputed per branch. A
+ *  dominator is always a real, specific supply lot (`kind = "bom_child"`, `supplyId` set), never
+ *  something composed on-the-fly at the propagation site. Which sibling branches were also
+ *  drawing on it rides along on `competingDemandIds` purely for UI-tooltip use — attached to the
+ *  copy, never baked into its identity or label — and the copy still has to survive
+ *  `isLotExhausted` at reconcile() time like any other `bom_child` ref: this is a candidate, not
+ *  a final verdict on which lot actually bound. Empty [dominatorByBranch] when the group wasn't
+ *  actually constrained (available >= total ask). */
+private data class SiblingGroupAllocation(
+    val shares: Map<BranchKey, Double>,
+    val dominatorByBranch: Map<BranchKey, List<DominatorRef>>,
+)
+
+/**
+ * Step (b): fair-split [availableAgg] of [sk] across [byBranch]'s contending branches — reuses
+ * [allocate], the same fair-split primitive already used cross-demand, one level deeper.
+ *
+ * Step (c): when the group's total ask exceeds [availableAgg] — the common case, proportional
+ * scaling across ALL branches rather than a single identifiable "worst" one — every constrained
+ * branch is tagged with the SAME [rawSupplyLotRefs] resolution for `sk`, copied rather than
+ * independently recomputed (see [SiblingGroupAllocation]'s own doc for why copy, not compose).
+ */
+private fun allocateSiblingGroup(
+    sk: SupplyKey,
+    byBranch: Map<BranchKey, List<AndSiblingRequest>>,
+    availableAgg: Double,
+    allocationMode: String,
+    demandBudgets: Map<String, Double>,
+): SiblingGroupAllocation {
+    val candidates = byBranch.map { (branch, reqs) ->
+        AllocationCandidate(demandId = branch, neededQty = reqs.sumOf { it.requestedQty }, priority = 0)
+    }
+    // Mode "demand_qty" (the default) gracefully falls back to proportional-by-neededQty here —
+    // AllocationCandidate.demandQty is deliberately left unset (0.0) since these candidates are
+    // branches of ONE demand, not competing demands; splitting by each branch's own need is
+    // exactly the right semantics.
+    // allocate() returns Map<Any?, Double> (AllocationCandidate.demandId is Any? so it can hold
+    // a BranchKey here) — safe per-entry cast, same as the pre-split code's own
+    // `branch as? BranchKey ?: continue`, not a blanket cast.
+    val shares = allocate(candidates, availableAgg, allocationMode)
+        .mapNotNull { (k, v) -> (k as? BranchKey)?.let { it to v } }.toMap()
+
+    val totalRequested = candidates.sumOf { it.neededQty }
+    val dominatorByBranch = if (totalRequested > availableAgg + 1e-9) {
+        val sharedDominator = rawSupplyLotRefs(sk.productId, sk.locationId, demandBudgets)
+        byBranch.keys.associateWith { branch ->
+            val siblingLabels = byBranch.keys.filter { it != branch }.map { it.label() }
+            sharedDominator.map { it.copy(competingDemandIds = siblingLabels) }
+        }
+    } else emptyMap()
+    return SiblingGroupAllocation(shares, dominatorByBranch)
+}
+
 /**
  * Phase 2 — per-(demand, critical supply) fair allocation among contending branches
- * discovered by [gatherAndSiblingRequests]. Reuses [allocate] — the same fair-split
- * primitive already used cross-demand — one level deeper, within a single demand's own
- * tree.
+ * discovered by [gatherAndSiblingRequests] (step a), split into fair-share allocation (step
+ * b, [allocateSiblingGroup]) and horizontal dominator propagation (step c, same function) —
+ * see [allocateSiblingGroup]'s own doc for why b and c are one call, not two.
  *
  * Grouped by supplyKey alone, deliberately NOT by (cohort, supplyKey): branches from
  * different AND-parents ("cousins") competing for the same scarce material draw from the
  * exact same demand-wide budget and must be split together, not one cohort at a time —
  * see the grouping loop below for the full rationale.
  *
- * Returns demandId → branch → lotKey → capped qty, ready to slice per-demand and thread
- * into [legacyCommit] as `andSiblingCaps`.
+ * Returns, per demand: demandId → branch → lotKey → capped qty (`caps`, ready to slice
+ * per-demand and thread into [legacyCommit] as `andSiblingCaps`), and demandId → branch →
+ * dominator refs (`dominators`, threaded the same way as `andSiblingDominators`).
  */
 internal fun computeAndSiblingCaps(
     demands: List<Map<String, Any?>>,
@@ -999,15 +1103,21 @@ internal fun computeAndSiblingCaps(
      *  single most expensive step in a large plan's pre-processing (a full BOM gather walk per
      *  demand), so it gets its own sub-progress rather than reporting only once at entry/exit. */
     onDemandProcessed: ((Int, Int) -> Unit)? = null,
-): Map<Any?, Map<BranchKey, Map<String, Double>>> {
-    val result = mutableMapOf<Any?, Map<BranchKey, Map<String, Double>>>()
+    /** [computePlanBlueprint]'s sketch-phase output — sliced per-demand and passed to
+     *  [gatherAndSiblingRequests] as its own `demandBlueprint` param. See that param's own doc
+     *  for why step (a)'s gather reuses it instead of assuming infinite achievability. */
+    planBlueprint: PlanBlueprint? = null,
+): AndSiblingCapsResult {
+    val capsResult = mutableMapOf<Any?, Map<BranchKey, Map<String, Double>>>()
+    val dominatorResult = mutableMapOf<Any?, Map<BranchKey, List<DominatorRef>>>()
     for ((idx, demand) in demands.withIndex()) {
         val demandId = demand["demand_id"] ?: continue
-        val requests = gatherAndSiblingRequests(demand, allocation, data, config, preferenceKb)
+        val requests = gatherAndSiblingRequests(demand, allocation, data, config, preferenceKb, planBlueprint?.get(demandId))  // (a)
         onDemandProcessed?.invoke(idx + 1, demands.size)
         if (requests.isEmpty()) continue
         val demandBudgets = allocation.perLotBudgets[demandId] ?: emptyMap()
         val branchCaps = mutableMapOf<BranchKey, MutableMap<String, Double>>()
+        val branchDominators = mutableMapOf<BranchKey, MutableList<DominatorRef>>()
 
         // Group by supplyKey ALONE — not (cohort, supplyKey). Two branches hanging off
         // different AND-parents ("cousins") that both reach the same scarce critical
@@ -1028,23 +1138,16 @@ internal fun computeAndSiblingCaps(
             val availableAgg = lotEntries.sumOf { it.second }
             if (availableAgg <= 1e-9) continue
 
-            val candidates = byBranch.map { (branch, reqs) ->
-                AllocationCandidate(demandId = branch, neededQty = reqs.sumOf { it.requestedQty }, priority = 0)
-            }
-            // Mode "demand_qty" (the default) gracefully falls back to proportional-by-
-            // neededQty here — AllocationCandidate.demandQty is deliberately left unset
-            // (0.0) since these candidates are branches of ONE demand, not competing
-            // demands; splitting by each branch's own need is exactly the right semantics.
-            val shares = allocate(candidates, availableAgg, allocation.sgConfig.allocationMode)
+            val (shares, dominatorByBranch) =
+                allocateSiblingGroup(sk, byBranch, availableAgg, allocation.sgConfig.allocationMode, demandBudgets)  // (b) + (c)
 
             // Known v1 limitation: projects one flat ratio onto every one of the demand's
             // existing per-lot entries for this supply key — doesn't re-check per-lot date
             // eligibility per branch.
             for ((branch, share) in shares) {
-                val b = branch as? BranchKey ?: continue
                 if (share <= 1e-9) continue
                 val ratio = share / availableAgg
-                val m = branchCaps.getOrPut(b) { mutableMapOf() }
+                val m = branchCaps.getOrPut(branch) { mutableMapOf() }
                 for ((lotKey, lotQty) in lotEntries) {
                     val cap = lotQty * ratio
                     // A branch key can legitimately recur across independent cohorts (e.g. a
@@ -1054,10 +1157,14 @@ internal fun computeAndSiblingCaps(
                     m[lotKey] = m[lotKey]?.let { min(it, cap) } ?: cap
                 }
             }
+            for ((branch, refs) in dominatorByBranch) {
+                branchDominators.getOrPut(branch) { mutableListOf() }.addAll(refs)
+            }
         }
-        if (branchCaps.isNotEmpty()) result[demandId] = branchCaps
+        if (branchCaps.isNotEmpty()) capsResult[demandId] = branchCaps
+        if (branchDominators.isNotEmpty()) dominatorResult[demandId] = branchDominators
     }
-    return result
+    return AndSiblingCapsResult(capsResult, dominatorResult)
 }
 
 // ── Post-planning trace ─────────────────────────────────────────────────────────

@@ -385,7 +385,7 @@ class SupplyGuidedPlanningTest : FunSpec({
     test("computeAndSiblingCaps: splits D1's own 40-unit X allowance evenly, 10 per sibling") {
         val data = diamondData()
         val alloc = buildSupplyAllocation(data["demand"]!!, data, diamondConfig)
-        val caps = computeAndSiblingCaps(data["demand"]!!, alloc, data, diamondConfig, null)
+        val caps = computeAndSiblingCaps(data["demand"]!!, alloc, data, diamondConfig, null).caps
 
         val d1Caps = caps["D1"]
         d1Caps shouldNotBe null
@@ -395,6 +395,142 @@ class SupplyGuidedPlanningTest : FunSpec({
             branchCap shouldNotBe null
             branchCap!!.values.sum() shouldBe (10.0 plusOrMinus 1e-6)
         }
+    }
+
+    test("computeAndSiblingCaps: step (c) copies the SAME bom_child dominator (X's own lot) onto all 4 constrained siblings") {
+        // Total ask (4 x 40 = 160) massively exceeds D1's own 40-unit X ceiling — a genuinely
+        // constrained group, so every sibling should be tagged, not just one arbitrary "worst" one.
+        // All 4 branches share the same material X, so step (c) resolves ONE rawSupplyLotRefs
+        // result for X@L (diamondData's single lot, S_X_L) and copies it onto every branch —
+        // never independently recomputes or synthesizes a "shared budget" abstraction per branch.
+        val data = diamondData()
+        val alloc = buildSupplyAllocation(data["demand"]!!, data, diamondConfig)
+        val result = computeAndSiblingCaps(data["demand"]!!, alloc, data, diamondConfig, null)
+
+        val d1Dominators = result.dominators["D1"]
+        d1Dominators shouldNotBe null
+        d1Dominators!!.size shouldBe 4
+        for (child in listOf("C1", "C2", "C3", "C4")) {
+            val refs = d1Dominators[BranchKey(child, "L")]
+            refs shouldNotBe null
+            refs!!.size shouldBe 1
+            val ref = refs.first()
+            ref.kind shouldBe "bom_child"
+            ref.productId shouldBe "X"
+            ref.locationId shouldBe "L"
+            ref.supplyId shouldBe "S_X_L"
+            // Which siblings were also drawing on the same lot rides along purely for a UI
+            // tooltip — every OTHER branch in the group ("$productId@$locationId", no [slot]
+            // suffix since these are top-level, unnested AND-siblings), not itself — and is
+            // never baked into the ref's kind or label.
+            val competing = ref.competingDemandIds
+            competing shouldNotBe null
+            competing!!.size shouldBe 3
+            competing.contains("$child@L") shouldBe false
+            listOf("C1", "C2", "C3", "C4").filter { it != child }
+                .forEach { other -> competing.contains("$other@L") shouldBe true }
+        }
+    }
+
+    // A demand's own aggregate ceiling on a critical material is its raw demand quantity (see
+    // diamondData's own comment), NOT scaled down by BOM rate — so an AND-group where every
+    // sibling asks for the FULL demand quantity of the shared material (rate 1.0, as in
+    // diamondData) is ALWAYS constrained once there are >=2 siblings, regardless of the
+    // demand's absolute size. To build a genuinely UNconstrained fixture, each sibling's own
+    // rate down to the shared material must be small enough that even N siblings' combined ask
+    // stays under the demand's own (unscaled) ceiling.
+    val unconstrainedConfig = mapOf<String, Any?>("purchase_allowed" to false)
+    fun unconstrainedData() = mkData(
+        supplies = listOf(supply("X", "L", 1000.0)),
+        methodMake = listOf(
+            mapOf("bom_id" to "BP", "product_id" to "P", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+            mapOf("bom_id" to "B1", "product_id" to "C1", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+            mapOf("bom_id" to "B2", "product_id" to "C2", "location_id" to "L", "lead_time" to 0.0, "preference" to 1),
+        ),
+        methodBuy = listOf(mapOf("product_id" to "X", "location_id" to "L", "preference" to 1)),
+        bom = listOf(
+            mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "C1", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "C2", "rate" to 1.0, "alt_group" to null),
+            // Each sibling only needs 10% of P's own quantity in X — two siblings combined
+            // (20%) stays well under the demand's own 100%-of-quantity ceiling on X.
+            mapOf("bom_id" to "B1", "parent_id" to "C1", "child_id" to "X", "rate" to 0.1, "alt_group" to null),
+            mapOf("bom_id" to "B2", "parent_id" to "C2", "child_id" to "X", "rate" to 0.1, "alt_group" to null),
+        ),
+        demands = listOf(demand("D1", "P", "L", qty = 40.0)),
+        productlocation = listOf(mapOf("product_id" to "X", "location_id" to "L", "prod_area" to "raw")),
+    )
+
+    test("computeAndSiblingCaps: an UNconstrained group (availability >= total ask) attaches no dominator") {
+        val data = unconstrainedData()
+        val alloc = buildSupplyAllocation(data["demand"]!!, data, unconstrainedConfig)
+        val result = computeAndSiblingCaps(data["demand"]!!, alloc, data, unconstrainedConfig, null)
+
+        (result.dominators["D1"] ?: emptyMap<BranchKey, List<DominatorRef>>()) shouldBe emptyMap<BranchKey, List<DominatorRef>>()
+    }
+
+    // ── rawSupplyLotRefs fix: sketch-phase terminal dominator only names lots THIS demand is
+    // entitled to, not every physical lot of the product@location (the 858_F35_2024_07_VIRTUAL
+    // bug: 7 unrelated lots shown, none of which the demand had exhausted). Two demands (D1, D2)
+    // each need P = make(X) — X reached as a BOM child, same shape as diamondData/cousinData
+    // (a demand directly asking for the critical material itself, with no BOM in between,
+    // doesn't populate perLotBudgets the same way). Combined ask (80) exceeds total X supply
+    // (60), so buildSupplyAllocation must split entitlement between them; neither demand alone
+    // is entitled to the whole 60.
+    // No buy method for X: computePlanBlueprint's sketch phase (unlike the live commit) doesn't
+    // check purchase_allowed/whitelist admission when deciding whether "buy" resolves a
+    // shortfall — it treats any present buy row as unconditionally elastic. So the fixture must
+    // give X no method at all to force a genuine, sketch-visible shortfall at the leaf itself
+    // (matching a truly raw material — the real 858_F35_2024_07_VIRTUAL case's 160-1153 had no
+    // move/make into that exact location either).
+    val perDemandBudgetConfig = mapOf<String, Any?>("purchase_allowed" to false)
+    fun perDemandBudgetData(d1Qty: Double, d2Qty: Double) = mkData(
+        supplies = listOf(supply("X", "L", 30.0, "X_LOT_A"), supply("X", "L", 30.0, "X_LOT_B")),
+        methodMake = listOf(mapOf("bom_id" to "BP", "product_id" to "P", "location_id" to "L", "lead_time" to 0.0, "preference" to 1)),
+        bom = listOf(mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "X", "rate" to 1.0, "alt_group" to null)),
+        demands = listOf(demand("D1", "P", "L", qty = d1Qty), demand("D2", "P", "L", qty = d2Qty)),
+        productlocation = listOf(mapOf("product_id" to "X", "location_id" to "L", "prod_area" to "raw")),
+    )
+
+    test("computePlanBlueprint: constrained leaf's quantityDominator only names lots this demand's own perLotBudgets covers") {
+        val data = perDemandBudgetData(d1Qty = 40.0, d2Qty = 40.0)
+        val alloc = buildSupplyAllocation(data["demand"]!!, data, perDemandBudgetConfig)
+        val blueprint = computePlanBlueprint(data["demand"]!!, alloc, data, null)
+
+        val d1Budget = alloc.perLotBudgets["D1"] ?: emptyMap()
+        val d1OwnLotIds = d1Budget.keys.filter { it.startsWith("X|L|") }.map { it.removePrefix("X|L|") }.toSet()
+
+        val d1Node = blueprint["D1"]?.get("X" to "L")
+        d1Node shouldNotBe null
+        // Constrained (combined ask 80 > total supply 60), so there should be a dominator.
+        (d1Node!!.achievable < 40.0 - 1e-6) shouldBe true
+        d1Node.quantityDominator.isNotEmpty() shouldBe true
+        // Every named lot must be one D1 actually has entitlement to — never a lot that only
+        // belongs to D2's own share, and never the FULL physical lot list regardless of split.
+        for (ref in d1Node.quantityDominator) {
+            if (ref.supplyId != null) (ref.supplyId in d1OwnLotIds) shouldBe true
+        }
+    }
+
+    test("computePlanBlueprint: zero entitlement collapses to the self-referencing terminal ref, not a lot list") {
+        // D1 asks for a tiny amount, D2 asks for far more — proportional split can leave D1
+        // with an entitlement small enough that, combined with a demand size mismatch, we can
+        // directly exercise the zero-entitlement path via a demand for a product with NO
+        // critical supply reachable at all (sk !in allocation.graph.supplyIndex — Case A).
+        val data = mkData(
+            supplies = listOf(supply("X", "L", 30.0)),
+            methodBuy = listOf(mapOf("product_id" to "X", "location_id" to "L", "preference" to 1)),
+            demands = listOf(demand("D1", "UNREACHABLE", "L", qty = 10.0)),
+            productlocation = listOf(mapOf("product_id" to "X", "location_id" to "L", "prod_area" to "raw")),
+        )
+        val alloc = buildSupplyAllocation(data["demand"]!!, data, perDemandBudgetConfig)
+        val blueprint = computePlanBlueprint(data["demand"]!!, alloc, data, null)
+
+        val d1Node = blueprint["D1"]?.get("UNREACHABLE" to "L")
+        d1Node shouldNotBe null
+        d1Node!!.quantityDominator.size shouldBe 1
+        val ref = d1Node.quantityDominator.first()
+        ref.supplyId shouldBe null
+        ref.label shouldBe "UNREACHABLE@L (no supply)"
     }
 
     test("diamond: AND-required siblings independently reaching one scarce material split fairly, not sequentially") {
@@ -491,7 +627,7 @@ class SupplyGuidedPlanningTest : FunSpec({
     test("computeAndSiblingCaps: pools cousin branches from different cohorts into one fair split") {
         val data = cousinData()
         val alloc = buildSupplyAllocation(data["demand"]!!, data, cousinConfig)
-        val caps = computeAndSiblingCaps(data["demand"]!!, alloc, data, cousinConfig, null)
+        val caps = computeAndSiblingCaps(data["demand"]!!, alloc, data, cousinConfig, null).caps
 
         val d1Caps = caps["D1"]
         d1Caps shouldNotBe null
@@ -578,7 +714,7 @@ class SupplyGuidedPlanningTest : FunSpec({
     test("computeAndSiblingCaps: splits X fairly between C1's and C2's own identical-shaped subtrees") {
         val data = sharedDescendantData()
         val alloc = buildSupplyAllocation(data["demand"]!!, data, sharedDescendantConfig)
-        val caps = computeAndSiblingCaps(data["demand"]!!, alloc, data, sharedDescendantConfig, null)
+        val caps = computeAndSiblingCaps(data["demand"]!!, alloc, data, sharedDescendantConfig, null).caps
 
         val d1Caps = caps["D1"]
         d1Caps shouldNotBe null
