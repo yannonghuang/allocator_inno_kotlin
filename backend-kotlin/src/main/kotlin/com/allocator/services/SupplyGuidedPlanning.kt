@@ -463,6 +463,10 @@ internal fun computePlanBlueprint(
     /** Optional Preferences KB override, see [plan]'s `preferenceKb` param. `null` preserves
      *  today's exact raw-preference behavior. */
     preferenceKb: PreferenceKb? = null,
+    /** Needed to build the SAME unified waterfall candidate list [nodeSketchInto] now shares
+     *  with the live commit (expandWaterfallCandidates respects customer BOM-alternative
+     *  constraints, config-scoped) and to read `max_methods` via [resolveMethodSelection]. */
+    config: Map<String, Any?>? = null,
 ): PlanBlueprint {
     val result = mutableMapOf<Any?, DemandBlueprint>()
     for (demand in demands) {
@@ -472,7 +476,7 @@ internal fun computePlanBlueprint(
         val qty  = (demand["quantity"]    as? Number)?.toDouble() ?: continue
         if (qty <= 0.0) { result[demandId] = emptyMap(); continue }
         val nodeMap = mutableMapOf<Pair<String, String>, NodeBlueprint>()
-        nodeSketchInto(pid, lid, qty, demandId, allocation, data, mutableSetOf(), nodeMap, preferenceKb)
+        nodeSketchInto(pid, lid, qty, demandId, demand, allocation, data, config, mutableSetOf(), nodeMap, preferenceKb)
         result[demandId] = nodeMap
         val rootAq = nodeMap[pid to lid]?.achievable ?: qty
         if (rootAq < qty - 1e-9) {
@@ -509,8 +513,15 @@ private fun rawSupplyLotRefs(pid: String, lid: String, demandBudgets: Map<String
 private fun nodeSketchInto(
     pid: String, lid: String, needed: Double,
     demandId: Any?,
+    /** The demand this whole sketch pass belongs to — threaded through every recursive call
+     *  unchanged (its own product/location/quantity aren't reread below this point; only
+     *  customer_id, via expandWaterfallCandidates's constraint filter, still applies at every
+     *  depth). Needed to call the SAME expandWaterfallCandidates the live commit and the
+     *  diamond-allocation gather pass already use. */
+    demand: Map<String, Any?>,
     allocation: SupplyAllocationResult,
     data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
     visited: MutableSet<Pair<String, String>>,
     into: MutableMap<Pair<String, String>, NodeBlueprint>,
     preferenceKb: PreferenceKb? = null,
@@ -536,36 +547,60 @@ private fun nodeSketchInto(
 
         val residual = needed - supplyQty
 
-        // First feasible method by preference (ascending int = higher priority) — the
-        // Preferences KB overrides this ranking per-alternative when present (see
-        // kbPreferenceForMethod), falling back to raw CSV preference otherwise.
-        // Takes the first method with achievable > 0 — no backtracking in commit phase.
-        val methods = getMethods(pid, lid, data)
-            .sortedBy { kbPreferenceForMethod(pid, lid, it, preferenceKb, data) }
+        // Unified waterfall candidate list — the SAME functions (expandWaterfallCandidates +
+        // kbPreference) the live commit's own waterfall (plan()) and the diamond-allocation
+        // gather pass (gatherAndSiblingRequests's rankedCandidates) already use, rather than a
+        // third, independently-evolving notion of "which methods/alt_groups, in what order."
+        // Bounded by max_methods (resolveMethodSelection) the SAME way plan()'s own candidate
+        // loop is — "root-level proportional split, waterfall elsewhere": this position isn't
+        // proportionally split here (that's rootSplitWeights, live-commit-only), but the
+        // CANDIDATE POOL itself is capped identically everywhere, not just at the root.
+        val methodCfg = resolveMethodSelection(config)
+        val ranked = expandWaterfallCandidates(getMethods(pid, lid, data), pid, demand, config, data)
+            .sortedBy { kbPreference(pid, lid, it.method, it.altKey, preferenceKb) }
+        val candidates = ranked.take(methodCfg.maxMethods.coerceAtMost(ranked.size))
 
-        var selectedMethod: Map<String, Any?>? = null
+        // Waterfall across candidates: the best-preference one gets the full residual; only
+        // spill to the next if it can't fully cover. Replaces the old "first method with ANY
+        // positive achievable wins, stop" rule, which under-explored relative to what the live
+        // commit's OWN waterfall actually does — silently leaving NodeBlueprint.achievable (and
+        // everything downstream that reads it: nodeQtyCaps, computeAndSiblingCaps's fair-split
+        // discount) with no prediction at all for whatever the live commit spills into once the
+        // sketch's first pick falls short.
+        var waterfallResidual = residual
         var selectedAchievable = 0.0
-        var selectedDominator: List<DominatorRef> = emptyList()
-
-        for (method in methods) {
-            val ms = methodAchievableForSketch(method, pid, lid, residual, demandId, allocation, data, visited, into, preferenceKb)
-            if (ms.achievable > 1e-9) {
-                selectedMethod = method
-                selectedAchievable = ms.achievable
-                selectedDominator = ms.dominator
-                break
+        var firstContributingCandidate: WaterfallCandidate? = null
+        var contributingCandidateCount = 0
+        var dominatorUnion: List<DominatorRef> = emptyList()
+        for (candidate in candidates) {
+            if (waterfallResidual <= 1e-9) break
+            val askedOfThisCandidate = waterfallResidual
+            val cs = candidateAchievableForSketch(candidate, pid, lid, waterfallResidual, demandId, demand, allocation, data, config, visited, into, preferenceKb)
+            if (cs.achievable <= 1e-9) continue
+            if (firstContributingCandidate == null) firstContributingCandidate = candidate
+            contributingCandidateCount++
+            selectedAchievable += cs.achievable
+            waterfallResidual -= cs.achievable
+            if (cs.achievable < askedOfThisCandidate - 1e-9 && cs.dominator.isNotEmpty()) {
+                dominatorUnion = dominatorUnion + cs.dominator
             }
         }
+        // The "blueprint shortcut" downstream (PlanningEngine.kt's plan()) collapses straight
+        // to NodeBlueprint.method, skipping full candidate expansion — only valid when trying
+        // that ONE method alone in the live commit would reproduce this same achievable qty.
+        // A waterfall spill (more than one candidate actually contributed) means the live
+        // commit must ALSO be free to explore beyond the first, so this is deliberately left
+        // null in that case — same as today's "no blueprint entry at all" fallback, which
+        // already correctly falls through to full candidate expansion.
+        val selectedMethod = if (contributingCandidateCount <= 1) firstContributingCandidate?.method else null
 
         val aq = supplyQty + selectedAchievable
-        // Genuine shortfall at THIS node: either the chosen method itself fell short of the
-        // residual it was asked for (inherit its own dominator — already the correct AND/OR
-        // result from the recursion above, computed alongside its own achievable qty), or no
-        // method exists/contributed anything at all, in which case the terminal cause IS this
-        // (pid, lid)'s own raw supply — point at its actual physical lot(s) directly.
+        // Genuine shortfall at THIS node: union the dominators of whichever candidates fell
+        // short of what THEY were individually asked — or, if nothing contributed at all, the
+        // terminal cause IS this (pid, lid)'s own raw supply — point at its actual physical
+        // lot(s) directly.
         val quantityDominator = if (aq < needed - 1e-9) {
-            if (selectedMethod != null && selectedDominator.isNotEmpty()) selectedDominator
-            else rawSupplyLotRefs(pid, lid, demandBudgets)
+            dominatorUnion.dedupBySupply().takeIf { it.isNotEmpty() } ?: rawSupplyLotRefs(pid, lid, demandBudgets)
         } else emptyList()
         into[key] = NodeBlueprint(achievable = aq, supplyQty = supplyQty, method = selectedMethod, quantityDominator = quantityDominator)
         return aq
@@ -574,109 +609,72 @@ private fun nodeSketchInto(
     }
 }
 
-/**
- * Preferences KB lookup for a "raw" (unsplit-by-alt_group) method as seen by the sketch
- * phase: for `move`/`purchase`, a direct [kbPreference] lookup (no alt_group concept); for
- * `make` with multiple BOM alt_groups, the MIN KB preference across that method's alt_groups
- * (its best-case rank) — so this method-level pre-selection stays consistent with the
- * finer-grained alt_group waterfall the commit phase runs afterward. Falls back to raw CSV
- * `preference` exactly like today when [preferenceKb] is null or has no entries for this node.
- */
-internal fun kbPreferenceForMethod(
-    pid: String, lid: String,
-    method: Map<String, Any?>,
-    preferenceKb: PreferenceKb?,
-    data: Map<String, List<Map<String, Any?>>>,
-): Int {
-    if (preferenceKb == null) return (method["preference"] as? Number)?.toInt() ?: Int.MAX_VALUE
-    if (method["type"] == "make") {
-        val variants = variantsForMake(pid, lid, 1.0, method, data)
-        if (variants.size > 1) {
-            return variants.minOf { (altKey, _) -> kbPreference(pid, lid, method, altKey, preferenceKb) }
-        }
-    }
-    return kbPreference(pid, lid, method, null, preferenceKb)
-}
-
 /** Paired with [NodeBlueprint.quantityDominator]: the achievable qty AND, computed in the
- *  same breath, who's to blame if it fell short of what was asked of this method. */
+ *  same breath, who's to blame if it fell short of what was asked of this candidate. */
 private data class MethodSketchResult(val achievable: Double, val dominator: List<DominatorRef> = emptyList())
 
-// Same arithmetic as methodAchievableInto but recurses via nodeSketchInto to populate blueprint entries.
-private fun methodAchievableForSketch(
-    method: Map<String, Any?>, pid: String, lid: String, needed: Double,
+/**
+ * Achievable qty (and dominator) for ONE unified-waterfall candidate — a specific method, or
+ * for "make" a specific alt_group variant of one (see [WaterfallCandidate]). Same arithmetic
+ * as the live commit's own per-candidate resolution, but recurses via [nodeSketchInto] to
+ * populate blueprint entries instead of actually consuming inventory/emitting work orders.
+ * Alt_group waterfalling itself happens one level up now, in [nodeSketchInto]'s own unified
+ * candidate loop — this function only ever evaluates the ONE variant [candidate] names.
+ */
+private fun candidateAchievableForSketch(
+    candidate: WaterfallCandidate, pid: String, lid: String, needed: Double,
     demandId: Any?,
+    demand: Map<String, Any?>,
     allocation: SupplyAllocationResult,
     data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
     visited: MutableSet<Pair<String, String>>,
     into: MutableMap<Pair<String, String>, NodeBlueprint>,
     preferenceKb: PreferenceKb? = null,
 ): MethodSketchResult {
+    val method = candidate.method
     return when (method["type"] as? String) {
         // Elastic on both quantity and time (can always order more / sooner) — never itself
         // a dominator, matching the "any purchase is a consequence, never a cause" rule.
         "purchase" -> MethodSketchResult(needed)
         "move" -> {
             val fromLid = (method["from_location_id"] as? String)?.trim() ?: return MethodSketchResult(0.0)
-            val ach = nodeSketchInto(pid, fromLid, needed, demandId, allocation, data, visited, into, preferenceKb)
+            val ach = nodeSketchInto(pid, fromLid, needed, demandId, demand, allocation, data, config, visited, into, preferenceKb)
             // Transparent 1:1 pass-through — move adds no constraint of its own, so it inherits
             // the source location's own already-computed dominator verbatim (whatever that is).
             MethodSketchResult(ach, into[pid to fromLid]?.quantityDominator ?: emptyList())
         }
         "make" -> {
             val variants = variantsForMake(pid, lid, needed, method, data)
-            if (variants.isEmpty()) return MethodSketchResult(0.0)
-            // Waterfall across alt_group variants — mirrors the commit phase's unified
-            // waterfall (best variant by preference/KB ranking gets the full residual; only
-            // spill to the next if it can't fully cover). Replaces the old equal-split-
-            // across-all-variants estimate, which diluted `needed` by 1/nVariants regardless
-            // of which variant was actually best — systematically under-predicting
-            // achievable qty for a KB/preference-favored variant and, since this feeds
-            // nodeQtyCaps, artificially capping the commit phase below what its own
-            // alt_group-aware waterfall could otherwise draw.
-            val ranked = variants.sortedBy { (altKey, _) -> kbPreference(pid, lid, method, altKey, preferenceKb) }
-            var residual = needed
-            var total = 0.0
-            // OR-group: at most one dominator per alt_group variant actually tried, unioned
-            // (deduped) only from variants that fell short of what THEY were asked — mirrors
-            // exactly which variants the waterfall below actually spilled past.
-            var dominatorUnion: List<DominatorRef> = emptyList()
-            for ((_, children) in ranked) {
-                if (residual <= 1e-9) break
-                val askedOfThisVariant = residual
-                if (children.isEmpty()) { total += residual; residual = 0.0; continue }
-                var variantAchievable = residual
-                // AND: exactly one child — whichever pulls variantAchievable down the most —
-                // dominates this variant. Ties keep whichever was found first (min tracking
-                // itself only ever holds one winner at a time).
-                var variantDominator: List<DominatorRef> = emptyList()
-                for (child in children) {
-                    val cPid        = (child["product_id"] as? String)?.trim() ?: continue
-                    val cLid        = (child["location_id"] as? String)?.trim() ?: continue
-                    // variantsForMake scaled each child's "quantity" by the full `needed` qty
-                    // (rate * needed) — rescale to this iteration's residual share.
-                    val cNeededFull = (child["quantity"]    as? Number)?.toDouble() ?: continue
-                    val cNeeded = if (needed > 1e-9) cNeededFull * (residual / needed) else 0.0
-                    if (cNeeded <= 1e-9) continue
-                    val cAch      = nodeSketchInto(cPid, cLid, cNeeded, demandId, allocation, data, visited, into, preferenceKb)
-                    val fromChild = cAch / (cNeeded / residual)
-                    if (fromChild < variantAchievable) {
-                        variantAchievable = fromChild
-                        // Inherit the child's own already-computed dominator (recursively
-                        // resolved — may itself be an OR-group from further below) rather than
-                        // re-deriving it; fall back to a fresh self-reference only if the child
-                        // (unexpectedly) didn't carry one despite falling short.
-                        variantDominator = into[cPid to cLid]?.quantityDominator?.takeIf { it.isNotEmpty() }
-                            ?: listOf(DominatorRef(kind = "bom_child", productId = cPid, locationId = cLid, label = "$cPid@$cLid"))
-                    }
-                }
-                total += variantAchievable
-                residual -= variantAchievable
-                if (variantAchievable < askedOfThisVariant - 1e-9 && variantDominator.isNotEmpty()) {
-                    dominatorUnion = dominatorUnion + variantDominator
+            // expandWaterfallCandidates emits one candidate per alt_group, so exactly one
+            // variant should match here — a null altKey (single-alt_group method) simply
+            // means there's exactly one variant to begin with.
+            val chosen = if (candidate.altKey != null) variants.filter { it.first == candidate.altKey } else variants
+            val (_, children) = chosen.firstOrNull() ?: return MethodSketchResult(0.0)
+            if (children.isEmpty()) return MethodSketchResult(needed)
+            // AND: exactly one child — whichever pulls achievable down the most — dominates
+            // this variant. Ties keep whichever was found first (min tracking itself only ever
+            // holds one winner at a time).
+            var achievable = needed
+            var dominator: List<DominatorRef> = emptyList()
+            for (child in children) {
+                val cPid = (child["product_id"] as? String)?.trim() ?: continue
+                val cLid = (child["location_id"] as? String)?.trim() ?: continue
+                val cNeeded = (child["quantity"] as? Number)?.toDouble() ?: continue
+                if (cNeeded <= 1e-9) continue
+                val cAch = nodeSketchInto(cPid, cLid, cNeeded, demandId, demand, allocation, data, config, visited, into, preferenceKb)
+                val fromChild = cAch / (cNeeded / needed)
+                if (fromChild < achievable) {
+                    achievable = fromChild
+                    // Inherit the child's own already-computed dominator (recursively resolved
+                    // — may itself be an OR-group from further below) rather than re-deriving
+                    // it; fall back to a fresh self-reference only if the child (unexpectedly)
+                    // didn't carry one despite falling short.
+                    dominator = into[cPid to cLid]?.quantityDominator?.takeIf { it.isNotEmpty() }
+                        ?: listOf(DominatorRef(kind = "bom_child", productId = cPid, locationId = cLid, label = "$cPid@$cLid"))
                 }
             }
-            MethodSketchResult(total, dominatorUnion.dedupBySupply())
+            MethodSketchResult(achievable, dominator)
         }
         else -> MethodSketchResult(0.0)
     }

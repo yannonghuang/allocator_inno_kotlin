@@ -4898,7 +4898,7 @@ fun runPlanning(
     // Replaces computeAchievableQtyMaps; eliminates getPreferredMethodCascade overhead
     // (probeChildren per node) from the commit phase entirely.
     emitPhase("blueprint", "Computing achievable quantities…", 8)
-    val planBlueprint = computePlanBlueprint(demands, sgAllocation, data, preferenceKb)
+    val planBlueprint = computePlanBlueprint(demands, sgAllocation, data, preferenceKb, config)
     val achievableQtyMaps = planBlueprint.mapValues { (_, db) ->
         db.mapValues { (_, nb) -> nb.achievable }
     }

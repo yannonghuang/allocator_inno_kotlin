@@ -79,8 +79,9 @@ private const val INFEASIBLE_LEAD_DAYS = Double.MAX_VALUE
 
 /**
  * Shared by build-time scoring AND runtime lookup ([kbPreference] in PlanningEngine.kt,
- * [kbPreferenceForMethod] in SupplyGuidedPlanning.kt) — the single source of truth for how
- * an alternative's identity is derived, so the two never drift out of sync.
+ * called identically from the live commit, the sketch phase, and the diamond-allocation
+ * gather pass) — the single source of truth for how an alternative's identity is derived,
+ * so none of them drift out of sync.
  */
 internal fun preferenceMethodKey(method: Map<String, Any?>, altKey: String?): String = when (method["type"]) {
     "make" -> "${(method["bom_id"] as? String)?.trim() ?: ""}:${altKey ?: ""}"
