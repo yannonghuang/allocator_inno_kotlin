@@ -100,18 +100,28 @@ internal fun buildSupplyAllocation(
     val sgConfig = parseSupplyGuidedConfig(config)
 
     // Critical-materials identification (done before BOM walk so the walk can prune early): a
-    // product qualifies if isRawCriticalPosition is true at ANY of its known locations — the
-    // SAME canonical test used for live dominator labeling (PlanningEngine.kt), so the two
-    // systems can never disagree about which materials are critical. "Has supply" and "pegged
-    // to a demand" are enforced automatically downstream, by buildReachabilityMatrix's own walk
-    // (a candidate only gets an entry in criticalMatrix when it's BOTH in graph.supplyIndex AND
-    // actually visited from some demand's BOM traversal) — no need to pre-filter here.
-    val criticalPids: Set<String> = (data["productlocation"] ?: emptyList())
+    // product qualifies only if isRawCriticalPosition is true at EVERY one of its known
+    // locations — i.e. no location anywhere offers an elastic path (make, or an admitted buy).
+    // A product with a make method at just one location (e.g. a sub-assembly built at a specific
+    // plant and moved elsewhere) is system-wide elastic, even though its move-destination
+    // locations individually have no method of their own — so a single method-less location must
+    // NOT drag the whole product into criticality when another location can produce more of it.
+    // Uses the SAME canonical per-location test used for live dominator labeling
+    // (PlanningEngine.kt), so the two systems can never disagree about which materials are
+    // critical. "Has supply" and "pegged to a demand" are enforced automatically downstream, by
+    // buildReachabilityMatrix's own walk (a candidate only gets an entry in criticalMatrix when
+    // it's BOTH in graph.supplyIndex AND actually visited from some demand's BOM traversal) — no
+    // need to pre-filter here.
+    val locationsByProduct: Map<String, List<String>> = (data["productlocation"] ?: emptyList())
         .mapNotNull { row ->
             val pid = (row["product_id"] as? String)?.trim() ?: return@mapNotNull null
             val lid = (row["location_id"] as? String)?.trim() ?: return@mapNotNull null
-            pid.takeIf { isRawCriticalPosition(pid, lid, data, config) }
+            pid to lid
         }
+        .groupBy({ it.first }, { it.second })
+    val criticalPids: Set<String> = locationsByProduct.entries
+        .filter { (pid, locs) -> locs.all { lid -> isRawCriticalPosition(pid, lid, data, config) } }
+        .map { it.key }
         .toSet()
 
     // Step 1 — BOM reachability: build full graph (for unmapped-demand check), then build

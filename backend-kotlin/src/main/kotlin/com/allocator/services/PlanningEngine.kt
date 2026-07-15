@@ -365,12 +365,15 @@ private fun bomChildDominatorRefs(
  */
 /**
  * True if [productId]@[locationId] is "critical": (1) no make method and no admitted purchase
- * — existing supply is the only possible source, system-wide — or (2) it has a buy method that
- * raw data offers but the current config explicitly excludes from purchase. `move` plays no
- * role in either criterion: relocating stock between locations never creates more of it
- * system-wide, so a move-only position (no make, no buy) is still critical here — even though
- * the live commit's own "no_methods" trigger in [plan]/[planMethodSlot] would NOT fail on such
- * a position (the move itself succeeds). This function answers a different, broader question
+ * — existing supply is the only possible source, system-wide — or (2) it has no make method and
+ * a buy method that raw data offers but the current config explicitly excludes from purchase.
+ * A `make` method always wins: if the material can be made, it is elastic and never critical,
+ * regardless of whether it also has a buy method and regardless of that buy method's purchase
+ * status — make availability alone is what determines "the total system-wide quantity is fixed."
+ * `move` plays no role in either criterion: relocating stock between locations never creates
+ * more of it system-wide, so a move-only position (no make, no buy) is still critical here — even
+ * though the live commit's own "no_methods" trigger in [plan]/[planMethodSlot] would NOT fail on
+ * such a position (the move itself succeeds). This function answers a different, broader question
  * than "will this draw fail right now": whether the TOTAL system-wide quantity of the material
  * is fixed (make/buy-elastic vs. not) — the property `criticalMatrix`/`perLotBudgets`/diamond
  * allocation actually need, to stop one demand from hoarding a shared, non-replenishable total.
@@ -392,11 +395,11 @@ internal fun isRawCriticalPosition(
     val hasBuy  = methods.any { it["type"] == "purchase" }
     // Move plays no role in either criterion: moving stock between locations never creates
     // more of it system-wide, so a move-only position is still critical.
-    if (!hasMake && !hasBuy) return true          // criterion 1 (method side)
-    if (!hasBuy) return false                      // has make, no buy: elastic via make
+    if (hasMake) return false                       // make available: always elastic, never critical
+    if (!hasBuy) return true                          // no make, no buy: criterion 1
     val purchaseAllowed = config?.get("purchase_allowed") != false
     val purchasable = effectivePurchasableSet(config, data)
-    return !buyAdmitted(pid, purchaseAllowed, purchasable)  // criterion 2
+    return !buyAdmitted(pid, purchaseAllowed, purchasable)  // criterion 2: no make, buy exists but excluded
 }
 
 internal fun rawDominatorRefs(
