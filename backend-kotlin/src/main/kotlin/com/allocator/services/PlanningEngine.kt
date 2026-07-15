@@ -364,17 +364,20 @@ private fun bomChildDominatorRefs(
  * and the AND/OR call sites below) — not reconstructed here after the fact.
  */
 /**
- * True if [productId]@[locationId] is genuinely fixed — no make, no move, and no admitted
- * purchase — so more of it can never be obtained here, at any quantity or lead time. Mirrors
- * the exact "no_methods" gate in [plan]/[planMethodSlot] (same [getMethods] + buy-admission
- * check) so a position is only ever called "raw" when the live commit would ALSO have called
- * it structurally unfulfillable, not merely under-stocked right now.
+ * True if [productId]@[locationId] is "critical": (1) no make method and no admitted purchase
+ * — existing supply is the only possible source, system-wide — or (2) it has a buy method that
+ * raw data offers but the current config explicitly excludes from purchase. `move` plays no
+ * role in either criterion: relocating stock between locations never creates more of it
+ * system-wide, so a move-only position (no make, no buy) is still critical here — even though
+ * the live commit's own "no_methods" trigger in [plan]/[planMethodSlot] would NOT fail on such
+ * a position (the move itself succeeds). This function answers a different, broader question
+ * than "will this draw fail right now": whether the TOTAL system-wide quantity of the material
+ * is fixed (make/buy-elastic vs. not) — the property `criticalMatrix`/`perLotBudgets`/diamond
+ * allocation actually need, to stop one demand from hoarding a shared, non-replenishable total.
  *
- * This is deliberately the SAME test used to classify a material "critical" elsewhere (a
- * purchase-admitted product is always elastic — you can just buy more — so it never qualifies):
- * a dominator naming a material is only meaningful when that material is both raw AND critical,
- * otherwise the true constraint lies wherever the elastic alternative (make/move/buy) itself
- * bottlenecks, not at this now-empty lot.
+ * This is the single, canonical critical-material test — used identically here (dominator
+ * labeling) and by [buildSupplyAllocation]'s `criticalPids` construction (which feeds
+ * `criticalMatrix`), so the two systems can never classify the same material differently.
  */
 internal fun isRawCriticalPosition(
     productId: String?,
@@ -384,12 +387,16 @@ internal fun isRawCriticalPosition(
 ): Boolean {
     val pid = productId ?: return false
     val lid = locationId ?: return false
+    val methods = getMethods(pid, lid, data)
+    val hasMake = methods.any { it["type"] == "make" }
+    val hasBuy  = methods.any { it["type"] == "purchase" }
+    // Move plays no role in either criterion: moving stock between locations never creates
+    // more of it system-wide, so a move-only position is still critical.
+    if (!hasMake && !hasBuy) return true          // criterion 1 (method side)
+    if (!hasBuy) return false                      // has make, no buy: elastic via make
     val purchaseAllowed = config?.get("purchase_allowed") != false
     val purchasable = effectivePurchasableSet(config, data)
-    val methods = getMethods(pid, lid, data).filter { m ->
-        m["type"] != "purchase" || buyAdmitted((m["product_id"] as? String) ?: pid, purchaseAllowed, purchasable)
-    }
-    return methods.isEmpty()
+    return !buyAdmitted(pid, purchaseAllowed, purchasable)  // criterion 2
 }
 
 internal fun rawDominatorRefs(
@@ -989,8 +996,8 @@ internal fun purchasableSet(config: Map<String, Any?>?): Set<String>? {
 
 /**
  * Partitions all method_buy products into (rawBuyables, nonRawBuyables) by checking
- * productlocation.prod_area.  Shared by [effectivePurchasableSet] and [buildRawBuyableSet]
- * so the rawIds scan over productlocation is done exactly once per callsite.
+ * productlocation.prod_area.  Used by [effectivePurchasableSet] so the rawIds scan over
+ * productlocation is done exactly once per callsite.
  *
  * @return Pair(rawBuyables, nonRawBuyables)
  *   rawBuyables    — products with method_buy AND prod_area='raw'  (the "Purchase allowed" candidates)

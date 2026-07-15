@@ -99,21 +99,20 @@ internal fun buildSupplyAllocation(
 ): SupplyAllocationResult {
     val sgConfig = parseSupplyGuidedConfig(config)
 
-    // Critical-materials identification (done before BOM walk so the walk can prune early):
-    //   Step A — restrict to the "Purchasable raw materials" candidate set: products that have
-    //            method_buy AND prod_area='raw' in productlocation.  This is exactly the set
-    //            that appears in the UI selection list.  Make-only, WIP, and OB items are
-    //            excluded — they are not purchasable candidates.
-    //   Step B — from those candidates, keep only the UNSELECTED (unchecked) ones: products
-    //            NOT in purchasable_materials config.  These are the materials the user has
-    //            explicitly NOT allowed purchasing → existing supply is the only source →
-    //            proportional allocation is required.
-    //   Open-world semantics: absent from allocation map ⇒ uncapped in planning.
-    val rawBuyableIds = buildRawBuyableSet(data)
-    val purchasable   = effectivePurchasableSet(config, data)
-    // criticalPids: raw-buyable products NOT in purchasable_materials → must be allocated.
-    // null purchasable means no whitelist → all raw-buyable are critical.
-    val criticalPids: Set<String>? = if (purchasable == null) null else rawBuyableIds - purchasable
+    // Critical-materials identification (done before BOM walk so the walk can prune early): a
+    // product qualifies if isRawCriticalPosition is true at ANY of its known locations — the
+    // SAME canonical test used for live dominator labeling (PlanningEngine.kt), so the two
+    // systems can never disagree about which materials are critical. "Has supply" and "pegged
+    // to a demand" are enforced automatically downstream, by buildReachabilityMatrix's own walk
+    // (a candidate only gets an entry in criticalMatrix when it's BOTH in graph.supplyIndex AND
+    // actually visited from some demand's BOM traversal) — no need to pre-filter here.
+    val criticalPids: Set<String> = (data["productlocation"] ?: emptyList())
+        .mapNotNull { row ->
+            val pid = (row["product_id"] as? String)?.trim() ?: return@mapNotNull null
+            val lid = (row["location_id"] as? String)?.trim() ?: return@mapNotNull null
+            pid.takeIf { isRawCriticalPosition(pid, lid, data, config) }
+        }
+        .toSet()
 
     // Step 1 — BOM reachability: build full graph (for unmapped-demand check), then build
     // the critical-only matrix in one pass by pruning non-critical supply leaves during walk.
@@ -129,8 +128,8 @@ internal fun buildSupplyAllocation(
     }
     val criticalMatrix = buildReachabilityMatrix(demands, graph, criticalPids = criticalPids)
     log.info(
-        "[supply-guided] critical matrix: {} supply columns (raw-buyable unselected) of {} raw-buyable of {} total",
-        criticalMatrix.byColumn.size, rawBuyableIds.size, requestMatrix.byColumn.size,
+        "[supply-guided] critical matrix: {} supply columns ({} critical product ids) of {} total",
+        criticalMatrix.byColumn.size, criticalPids.size, requestMatrix.byColumn.size,
     )
 
     // Step 2 — supply allocation: split each lot proportionally among competing demands.
@@ -1370,12 +1369,6 @@ private fun filterToCritical(matrix: NeedsMatrix, purchasable: Set<String>): Nee
     }
     return NeedsMatrix(newByRow, newByColumn)
 }
-
-/** Returns the "Purchasable raw materials" candidate set: products with method_buy AND
- *  prod_area='raw' in productlocation — the exact set shown in the UI selection list.
- *  Delegates to [partitionBuyables] — same classification used by [effectivePurchasableSet]. */
-private fun buildRawBuyableSet(data: Map<String, List<Map<String, Any?>>>): Set<String> =
-    partitionBuyables(data).first
 
 /** Keeps only supply columns whose productId is in [productIds]; rebuilds byRow accordingly. */
 private fun filterToProductIds(matrix: NeedsMatrix, productIds: Set<String>): NeedsMatrix {
