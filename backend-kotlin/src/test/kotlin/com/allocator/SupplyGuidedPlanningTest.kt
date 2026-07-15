@@ -810,4 +810,69 @@ class SupplyGuidedPlanningTest : FunSpec({
         // the pool fairly instead of one starving the other.
         (d1Total > 20.0 + 1e-6) shouldBe true
     }
+
+    // ── F. findOrGroupRecipients: structural OR-group grand-parent discovery ───────
+
+    test("findOrGroupRecipients: AND-mandatory recipients each with their own nested OR-group reaching X") {
+        // P -> AND(A1, A3). A1 -> OR(V1a, V1b), both -> X. A3 -> OR(V3a, V3b), both -> X.
+        // Mirrors the real dataset's 160-1153/A1/A3 shape (an added OR layer between the
+        // AND-mandatory recipient and the critical leaf) — A1 and A3 are the collapsing
+        // points, not V1a/V1b/V3a/V3b individually, and not P itself.
+        val data = mkData(
+            bom = listOf(
+                mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "A1", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "A3", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BA1", "parent_id" to "A1", "child_id" to "V1a", "rate" to 1.0, "alt_group" to "g1a"),
+                mapOf("bom_id" to "BA1", "parent_id" to "A1", "child_id" to "V1b", "rate" to 1.0, "alt_group" to "g1b"),
+                mapOf("bom_id" to "BA3", "parent_id" to "A3", "child_id" to "V3a", "rate" to 1.0, "alt_group" to "g3a"),
+                mapOf("bom_id" to "BA3", "parent_id" to "A3", "child_id" to "V3b", "rate" to 1.0, "alt_group" to "g3b"),
+                mapOf("bom_id" to "BV1a", "parent_id" to "V1a", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BV1b", "parent_id" to "V1b", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BV3a", "parent_id" to "V3a", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BV3b", "parent_id" to "V3b", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+            ),
+        )
+        val recipients = findOrGroupRecipients(setOf("X"), data)
+        recipients["X"] shouldBe setOf("A1", "A3")
+    }
+
+    test("findOrGroupRecipients: mutually exclusive OR-alternatives collapse to their shared parent, not each other") {
+        // FG -> OR(P, P2) directly. P -> X. P2 -> X (a different path to the same X).
+        // X's own link to P/P2 has no alt_group, so the walk continues up past P/P2 to their
+        // shared parent FG, which IS the OR-group's parent — FG is the recipient, not P/P2.
+        val data = mkData(
+            bom = listOf(
+                mapOf("bom_id" to "BFG", "parent_id" to "FG", "child_id" to "P", "rate" to 1.0, "alt_group" to "gP"),
+                mapOf("bom_id" to "BFG", "parent_id" to "FG", "child_id" to "P2", "rate" to 1.0, "alt_group" to "gP2"),
+                mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BP2", "parent_id" to "P2", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+            ),
+        )
+        val recipients = findOrGroupRecipients(setOf("X"), data)
+        recipients["X"] shouldBe setOf("FG")
+    }
+
+    test("findOrGroupRecipients: plain AND-only chain (no alt_group anywhere) yields zero recipients") {
+        val data = mkData(
+            bom = listOf(
+                mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "C1", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BC1", "parent_id" to "C1", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+            ),
+        )
+        val recipients = findOrGroupRecipients(setOf("X"), data)
+        recipients.containsKey("X") shouldBe false
+    }
+
+    test("findOrGroupRecipients: a lone (singleton) alt_group is not a real OR-group") {
+        // Only ONE child under (P, BP) has a non-null alt_group — not a genuine >=2-member
+        // OR-group, so the walk must continue past P rather than recording it.
+        val data = mkData(
+            bom = listOf(
+                mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "C1", "rate" to 1.0, "alt_group" to "onlyGroup"),
+                mapOf("bom_id" to "BC1", "parent_id" to "C1", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+            ),
+        )
+        val recipients = findOrGroupRecipients(setOf("X"), data)
+        recipients.containsKey("X") shouldBe false
+    }
 })

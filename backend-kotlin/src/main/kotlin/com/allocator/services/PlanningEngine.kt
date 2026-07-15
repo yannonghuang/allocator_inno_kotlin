@@ -364,17 +364,23 @@ private fun bomChildDominatorRefs(
  * and the AND/OR call sites below) — not reconstructed here after the fact.
  */
 /**
- * True if [productId]@[locationId] is genuinely fixed — no make, no move, and no admitted
- * purchase — so more of it can never be obtained here, at any quantity or lead time. Mirrors
- * the exact "no_methods" gate in [plan]/[planMethodSlot] (same [getMethods] + buy-admission
- * check) so a position is only ever called "raw" when the live commit would ALSO have called
- * it structurally unfulfillable, not merely under-stocked right now.
+ * True if [productId]@[locationId] is "critical": (1) no make method and no admitted purchase
+ * — existing supply is the only possible source, system-wide — or (2) it has no make method and
+ * a buy method that raw data offers but the current config explicitly excludes from purchase.
+ * A `make` method always wins: if the material can be made, it is elastic and never critical,
+ * regardless of whether it also has a buy method and regardless of that buy method's purchase
+ * status — make availability alone is what determines "the total system-wide quantity is fixed."
+ * `move` plays no role in either criterion: relocating stock between locations never creates
+ * more of it system-wide, so a move-only position (no make, no buy) is still critical here — even
+ * though the live commit's own "no_methods" trigger in [plan]/[planMethodSlot] would NOT fail on
+ * such a position (the move itself succeeds). This function answers a different, broader question
+ * than "will this draw fail right now": whether the TOTAL system-wide quantity of the material
+ * is fixed (make/buy-elastic vs. not) — the property `criticalMatrix`/`perLotBudgets`/diamond
+ * allocation actually need, to stop one demand from hoarding a shared, non-replenishable total.
  *
- * This is deliberately the SAME test used to classify a material "critical" elsewhere (a
- * purchase-admitted product is always elastic — you can just buy more — so it never qualifies):
- * a dominator naming a material is only meaningful when that material is both raw AND critical,
- * otherwise the true constraint lies wherever the elastic alternative (make/move/buy) itself
- * bottlenecks, not at this now-empty lot.
+ * This is the single, canonical critical-material test — used identically here (dominator
+ * labeling) and by [buildSupplyAllocation]'s `criticalPids` construction (which feeds
+ * `criticalMatrix`), so the two systems can never classify the same material differently.
  */
 internal fun isRawCriticalPosition(
     productId: String?,
@@ -384,12 +390,16 @@ internal fun isRawCriticalPosition(
 ): Boolean {
     val pid = productId ?: return false
     val lid = locationId ?: return false
+    val methods = getMethods(pid, lid, data)
+    val hasMake = methods.any { it["type"] == "make" }
+    val hasBuy  = methods.any { it["type"] == "purchase" }
+    // Move plays no role in either criterion: moving stock between locations never creates
+    // more of it system-wide, so a move-only position is still critical.
+    if (hasMake) return false                       // make available: always elastic, never critical
+    if (!hasBuy) return true                          // no make, no buy: criterion 1
     val purchaseAllowed = config?.get("purchase_allowed") != false
     val purchasable = effectivePurchasableSet(config, data)
-    val methods = getMethods(pid, lid, data).filter { m ->
-        m["type"] != "purchase" || buyAdmitted((m["product_id"] as? String) ?: pid, purchaseAllowed, purchasable)
-    }
-    return methods.isEmpty()
+    return !buyAdmitted(pid, purchaseAllowed, purchasable)  // criterion 2: no make, buy exists but excluded
 }
 
 internal fun rawDominatorRefs(
@@ -971,6 +981,149 @@ internal fun kbPreference(
     return preferenceKb.entries[Triple(productId, locationId, preferenceMethodKey(method, altKey))]?.preference ?: fallback
 }
 
+// ── Diamond allocation: OR-group grand-parent recipient caps, recomputed live per attempt ──────
+
+/**
+ * Downward counterpart to [findOrGroupRecipients]'s upward, structural walk: from a resolved
+ * method (a specific waterfall candidate already chosen by the caller — [computeDiamondCapsForAttempt]
+ * is what chooses it), finds which of [candidateRecipients] are reachable through THIS method's
+ * own children. AND-mandatory children (a "make" variant's own multiple children) are all
+ * explored, matching their simultaneous, deterministic visitation in the live AND-loop; nested
+ * OR-choices further down follow [reachableRecipients]'s own single-top-choice rule — mirroring
+ * exactly how the live commit itself resolves them, so this never counts a recipient the live
+ * commit wouldn't actually visit for this candidate. Stops descending at a matched recipient (it
+ * IS the collapsing point) but keeps exploring sibling AND-branches for other recipients.
+ */
+private fun reachableRecipientsForMethod(
+    pid: String,
+    lid: String,
+    method: Map<String, Any?>,
+    altKey: String?,
+    candidateRecipients: Set<String>,
+    demand: Map<String, Any?>,
+    config: Map<String, Any?>?,
+    data: Map<String, List<Map<String, Any?>>>,
+    preferenceKb: PreferenceKb?,
+    visited: MutableSet<Pair<String, String>>,
+): Set<String> {
+    if (pid in candidateRecipients) return setOf(pid)
+    val found = mutableSetOf<String>()
+    when (method["type"]) {
+        "move" -> {
+            val fromLid = (method["from_location_id"] as? String)?.trim()
+            if (fromLid != null) {
+                found += reachableRecipients(pid, fromLid, candidateRecipients, demand, config, data, preferenceKb, visited)
+            }
+        }
+        "make" -> {
+            val mLoc = (method["location_id"] as? String)?.trim() ?: lid
+            val variants = variantsForMake(pid, mLoc, 1.0, method, data)
+            val chosen = if (altKey != null) variants.filter { it.first == altKey } else variants
+            for ((_, children) in chosen) {
+                for (child in children) {
+                    val cPid = (child["product_id"] as? String)?.trim() ?: continue
+                    val cLid = (child["location_id"] as? String)?.trim() ?: continue
+                    found += reachableRecipients(cPid, cLid, candidateRecipients, demand, config, data, preferenceKb, visited)
+                }
+            }
+        }
+        // "purchase": elastic, no children — never itself a recipient path.
+    }
+    return found
+}
+
+/**
+ * Picks the single top-ranked candidate at (pid, lid) — mirroring the live commit's own
+ * non-root waterfall rule (try the best choice, no simultaneous exploration) — and delegates to
+ * [reachableRecipientsForMethod]. Cycle-guarded via [visited], shared with the caller's own walk
+ * so re-entering an already-open frame (e.g. a two-location move cycle) safely yields no match
+ * instead of recursing forever.
+ */
+private fun reachableRecipients(
+    pid: String,
+    lid: String,
+    candidateRecipients: Set<String>,
+    demand: Map<String, Any?>,
+    config: Map<String, Any?>?,
+    data: Map<String, List<Map<String, Any?>>>,
+    preferenceKb: PreferenceKb?,
+    visited: MutableSet<Pair<String, String>>,
+): Set<String> {
+    if (candidateRecipients.isEmpty()) return emptySet()
+    if (pid in candidateRecipients) return setOf(pid)
+    val key = pid to lid
+    if (!visited.add(key)) return emptySet()
+    val methods = getMethods(pid, lid, data)
+    if (methods.isEmpty()) return emptySet()
+    val best = expandWaterfallCandidates(methods, pid, demand, config, data)
+        .minByOrNull { kbPreference(pid, lid, it.method, it.altKey, preferenceKb) }
+        ?: return emptySet()
+    return reachableRecipientsForMethod(pid, lid, best.method, best.altKey, candidateRecipients, demand, config, data, preferenceKb, visited)
+}
+
+/**
+ * Live, per-waterfall-candidate-attempt counterpart to [findOrGroupRecipients]'s structural
+ * discovery — this is what makes diamond allocation "embedded" in the planner's own loop rather
+ * than a separate, static pre-pass (this session's explicit design mandate). Called once by
+ * [plan]'s root-split/waterfall candidate loop, immediately before EACH candidate is attempted:
+ * given that candidate's own method/altKey (already chosen by the caller) and the quantity it's
+ * about to be asked for, finds which of the structurally-known recipients for each critical
+ * material are reachable through THIS SPECIFIC candidate's own subtree, then splits whatever
+ * entitlement remains (the demand's total [diamondCriticalEntitlement] for that material, MINUS
+ * whatever ANY of that material's recipients have already actually consumed so far this demand —
+ * read live from [diamondRecipientConsumed]) evenly across however many recipients are found.
+ *
+ * This single mechanism handles both shapes from this session's toy example automatically:
+ * - Recipients simultaneously reachable from ONE candidate (e.g. A1 and A3, both AND-mandatory
+ *   children of the same "make" choice) are genuinely split evenly in ONE call — correct, since
+ *   both WILL be visited together in this one pass. Behaviorally identical to the old, static,
+ *   hardcoded 50/50 [findOrGroupRecipients] shape for 160-1153.
+ * - Recipients that only appear behind DIFFERENT, mutually exclusive waterfall candidates (e.g.
+ *   P vs P') each get their OWN separate call — once per candidate the outer loop tries, each
+ *   time reading whatever [diamondRecipientConsumed] currently shows. A candidate that falls
+ *   short of its target simply leaves more of the pool for the NEXT candidate's own, later call
+ *   — the waterfall loop's own iteration over candidates with shrinking `slotQty`/`residual` IS
+ *   the "rerun with leftover quantity," with no separate rerun mechanism needed.
+ */
+internal fun computeDiamondCapsForAttempt(
+    productId: String,
+    locationId: String,
+    method: Map<String, Any?>,
+    altKey: String?,
+    demand: Map<String, Any?>,
+    config: Map<String, Any?>?,
+    data: Map<String, List<Map<String, Any?>>>,
+    preferenceKb: PreferenceKb?,
+    diamondRecipients: Map<String, Set<String>>,
+    diamondCriticalEntitlement: Map<String, Map<String, Double>>,
+    diamondRecipientConsumed: Map<String, MutableMap<String, Double>>,
+): Map<String, Map<String, Double>> {
+    if (diamondRecipients.isEmpty() || diamondCriticalEntitlement.isEmpty()) return emptyMap()
+    val result = mutableMapOf<String, MutableMap<String, Double>>()
+    for ((criticalPid, recipients) in diamondRecipients) {
+        val totalEntitlement = diamondCriticalEntitlement[criticalPid] ?: continue
+        if (totalEntitlement.isEmpty()) continue
+        val found = reachableRecipientsForMethod(
+            productId, locationId, method, altKey, recipients, demand, config, data, preferenceKb, mutableSetOf(),
+        )
+        if (found.isEmpty()) continue
+        val n = found.size
+        for ((lotKey, totalQty) in totalEntitlement) {
+            // Remaining pool = total entitlement minus what's ALREADY been consumed by ANY of
+            // this critical material's known recipients so far (not just the ones found in
+            // THIS attempt) — so re-descending into the same diamond later in the same demand
+            // still respects the original total, not a re-inflated one.
+            val consumedSoFar = recipients.sumOf { r -> diamondRecipientConsumed[r]?.get(lotKey) ?: 0.0 }
+            val remaining = (totalQty - consumedSoFar).coerceAtLeast(0.0)
+            val share = remaining / n
+            for (recipient in found) {
+                result.getOrPut(recipient) { mutableMapOf() }[lotKey] = share
+            }
+        }
+    }
+    return result
+}
+
 // ── Method selection ───────────────────────────────────────────────────────────
 
 /**
@@ -989,8 +1142,8 @@ internal fun purchasableSet(config: Map<String, Any?>?): Set<String>? {
 
 /**
  * Partitions all method_buy products into (rawBuyables, nonRawBuyables) by checking
- * productlocation.prod_area.  Shared by [effectivePurchasableSet] and [buildRawBuyableSet]
- * so the rawIds scan over productlocation is done exactly once per callsite.
+ * productlocation.prod_area.  Used by [effectivePurchasableSet] so the rawIds scan over
+ * productlocation is done exactly once per callsite.
  *
  * @return Pair(rawBuyables, nonRawBuyables)
  *   rawBuyables    — products with method_buy AND prod_area='raw'  (the "Purchase allowed" candidates)
@@ -1360,12 +1513,20 @@ internal fun planMethodSlot(
     /** See [plan]'s doc — freshly resolved dominator for the branch this call is currently
      *  inside, if any. Never inherited from an enclosing call — see [plan]'s doc for why. */
     branchDominator: List<DominatorRef>? = null,
-    /** See [plan]'s doc — this demand's fixed 50/50 caps for the two known 160-1153 diamond
-     *  recipients, keyed by product_id ("VirtualProduct_280-1159_A1"/"_A3"), not lineage. */
+    /** See [plan]'s doc — live, per-waterfall-candidate-attempt caps for whichever OR-group
+     *  recipients this SPECIFIC candidate's own subtree reaches, keyed by product_id, not
+     *  lineage. Recomputed fresh by [plan]'s waterfall loop before each candidate attempt — see
+     *  [computeDiamondCapsForAttempt]'s own doc. */
     diamondRecipientCaps: Map<String, Map<String, Double>>? = null,
     /** See [plan]'s doc — demand-wide-persistent consumption pool for the diamond recipients,
      *  keyed the same fixed way, so every occurrence of a recipient within one demand shares it. */
     diamondRecipientConsumed: MutableMap<String, MutableMap<String, Double>>? = null,
+    /** See [plan]'s doc — structural (BOM-topology-only) OR-group recipient sets per critical
+     *  material, from [findOrGroupRecipients]. Global — identical for every demand. */
+    diamondRecipients: Map<String, Set<String>>? = null,
+    /** See [plan]'s doc — this demand's raw (unsplit) entitlement per critical material that
+     *  has known [diamondRecipients], from [buildDiamondCriticalEntitlement]. */
+    diamondCriticalEntitlement: Map<String, Map<String, Double>>? = null,
 ): MethodSlotResult {
     val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
     val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
@@ -1490,12 +1651,12 @@ internal fun planMethodSlot(
         // what gatherAndSiblingRequests used when it created this child's own branch, if any
         // (see BranchKey/combineSlot's doc). Whether lineage gets EXTENDED for the recursive
         // call below depends on isAndGroupChild — see that flag's own comment.
-        // Dataset-specific diamond recipients (VirtualProduct_280-1159_A1/_A3) take precedence
-        // over the general andSiblingCaps lookup — identified by product identity, not
-        // lineage, so every occurrence within this demand shares the SAME fixed cap+pool
-        // instead of each getting an independent, lineage-derived one. See
-        // computeDiamondRecipientCaps's doc for why the general mechanism is unreliable for
-        // this specific shape.
+        // OR-group grand-parent diamond recipients (findOrGroupRecipients/
+        // computeDiamondCapsForAttempt) take precedence over the general andSiblingCaps lookup —
+        // identified by product identity, not lineage, so every occurrence within this demand
+        // shares the SAME pool instead of each getting an independent, lineage-derived one. See
+        // computeDiamondCapsForAttempt's own doc for why the general andSiblingCaps mechanism is
+        // unreliable for this shape.
         val diamondCap = diamondRecipientCaps?.get(cPid)
         val childAndCap = diamondCap ?: andSiblingCaps?.get(BranchKey(cPid, cLid, combineSlot(branchLineage, null)))
         val cBranchLotCap = childAndCap ?: branchLotCap
@@ -1514,7 +1675,7 @@ internal fun planMethodSlot(
         // nested fanout further down was actually tagged with.
         val isAndGroupChild = activeChildren.size > 1
         val cBranchLineage = if (isAndGroupChild) extendLineage(branchLineage, cPid, cLid) else branchLineage
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, andSiblingCaps = andSiblingCaps, branchLotCap = cBranchLotCap, branchConsumed = cBranchConsumed, branchLineage = cBranchLineage, andSiblingDominators = andSiblingDominators, branchDominator = cBranchDominator, diamondRecipientCaps = diamondRecipientCaps, diamondRecipientConsumed = diamondRecipientConsumed)
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, andSiblingCaps = andSiblingCaps, branchLotCap = cBranchLotCap, branchConsumed = cBranchConsumed, branchLineage = cBranchLineage, andSiblingDominators = andSiblingDominators, branchDominator = cBranchDominator, diamondRecipientCaps = diamondRecipientCaps, diamondRecipientConsumed = diamondRecipientConsumed, diamondRecipients = diamondRecipients, diamondCriticalEntitlement = diamondCriticalEntitlement)
         // Prefer the unrounded "quantity_precise" (see committedRow's doc) over the rounded
         // "quantity" — this feeds the AND-min ratio (computeRawAchievable) below, and reading
         // the rounded value here would let a genuinely-achieved fractional child (e.g. 0.4999
@@ -2127,22 +2288,41 @@ fun plan(
      */
     branchDominator: List<DominatorRef>? = null,
     /**
-     * Dataset-specific replacement for the general diamond-allocation machinery, scoped to
-     * 160-1153's one known, fixed diamond shape (280-1159 → AND, only
-     * VirtualProduct_280-1159_A1/_A3 lead to it) — see [computeDiamondRecipientCaps]'s own
-     * doc. This demand's own fixed 50/50 caps for the two recipients, keyed by product_id
-     * (not lineage) — `null` when this demand doesn't touch 160-1153 at all. Threaded
-     * through unchanged to every recursive call, same as [andSiblingCaps].
+     * OR-group grand-parent recipient caps for whichever critical materials the CURRENT
+     * waterfall candidate attempt actually reaches — generalizes the former hardcoded 160-1153
+     * shape ([findOrGroupRecipients]) to any critical material reached through an OR-group.
+     * Recomputed FRESH by this function's own root-split/waterfall candidate loop before each
+     * candidate is tried (see [computeDiamondCapsForAttempt]'s own doc for why this must be
+     * live, per-attempt, rather than a static per-demand map): a candidate that only partially
+     * succeeds leaves more of the demand's own entitlement for the NEXT candidate's own, later,
+     * fresh computation — the waterfall loop's own iteration IS the "rerun with leftover
+     * quantity." Keyed by product_id (not lineage) — inherited unchanged by this candidate's
+     * OWN recursive descent (AND-loop, deeper waterfall levels), since they're all still
+     * inside the SAME one candidate attempt.
      */
     diamondRecipientCaps: Map<String, Map<String, Double>>? = null,
     /**
      * Demand-wide-persistent pool of consumption, keyed the same fixed way as
      * [diamondRecipientCaps] — created once per demand in [legacyCommit], alongside
-     * [demandConsumed], so every occurrence of VirtualProduct_280-1159_A1 (or _A3) within
-     * one demand's tree shares the SAME tally instead of each getting a fresh, disconnected
-     * one (the failure mode of the general [andSiblingCaps] mechanism for this shape).
+     * [demandConsumed], so every occurrence of a given recipient within one demand's tree
+     * shares the SAME tally instead of each getting a fresh, disconnected one (the failure
+     * mode of the general [andSiblingCaps] mechanism for this shape), and so
+     * [computeDiamondCapsForAttempt]'s live "remaining entitlement" computation at a later
+     * candidate attempt correctly sees what an earlier one already drew.
      */
     diamondRecipientConsumed: MutableMap<String, MutableMap<String, Double>>? = null,
+    /** Structural (BOM-topology-only) OR-group recipient sets per critical material, from
+     *  [findOrGroupRecipients]. Global — identical for every demand, computed once in
+     *  [runPlanning]. `null`/empty when no critical material has an OR-group ancestor. */
+    diamondRecipients: Map<String, Set<String>>? = null,
+    /** This demand's raw (unsplit) entitlement per critical material that has known
+     *  [diamondRecipients], from [buildDiamondCriticalEntitlement] — the pool
+     *  [computeDiamondCapsForAttempt] splits live, per candidate attempt. Deliberately NOT
+     *  pre-split (unlike the old [diamondRecipientCaps]'s predecessor): recipients gated
+     *  behind a shared ancestor OR-choice are mutually exclusive, so pre-splitting between them
+     *  would be wrong — only the live, per-attempt computation knows which is actually being
+     *  visited right now. */
+    diamondCriticalEntitlement: Map<String, Map<String, Double>>? = null,
 ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
 
     val productId = (demand["product_id"] as? String)?.trim() ?: ""
@@ -2180,6 +2360,8 @@ fun plan(
             branchDominator  = branchDominator,
             diamondRecipientCaps = diamondRecipientCaps,
             diamondRecipientConsumed = diamondRecipientConsumed,
+            diamondRecipients = diamondRecipients,
+            diamondCriticalEntitlement = diamondCriticalEntitlement,
         )
         // No cross-demand contention tag for quantity: critical materials are fully resolved by
         // the supply-guided pre-processor (buildSupplyAllocation's perLotBudgets) before this
@@ -2703,6 +2885,29 @@ fun plan(
         // matching gather's own fix at its mirror-image call site exactly.
         val slotBranchLineage = if (rootSplitWeights != null)
             extendLineage(branchLineage, productId, "$locationId#${slotIdFor(candidate)}") else branchLineage
+        // OR-group grand-parent diamond allocation, recomputed FRESH for THIS candidate attempt
+        // — "embedding" diamond allocation into the live commit loop (per this session's
+        // explicit design mandate): rather than a static per-demand split computed once before
+        // any commit happens, each waterfall candidate gets its own fresh cap, split only
+        // across whichever known recipients ITS OWN subtree actually reaches, using whatever
+        // entitlement remains after any earlier candidate attempt's real consumption (read live
+        // from diamondRecipientConsumed). A candidate that falls short simply leaves more for
+        // the next candidate's own later call here — the waterfall loop's own iteration IS the
+        // "rerun with leftover quantity"; no separate rerun trigger needed. See
+        // computeDiamondCapsForAttempt's own doc.
+        val slotDiamondCaps = if (diamondRecipients.isNullOrEmpty() || diamondCriticalEntitlement.isNullOrEmpty()) {
+            diamondRecipientCaps
+        } else {
+            computeDiamondCapsForAttempt(
+                productId = productId, locationId = locationId,
+                method = candidate.method, altKey = candidate.altKey,
+                demand = demand, config = config, data = data,
+                preferenceKb = preferenceKb,
+                diamondRecipients = diamondRecipients,
+                diamondCriticalEntitlement = diamondCriticalEntitlement,
+                diamondRecipientConsumed = diamondRecipientConsumed ?: emptyMap(),
+            )
+        }
         val attempt = planMethodSlot(
             m = candidate.method, slotQty = slotQty,
             productId = productId, locationId = locationId,
@@ -2727,8 +2932,10 @@ fun plan(
             branchLineage = slotBranchLineage,
             andSiblingDominators = andSiblingDominators,
             branchDominator = slotBranchDominator,
-            diamondRecipientCaps = diamondRecipientCaps,
+            diamondRecipientCaps = slotDiamondCaps,
             diamondRecipientConsumed = diamondRecipientConsumed,
+            diamondRecipients = diamondRecipients,
+            diamondCriticalEntitlement = diamondCriticalEntitlement,
         )
         // Intra-demand sibling contention (step c), applied directly here rather than relying
         // solely on plan()'s nodeCap-gated tagging site — same rationale as the AND-loop's
@@ -4752,9 +4959,16 @@ internal fun legacyCommit(
      *  keyed the same way (demand_id). Sliced per-demand and passed to [plan] as
      *  `andSiblingDominators`. */
     andSiblingDominators: Map<Any?, Map<BranchKey, List<DominatorRef>>>? = null,
-    /** Optional fixed 50/50 diamond-recipient caps from [computeDiamondRecipientCaps], keyed
-     *  by demand_id. Sliced per-demand and passed to [plan] as `diamondRecipientCaps`. */
-    diamondRecipientCaps: Map<Any?, Map<String, Map<String, Double>>>? = null,
+    /** Structural OR-group recipient sets per critical material from [findOrGroupRecipients] —
+     *  global, identical for every demand, passed straight through to [plan] as
+     *  `diamondRecipients` (unsliced, unlike the other per-demand tables above). */
+    diamondRecipients: Map<String, Set<String>>? = null,
+    /** Per-demand raw (unsplit) entitlement per critical material with known
+     *  [diamondRecipients], from [buildDiamondCriticalEntitlement]. Sliced per-demand and
+     *  passed to [plan] as `diamondCriticalEntitlement` — [plan]'s own waterfall loop computes
+     *  the actual per-recipient caps live, per candidate attempt; `legacyCommit` no longer
+     *  precomputes a static, pre-split `diamondRecipientCaps` map at all. */
+    diamondCriticalEntitlement: Map<Any?, Map<String, Map<String, Double>>>? = null,
 ): LegacyCommitResult {
     val committedDemands = mutableListOf<Map<String, Any?>>()
     val workOrders = mutableListOf<Map<String, Any?>>()
@@ -4803,8 +5017,8 @@ internal fun legacyCommit(
         // static per-lot cap it has actually spent so far, across every independent branch
         // of its own tree — see plan()'s doc for why this can't just be derived from `budget`.
         val demandConsumed = mutableMapOf<String, Double>()
-        // Fresh per demand: pooled consumption for the two fixed 160-1153 diamond recipients
-        // (keyed "VirtualProduct_280-1159_A1"/"_A3") — see diamondRecipientCaps's own doc.
+        // Fresh per demand: pooled consumption for whichever diamond recipients this demand's
+        // tree actually visits, keyed by product identity — see diamondRecipientCaps's own doc.
         val diamondRecipientConsumed = mutableMapOf<String, MutableMap<String, Double>>()
         val (solvedList, wos, peggingNode) = plan(
             d, indexedInventory, planData, reqDt,
@@ -4819,8 +5033,9 @@ internal fun legacyCommit(
             preferenceKb = preferenceKb,
             andSiblingCaps = andSiblingCaps?.get(demandId),
             andSiblingDominators = andSiblingDominators?.get(demandId),
-            diamondRecipientCaps = diamondRecipientCaps?.get(demandId),
             diamondRecipientConsumed = diamondRecipientConsumed,
+            diamondRecipients = diamondRecipients,
+            diamondCriticalEntitlement = diamondCriticalEntitlement?.get(demandId),
         )
         committedDemands.addAll(solvedList)
         workOrders.addAll(wos)
@@ -4977,11 +5192,17 @@ fun runPlanning(
     )
     val andSiblingCaps = andSiblingCapsResult.caps
     val andSiblingDominators = andSiblingCapsResult.dominators
-    // Dataset-specific replacement for the above, scoped to 160-1153's one known, fixed
-    // diamond shape (see computeDiamondRecipientCaps's own doc) — takes precedence over
-    // andSiblingCaps for VirtualProduct_280-1159_A1/_A3 specifically at the AND-loop lookup
-    // site; andSiblingCaps stays available, unchanged, for anything else.
-    val diamondRecipientCaps = computeDiamondRecipientCaps(demands, sgAllocation)
+    // Structural (BOM-topology-only) OR-group grand-parent recipients — generalizes the former
+    // hardcoded 160-1153/A1/A3 shape to any critical material reached through an OR-group.
+    // Takes precedence over andSiblingCaps at the AND-loop lookup site for whichever recipients
+    // are found; andSiblingCaps stays available, unchanged, for anything else. Computed once
+    // here (pure BOM topology, no quantities); the actual per-recipient split happens live,
+    // per waterfall-candidate attempt, inside plan()'s own loop — see
+    // computeDiamondCapsForAttempt's own doc for why.
+    val diamondRecipients = findOrGroupRecipients(
+        sgAllocation.criticalMatrix.byColumn.keys.map { it.productId }.toSet(), data,
+    )
+    val diamondCriticalEntitlement = buildDiamondCriticalEntitlement(demands, sgAllocation, diamondRecipients)
     // Step 3: commit with pre-selected methods, per-node caps, and per-lot budget guards.
     // Wraps the raw per-demand callback with the overall phase/percent this stage occupies
     // (83%→95%) so the UI can keep showing "N / total demands" (from legacyCommit's own
@@ -5010,7 +5231,8 @@ fun runPlanning(
         preferenceKb      = preferenceKb,
         andSiblingCaps    = andSiblingCaps,
         andSiblingDominators = andSiblingDominators,
-        diamondRecipientCaps = diamondRecipientCaps,
+        diamondRecipients = diamondRecipients,
+        diamondCriticalEntitlement = diamondCriticalEntitlement,
     )
     // Post-planning trace + compensation-pass telemetry (opt-in: trace_lots=true).
     if (sgAllocation.sgConfig.traceLots)
