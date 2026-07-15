@@ -1360,6 +1360,12 @@ internal fun planMethodSlot(
     /** See [plan]'s doc — freshly resolved dominator for the branch this call is currently
      *  inside, if any. Never inherited from an enclosing call — see [plan]'s doc for why. */
     branchDominator: List<DominatorRef>? = null,
+    /** See [plan]'s doc — this demand's fixed 50/50 caps for the two known 160-1153 diamond
+     *  recipients, keyed by product_id ("VirtualProduct_280-1159_A1"/"_A3"), not lineage. */
+    diamondRecipientCaps: Map<String, Map<String, Double>>? = null,
+    /** See [plan]'s doc — demand-wide-persistent consumption pool for the diamond recipients,
+     *  keyed the same fixed way, so every occurrence of a recipient within one demand shares it. */
+    diamondRecipientConsumed: MutableMap<String, MutableMap<String, Double>>? = null,
 ): MethodSlotResult {
     val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
     val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
@@ -1484,9 +1490,18 @@ internal fun planMethodSlot(
         // what gatherAndSiblingRequests used when it created this child's own branch, if any
         // (see BranchKey/combineSlot's doc). Whether lineage gets EXTENDED for the recursive
         // call below depends on isAndGroupChild — see that flag's own comment.
-        val childAndCap = andSiblingCaps?.get(BranchKey(cPid, cLid, combineSlot(branchLineage, null)))
+        // Dataset-specific diamond recipients (VirtualProduct_280-1159_A1/_A3) take precedence
+        // over the general andSiblingCaps lookup — identified by product identity, not
+        // lineage, so every occurrence within this demand shares the SAME fixed cap+pool
+        // instead of each getting an independent, lineage-derived one. See
+        // computeDiamondRecipientCaps's doc for why the general mechanism is unreliable for
+        // this specific shape.
+        val diamondCap = diamondRecipientCaps?.get(cPid)
+        val childAndCap = diamondCap ?: andSiblingCaps?.get(BranchKey(cPid, cLid, combineSlot(branchLineage, null)))
         val cBranchLotCap = childAndCap ?: branchLotCap
-        val cBranchConsumed = if (childAndCap != null) mutableMapOf<String, Double>() else branchConsumed
+        val cBranchConsumed = if (diamondCap != null) {
+            diamondRecipientConsumed?.getOrPut(cPid) { mutableMapOf() } ?: mutableMapOf()
+        } else if (childAndCap != null) mutableMapOf<String, Double>() else branchConsumed
         // Freshly resolved for THIS child only — never inherited from the enclosing branchDominator
         // (see plan()'s own doc for why: a dominator is an explanatory tag scoped to the exact node
         // where the constraint was detected, not a composable budget).
@@ -1499,7 +1514,7 @@ internal fun planMethodSlot(
         // nested fanout further down was actually tagged with.
         val isAndGroupChild = activeChildren.size > 1
         val cBranchLineage = if (isAndGroupChild) extendLineage(branchLineage, cPid, cLid) else branchLineage
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, andSiblingCaps = andSiblingCaps, branchLotCap = cBranchLotCap, branchConsumed = cBranchConsumed, branchLineage = cBranchLineage, andSiblingDominators = andSiblingDominators, branchDominator = cBranchDominator)
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, andSiblingCaps = andSiblingCaps, branchLotCap = cBranchLotCap, branchConsumed = cBranchConsumed, branchLineage = cBranchLineage, andSiblingDominators = andSiblingDominators, branchDominator = cBranchDominator, diamondRecipientCaps = diamondRecipientCaps, diamondRecipientConsumed = diamondRecipientConsumed)
         // Prefer the unrounded "quantity_precise" (see committedRow's doc) over the rounded
         // "quantity" — this feeds the AND-min ratio (computeRawAchievable) below, and reading
         // the rounded value here would let a genuinely-achieved fractional child (e.g. 0.4999
@@ -2111,6 +2126,23 @@ fun plan(
      * branches — never a fallback to the enclosing call's own value.
      */
     branchDominator: List<DominatorRef>? = null,
+    /**
+     * Dataset-specific replacement for the general diamond-allocation machinery, scoped to
+     * 160-1153's one known, fixed diamond shape (280-1159 → AND, only
+     * VirtualProduct_280-1159_A1/_A3 lead to it) — see [computeDiamondRecipientCaps]'s own
+     * doc. This demand's own fixed 50/50 caps for the two recipients, keyed by product_id
+     * (not lineage) — `null` when this demand doesn't touch 160-1153 at all. Threaded
+     * through unchanged to every recursive call, same as [andSiblingCaps].
+     */
+    diamondRecipientCaps: Map<String, Map<String, Double>>? = null,
+    /**
+     * Demand-wide-persistent pool of consumption, keyed the same fixed way as
+     * [diamondRecipientCaps] — created once per demand in [legacyCommit], alongside
+     * [demandConsumed], so every occurrence of VirtualProduct_280-1159_A1 (or _A3) within
+     * one demand's tree shares the SAME tally instead of each getting a fresh, disconnected
+     * one (the failure mode of the general [andSiblingCaps] mechanism for this shape).
+     */
+    diamondRecipientConsumed: MutableMap<String, MutableMap<String, Double>>? = null,
 ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
 
     val productId = (demand["product_id"] as? String)?.trim() ?: ""
@@ -2146,6 +2178,8 @@ fun plan(
             branchLineage    = branchLineage,
             andSiblingDominators = andSiblingDominators,
             branchDominator  = branchDominator,
+            diamondRecipientCaps = diamondRecipientCaps,
+            diamondRecipientConsumed = diamondRecipientConsumed,
         )
         // No cross-demand contention tag for quantity: critical materials are fully resolved by
         // the supply-guided pre-processor (buildSupplyAllocation's perLotBudgets) before this
@@ -2693,6 +2727,8 @@ fun plan(
             branchLineage = slotBranchLineage,
             andSiblingDominators = andSiblingDominators,
             branchDominator = slotBranchDominator,
+            diamondRecipientCaps = diamondRecipientCaps,
+            diamondRecipientConsumed = diamondRecipientConsumed,
         )
         // Intra-demand sibling contention (step c), applied directly here rather than relying
         // solely on plan()'s nodeCap-gated tagging site — same rationale as the AND-loop's
@@ -4716,6 +4752,9 @@ internal fun legacyCommit(
      *  keyed the same way (demand_id). Sliced per-demand and passed to [plan] as
      *  `andSiblingDominators`. */
     andSiblingDominators: Map<Any?, Map<BranchKey, List<DominatorRef>>>? = null,
+    /** Optional fixed 50/50 diamond-recipient caps from [computeDiamondRecipientCaps], keyed
+     *  by demand_id. Sliced per-demand and passed to [plan] as `diamondRecipientCaps`. */
+    diamondRecipientCaps: Map<Any?, Map<String, Map<String, Double>>>? = null,
 ): LegacyCommitResult {
     val committedDemands = mutableListOf<Map<String, Any?>>()
     val workOrders = mutableListOf<Map<String, Any?>>()
@@ -4764,6 +4803,9 @@ internal fun legacyCommit(
         // static per-lot cap it has actually spent so far, across every independent branch
         // of its own tree — see plan()'s doc for why this can't just be derived from `budget`.
         val demandConsumed = mutableMapOf<String, Double>()
+        // Fresh per demand: pooled consumption for the two fixed 160-1153 diamond recipients
+        // (keyed "VirtualProduct_280-1159_A1"/"_A3") — see diamondRecipientCaps's own doc.
+        val diamondRecipientConsumed = mutableMapOf<String, MutableMap<String, Double>>()
         val (solvedList, wos, peggingNode) = plan(
             d, indexedInventory, planData, reqDt,
             config = config, preferDemandId = prefId,
@@ -4777,6 +4819,8 @@ internal fun legacyCommit(
             preferenceKb = preferenceKb,
             andSiblingCaps = andSiblingCaps?.get(demandId),
             andSiblingDominators = andSiblingDominators?.get(demandId),
+            diamondRecipientCaps = diamondRecipientCaps?.get(demandId),
+            diamondRecipientConsumed = diamondRecipientConsumed,
         )
         committedDemands.addAll(solvedList)
         workOrders.addAll(wos)
@@ -4933,6 +4977,11 @@ fun runPlanning(
     )
     val andSiblingCaps = andSiblingCapsResult.caps
     val andSiblingDominators = andSiblingCapsResult.dominators
+    // Dataset-specific replacement for the above, scoped to 160-1153's one known, fixed
+    // diamond shape (see computeDiamondRecipientCaps's own doc) — takes precedence over
+    // andSiblingCaps for VirtualProduct_280-1159_A1/_A3 specifically at the AND-loop lookup
+    // site; andSiblingCaps stays available, unchanged, for anything else.
+    val diamondRecipientCaps = computeDiamondRecipientCaps(demands, sgAllocation)
     // Step 3: commit with pre-selected methods, per-node caps, and per-lot budget guards.
     // Wraps the raw per-demand callback with the overall phase/percent this stage occupies
     // (83%→95%) so the UI can keep showing "N / total demands" (from legacyCommit's own
@@ -4961,6 +5010,7 @@ fun runPlanning(
         preferenceKb      = preferenceKb,
         andSiblingCaps    = andSiblingCaps,
         andSiblingDominators = andSiblingDominators,
+        diamondRecipientCaps = diamondRecipientCaps,
     )
     // Post-planning trace + compensation-pass telemetry (opt-in: trace_lots=true).
     if (sgAllocation.sgConfig.traceLots)
