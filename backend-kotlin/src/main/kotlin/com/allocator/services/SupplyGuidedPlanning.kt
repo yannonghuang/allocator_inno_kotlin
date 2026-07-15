@@ -1085,46 +1085,100 @@ private fun allocateSiblingGroup(
     return SiblingGroupAllocation(shares, dominatorByBranch)
 }
 
-/** The two known, fixed BOM positions that lead to 160-1153 within its one recurring diamond
- *  shape (280-1159 → AND over 6 children, only these two ever reach 160-1153) — see
- *  [computeDiamondRecipientCaps]'s own doc. Verified 100% consistent across all 34 demands
- *  that touch 160-1153 in this dataset; not a general mechanism. */
-private val DIAMOND_RECIPIENTS = listOf("VirtualProduct_280-1159_A1", "VirtualProduct_280-1159_A3")
+/**
+ * Structural (BOM-topology-only) discovery of OR-group "grand-parent" recipients for each
+ * critical material — generalizes the former hardcoded `DIAMOND_RECIPIENTS`
+ * (`["VirtualProduct_280-1159_A1", "VirtualProduct_280-1159_A3"]`, the one known 160-1153 shape)
+ * into an automatic algorithm covering any critical material reached through an OR-group,
+ * anywhere in the BOM.
+ *
+ * For a critical material `c`, walks every BOM parent chain upward from `c` (`data["bom"]`:
+ * `child_id -> parent_id`, one row per `(parent_id, bom_id, child_id)` triple, `alt_group`
+ * marking OR-alternative membership). At each step from child `x` to parent `p`: if `x`'s own
+ * BOM row has a non-null `alt_group`, AND a sibling row under the same `(parent_id, bom_id)`
+ * has a *different* non-null `alt_group` (confirming a genuine >=2-member OR-group, not a
+ * singleton), `p` is recorded as a recipient for `c` and that chain stops there — the nearest
+ * enclosing OR-group's parent is the collapsing point (e.g. `VirtualProduct_280-1159_A1`, not
+ * `280-1159` itself, for 160-1153 — matches the original hardcode exactly). Plain AND-mandatory
+ * links (`alt_group = NULL`, or a lone alt_group with no sibling) are walked through without
+ * recording, continuing the search further up.
+ *
+ * Pure structural fact: computed once for the whole dataset, no demand or quantity involved —
+ * a critical material can have multiple recipients (generalizing the A1/A3 pair to N), and one
+ * recipient can serve multiple critical materials. The quantity split among recipients found
+ * here happens live, per waterfall-candidate attempt, in `PlanningEngine.kt`'s
+ * `computeDiamondCapsForAttempt` — see that function's own doc for why a static, upfront split
+ * (this function's predecessor) is wrong for recipients that are mutually exclusive with each
+ * other (gated behind a shared ancestor OR-choice), as opposed to always-simultaneously-visited
+ * AND-mandatory siblings like A1/A3.
+ */
+internal fun findOrGroupRecipients(
+    criticalPids: Set<String>,
+    data: Map<String, List<Map<String, Any?>>>,
+): Map<String, Set<String>> {
+    val bomRows = data["bom"] ?: emptyList()
+    // child_id -> list of (parent_id, bom_id, alt_group)
+    val parentsByChild = mutableMapOf<String, MutableList<Triple<String, String, String?>>>()
+    // (parent_id, bom_id) -> set of distinct non-null alt_group values among its children
+    val altGroupsByParentBom = mutableMapOf<Pair<String, String>, MutableSet<String>>()
+    for (row in bomRows) {
+        val parentId = (row["parent_id"] as? String)?.trim() ?: continue
+        val childId = (row["child_id"] as? String)?.trim() ?: continue
+        val bomId = (row["bom_id"] as? String)?.trim() ?: continue
+        if (parentId.isBlank() || childId.isBlank() || bomId.isBlank()) continue
+        val altGroup = (row["alt_group"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+        parentsByChild.getOrPut(childId) { mutableListOf() }.add(Triple(parentId, bomId, altGroup))
+        if (altGroup != null) altGroupsByParentBom.getOrPut(parentId to bomId) { mutableSetOf() }.add(altGroup)
+    }
+
+    val result = mutableMapOf<String, MutableSet<String>>()
+    for (c in criticalPids) {
+        val recipients = mutableSetOf<String>()
+        fun walk(childId: String, visited: MutableSet<String>) {
+            if (!visited.add(childId)) return
+            for ((parentId, bomId, altGroup) in parentsByChild[childId] ?: emptyList()) {
+                val siblingAltGroups = altGroupsByParentBom[parentId to bomId] ?: emptySet()
+                val isRealOrGroup = altGroup != null && siblingAltGroups.size >= 2
+                if (isRealOrGroup) {
+                    recipients.add(parentId)
+                } else {
+                    walk(parentId, visited)
+                }
+            }
+        }
+        walk(c, mutableSetOf())
+        if (recipients.isNotEmpty()) result[c] = recipients
+    }
+    return result
+}
 
 /**
- * Dataset-specific replacement for the general diamond-allocation machinery
- * ([gatherAndSiblingRequests]/[computeAndSiblingCaps]), scoped to the one shape that actually
- * needs fair intra-demand splitting in this dataset: 160-1153, reached from every affected
- * demand via the identical `280-1159 → AND(..., VirtualProduct_280-1159_A1, ...,
- * VirtualProduct_280-1159_A3, ...)` structure. The general mechanism identifies branches by a
- * lineage-qualified [BranchKey], which is unreliable here because the SAME diamond gets
- * independently re-descended into many times within one demand (waterfall spills at ancestor
- * nodes, shared-descendant convergence) — each occurrence gets a different lineage, so the
- * general machinery's per-branch cap/consumption tracking never accumulates across occurrences.
- *
- * This sidesteps that entirely: instead of discovering branches by walking the tree, the two
- * recipients are known and fixed upfront, identified purely by PRODUCT IDENTITY. Each demand's
- * own 160-1153 entitlement (already correctly computed by [buildSupplyAllocation]'s
- * criticalMatrix/perLotBudgets — unchanged, still the cross-demand-fair source of truth) is
- * split 50/50 between the two, per-lot. The live-commit side (`PlanningEngine.kt`'s AND-loop)
- * pools consumption across every occurrence of a given recipient within one demand via a
- * fixed-key map (`"A1"`/`"A3"`), the same demand-wide-persistent pattern `demandConsumed`
- * already uses successfully — just keyed by a fixed, known string instead of a derived,
- * occurrence-dependent lineage.
+ * Per-demand slice of the raw (unsplit) entitlement for every critical material that has at
+ * least one structurally-discovered OR-group recipient ([findOrGroupRecipients]) — exactly the
+ * materials `PlanningEngine.kt`'s `computeDiamondCapsForAttempt` needs to split live, per
+ * waterfall-candidate attempt, as the live commit proceeds. Unlike the former
+ * `computeDiamondRecipientCaps`, this does NOT split the entitlement at all: recipients that are
+ * mutually exclusive (gated behind a shared ancestor OR-choice) must not be pre-split — only the
+ * live, per-attempt computation can tell which one is actually being visited right now. Critical
+ * materials with no known recipients are simply absent here (nothing for the live commit to do
+ * beyond the existing andSiblingCaps mechanism).
  */
-internal fun computeDiamondRecipientCaps(
+internal fun buildDiamondCriticalEntitlement(
     demands: List<Map<String, Any?>>,
     allocation: SupplyAllocationResult,
+    diamondRecipients: Map<String, Set<String>>,
 ): Map<Any?, Map<String, Map<String, Double>>> {
+    if (diamondRecipients.isEmpty()) return emptyMap()
     val result = mutableMapOf<Any?, Map<String, Map<String, Double>>>()
     for (demand in demands) {
         val demandId = demand["demand_id"] ?: continue
         val demandBudgets = allocation.perLotBudgets[demandId] ?: continue
-        val lotEntries = demandBudgets.entries.filter { it.key.startsWith("160-1153|") }
-        if (lotEntries.isEmpty()) continue
-        result[demandId] = DIAMOND_RECIPIENTS.associateWith { _ ->
-            lotEntries.associate { (lotKey, qty) -> lotKey to qty * 0.5 }
+        val perMaterial = mutableMapOf<String, Map<String, Double>>()
+        for (criticalPid in diamondRecipients.keys) {
+            val lotEntries = demandBudgets.entries.filter { it.key.startsWith("$criticalPid|") }
+            if (lotEntries.isNotEmpty()) perMaterial[criticalPid] = lotEntries.associate { it.key to it.value }
         }
+        if (perMaterial.isNotEmpty()) result[demandId] = perMaterial
     }
     return result
 }
