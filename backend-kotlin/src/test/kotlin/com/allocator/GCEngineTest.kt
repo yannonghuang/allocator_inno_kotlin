@@ -226,4 +226,65 @@ class GCEngineTest : FunSpec({
         // child target = 60 * (150/100) = 90; excess = 150-90 = 60 returned
         (inv.find { it["supply_id"] == "SC" }!!["qty"] as Number).toDouble() shouldBe (60.0 plusOrMinus 1e-6)
     }
+
+    // ── T11/T12: rounded committed_qty inflates excess, over-trimming a child ──
+    // Reproduces the 858_F35_2024_07_VIRTUAL / 500-6161 collapse (2.667 instead of
+    // ~36): demandNode() rounds "committed_qty" for display (e.g. 1.6667 -> 2.0),
+    // but until this fix gcDemandNode read that ROUNDED value to compute excess,
+    // then applied the inflated excess straight against a child's own UNROUNDED
+    // quantity — over-trimming by the rounding gap.
+
+    fun demandNodePrecise(committedQty: Double, committedQtyPrecise: Double, children: List<Map<String, Any?>>): Map<String, Any?> =
+        mapOf("type" to "demand", "committed_qty" to committedQty, "committed_qty_precise" to committedQtyPrecise, "children" to children)
+
+    fun woNodePrecise(qty: Double, qtyPrecise: Double, relation: String? = null, children: List<Map<String, Any?>> = emptyList()): Map<String, Any?> =
+        mapOf("type" to "work_order", "quantity" to qty, "quantity_precise" to qtyPrecise,
+              "children_relation" to relation, "children" to children)
+
+    test("T11: gcDemandNode uses committed_qty_precise, not the rounded committed_qty, to compute excess") {
+        // True achieved = 1.6667, but demandNode() rounds committed_qty to 2.0 for display.
+        // Trimming to effectiveCap=0.36 must land the supply leaf at 0.36 (1.6667-1.3067),
+        // not 0.0267 (1.6667 - (2.0-0.36) — the rounding-inflated excess).
+        // Shape mirrors the real tree: WO's own child is a "demand" wrapper carrying an
+        // explicit gc_bom_rate=1.0 tag (as plan()'s childPassResults construction always
+        // sets), not a bare supply node directly under the WO.
+        val inv = mkInv(invBucket("A", "L", "SA", 900.0))
+        val supply = supplyNode("A", "L", "SA", 1.6666666666666665)
+        val childDemand = demandNodePrecise(2.0, 1.6666666666666665, listOf(supply)).plus("gc_bom_rate" to 1.0)
+        val wo = woNodePrecise(2.0, 1.6666666666666665, "and", listOf(childDemand))
+        val demand = demandNodePrecise(2.0, 1.6666666666666665, listOf(wo))
+
+        val result = garbageCollectPegging(demand, 0.36, inv, null)
+
+        (result["committed_qty_precise"] as Number).toDouble() shouldBe (0.36 plusOrMinus 1e-6)
+        @Suppress("UNCHECKED_CAST")
+        val woResult = (result["children"] as List<Map<String, Any?>>).first()
+        @Suppress("UNCHECKED_CAST")
+        val childDemandResult = (woResult["children"] as List<Map<String, Any?>>).first()
+        @Suppress("UNCHECKED_CAST")
+        val supplyResult = (childDemandResult["children"] as List<Map<String, Any?>>).first()
+        (supplyResult["quantity"] as Number).toDouble() shouldBe (0.36 plusOrMinus 1e-6)
+    }
+
+    test("T12: gcDemandNode and gcWoNode refresh their own _precise field after trimming, not leaving it stale") {
+        // Reproduces the second-order bug found verifying T11's fix live: GC trim updated
+        // the rounded "committed_qty"/"quantity" on return but left "committed_qty_precise"/
+        // "quantity_precise" at their PRE-trim value — a downstream reader that (correctly)
+        // prefers the precise field then sees a stale, un-trimmed figure. This caused
+        // conservation violations (initial != leftover + pegged) elsewhere in case 173
+        // once T11's fix made gcDemandNode itself prefer the precise field.
+        val inv = mkInv(invBucket("A", "L", "SA", 0.0))
+        val supply = supplyNode("A", "L", "SA", 3000.0)
+        val wo = woNodePrecise(3000.0, 3000.0, null, listOf(supply))
+        val demand = demandNodePrecise(3000.0, 3000.0, listOf(wo))
+
+        val result = garbageCollectPegging(demand, 0.0, inv, null)
+
+        (result["committed_qty"] as Number).toDouble() shouldBe (0.0 plusOrMinus 1e-6)
+        (result["committed_qty_precise"] as Number).toDouble() shouldBe (0.0 plusOrMinus 1e-6)
+        @Suppress("UNCHECKED_CAST")
+        val woResult = (result["children"] as List<Map<String, Any?>>).first()
+        (woResult["quantity"] as Number).toDouble() shouldBe (0.0 plusOrMinus 1e-6)
+        (woResult["quantity_precise"] as Number).toDouble() shouldBe (0.0 plusOrMinus 1e-6)
+    }
 })

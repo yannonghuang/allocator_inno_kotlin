@@ -1109,6 +1109,19 @@ private fun reachableRecipients(
  *   short of its target simply leaves more of the pool for the NEXT candidate's own, later call
  *   — the waterfall loop's own iteration over candidates with shrinking `slotQty`/`residual` IS
  *   the "rerun with leftover quantity," with no separate rerun mechanism needed.
+ *
+ * [candidateWeight] (default 1.0 — the ordinary sequential-waterfall case, unchanged) bounds this
+ * ONE candidate attempt to at most `candidateWeight * totalEntitlement` of the critical material,
+ * regardless of how much of the (possibly still-full) pool looks "remaining" at the moment this
+ * attempt runs. Without this, whichever candidate happens to be evaluated FIRST can claim the
+ * entire shared pool for itself before a later candidate ever gets a look — observed concretely
+ * on case 173's 858_F35_2024_07_VIRTUAL demand: a 2:1-weighted root split (500-6267 vs 500-6161)
+ * on a shared critical material (160-1153) resolved 167:3 instead of anywhere near 2:1, because
+ * the first-processed candidate's own reachable recipients absorbed the whole remaining pool in
+ * one call with no reservation left for the second. Callers pass the SAME per-candidate weight
+ * already used to size `slotQty` at a root split (`rootSplitWeights[slotIdx]`) — proportional to
+ * REQUEST, matching how the rest of the root-split mechanism divides the demand, not a per-lot
+ * consumption-rate estimate (that would need BOM-rate knowledge this function doesn't have).
  */
 internal fun computeDiamondCapsForAttempt(
     productId: String,
@@ -1122,6 +1135,7 @@ internal fun computeDiamondCapsForAttempt(
     diamondRecipients: Map<String, Set<String>>,
     diamondCriticalEntitlement: Map<String, Map<String, Double>>,
     diamondRecipientConsumed: Map<String, MutableMap<String, Double>>,
+    candidateWeight: Double = 1.0,
 ): Map<String, Map<String, Double>> {
     if (diamondRecipients.isEmpty() || diamondCriticalEntitlement.isEmpty()) return emptyMap()
     val result = mutableMapOf<String, MutableMap<String, Double>>()
@@ -1139,7 +1153,11 @@ internal fun computeDiamondCapsForAttempt(
             // THIS attempt) — so re-descending into the same diamond later in the same demand
             // still respects the original total, not a re-inflated one.
             val consumedSoFar = recipients.sumOf { r -> diamondRecipientConsumed[r]?.get(lotKey) ?: 0.0 }
-            val remaining = (totalQty - consumedSoFar).coerceAtLeast(0.0)
+            val remainingPool = (totalQty - consumedSoFar).coerceAtLeast(0.0)
+            // Proportional reservation: cap THIS attempt to its own weighted share of the
+            // TOTAL entitlement (not the shrinking pool), so a candidate processed earlier in
+            // the waterfall can never crowd out a later candidate's fair share.
+            val remaining = min(remainingPool, candidateWeight * totalQty)
             val share = remaining / n
             for (recipient in found) {
                 result.getOrPut(recipient) { mutableMapOf() }[lotKey] = share
@@ -1147,6 +1165,99 @@ internal fun computeDiamondCapsForAttempt(
         }
     }
     return result
+}
+
+/**
+ * Finds the first node in [node]'s subtree (including itself) whose `product_id` matches
+ * [productId] — used by [reconcileDiamondConsumption] to locate a diamond recipient's own
+ * pegging subtree inside a just-completed waterfall candidate attempt.
+ */
+private fun findNodeByProductId(node: Map<String, Any?>?, productId: String): Map<String, Any?>? {
+    if (node == null) return null
+    if (node["product_id"] == productId) return node
+    @Suppress("UNCHECKED_CAST")
+    val children = node["children"] as? List<Map<String, Any?>> ?: return null
+    for (c in children) {
+        findNodeByProductId(c, productId)?.let { return it }
+    }
+    return null
+}
+
+/**
+ * Sums real "supply" leaf draws under [node], keyed exactly like [branchConsumed]'s own
+ * "pid|lid|sid" lot keys. Skips anything nested under a `failed=true` ancestor: those subtrees
+ * are first-pass diagnostic artifacts [plan] deliberately keeps for the UI (see its own doc) —
+ * GC-trimmed away in the live commit, so they never happened and must not count here.
+ */
+private fun sumRealSupplyDraws(node: Map<String, Any?>?, underFailed: Boolean = false): Map<String, Double> {
+    if (node == null) return emptyMap()
+    val isFailed = underFailed || (node["failed"] == true)
+    val result = mutableMapOf<String, Double>()
+    if (!isFailed && node["type"] == "supply") {
+        val pid = node["product_id"] as? String
+        val lid = node["location_id"] as? String
+        val sid = node["supply_id"] as? String
+        if (pid != null && lid != null && sid != null) {
+            val qty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
+            val lotKey = "$pid|$lid|$sid"
+            result[lotKey] = (result[lotKey] ?: 0.0) + qty
+        }
+    }
+    @Suppress("UNCHECKED_CAST")
+    val children = node["children"] as? List<Map<String, Any?>> ?: emptyList()
+    for (c in children) {
+        for ((k, v) in sumRealSupplyDraws(c, isFailed)) {
+            result[k] = (result[k] ?: 0.0) + v
+        }
+    }
+    return result
+}
+
+/**
+ * Corrects [diamondRecipientConsumed] after one waterfall candidate attempt fully completes
+ * (including whatever GC-trim ran inside it), replacing the SPECULATIVE charge that attempt's
+ * own [consumeFromInventory] calls recorded eagerly, first-pass, with what the attempt's final
+ * pegging tree shows it ACTUALLY, permanently drew.
+ *
+ * Needed because GC's excess-return mechanism ([garbageCollectPegging]) already restores
+ * `inventory` and the general per-lot `budget` when a first-pass draw gets trimmed away by an
+ * enclosing AND-min collapse or the whole branch is abandoned — but it has no knowledge of
+ * [diamondRecipientConsumed] (a narrower, per-diamond-recipient ledger, not threaded through
+ * GC's recursive descent). Left unreconciled, a candidate whose first-pass exploration touched a
+ * shared critical material deep in its own subtree — then got fully or partially trimmed away —
+ * permanently over-charges the pool, silently starving whichever later waterfall candidate draws
+ * on the same material next. Concretely: run 1247's 858_F35_2024_07_VIRTUAL demand — 500-6267's
+ * root-split candidate speculatively drew ~169 units of 160-1153 through a first-pass attempt at
+ * the 280-1159 diamond that its own AND-min later abandoned in favor of a different, non-diamond
+ * path (final live delivery touches 160-1153 not at all); with no refund, 500-6161's later
+ * candidate saw almost none of the pool left, capping it to ~3 units of real, achievable output.
+ *
+ * [preSnapshot] is [diamondRecipientConsumed] as it stood immediately before this attempt started
+ * (one entry per recipient in [recipients], each a value-copy of that recipient's lot map) — the
+ * baseline this attempt's own speculative delta is measured against, so unrelated consumption
+ * from an EARLIER, different occurrence of the same recipient elsewhere in this demand's tree is
+ * left untouched.
+ */
+private fun reconcileDiamondConsumption(
+    attemptPeggingNode: Map<String, Any?>?,
+    recipients: Set<String>,
+    preSnapshot: Map<String, Map<String, Double>>,
+    diamondRecipientConsumed: MutableMap<String, MutableMap<String, Double>>,
+) {
+    if (attemptPeggingNode == null) return
+    for (recipient in recipients) {
+        val consumedMap = diamondRecipientConsumed[recipient] ?: continue
+        val before = preSnapshot[recipient] ?: emptyMap()
+        val recipientNode = findNodeByProductId(attemptPeggingNode, recipient)
+        val trueFinal = sumRealSupplyDraws(recipientNode)
+        for (lotKey in consumedMap.keys.toList()) {
+            val beforeQty = before[lotKey] ?: 0.0
+            val speculativeDelta = (consumedMap[lotKey] ?: 0.0) - beforeQty
+            if (speculativeDelta <= 1e-9) continue
+            val trueDelta = (trueFinal[lotKey] ?: 0.0).coerceIn(0.0, speculativeDelta)
+            consumedMap[lotKey] = beforeQty + trueDelta
+        }
+    }
 }
 
 // ── Method selection ───────────────────────────────────────────────────────────
@@ -2458,6 +2569,14 @@ fun plan(
         put("location_id", locationId)
         put("quantity", roundQty(quantity))
         put("committed_qty", roundQty(committedQty))
+        // Unrounded companion to "committed_qty" — mirrors committedRow()'s own
+        // "quantity_precise" (see its doc above). Without this, GCEngine.kt's
+        // gcDemandNode reads the rounded committed_qty to compute how much excess to
+        // trim from this node's children, then applies that excess directly against a
+        // child's own unrounded "quantity" — over-trimming by the rounding gap (e.g.
+        // committed_qty rounds 1.6667 up to 2.0, so a target of 0.36 computes excess=1.64
+        // instead of the true 1.3067, landing a supply leaf at 0.0267 instead of 0.36).
+        put("committed_qty_precise", committedQty)
         put("request_time", reqTimeStr)
         put("commit_time", commitTime)
         put("commit_reason", commitReason)
@@ -2931,8 +3050,19 @@ fun plan(
                 diamondRecipients = diamondRecipients,
                 diamondCriticalEntitlement = diamondCriticalEntitlement,
                 diamondRecipientConsumed = diamondRecipientConsumed ?: emptyMap(),
+                // Root-split candidates share a fixed proportional reservation (their own
+                // rootSplitWeights share) of any diamond-critical material; ordinary sequential
+                // waterfall candidates keep today's behavior (may draw up to the whole pool).
+                candidateWeight = rootSplitWeights?.getOrNull(slotIdx) ?: 1.0,
             )
         }
+        // Baseline for reconcileDiamondConsumption below — diamondRecipientConsumed as it
+        // stands right before this attempt's own recursive plan() calls speculatively charge
+        // it, so the reconciliation can isolate exactly THIS attempt's delta afterward.
+        val diamondPreSnapshot: Map<String, Map<String, Double>> =
+            if (diamondRecipientConsumed != null && !slotDiamondCaps.isNullOrEmpty())
+                slotDiamondCaps.keys.associateWith { r -> diamondRecipientConsumed[r]?.toMap() ?: emptyMap() }
+            else emptyMap()
         val attempt = planMethodSlot(
             m = candidate.method, slotQty = slotQty,
             productId = productId, locationId = locationId,
@@ -2962,6 +3092,17 @@ fun plan(
             diamondRecipients = diamondRecipients,
             diamondCriticalEntitlement = diamondCriticalEntitlement,
         )
+        // Replace this attempt's speculative diamondRecipientConsumed charge with what its
+        // final (post-GC-trim) pegging subtree shows it actually drew — see
+        // reconcileDiamondConsumption's own doc for why this can't be left to GC alone.
+        if (diamondRecipientConsumed != null && !slotDiamondCaps.isNullOrEmpty()) {
+            reconcileDiamondConsumption(
+                attemptPeggingNode = attempt.methodPeggingNode,
+                recipients = slotDiamondCaps.keys,
+                preSnapshot = diamondPreSnapshot,
+                diamondRecipientConsumed = diamondRecipientConsumed,
+            )
+        }
         // Intra-demand sibling contention (step c), applied directly here rather than relying
         // solely on plan()'s nodeCap-gated tagging site — same rationale as the AND-loop's
         // identical override (see its own comment): the sketch phase's nodeQtyCaps prediction
@@ -3236,7 +3377,7 @@ private fun scaleSubtree(node: Map<String, Any?>, factor: Double): Map<String, A
     return nn
 }
 
-private fun reconcile(
+internal fun reconcile(
     node: Map<String, Any?>,
     target: Double,
     data: Map<String, List<Map<String, Any?>>>,
@@ -3245,11 +3386,21 @@ private fun reconcile(
     if (node["failed"] == true) return node to 0.0
     val allChildren = node["children"] as? List<*> ?: emptyList<Any?>()
     when (node["type"]) {
-        "supply", "purchase" -> {
-            // Prefer the unrounded "quantity_precise" when present (see committedRow's doc).
-            // "supply" nodes are already unrounded in "quantity" itself (see the comment where
-            // they're built); "purchase" nodes carry quantity_precise separately since their own
-            // "quantity" is rounded for display.
+        "purchase" -> {
+            // Elastic, same rule as isRawCriticalPosition's own dominator logic already
+            // encodes ("a purchase is NOT raw... its quantity is elastic — you can always
+            // order more"): a purchase leaf's recorded quantity is whatever the live commit's
+            // first pass happened to buy, not a hard ceiling. Capping it at that stale figure
+            // (as "supply" below correctly does, since a supply lot IS fixed) silently treats
+            // an elastic material as raw, and — because a small, easily-purchasable shortfall
+            // can sit behind a tiny BOM rate several levels up — gets amplified into a large,
+            // unrelated-looking collapse at the top of the tree. Grant `target` directly.
+            val supplied = target.coerceAtLeast(0.0)
+            return (node + ("quantity" to supplied)) to supplied
+        }
+        "supply" -> {
+            // Prefer the unrounded "quantity_precise" when present (see committedRow's doc) —
+            // a supply lot is genuinely fixed (raw, existing inventory), so it stays capped.
             val q = ((node["quantity_precise"] as? Number) ?: (node["quantity"] as? Number))?.toDouble() ?: 0.0
             val supplied = minOf(target, q).coerceAtLeast(0.0)
             return (node + ("quantity" to supplied)) to supplied
@@ -3304,8 +3455,12 @@ private fun reconcile(
             // out of 0.5) register as a hard 0 one level up, the same rounding-cascade class of
             // bug fixed in planMethodSlot's effectiveQty.
             val curQty = ((node["quantity_precise"] as? Number) ?: (node["quantity"] as? Number))?.toDouble() ?: 0.0
-            val want = minOf(target, curQty).coerceAtLeast(0.0)
             val method = node["method"]
+            // Purchase WOs are elastic — see the "purchase" leaf case's own doc for why. This
+            // wrapper's own curQty cap must be bypassed too, or a purchase WO would still be
+            // frozen at its stale first-pass buy before `want` ever reaches the leaf below.
+            val want = if (method == "purchase") target.coerceAtLeast(0.0)
+                       else minOf(target, curQty).coerceAtLeast(0.0)
             val demandChildren = allChildren.mapNotNull { it as? Map<String, Any?> }.filter { it["type"] == "demand" }
             if (method == "purchase" || demandChildren.isEmpty()) {
                 // Procurement / leaf-backed WO delivers `want`; trim leaf children to it.

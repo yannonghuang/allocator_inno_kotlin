@@ -876,6 +876,86 @@ class SupplyGuidedPlanningTest : FunSpec({
         caps["A3"]?.get("X|L|S1") shouldBe (50.0 plusOrMinus 1e-6)
     }
 
+    test("computeDiamondCapsForAttempt: candidateWeight bounds this attempt to its proportional share of the pool, not the whole remaining pool") {
+        // Same P/A1/A3/X shape as above, but this call represents one candidate of a 2:1
+        // weighted root split (candidateWeight=0.3333) reached BEFORE anything else has drawn
+        // from the pool — i.e. remainingPool == totalEntitlement == 100. Without the weight
+        // cap this candidate would grab the entire 100 for itself (split 50/50 across A1/A3,
+        // as the unweighted test above shows); with it, it must be held to its own ~33.33
+        // share, leaving ~66.67 genuinely reserved for whichever candidate the waterfall tries
+        // next — this is the fix for the 167:3 (instead of ~2:1) split found on case 173's
+        // 858_F35_2024_07_VIRTUAL / 160-1153.
+        val data = mkData(
+            methodMake = listOf(
+                mapOf<String, Any?>("bom_id" to "BP", "product_id" to "P", "location_id" to "L", "preference" to 1, "lead_time" to 0.0),
+            ),
+            bom = listOf(
+                mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "A1", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "A3", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BA1", "parent_id" to "A1", "child_id" to "V1a", "rate" to 1.0, "alt_group" to "g1a"),
+                mapOf("bom_id" to "BA1", "parent_id" to "A1", "child_id" to "V1b", "rate" to 1.0, "alt_group" to "g1b"),
+                mapOf("bom_id" to "BA3", "parent_id" to "A3", "child_id" to "V3a", "rate" to 1.0, "alt_group" to "g3a"),
+                mapOf("bom_id" to "BA3", "parent_id" to "A3", "child_id" to "V3b", "rate" to 1.0, "alt_group" to "g3b"),
+                mapOf("bom_id" to "BV1a", "parent_id" to "V1a", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BV1b", "parent_id" to "V1b", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BV3a", "parent_id" to "V3a", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BV3b", "parent_id" to "V3b", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+            ),
+        )
+        val pMethod = getMethods("P", "L", data).first()
+        val diamondRecipients = mapOf("X" to setOf("A1", "A3"))
+        val diamondCriticalEntitlement = mapOf("X" to mapOf("X|L|S1" to 100.0))
+        val caps = computeDiamondCapsForAttempt(
+            productId = "P", locationId = "L", method = pMethod, altKey = null,
+            demand = demand("D1", "P", "L", 100.0), config = null, data = data,
+            preferenceKb = null,
+            diamondRecipients = diamondRecipients,
+            diamondCriticalEntitlement = diamondCriticalEntitlement,
+            diamondRecipientConsumed = emptyMap(),
+            candidateWeight = 1.0 / 3.0,
+        )
+        caps.keys shouldBe setOf("A1", "A3")
+        // Total reserved across both recipients must equal candidateWeight * totalEntitlement
+        // (~33.33), not totalEntitlement itself (100) — split evenly across the 2 recipients.
+        val totalReserved = (caps["A1"]?.get("X|L|S1") ?: 0.0) + (caps["A3"]?.get("X|L|S1") ?: 0.0)
+        totalReserved shouldBe (100.0 / 3.0 plusOrMinus 1e-6)
+        caps["A1"]?.get("X|L|S1") shouldBe (50.0 / 3.0 plusOrMinus 1e-6)
+        caps["A3"]?.get("X|L|S1") shouldBe (50.0 / 3.0 plusOrMinus 1e-6)
+    }
+
+    test("computeDiamondCapsForAttempt: candidateWeight still respects a pool already partly consumed by an earlier candidate") {
+        // Same shape, but this time diamondRecipientConsumed shows an earlier candidate
+        // already permanently used 90 of the 100 total (a genuine, real draw — not the
+        // abandoned-speculation case reconcileDiamondConsumption fixes). Even at
+        // candidateWeight=1.0 (e.g. the ordinary sequential-waterfall default), this
+        // candidate must be bounded by the smaller of the two caps: what's actually left
+        // (10), not its own full weighted share.
+        val data = mkData(
+            methodMake = listOf(
+                mapOf<String, Any?>("bom_id" to "BP", "product_id" to "P", "location_id" to "L", "preference" to 1, "lead_time" to 0.0),
+            ),
+            bom = listOf(
+                mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "A1", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BA1", "parent_id" to "A1", "child_id" to "V1a", "rate" to 1.0, "alt_group" to "g1a"),
+                mapOf("bom_id" to "BV1a", "parent_id" to "V1a", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+            ),
+        )
+        val pMethod = getMethods("P", "L", data).first()
+        val diamondRecipients = mapOf("X" to setOf("A1"))
+        val diamondCriticalEntitlement = mapOf("X" to mapOf("X|L|S1" to 100.0))
+        val consumed = mutableMapOf<String, MutableMap<String, Double>>("A1" to mutableMapOf("X|L|S1" to 90.0))
+        val caps = computeDiamondCapsForAttempt(
+            productId = "P", locationId = "L", method = pMethod, altKey = null,
+            demand = demand("D1", "P", "L", 100.0), config = null, data = data,
+            preferenceKb = null,
+            diamondRecipients = diamondRecipients,
+            diamondCriticalEntitlement = diamondCriticalEntitlement,
+            diamondRecipientConsumed = consumed,
+            candidateWeight = 1.0,
+        )
+        caps["A1"]?.get("X|L|S1") shouldBe (10.0 plusOrMinus 1e-6)
+    }
+
     test("computeDiamondCapsForAttempt: same AND-mandatory shape, but via the indexed PlanData fast path (matches production's legacyCommit wrapping)") {
         val data = mkData(
             methodMake = listOf(
