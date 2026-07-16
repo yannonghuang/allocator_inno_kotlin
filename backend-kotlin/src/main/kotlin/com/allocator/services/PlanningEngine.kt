@@ -989,10 +989,15 @@ internal fun kbPreference(
  * is what chooses it), finds which of [candidateRecipients] are reachable through THIS method's
  * own children. AND-mandatory children (a "make" variant's own multiple children) are all
  * explored, matching their simultaneous, deterministic visitation in the live AND-loop; nested
- * OR-choices further down follow [reachableRecipients]'s own single-top-choice rule — mirroring
- * exactly how the live commit itself resolves them, so this never counts a recipient the live
- * commit wouldn't actually visit for this candidate. Stops descending at a matched recipient (it
- * IS the collapsing point) but keeps exploring sibling AND-branches for other recipients.
+ * OR-choices further down explore EVERY candidate via [reachableRecipients] (union-all, not a
+ * single guessed top choice) — a known recipient several unrelated OR-hops below this method
+ * must never be missed just because some intermediate level's top-ranked pick differs from
+ * whatever the live commit eventually resolves there. Confirmed necessary in practice: an
+ * earlier single-top-choice version of this walk missed 280-1159's own AND-mandatory A1-D1
+ * children entirely whenever an unrelated intermediate OR-choice several levels up picked
+ * differently, silently falling back to the unreliable general `andSiblingCaps` mechanism this
+ * whole function exists to avoid. Stops descending at a matched recipient (it IS the collapsing
+ * point) but keeps exploring sibling AND-branches for other recipients.
  */
 private fun reachableRecipientsForMethod(
     pid: String,
@@ -1033,11 +1038,18 @@ private fun reachableRecipientsForMethod(
 }
 
 /**
- * Picks the single top-ranked candidate at (pid, lid) — mirroring the live commit's own
- * non-root waterfall rule (try the best choice, no simultaneous exploration) — and delegates to
- * [reachableRecipientsForMethod]. Cycle-guarded via [visited], shared with the caller's own walk
- * so re-entering an already-open frame (e.g. a two-location move cycle) safely yields no match
- * instead of recursing forever.
+ * Explores EVERY candidate at (pid, lid) — union-all reachability, not "guess the live
+ * commit's single top choice" — and delegates each to [reachableRecipientsForMethod]. This is
+ * deliberately more permissive than the live commit's own actual resolution: a KNOWN recipient
+ * (e.g. an AND-mandatory child several intermediate OR-hops down, like 280-1159's own A1-D1)
+ * must never be missed just because the top-ranked choice at some UNRELATED intermediate level
+ * happens to differ from the live commit's own eventual pick — under-reaching here silently
+ * falls back to the general (and, for this exact shape, unreliable — see
+ * [computeDiamondCapsForAttempt]'s own doc) `andSiblingCaps` mechanism, which is far worse than
+ * the comparatively harmless cost of over-including a candidate the live commit ends up not
+ * visiting (that candidate's computed cap simply goes unused). Cycle-guarded via [visited],
+ * shared with the caller's own walk so re-entering an already-open frame (e.g. a two-location
+ * move cycle) safely yields no match instead of recursing forever.
  */
 private fun reachableRecipients(
     pid: String,
@@ -1052,13 +1064,26 @@ private fun reachableRecipients(
     if (candidateRecipients.isEmpty()) return emptySet()
     if (pid in candidateRecipients) return setOf(pid)
     val key = pid to lid
+    // Path-scoped cycle guard, NOT a global "ever visited" memo: this BOM has heavily shared
+    // sub-assemblies (e.g. 280-1159 is reached from several unrelated higher-level components),
+    // so the SAME (pid, lid) can legitimately appear on many different, non-cyclic paths within
+    // one top-level search. Must un-mark on the way back out (try/finally, matching
+    // gatherAndSiblingRequests's own accumulate/discover pattern) — leaving it marked for the
+    // rest of the search (as an earlier version of this function did) causes the first branch
+    // explored to permanently block every other legitimate path through the same shared node,
+    // silently losing real recipients.
     if (!visited.add(key)) return emptySet()
-    val methods = getMethods(pid, lid, data)
-    if (methods.isEmpty()) return emptySet()
-    val best = expandWaterfallCandidates(methods, pid, demand, config, data)
-        .minByOrNull { kbPreference(pid, lid, it.method, it.altKey, preferenceKb) }
-        ?: return emptySet()
-    return reachableRecipientsForMethod(pid, lid, best.method, best.altKey, candidateRecipients, demand, config, data, preferenceKb, visited)
+    try {
+        val methods = getMethods(pid, lid, data)
+        if (methods.isEmpty()) return emptySet()
+        val found = mutableSetOf<String>()
+        for (candidate in expandWaterfallCandidates(methods, pid, demand, config, data)) {
+            found += reachableRecipientsForMethod(pid, lid, candidate.method, candidate.altKey, candidateRecipients, demand, config, data, preferenceKb, visited)
+        }
+        return found
+    } finally {
+        visited.remove(key)
+    }
 }
 
 /**

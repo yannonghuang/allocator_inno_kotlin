@@ -836,6 +836,92 @@ class SupplyGuidedPlanningTest : FunSpec({
         recipients["X"] shouldBe setOf("A1", "A3")
     }
 
+    test("computeDiamondCapsForAttempt: finds AND-mandatory recipients directly, same shape as the live-dataset 160-1153/A1/A3 diamond") {
+        // Same BOM shape as the findOrGroupRecipients test above, but exercised through the
+        // LIVE per-attempt downward search (reachableRecipientsForMethod/reachableRecipients)
+        // instead of the structural upward walk — this is what plan()'s waterfall loop
+        // actually calls. P's own make method (bom_id="BP") has A1/A3 as direct AND-mandatory
+        // children (alt_group=null) — computeDiamondCapsForAttempt, invoked AT P's own level,
+        // must find both directly in one hop.
+        val data = mkData(
+            methodMake = listOf(
+                mapOf<String, Any?>("bom_id" to "BP", "product_id" to "P", "location_id" to "L", "preference" to 1, "lead_time" to 0.0),
+            ),
+            bom = listOf(
+                mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "A1", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "A3", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BA1", "parent_id" to "A1", "child_id" to "V1a", "rate" to 1.0, "alt_group" to "g1a"),
+                mapOf("bom_id" to "BA1", "parent_id" to "A1", "child_id" to "V1b", "rate" to 1.0, "alt_group" to "g1b"),
+                mapOf("bom_id" to "BA3", "parent_id" to "A3", "child_id" to "V3a", "rate" to 1.0, "alt_group" to "g3a"),
+                mapOf("bom_id" to "BA3", "parent_id" to "A3", "child_id" to "V3b", "rate" to 1.0, "alt_group" to "g3b"),
+                mapOf("bom_id" to "BV1a", "parent_id" to "V1a", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BV1b", "parent_id" to "V1b", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BV3a", "parent_id" to "V3a", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BV3b", "parent_id" to "V3b", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+            ),
+        )
+        val pMethod = getMethods("P", "L", data).first()
+        val diamondRecipients = mapOf("X" to setOf("A1", "A3"))
+        val diamondCriticalEntitlement = mapOf("X" to mapOf("X|L|S1" to 100.0))
+        val caps = computeDiamondCapsForAttempt(
+            productId = "P", locationId = "L", method = pMethod, altKey = null,
+            demand = demand("D1", "P", "L", 100.0), config = null, data = data,
+            preferenceKb = null,
+            diamondRecipients = diamondRecipients,
+            diamondCriticalEntitlement = diamondCriticalEntitlement,
+            diamondRecipientConsumed = emptyMap(),
+        )
+        caps.keys shouldBe setOf("A1", "A3")
+        caps["A1"]?.get("X|L|S1") shouldBe (50.0 plusOrMinus 1e-6)
+        caps["A3"]?.get("X|L|S1") shouldBe (50.0 plusOrMinus 1e-6)
+    }
+
+    test("computeDiamondCapsForAttempt: same AND-mandatory shape, but via the indexed PlanData fast path (matches production's legacyCommit wrapping)") {
+        val data = mkData(
+            methodMake = listOf(
+                mapOf<String, Any?>("bom_id" to "BP", "product_id" to "P", "location_id" to "L", "preference" to 1, "lead_time" to 0.0),
+            ),
+            bom = listOf(
+                mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "A1", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "A3", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BA1", "parent_id" to "A1", "child_id" to "V1a", "rate" to 1.0, "alt_group" to "g1a"),
+                mapOf("bom_id" to "BA1", "parent_id" to "A1", "child_id" to "V1b", "rate" to 1.0, "alt_group" to "g1b"),
+                mapOf("bom_id" to "BA3", "parent_id" to "A3", "child_id" to "V3a", "rate" to 1.0, "alt_group" to "g3a"),
+                mapOf("bom_id" to "BA3", "parent_id" to "A3", "child_id" to "V3b", "rate" to 1.0, "alt_group" to "g3b"),
+                mapOf("bom_id" to "BV1a", "parent_id" to "V1a", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BV1b", "parent_id" to "V1b", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BV3a", "parent_id" to "V3a", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BV3b", "parent_id" to "V3b", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+            ),
+        )
+        val idx = DataIndex(
+            makeByPidLid = (data["method_make"] ?: emptyList()).groupBy {
+                Pair(it["product_id"]?.toString()?.trim() ?: "", it["location_id"]?.toString()?.trim() ?: "")
+            },
+            moveByPidToLid = (data["method_move"] ?: emptyList()).groupBy {
+                Pair(it["product_id"]?.toString()?.trim() ?: "", it["to_location_id"]?.toString()?.trim() ?: "")
+            },
+            buyByPidLid = (data["method_buy"] ?: emptyList()).groupBy {
+                Pair(it["product_id"]?.toString()?.trim() ?: "", it["location_id"]?.toString()?.trim() ?: "")
+            },
+            bomByBomId = (data["bom"] ?: emptyList()).groupBy { it["bom_id"]?.toString()?.trim() ?: "" },
+            bomByParentId = (data["bom"] ?: emptyList()).groupBy { it["parent_id"]?.toString()?.trim() ?: "" },
+        )
+        val indexedData = PlanData(data, idx)
+        val pMethod = getMethods("P", "L", indexedData).first()
+        val diamondRecipients = mapOf("X" to setOf("A1", "A3"))
+        val diamondCriticalEntitlement = mapOf("X" to mapOf("X|L|S1" to 100.0))
+        val caps = computeDiamondCapsForAttempt(
+            productId = "P", locationId = "L", method = pMethod, altKey = null,
+            demand = demand("D1", "P", "L", 100.0), config = null, data = indexedData,
+            preferenceKb = null,
+            diamondRecipients = diamondRecipients,
+            diamondCriticalEntitlement = diamondCriticalEntitlement,
+            diamondRecipientConsumed = emptyMap(),
+        )
+        caps.keys shouldBe setOf("A1", "A3")
+    }
+
     test("findOrGroupRecipients: mutually exclusive OR-alternatives collapse to their shared parent, not each other") {
         // FG -> OR(P, P2) directly. P -> X. P2 -> X (a different path to the same X).
         // X's own link to P/P2 has no alt_group, so the walk continues up past P/P2 to their
@@ -874,5 +960,28 @@ class SupplyGuidedPlanningTest : FunSpec({
         )
         val recipients = findOrGroupRecipients(setOf("X"), data)
         recipients.containsKey("X") shouldBe false
+    }
+
+    test("findOrGroupRecipients: siblings with distinct per-child bom_id but shared elem_ix are still one OR-group") {
+        // Reproduces the live dataset's actual shape for 160-1153/A3: each of A3's 4
+        // alternatives (504-1319/1532/1548/1817) has its OWN, per-child bom_id (its own
+        // single-row method_make) rather than sharing one bom_id — bom_id can never group
+        // these as siblings. elem_ix is the real "same slot" signal: all 4 share elem_ix=1.
+        // Grouping by bom_id alone (this function's predecessor) would treat each as its own
+        // singleton alt_group and walk straight past A3 — exactly the bug that let the
+        // upward walk for 160-1153 miss A1/A3 entirely and reach as far as top-level demand
+        // roots instead.
+        val data = mkData(
+            bom = listOf(
+                mapOf("bom_id" to "BOM_A3_C1", "parent_id" to "A3", "child_id" to "C1", "rate" to 1.0, "alt_group" to "C1", "elem_ix" to 1),
+                mapOf("bom_id" to "BOM_A3_C2", "parent_id" to "A3", "child_id" to "C2", "rate" to 1.0, "alt_group" to "C2", "elem_ix" to 1),
+                mapOf("bom_id" to "BOM_A3_C3", "parent_id" to "A3", "child_id" to "C3", "rate" to 1.0, "alt_group" to "C3", "elem_ix" to 1),
+                mapOf("bom_id" to "BOM_C1_X", "parent_id" to "C1", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BOM_C2_X", "parent_id" to "C2", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BOM_C3_X", "parent_id" to "C3", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+            ),
+        )
+        val recipients = findOrGroupRecipients(setOf("X"), data)
+        recipients["X"] shouldBe setOf("A3")
     }
 })

@@ -30,6 +30,7 @@ object CaseLoader {
                 "child_id" to it[Boms.childId],
                 "rate" to (it[Boms.rate] ?: 0.0),
                 "alt_group" to it[Boms.altGroup],
+                "elem_ix" to it[Boms.elemIx],
             )
         }
 

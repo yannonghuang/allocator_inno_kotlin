@@ -6,6 +6,7 @@ import com.allocator.services.NodeBlueprint
 import com.allocator.services.plan
 import com.allocator.services.runPlanning
 import io.kotest.core.spec.style.FunSpec
+import io.kotest.matchers.doubles.plusOrMinus
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 
@@ -272,5 +273,104 @@ class DominatorTest : FunSpec({
         val dominators = dominatorEntries(tree, "quantity_dominator")
         dominators.size shouldBe 1
         dominators[0]["label"] shouldBe "intra-demand branch cause"
+    }
+
+    // ── Reproduction: no_methods failure's reported committed_qty ──────────────
+
+    fun findNode(node: Map<String, Any?>?, pid: String, lid: String): Map<String, Any?>? {
+        if (node == null) return null
+        if (node["product_id"] == pid && node["location_id"] == lid && node["type"] == "demand") return node
+        return children(node).firstNotNullOfOrNull { findNode(it, pid, lid) }
+    }
+
+    test("move chain into a partial no_methods source: committed_qty must equal actual taken, not the unmet residual") {
+        // P@Dest (qty 20) has no local supply and must move from P@Source. P@Source has only
+        // 15 real units of supply and no method (make/buy/move) to cover the remaining 5 — a
+        // genuine, partial no_methods failure at the source. The source's own reported
+        // committed_qty should be 15 (what was actually drawn), not 20 (the full ask) or 5
+        // (the unmet residual) — either of the latter would misrepresent a failed node as if
+        // it had (near-)fully succeeded.
+        val data = mapOf(
+            "method_make" to emptyList<Map<String, Any?>>(),
+            "method_buy" to emptyList<Map<String, Any?>>(),
+            "method_move" to listOf(mapOf<String, Any?>(
+                "product_id" to "P", "from_location_id" to "Source", "to_location_id" to "Dest",
+                "preference" to 1, "transit_time" to 0.0,
+            )),
+            "bom" to emptyList<Map<String, Any?>>(),
+            "productlocation" to emptyList<Map<String, Any?>>(),
+            "supply" to listOf(mapOf<String, Any?>(
+                "product_id" to "P", "location_id" to "Source", "qty" to 15.0, "supply_id" to "S_P_Source",
+            )),
+        )
+        val demand = mapOf<String, Any?>(
+            "demand_id" to "D1", "product_id" to "P", "location_id" to "Dest",
+            "quantity" to 20.0, "request_due_time" to "2024-01-01",
+        )
+        val inventory = mutableListOf(mapOf<String, Any?>(
+            "product_id" to "P", "location_id" to "Source", "qty" to 15.0, "supply_id" to "S_P_Source",
+        ).toMutableMap())
+        val (_, _, tree) = plan(demand, inventory, data, requestTimeDt = null, config = mapOf("purchase_allowed" to false))
+
+        val sourceNode = findNode(tree, "P", "Source")
+        sourceNode shouldNotBe null
+        sourceNode!!["commit_reason"] shouldBe "no_methods"
+        ((sourceNode["committed_qty"] as? Number)?.toDouble() ?: -1.0) shouldBe (15.0 plusOrMinus 1e-6)
+
+        // The move's own achievable is bottlenecked by the source: 15, not 20.
+        ((tree?.get("committed_qty") as? Number)?.toDouble() ?: -1.0) shouldBe (15.0 plusOrMinus 1e-6)
+    }
+
+    test("GC trim of an AND-sibling with its own partial no_methods failure: nested committed_qty must reflect the trim, not the stale first-pass value") {
+        // FG = make(C1, C2), rate 1 each (AND, qty 100). C1 has only 30 real units (no
+        // further method) — the true bottleneck, ratio 0.3. C2 moves from a source with 90
+        // real units (no further method) — first pass achieves 90 (partial no_methods on the
+        // remaining 10). FG's AND-min caps at 30 (C1's ratio), so C2 — having over-achieved
+        // relative to its 30-unit fair share — must be GC-trimmed from 90 down to 30. The
+        // nested "no_methods" demand node inside C2's move subtree must reflect that trim
+        // (committed_qty == 30, with 60 units of real inventory returned), not the stale
+        // first-pass 90.
+        val data = mapOf(
+            "method_make" to listOf(mapOf<String, Any?>(
+                "bom_id" to "B", "product_id" to "FG", "location_id" to "L", "preference" to 1, "lead_time" to 0.0,
+            )),
+            "method_buy" to emptyList<Map<String, Any?>>(),
+            "method_move" to listOf(mapOf<String, Any?>(
+                "product_id" to "C2", "from_location_id" to "Source", "to_location_id" to "L",
+                "preference" to 1, "transit_time" to 0.0,
+            )),
+            "bom" to listOf(
+                mapOf<String, Any?>("bom_id" to "B", "parent_id" to "FG", "child_id" to "C1", "rate" to 1.0, "alt_group" to null),
+                mapOf<String, Any?>("bom_id" to "B", "parent_id" to "FG", "child_id" to "C2", "rate" to 1.0, "alt_group" to null),
+            ),
+            "productlocation" to emptyList<Map<String, Any?>>(),
+            "supply" to listOf(
+                mapOf<String, Any?>("product_id" to "C1", "location_id" to "L", "qty" to 30.0, "supply_id" to "S_C1"),
+                mapOf<String, Any?>("product_id" to "C2", "location_id" to "Source", "qty" to 90.0, "supply_id" to "S_C2_Source"),
+            ),
+        )
+        val demand = mapOf<String, Any?>(
+            "demand_id" to "D1", "product_id" to "FG", "location_id" to "L",
+            "quantity" to 100.0, "request_due_time" to "2024-01-01",
+        )
+        val inventory = mutableListOf(
+            mapOf<String, Any?>("product_id" to "C1", "location_id" to "L", "qty" to 30.0, "supply_id" to "S_C1").toMutableMap(),
+            mapOf<String, Any?>("product_id" to "C2", "location_id" to "Source", "qty" to 90.0, "supply_id" to "S_C2_Source").toMutableMap(),
+        )
+        val (_, _, tree) = plan(demand, inventory, data, requestTimeDt = null, config = mapOf("purchase_allowed" to false))
+
+        // FG's own achievable must be capped at 30 (C1's bottleneck).
+        ((tree?.get("committed_qty") as? Number)?.toDouble() ?: -1.0) shouldBe (30.0 plusOrMinus 1e-6)
+
+        val c2SourceNode = findNode(tree, "C2", "Source")
+        c2SourceNode shouldNotBe null
+        c2SourceNode!!["commit_reason"] shouldBe "no_methods"
+        // This is the crux: after GC trims C2 from 90 down to its 30-unit fair share, the
+        // nested no_methods node must report 30, not the stale first-pass 90.
+        ((c2SourceNode["committed_qty"] as? Number)?.toDouble() ?: -1.0) shouldBe (30.0 plusOrMinus 1e-6)
+
+        // And the excess 60 units must have been returned to real inventory, not lost.
+        val c2Bucket = inventory.first { it["product_id"] == "C2" && it["location_id"] == "Source" }
+        ((c2Bucket["qty"] as? Number)?.toDouble() ?: -1.0) shouldBe (60.0 plusOrMinus 1e-6)
     }
 })
