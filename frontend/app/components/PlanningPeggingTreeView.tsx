@@ -82,7 +82,7 @@ type NodeProps = Omit<PlanningPeggingTreeProps, 'tree'> & {
  *  its committed qty/time. Clicking follows the chain one hop; the user can click again on
  *  the node it lands on to keep walking it back to the root cause. */
 export function DominatorLink({
-  kind, dominator, onClick, contextDemandId,
+  kind, dominator, onClick, contextDemandId, showPrefix = true,
 }: {
   kind: 'quantity' | 'time';
   dominator: DominatorRef;
@@ -92,13 +92,17 @@ export function DominatorLink({
    *  order — when dominator.demand_id is set and differs from this, the true cause isn't the
    *  demand on screen, so it's flagged distinctly rather than looking like a same-tree cause. */
   contextDemandId?: string | null;
+  /** False when the caller already labels the group once (e.g. a table column header reading
+   *  "Qty limited by") — repeating the prefix on every row would be redundant. Defaults to true
+   *  for standalone-list callers, where each line needs its own label. */
+  showPrefix?: boolean;
 }): JSX.Element {
   const prefix = kind === 'quantity' ? 'Qty limited by' : 'Delayed by';
   const color = kind === 'quantity' ? '#facc15' : '#38bdf8';
   const isOtherDemand = dominator.demand_id != null && contextDemandId != null && dominator.demand_id !== contextDemandId;
   const content = (
     <>
-      <span style={{ color: '#71717a' }}>{prefix}:</span> {dominator.label}
+      {showPrefix && <span style={{ color: '#71717a' }}>{prefix}:</span>} {dominator.label}
       {isOtherDemand && (
         <span
           style={{

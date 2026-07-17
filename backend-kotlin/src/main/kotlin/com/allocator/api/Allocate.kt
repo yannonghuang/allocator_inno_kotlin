@@ -1247,6 +1247,57 @@ fun Routing.allocateRoutes() {
         call.respondText(entry, contentType = io.ktor.http.ContentType.Application.Json)
     }
 
+    // ── GET /cases/{case_id}/plan-runs/{run_id}/supply-allocations/{demand_id} ───
+    // Per-lot qty_allocated (the demand's planning-time entitlement — see
+    // extractSupplyAllocations' own doc) and qty_consumed (what it actually drew),
+    // as persisted to plan_supply_allocation at save time. Feeds the pegging panel's
+    // quantity-dominator table so "Qty limited by: <lot>" rows can show how much of
+    // that lot's entitlement this demand was allocated vs. actually used, without
+    // re-deriving either number client-side.
+    get("/cases/{case_id}/plan-runs/{run_id}/supply-allocations/{demand_id}") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val runId = call.parameters["run_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid run_id")
+        val demandId = call.parameters["demand_id"]
+            ?: throw IllegalArgumentException("Invalid demand_id")
+        // plan_supply_allocation carries ONE ROW PER LEAF OCCURRENCE in the pegging tree
+        // (extractSupplyAllocations' walk() appends a row per supply/purchase leaf visited,
+        // never merging same-lot leaves reached via different BOM branches) — so a single lot
+        // drawn from several places in one demand's tree genuinely has several rows here, all
+        // sharing the same qty_allocated (it's a per-lot, not per-leaf, entitlement) but each
+        // carrying only that leaf's own slice of qty_consumed. Must sum qty_consumed and collapse
+        // qty_allocated (identical across a lot's rows) per supply_id — returning raw rows lets
+        // a naive one-row-per-lot consumer silently pick an arbitrary single leaf's value instead
+        // of the lot's true total.
+        val rows = transaction {
+            PlanSupplyAllocations.selectAll().where {
+                (PlanSupplyAllocations.caseId eq caseId) and
+                    (PlanSupplyAllocations.planRunId eq runId) and
+                    (PlanSupplyAllocations.demandId eq demandId)
+            }.map { row ->
+                Triple(row[PlanSupplyAllocations.supplyId], row[PlanSupplyAllocations.qtyAllocated], row[PlanSupplyAllocations.qtyConsumed])
+            }
+        }
+        data class LotTotal(var qtyAllocated: Double?, var qtyConsumed: Double)
+        val bySupply = LinkedHashMap<String, LotTotal>()
+        for ((supplyId, qtyAllocated, qtyConsumed) in rows) {
+            val acc = bySupply.getOrPut(supplyId) { LotTotal(qtyAllocated, 0.0) }
+            acc.qtyConsumed += qtyConsumed
+        }
+        call.respond(buildJsonObject {
+            put("demand_id", demandId)
+            put("allocations", buildJsonArray {
+                for ((supplyId, totals) in bySupply) add(buildJsonObject {
+                    put("supply_id", supplyId)
+                    val qa = totals.qtyAllocated
+                    if (qa != null) put("qty_allocated", qa) else put("qty_allocated", JsonNull)
+                    put("qty_consumed", totals.qtyConsumed)
+                })
+            })
+        })
+    }
+
     // ── DELETE /cases/{case_id}/plan-runs/{run_id} ────────────────────────────
     delete("/cases/{case_id}/plan-runs/{run_id}") {
         val caseId = call.parameters["case_id"]?.toIntOrNull()

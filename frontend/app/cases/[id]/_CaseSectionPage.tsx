@@ -10093,6 +10093,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     : null}
                   planningPegging={planResult?.planning_pegging ?? []}
                   onNavigateToSupply={handleDominatorSupplyClick}
+                  caseId={id}
+                  runId={currentPlanRunId ?? freshPlanRunId ?? null}
                 />
               ) : null;
             })()}
