@@ -922,6 +922,20 @@ export async function getPlanRunPegging(caseId: number, runId: number, demandId:
   return { planning_pegging: [entry] };
 }
 
+/** A single supply lot's allocated/consumed amounts for one demand, as persisted to
+ *  plan_supply_allocation at save time. qty_allocated is the demand's planning-time
+ *  entitlement for that lot (null for non-critical/purchasable lots, which have no
+ *  allocation concept); qty_consumed is what it actually drew. */
+export type SupplyAllocationRow = { supply_id: string; qty_allocated: number | null; qty_consumed: number };
+
+export async function getPlanRunSupplyAllocations(
+  caseId: number, runId: number, demandId: string
+): Promise<{ demand_id: string; allocations: SupplyAllocationRow[] }> {
+  const r = await fetch(`${API}/cases/${caseId}/plan-runs/${runId}/supply-allocations/${encodeURIComponent(demandId)}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
 /** Returns the current unsaved (status="ready") plan run with its in-memory result,
  *  or null if none exists or the server-side memory has expired. */
 export async function getUnsavedPlanRun(caseId: number): Promise<PlanRunFull | null> {

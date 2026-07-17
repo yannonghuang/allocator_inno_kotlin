@@ -791,6 +791,8 @@ function BreakdownSlideIn({
                       tree={woTree}
                       contextDemandId={peggingWo.demandId || null}
                       planningPegging={accordionData?.planningPegging ?? []}
+                      caseId={caseId}
+                      runId={planRunId}
                     />
                   )}
                 </>

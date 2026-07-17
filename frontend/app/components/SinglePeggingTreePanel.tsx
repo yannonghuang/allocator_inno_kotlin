@@ -1,8 +1,10 @@
 'use client';
 
-import React, { startTransition, useState } from 'react';
-import type { DominatorRef, PlanningPeggingEntry, PlanningPeggingNode } from '@/lib/api';
+import React, { startTransition, useEffect, useState } from 'react';
+import type { DominatorRef, PlanningPeggingEntry, PlanningPeggingNode, SupplyAllocationRow } from '@/lib/api';
+import { getPlanRunSupplyAllocations } from '@/lib/api';
 import { DominatorLink, PlanningPeggingTreeView } from './PlanningPeggingTreeView';
+import { qtyFmt } from '@/app/lib/format';
 
 export type SinglePeggingTreePanelProps = {
   tree: PlanningPeggingNode;
@@ -20,6 +22,12 @@ export type SinglePeggingTreePanelProps = {
    *  supply lot by design). Omitted refs (e.g. a cross-demand shared_supply_budget tag with no
    *  single lot) fall back to the same-tree search below instead. */
   onNavigateToSupply?: (supplyId: string) => void;
+  /** case/run identity, needed to fetch each quantity-dominator lot's allocated/consumed
+   *  amounts for the "Qty limited by" table below. When either is omitted (e.g. a work-order
+   *  pegging view spanning more than one demand, where "allocated to the demand" doesn't apply
+   *  to a single demand), the table still renders but its two amount columns show "–". */
+  caseId?: number | null;
+  runId?: number | null;
 };
 
 /** A single demand's or single work order's pegging tree, with search,
@@ -36,6 +44,8 @@ export function SinglePeggingTreePanel({
   workOrderRootQty,
   planningPegging,
   onNavigateToSupply,
+  caseId,
+  runId,
 }: SinglePeggingTreePanelProps): JSX.Element {
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [explanationExpanded, setExplanationExpanded] = useState<Set<string>>(() => new Set());
@@ -43,6 +53,31 @@ export function SinglePeggingTreePanel({
   const [matchPaths, setMatchPaths] = useState<string[]>([]);
   const [matchPath, setMatchPath] = useState<string | null>(null);
   const [matchIndex, setMatchIndex] = useState(0);
+  // supply_id -> {qty_allocated, qty_consumed}, for the quantity-dominator table below —
+  // both sourced from plan_supply_allocation (the DB), the single source of truth for "how
+  // much of this scarce lot's budget did this demand actually draw." Deliberately NOT derived
+  // from this tree: the tree is reconcile()'s output, which caps a leaf's DISPLAYED quantity to
+  // whatever its parent assembly could usefully absorb (an AND-sibling elsewhere in the same
+  // assembly can bottleneck the whole unit) — but that's a reporting-level adjustment, not an
+  // inventory give-back; the physical draw already happened and is what plan_supply_allocation
+  // (and the final inventory ledger) correctly record. For a table about budget usage, the DB's
+  // number — not the tree's "how much ended up usefully deliverable" number — is the right one.
+  // Only fetched when the caller can identify a single owning demand (caseId/runId + a
+  // resolvable demand id) — see the props' own doc for why this degrades gracefully otherwise.
+  const [supplyAllocByLot, setSupplyAllocByLot] = useState<Map<string, SupplyAllocationRow> | null>(null);
+  const allocDemandId = contextDemandId ?? tree.demand_id ?? null;
+  useEffect(() => {
+    setSupplyAllocByLot(null);
+    if (caseId == null || runId == null || !allocDemandId) return;
+    let cancelled = false;
+    getPlanRunSupplyAllocations(caseId, runId, allocDemandId)
+      .then((res) => {
+        if (cancelled) return;
+        setSupplyAllocByLot(new Map(res.allocations.map((a) => [a.supply_id, a])));
+      })
+      .catch(() => { if (!cancelled) setSupplyAllocByLot(null); });
+    return () => { cancelled = true; };
+  }, [caseId, runId, allocDemandId]);
 
   // Locates the node a DominatorRef points at, WITHIN THIS tree — the common case (a BOM
   // sibling, a method alternative, a bottom-up child, all live in the same demand's pegging).
@@ -195,6 +230,20 @@ export function SinglePeggingTreePanel({
   const rootQtyDominators = dedupBySupply(tree.quantity_dominator ?? []);
   const rootTimeDominators = dedupBySupply(tree.time_dominator ?? []);
 
+  // Totals for the qty-dominator table's footer. Both columns are summed only over rows that
+  // actually carry a value — allocated has none for non-critical/purchasable lots (see
+  // qty_allocated's own doc), and both are unavailable until caseId/runId let them be fetched
+  // (see supplyAllocByLot's own doc for why they're DB-sourced) — an entirely-empty column
+  // renders "–" rather than a misleading 0.
+  let totalAllocated: number | null = null;
+  let totalConsumed = 0;
+  for (const d of rootQtyDominators) {
+    const alloc = d.supply_id ? supplyAllocByLot?.get(d.supply_id) : undefined;
+    if (alloc?.qty_allocated != null) totalAllocated = (totalAllocated ?? 0) + alloc.qty_allocated;
+    if (alloc?.qty_consumed != null) totalConsumed += alloc.qty_consumed;
+  }
+  const showAllocCols = caseId != null && runId != null;
+
   return (
     <>
       {(rootQtyDominators.length > 0 || rootTimeDominators.length > 0) && (
@@ -203,9 +252,56 @@ export function SinglePeggingTreePanel({
           border: '1px solid #3d3d40', borderRadius: 4,
           display: 'flex', flexDirection: 'column', gap: 4, fontSize: '0.78rem',
         }}>
-          {rootQtyDominators.map((d, i) => (
-            <DominatorLink key={`rq-${i}`} kind="quantity" dominator={d} onClick={handleDominatorClick} contextDemandId={contextDemandId ?? tree.demand_id} />
-          ))}
+          {rootQtyDominators.length > 0 && (
+            <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+              <thead>
+                <tr>
+                  <th style={{ textAlign: 'left', fontWeight: 400, color: '#71717a', padding: '2px 8px 2px 0' }}>Qty limited by</th>
+                  {showAllocCols && (
+                    <>
+                      <th style={{ textAlign: 'right', fontWeight: 400, color: '#71717a', padding: '2px 8px' }}>Allocated</th>
+                      <th style={{ textAlign: 'right', fontWeight: 400, color: '#71717a', padding: '2px 0' }}>Consumed</th>
+                    </>
+                  )}
+                </tr>
+              </thead>
+              <tbody>
+                {rootQtyDominators.map((d, i) => {
+                  const alloc = d.supply_id ? supplyAllocByLot?.get(d.supply_id) : undefined;
+                  return (
+                    <tr key={`rq-${i}`}>
+                      <td style={{ padding: '2px 8px 2px 0' }}>
+                        <DominatorLink kind="quantity" dominator={d} onClick={handleDominatorClick} contextDemandId={contextDemandId ?? tree.demand_id} showPrefix={false} />
+                      </td>
+                      {showAllocCols && (
+                        <>
+                          <td style={{ textAlign: 'right', padding: '2px 8px', color: '#d4d4d8' }}>
+                            {alloc?.qty_allocated != null ? qtyFmt(alloc.qty_allocated) : '–'}
+                          </td>
+                          <td style={{ textAlign: 'right', padding: '2px 0', color: '#d4d4d8' }}>
+                            {alloc ? qtyFmt(alloc.qty_consumed) : '–'}
+                          </td>
+                        </>
+                      )}
+                    </tr>
+                  );
+                })}
+              </tbody>
+              {showAllocCols && (
+                <tfoot>
+                  <tr style={{ borderTop: '1px solid #3d3d40' }}>
+                    <td style={{ padding: '4px 8px 0 0', color: '#a1a1aa' }}>Total</td>
+                    <td style={{ textAlign: 'right', padding: '4px 8px 0', color: '#fafafa', fontWeight: 600 }}>
+                      {totalAllocated != null ? qtyFmt(totalAllocated) : '–'}
+                    </td>
+                    <td style={{ textAlign: 'right', padding: '4px 0 0', color: '#fafafa', fontWeight: 600 }}>
+                      {qtyFmt(totalConsumed)}
+                    </td>
+                  </tr>
+                </tfoot>
+              )}
+            </table>
+          )}
           {rootTimeDominators.map((d, i) => (
             <DominatorLink key={`rt-${i}`} kind="time" dominator={d} onClick={handleDominatorClick} contextDemandId={contextDemandId ?? tree.demand_id} />
           ))}
