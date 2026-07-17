@@ -869,22 +869,23 @@ class SupplyGuidedPlanningTest : FunSpec({
             preferenceKb = null,
             diamondRecipients = diamondRecipients,
             diamondCriticalEntitlement = diamondCriticalEntitlement,
-            diamondRecipientConsumed = emptyMap(),
+            budget = null,
         )
         caps.keys shouldBe setOf("A1", "A3")
         caps["A1"]?.get("X|L|S1") shouldBe (50.0 plusOrMinus 1e-6)
         caps["A3"]?.get("X|L|S1") shouldBe (50.0 plusOrMinus 1e-6)
     }
 
-    test("computeDiamondCapsForAttempt: candidateWeight bounds this attempt to its proportional share of the pool, not the whole remaining pool") {
-        // Same P/A1/A3/X shape as above, but this call represents one candidate of a 2:1
-        // weighted root split (candidateWeight=0.3333) reached BEFORE anything else has drawn
-        // from the pool — i.e. remainingPool == totalEntitlement == 100. Without the weight
-        // cap this candidate would grab the entire 100 for itself (split 50/50 across A1/A3,
-        // as the unweighted test above shows); with it, it must be held to its own ~33.33
-        // share, leaving ~66.67 genuinely reserved for whichever candidate the waterfall tries
-        // next — this is the fix for the 167:3 (instead of ~2:1) split found on case 173's
-        // 858_F35_2024_07_VIRTUAL / 160-1153.
+    test("computeDiamondCapsForAttempt: reserveForLaterCandidates protects a later slot's own share when nothing has been consumed yet") {
+        // Same P/A1/A3/X shape as above, but this call represents the FIRST candidate of a 2:1
+        // weighted root split (its own weight 1/3, so it must leave the OTHER candidate's 2/3
+        // reserved) reached BEFORE anything else has drawn from the pool — i.e. remainingPool ==
+        // totalEntitlement == 100. Without the reservation this candidate would grab the entire
+        // 100 for itself (split 50/50 across A1/A3, as the unweighted test above shows); with
+        // it, it's held to ~33.33, leaving ~66.67 genuinely reserved for the candidate still to
+        // come — the ORIGINAL half of the fix for the 167:3 (instead of ~2:1) split found on
+        // case 173's 858_F35_2024_07_VIRTUAL / 160-1153. See the next test for the OTHER half:
+        // the later candidate must NOT be similarly capped once it's actually its own turn.
         val data = mkData(
             methodMake = listOf(
                 mapOf<String, Any?>("bom_id" to "BP", "product_id" to "P", "location_id" to "L", "preference" to 1, "lead_time" to 0.0),
@@ -911,11 +912,11 @@ class SupplyGuidedPlanningTest : FunSpec({
             preferenceKb = null,
             diamondRecipients = diamondRecipients,
             diamondCriticalEntitlement = diamondCriticalEntitlement,
-            diamondRecipientConsumed = emptyMap(),
-            candidateWeight = 1.0 / 3.0,
+            budget = null,
+            reserveForLaterCandidates = 2.0 / 3.0,
         )
         caps.keys shouldBe setOf("A1", "A3")
-        // Total reserved across both recipients must equal candidateWeight * totalEntitlement
+        // Total reserved across both recipients must equal (1 - 2/3) * totalEntitlement
         // (~33.33), not totalEntitlement itself (100) — split evenly across the 2 recipients.
         val totalReserved = (caps["A1"]?.get("X|L|S1") ?: 0.0) + (caps["A3"]?.get("X|L|S1") ?: 0.0)
         totalReserved shouldBe (100.0 / 3.0 plusOrMinus 1e-6)
@@ -923,13 +924,18 @@ class SupplyGuidedPlanningTest : FunSpec({
         caps["A3"]?.get("X|L|S1") shouldBe (50.0 / 3.0 plusOrMinus 1e-6)
     }
 
-    test("computeDiamondCapsForAttempt: candidateWeight still respects a pool already partly consumed by an earlier candidate") {
-        // Same shape, but this time diamondRecipientConsumed shows an earlier candidate
-        // already permanently used 90 of the 100 total (a genuine, real draw — not the
-        // abandoned-speculation case reconcileDiamondConsumption fixes). Even at
-        // candidateWeight=1.0 (e.g. the ordinary sequential-waterfall default), this
-        // candidate must be bounded by the smaller of the two caps: what's actually left
-        // (10), not its own full weighted share.
+    test("computeDiamondCapsForAttempt: the LAST candidate gets the full true remaining pool, not just its own nominal share") {
+        // This is the actual fix, verified directly: reproduces case 173's
+        // 858_F35_2024_07_VIRTUAL / 160-1153 shape end to end. A 2:1-weighted root split
+        // (500-6267 weight 2/3, 500-6161 weight 1/3) where the FIRST candidate (500-6267)
+        // already ran and its true consumption left only 7 of the 100-unit pool actually
+        // used — 93 remain, reflected directly in budget (the single source of truth
+        // consumeFromInventory decrements). The SECOND candidate is the LAST in the
+        // waterfall (nothing left to protect), so reserveForLaterCandidates=0 must let it
+        // claim the full 93, not just its own nominal 1/3 (~33.33) share. Before this fix,
+        // the old candidateWeight-based formula capped it at candidateWeight*totalEntitlement
+        // regardless of position, stranding ~60 units even though nothing else needed them
+        // anymore.
         val data = mkData(
             methodMake = listOf(
                 mapOf<String, Any?>("bom_id" to "BP", "product_id" to "P", "location_id" to "L", "preference" to 1, "lead_time" to 0.0),
@@ -943,15 +949,48 @@ class SupplyGuidedPlanningTest : FunSpec({
         val pMethod = getMethods("P", "L", data).first()
         val diamondRecipients = mapOf("X" to setOf("A1"))
         val diamondCriticalEntitlement = mapOf("X" to mapOf("X|L|S1" to 100.0))
-        val consumed = mutableMapOf<String, MutableMap<String, Double>>("A1" to mutableMapOf("X|L|S1" to 90.0))
+        val budget = mapOf("X|L|S1" to 93.0)
         val caps = computeDiamondCapsForAttempt(
             productId = "P", locationId = "L", method = pMethod, altKey = null,
             demand = demand("D1", "P", "L", 100.0), config = null, data = data,
             preferenceKb = null,
             diamondRecipients = diamondRecipients,
             diamondCriticalEntitlement = diamondCriticalEntitlement,
-            diamondRecipientConsumed = consumed,
-            candidateWeight = 1.0,
+            budget = budget,
+            reserveForLaterCandidates = 0.0,
+        )
+        caps["A1"]?.get("X|L|S1") shouldBe (93.0 plusOrMinus 1e-6)
+    }
+
+    test("computeDiamondCapsForAttempt: reserveForLaterCandidates still respects a pool already partly consumed by an earlier candidate") {
+        // Same shape, but this time budget shows an earlier candidate already permanently
+        // used 90 of the 100 total (a genuine, real draw — budget reflects only what
+        // consumeFromInventory actually drew, never a speculative/rolled-back one). Even
+        // with nothing left to reserve (reserveForLaterCandidates=0, e.g. the ordinary
+        // sequential-waterfall default), this candidate must be bounded by what's actually
+        // left (10), not the full original total.
+        val data = mkData(
+            methodMake = listOf(
+                mapOf<String, Any?>("bom_id" to "BP", "product_id" to "P", "location_id" to "L", "preference" to 1, "lead_time" to 0.0),
+            ),
+            bom = listOf(
+                mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "A1", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BA1", "parent_id" to "A1", "child_id" to "V1a", "rate" to 1.0, "alt_group" to "g1a"),
+                mapOf("bom_id" to "BV1a", "parent_id" to "V1a", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+            ),
+        )
+        val pMethod = getMethods("P", "L", data).first()
+        val diamondRecipients = mapOf("X" to setOf("A1"))
+        val diamondCriticalEntitlement = mapOf("X" to mapOf("X|L|S1" to 100.0))
+        val budget = mapOf("X|L|S1" to 10.0)
+        val caps = computeDiamondCapsForAttempt(
+            productId = "P", locationId = "L", method = pMethod, altKey = null,
+            demand = demand("D1", "P", "L", 100.0), config = null, data = data,
+            preferenceKb = null,
+            diamondRecipients = diamondRecipients,
+            diamondCriticalEntitlement = diamondCriticalEntitlement,
+            budget = budget,
+            reserveForLaterCandidates = 0.0,
         )
         caps["A1"]?.get("X|L|S1") shouldBe (10.0 plusOrMinus 1e-6)
     }
@@ -997,7 +1036,7 @@ class SupplyGuidedPlanningTest : FunSpec({
             preferenceKb = null,
             diamondRecipients = diamondRecipients,
             diamondCriticalEntitlement = diamondCriticalEntitlement,
-            diamondRecipientConsumed = emptyMap(),
+            budget = null,
         )
         caps.keys shouldBe setOf("A1", "A3")
     }
