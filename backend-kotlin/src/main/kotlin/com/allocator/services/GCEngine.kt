@@ -122,7 +122,12 @@ private fun gcWoNode(
         }
     }
 
-    return node + ("quantity" to roundQty(effectiveCap)) + ("children" to newChildren)
+    // Keep "quantity_precise" (if present) in sync with the trim — a stale precise
+    // value left over from before this trim would misreport this node's true
+    // post-trim quantity to any caller that (correctly) prefers the precise field,
+    // e.g. gcDemandNode's own woQty read, or extractSupplyAllocations downstream.
+    val precised = if (node.containsKey("quantity_precise")) node + ("quantity_precise" to effectiveCap) else node
+    return precised + ("quantity" to roundQty(effectiveCap)) + ("children" to newChildren)
 }
 
 // ── Demand node ──────────────────────────────────────────────────────────────
@@ -133,7 +138,11 @@ private fun gcDemandNode(
     inventory: MutableList<MutableMap<String, Any?>>,
     budget: MutableMap<String, Double>?,
 ): Map<String, Any?> {
-    val committed = (node["committed_qty"] as? Number)?.toDouble() ?: 0.0
+    // Prefer the unrounded "committed_qty_precise" (see demandNode()'s own doc) — reading
+    // the rounded "committed_qty" here computes excess against an inflated figure (e.g.
+    // 2.0 instead of the true 1.6667), and that inflated excess then gets applied directly
+    // against a child's own unrounded quantity, over-trimming it by the rounding gap.
+    val committed = ((node["committed_qty_precise"] as? Number) ?: (node["committed_qty"] as? Number))?.toDouble() ?: 0.0
     if (committed <= effectiveCap + 1e-9) return node
 
     @Suppress("UNCHECKED_CAST")
@@ -148,7 +157,10 @@ private fun gcDemandNode(
     var excess = committed - effectiveCap
     val newWoChildren = woChildren.reversed().map { wo ->
         if (excess <= 1e-9) return@map wo
-        val woQty = (wo["quantity"] as? Number)?.toDouble() ?: 0.0
+        // Same rounding hazard as `committed` above — a WO's own "quantity" is rounded for
+        // display; use "quantity_precise" so `woQty - trim` lands exactly on effectiveCap
+        // instead of retaining the parent's rounding slack.
+        val woQty = ((wo["quantity_precise"] as? Number) ?: (wo["quantity"] as? Number))?.toDouble() ?: 0.0
         val trim  = min(woQty, excess)
         excess -= trim
         garbageCollectPegging(wo, woQty - trim, inventory, budget)
@@ -164,7 +176,12 @@ private fun gcDemandNode(
     }.reversed()
 
     val newChildren = newSupplyChildren + newWoChildren + otherChildren
-    return node + ("committed_qty" to roundQty(effectiveCap)) + ("children" to newChildren)
+    // Keep "committed_qty_precise" (see demandNode()'s own doc) in sync with the trim —
+    // same rationale as gcWoNode's own "quantity_precise" refresh just above: a stale
+    // precise value from before this trim would misreport this node's true post-trim
+    // commitment to any downstream reader that prefers the precise field.
+    val precised = if (node.containsKey("committed_qty_precise")) node + ("committed_qty_precise" to effectiveCap) else node
+    return precised + ("committed_qty" to roundQty(effectiveCap)) + ("children" to newChildren)
 }
 
 // ── OR-split trimmer (variant-level children inside a WO) ───────────────────

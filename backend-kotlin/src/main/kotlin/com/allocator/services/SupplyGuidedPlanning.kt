@@ -1093,42 +1093,56 @@ private fun allocateSiblingGroup(
  * anywhere in the BOM.
  *
  * For a critical material `c`, walks every BOM parent chain upward from `c` (`data["bom"]`:
- * `child_id -> parent_id`, one row per `(parent_id, bom_id, child_id)` triple, `alt_group`
- * marking OR-alternative membership). At each step from child `x` to parent `p`: if `x`'s own
- * BOM row has a non-null `alt_group`, AND a sibling row under the same `(parent_id, bom_id)`
- * has a *different* non-null `alt_group` (confirming a genuine >=2-member OR-group, not a
- * singleton), `p` is recorded as a recipient for `c` and that chain stops there — the nearest
- * enclosing OR-group's parent is the collapsing point (e.g. `VirtualProduct_280-1159_A1`, not
- * `280-1159` itself, for 160-1153 — matches the original hardcode exactly). Plain AND-mandatory
- * links (`alt_group = NULL`, or a lone alt_group with no sibling) are walked through without
- * recording, continuing the search further up.
+ * `child_id -> parent_id`, one row per `(parent_id, elem_ix, child_id)` triple, `alt_group`
+ * marking OR-alternative membership). Sibling OR-alternatives for the SAME logical slot are
+ * grouped by `(parent_id, elem_ix)`, NOT `(parent_id, bom_id)`: in this dataset, each
+ * alternative typically gets its OWN, per-child `bom_id` (e.g. `BOM_..._A3_504-1319` vs
+ * `..._504-1532`, one row apiece, each its own single-row `method_make`) — `bom_id` never
+ * groups true siblings together. `elem_ix` is the actual "same slot" signal (confirmed against
+ * the live dataset: 160-1153's A3 recipient has 4 alternative children — 504-1319/1532/1548/
+ * 1817 — each its own `bom_id`, but all sharing `elem_ix=1`). Falls back to `bom_id` when
+ * `elem_ix` is absent (older/test fixtures that predate this field, or genuinely don't set it —
+ * those already share one `bom_id` across true siblings, so the fallback preserves them).
+ *
+ * At each step from child `x` to parent `p`: if `x`'s own BOM row has a non-null `alt_group`,
+ * AND a sibling row under the same `(parent_id, elem_ix)` has a *different* non-null
+ * `alt_group` (confirming a genuine >=2-member OR-group, not a singleton), `p` is recorded as a
+ * recipient for `c` and that chain stops there — the nearest enclosing OR-group's parent is the
+ * collapsing point (e.g. `VirtualProduct_280-1159_A1`/`_A3`, not `280-1159` itself, for
+ * 160-1153 — matches the original hardcode exactly). Plain AND-mandatory links (`alt_group =
+ * NULL`, or a lone alt_group with no sibling) are walked through without recording, continuing
+ * the search further up.
  *
  * Pure structural fact: computed once for the whole dataset, no demand or quantity involved —
- * a critical material can have multiple recipients (generalizing the A1/A3 pair to N), and one
- * recipient can serve multiple critical materials. The quantity split among recipients found
- * here happens live, per waterfall-candidate attempt, in `PlanningEngine.kt`'s
- * `computeDiamondCapsForAttempt` — see that function's own doc for why a static, upfront split
- * (this function's predecessor) is wrong for recipients that are mutually exclusive with each
- * other (gated behind a shared ancestor OR-choice), as opposed to always-simultaneously-visited
- * AND-mandatory siblings like A1/A3.
+ * a critical material can have multiple recipients (generalizing the A1/A3 pair to N — the live
+ * dataset has ~29 for 160-1153 alone, most far less consequential than A1/A3 since they're
+ * rarely on a currently-reachable demand path), and one recipient can serve multiple critical
+ * materials. The quantity split among recipients found here happens live, per
+ * waterfall-candidate attempt, in `PlanningEngine.kt`'s `computeDiamondCapsForAttempt` — see
+ * that function's own doc for why a static, upfront split (this function's predecessor) is
+ * wrong for recipients that are mutually exclusive with each other (gated behind a shared
+ * ancestor OR-choice), as opposed to always-simultaneously-visited AND-mandatory siblings like
+ * A1/A3.
  */
 internal fun findOrGroupRecipients(
     criticalPids: Set<String>,
     data: Map<String, List<Map<String, Any?>>>,
 ): Map<String, Set<String>> {
     val bomRows = data["bom"] ?: emptyList()
-    // child_id -> list of (parent_id, bom_id, alt_group)
+    // child_id -> list of (parent_id, slotKey, alt_group)
     val parentsByChild = mutableMapOf<String, MutableList<Triple<String, String, String?>>>()
-    // (parent_id, bom_id) -> set of distinct non-null alt_group values among its children
-    val altGroupsByParentBom = mutableMapOf<Pair<String, String>, MutableSet<String>>()
+    // (parent_id, slotKey) -> set of distinct non-null alt_group values among its children
+    val altGroupsByParentSlot = mutableMapOf<Pair<String, String>, MutableSet<String>>()
     for (row in bomRows) {
         val parentId = (row["parent_id"] as? String)?.trim() ?: continue
         val childId = (row["child_id"] as? String)?.trim() ?: continue
         val bomId = (row["bom_id"] as? String)?.trim() ?: continue
         if (parentId.isBlank() || childId.isBlank() || bomId.isBlank()) continue
         val altGroup = (row["alt_group"] as? String)?.trim()?.takeIf { it.isNotBlank() }
-        parentsByChild.getOrPut(childId) { mutableListOf() }.add(Triple(parentId, bomId, altGroup))
-        if (altGroup != null) altGroupsByParentBom.getOrPut(parentId to bomId) { mutableSetOf() }.add(altGroup)
+        // "Same slot" grouping key: elem_ix when present, else fall back to bom_id.
+        val slotKey = (row["elem_ix"] as? Number)?.toString() ?: bomId
+        parentsByChild.getOrPut(childId) { mutableListOf() }.add(Triple(parentId, slotKey, altGroup))
+        if (altGroup != null) altGroupsByParentSlot.getOrPut(parentId to slotKey) { mutableSetOf() }.add(altGroup)
     }
 
     val result = mutableMapOf<String, MutableSet<String>>()
@@ -1136,8 +1150,8 @@ internal fun findOrGroupRecipients(
         val recipients = mutableSetOf<String>()
         fun walk(childId: String, visited: MutableSet<String>) {
             if (!visited.add(childId)) return
-            for ((parentId, bomId, altGroup) in parentsByChild[childId] ?: emptyList()) {
-                val siblingAltGroups = altGroupsByParentBom[parentId to bomId] ?: emptySet()
+            for ((parentId, slotKey, altGroup) in parentsByChild[childId] ?: emptyList()) {
+                val siblingAltGroups = altGroupsByParentSlot[parentId to slotKey] ?: emptySet()
                 val isRealOrGroup = altGroup != null && siblingAltGroups.size >= 2
                 if (isRealOrGroup) {
                     recipients.add(parentId)
