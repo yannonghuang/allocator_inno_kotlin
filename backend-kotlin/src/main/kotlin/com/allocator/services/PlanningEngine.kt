@@ -3621,10 +3621,19 @@ internal fun reconcile(
             // scale-down that under-commits what the child actually delivered).
             // "Least dominates, and that's the dominator for the WHOLE AND-group": the winning
             // (least-achieving) sibling's dominator isn't just this WO's own — it's WHY every
-            // other sibling got scaled down too, even the ones that fully achieved their own
-            // ask. Copy it onto them directly (unless a sibling already carries its own, more
-            // specific dominator from being independently constrained) so a sibling scaled down
-            // by scaleSubtree below isn't left looking unexplained.
+            // OTHER GENUINELY-SCALED-DOWN sibling got reduced too. Copy it onto those siblings
+            // directly (unless a sibling already carries its own, more specific dominator from
+            // being independently constrained) so a sibling scaled down by scaleSubtree below
+            // isn't left looking unexplained. Gated on `wasScaled` (not just "carries no
+            // dominator yet") — a sibling whose own rate-scaled target already matched what it
+            // asked for (the `else asked` branch below, no scaleSubtree applied) was NEVER
+            // actually constrained by this AND-group's bottleneck, even if its own `third` value
+            // happened to tie the group minimum (ties are the norm here, not genuine shared
+            // causation — see `minVal`'s own comment above). Blindly tagging it anyway falsely
+            // blames a fully-successful, often materially-unrelated sibling for a shortfall that
+            // was never its own — confirmed live on case 173's 20018963_20, where several
+            // directly-inventory-backed siblings (zero shortfall, single supply-leaf child) all
+            // inherited a sibling's 160-1153 dominator this way.
             val groupDominatorJson: List<Map<String, Any?>>? =
                 existingDominator ?: qtyDominatorRefs.takeIf { it.isNotEmpty() }?.toJsonList()
             var askIdx = 0
@@ -3632,14 +3641,23 @@ internal fun reconcile(
                 val cm = ch as? Map<String, Any?> ?: return@map ch
                 if (cm["type"] != "demand") return@map cm
                 val (asked, r, _) = firstAsk[askIdx]; askIdx++
-                val trimmed = if (rel == "or") {
-                    asked  // keep each variant's reconciled commitment as-is
+                val trimmed: Map<String, Any?>
+                val wasScaled: Boolean
+                if (rel == "or") {
+                    trimmed = asked  // keep each variant's reconciled commitment as-is
+                    wasScaled = false
                 } else {
                     val askedCommitted = (asked["committed_qty"] as? Number)?.toDouble() ?: (want * r)
                     val targetT = supply * r
-                    if (askedCommitted > 1e-9 && targetT < askedCommitted - 1e-9) scaleSubtree(asked, targetT / askedCommitted) else asked
+                    if (askedCommitted > 1e-9 && targetT < askedCommitted - 1e-9) {
+                        trimmed = scaleSubtree(asked, targetT / askedCommitted)
+                        wasScaled = true
+                    } else {
+                        trimmed = asked
+                        wasScaled = false
+                    }
                 }
-                if (rel != "or" && groupDominatorJson != null && trimmed["quantity_dominator"] == null)
+                if (rel != "or" && wasScaled && groupDominatorJson != null && trimmed["quantity_dominator"] == null)
                     trimmed + ("quantity_dominator" to groupDominatorJson)
                 else trimmed
             }
