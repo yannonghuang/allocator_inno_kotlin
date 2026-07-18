@@ -5122,6 +5122,18 @@ internal fun extractSupplyAllocations(
         val lid = (s["location_id"] as? String)?.trim() ?: return@mapNotNull null
         sid to (pid to lid)
     }.toMap()
+    // perLotBudgets[demandId][lotKey] is ONE pool shared by the whole demand at that lot — not
+    // per-consuming-leaf. A demand can have several separate result rows against the SAME lot
+    // (e.g. two distinct AND-sibling branches that each independently, legitimately draw from
+    // the same shared critical material — confirmed live on case 173's 688_F35_2024_07_VIRTUAL,
+    // where AND-siblings VirtualProduct_280-1159_A1 and _A3 both draw 160-1153 from the same
+    // lot). Attaching the full pool value to EVERY such row double-(or N-times-)counts the same
+    // entitlement in any aggregate sum over qty_allocated (R13's own check, persisted totals) —
+    // qty_consumed is correctly per-row (each branch's own real, distinct draw), only
+    // qty_allocated needs deduping. Track which (demandId, lotKey) pairs have already been
+    // assigned the pool and zero out qty_allocated on subsequent rows for the same pair — the
+    // pool is still fully represented exactly once in the aggregate.
+    val assignedPool = mutableSetOf<Pair<String, String>>()
     for (rec in result) {
         val sid = rec["supply_id"] as? String
         val isCritical = criticalSupplyIds == null || (sid != null && sid in criticalSupplyIds)
@@ -5131,7 +5143,8 @@ internal fun extractSupplyAllocations(
             null  // non-critical (purchasable): FIFO consumption, no allocation concept
         } else if (pidLid != null && did != null && perLotBudgets != null) {
             val lotKey = "${pidLid.first}|${pidLid.second}|$sid"
-            perLotBudgets[did]?.get(lotKey) ?: 0.0
+            val poolKey = did to lotKey
+            if (assignedPool.add(poolKey)) perLotBudgets[did]?.get(lotKey) ?: 0.0 else 0.0
         } else {
             0.0
         }
