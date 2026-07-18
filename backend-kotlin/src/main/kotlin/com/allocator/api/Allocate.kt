@@ -1686,18 +1686,21 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
         } ?: emptyList()
         val inventoryInitial = parseInvJson(inputs.invInitialJson)
         val inventoryLeftover = parseInvJson(inputs.invLeftoverJson)
-        // R7e: load persisted supply allocations from plan_supply_allocation table.
-        val supplyAllocations: List<Map<String, Any?>> = if (inventoryInitial.isNotEmpty()) {
-            transaction {
-                PlanSupplyAllocations.selectAll()
-                    .where { PlanSupplyAllocations.planRunId eq runId }
-                    .map { row -> mapOf(
-                        "supply_id"    to row[PlanSupplyAllocations.supplyId],
-                        "demand_id"    to row[PlanSupplyAllocations.demandId],
-                        "qty_consumed" to row[PlanSupplyAllocations.qtyConsumed],
-                    )}
-            }
-        } else emptyList()
+        // Load persisted supply allocations from plan_supply_allocation table. Used by R7e
+        // (gated there on inventoryInitial/inventoryLeftover both being non-empty) and R13
+        // (dominator budget exhaustion, which needs qty_allocated regardless of whether
+        // inventory snapshots were persisted) — loaded unconditionally so R13 isn't silently
+        // skipped on older/historical runs that never persisted inventory snapshots.
+        val supplyAllocations: List<Map<String, Any?>> = transaction {
+            PlanSupplyAllocations.selectAll()
+                .where { PlanSupplyAllocations.planRunId eq runId }
+                .map { row -> mapOf(
+                    "supply_id"     to row[PlanSupplyAllocations.supplyId],
+                    "demand_id"     to row[PlanSupplyAllocations.demandId],
+                    "qty_consumed"  to row[PlanSupplyAllocations.qtyConsumed],
+                    "qty_allocated" to row[PlanSupplyAllocations.qtyAllocated],
+                )}
+        }
         val soundnessConfig = com.allocator.services.SoundnessConfig(deepCheck = deepCheck)
         // If pegging save is still in-flight, use the in-memory transit trees directly.
         // This avoids competing heap pressure from JSON re-parsing while serialization runs
@@ -1834,6 +1837,15 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
         }
         putJsonArray("resource_overload_violations") {
             for (v in report.resourceOverloadViolations) addJsonObject {
+                put("rule", v.rule)
+                put("node_path", v.nodePath)
+                put("message", v.message)
+                put("expected", anyToJson(v.expected))
+                put("actual", anyToJson(v.actual))
+            }
+        }
+        putJsonArray("dominator_budget_violations") {
+            for (v in report.dominatorBudgetViolations) addJsonObject {
                 put("rule", v.rule)
                 put("node_path", v.nodePath)
                 put("message", v.message)
