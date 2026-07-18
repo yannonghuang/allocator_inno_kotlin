@@ -830,4 +830,123 @@ class SoundnessCheckerTest : FunSpec({
         )
         report.crossDemandViolations.none { it.rule == "R7c_consolidated_overconsumption" } shouldBe true
     }
+
+    // ── R13: dominator budget exhaustion ──────────────────────────────────────
+
+    /** quantity_dominator entry builder — matches DominatorRef.toMap()'s shape. */
+    fun dominatorRef(pid: String, lid: String, supplyId: String) = mapOf(
+        "kind" to "bom_child",
+        "product_id" to pid,
+        "location_id" to lid,
+        "supply_id" to supplyId,
+        "label" to "$pid@$lid ($supplyId)",
+    )
+
+    fun supplyAlloc(demandId: String, supplyId: String, qtyConsumed: Double, qtyAllocated: Double?) = mapOf(
+        "demand_id" to demandId,
+        "supply_id" to supplyId,
+        "qty_consumed" to qtyConsumed,
+        "qty_allocated" to qtyAllocated,
+    )
+
+    test("R13 fires: material named as dominator but its allocated budget for the demand is unused") {
+        // Mirrors the case 173 858_F35_2024_08_VIRTUAL bug: a root-split candidate's own
+        // budget for a shared critical material went entirely unused while its sibling
+        // over-consumed it, yet the unused candidate's tree still named the material as
+        // its own dominator.
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 0.0).toMutableMap().also {
+            it["quantity_dominator"] = listOf(dominatorRef("CRIT", "L1", "S1"))
+        }
+        val data = mapOf<String, List<Map<String, Any?>>>(
+            "supply" to listOf(supply("S1", "CRIT", "L1", 100.0)),
+        )
+        // D1 was allocated 50 units of CRIT|L1 but consumed none — the dominator claim
+        // ("CRIT blocked me") doesn't match the demand's own actual draw.
+        val supplyAllocations = listOf(supplyAlloc("D1", "S1", qtyConsumed = 0.0, qtyAllocated = 50.0))
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", tree)),
+            demands = demands, data = data,
+            supplyAllocations = supplyAllocations,
+        )
+        val v = report.dominatorBudgetViolations.first { it.rule == "R13_dominator_budget_exhausted" }
+        v.expected shouldBe 50.0
+        v.actual shouldBe 0.0
+        v.message stringShouldContain "CRIT"
+        report.overallSound shouldBe false
+    }
+
+    test("R13 sound: material named as dominator and its allocated budget is fully consumed") {
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0).toMutableMap().also {
+            it["quantity_dominator"] = listOf(dominatorRef("CRIT", "L1", "S1"))
+        }
+        val data = mapOf<String, List<Map<String, Any?>>>(
+            "supply" to listOf(supply("S1", "CRIT", "L1", 100.0)),
+        )
+        val supplyAllocations = listOf(supplyAlloc("D1", "S1", qtyConsumed = 50.0, qtyAllocated = 50.0))
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", tree)),
+            demands = demands, data = data,
+            supplyAllocations = supplyAllocations,
+        )
+        report.dominatorBudgetViolations shouldHaveSize 0
+    }
+
+    test("R13 sound: budget spread across multiple lots of the same material is aggregated before checking") {
+        // D1's entitlement for CRIT spans two lots; individually each looks under-consumed,
+        // but summed across the whole material the budget is fully used — matches how a
+        // demand's entitlement for a critical material spans multiple lots in practice.
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 10.0).toMutableMap().also {
+            it["quantity_dominator"] = listOf(dominatorRef("CRIT", "L1", "S1"), dominatorRef("CRIT", "L1", "S2"))
+        }
+        val data = mapOf<String, List<Map<String, Any?>>>(
+            "supply" to listOf(supply("S1", "CRIT", "L1", 100.0), supply("S2", "CRIT", "L1", 100.0)),
+        )
+        val supplyAllocations = listOf(
+            supplyAlloc("D1", "S1", qtyConsumed = 60.0, qtyAllocated = 30.0),
+            supplyAlloc("D1", "S2", qtyConsumed = 0.0, qtyAllocated = 30.0),
+        )
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", tree)),
+            demands = demands, data = data,
+            supplyAllocations = supplyAllocations,
+        )
+        report.dominatorBudgetViolations shouldHaveSize 0
+    }
+
+    test("R13 doesn't apply: dominator names a non-critical material (qty_allocated is null)") {
+        // A purchasable/non-critical material is FIFO-consumed with no allocation concept —
+        // qty_allocated is null, so it never carries an entitlement to check against.
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 0.0).toMutableMap().also {
+            it["quantity_dominator"] = listOf(dominatorRef("PURCH", "L1", "S1"))
+        }
+        val data = mapOf<String, List<Map<String, Any?>>>(
+            "supply" to listOf(supply("S1", "PURCH", "L1", 100.0)),
+        )
+        val supplyAllocations = listOf(supplyAlloc("D1", "S1", qtyConsumed = 0.0, qtyAllocated = null))
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", tree)),
+            demands = demands, data = data,
+            supplyAllocations = supplyAllocations,
+        )
+        report.dominatorBudgetViolations shouldHaveSize 0
+    }
+
+    test("R13 skipped when supplyAllocations is empty") {
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 0.0).toMutableMap().also {
+            it["quantity_dominator"] = listOf(dominatorRef("CRIT", "L1", "S1"))
+        }
+        val data = mapOf<String, List<Map<String, Any?>>>(
+            "supply" to listOf(supply("S1", "CRIT", "L1", 100.0)),
+        )
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", tree)),
+            demands = demands, data = data,
+        )
+        report.dominatorBudgetViolations shouldHaveSize 0
+    }
 })

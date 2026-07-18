@@ -60,6 +60,10 @@ import kotlin.math.abs
  *      min(lot_count, parallelCap) × resource_rate, where parallelCap comes from
  *      the operation's BOR (floor(size/rate)). Gates overallSound.
  *      Skipped when work_orders is not provided.
+ *   R13 dominator budget exhaustion — if a critical material is named as a demand's own
+ *      quantity_dominator, that demand's allocated budget for the SAME material (summed
+ *      across every lot it touches) must actually be used up. Gates overallSound.
+ *      Skipped when supply_allocations (with qty_allocated) is not provided.
  *
  * The checker is a pure function — it neither mutates inputs nor consults the
  * database. Callers feed it the persisted plan-run state plus the case data.
@@ -158,6 +162,12 @@ data class SoundnessReport(
      * Empty when work_orders was not passed (cannot compute load without WO data).
      */
     val resourceOverloadViolations: List<Violation> = emptyList(),
+    /**
+     * R13 dominator budget exhaustion violations: a critical material named as a demand's
+     * own quantity_dominator whose allocated budget for that demand was NOT fully consumed.
+     * Empty when supplyAllocations was not provided.
+     */
+    val dominatorBudgetViolations: List<Violation> = emptyList(),
 )
 
 /**
@@ -544,18 +554,32 @@ fun checkRunSoundness(
         if (workOrders.isNotEmpty()) verifyResourceOverload(workOrders, data)
         else emptyList()
 
+    // R13: dominator budget exhaustion — only when supplyAllocations (with qty_allocated)
+    // is available.
+    val dominatorBudgetViolations: List<Violation> = if (supplyAllocations.isNotEmpty()) {
+        val dominatedMaterials = mutableSetOf<Pair<String, String>>()
+        for (entry in planningPegging) {
+            val demandId = entry["demand_id"] as? String
+            val tree = entry["tree"] as? Map<String, Any?> ?: continue
+            collectDominatedMaterials(tree, demandId, dominatedMaterials)
+        }
+        verifyDominatorBudgetExhausted(dominatedMaterials, supplyAllocations, supplies, config.tolerance)
+    } else emptyList()
+
     val soundCount = demandReports.count { it.sound }
     // R7f (component conservation) and R7g (WO conservation) are efficiency signals:
     // they fire at max_iterations=1 by design (budget leakage is expected and reclaimed
     // naturally at higher iter counts). They do NOT gate overallSound so that sound plans
     // can still be promoted to KB even when single-pass allocation leaves some slack.
-    // R10/R11/R12 gate overallSound: scheduling errors are planning bugs.
+    // R10/R11/R12/R13 gate overallSound: scheduling errors and dominator-budget mismatches
+    // are planning bugs.
     val overallSound = soundCount == demandReports.size &&
         crossViolations.isEmpty() &&
         conservationViolations.isEmpty() &&
         inventoryPriorityViolations.isEmpty() &&
         woGidOrphanViolations.isEmpty() &&
-        resourceOverloadViolations.isEmpty()
+        resourceOverloadViolations.isEmpty() &&
+        dominatorBudgetViolations.isEmpty()
 
     return SoundnessReport(
         overallSound = overallSound,
@@ -570,6 +594,7 @@ fun checkRunSoundness(
         inventoryPriorityViolations = inventoryPriorityViolations,
         woGidOrphanViolations = woGidOrphanViolations,
         resourceOverloadViolations = resourceOverloadViolations,
+        dominatorBudgetViolations = dominatorBudgetViolations,
     )
 }
 
@@ -1312,6 +1337,113 @@ private class WalkContext(
 }
 
 /**
+ * R13 helper — collects every (demandId, productId) pair where productId is named as a
+ * "bom_child" [DominatorRef] (a real, physical critical-material shortage — not a
+ * "sibling_wo"/"method_alternative"/"wave_peer" contention tag, which don't claim a
+ * specific material was exhausted) anywhere within demandId's own subtree of [tree].
+ * Shared between [checkRunSoundness]'s batch walk and [checkRunSoundnessStreaming]'s
+ * per-entry accumulation so both paths compute R13 identically.
+ */
+@Suppress("UNCHECKED_CAST")
+internal fun collectDominatedMaterials(
+    tree: Map<String, Any?>,
+    demandId: String?,
+    into: MutableSet<Pair<String, String>>,
+    depth: Int = 0,
+) {
+    if (depth > 60) return
+    val nextDemandId = if (tree["type"] == "demand") (tree["demand_id"] as? String ?: demandId) else demandId
+    val dominator = tree["quantity_dominator"] as? List<Map<String, Any?>>
+    if (nextDemandId != null && dominator != null) {
+        for (ref in dominator) {
+            if (ref["kind"] != "bom_child") continue
+            val pid = (ref["product_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: continue
+            into.add(nextDemandId to pid)
+        }
+    }
+    for (c in (tree["children"] as? List<Map<String, Any?>>) ?: emptyList()) collectDominatedMaterials(c, nextDemandId, into, depth + 1)
+}
+
+/**
+ * R13 — dominator budget exhaustion.
+ *
+ * If a critical material is named as a demand's own quantity_dominator — the "why" behind
+ * a shortfall, surfaced in the pegging tree's `quantity_dominator` field — that demand's
+ * OWN allocated budget for that material must actually be used up. A dominator that blames
+ * a shortage the demand never drew down to is not trustworthy: either enforcement is
+ * wrongly leaving real, entitled supply unconsumed, or the dominator tag itself is stale.
+ * This is exactly the class of bug fix/quantity-dominator-no-supply-method fixed on case
+ * 173's 858_F35_2024_08_VIRTUAL: a root-split candidate's own budget for a shared critical
+ * material (160-1153) went entirely unused while a sibling candidate silently over-consumed
+ * it — the unused candidate's tree still named 160-1153 as its dominator, which this rule
+ * would have caught directly (allocated 208.94, consumed 0).
+ *
+ * Scoped to lots the demand has an actual budgeted entitlement for — [qty_allocated] is
+ * null for non-critical (purchasable) lots, which are FIFO-consumed with no allocation
+ * concept and so are silently skipped (a purchasable material is never "used up" in this
+ * sense — see reconcile()'s own purchase-elasticity rule). Aggregated at the PRODUCT level
+ * (summed across every lot of that material the demand touches), matching the claim's own
+ * granularity — a demand's entitlement for a critical material spans multiple lots, and the
+ * dominator names the material, not necessarily every one of its lots individually.
+ *
+ * @param dominatedPairs (demandId, productId) pairs from [collectDominatedMaterials], across
+ *        every pegging entry in the run.
+ * @param supplyAllocations the run's per-(demand, supply_id) `qty_consumed`/`qty_allocated`
+ *        records — see [extractSupplyAllocations]'s own doc for why `qty_allocated` is the
+ *        actual enforced cap, not a re-derived estimate.
+ * @param supplies case supply rows, for supply_id → product_id resolution.
+ */
+internal fun verifyDominatorBudgetExhausted(
+    dominatedPairs: Set<Pair<String, String>>,
+    supplyAllocations: List<Map<String, Any?>>,
+    supplies: List<Map<String, Any?>>,
+    tolerance: Double = 1e-6,
+): List<Violation> {
+    if (dominatedPairs.isEmpty() || supplyAllocations.isEmpty()) return emptyList()
+
+    val productBySupplyId: Map<String, String> = supplies.mapNotNull { s ->
+        val sid = (s["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        val pid = (s["product_id"] as? String)?.trim() ?: return@mapNotNull null
+        sid to pid
+    }.toMap()
+
+    class Totals { var allocated = 0.0; var consumed = 0.0 }
+    val totals = mutableMapOf<Pair<String, String>, Totals>()
+    for (a in supplyAllocations) {
+        val demandId = a["demand_id"] as? String ?: continue
+        val supplyId = a["supply_id"] as? String ?: continue
+        // null qty_allocated = non-critical/purchasable lot (no allocation concept) —
+        // excluded from totals entirely, so a dominator naming only such a material never
+        // matches an entry below and the rule correctly doesn't apply to it.
+        val qtyAllocated = (a["qty_allocated"] as? Number)?.toDouble() ?: continue
+        val productId = productBySupplyId[supplyId] ?: continue
+        val qtyConsumed = (a["qty_consumed"] as? Number)?.toDouble() ?: 0.0
+        val t = totals.getOrPut(demandId to productId) { Totals() }
+        t.allocated += qtyAllocated
+        t.consumed += qtyConsumed
+    }
+
+    val violations = mutableListOf<Violation>()
+    for (pair in dominatedPairs) {
+        val t = totals[pair] ?: continue
+        val gap = t.allocated - t.consumed
+        val tol = maxOf(tolerance, 1e-9 * t.allocated)
+        if (gap > tol) {
+            val (demandId, productId) = pair
+            violations.add(Violation(
+                rule = "R13_dominator_budget_exhausted",
+                nodePath = "demand:$demandId",
+                message = "$productId is named as demand $demandId's own quantity_dominator, but its allocated " +
+                    "budget (%.4f) isn't used up (consumed %.4f, gap %.4f).".format(t.allocated, t.consumed, gap),
+                expected = t.allocated,
+                actual = t.consumed,
+            ))
+        }
+    }
+    return violations
+}
+
+/**
  * R11 — wo_group_id orphan check.
  *
  * Collects every wo_group_id referenced by a non-failed WO node across all
@@ -1578,6 +1710,7 @@ internal fun checkRunSoundnessStreaming(
     var anyPeggingEntry = false
 
     val orphanGids = mutableSetOf<String>()                            // R11
+    val dominatedMaterials = mutableSetOf<Pair<String, String>>()      // R13
 
     // ── Single streaming pass ─────────────────────────────────────────────────
     forEachEntry { entry ->
@@ -1623,6 +1756,11 @@ internal fun checkRunSoundnessStreaming(
         if (!seenCanonicalDemands.add(did)) return@forEachEntry  // duplicate — skip; R0 fires below
 
         val demandRow = demandById[did] ?: return@forEachEntry
+
+        // R13: collect this demand's own dominated materials (canonical trees only —
+        // quantity_dominator is a per-demand explainability field, not meaningful on the
+        // consolidated/passthrough views built by a later, separate pass).
+        if (supplyAllocations.isNotEmpty()) collectDominatedMaterials(tree, did, dominatedMaterials)
 
         val ctx = WalkContext(
             demandId   = did,
@@ -1749,13 +1887,20 @@ internal fun checkRunSoundnessStreaming(
         if (workOrders.isNotEmpty()) verifyResourceOverload(workOrders, data)
         else emptyList()
 
+    // R13: dominator budget exhaustion — from accumulated (demandId, productId) pairs.
+    val dominatorBudgetViolations: List<Violation> =
+        if (supplyAllocations.isNotEmpty())
+            verifyDominatorBudgetExhausted(dominatedMaterials, supplyAllocations, supplies, config.tolerance)
+        else emptyList()
+
     val soundCount = demandReports.count { it.sound }
     val overallSound = soundCount == demandReports.size &&
         crossViolations.isEmpty() &&
         conservationViolations.isEmpty() &&
         inventoryPriorityViolations.isEmpty() &&
         woGidOrphanViolations.isEmpty() &&
-        resourceOverloadViolations.isEmpty()
+        resourceOverloadViolations.isEmpty() &&
+        dominatorBudgetViolations.isEmpty()
 
     return SoundnessReport(
         overallSound  = overallSound,
@@ -1770,5 +1915,6 @@ internal fun checkRunSoundnessStreaming(
         inventoryPriorityViolations     = inventoryPriorityViolations,
         woGidOrphanViolations           = woGidOrphanViolations,
         resourceOverloadViolations      = resourceOverloadViolations,
+        dominatorBudgetViolations       = dominatorBudgetViolations,
     )
 }
