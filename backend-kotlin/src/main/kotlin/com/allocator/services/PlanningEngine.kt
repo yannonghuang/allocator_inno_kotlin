@@ -1181,6 +1181,11 @@ internal fun computeDiamondCapsForAttempt(
             // share of the ORIGINAL total. A candidate that runs after everyone else (reserve=0)
             // gets the full true remaining pool; an earlier candidate still gets exactly its own
             // nominal share when nothing has been consumed yet (remainingPool == totalQty).
+            // reserveForLaterCandidates is applied here regardless of whether remainingPool came
+            // from budget or the totalQty fallback above — see plan()'s own diamondReserveFraction
+            // doc for why this (a fraction subtracted from the live pool) is what makes the
+            // reservation survive nested recursion, unlike an earlier design that instead scaled
+            // totalQty itself (silently ignored once budget had a live entry for the lot).
             val remaining = (remainingPool - reserveForLaterCandidates * totalQty).coerceAtLeast(0.0)
             val share = remaining / n
             for (recipient in found) {
@@ -1591,6 +1596,16 @@ internal fun planMethodSlot(
     /** See [plan]'s doc — this demand's raw (unsplit) entitlement per critical material that
      *  has known [diamondRecipients], from [buildDiamondCriticalEntitlement]. */
     diamondCriticalEntitlement: Map<String, Map<String, Double>>? = null,
+    /** See [plan]'s doc — fraction of a diamond critical material's pool reserved for sibling
+     *  root-split candidates not yet processed; simply threaded through to every recursive
+     *  [plan] call this slot makes for its own BOM children, unchanged. */
+    diamondReserveFraction: Double = 0.0,
+    /** See [plan]'s doc — this root-split candidate's own hard per-lot ceiling; threaded through
+     *  unchanged to every recursive [plan] call this slot makes for its own BOM children. */
+    intraBudget: Map<String, Double>? = null,
+    /** See [plan]'s doc — [demandConsumed] snapshot taken at this root-split candidate's own
+     *  start; threaded through unchanged alongside [intraBudget]. */
+    intraBudgetBaseline: Map<String, Double>? = null,
 ): MethodSlotResult {
     val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
     val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
@@ -1742,7 +1757,7 @@ internal fun planMethodSlot(
         // nested fanout further down was actually tagged with.
         val isAndGroupChild = activeChildren.size > 1
         val cBranchLineage = if (isAndGroupChild) extendLineage(branchLineage, cPid, cLid) else branchLineage
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, andSiblingCaps = andSiblingCaps, branchLotCap = cBranchLotCap, branchConsumed = cBranchConsumed, branchLineage = cBranchLineage, andSiblingDominators = andSiblingDominators, branchDominator = cBranchDominator, diamondRecipientCaps = diamondRecipientCaps, diamondRecipients = diamondRecipients, diamondCriticalEntitlement = diamondCriticalEntitlement)
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, andSiblingCaps = andSiblingCaps, branchLotCap = cBranchLotCap, branchConsumed = cBranchConsumed, branchLineage = cBranchLineage, andSiblingDominators = andSiblingDominators, branchDominator = cBranchDominator, diamondRecipientCaps = diamondRecipientCaps, diamondRecipients = diamondRecipients, diamondCriticalEntitlement = diamondCriticalEntitlement, diamondReserveFraction = diamondReserveFraction, intraBudget = intraBudget, intraBudgetBaseline = intraBudgetBaseline)
         // Prefer the unrounded "quantity_precise" (see committedRow's doc) over the rounded
         // "quantity" — this feeds the AND-min ratio (computeRawAchievable) below, and reading
         // the rounded value here would let a genuinely-achieved fractional child (e.g. 0.4999
@@ -2380,6 +2395,54 @@ fun plan(
      *  would be wrong — only the live, per-attempt computation knows which is actually being
      *  visited right now. */
     diamondCriticalEntitlement: Map<String, Map<String, Double>>? = null,
+    /** Fraction (0..1) of a diamond critical material's pool that's reserved for OTHER,
+     *  sibling root-split candidates not yet processed — set fresh at the ROOT for whichever
+     *  candidate slot is currently running (from `rootSplitWeights.drop(slotIdx+1).sum()`),
+     *  then INHERITED UNCHANGED through every non-root recursive [plan] call below it, so a
+     *  [computeDiamondCapsForAttempt] call several BOM levels deep still knows to protect a
+     *  sibling root-split candidate's share. Without this, a nested call — which is never
+     *  itself `isRoot`, so it always computes its OWN local reserve as 0 — sees the full,
+     *  unreserved remaining pool and can consume a sibling's entire protected share before
+     *  that sibling ever gets its turn (observed live on case 173's 858_F35_2024_08_VIRTUAL:
+     *  candidate 500-6267, entitled to only 2/3 of the demand's 160-1153 budget, consumed the
+     *  full 100% through a nested waterfall several levels below its own top-level method,
+     *  leaving nothing for candidate 500-6161's reserved 1/3 turn). Deliberately a
+     *  plain fraction threaded through the recursion — NOT baked into a scaled copy of
+     *  [diamondCriticalEntitlement] (an earlier design) — because [computeDiamondCapsForAttempt]
+     *  reads its own `remainingPool` from `budget` first (the single source of truth for what's
+     *  actually been consumed), falling back to the entitlement total only when `budget` has no
+     *  entry yet; once `budget` is populated (which it always is, for every lot a demand
+     *  touches), a scaled entitlement is silently ignored. Applying the reservation as a
+     *  fraction subtracted from `remainingPool` — instead of shrinking the pool's own baseline
+     *  — works correctly regardless of which source `remainingPool` came from. */
+    diamondReserveFraction: Double = 0.0,
+    /** A root-split candidate's own hard, per-lot ceiling on every critical material with known
+     *  [diamondCriticalEntitlement] — set ONCE, at THIS demand's root waterfall loop, for
+     *  whichever candidate slot is currently running (`diamondCriticalEntitlement[...] ×
+     *  rootSplitWeights[slotIdx]`), then INHERITED UNCHANGED through every non-root recursive
+     *  [plan] call below it — including calls where a NESTED [diamondRecipientCaps] match
+     *  narrows [branchLotCap] further for one specific recipient. This is a deliberately
+     *  SEPARATE, coarser mechanism from [diamondReserveFraction]/[diamondRecipientCaps]: those
+     *  only bind AT a discovered recipient's own position, so a sibling subtree that reaches the
+     *  same critical material WITHOUT itself being a registered recipient (e.g. an AND-mandatory
+     *  sibling of an OR-group ancestor, never itself an alternative) inherits no narrowing at
+     *  all and can silently draw a second, un-split share on top of what the discovered
+     *  recipients already correctly split between themselves (observed live on case 173's
+     *  858_F35_2024_08_VIRTUAL: 500-6267's own 2/3 share was correctly split between
+     *  VirtualProduct_280-1159_A1/_A3, but a sibling, 280-1210-02, reached the same 160-1153
+     *  through a path that was never itself a registered recipient, and consumed a second,
+     *  full, un-split 2/3 share on top — draining the whole demand's entitlement instead of
+     *  just 500-6267's own share). Enforced directly against [demandConsumed] (the single,
+     *  permanent, demand-wide tracker — see its own doc) rather than the branch-scoped
+     *  [branchConsumed], specifically BECAUSE it must catch consumption regardless of which
+     *  internal branch/recipient/path within this root candidate's subtree did the drawing. */
+    intraBudget: Map<String, Double>? = null,
+    /** [demandConsumed] snapshot taken at [intraBudget]'s own root-split candidate slot start —
+     *  paired with it so the live enforcement measures "consumed BY THIS SLOT since it began"
+     *  (`demandConsumed.now - intraBudgetBaseline`), not total demand-wide consumption (which
+     *  would double-count whatever an EARLIER root-split slot already consumed and had
+     *  protected via its own, now-expired [diamondReserveFraction]). */
+    intraBudgetBaseline: Map<String, Double>? = null,
 ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
 
     val productId = (demand["product_id"] as? String)?.trim() ?: ""
@@ -2418,6 +2481,9 @@ fun plan(
             diamondRecipientCaps = diamondRecipientCaps,
             diamondRecipients = diamondRecipients,
             diamondCriticalEntitlement = diamondCriticalEntitlement,
+            diamondReserveFraction = diamondReserveFraction,
+            intraBudget = intraBudget,
+            intraBudgetBaseline = intraBudgetBaseline,
         )
         // No cross-demand contention tag for quantity: critical materials are fully resolved by
         // the supply-guided pre-processor (buildSupplyAllocation's perLotBudgets) before this
@@ -2568,7 +2634,18 @@ fun plan(
             val branchConsumedSoFar = branchConsumed?.get(k) ?: 0.0
             val boundedForBranch = if (branchCap != null)
                 min(bounded, (branchCap - branchConsumedSoFar).coerceAtLeast(0.0)) else bounded
-            sid to boundedForBranch   // supplyId → remaining
+            // Fourth, coarsest cap: this root-split candidate's own hard ceiling — see [plan]'s
+            // own [intraBudget] doc. Measured against demandConsumed (permanent, demand-wide)
+            // rather than branchConsumedSoFar (branch-scoped, reset at every discovered-recipient
+            // boundary) specifically so it catches consumption from ANY path within this
+            // candidate's subtree, including one that never itself matched a registered diamond
+            // recipient (branchCap above would be null there, giving it no narrowing at all).
+            val intraCap = intraBudget?.get(k)
+            val consumedByThisSlot = if (intraCap != null)
+                (demandConsumed?.get(k) ?: 0.0) - (intraBudgetBaseline?.get(k) ?: 0.0) else 0.0
+            val boundedForIntra = if (intraCap != null)
+                min(boundedForBranch, (intraCap - consumedByThisSlot).coerceAtLeast(0.0)) else boundedForBranch
+            sid to boundedForIntra   // supplyId → remaining
         }
     }
     // Aggregate cap: explicit key, or sum of per-lot entries.
@@ -2755,7 +2832,29 @@ fun plan(
             }
         }
         demandFulfilledList.add(committedRow(demandNetQty, reqTimeStr, "no_methods"))
-        val baseNode = demandNode(peggingChildren, reqTimeStr, "no_methods", committedQty = taken)
+        // If this demand ever had its OWN entitlement (initialBudget) for this exact
+        // position, list every one of its own lots as the dominator — the same per-lot
+        // shape a genuine draw's own dominator uses (each with a real supply_id, so the
+        // UI's allocated/consumed table renders them like any other) — rather than a
+        // single synthetic ref with no supply_id (rawDominatorRefs' generic "(no supply
+        // method)" fallback, which the UI can't show a breakdown for). "No methods" is
+        // permanently, structurally true for a raw+critical material — it's the SAME fact
+        // regardless of whether real supply was fully spent by another branch of this same
+        // demand moments ago, or never existed at all; showing this demand's own lots with
+        // their real allocated/consumed figures lets the table itself answer which case
+        // this is, instead of a label ("no supply method") that reads as the latter even
+        // when it's actually the former.
+        val entitledLots = initialBudget?.keys
+            ?.filter { it.startsWith("$componentKey|") }
+            ?.mapNotNull { lotKey ->
+                val sid = lotKey.removePrefix("$componentKey|").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                DominatorRef(kind = "bom_child", productId = productId, locationId = locationId,
+                    supplyId = sid, label = "$productId@$locationId ($sid)")
+            }
+            ?.dedupBySupply()
+            ?: emptyList()
+        val baseNode = demandNode(peggingChildren, reqTimeStr, "no_methods", committedQty = taken,
+            quantityDominator = entitledLots)
         return Triple(demandFulfilledList, emptyList(), baseNode + ("failure_explanation" to explanation))
     }
 
@@ -2960,6 +3059,43 @@ fun plan(
         // short simply leaves more for the next candidate's own later call here — the waterfall
         // loop's own iteration IS the "rerun with leftover quantity"; no separate rerun trigger
         // needed.
+        // Reserve only what root-split slots STILL TO COME need protecting — this candidate is
+        // free to absorb whatever earlier slots' true consumption left behind, down to (but not
+        // below) the reservation for whoever's still ahead in the queue. The last slot has
+        // nothing left to protect (reserve sums to 0) and gets the full true remaining pool.
+        // At the ROOT with root-split active, this is freshly computed per slot; everywhere else
+        // (ordinary sequential waterfall, or any non-root nested call) rootSplitWeights is null,
+        // so INHERIT whatever reserve fraction an enclosing root-split slot already established
+        // (diamondReserveFraction, this call's own parameter — 0.0 unless we're nested inside
+        // one). Without this inheritance, a nested computeDiamondCapsForAttempt call several BOM
+        // levels below a root-split candidate's own top-level method always computes reserve=0
+        // (it's never itself isRoot), so it sees the full, un-reserved remaining pool and can
+        // consume a sibling candidate's entire protected share before that sibling gets its own
+        // turn — observed live on case 173's 858_F35_2024_08_VIRTUAL: candidate 500-6267,
+        // entitled to only 2/3 of the demand's 160-1153 budget, consumed the full 100% through
+        // a nested waterfall reaching 280-1159_A1/_A3 several levels below its own top-level
+        // method, leaving nothing for candidate 500-6161's reserved 1/3 turn.
+        val effectiveReserve = rootSplitWeights?.drop(slotIdx + 1)?.sum() ?: diamondReserveFraction
+        // Hard, per-lot ceiling for THIS root-split candidate's own ENTIRE subtree — see
+        // [plan]'s own [intraBudget] doc for why this is a separate, coarser mechanism from
+        // [diamondReserveFraction]/[diamondRecipientCaps]: those only bind at a discovered
+        // recipient's own position, so a sibling subtree that reaches the same critical material
+        // WITHOUT itself being a registered recipient inherits no narrowing at all. Set fresh,
+        // ONCE, only at the actual root-split point (rootSplitWeights != null) — every other
+        // (non-root-split) call inherits whatever its own parent already established, unchanged.
+        val slotIntraBudget: Map<String, Double>? = if (rootSplitWeights != null) {
+            val weight = rootSplitWeights.getOrNull(slotIdx) ?: (1.0 / cap)
+            diamondCriticalEntitlement?.values?.flatMap { it.entries }
+                ?.associate { it.key to it.value * weight }
+                ?.takeIf { it.isNotEmpty() }
+        } else intraBudget
+        // Snapshot of demandConsumed taken at THIS slot's own start — paired with
+        // slotIntraBudget so enforcement measures "consumed by this slot since it began," not
+        // total demand-wide consumption (which would double-count an earlier slot's own,
+        // already-protected draws). Only re-snapshotted at the actual root-split point, for the
+        // same reason as slotIntraBudget above.
+        val slotIntraBudgetBaseline: Map<String, Double>? =
+            if (rootSplitWeights != null) demandConsumed?.toMap() else intraBudgetBaseline
         val slotDiamondCaps = if (diamondRecipients.isNullOrEmpty() || diamondCriticalEntitlement.isNullOrEmpty()) {
             diamondRecipientCaps
         } else {
@@ -2971,43 +3107,9 @@ fun plan(
                 diamondRecipients = diamondRecipients,
                 diamondCriticalEntitlement = diamondCriticalEntitlement,
                 budget = budget,
-                // Reserve only what root-split slots STILL TO COME need protecting — this
-                // candidate is free to absorb whatever earlier slots' true consumption left
-                // behind, down to (but not below) the reservation for whoever's still ahead in
-                // the queue. The last slot has nothing left to protect (reserve sums to 0) and
-                // gets the full true remaining pool. Ordinary sequential-waterfall candidates
-                // (no root split) keep today's behavior — reserve 0, draw up to the whole pool.
-                reserveForLaterCandidates = rootSplitWeights?.drop(slotIdx + 1)?.sum() ?: 0.0,
+                reserveForLaterCandidates = effectiveReserve,
             )
         }
-        // computeDiamondCapsForAttempt only reserves the OTHER root-split candidates' share at
-        // THIS exact call site — a direct child of THIS demand/method that happens to be a known
-        // diamond recipient. But plan()'s own recursive descent into an intermediate assembly
-        // can reach the SAME diamond material through ANOTHER waterfall/candidate loop several
-        // levels deeper, which calls computeDiamondCapsForAttempt again on ITS OWN (rootSplitWeights
-        // == null, since it isn't the root) — with no idea a sibling root-split candidate still
-        // needs its share protected, that nested call sees the full, un-reserved remaining pool.
-        // Observed live on case 173's 858_F35_2024_07_VIRTUAL: 500-6267's own top-level diamond
-        // cap correctly capped it at ~56 for 160-1153, but a deeper waterfall level inside its
-        // own subtree reached the same recipient again and granted it the FULL ~169 remaining —
-        // completely bypassing the top-level reservation before 500-6161 ever got its turn.
-        // Fix: scale down the ENTITLEMENT itself (not just this one call's cap) by the same
-        // reservation fraction, and thread that scoped-down copy into planMethodSlot instead of
-        // the raw, unscoped one — every nested computeDiamondCapsForAttempt call within THIS
-        // attempt's own subtree reads totalQty from whatever diamondCriticalEntitlement it was
-        // handed, so scaling it here is inherited automatically at any depth, with no need to
-        // thread a brand-new parameter through the whole recursion. The math matches exactly:
-        // scaledTotal*(1) - consumedSoFar == totalQty*(1-reserve) - consumedSoFar, the same
-        // remaining-pool this call's own reserveForLaterCandidates produces for direct children.
-        val slotDiamondCriticalEntitlement: Map<String, Map<String, Double>>? =
-            if (diamondCriticalEntitlement.isNullOrEmpty()) diamondCriticalEntitlement
-            else {
-                val reserve = rootSplitWeights?.drop(slotIdx + 1)?.sum() ?: 0.0
-                if (reserve <= 1e-9) diamondCriticalEntitlement
-                else diamondCriticalEntitlement.mapValues { (_, lotMap) ->
-                    lotMap.mapValues { (_, totalQty) -> totalQty * (1.0 - reserve) }
-                }
-            }
         val attempt = planMethodSlot(
             m = candidate.method, slotQty = slotQty,
             productId = productId, locationId = locationId,
@@ -3034,7 +3136,10 @@ fun plan(
             branchDominator = slotBranchDominator,
             diamondRecipientCaps = slotDiamondCaps,
             diamondRecipients = diamondRecipients,
-            diamondCriticalEntitlement = slotDiamondCriticalEntitlement,
+            diamondCriticalEntitlement = diamondCriticalEntitlement,
+            diamondReserveFraction = effectiveReserve,
+            intraBudget = slotIntraBudget,
+            intraBudgetBaseline = slotIntraBudgetBaseline,
         )
         // Intra-demand sibling contention (step c), applied directly here rather than relying
         // solely on plan()'s nodeCap-gated tagging site — same rationale as the AND-loop's
@@ -3090,6 +3195,26 @@ fun plan(
         combinedWos.addAll(attempt.wos)
         totalAchievable += attempt.achievableQty
         residual -= attempt.achievableQty
+        // In the ORDINARY sequential waterfall (rootSplitWeights == null — a later candidate
+        // is only tried because an earlier one was blocked or fell short, i.e. a genuine
+        // retry/fallback, not a simultaneously-active parallel candidate), a candidate that
+        // achieves something SUPERSEDES every earlier candidate's own dominator: an earlier
+        // attempt's "why" only still explains the FINAL residual if nothing later ever got a
+        // chance to use its slack. Once a later candidate contributes, whatever's still
+        // missing is explained by THIS candidate's own shortfall (if any) — not by a now-moot
+        // earlier attempt. Without this, a wholly-superseded blocked candidate's dominator
+        // survived verbatim even when the genuinely successful later candidate — with no
+        // shortfall of its own (e.g. its own ask was already pre-scaled by nodeQtyCaps before
+        // ever reaching here) — delivered the entire committed total, leaving a misleading
+        // "why" pointing at a material that was never actually short on the winning path.
+        // Observed live on case 173's 858_F35_2024_08_VIRTUAL: an early attempt right at the
+        // request date failed entirely ("160-1153 no supply method"), a later retry then
+        // delivered the full committed 533/800 with no shortfall of its own — yet the demand
+        // root kept showing the first attempt's stale 160-1153 dominator. Root-split candidates
+        // (rootSplitWeights != null) are simultaneously active, not sequential retries — each
+        // one's own shortfall remains a genuine, independent contributor, so the existing
+        // union/append behavior there is unchanged.
+        if (rootSplitWeights == null) qtyDominatorForDemand = emptyList()
         // This candidate delivered less than what it was asked (slotQty — either its
         // rootSplitWeights share or the ordinary sequential residual, whichever this loop
         // actually computed above) — one of the (possibly several) alternatives behind the

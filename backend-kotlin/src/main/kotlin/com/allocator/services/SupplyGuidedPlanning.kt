@@ -1133,6 +1133,9 @@ internal fun findOrGroupRecipients(
     val parentsByChild = mutableMapOf<String, MutableList<Triple<String, String, String?>>>()
     // (parent_id, slotKey) -> set of distinct non-null alt_group values among its children
     val altGroupsByParentSlot = mutableMapOf<Pair<String, String>, MutableSet<String>>()
+    // parent_id -> list of child_id, the downward mirror of parentsByChild — only needed for
+    // the ancestor-pruning pass below (isDescendantOf).
+    val childrenByParent = mutableMapOf<String, MutableList<String>>()
     for (row in bomRows) {
         val parentId = (row["parent_id"] as? String)?.trim() ?: continue
         val childId = (row["child_id"] as? String)?.trim() ?: continue
@@ -1143,6 +1146,25 @@ internal fun findOrGroupRecipients(
         val slotKey = (row["elem_ix"] as? Number)?.toString() ?: bomId
         parentsByChild.getOrPut(childId) { mutableListOf() }.add(Triple(parentId, slotKey, altGroup))
         if (altGroup != null) altGroupsByParentSlot.getOrPut(parentId to slotKey) { mutableSetOf() }.add(altGroup)
+        childrenByParent.getOrPut(parentId) { mutableListOf() }.add(childId)
+    }
+
+    // Is `descendant` reachable downward from `ancestor` via the BOM? Used only to prune
+    // recipients below — cheap enough as a one-time, whole-dataset pre-pass (not on the live
+    // commit path).
+    fun isDescendantOf(ancestor: String, descendant: String): Boolean {
+        val seen = mutableSetOf<String>()
+        val stack = ArrayDeque<String>()
+        stack.add(ancestor)
+        while (stack.isNotEmpty()) {
+            val cur = stack.removeLast()
+            if (!seen.add(cur)) continue
+            for (child in childrenByParent[cur] ?: emptyList()) {
+                if (child == descendant) return true
+                stack.add(child)
+            }
+        }
+        return false
     }
 
     val result = mutableMapOf<String, MutableSet<String>>()
@@ -1161,7 +1183,24 @@ internal fun findOrGroupRecipients(
             }
         }
         walk(c, mutableSetOf())
-        if (recipients.isNotEmpty()) result[c] = recipients
+        // A recipient whose own subtree structurally contains ANOTHER, more specific recipient
+        // for the same critical material is a coarser, outer OR-group junction — one of its
+        // alternatives (e.g. 280-1210-02) may never itself reach a real inner OR-group, while a
+        // SIBLING alternative (e.g. 280-1159) does, deeper down (its own A1/A3 split). Treating
+        // the outer junction as an independent recipient wrongly grants it a share of the SAME
+        // pool the inner recipients already split correctly between themselves — a candidate
+        // reaching the critical material via the non-diamond sibling then inherits that
+        // un-narrowed outer share whole, on top of what the inner split already allows (observed
+        // live on case 173's 858_F35_2024_08_VIRTUAL: VirtualProduct_280-1314_A2 registered
+        // alongside its own descendants VirtualProduct_280-1159_A1/_A3, letting a demand's
+        // 280-1210-02 branch draw a full second, un-split share of 160-1153 after A1+A3 already
+        // consumed their correctly-split one). Keep only the innermost (most specific)
+        // recipients — drop any recipient that is a BOM ancestor of another recipient in the
+        // same set.
+        val innermost = recipients.filterNotTo(mutableSetOf()) { outer ->
+            recipients.any { inner -> inner != outer && isDescendantOf(outer, inner) }
+        }
+        if (innermost.isNotEmpty()) result[c] = innermost
     }
     return result
 }
