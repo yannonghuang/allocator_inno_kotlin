@@ -949,4 +949,23 @@ class SoundnessCheckerTest : FunSpec({
         )
         report.dominatorBudgetViolations shouldHaveSize 0
     }
+
+    test("R13 violation is reflected on the demand's own entry in report.demands, not just the top-level list") {
+        val demands = listOf(demand("D1", "FG", "L1", qty = 10.0))
+        val tree = demandNode("D1", "FG", "L1", qty = 10.0, committedQty = 0.0).toMutableMap().also {
+            it["quantity_dominator"] = listOf(dominatorRef("CRIT", "L1", "S1"))
+        }
+        val data = mapOf<String, List<Map<String, Any?>>>(
+            "supply" to listOf(supply("S1", "CRIT", "L1", 100.0)),
+        )
+        val supplyAllocations = listOf(supplyAlloc("D1", "S1", qtyConsumed = 0.0, qtyAllocated = 50.0))
+        val report = checkRunSoundness(
+            planningPegging = listOf(pegEntry("D1", tree)),
+            demands = demands, data = data,
+            supplyAllocations = supplyAllocations,
+        )
+        val d1 = report.demands.first { it.demandId == "D1" }
+        d1.sound shouldBe false
+        d1.violations.map { it.rule } shouldContain "R13_dominator_budget_exhausted"
+    }
 })

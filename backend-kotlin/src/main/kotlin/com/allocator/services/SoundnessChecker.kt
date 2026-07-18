@@ -565,6 +565,7 @@ fun checkRunSoundness(
         }
         verifyDominatorBudgetExhausted(dominatedMaterials, supplyAllocations, supplies, config.tolerance)
     } else emptyList()
+    applyDominatorBudgetViolations(demandReports, dominatorBudgetViolations)
 
     val soundCount = demandReports.count { it.sound }
     // R7f (component conservation) and R7g (WO conservation) are efficiency signals:
@@ -1444,6 +1445,29 @@ internal fun verifyDominatorBudgetExhausted(
 }
 
 /**
+ * R13 helper — back-patches [demandReports] with the dominator-budget violations found for
+ * each demand. Without this, a demand whose own `quantity_dominator` names a critical material
+ * with an unexhausted budget still gates `overallSound` (via [dominatorBudgetViolations] at the
+ * report level) but shows `sound: true` with an empty `violations` list in its OWN entry —
+ * [dominatorBudgetViolations] is computed after the per-demand walk that builds [demandReports],
+ * as a separate cross-cutting pass (same as R10/R11/R12), so it was never folded back in. Matches
+ * each violation's `nodePath` ("demand:$demandId", set in [verifyDominatorBudgetExhausted]) against
+ * [DemandSoundness.demandId] to attach it to the right entry.
+ */
+internal fun applyDominatorBudgetViolations(
+    demandReports: MutableList<DemandSoundness>,
+    dominatorBudgetViolations: List<Violation>,
+) {
+    if (dominatorBudgetViolations.isEmpty()) return
+    val byDemandId = dominatorBudgetViolations.groupBy { it.nodePath.removePrefix("demand:") }
+    for (i in demandReports.indices) {
+        val dr = demandReports[i]
+        val extra = byDemandId[dr.demandId] ?: continue
+        demandReports[i] = dr.copy(sound = false, violations = dr.violations + extra)
+    }
+}
+
+/**
  * R11 — wo_group_id orphan check.
  *
  * Collects every wo_group_id referenced by a non-failed WO node across all
@@ -1892,6 +1916,7 @@ internal fun checkRunSoundnessStreaming(
         if (supplyAllocations.isNotEmpty())
             verifyDominatorBudgetExhausted(dominatedMaterials, supplyAllocations, supplies, config.tolerance)
         else emptyList()
+    applyDominatorBudgetViolations(demandReports, dominatorBudgetViolations)
 
     val soundCount = demandReports.count { it.sound }
     val overallSound = soundCount == demandReports.size &&
