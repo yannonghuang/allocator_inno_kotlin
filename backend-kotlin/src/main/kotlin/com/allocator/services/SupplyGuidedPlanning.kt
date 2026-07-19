@@ -1050,9 +1050,18 @@ private data class SiblingGroupAllocation(
  * [allocate], the same fair-split primitive already used cross-demand, one level deeper.
  *
  * Step (c): when the group's total ask exceeds [availableAgg] — the common case, proportional
- * scaling across ALL branches rather than a single identifiable "worst" one — every constrained
- * branch is tagged with the SAME [rawSupplyLotRefs] resolution for `sk`, copied rather than
- * independently recomputed (see [SiblingGroupAllocation]'s own doc for why copy, not compose).
+ * scaling across ALL branches rather than a single identifiable "worst" one — every branch that
+ * GENUINELY NEEDS some of `sk` (its own alternative capacity, [achievableExcludingMaterial], falls
+ * short of its own request) is tagged with the SAME [rawSupplyLotRefs] resolution for `sk`, copied
+ * rather than independently recomputed (see [SiblingGroupAllocation]'s own doc for why copy, not
+ * compose). A branch with a perfectly good alternative that never actually touches `sk` — e.g. a
+ * VirtualProduct OR-group with several make-method candidates, only one of which reaches `sk` —
+ * is NOT blamed just because it structurally COULD reach `sk` and the group overall is scarce;
+ * confirmed live on case 173's 20018963_20/688_F35_2024_07_VIRTUAL, where
+ * VirtualProduct_280-1159_A1 (fully satisfiable via 504-1532, unrelated to the contended
+ * 160-1153) was tagged with sibling A3's 160-1153 dominator this way — [branchDominator] carries
+ * this tag with priority over a branch's own, correctly-resolved sketch-phase dominator (see
+ * PlanningEngine.kt's `plan()`), so a wrong guess here silently overrides a right answer downstream.
  */
 private fun allocateSiblingGroup(
     sk: SupplyKey,
@@ -1060,6 +1069,10 @@ private fun allocateSiblingGroup(
     availableAgg: Double,
     allocationMode: String,
     demandBudgets: Map<String, Double>,
+    demand: Map<String, Any?>,
+    config: Map<String, Any?>?,
+    data: Map<String, List<Map<String, Any?>>>,
+    preferenceKb: PreferenceKb?,
 ): SiblingGroupAllocation {
     val candidates = byBranch.map { (branch, reqs) ->
         AllocationCandidate(demandId = branch, neededQty = reqs.sumOf { it.requestedQty }, priority = 0)
@@ -1077,7 +1090,22 @@ private fun allocateSiblingGroup(
     val totalRequested = candidates.sumOf { it.neededQty }
     val dominatorByBranch = if (totalRequested > availableAgg + 1e-9) {
         val sharedDominator = rawSupplyLotRefs(sk.productId, sk.locationId, demandBudgets)
-        byBranch.keys.associateWith { branch ->
+        // ONE shared, mutable snapshot across all N candidates in iteration order — each
+        // candidate's probe destructively consumes from it (via the real
+        // consumeFromInventory), so a later candidate's probe never double-credits the same
+        // physical lot an earlier one already claimed — see
+        // computeDiamondCapsForAttempt's identical two-recipient version for the full
+        // rationale.
+        val stockSnapshot = copyInventory(data["supply"] ?: emptyList())
+        val genuinelyConstrained = candidates.mapNotNull { c ->
+            val branch = c.demandId as? BranchKey ?: return@mapNotNull null
+            val stock = achievableExcludingMaterial(
+                branch.productId, branch.locationId, c.neededQty, sk.productId,
+                demand, config, data, preferenceKb, stockSnapshot,
+            )
+            if (stock < c.neededQty - 1e-6) branch else null
+        }.toSet()
+        genuinelyConstrained.associateWith { branch ->
             val siblingLabels = byBranch.keys.filter { it != branch }.map { it.label() }
             sharedDominator.map { it.copy(competingDemandIds = siblingLabels) }
         }
@@ -1228,7 +1256,16 @@ internal fun buildDiamondCriticalEntitlement(
         val demandBudgets = allocation.perLotBudgets[demandId] ?: continue
         val perMaterial = mutableMapOf<String, Map<String, Double>>()
         for (criticalPid in diamondRecipients.keys) {
-            val lotEntries = demandBudgets.entries.filter { it.key.startsWith("$criticalPid|") }
+            // allocateSuppliesPerLot writes BOTH a per-lot key ("pid|lid|supplyId") AND an
+            // aggregate key ("pid|lid", the sum of all lots) into the SAME demandBudgets map —
+            // the aggregate key also starts with "$criticalPid|", so a plain prefix filter
+            // matches both and summing every match double-counts (7 real lots + 1 aggregate
+            // holding their sum = exactly 2x). Require >= 2 pipes (the supply_id component) to
+            // keep only genuine per-lot entries — same disambiguation PlanningEngine.kt's own
+            // criticalSupplyIds computation already uses for the identical key-shape ambiguity.
+            val lotEntries = demandBudgets.entries.filter {
+                it.key.startsWith("$criticalPid|") && it.key.count { c -> c == '|' } >= 2
+            }
             if (lotEntries.isNotEmpty()) perMaterial[criticalPid] = lotEntries.associate { it.key to it.value }
         }
         if (perMaterial.isNotEmpty()) result[demandId] = perMaterial
@@ -1297,7 +1334,7 @@ internal fun computeAndSiblingCaps(
             if (availableAgg <= 1e-9) continue
 
             val (shares, dominatorByBranch) =
-                allocateSiblingGroup(sk, byBranch, availableAgg, allocation.sgConfig.allocationMode, demandBudgets)  // (b) + (c)
+                allocateSiblingGroup(sk, byBranch, availableAgg, allocation.sgConfig.allocationMode, demandBudgets, demand, config, data, preferenceKb)  // (b) + (c)
 
             // Known v1 limitation: projects one flat ratio onto every one of the demand's
             // existing per-lot entries for this supply key — doesn't re-check per-lot date
