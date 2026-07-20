@@ -1353,6 +1353,19 @@ internal fun collectDominatedMaterials(
     depth: Int = 0,
 ) {
     if (depth > 60) return
+    // An abandoned waterfall candidate (max_methods > 1 trying several alternatives, one of
+    // which is ultimately discarded) is never "the demand's own story" — it contributed
+    // nothing to the final result. Its own sub-children can still look "genuinely short" by
+    // the committed_qty < quantity check below (they were asked for this candidate's own,
+    // never-realized full quantity and correctly found nothing), but that shortfall belongs to
+    // a discarded alternative, not a live claim about why the demand itself fell short. Skip
+    // the whole subtree outright. Concretely fixes case 173's 888_F37_2024_08_VIRTUAL-class
+    // violations under max_methods=3: a second, wholly-abandoned top-level candidate
+    // (work_order failed=true) still had its own T1-T4-style AND-siblings correctly detected
+    // as "genuinely short" against that candidate's own 2110-unit ask, incorrectly surfacing
+    // 283-0110-27/29/31/33 as live dominators for a demand whose actual, kept result never
+    // touched that candidate at all.
+    if (tree["type"] == "work_order" && tree["failed"] == true) return
     val nextDemandId = if (tree["type"] == "demand") (tree["demand_id"] as? String ?: demandId) else demandId
     // Only a genuinely-short "demand" node (its own committed_qty < quantity, a real gap
     // between what THIS node was asked and what it actually delivered) represents a live claim
