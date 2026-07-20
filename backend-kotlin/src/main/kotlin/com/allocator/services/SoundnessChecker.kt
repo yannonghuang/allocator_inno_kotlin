@@ -1354,6 +1354,27 @@ internal fun collectDominatedMaterials(
 ) {
     if (depth > 60) return
     val nextDemandId = if (tree["type"] == "demand") (tree["demand_id"] as? String ?: demandId) else demandId
+    // Only a genuinely-short "demand" node (its own committed_qty < quantity, a real gap
+    // between what THIS node was asked and what it actually delivered) represents a live claim
+    // about a shortfall. A fully-satisfied node's own quantity_dominator, if present, is stale
+    // drill-down detail preserved from an earlier, differently-scaled exploration pass (see
+    // plan()'s/planMethodSlot's first-pass-preservation doc) — a record of what once bottlenecked
+    // this node's OWN sub-exploration, not a claim that it's currently constraining anything.
+    // Gating both collection AND further recursion on this check naturally follows only the
+    // tied-min AND-sibling / under-delivering OR-candidate chain all the way down: a fully-
+    // satisfied sibling can never be "the" bottleneck at its own parent's level, so it — and
+    // everything beneath it — is correctly excluded, without needing to separately model AND vs
+    // OR composition here. Concretely fixes case 173's 888_F37_2024_09_VIRTUAL-class violations:
+    // 280-1786 (a fully-satisfied AND-sibling, 889.50 asked = 889.50 delivered) was carrying a
+    // stale dominator naming 283-0226, and its own children T1-T4 each independently carried
+    // their OWN stale dominators (283-0110-27/29/31/33) from THEIR OWN earlier, larger-ask
+    // exploration — none of which any longer explain any real shortfall once the tree converged.
+    if (tree["type"] == "demand") {
+        val quantity = (tree["quantity"] as? Number)?.toDouble()
+        val committed = (tree["committed_qty"] as? Number)?.toDouble()
+        val genuinelyShort = quantity != null && committed != null && quantity > committed + 1e-6
+        if (!genuinelyShort) return
+    }
     val dominator = tree["quantity_dominator"] as? List<Map<String, Any?>>
     if (nextDemandId != null && dominator != null) {
         for (ref in dominator) {

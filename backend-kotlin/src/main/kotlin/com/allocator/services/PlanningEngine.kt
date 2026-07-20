@@ -2885,6 +2885,37 @@ fun plan(
         inventory, productId, locationId, quantity, preferDemandId, null, perLotBudget,
     )
     val taken = consumedBuckets.sumOf { it.qty }
+    // Real, physical lots THIS node actually drew from — the informative, "688_M51-style"
+    // dominator when this draw still falls short of what was asked. Without this, a demand
+    // that partially satisfies its own ask from a real (but shared/exhausted) supply lot, then
+    // falls through to a method-waterfall whose only candidate is a structurally-impossible
+    // dead end (e.g. a move whose source location can never have supply), ends up with THAT
+    // dead end's placeholder ("no supply method") as its sole dominator — dedupBySupply()'s own
+    // "a real lot beats a placeholder" rule never gets a chance to apply, because these real
+    // lots were never added to the union it operates on. See "283-0226@1000 (no supply
+    // method)" replacing "283-0226@2000 (283-0226_2000_9075)" on case 173's F37/M51-family
+    // demands for the live bug this fixes.
+    val ownLotRefs: List<DominatorRef> = consumedBuckets.mapNotNull { bucket ->
+        val sid = bucket.supplyId ?: return@mapNotNull null
+        DominatorRef(kind = "bom_child", productId = productId, locationId = locationId,
+            supplyId = sid, label = "$productId@$locationId ($sid)")
+    }
+    // Time counterpart: "latest wins," exactly one dominator (unlike quantity's OR-group union)
+    // — the single latest-dated real lot this node itself drew from. Without this, a node whose
+    // own direct-inventory draw (not any method-waterfall candidate) sets the actual latest
+    // commit time never gets a chance to record why — latestCommit/latestCommitDominator below
+    // are only ever fed by method candidates, so a demand fully satisfied straight from a late
+    // real lot (no method needed at all) ends up with an empty time_dominator despite a real,
+    // traceable raw-material cause. This is what lets "latest wins" propagate all the way down
+    // to a genuine raw supply lot through both AND (computeStartDt) and OR (below) associations,
+    // and — via wave consolidation's resolveWavePeer, which reads exactly this field — across
+    // demands too.
+    val ownLotLatestBucket = consumedBuckets.maxByOrNull { parseDate(it.commitTime) ?: LocalDate.MIN }
+    val ownLotLatestTime: LocalDate? = ownLotLatestBucket?.let { parseDate(it.commitTime) }
+    val ownLotLatestTimeRef: DominatorRef? = ownLotLatestBucket?.supplyId?.let { sid ->
+        DominatorRef(kind = "bom_child", productId = productId, locationId = locationId,
+            supplyId = sid, label = "$productId@$locationId ($sid)")
+    }
     // Permanently record this draw against the demand-wide cap — deliberately NOT part of
     // any snapshot/restore scope, so a later, structurally-independent branch of this same
     // demand's tree can't get a fresh, un-depleted view of a lot this demand already spent
@@ -2983,17 +3014,24 @@ fun plan(
     }
 
     val demandNetQty = quantity - taken
+    // Real, single-latest-lot time dominator for a node fully (or near-fully) satisfied by
+    // direct inventory alone — no method/waterfall ever runs for these, so without this the
+    // "latest wins" AND/OR propagation chain (computeStartDt above, the waterfall wrap-up below)
+    // silently breaks the moment it bottoms out at a pure-inventory leaf, even though this is
+    // exactly the node with the real raw-lot answer to propagate. See ownLotLatestTimeRef's own
+    // doc for the full rationale.
+    val ownLotTimeDominator = ownLotLatestTimeRef?.let { listOf(it) } ?: emptyList()
     if (demandNetQty <= 1e-9) {
         // Treat sub-epsilon residuals as fully satisfied (prevents floating-point drift from
         // cascading into child_failed when a consolidation proportional share rounds down by ε)
-        return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, fulfillCommitTime, committedQty = taken))
+        return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, fulfillCommitTime, committedQty = taken, timeDominator = ownLotTimeDominator))
     }
     // Sub-half residuals after partial inventory consumption are numerical noise from
     // proportional pda splits and partial-replan scaling (e.g. demand=2119 vs synthetic
     // bucket=2118.95 leaves a 0.05 residual). Recursing on those produces a roundQty(0.x)=0
     // WO in the ledger and a phantom pegging entry — absorb them as fulfilled instead.
     if (taken > 0 && demandNetQty < 0.5) {
-        return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, fulfillCommitTime, committedQty = quantity))
+        return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, fulfillCommitTime, committedQty = quantity, timeDominator = ownLotTimeDominator))
     }
 
     // 2) Get methods
@@ -3489,7 +3527,14 @@ fun plan(
         demandFulfilledList.add(committedRow(0.0, reqTimeStr, lastBlockedReason ?: "no_methods_succeeded"))
         val failedPegging = combinedPegging + peggingChildren
         val rel = if (failedPegging.size > 1) "or" else null
-        return Triple(demandFulfilledList, emptyList(), demandNode(failedPegging, reqTimeStr, lastBlockedReason, committedQty = taken, childrenRelation = rel, quantityDominator = qtyDominatorForDemand.dedupBySupply()))
+        // Every method candidate failed, but this node's OWN direct-inventory draw (taken > 0)
+        // may still have genuinely committed something with its own real arrival date — that
+        // real date (and the real lot behind it), not reqTimeStr, is this node's true commit
+        // time and time dominator when it applies. See ownLotLatestTime's own doc.
+        val blockedCommitTimeStr = if (ownLotLatestTime != null) formatDate(ownLotLatestTime) else reqTimeStr
+        return Triple(demandFulfilledList, emptyList(), demandNode(failedPegging, blockedCommitTimeStr, lastBlockedReason, committedQty = taken, childrenRelation = rel,
+            timeDominator = ownLotLatestTimeRef?.let { listOf(it) } ?: emptyList(),
+            quantityDominator = (ownLotRefs + qtyDominatorForDemand).dedupBySupply()))
     }
 
     // Some commit. Combine all attempted WOs (success + blocked) in pegging. Siblings
@@ -3497,16 +3542,23 @@ fun plan(
     // part of the demand) — mark "or" so the UI labels them as alternatives.
     peggingChildren.addAll(combinedPegging)
     val partialReason = if (residual > 1e-9) "partial" else null
-    val commitTimeStr = formatDate(latestCommit)
+    // "Latest wins" between this node's own direct-inventory draw and whatever the method
+    // waterfall (above) separately contributed — the OVERALL commit time and its dominator must
+    // both reflect whichever one is genuinely later, not just the waterfall's own view.
+    val finalLatestCommit = if (ownLotLatestTime != null && (latestCommit == null || ownLotLatestTime > latestCommit))
+        ownLotLatestTime else latestCommit
+    val finalLatestCommitDominator = if (finalLatestCommit == ownLotLatestTime && ownLotLatestTimeRef != null)
+        listOf(ownLotLatestTimeRef) else latestCommitDominator
+    val commitTimeStr = formatDate(finalLatestCommit)
     demandFulfilledList.add(committedRow(totalAchievable, commitTimeStr, partialReason))
     val rel = if (peggingChildren.size > 1) "or" else null
     return Triple(demandFulfilledList, combinedWos, demandNode(
         peggingChildren, commitTimeStr ?: reqTimeStr, partialReason, committedQty = taken + totalAchievable, childrenRelation = rel,
-        timeDominator = latestCommitDominator,
+        timeDominator = finalLatestCommitDominator,
         // Only when the OVERALL waterfall genuinely fell short — a candidate that failed but
         // was fully compensated by a later one must not leave a stale dominator behind on an
         // otherwise fully-satisfied demand.
-        quantityDominator = if (residual > 1e-9) qtyDominatorForDemand.dedupBySupply() else emptyList(),
+        quantityDominator = if (residual > 1e-9) (ownLotRefs + qtyDominatorForDemand).dedupBySupply() else emptyList(),
     ))
 }
 
@@ -3561,15 +3613,29 @@ private fun computeStartDt(
         val latestChild = commitTimesWithSource.maxOf { it.first }
         if (latestChild > startDt) {
             startDt = latestChild
-            // "Latest time dominates": unlike quantity (an OR-group can have several genuine
-            // contributing alternatives), time has exactly ONE dominator — whichever single
-            // child's commit time is the actual latest. Several dates can tie exactly (a
-            // multi-lot child contributes several commit_times, or a pre-equalized wave), but
-            // that's not evidence of several equally-responsible causes — pick the first tied
-            // child and propagate its own (already-resolved) dominator verbatim.
-            val winner = commitTimesWithSource.firstOrNull { it.first == latestChild }?.second
-            dominator = rawDominatorRefs(winner?.pegging, "time_dominator", "bom_child", data, config)
         }
+        // "Latest time dominates": unlike quantity (an OR-group can have several genuine
+        // contributing alternatives), time has exactly ONE dominator — whichever single child's
+        // commit time is the actual latest. Several dates can tie exactly (a multi-lot child
+        // contributes several commit_times, or a pre-equalized wave), but that's not evidence of
+        // several equally-responsible causes. Among tied children, prefer whichever ALREADY
+        // carries its own genuine (non-empty) time_dominator — mirrors bomChildDominatorRefs's
+        // identical tie-break for quantity. A plain firstOrNull() picks whichever tied child
+        // happens to come first in iteration order, which is frequently an elastic purchase leaf
+        // (no dominator by design — purchases are never a genuine cause) sitting ahead of a
+        // sibling that traces to a real raw supply lot, silently dropping the real answer purely
+        // due to list ordering. Resolved unconditionally (NOT gated on latestChild > startDt,
+        // i.e. NOT only when this child pushed the parent beyond its own lead-time baseline) — a
+        // raw-material trail should always be traceable for any node that has one, whether or not
+        // consolidation/contention happened to push the schedule out further than plain lead-time
+        // accumulation alone would. Gating this the same way startDt itself is gated conflates
+        // "did this change the schedule" with "is there a real cause to point at" — the latter is
+        // the whole point of a dominator.
+        val tiedForLatest = commitTimesWithSource.filter { it.first == latestChild }
+        val winner = (tiedForLatest.firstOrNull { (_, cr) ->
+            !(cr.pegging?.get("time_dominator") as? List<*>).isNullOrEmpty()
+        } ?: tiedForLatest.firstOrNull())?.second
+        dominator = rawDominatorRefs(winner?.pegging, "time_dominator", "bom_child", data, config)
     }
     return startDt to dominator
 }
