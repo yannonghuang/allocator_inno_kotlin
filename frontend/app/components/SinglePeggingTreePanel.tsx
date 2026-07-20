@@ -230,17 +230,23 @@ export function SinglePeggingTreePanel({
   const rootQtyDominators = dedupBySupply(tree.quantity_dominator ?? []);
   const rootTimeDominators = dedupBySupply(tree.time_dominator ?? []);
 
-  // Totals for the qty-dominator table's footer. Both columns are summed only over rows that
-  // actually carry a value — allocated has none for non-critical/purchasable lots (see
-  // qty_allocated's own doc), and both are unavailable until caseId/runId let them be fetched
-  // (see supplyAllocByLot's own doc for why they're DB-sourced) — an entirely-empty column
-  // renders "–" rather than a misleading 0.
+  // Totals for the qty-dominator table's footer. Both columns are summed over the SAME row
+  // subset — rows with a genuine budget entitlement (qty_allocated != null). A non-critical/
+  // purchasable lot has no allocation concept at all (FIFO-consumed — see qty_allocated's own
+  // doc) and shows "–" in Allocated; its own qty_consumed isn't part of the "was the allocated
+  // budget used up" story this footer exists to answer, and summing it into Consumed alongside
+  // an Allocated total that excludes it made Consumed exceed Allocated for reasons that have
+  // nothing to do with any budget ever being exceeded (a non-critical row can consume plenty
+  // while carrying no allocation at all). Both are unavailable until caseId/runId let them be
+  // fetched (see supplyAllocByLot's own doc) — an entirely-empty column renders "–" rather than
+  // a misleading 0.
   let totalAllocated: number | null = null;
   let totalConsumed = 0;
   for (const d of rootQtyDominators) {
     const alloc = d.supply_id ? supplyAllocByLot?.get(d.supply_id) : undefined;
-    if (alloc?.qty_allocated != null) totalAllocated = (totalAllocated ?? 0) + alloc.qty_allocated;
-    if (alloc?.qty_consumed != null) totalConsumed += alloc.qty_consumed;
+    if (alloc?.qty_allocated == null) continue;
+    totalAllocated = (totalAllocated ?? 0) + alloc.qty_allocated;
+    totalConsumed += alloc.qty_consumed ?? 0;
   }
   const showAllocCols = caseId != null && runId != null;
 
