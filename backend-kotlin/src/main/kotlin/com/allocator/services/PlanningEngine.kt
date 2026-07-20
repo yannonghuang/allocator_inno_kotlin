@@ -1279,6 +1279,14 @@ private fun recipientLocationOf(recipient: String, data: Map<String, List<Map<St
  * [excludePid] as contributing zero instead of its real supply. Feeds
  * [computeDiamondCapsForAttempt]'s two-recipient budget split — see its own doc.
  */
+/** Sentinel "want" for probing a recipient's TRUE existing-supply ceiling via
+ *  [consumeFromInventory] — large enough to never itself be the limiting factor against any
+ *  real lot size in this codebase's data (lots run to the tens of thousands), so the probe
+ *  drains whatever is genuinely on hand rather than being truncated by an unrelated caller-side
+ *  quantity. Not Double.MAX_VALUE — keeps intermediate arithmetic (e.g. rate-based rescaling)
+ *  comfortably away from overflow/precision edge cases. */
+private const val UNCAPPED_STOCK_PROBE = 1e12
+
 internal fun achievableExcludingMaterial(
     pid: String, lid: String, needed: Double, excludePid: String,
     demand: Map<String, Any?>,
@@ -1313,8 +1321,18 @@ internal fun achievableExcludingMaterial(
     // materials' perLotBudget gating, not to an ordinary non-critical position like 504-1532,
     // which consumeFromInventory draws FIFO-by-date with no eligibility gate at all — confirmed
     // live: date-filtering here changed nothing because it was never the real rule).
-    fun existingSupplyOf(sPid: String, sLid: String, want: Double): Double =
-        consumeFromInventory(inventory, sPid, sLid, want).sumOf { it.qty }
+    // Uncapped probe: this recipient's TRUE existing-supply ceiling, not truncated by [needed]
+    // (which, for the diamond-split's own callers, is totalRemainingC — the SHARED POOL size,
+    // an artificial ceiling unrelated to how much this specific position's own real inventory
+    // actually holds). Capping the probe at [needed] silently truncates the honest answer
+    // whenever real stock happens to exceed it (live case: 504-1532@1000 genuinely holds 539
+    // units, but a needed-bounded probe reports only 534.21, understating this recipient's true
+    // self-sufficiency and skewing the split). [rate] below already reconstructs the correct
+    // parent-equivalent scale independent of [needed] (needed cancels out algebraically:
+    // cNeeded = needed*trueBomRate, so cNeeded/needed = trueBomRate regardless of what needed
+    // itself is) — so feeding it an uncapped probe here is the only change required.
+    fun existingSupplyOf(sPid: String, sLid: String): Double =
+        consumeFromInventory(inventory, sPid, sLid, UNCAPPED_STOCK_PROBE).sumOf { it.qty }
     var total = 0.0
     for (candidate in candidates) {
         total += when (candidate.method["type"] as? String) {
@@ -1324,7 +1342,7 @@ internal fun achievableExcludingMaterial(
             "purchase" -> 0.0
             "move" -> {
                 val fromLid = (candidate.method["from_location_id"] as? String)?.trim()
-                if (fromLid != null) existingSupplyOf(pid, fromLid, needed) else 0.0
+                if (fromLid != null) existingSupplyOf(pid, fromLid) else 0.0
             }
             "make" -> {
                 val mLoc = (candidate.method["location_id"] as? String)?.trim() ?: lid
@@ -1343,7 +1361,7 @@ internal fun achievableExcludingMaterial(
                         val cNeeded = (child["quantity"] as? Number)?.toDouble() ?: continue
                         if (cNeeded <= 1e-9) continue
                         if (cPid == excludePid) { variantAchievable = 0.0; break }
-                        val cSupply = existingSupplyOf(cPid, cLid, cNeeded)
+                        val cSupply = existingSupplyOf(cPid, cLid)
                         val rate = cNeeded / needed
                         val fromChild = if (rate > 1e-12) cSupply / rate else 0.0
                         if (fromChild < variantAchievable) variantAchievable = fromChild
@@ -1355,7 +1373,11 @@ internal fun achievableExcludingMaterial(
             else -> 0.0
         }
     }
-    return total.coerceAtMost(needed)
+    // Deliberately NOT coerced to [needed] — this recipient's true stock ceiling can, and
+    // often should, exceed the shared pool it's being compared against (needed here is
+    // totalRemainingC, not this recipient's own requirement); truncating it here would
+    // reintroduce the exact same understatement the uncapped probe above was fixing.
+    return total
 }
 
 // ── Method selection ───────────────────────────────────────────────────────────
@@ -2112,14 +2134,18 @@ internal fun planMethodSlot(
                         if (v != null && v > cap) budget[key] = cap
                     }
                 }
-                // Same defensive clamp, one level narrower: this branch's own fair-share cap.
-                if (branchLotCap != null) {
-                    for (key in budget.keys) {
-                        val cap = branchLotCap[key] ?: continue
-                        val v = budget[key]
-                        if (v != null && v > cap) budget[key] = cap
-                    }
-                }
+                // Deliberately NOT also clamped to branchLotCap here — branchLotCap is this ONE
+                // branch's own narrow, fair-share cap, but `budget` is the SHARED, demand-wide
+                // map every sibling branch (including ones with a far larger cap, e.g. a diamond
+                // co-recipient) also reads from. Clamping the whole shared map down to this
+                // branch's own tiny/zero allotment permanently poisons it for every sibling that
+                // hasn't taken its own turn yet — confirmed live: once a diamond-cap fix
+                // correctly gave one recipient an exact-zero share, its own abandoned "make"
+                // attempt hit this restore path and zeroed the shared budget map for a co-
+                // recipient with a legitimate 534-unit share, before that co-recipient ever got
+                // to draw. The demand-wide initialBudget clamp above is the correct, safe
+                // invariant; a branch-local one belongs on this branch's own consumption
+                // tracking (branchConsumed), never on the shared map.
             }
             // Undo the permanent demand-wide/branch-wide consumption charges this abandoned
             // candidate's children racked up — see demandConsumedSnap's doc above. Without
