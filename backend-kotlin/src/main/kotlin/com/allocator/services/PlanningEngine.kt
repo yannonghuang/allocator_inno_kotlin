@@ -3487,10 +3487,27 @@ fun plan(
         // WITHOUT itself being a registered recipient inherits no narrowing at all. Set fresh,
         // ONCE, only at the actual root-split point (rootSplitWeights != null) — every other
         // (non-root-split) call inherits whatever its own parent already established, unchanged.
+        //
+        // Deliberately NOT pre-divided by this slot's own rootSplitWeights share: an earlier
+        // version multiplied diamondCriticalEntitlement by `weight`, artificially pre-splitting
+        // a shared critical material's entitlement across root-level alternatives BEFORE any of
+        // them had actually tried to use it — so a candidate that could have delivered the full
+        // amount was capped down to a "fair" fraction, leaving real, physical, entitled supply
+        // unused even when no other candidate ever needed it. Delivery matters more than an even
+        // split among root-alternatives: each root-split candidate is entitled to the FULL
+        // remaining pool on a shared critical material, not a pre-carved fraction of it. The
+        // lower-level demandConsumed/trueRemaining mechanism (see perLotBudget's own doc) is what
+        // actually, reliably prevents any real over-draw beyond the true remaining entitlement —
+        // it's permanent and cumulative across every slot, unlike intraBudget's own per-slot
+        // baseline reset — so removing the pre-split here doesn't risk double-spending; it only
+        // stops an earlier candidate from being blocked from entitlement no later candidate ever
+        // touches. Observed live on case 173's 677_F29_2024_07_VIRTUAL: a single root-split
+        // candidate's own reachable lot for 283-0019 was pre-capped to a 1/N fraction (87.898)
+        // of its true entitlement, leaving the demand short by exactly that gap even though
+        // nothing else in the case was competing for the same lot.
         val slotIntraBudget: Map<String, Double>? = if (rootSplitWeights != null) {
-            val weight = rootSplitWeights.getOrNull(slotIdx) ?: (1.0 / cap)
             diamondCriticalEntitlement?.values?.flatMap { it.entries }
-                ?.associate { it.key to it.value * weight }
+                ?.associate { it.key to it.value }
                 ?.takeIf { it.isNotEmpty() }
         } else intraBudget
         // Snapshot of demandConsumed taken at THIS slot's own start — paired with
