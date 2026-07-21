@@ -3248,7 +3248,22 @@ fun plan(
         // their real allocated/consumed figures lets the table itself answer which case
         // this is, instead of a label ("no supply method") that reads as the latter even
         // when it's actually the former.
-        val entitledLots = initialBudget?.keys
+        //
+        // Only attach it as this node's OWN quantity_dominator when this node itself is
+        // genuinely short (demandNetQty > 0) — a fully-satisfied node (taken >= quantity,
+        // "no methods beyond direct inventory" is structurally true for a raw+critical
+        // material but never actually bound anything here) must not carry a non-empty
+        // dominator at all, because bomChildDominatorRefs' "winner" selection (see its own
+        // doc) copies ANY tied AND-sibling's non-empty dominator up to its parent regardless
+        // of whether that specific sibling had a shortfall — an unconditional citation here
+        // then propagates into genuinely-short, structurally-unrelated ancestors as a false
+        // R13 dominator. Traced live on case 173's 688_M51_2024_10_VIRTUAL under
+        // max_methods=4: several fully-satisfied 160-1153@1000 demand nodes (taken == quantity)
+        // each carried all 12 lots they'd ever drawn from as their own dominator; one of them
+        // won the tied-sibling pick at an ancestor AND-group and got copied onto the root,
+        // even though 11 of those 12 lots were genuinely exhausted system-wide and the 12th
+        // (160-1153_100020240929) still had 384 units of this demand's own entitlement unused.
+        val entitledLots = if (demandNetQty <= 1e-6) emptyList() else initialBudget?.keys
             ?.filter { it.startsWith("$componentKey|") }
             ?.mapNotNull { lotKey ->
                 val sid = lotKey.removePrefix("$componentKey|").takeIf { it.isNotBlank() } ?: return@mapNotNull null
