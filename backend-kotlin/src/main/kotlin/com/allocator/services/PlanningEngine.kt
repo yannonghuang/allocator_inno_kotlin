@@ -505,6 +505,17 @@ private data class ChildPassResult(
     val solvedList: List<Map<String, Any?>>,  // raw committedRow list — needed by the
                                               // bottleneck branch to surface the deepest
                                               // cause (vs the immediate failing child).
+    /** True when [pegging]'s quantity_dominator/time_dominator were stamped by this child
+     *  loop's own cBranchDominator override (a per-branch GUESS from andSiblingDominators,
+     *  computed once up front — see the override's own comment) rather than resolved by the
+     *  child's own recursive plan() call. The override fires whenever THIS child's first-pass
+     *  ask (at the AND-group's full, unreduced activeSlotQty) exceeded what it could achieve —
+     *  a much looser bar than "is this child the group's actual tied-minimum bottleneck." When
+     *  the group later GC-trims down to achievableParentQty (see that loop's own doc), a child
+     *  outside the tied-minimum set never needed the group's own dominator explanation — the
+     *  override's guess is stale for it and must be dropped, not carried into the final tree.
+     */
+    val dominatorOverridden: Boolean = false,
 )
 
 /**
@@ -771,7 +782,7 @@ private fun consumeFromInventory(
     return consumed
 }
 
-private fun copyInventory(inventory: List<Map<String, Any?>>): MutableList<MutableMap<String, Any?>> =
+internal fun copyInventory(inventory: List<Map<String, Any?>>): MutableList<MutableMap<String, Any?>> =
     inventory.map { b ->
         mutableMapOf(
             "product_id" to (b["product_id"] ?: ""),
@@ -1110,26 +1121,19 @@ private fun reachableRecipients(
  *   waterfall loop's own iteration over candidates with shrinking `slotQty`/`residual` IS the
  *   "rerun with leftover quantity," with no separate rerun mechanism needed.
  *
- * [reserveForLaterCandidates] (default 0.0 — the ordinary sequential-waterfall case, unchanged)
- * sets aside `reserveForLaterCandidates * totalEntitlement` of the critical material so that
- * candidates which haven't had their turn yet are still guaranteed their own nominal share —
- * everything else in the pool is fair game for THIS attempt. Without a reservation, whichever
- * candidate happens to be evaluated FIRST can claim the entire shared pool for itself before a
- * later candidate ever gets a look. But reserving a FIXED share for THIS candidate (the earlier,
- * rejected design: capping at `candidateWeight * totalEntitlement` regardless of what's actually
- * left) over-corrects the other way — a candidate that fully achieves its own output using LESS
- * than its nominal share leaves the difference stranded, since the reservation is anchored to
- * each candidate's OWN weight rather than to what remains AFTER protecting whoever's still ahead
- * in the queue. The LAST candidate in a waterfall has nothing left to protect, so it must be able
- * to claim the entire true remaining pool, not just its own static proportional slice — that's
- * the whole point of "500-6161 should get the full budget after 500-6267 returns its unused
- * budget." Observed concretely on case 173's 858_F35_2024_07_VIRTUAL demand: a 2:1-weighted root
- * split (500-6267 vs 500-6161) on a shared critical material (160-1153) left the pool severely
- * under-used because 500-6161 (the second, last candidate) was still capped at its own ~1/3
- * share even after 500-6267 (the first) returned most of its 2/3 unused. Callers pass the SUM of
- * `rootSplitWeights` for every slot STILL TO COME after this one — proportional to REQUEST,
- * matching how the rest of the root-split mechanism divides the demand, not a per-lot
- * consumption-rate estimate (that would need BOM-rate knowledge this function doesn't have).
+ * [reserveForLaterCandidates] (always 0.0 today — no caller sets it otherwise, see [plan]'s own
+ * [diamondReserveFraction] doc for why): an earlier design set aside
+ * `reserveForLaterCandidates * totalEntitlement` of the critical material so that root-split
+ * candidates which haven't had their turn yet were guaranteed their own nominal share. That over-
+ * corrected: root-split already divides the DEMAND'S OWN QUANTITY across alternatives
+ * (rootSplitWeights) — reserving a share of the shared MATERIAL on top of that double-narrows,
+ * capping each candidate's own diamond split (the pooled-stock split below) well under what it
+ * actually needed, manufacturing an artificial shortfall that a later, unrelated OR-alternative
+ * then had to rescue (case 173's 688_M51_2024_10_VIRTUAL
+ * family, max_methods=4). Each root-alternative now sees the FULL remaining pool; the lower-level
+ * demandConsumed/trueRemaining mechanism (permanent, cumulative across every slot) is what
+ * actually, reliably prevents any real over-draw. Parameter kept (rather than removed) in case a
+ * future, narrower reservation need arises.
  */
 internal fun computeDiamondCapsForAttempt(
     productId: String,
@@ -1157,6 +1161,10 @@ internal fun computeDiamondCapsForAttempt(
      */
     budget: Map<String, Double>?,
     reserveForLaterCandidates: Double = 0.0,
+    /** The live inventory list — threaded through to [achievableExcludingMaterial] so stock_x/
+     *  stock_y are computed via the SAME [consumeFromInventory] logic a real draw uses, against
+     *  the actual current state (not a re-derived approximation). */
+    inventory: List<Map<String, Any?>> = emptyList(),
 ): Map<String, Map<String, Double>> {
     if (diamondRecipients.isEmpty() || diamondCriticalEntitlement.isEmpty()) return emptyMap()
     val result = mutableMapOf<String, MutableMap<String, Double>>()
@@ -1168,32 +1176,207 @@ internal fun computeDiamondCapsForAttempt(
         )
         if (found.isEmpty()) continue
         val n = found.size
-        for ((lotKey, totalQty) in totalEntitlement) {
-            // Remaining pool = budget's own live, already-correct state for this lot — not a
-            // separately-tracked "totalQty minus consumed" computation. budget starts at
-            // totalQty (diamondCriticalEntitlement is itself derived from the same per-demand
-            // allocation) and is decremented by every real draw, by any recipient, anywhere in
-            // this demand's tree — exactly the semantics this cap needs, with no separate
-            // bookkeeping to keep in sync.
+        // N-recipient pooled-stock split (generalizes the original two-recipient-only formula
+        // — see this function's own doc): pool C together with EVERY recipient's own alternative
+        // capacity — how much it could get WITHOUT touching the shared critical material at all
+        // (its "stock") — split that pooled total evenly N ways, then each recipient's own stock
+        // counts entirely toward its share, so only the residual comes from C:
+        //   budget(R_i) = (budget(C) + sum(stock_1..N))/N - stock_i
+        // These still always sum to exactly budget(C) (the pooled stock terms cancel out).
+        // Originally special-cased to n==2 (AND(X,Y)'s "pooledHalf" shape) with a flat `remaining
+        // / n` equal split for n > 2 — that blind equal split ignores how much of its OWN
+        // ask a recipient can already cover without C at all, so a recipient content with its
+        // OWN alternative supply still got handed a full, unneeded 1/n slice of the SHARED
+        // critical material while a genuinely C-hungry sibling was capped at the SAME 1/n,
+        // stranding real, entitled headroom neither one ever claimed (observed live on case
+        // 173's 688_F35/888_F35_2024_09-12_VIRTUAL family under max_methods=4: a 6-way AND-group
+        // reaching 160-1153 left a consistent, exact 1/6 of two shared lots' entitlement unused
+        // by every member, matching this formula's blind per-head fraction exactly). Falls back
+        // to the flat equal split only when a recipient's location can't be resolved (stock
+        // can't be probed without one).
+        val recipientLocs: Map<String, String> = found.mapNotNull { r -> recipientLocationOf(r, data)?.let { r to it } }.toMap()
+        val poolStock: Boolean = recipientLocs.size == found.size
+        // Remaining pool PER LOT = budget's own live, already-correct state — not a separately-
+        // tracked "totalQty minus consumed" computation. budget starts at totalQty
+        // (diamondCriticalEntitlement is itself derived from the same per-demand allocation) and
+        // is decremented by every real draw, by any recipient, anywhere in this demand's tree —
+        // exactly the semantics this cap needs, with no separate bookkeeping to keep in sync.
+        // Protect only what's genuinely still ahead in the queue — subtract their reserved share
+        // from what's ACTUALLY left, rather than capping this attempt at its own fixed share of
+        // the ORIGINAL total. A candidate that runs after everyone else (reserve=0) gets the full
+        // true remaining pool; an earlier candidate still gets exactly its own nominal share when
+        // nothing has been consumed yet (remainingPool == totalQty). reserveForLaterCandidates is
+        // applied here regardless of whether remainingPool came from budget or the totalQty
+        // fallback above — see plan()'s own diamondReserveFraction doc for why this (a fraction
+        // subtracted from the live pool) is what makes the reservation survive nested recursion,
+        // unlike an earlier design that instead scaled totalQty itself (silently ignored once
+        // budget had a live entry for the lot).
+        val remainingByLot: Map<String, Double> = totalEntitlement.mapValues { (lotKey, totalQty) ->
             val remainingPool = (budget?.get(lotKey) ?: totalQty).coerceAtLeast(0.0)
-            // Protect only what's genuinely still ahead in the queue — subtract their reserved
-            // share from what's ACTUALLY left, rather than capping this attempt at its own fixed
-            // share of the ORIGINAL total. A candidate that runs after everyone else (reserve=0)
-            // gets the full true remaining pool; an earlier candidate still gets exactly its own
-            // nominal share when nothing has been consumed yet (remainingPool == totalQty).
-            // reserveForLaterCandidates is applied here regardless of whether remainingPool came
-            // from budget or the totalQty fallback above — see plan()'s own diamondReserveFraction
-            // doc for why this (a fraction subtracted from the live pool) is what makes the
-            // reservation survive nested recursion, unlike an earlier design that instead scaled
-            // totalQty itself (silently ignored once budget had a live entry for the lot).
-            val remaining = (remainingPool - reserveForLaterCandidates * totalQty).coerceAtLeast(0.0)
-            val share = remaining / n
-            for (recipient in found) {
-                result.getOrPut(recipient) { mutableMapOf() }[lotKey] = share
+            (remainingPool - reserveForLaterCandidates * totalQty).coerceAtLeast(0.0)
+        }
+        if (poolStock) {
+            // Whole-demand entitlement for this critical material — budget(C) — summed ACROSS
+            // ALL its lots, not fragmented per lot: each recipient's stock compares against the
+            // demand's TOTAL reachable capacity, not an arbitrary single-lot slice of it.
+            val totalRemainingC = remainingByLot.values.sum()
+            if (totalRemainingC > 1e-9) {
+                // ONE shared, mutable snapshot across every recipient's probe, in a fixed order —
+                // each probe destructively consumes from it (via the real consumeFromInventory),
+                // so a later recipient's probe sees only what earlier ones didn't claim, not the
+                // same physical lot double-counted. A fresh copy of the LIVE inventory, not the
+                // live inventory itself — a probe must not leak into what actually gets committed.
+                val orderedRecipients = found.toList()
+                val stockSnapshot = copyInventory(inventory)
+                val stocks: Map<String, Double> = orderedRecipients.associateWith { r ->
+                    achievableExcludingMaterial(r, recipientLocs.getValue(r), totalRemainingC, criticalPid, demand, config, data, preferenceKb, stockSnapshot)
+                }
+                val pooledShare = (totalRemainingC + stocks.values.sum()) / n
+                val fromC: Map<String, Double> = orderedRecipients.associateWith { r ->
+                    (pooledShare - stocks.getValue(r)).coerceIn(0.0, totalRemainingC)
+                }
+                // Distribute each recipient's whole-demand fromC share back across lots
+                // proportional to each lot's own share of the total remaining pool — a lot with
+                // more left contributes more of every recipient's overall entitlement, matching
+                // how the equal-split fallback below already treats every lot uniformly by ratio.
+                for ((lotKey, lotRemaining) in remainingByLot) {
+                    if (lotRemaining <= 1e-9) continue
+                    val fraction = lotRemaining / totalRemainingC
+                    for (r in orderedRecipients) {
+                        result.getOrPut(r) { mutableMapOf() }[lotKey] = fromC.getValue(r) * fraction
+                    }
+                }
+            }
+        } else {
+            for ((lotKey, remaining) in remainingByLot) {
+                val share = remaining / n
+                for (recipient in found) {
+                    result.getOrPut(recipient) { mutableMapOf() }[lotKey] = share
+                }
             }
         }
     }
     return result
+}
+
+/** [recipient]'s canonical location — looked up from `productlocation` since diamond
+ *  recipients are tracked by product_id alone (see [reachableRecipientsForMethod]'s return
+ *  type). Assumes one canonical location per recipient product, true for the synthetic
+ *  "VirtualProduct_*" OR-group collapse points [findOrGroupRecipients] discovers. Null when
+ *  not found — callers fall back to the equal-split behavior rather than guess. */
+private fun recipientLocationOf(recipient: String, data: Map<String, List<Map<String, Any?>>>): String? =
+    (data["productlocation"] ?: emptyList())
+        .firstOrNull { (it["product_id"] as? String)?.trim() == recipient }
+        ?.get("location_id") as? String
+
+/**
+ * How much of [pid]@[lid]'s own need could be satisfied via paths that never touch
+ * [excludePid] anywhere in the subtree — raw physical supply only, no notion of competing
+ * demands (a structural "how big is this recipient's own alternative capacity" figure, not a
+ * live, demand-competitive entitlement). Mirrors the AND(min-over-children)/OR(waterfall-sum)
+ * arithmetic used elsewhere for achievable-quantity computation, but treats any leaf matching
+ * [excludePid] as contributing zero instead of its real supply. Feeds
+ * [computeDiamondCapsForAttempt]'s two-recipient budget split — see its own doc.
+ */
+/** Sentinel "want" for probing a recipient's TRUE existing-supply ceiling via
+ *  [consumeFromInventory] — large enough to never itself be the limiting factor against any
+ *  real lot size in this codebase's data (lots run to the tens of thousands), so the probe
+ *  drains whatever is genuinely on hand rather than being truncated by an unrelated caller-side
+ *  quantity. Not Double.MAX_VALUE — keeps intermediate arithmetic (e.g. rate-based rescaling)
+ *  comfortably away from overflow/precision edge cases. */
+private const val UNCAPPED_STOCK_PROBE = 1e12
+
+internal fun achievableExcludingMaterial(
+    pid: String, lid: String, needed: Double, excludePid: String,
+    demand: Map<String, Any?>,
+    config: Map<String, Any?>?,
+    data: Map<String, List<Map<String, Any?>>>,
+    preferenceKb: PreferenceKb?,
+    /** A snapshot of the live inventory, consumed DESTRUCTIVELY via the real
+     *  [consumeFromInventory] — not the actual production inventory (a probe here must not
+     *  leak into real commits), but a shared, sequentially-depleting copy the caller passes to
+     *  MULTIPLE recipients in processing order: X's probe actually decrements it, so Y's
+     *  subsequent probe sees only what X didn't claim — no double-crediting the same physical
+     *  lot to both sides. Callers wanting fully independent probes pass their OWN separate
+     *  [copyInventory] snapshot per recipient instead. */
+    inventory: MutableList<MutableMap<String, Any?>>,
+): Double {
+    if (needed <= 1e-9) return 0.0
+    if (pid == excludePid) return 0.0
+    // Existing supply only — "any existing supplies have to be consumed first before whatever
+    // work orders," so stock is pre-deterministic and doesn't recurse into make/move method
+    // chains at all (a deeper make step would itself be a work order, not existing stock; a
+    // deeper move step's own source is a different position's existing stock, one level down,
+    // not this position's). Scoped to [pid]@[lid]'s own top-ranked candidate(s) (capped to
+    // max_methods, matching every other achievability computation in this codebase).
+    val methodCfg = resolveMethodSelection(config)
+    val candidates = expandWaterfallCandidates(getMethods(pid, lid, data), pid, demand, config, data)
+        .sortedBy { kbPreference(pid, lid, it.method, it.altKey, preferenceKb) }
+        .let { it.take(methodCfg.maxMethods.coerceAtMost(it.size)) }
+    // Reuses consumeFromInventory itself — the exact bucket-matching + date-sort logic a real
+    // draw would use — directly against the shared [inventory] snapshot (destructive: draws
+    // here actually decrement it), rather than re-deriving eligibility rules here (an earlier
+    // version hand-rolled a date-eligibility filter that turned out to apply only to CRITICAL
+    // materials' perLotBudget gating, not to an ordinary non-critical position like 504-1532,
+    // which consumeFromInventory draws FIFO-by-date with no eligibility gate at all — confirmed
+    // live: date-filtering here changed nothing because it was never the real rule).
+    // Uncapped probe: this recipient's TRUE existing-supply ceiling, not truncated by [needed]
+    // (which, for the diamond-split's own callers, is totalRemainingC — the SHARED POOL size,
+    // an artificial ceiling unrelated to how much this specific position's own real inventory
+    // actually holds). Capping the probe at [needed] silently truncates the honest answer
+    // whenever real stock happens to exceed it (live case: 504-1532@1000 genuinely holds 539
+    // units, but a needed-bounded probe reports only 534.21, understating this recipient's true
+    // self-sufficiency and skewing the split). [rate] below already reconstructs the correct
+    // parent-equivalent scale independent of [needed] (needed cancels out algebraically:
+    // cNeeded = needed*trueBomRate, so cNeeded/needed = trueBomRate regardless of what needed
+    // itself is) — so feeding it an uncapped probe here is the only change required.
+    fun existingSupplyOf(sPid: String, sLid: String): Double =
+        consumeFromInventory(inventory, sPid, sLid, UNCAPPED_STOCK_PROBE).sumOf { it.qty }
+    var total = 0.0
+    for (candidate in candidates) {
+        total += when (candidate.method["type"] as? String) {
+            // Purchase is elastic (can always order more/sooner) — reveals nothing about this
+            // recipient's OWN existing capacity advantage, so it doesn't count toward "stock"
+            // any more than it counts as a raw dominator elsewhere in this file.
+            "purchase" -> 0.0
+            "move" -> {
+                val fromLid = (candidate.method["from_location_id"] as? String)?.trim()
+                if (fromLid != null) existingSupplyOf(pid, fromLid) else 0.0
+            }
+            "make" -> {
+                val mLoc = (candidate.method["location_id"] as? String)?.trim() ?: lid
+                val variants = variantsForMake(pid, mLoc, needed, candidate.method, data)
+                val chosen = if (candidate.altKey != null) variants.filter { it.first == candidate.altKey } else variants
+                var variantTotal = 0.0
+                for ((_, children) in chosen) {
+                    if (children.isEmpty()) continue
+                    // AND: this variant's own achievable is the tightest child — a variant that
+                    // itself routes through excludePid contributes 0 (that portion is exactly
+                    // what the critical-material budget split governs, not "stock").
+                    var variantAchievable = Double.MAX_VALUE
+                    for (child in children) {
+                        val cPid = (child["product_id"] as? String)?.trim() ?: continue
+                        val cLid = (child["location_id"] as? String)?.trim() ?: continue
+                        val cNeeded = (child["quantity"] as? Number)?.toDouble() ?: continue
+                        if (cNeeded <= 1e-9) continue
+                        if (cPid == excludePid) { variantAchievable = 0.0; break }
+                        val cSupply = existingSupplyOf(cPid, cLid)
+                        val rate = cNeeded / needed
+                        val fromChild = if (rate > 1e-12) cSupply / rate else 0.0
+                        if (fromChild < variantAchievable) variantAchievable = fromChild
+                    }
+                    if (variantAchievable != Double.MAX_VALUE) variantTotal += variantAchievable
+                }
+                variantTotal
+            }
+            else -> 0.0
+        }
+    }
+    // Deliberately NOT coerced to [needed] — this recipient's true stock ceiling can, and
+    // often should, exceed the shared pool it's being compared against (needed here is
+    // totalRemainingC, not this recipient's own requirement); truncating it here would
+    // reintroduce the exact same understatement the uncapped probe above was fixing.
+    return total
 }
 
 // ── Method selection ───────────────────────────────────────────────────────────
@@ -1606,6 +1789,14 @@ internal fun planMethodSlot(
     /** See [plan]'s doc — [demandConsumed] snapshot taken at this root-split candidate's own
      *  start; threaded through unchanged alongside [intraBudget]. */
     intraBudgetBaseline: Map<String, Double>? = null,
+    /** True once this call is already inside a resolved diamond recipient's own subtree (a
+     *  "competition zone" member whose share of a shared critical material has already been
+     *  fixed by an enclosing AND-loop). See [plan]'s own doc for why this suppresses the
+     *  separate [andSiblingCaps] fallback below — the "competition zone" only exists at the
+     *  AND-group boundary where recipients are direct siblings; nothing inside one specific
+     *  recipient's own descent (its own BOM chain down to the critical material) is a fresh
+     *  contender for the same pool, no matter how many nested OR/AND-nodes it contains. */
+    insideDiamondRecipient: Boolean = false,
 ): MethodSlotResult {
     val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
     val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
@@ -1641,6 +1832,16 @@ internal fun planMethodSlot(
     // all cap-bounded cases, eliminating the second-pass BOM retrace.
     var activeSlotQty = slotQty
     val activeChildren: List<Map<String, Any?>>
+    // The child whose (cap / cNeeded) ratio set minScale below — i.e. the TRUE reason this
+    // whole slot was pre-shrunk before any commit was ever attempted. Once every child is
+    // uniformly scaled down to fit, the first-pass/AND-min machinery further below sees a
+    // self-consistent, fully-achievable ask at every level (achievableParentQty ==
+    // activeSlotQty) and finds no shortfall of its own to blame — so without this, the
+    // demand's real "why" (this specific nodeQtyCaps-capped child) is silently lost, and
+    // whatever real-lot refs the (now fully-satisfied) subtree happens to carry (the real-lot
+    // dominator preference fix decorates fully-satisfied nodes too) get mistaken for the cause
+    // instead. See its use below, after qtyDominatorForWoNode is computed.
+    var preScaleLimitingKey: Pair<String, String>? = null
     if (nodeQtyCaps != null && childMaterials.isNotEmpty() && slotQty > 1e-9) {
         var minScale = 1.0
         for (c in childMaterials) {
@@ -1651,7 +1852,10 @@ internal fun planMethodSlot(
             val cap = nodeQtyCaps[cPid to cLid] ?: continue
             if (cap >= cNeeded - 1e-9) continue
             val s = cap / cNeeded
-            if (s < minScale) minScale = s
+            if (s < minScale) {
+                minScale = s
+                preScaleLimitingKey = cPid to cLid
+            }
         }
         if (minScale < 1.0 - 1e-9) {
             activeSlotQty = floor(slotQty * minScale).coerceAtLeast(0.0)
@@ -1664,6 +1868,7 @@ internal fun planMethodSlot(
                 productId, productionLocation, demandId, slotQty, activeSlotQty, "%.4f".format(minScale))
         } else {
             activeChildren = childMaterials
+            preScaleLimitingKey = null
         }
     } else {
         activeChildren = childMaterials
@@ -1702,6 +1907,37 @@ internal fun planMethodSlot(
     val demandConsumedSnap: Map<String, Double>? = demandConsumed?.toMap()
     val branchConsumedSnap: Map<String, Double>? = branchConsumed?.toMap()
 
+    // ── "Competition zone" entry point ───────────────────────────────────────
+    // A diamond split is only meaningful exactly HERE, at an AND-group's own parent node,
+    // among its own direct children — never re-derived from some arbitrary descendant's own
+    // local position (which can only ever see itself, or a structurally-unrelated cousin
+    // reachable via a completely different path, never the true sibling it should be paired
+    // with). Restrict the candidate recipient set to activeChildren's OWN product ids
+    // intersected with the globally-known recipient set — this is what keeps a genuinely
+    // unrelated OR-group collapse point elsewhere in the demand's tree (reachable only via a
+    // much broader downward walk from a distant ancestor) from ever being pooled in with this
+    // AND-group's real siblings.
+    val andGroupHere = activeChildren.size > 1
+    val localDiamondCaps: Map<String, Map<String, Double>>? =
+        if (andGroupHere && !diamondRecipients.isNullOrEmpty() && !diamondCriticalEntitlement.isNullOrEmpty()) {
+            val cPidsHere = activeChildren.mapNotNull { (it["product_id"] as? String)?.trim() }.toSet()
+            val localRecipients = diamondRecipients
+                .mapValues { (_, recipients) -> recipients.intersect(cPidsHere) }
+                .filterValues { it.size >= 2 }
+            if (localRecipients.isNotEmpty()) {
+                computeDiamondCapsForAttempt(
+                    productId = productId, locationId = locationId,
+                    method = m, altKey = selectedAltKey,
+                    demand = demand, config = config, data = data, preferenceKb = preferenceKb,
+                    diamondRecipients = localRecipients,
+                    diamondCriticalEntitlement = diamondCriticalEntitlement,
+                    budget = budget,
+                    reserveForLaterCandidates = diamondReserveFraction,
+                    inventory = inventory,
+                )
+            } else null
+        } else null
+
     // ── First pass: plan all children at activeSlotQty ───────────────────────
     val childPassResults = mutableListOf<ChildPassResult>()
     for (c in activeChildren) {
@@ -1736,9 +1972,18 @@ internal fun planMethodSlot(
         // shares the SAME pool instead of each getting an independent, lineage-derived one. See
         // computeDiamondCapsForAttempt's own doc for why the general andSiblingCaps mechanism is
         // unreliable for this shape.
-        val diamondCap = diamondRecipientCaps?.get(cPid)
-        val childAndCap = diamondCap ?: andSiblingCaps?.get(BranchKey(cPid, cLid, combineSlot(branchLineage, null)))
+        // "Competition zone" cap: resolved once, above, from THIS AND-group's own direct
+        // children — never re-derived deeper down. A child not itself a recognized recipient
+        // (localDiamondCaps has no entry) falls back to the general andSiblingCaps mechanism,
+        // but ONLY when we are not already inside a resolved recipient's own subtree —
+        // once insideDiamondRecipient is true, nothing further down is a fresh competition
+        // zone member for the same (or any) critical material; the inherited branchLotCap is
+        // final all the way down (the 504-1532/160-1153-own-andSiblingCaps-entry bug).
+        val diamondCap = localDiamondCaps?.get(cPid)
+        val childAndCap = diamondCap
+            ?: (if (insideDiamondRecipient) null else andSiblingCaps?.get(BranchKey(cPid, cLid, combineSlot(branchLineage, null))))
         val cBranchLotCap = childAndCap ?: branchLotCap
+        val cInsideDiamondRecipient = insideDiamondRecipient || diamondCap != null
         // Diamond caps fold into childAndCap above just like andSiblingCaps — a fresh, empty
         // tally is correct for both: the cap itself (share = remaining/n) already reflects
         // everything consumed so far, demand-wide, by reading live from budget (see
@@ -1757,7 +2002,7 @@ internal fun planMethodSlot(
         // nested fanout further down was actually tagged with.
         val isAndGroupChild = activeChildren.size > 1
         val cBranchLineage = if (isAndGroupChild) extendLineage(branchLineage, cPid, cLid) else branchLineage
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, andSiblingCaps = andSiblingCaps, branchLotCap = cBranchLotCap, branchConsumed = cBranchConsumed, branchLineage = cBranchLineage, andSiblingDominators = andSiblingDominators, branchDominator = cBranchDominator, diamondRecipientCaps = diamondRecipientCaps, diamondRecipients = diamondRecipients, diamondCriticalEntitlement = diamondCriticalEntitlement, diamondReserveFraction = diamondReserveFraction, intraBudget = intraBudget, intraBudgetBaseline = intraBudgetBaseline)
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, andSiblingCaps = andSiblingCaps, branchLotCap = cBranchLotCap, branchConsumed = cBranchConsumed, branchLineage = cBranchLineage, andSiblingDominators = andSiblingDominators, branchDominator = cBranchDominator, diamondRecipientCaps = diamondRecipientCaps, diamondRecipients = diamondRecipients, diamondCriticalEntitlement = diamondCriticalEntitlement, diamondReserveFraction = diamondReserveFraction, intraBudget = intraBudget, intraBudgetBaseline = intraBudgetBaseline, insideDiamondRecipient = cInsideDiamondRecipient)
         // Prefer the unrounded "quantity_precise" (see committedRow's doc) over the rounded
         // "quantity" — this feeds the AND-min ratio (computeRawAchievable) below, and reading
         // the rounded value here would let a genuinely-achieved fractional child (e.g. 0.4999
@@ -1808,7 +2053,7 @@ internal fun planMethodSlot(
             }
         } else emptyMap()
         val taggedPegging = cPegging?.plus("gc_bom_rate" to bomRate)?.plus(dominatorOverride)
-        childPassResults.add(ChildPassResult(c, neededQty, effectiveQty, cWos, taggedPegging, cTimes, solvedList))
+        childPassResults.add(ChildPassResult(c, neededQty, effectiveQty, cWos, taggedPegging, cTimes, solvedList, dominatorOverridden = dominatorOverride.isNotEmpty()))
     }
 
     // Blueprint mode: BOM rates produce fractional child quantities (e.g. 452.0012 from
@@ -1902,14 +2147,18 @@ internal fun planMethodSlot(
                         if (v != null && v > cap) budget[key] = cap
                     }
                 }
-                // Same defensive clamp, one level narrower: this branch's own fair-share cap.
-                if (branchLotCap != null) {
-                    for (key in budget.keys) {
-                        val cap = branchLotCap[key] ?: continue
-                        val v = budget[key]
-                        if (v != null && v > cap) budget[key] = cap
-                    }
-                }
+                // Deliberately NOT also clamped to branchLotCap here — branchLotCap is this ONE
+                // branch's own narrow, fair-share cap, but `budget` is the SHARED, demand-wide
+                // map every sibling branch (including ones with a far larger cap, e.g. a diamond
+                // co-recipient) also reads from. Clamping the whole shared map down to this
+                // branch's own tiny/zero allotment permanently poisons it for every sibling that
+                // hasn't taken its own turn yet — confirmed live: once a diamond-cap fix
+                // correctly gave one recipient an exact-zero share, its own abandoned "make"
+                // attempt hit this restore path and zeroed the shared budget map for a co-
+                // recipient with a legitimate 534-unit share, before that co-recipient ever got
+                // to draw. The demand-wide initialBudget clamp above is the correct, safe
+                // invariant; a branch-local one belongs on this branch's own consumption
+                // tracking (branchConsumed), never on the shared map.
             }
             // Undo the permanent demand-wide/branch-wide consumption charges this abandoned
             // candidate's children racked up — see demandConsumedSnap's doc above. Without
@@ -2095,6 +2344,21 @@ internal fun planMethodSlot(
                         }
                 } else emptyMap()
             qtyDominatorForWoNode = bomChildDominatorRefs(childPassResults, bottleneckPegging.keys, data, config)
+            // This slot's own ask (activeSlotQty) was already pre-shrunk from slotQty by the
+            // nodeQtyCaps pre-scale above — every child then fit inside that reduced ask with
+            // no further shortfall of its own (bottleneckPegging empty), so
+            // bomChildDominatorRefs found nothing to blame. The TRUE reason this slot could
+            // only ask for activeSlotQty instead of slotQty is whatever nodeQtyCaps capped
+            // preScaleLimitingKey to — read that straight from the blueprint, the same "ONLY
+            // reliable source" plan()'s own nodeCap wrapper (see its ownDominator doc) falls
+            // back to. Concretely fixes case 173's 677_F29_2024_07_VIRTUAL-class violations
+            // under max_methods=3: a fallback waterfall candidate's whole BOM was pre-scaled
+            // to 89.898 (from a 333.33 ask) by a 500-5392 nodeQtyCaps hit, fully satisfied that
+            // reduced ask with real-lot refs for 500-5392/283-0019 that were then wrongly
+            // carried up as "why" the demand fell short of its true 333.33 ask.
+            if (qtyDominatorForWoNode.isEmpty() && preScaleLimitingKey != null) {
+                qtyDominatorForWoNode = demandBlueprint?.get(preScaleLimitingKey)?.quantityDominator ?: emptyList()
+            }
 
             // Root-bottleneck identification using iter-0 budget caps. The
             // child whose `initialBudget[pid|lid] / cr.neededQty` is the
@@ -2142,7 +2406,7 @@ internal fun planMethodSlot(
                 commitTimesWithSource.addAll(cr.cTimes.map { it to cr })
                 val peg = cr.pegging ?: continue
                 val trimmed: Map<String, Any?> = if (cr.effectiveQty > targetQty + 1e-9)
-                    garbageCollectPegging(peg, targetQty, inventory, budget)
+                    garbageCollectPegging(peg, targetQty, inventory, budget, demandConsumed)
                 else peg
                 // reconcile() derives BOM rate as child.quantity / wo.quantity. In the old second-pass
                 // world the child node was replanned at targetQty so its quantity == targetQty. In the
@@ -2150,10 +2414,20 @@ internal fun planMethodSlot(
                 // first-pass request). Without this fix, rateOf = neededQty / achievableParentQty
                 // (e.g. 40/10 = 4.0) instead of the true BOM rate (neededQty / activeSlotQty = 1.0),
                 // causing reconcile to cut the parent commit to effectiveQty / inflatedRate = 2.5.
-                val scaled = trimmed + ("quantity" to targetQty)
                 val pid = (cr.child["product_id"] as? String)?.trim() ?: ""
                 val lid = (cr.child["location_id"] as? String)?.trim() ?: ""
                 val key = pid to lid
+                // Drop a stale dominatorOverride tag: it was stamped against this child's own
+                // oversized, unreduced first-pass ask (cHadShortfall there is a much looser bar
+                // than "is this child the group's actual tied-minimum bottleneck" — see
+                // ChildPassResult.dominatorOverridden's own doc). Once GC-trims this child down
+                // to its true share and it turns out NOT to be the group's real constraint, the
+                // guess never applied to it in the first place and must not survive into the
+                // final tree — confirmed live on case 173's 20018963_20/688_F35_2024_07_VIRTUAL,
+                // where VirtualProduct_280-1159_A1 (fully satisfied via 504-1532, unrelated to
+                // 160-1153) incorrectly inherited sibling A3's 160-1153 dominator this way.
+                val scaled = (if (cr.dominatorOverridden && key !in bottleneckPegging)
+                    trimmed - "quantity_dominator" - "time_dominator" else trimmed) + ("quantity" to targetQty)
                 var tagged: Map<String, Any?> = scaled
                 if (key in bottleneckPegging) tagged = tagged + ("is_bottleneck" to true)
                 if (key in rootBottleneckKeys) tagged = tagged + ("is_root_bottleneck" to true)
@@ -2395,26 +2669,24 @@ fun plan(
      *  would be wrong — only the live, per-attempt computation knows which is actually being
      *  visited right now. */
     diamondCriticalEntitlement: Map<String, Map<String, Double>>? = null,
-    /** Fraction (0..1) of a diamond critical material's pool that's reserved for OTHER,
-     *  sibling root-split candidates not yet processed — set fresh at the ROOT for whichever
-     *  candidate slot is currently running (from `rootSplitWeights.drop(slotIdx+1).sum()`),
-     *  then INHERITED UNCHANGED through every non-root recursive [plan] call below it, so a
-     *  [computeDiamondCapsForAttempt] call several BOM levels deep still knows to protect a
-     *  sibling root-split candidate's share. Without this, a nested call — which is never
-     *  itself `isRoot`, so it always computes its OWN local reserve as 0 — sees the full,
-     *  unreserved remaining pool and can consume a sibling's entire protected share before
-     *  that sibling ever gets its turn (observed live on case 173's 858_F35_2024_08_VIRTUAL:
-     *  candidate 500-6267, entitled to only 2/3 of the demand's 160-1153 budget, consumed the
-     *  full 100% through a nested waterfall several levels below its own top-level method,
-     *  leaving nothing for candidate 500-6161's reserved 1/3 turn). Deliberately a
-     *  plain fraction threaded through the recursion — NOT baked into a scaled copy of
-     *  [diamondCriticalEntitlement] (an earlier design) — because [computeDiamondCapsForAttempt]
-     *  reads its own `remainingPool` from `budget` first (the single source of truth for what's
-     *  actually been consumed), falling back to the entitlement total only when `budget` has no
-     *  entry yet; once `budget` is populated (which it always is, for every lot a demand
-     *  touches), a scaled entitlement is silently ignored. Applying the reservation as a
-     *  fraction subtracted from `remainingPool` — instead of shrinking the pool's own baseline
-     *  — works correctly regardless of which source `remainingPool` came from. */
+    /** Fraction (0..1) of a diamond critical material's pool reserved for OTHER, sibling
+     *  root-split candidates not yet processed — always 0.0 now. A prior version set this fresh
+     *  at the ROOT for whichever candidate slot was currently running (from
+     *  `rootSplitWeights.drop(slotIdx+1).sum()`) to stop a nested [computeDiamondCapsForAttempt]
+     *  call from consuming a later sibling's entire protected share before that sibling's own
+     *  turn — but reserving a share of the CRITICAL MATERIAL for slots still to come, on top of
+     *  root-split's own quantity split (`rootSplitWeights`), double-narrows: each root-alternative
+     *  should see the full remaining pool and only ever split the DEMAND'S OWN QUANTITY across
+     *  alternatives, never the shared material itself. Observed live on case 173's
+     *  688_M51_2024_10_VIRTUAL family (max_methods=4): reserving 75%/50%/25% for not-yet-tried
+     *  work-order slots forced each slot's own diamond pair down to as little as 1/8 of the
+     *  demand-wide pool — an artificial shortfall an unrelated, unreserved OR-alternative then had
+     *  to "rescue," leaving a permanent [demandConsumed] overcharge once that rescue's own work
+     *  order was only partially kept. The lower-level demandConsumed/trueRemaining mechanism
+     *  (permanent, cumulative across every slot) is what actually, reliably prevents any real
+     *  over-draw across root-split slots; kept as a threaded parameter (rather than removed
+     *  outright) in case a future, narrower reservation need arises, but nothing sets it non-zero
+     *  today. */
     diamondReserveFraction: Double = 0.0,
     /** A root-split candidate's own hard, per-lot ceiling on every critical material with known
      *  [diamondCriticalEntitlement] — set ONCE, at THIS demand's root waterfall loop, for
@@ -2440,9 +2712,14 @@ fun plan(
     /** [demandConsumed] snapshot taken at [intraBudget]'s own root-split candidate slot start —
      *  paired with it so the live enforcement measures "consumed BY THIS SLOT since it began"
      *  (`demandConsumed.now - intraBudgetBaseline`), not total demand-wide consumption (which
-     *  would double-count whatever an EARLIER root-split slot already consumed and had
-     *  protected via its own, now-expired [diamondReserveFraction]). */
+     *  would double-count whatever an EARLIER root-split slot already consumed under its own,
+     *  now-finished [intraBudget] baseline). */
     intraBudgetBaseline: Map<String, Double>? = null,
+    /** See [planMethodSlot]'s own doc — true once already inside a resolved diamond
+     *  recipient's own subtree; threaded through unchanged to every recursive [plan] call
+     *  this makes for itself (nodeCap re-entry) — the AND-loop in [planMethodSlot] is the
+     *  only place that ever flips it from false to true. */
+    insideDiamondRecipient: Boolean = false,
 ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
 
     val productId = (demand["product_id"] as? String)?.trim() ?: ""
@@ -2484,6 +2761,7 @@ fun plan(
             diamondReserveFraction = diamondReserveFraction,
             intraBudget = intraBudget,
             intraBudgetBaseline = intraBudgetBaseline,
+            insideDiamondRecipient = insideDiamondRecipient,
         )
         // No cross-demand contention tag for quantity: critical materials are fully resolved by
         // the supply-guided pre-processor (buildSupplyAllocation's perLotBudgets) before this
@@ -2503,12 +2781,29 @@ fun plan(
         val ownDominator = demandBlueprint?.get(productId to locationId)?.quantityDominator
         // Which quantity_dominator wins: peggingNode's OWN dominator (from the recursive plan()
         // call just above, itself potentially chasing an even deeper, more specific cause) is
-        // ALWAYS preferred when present — same "don't overwrite a more specific existing
-        // dominator" rule as the AND-loop's and root-split loop's identical overrides. Only
-        // fall back to branchDominator (step c's per-branch guess) or ownDominator (the
-        // sketch-phase catch-all) when peggingNode didn't already resolve something of its own.
+        // preferred ONLY when the capped subtree itself genuinely fell short of nodeCap — same
+        // "don't overwrite a more specific existing dominator" rule as the AND-loop's and
+        // root-split loop's identical overrides, but gated on a real shortfall rather than mere
+        // non-emptiness. Since the real-lot dominator preference fix, plan() unconditionally
+        // decorates even a FULLY satisfied node with its own consumed-lot refs (a true "what I
+        // used" fact) — so a capped subtree that fully achieves nodeCap can still carry a
+        // non-empty quantity_dominator that documents its own consumption, not why the ORIGINAL,
+        // uncapped ask went unmet. Preferring that decorative tag here misattributes the demand's
+        // real shortfall (the cap itself) to whichever material the capped subtree happened to
+        // consume in full. Fall back to branchDominator (step c's per-branch guess) or
+        // ownDominator (the sketch-phase catch-all, which already knows the TRUE reason this
+        // node was capped) whenever the capped subtree didn't itself fall short.
+        // Observed live on case 173's 677_F29_2024_07_VIRTUAL under max_methods=3: a waterfall
+        // candidate's BOM-child demand was capped by nodeQtyCaps to 89.898 (from 333.33), fully
+        // satisfied that capped ask via 500-5392/283-0019 (both fully consumed, no local
+        // shortfall), yet those fully-satisfied materials' own consumed-lot refs were carried
+        // upward and blamed for the demand's real 243.4-unit gap.
         @Suppress("UNCHECKED_CAST")
-        val peggingHasOwnQtyDominator = !(peggingNode?.get("quantity_dominator") as? List<*>).isNullOrEmpty()
+        val peggingCommitted = (peggingNode?.get("committed_qty") as? Number)?.toDouble()
+        val peggingGenuinelyShort = peggingCommitted != null && peggingCommitted < nodeCap - 1e-6
+        @Suppress("UNCHECKED_CAST")
+        val peggingHasOwnQtyDominator = peggingGenuinelyShort &&
+            !(peggingNode?.get("quantity_dominator") as? List<*>).isNullOrEmpty()
         @Suppress("UNCHECKED_CAST")
         val peggingHasOwnTimeDominator = !(peggingNode?.get("time_dominator") as? List<*>).isNullOrEmpty()
         val qtyRefs: List<Map<String, Any?>>? = if (peggingHasOwnQtyDominator) {
@@ -2615,37 +2910,93 @@ fun plan(
         val prefix = "$componentKey|"
         val lotEntries = b.entries.filter { it.key.startsWith(prefix) }
         if (lotEntries.isEmpty()) null
-        else lotEntries.associateTo(mutableMapOf()) { (k, v) ->
-            // True remaining allowance for this lot, demand-wide: the static cap minus
-            // whatever this demand has PERMANENTLY consumed so far from it, across every
-            // independent branch of its own tree — not just `v` (budget's own local,
-            // rollback-scoped view, which legitimately resets to the full cap for every
-            // structurally-separate branch that reaches this lot, letting each one draw
-            // independently past the demand's true, single per-lot allocation).
-            val cap = initialBudget?.get(k)
-            val consumedSoFar = demandConsumed?.get(k) ?: 0.0
-            val trueRemaining = if (cap != null) (cap - consumedSoFar).coerceAtLeast(0.0) else v
-            val bounded = min(v, trueRemaining)
-            val sid = k.removePrefix(prefix)
-            demandWideRemainingBySid[sid] = bounded
-            // Third, tighter cap: this branch's own fair share (Phase 2's
-            // computeAndSiblingCaps split), if this call is inside a contending branch.
-            val branchCap = branchLotCap?.get(k)
-            val branchConsumedSoFar = branchConsumed?.get(k) ?: 0.0
-            val boundedForBranch = if (branchCap != null)
-                min(bounded, (branchCap - branchConsumedSoFar).coerceAtLeast(0.0)) else bounded
-            // Fourth, coarsest cap: this root-split candidate's own hard ceiling — see [plan]'s
-            // own [intraBudget] doc. Measured against demandConsumed (permanent, demand-wide)
-            // rather than branchConsumedSoFar (branch-scoped, reset at every discovered-recipient
-            // boundary) specifically so it catches consumption from ANY path within this
-            // candidate's subtree, including one that never itself matched a registered diamond
-            // recipient (branchCap above would be null there, giving it no narrowing at all).
-            val intraCap = intraBudget?.get(k)
-            val consumedByThisSlot = if (intraCap != null)
-                (demandConsumed?.get(k) ?: 0.0) - (intraBudgetBaseline?.get(k) ?: 0.0) else 0.0
-            val boundedForIntra = if (intraCap != null)
-                min(boundedForBranch, (intraCap - consumedByThisSlot).coerceAtLeast(0.0)) else boundedForBranch
-            sid to boundedForIntra   // supplyId → remaining
+        else {
+            // Pass 1: each lot's demand-wide-correct remaining BEFORE branch narrowing —
+            // v (budget's own live per-lot entry) capped by trueRemaining (initialBudget minus
+            // demandConsumed, the PERMANENT, never-restored-but-draw-only-updated per-lot
+            // ledger — see its own doc).
+            val trueRemainingBySid = lotEntries.associate { (k, v) ->
+                val cap = initialBudget?.get(k)
+                val consumedSoFar = demandConsumed?.get(k) ?: 0.0
+                val trueRemaining = if (cap != null) (cap - consumedSoFar).coerceAtLeast(0.0) else v
+                k.removePrefix(prefix) to trueRemaining
+            }
+            val rawBySid = lotEntries.associate { (k, v) ->
+                val sid = k.removePrefix(prefix)
+                sid to min(v, trueRemainingBySid[sid] ?: v)
+            }
+            // Reconciliation: `v` (budget's own live per-lot entry) can itself be a STALE
+            // competition-zone split — computeDiamondCapsForAttempt writes each recipient's
+            // narrowed share directly into budget's per-lot entries, and when the candidate
+            // that triggered that split is later abandoned, that write is not guaranteed to be
+            // restored at every level (confirmed live: a fresh, never-yet-drawn call already
+            // saw a halved per-lot v before any real draw had happened at all). So `v` cannot
+            // be trusted as the ceiling for repairing this — trueRemaining (initialBudget minus
+            // demandConsumed, which ONLY changes on an actual, real draw, never on a mere cap
+            // computation) is the reliable one. The aggregate budget[componentKey] (a simple
+            // budgetCap-minus-taken subtraction, independent of both v and demandConsumed)
+            // stays correct throughout and is the ground truth for "how much is really left."
+            // If it exceeds what the per-lot breakdown sums to, lift each lot's own raw
+            // remaining back up — capped at that lot's own trueRemaining, never resurrecting
+            // more than this demand's real, permanent per-lot entitlement — until the per-lot
+            // total matches the aggregate. Observed live on case 173's 858_F35_2024_07/08_
+            // VIRTUAL: aggregate correctly showed ~113 remaining while every one of 7 per-lot
+            // entries had been driven to 0 by a sibling candidate's abandoned diamond-cap split.
+            val aggregateRemaining = b[componentKey]
+            val rawTotal = rawBySid.values.sum()
+            val reconciledBySid = if (aggregateRemaining != null && aggregateRemaining > rawTotal + 1e-9) {
+                var deficit = aggregateRemaining - rawTotal
+                val lifted = rawBySid.toMutableMap()
+                // Distribute the shortfall across lots with spare headroom (trueRemaining >
+                // current raw), largest headroom first, until the deficit or headroom runs out.
+                for (sid in trueRemainingBySid.keys.sortedByDescending { (trueRemainingBySid[it] ?: 0.0) - (rawBySid[it] ?: 0.0) }) {
+                    if (deficit <= 1e-9) break
+                    val room = ((trueRemainingBySid[sid] ?: 0.0) - (lifted[sid] ?: 0.0)).coerceAtLeast(0.0)
+                    if (room <= 1e-9) continue
+                    val add = min(room, deficit)
+                    lifted[sid] = (lifted[sid] ?: 0.0) + add
+                    deficit -= add
+                }
+                lifted
+            } else rawBySid
+            demandWideRemainingBySid.putAll(reconciledBySid)
+            // Pass 2: layer branch/intra narrowing on top of the (possibly reconciled) demand-
+            // wide remaining — unchanged from before.
+            reconciledBySid.entries.associateTo(mutableMapOf()) { (sid, bounded) ->
+                val k = "$prefix$sid"
+                // Third, tighter cap: this branch's own fair share (Phase 2's
+                // computeAndSiblingCaps split), if this call is inside a contending branch.
+                val branchCap = branchLotCap?.get(k)
+                val branchConsumedSoFar = branchConsumed?.get(k) ?: 0.0
+                val boundedForBranch = if (branchCap != null)
+                    min(bounded, (branchCap - branchConsumedSoFar).coerceAtLeast(0.0)) else bounded
+                // Fourth, coarsest cap: this root-split candidate's own hard ceiling — see [plan]'s
+                // own [intraBudget] doc. Prefer branchConsumed (per-recipient, freshly reset to
+                // empty at THIS recipient's own branch boundary — confirmed live, never touched by
+                // a sibling recipient's own draws) over demandConsumed (permanent, demand-wide)
+                // whenever this call is inside a registered diamond-cap recipient's own branch
+                // (branchCap != null) — intraBudget itself is a single, frozen snapshot shared
+                // identically across every sibling recipient descending from the same root-split
+                // point, so measuring its consumption against the SHARED demandConsumed let one
+                // recipient's own real draw exhaust a DIFFERENT sibling's entirely separate
+                // allotment of the very same nominal cap, even though branchLotCap/branchConsumed
+                // (the mechanism that's supposed to keep siblings isolated) was working correctly
+                // the whole time. Observed live on case 173's 858_F35_2024_07/08_VIRTUAL:
+                // VirtualProduct_280-1159_A1 draws 56 units (its own fair share), and immediately
+                // afterward VirtualProduct_280-1159_A3 — a true sibling with its OWN untouched,
+                // empty branchConsumed — hits a false "no_methods" because intraCap minus A1's
+                // now-recorded demandConsumed charge is exactly 0, despite A3 never having drawn
+                // anything. Still fall back to demandConsumed (with its own baseline offset) for
+                // an UNPROTECTED consumer with no branch-level tracking of its own (branchCap ==
+                // null) — that's the scenario this measurement was originally built for.
+                val intraCap = intraBudget?.get(k)
+                val consumedByThisSlot = if (intraCap == null) 0.0
+                    else if (branchCap != null) branchConsumedSoFar
+                    else (demandConsumed?.get(k) ?: 0.0) - (intraBudgetBaseline?.get(k) ?: 0.0)
+                val boundedForIntra = if (intraCap != null)
+                    min(boundedForBranch, (intraCap - consumedByThisSlot).coerceAtLeast(0.0)) else boundedForBranch
+                sid to boundedForIntra   // supplyId → remaining
+            }
         }
     }
     // Aggregate cap: explicit key, or sum of per-lot entries.
@@ -2659,6 +3010,49 @@ fun plan(
         inventory, productId, locationId, quantity, preferDemandId, null, perLotBudget,
     )
     val taken = consumedBuckets.sumOf { it.qty }
+    // Real, physical lots THIS node actually drew from — the informative, "688_M51-style"
+    // dominator when this draw still falls short of what was asked. Without this, a demand
+    // that partially satisfies its own ask from a real (but shared/exhausted) supply lot, then
+    // falls through to a method-waterfall whose only candidate is a structurally-impossible
+    // dead end (e.g. a move whose source location can never have supply), ends up with THAT
+    // dead end's placeholder ("no supply method") as its sole dominator — dedupBySupply()'s own
+    // "a real lot beats a placeholder" rule never gets a chance to apply, because these real
+    // lots were never added to the union it operates on. See "283-0226@1000 (no supply
+    // method)" replacing "283-0226@2000 (283-0226_2000_9075)" on case 173's F37/M51-family
+    // demands for the live bug this fixes.
+    // Quantity dominator is scoped to raw+critical positions everywhere else in this file (see
+    // rawDominatorRefs's own isRawLeaf gate) — a material with a make method (or an admitted buy)
+    // is elastic, so exhausting one specific lot of it was never the reason a demand fell short
+    // (more could always have been produced/bought). Without this gate, ANY direct-inventory draw
+    // — critical or not — got tagged as a "bom_child" quantity dominator here and then survived
+    // verbatim through rawDominatorRefs's "existing non-empty → return as-is" shortcut, leaking
+    // non-critical materials (e.g. case 173's 500-6336, 262-0164-CD — both independently
+    // manufacturable) into a demand's quantity_dominator alongside its genuine critical-material
+    // cause. Time has no such gate by design (any real lot's arrival date is fixed regardless of
+    // whether the product also has an elastic path) — ownLotLatestTimeRef below stays ungated.
+    val ownLotRefs: List<DominatorRef> = if (isRawCriticalPosition(productId, locationId, data, config))
+        consumedBuckets.mapNotNull { bucket ->
+            val sid = bucket.supplyId ?: return@mapNotNull null
+            DominatorRef(kind = "bom_child", productId = productId, locationId = locationId,
+                supplyId = sid, label = "$productId@$locationId ($sid)")
+        }
+    else emptyList()
+    // Time counterpart: "latest wins," exactly one dominator (unlike quantity's OR-group union)
+    // — the single latest-dated real lot this node itself drew from. Without this, a node whose
+    // own direct-inventory draw (not any method-waterfall candidate) sets the actual latest
+    // commit time never gets a chance to record why — latestCommit/latestCommitDominator below
+    // are only ever fed by method candidates, so a demand fully satisfied straight from a late
+    // real lot (no method needed at all) ends up with an empty time_dominator despite a real,
+    // traceable raw-material cause. This is what lets "latest wins" propagate all the way down
+    // to a genuine raw supply lot through both AND (computeStartDt) and OR (below) associations,
+    // and — via wave consolidation's resolveWavePeer, which reads exactly this field — across
+    // demands too.
+    val ownLotLatestBucket = consumedBuckets.maxByOrNull { parseDate(it.commitTime) ?: LocalDate.MIN }
+    val ownLotLatestTime: LocalDate? = ownLotLatestBucket?.let { parseDate(it.commitTime) }
+    val ownLotLatestTimeRef: DominatorRef? = ownLotLatestBucket?.supplyId?.let { sid ->
+        DominatorRef(kind = "bom_child", productId = productId, locationId = locationId,
+            supplyId = sid, label = "$productId@$locationId ($sid)")
+    }
     // Permanently record this draw against the demand-wide cap — deliberately NOT part of
     // any snapshot/restore scope, so a later, structurally-independent branch of this same
     // demand's tree can't get a fresh, un-depleted view of a lot this demand already spent
@@ -2757,17 +3151,24 @@ fun plan(
     }
 
     val demandNetQty = quantity - taken
+    // Real, single-latest-lot time dominator for a node fully (or near-fully) satisfied by
+    // direct inventory alone — no method/waterfall ever runs for these, so without this the
+    // "latest wins" AND/OR propagation chain (computeStartDt above, the waterfall wrap-up below)
+    // silently breaks the moment it bottoms out at a pure-inventory leaf, even though this is
+    // exactly the node with the real raw-lot answer to propagate. See ownLotLatestTimeRef's own
+    // doc for the full rationale.
+    val ownLotTimeDominator = ownLotLatestTimeRef?.let { listOf(it) } ?: emptyList()
     if (demandNetQty <= 1e-9) {
         // Treat sub-epsilon residuals as fully satisfied (prevents floating-point drift from
         // cascading into child_failed when a consolidation proportional share rounds down by ε)
-        return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, fulfillCommitTime, committedQty = taken))
+        return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, fulfillCommitTime, committedQty = taken, timeDominator = ownLotTimeDominator))
     }
     // Sub-half residuals after partial inventory consumption are numerical noise from
     // proportional pda splits and partial-replan scaling (e.g. demand=2119 vs synthetic
     // bucket=2118.95 leaves a 0.05 residual). Recursing on those produces a roundQty(0.x)=0
     // WO in the ledger and a phantom pegging entry — absorb them as fulfilled instead.
     if (taken > 0 && demandNetQty < 0.5) {
-        return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, fulfillCommitTime, committedQty = quantity))
+        return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, fulfillCommitTime, committedQty = quantity, timeDominator = ownLotTimeDominator))
     }
 
     // 2) Get methods
@@ -2844,7 +3245,22 @@ fun plan(
         // their real allocated/consumed figures lets the table itself answer which case
         // this is, instead of a label ("no supply method") that reads as the latter even
         // when it's actually the former.
-        val entitledLots = initialBudget?.keys
+        //
+        // Only attach it as this node's OWN quantity_dominator when this node itself is
+        // genuinely short (demandNetQty > 0) — a fully-satisfied node (taken >= quantity,
+        // "no methods beyond direct inventory" is structurally true for a raw+critical
+        // material but never actually bound anything here) must not carry a non-empty
+        // dominator at all, because bomChildDominatorRefs' "winner" selection (see its own
+        // doc) copies ANY tied AND-sibling's non-empty dominator up to its parent regardless
+        // of whether that specific sibling had a shortfall — an unconditional citation here
+        // then propagates into genuinely-short, structurally-unrelated ancestors as a false
+        // R13 dominator. Traced live on case 173's 688_M51_2024_10_VIRTUAL under
+        // max_methods=4: several fully-satisfied 160-1153@1000 demand nodes (taken == quantity)
+        // each carried all 12 lots they'd ever drawn from as their own dominator; one of them
+        // won the tied-sibling pick at an ancestor AND-group and got copied onto the root,
+        // even though 11 of those 12 lots were genuinely exhausted system-wide and the 12th
+        // (160-1153_100020240929) still had 384 units of this demand's own entitlement unused.
+        val entitledLots = if (demandNetQty <= 1e-6) emptyList() else initialBudget?.keys
             ?.filter { it.startsWith("$componentKey|") }
             ?.mapNotNull { lotKey ->
                 val sid = lotKey.removePrefix("$componentKey|").takeIf { it.isNotBlank() } ?: return@mapNotNull null
@@ -3059,23 +3475,30 @@ fun plan(
         // short simply leaves more for the next candidate's own later call here — the waterfall
         // loop's own iteration IS the "rerun with leftover quantity"; no separate rerun trigger
         // needed.
-        // Reserve only what root-split slots STILL TO COME need protecting — this candidate is
-        // free to absorb whatever earlier slots' true consumption left behind, down to (but not
-        // below) the reservation for whoever's still ahead in the queue. The last slot has
-        // nothing left to protect (reserve sums to 0) and gets the full true remaining pool.
-        // At the ROOT with root-split active, this is freshly computed per slot; everywhere else
-        // (ordinary sequential waterfall, or any non-root nested call) rootSplitWeights is null,
-        // so INHERIT whatever reserve fraction an enclosing root-split slot already established
-        // (diamondReserveFraction, this call's own parameter — 0.0 unless we're nested inside
-        // one). Without this inheritance, a nested computeDiamondCapsForAttempt call several BOM
-        // levels below a root-split candidate's own top-level method always computes reserve=0
-        // (it's never itself isRoot), so it sees the full, un-reserved remaining pool and can
-        // consume a sibling candidate's entire protected share before that sibling gets its own
-        // turn — observed live on case 173's 858_F35_2024_08_VIRTUAL: candidate 500-6267,
-        // entitled to only 2/3 of the demand's 160-1153 budget, consumed the full 100% through
-        // a nested waterfall reaching 280-1159_A1/_A3 several levels below its own top-level
-        // method, leaving nothing for candidate 500-6161's reserved 1/3 turn.
-        val effectiveReserve = rootSplitWeights?.drop(slotIdx + 1)?.sum() ?: diamondReserveFraction
+        // No pre-set reservation for root-alternatives on a shared critical material — each
+        // root-split slot (including every OR-alternative it falls through to internally, and
+        // every subsequent WORK-ORDER-level slot the outer waterfall tries after it) sees the
+        // FULL remaining pool, exactly like [slotIntraBudget] below already does. Root-split only
+        // ever divides the DEMAND'S OWN QUANTITY across alternatives (rootSplitWeights/[target]
+        // above) — it was never meant to also pre-carve the shared critical-material pool itself.
+        // A prior version reserved `rootSplitWeights.drop(slotIdx+1).sum()` of the pool for
+        // "slots still to come" specifically to stop a nested computeDiamondCapsForAttempt call
+        // (reached several BOM levels below a root-split candidate's own top-level method) from
+        // consuming a later sibling's entire share before that sibling's own turn — but this
+        // traded one bug for another: on case 173's 688_M51_2024_10_VIRTUAL family (max_methods=4),
+        // reserving 75%/50%/25% for not-yet-tried work-order slots forced EACH slot's own A1/A3
+        // diamond pair down to as little as 1/8 of the demand-wide pool, well under what either
+        // side's own ask needed — manufacturing an artificial shortfall that then had to be
+        // "rescued" by an unrelated, unreserved OR-alternative (e.g. 280-1663) reaching the SAME
+        // material with no narrowing at all, and left a permanent demandConsumed overcharge when
+        // that rescue's own work order was later only partially kept. The lower-level
+        // demandConsumed/trueRemaining mechanism (permanent, cumulative across every slot — see
+        // [slotIntraBudget]'s own doc, same rationale) is what actually, reliably prevents any
+        // real over-draw across root-split slots; a live, per-attempt reservation on top of that
+        // is redundant and, as above, actively harmful. Always inherit [diamondReserveFraction]
+        // unchanged (0.0 unless some future caller sets it) rather than deriving a fresh value
+        // from rootSplitWeights here.
+        val effectiveReserve = diamondReserveFraction
         // Hard, per-lot ceiling for THIS root-split candidate's own ENTIRE subtree — see
         // [plan]'s own [intraBudget] doc for why this is a separate, coarser mechanism from
         // [diamondReserveFraction]/[diamondRecipientCaps]: those only bind at a discovered
@@ -3083,10 +3506,27 @@ fun plan(
         // WITHOUT itself being a registered recipient inherits no narrowing at all. Set fresh,
         // ONCE, only at the actual root-split point (rootSplitWeights != null) — every other
         // (non-root-split) call inherits whatever its own parent already established, unchanged.
+        //
+        // Deliberately NOT pre-divided by this slot's own rootSplitWeights share: an earlier
+        // version multiplied diamondCriticalEntitlement by `weight`, artificially pre-splitting
+        // a shared critical material's entitlement across root-level alternatives BEFORE any of
+        // them had actually tried to use it — so a candidate that could have delivered the full
+        // amount was capped down to a "fair" fraction, leaving real, physical, entitled supply
+        // unused even when no other candidate ever needed it. Delivery matters more than an even
+        // split among root-alternatives: each root-split candidate is entitled to the FULL
+        // remaining pool on a shared critical material, not a pre-carved fraction of it. The
+        // lower-level demandConsumed/trueRemaining mechanism (see perLotBudget's own doc) is what
+        // actually, reliably prevents any real over-draw beyond the true remaining entitlement —
+        // it's permanent and cumulative across every slot, unlike intraBudget's own per-slot
+        // baseline reset — so removing the pre-split here doesn't risk double-spending; it only
+        // stops an earlier candidate from being blocked from entitlement no later candidate ever
+        // touches. Observed live on case 173's 677_F29_2024_07_VIRTUAL: a single root-split
+        // candidate's own reachable lot for 283-0019 was pre-capped to a 1/N fraction (87.898)
+        // of its true entitlement, leaving the demand short by exactly that gap even though
+        // nothing else in the case was competing for the same lot.
         val slotIntraBudget: Map<String, Double>? = if (rootSplitWeights != null) {
-            val weight = rootSplitWeights.getOrNull(slotIdx) ?: (1.0 / cap)
             diamondCriticalEntitlement?.values?.flatMap { it.entries }
-                ?.associate { it.key to it.value * weight }
+                ?.associate { it.key to it.value }
                 ?.takeIf { it.isNotEmpty() }
         } else intraBudget
         // Snapshot of demandConsumed taken at THIS slot's own start — paired with
@@ -3096,20 +3536,15 @@ fun plan(
         // same reason as slotIntraBudget above.
         val slotIntraBudgetBaseline: Map<String, Double>? =
             if (rootSplitWeights != null) demandConsumed?.toMap() else intraBudgetBaseline
-        val slotDiamondCaps = if (diamondRecipients.isNullOrEmpty() || diamondCriticalEntitlement.isNullOrEmpty()) {
-            diamondRecipientCaps
-        } else {
-            computeDiamondCapsForAttempt(
-                productId = productId, locationId = locationId,
-                method = candidate.method, altKey = candidate.altKey,
-                demand = demand, config = config, data = data,
-                preferenceKb = preferenceKb,
-                diamondRecipients = diamondRecipients,
-                diamondCriticalEntitlement = diamondCriticalEntitlement,
-                budget = budget,
-                reserveForLaterCandidates = effectiveReserve,
-            )
-        }
+        // The diamond split itself is no longer computed here — a per-OR-node/per-waterfall-slot
+        // recompute has no reliable way to know whether it's sitting at a genuine AND-group
+        // "competition zone" boundary or several levels inside one already-resolved recipient's
+        // own subtree (both looked identical from here, which was the root cause of the
+        // 531.82→267 and 178.07-three-way-split bugs). It's now computed exactly once, at the
+        // AND-group's own parent node, in planMethodSlot's pre-loop "competition zone" block —
+        // see its own doc. diamondRecipientCaps/diamondRecipients/diamondCriticalEntitlement
+        // just thread through unchanged here so planMethodSlot has what it needs when IT is
+        // itself an AND-group parent.
         val attempt = planMethodSlot(
             m = candidate.method, slotQty = slotQty,
             productId = productId, locationId = locationId,
@@ -3134,12 +3569,13 @@ fun plan(
             branchLineage = slotBranchLineage,
             andSiblingDominators = andSiblingDominators,
             branchDominator = slotBranchDominator,
-            diamondRecipientCaps = slotDiamondCaps,
+            diamondRecipientCaps = diamondRecipientCaps,
             diamondRecipients = diamondRecipients,
             diamondCriticalEntitlement = diamondCriticalEntitlement,
             diamondReserveFraction = effectiveReserve,
             intraBudget = slotIntraBudget,
             intraBudgetBaseline = slotIntraBudgetBaseline,
+            insideDiamondRecipient = insideDiamondRecipient,
         )
         // Intra-demand sibling contention (step c), applied directly here rather than relying
         // solely on plan()'s nodeCap-gated tagging site — same rationale as the AND-loop's
@@ -3267,7 +3703,14 @@ fun plan(
         demandFulfilledList.add(committedRow(0.0, reqTimeStr, lastBlockedReason ?: "no_methods_succeeded"))
         val failedPegging = combinedPegging + peggingChildren
         val rel = if (failedPegging.size > 1) "or" else null
-        return Triple(demandFulfilledList, emptyList(), demandNode(failedPegging, reqTimeStr, lastBlockedReason, committedQty = taken, childrenRelation = rel, quantityDominator = qtyDominatorForDemand.dedupBySupply()))
+        // Every method candidate failed, but this node's OWN direct-inventory draw (taken > 0)
+        // may still have genuinely committed something with its own real arrival date — that
+        // real date (and the real lot behind it), not reqTimeStr, is this node's true commit
+        // time and time dominator when it applies. See ownLotLatestTime's own doc.
+        val blockedCommitTimeStr = if (ownLotLatestTime != null) formatDate(ownLotLatestTime) else reqTimeStr
+        return Triple(demandFulfilledList, emptyList(), demandNode(failedPegging, blockedCommitTimeStr, lastBlockedReason, committedQty = taken, childrenRelation = rel,
+            timeDominator = ownLotLatestTimeRef?.let { listOf(it) } ?: emptyList(),
+            quantityDominator = (ownLotRefs + qtyDominatorForDemand).dedupBySupply()))
     }
 
     // Some commit. Combine all attempted WOs (success + blocked) in pegging. Siblings
@@ -3275,16 +3718,23 @@ fun plan(
     // part of the demand) — mark "or" so the UI labels them as alternatives.
     peggingChildren.addAll(combinedPegging)
     val partialReason = if (residual > 1e-9) "partial" else null
-    val commitTimeStr = formatDate(latestCommit)
+    // "Latest wins" between this node's own direct-inventory draw and whatever the method
+    // waterfall (above) separately contributed — the OVERALL commit time and its dominator must
+    // both reflect whichever one is genuinely later, not just the waterfall's own view.
+    val finalLatestCommit = if (ownLotLatestTime != null && (latestCommit == null || ownLotLatestTime > latestCommit))
+        ownLotLatestTime else latestCommit
+    val finalLatestCommitDominator = if (finalLatestCommit == ownLotLatestTime && ownLotLatestTimeRef != null)
+        listOf(ownLotLatestTimeRef) else latestCommitDominator
+    val commitTimeStr = formatDate(finalLatestCommit)
     demandFulfilledList.add(committedRow(totalAchievable, commitTimeStr, partialReason))
     val rel = if (peggingChildren.size > 1) "or" else null
     return Triple(demandFulfilledList, combinedWos, demandNode(
         peggingChildren, commitTimeStr ?: reqTimeStr, partialReason, committedQty = taken + totalAchievable, childrenRelation = rel,
-        timeDominator = latestCommitDominator,
+        timeDominator = finalLatestCommitDominator,
         // Only when the OVERALL waterfall genuinely fell short — a candidate that failed but
         // was fully compensated by a later one must not leave a stale dominator behind on an
         // otherwise fully-satisfied demand.
-        quantityDominator = if (residual > 1e-9) qtyDominatorForDemand.dedupBySupply() else emptyList(),
+        quantityDominator = if (residual > 1e-9) (ownLotRefs + qtyDominatorForDemand).dedupBySupply() else emptyList(),
     ))
 }
 
@@ -3339,15 +3789,29 @@ private fun computeStartDt(
         val latestChild = commitTimesWithSource.maxOf { it.first }
         if (latestChild > startDt) {
             startDt = latestChild
-            // "Latest time dominates": unlike quantity (an OR-group can have several genuine
-            // contributing alternatives), time has exactly ONE dominator — whichever single
-            // child's commit time is the actual latest. Several dates can tie exactly (a
-            // multi-lot child contributes several commit_times, or a pre-equalized wave), but
-            // that's not evidence of several equally-responsible causes — pick the first tied
-            // child and propagate its own (already-resolved) dominator verbatim.
-            val winner = commitTimesWithSource.firstOrNull { it.first == latestChild }?.second
-            dominator = rawDominatorRefs(winner?.pegging, "time_dominator", "bom_child", data, config)
         }
+        // "Latest time dominates": unlike quantity (an OR-group can have several genuine
+        // contributing alternatives), time has exactly ONE dominator — whichever single child's
+        // commit time is the actual latest. Several dates can tie exactly (a multi-lot child
+        // contributes several commit_times, or a pre-equalized wave), but that's not evidence of
+        // several equally-responsible causes. Among tied children, prefer whichever ALREADY
+        // carries its own genuine (non-empty) time_dominator — mirrors bomChildDominatorRefs's
+        // identical tie-break for quantity. A plain firstOrNull() picks whichever tied child
+        // happens to come first in iteration order, which is frequently an elastic purchase leaf
+        // (no dominator by design — purchases are never a genuine cause) sitting ahead of a
+        // sibling that traces to a real raw supply lot, silently dropping the real answer purely
+        // due to list ordering. Resolved unconditionally (NOT gated on latestChild > startDt,
+        // i.e. NOT only when this child pushed the parent beyond its own lead-time baseline) — a
+        // raw-material trail should always be traceable for any node that has one, whether or not
+        // consolidation/contention happened to push the schedule out further than plain lead-time
+        // accumulation alone would. Gating this the same way startDt itself is gated conflates
+        // "did this change the schedule" with "is there a real cause to point at" — the latter is
+        // the whole point of a dominator.
+        val tiedForLatest = commitTimesWithSource.filter { it.first == latestChild }
+        val winner = (tiedForLatest.firstOrNull { (_, cr) ->
+            !(cr.pegging?.get("time_dominator") as? List<*>).isNullOrEmpty()
+        } ?: tiedForLatest.firstOrNull())?.second
+        dominator = rawDominatorRefs(winner?.pegging, "time_dominator", "bom_child", data, config)
     }
     return startDt to dominator
 }
@@ -3621,10 +4085,19 @@ internal fun reconcile(
             // scale-down that under-commits what the child actually delivered).
             // "Least dominates, and that's the dominator for the WHOLE AND-group": the winning
             // (least-achieving) sibling's dominator isn't just this WO's own — it's WHY every
-            // other sibling got scaled down too, even the ones that fully achieved their own
-            // ask. Copy it onto them directly (unless a sibling already carries its own, more
-            // specific dominator from being independently constrained) so a sibling scaled down
-            // by scaleSubtree below isn't left looking unexplained.
+            // OTHER GENUINELY-SCALED-DOWN sibling got reduced too. Copy it onto those siblings
+            // directly (unless a sibling already carries its own, more specific dominator from
+            // being independently constrained) so a sibling scaled down by scaleSubtree below
+            // isn't left looking unexplained. Gated on `wasScaled` (not just "carries no
+            // dominator yet") — a sibling whose own rate-scaled target already matched what it
+            // asked for (the `else asked` branch below, no scaleSubtree applied) was NEVER
+            // actually constrained by this AND-group's bottleneck, even if its own `third` value
+            // happened to tie the group minimum (ties are the norm here, not genuine shared
+            // causation — see `minVal`'s own comment above). Blindly tagging it anyway falsely
+            // blames a fully-successful, often materially-unrelated sibling for a shortfall that
+            // was never its own — confirmed live on case 173's 20018963_20, where several
+            // directly-inventory-backed siblings (zero shortfall, single supply-leaf child) all
+            // inherited a sibling's 160-1153 dominator this way.
             val groupDominatorJson: List<Map<String, Any?>>? =
                 existingDominator ?: qtyDominatorRefs.takeIf { it.isNotEmpty() }?.toJsonList()
             var askIdx = 0
@@ -3632,14 +4105,23 @@ internal fun reconcile(
                 val cm = ch as? Map<String, Any?> ?: return@map ch
                 if (cm["type"] != "demand") return@map cm
                 val (asked, r, _) = firstAsk[askIdx]; askIdx++
-                val trimmed = if (rel == "or") {
-                    asked  // keep each variant's reconciled commitment as-is
+                val trimmed: Map<String, Any?>
+                val wasScaled: Boolean
+                if (rel == "or") {
+                    trimmed = asked  // keep each variant's reconciled commitment as-is
+                    wasScaled = false
                 } else {
                     val askedCommitted = (asked["committed_qty"] as? Number)?.toDouble() ?: (want * r)
                     val targetT = supply * r
-                    if (askedCommitted > 1e-9 && targetT < askedCommitted - 1e-9) scaleSubtree(asked, targetT / askedCommitted) else asked
+                    if (askedCommitted > 1e-9 && targetT < askedCommitted - 1e-9) {
+                        trimmed = scaleSubtree(asked, targetT / askedCommitted)
+                        wasScaled = true
+                    } else {
+                        trimmed = asked
+                        wasScaled = false
+                    }
                 }
-                if (rel != "or" && groupDominatorJson != null && trimmed["quantity_dominator"] == null)
+                if (rel != "or" && wasScaled && groupDominatorJson != null && trimmed["quantity_dominator"] == null)
                     trimmed + ("quantity_dominator" to groupDominatorJson)
                 else trimmed
             }
@@ -5104,6 +5586,18 @@ internal fun extractSupplyAllocations(
         val lid = (s["location_id"] as? String)?.trim() ?: return@mapNotNull null
         sid to (pid to lid)
     }.toMap()
+    // perLotBudgets[demandId][lotKey] is ONE pool shared by the whole demand at that lot — not
+    // per-consuming-leaf. A demand can have several separate result rows against the SAME lot
+    // (e.g. two distinct AND-sibling branches that each independently, legitimately draw from
+    // the same shared critical material — confirmed live on case 173's 688_F35_2024_07_VIRTUAL,
+    // where AND-siblings VirtualProduct_280-1159_A1 and _A3 both draw 160-1153 from the same
+    // lot). Attaching the full pool value to EVERY such row double-(or N-times-)counts the same
+    // entitlement in any aggregate sum over qty_allocated (R13's own check, persisted totals) —
+    // qty_consumed is correctly per-row (each branch's own real, distinct draw), only
+    // qty_allocated needs deduping. Track which (demandId, lotKey) pairs have already been
+    // assigned the pool and zero out qty_allocated on subsequent rows for the same pair — the
+    // pool is still fully represented exactly once in the aggregate.
+    val assignedPool = mutableSetOf<Pair<String, String>>()
     for (rec in result) {
         val sid = rec["supply_id"] as? String
         val isCritical = criticalSupplyIds == null || (sid != null && sid in criticalSupplyIds)
@@ -5113,11 +5607,44 @@ internal fun extractSupplyAllocations(
             null  // non-critical (purchasable): FIFO consumption, no allocation concept
         } else if (pidLid != null && did != null && perLotBudgets != null) {
             val lotKey = "${pidLid.first}|${pidLid.second}|$sid"
-            perLotBudgets[did]?.get(lotKey) ?: 0.0
+            val poolKey = did to lotKey
+            if (assignedPool.add(poolKey)) perLotBudgets[did]?.get(lotKey) ?: 0.0 else 0.0
         } else {
             0.0
         }
         rec["qty_allocated"] = qtyAllocated
+    }
+    // Surface entitlement even for lots this demand never actually drew from — walk() only
+    // ever creates a row when a supply/purchase LEAF has positive quantity, so a lot the demand
+    // was genuinely entitled to (part of its own perLotBudgets pool) but whose leaf ended up at
+    // zero (e.g. an AND-min rescale re-derived the final commit using fewer/earlier lots than
+    // the live draw actually touched) got NO row at all — not even qty_allocated with
+    // qty_consumed=0 — silently understating the demand's true entitlement total (observed live
+    // on case 173's 858_F35_2024_08_VIRTUAL: the UI's own "Qty limited by" footer summed to 195
+    // across 5 lots with a surviving leaf, while the demand's actual live entitlement, read
+    // straight from budget/perLotBudgets at commit time, totaled 626 across 9). Emit a
+    // zero-consumed row for every (demand, lot) pair perLotBudgets knows about that the walk
+    // above never claimed, so the full entitlement is always visible regardless of whether the
+    // final tree still needed it.
+    if (perLotBudgets != null) {
+        for ((didAny, lotMap) in perLotBudgets) {
+            val did = didAny as? String ?: continue
+            for ((lotKey, qty) in lotMap) {
+                if (qty <= 1e-9) continue
+                val parts = lotKey.split("|", limit = 3)
+                if (parts.size < 3) continue  // aggregate "pid|lid" key, not a genuine per-lot entry
+                val sid = parts[2]
+                if (criticalSupplyIds != null && sid !in criticalSupplyIds) continue
+                if (assignedPool.add(did to lotKey)) {
+                    result.add(mutableMapOf(
+                        "supply_id" to sid,
+                        "demand_id" to did,
+                        "qty_consumed" to 0.0,
+                        "qty_allocated" to qty,
+                    ))
+                }
+            }
+        }
     }
     return result
 }

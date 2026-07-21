@@ -11,12 +11,12 @@ private val gcLog = LoggerFactory.getLogger("com.allocator.services.GCEngine")
  * in [planMethodSlot] for the AND-min partial-fulfillment case.
  *
  * Returns a new (immutable) pegging node with corrected quantities.
- * [inventory] and [budget] are mutated in-place as excess is returned.
+ * [inventory], [budget], and [demandConsumed] are mutated in-place as excess is returned.
  *
  * Node dispatch:
  *   "demand"     — update committed_qty; trim WO children then supply children
  *   "work_order" — trim quantity; recurse into AND/OR children with bom_rate scaling
- *   "supply"     — return excess qty to inventory bucket + restore budget entries
+ *   "supply"     — return excess qty to inventory bucket + restore budget/demandConsumed entries
  *   "purchase"   — leaf (new procurement); cap quantity but no inventory return
  *   "operation"  — capacity metadata only; skip
  *   "resource"   — capacity metadata only; skip
@@ -27,10 +27,22 @@ internal fun garbageCollectPegging(
     effectiveCap: Double,
     inventory: MutableList<MutableMap<String, Any?>>,
     budget: MutableMap<String, Double>?,
+    /** Permanent, demand-wide per-lot consumption ledger (see [plan]'s own doc) — must be
+     *  given back the same excess as [budget] whenever GC trims a supply leaf, or a sibling
+     *  root-split candidate reading `initialBudget[lot] - demandConsumed[lot]` (the "true
+     *  remaining" reconciliation in [plan]'s own perLotBudget construction) sees this lot as
+     *  still fully spent even though [budget] and physical [inventory] both correctly show the
+     *  trimmed-back headroom. Observed live on case 173's 858_F35_2024_08_VIRTUAL: the first
+     *  root-alternative (500-6267) drew 313.41 units of 160-1153 per AND-sibling during its own
+     *  first pass, GC then trimmed each sibling's KEPT commitment down to ~90 (returning ~223
+     *  units to inventory/budget) — but demandConsumed stayed at the full, un-trimmed 313.41,
+     *  so the second root-alternative (500-6161) saw zero true remaining entitlement on every
+     *  lot 500-6267 had ever touched, even lots with substantial real headroom. */
+    demandConsumed: MutableMap<String, Double>? = null,
 ): Map<String, Any?> = when (node["type"] as? String) {
-    "supply"     -> gcSupplyNode(node, effectiveCap, inventory, budget)
-    "work_order" -> gcWoNode(node, effectiveCap, inventory, budget)
-    "demand"     -> gcDemandNode(node, effectiveCap, inventory, budget)
+    "supply"     -> gcSupplyNode(node, effectiveCap, inventory, budget, demandConsumed)
+    "work_order" -> gcWoNode(node, effectiveCap, inventory, budget, demandConsumed)
+    "demand"     -> gcDemandNode(node, effectiveCap, inventory, budget, demandConsumed)
     "purchase"   -> {
         val q = (node["quantity"] as? Number)?.toDouble() ?: 0.0
         if (q <= effectiveCap + 1e-9) node else node + ("quantity" to roundQty(effectiveCap))
@@ -46,6 +58,7 @@ private fun gcSupplyNode(
     effectiveCap: Double,
     inventory: MutableList<MutableMap<String, Any?>>,
     budget: MutableMap<String, Double>?,
+    demandConsumed: MutableMap<String, Double>?,
 ): Map<String, Any?> {
     val nodeQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
     if (nodeQty <= effectiveCap + 1e-9) return node
@@ -74,6 +87,15 @@ private fun gcSupplyNode(
             if (budget.containsKey(lotKey)) budget[lotKey] = budget[lotKey]!! + excess
         }
     }
+    // Restore demandConsumed's own per-lot entry too — same key shape budget uses, and the
+    // ONLY place this permanent ledger ever gets decremented (see this function's own doc for
+    // why leaving it un-restored strands a sibling root-split candidate's entitlement).
+    if (demandConsumed != null && supplyId != null) {
+        val lotKey = "$pid|$lid|$supplyId"
+        if (demandConsumed.containsKey(lotKey)) {
+            demandConsumed[lotKey] = (demandConsumed[lotKey]!! - excess).coerceAtLeast(0.0)
+        }
+    }
 
     // Keep exact double — mirrors the "do not round supply leaves" policy from
     // consumeFromInventory (PlanningEngine.kt:2249). GC returns exact excess to
@@ -89,6 +111,7 @@ private fun gcWoNode(
     effectiveCap: Double,
     inventory: MutableList<MutableMap<String, Any?>>,
     budget: MutableMap<String, Double>?,
+    demandConsumed: MutableMap<String, Double>?,
 ): Map<String, Any?> {
     val woQty = (node["quantity"] as? Number)?.toDouble() ?: 0.0
     if (woQty <= effectiveCap + 1e-9) return node
@@ -100,7 +123,7 @@ private fun gcWoNode(
     val newChildren: List<Map<String, Any?>> = when (childrenRelation) {
         "or" ->
             // OR-split (variant alternatives under a make WO): trim last child first
-            gcTrimOrChildren(children, effectiveCap, inventory, budget)
+            gcTrimOrChildren(children, effectiveCap, inventory, budget, demandConsumed)
 
         else -> {
             // AND-group (standard BOM children, or null for single child).
@@ -115,7 +138,7 @@ private fun gcWoNode(
                                 val cq = committedQtyOf(child)
                                 if (woQty > 1e-9) cq / woQty else 0.0
                             }
-                        garbageCollectPegging(child, effectiveCap * bomRate, inventory, budget)
+                        garbageCollectPegging(child, effectiveCap * bomRate, inventory, budget, demandConsumed)
                     }
                 }
             }
@@ -137,6 +160,7 @@ private fun gcDemandNode(
     effectiveCap: Double,
     inventory: MutableList<MutableMap<String, Any?>>,
     budget: MutableMap<String, Double>?,
+    demandConsumed: MutableMap<String, Double>?,
 ): Map<String, Any?> {
     // Prefer the unrounded "committed_qty_precise" (see demandNode()'s own doc) — reading
     // the rounded "committed_qty" here computes excess against an inflated figure (e.g.
@@ -163,7 +187,7 @@ private fun gcDemandNode(
         val woQty = ((wo["quantity_precise"] as? Number) ?: (wo["quantity"] as? Number))?.toDouble() ?: 0.0
         val trim  = min(woQty, excess)
         excess -= trim
-        garbageCollectPegging(wo, woQty - trim, inventory, budget)
+        garbageCollectPegging(wo, woQty - trim, inventory, budget, demandConsumed)
     }.reversed()
 
     // Trim supply children (LIFO — return the latest inventory buckets first)
@@ -172,7 +196,7 @@ private fun gcDemandNode(
         val sq   = (supply["quantity"] as? Number)?.toDouble() ?: 0.0
         val trim = min(sq, excess)
         excess -= trim
-        garbageCollectPegging(supply, sq - trim, inventory, budget)
+        garbageCollectPegging(supply, sq - trim, inventory, budget, demandConsumed)
     }.reversed()
 
     val newChildren = newSupplyChildren + newWoChildren + otherChildren
@@ -191,6 +215,7 @@ private fun gcTrimOrChildren(
     targetTotal: Double,
     inventory: MutableList<MutableMap<String, Any?>>,
     budget: MutableMap<String, Double>?,
+    demandConsumed: MutableMap<String, Double>?,
 ): List<Map<String, Any?>> {
     // Walk in reverse (last = least-preferred), reduce until sum == targetTotal
     var remaining = targetTotal
@@ -204,9 +229,9 @@ private fun gcTrimOrChildren(
             remaining > 1e-9 -> {
                 val cap = remaining
                 remaining = 0.0
-                garbageCollectPegging(child, cap, inventory, budget)
+                garbageCollectPegging(child, cap, inventory, budget, demandConsumed)
             }
-            else -> garbageCollectPegging(child, 0.0, inventory, budget)
+            else -> garbageCollectPegging(child, 0.0, inventory, budget, demandConsumed)
         }
     }.reversed()
 }

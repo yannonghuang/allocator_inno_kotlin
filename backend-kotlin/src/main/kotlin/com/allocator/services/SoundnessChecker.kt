@@ -557,7 +557,7 @@ fun checkRunSoundness(
     // R13: dominator budget exhaustion — only when supplyAllocations (with qty_allocated)
     // is available.
     val dominatorBudgetViolations: List<Violation> = if (supplyAllocations.isNotEmpty()) {
-        val dominatedMaterials = mutableSetOf<Pair<String, String>>()
+        val dominatedMaterials = mutableSetOf<Triple<String, String, String?>>()
         for (entry in planningPegging) {
             val demandId = entry["demand_id"] as? String
             val tree = entry["tree"] as? Map<String, Any?> ?: continue
@@ -565,6 +565,7 @@ fun checkRunSoundness(
         }
         verifyDominatorBudgetExhausted(dominatedMaterials, supplyAllocations, supplies, config.tolerance)
     } else emptyList()
+    applyDominatorBudgetViolations(demandReports, dominatorBudgetViolations)
 
     val soundCount = demandReports.count { it.sound }
     // R7f (component conservation) and R7g (WO conservation) are efficiency signals:
@@ -1348,17 +1349,55 @@ private class WalkContext(
 internal fun collectDominatedMaterials(
     tree: Map<String, Any?>,
     demandId: String?,
-    into: MutableSet<Pair<String, String>>,
+    // (demandId, productId, supplyId) — supplyId is null only for the "no supply method"
+    // dead-end fallback (see rawDominatorRefs' own doc), which names a raw+critical position
+    // with no reachable lot at all and so has nothing more specific to check.
+    into: MutableSet<Triple<String, String, String?>>,
     depth: Int = 0,
 ) {
     if (depth > 60) return
+    // An abandoned waterfall candidate (max_methods > 1 trying several alternatives, one of
+    // which is ultimately discarded) is never "the demand's own story" — it contributed
+    // nothing to the final result. Its own sub-children can still look "genuinely short" by
+    // the committed_qty < quantity check below (they were asked for this candidate's own,
+    // never-realized full quantity and correctly found nothing), but that shortfall belongs to
+    // a discarded alternative, not a live claim about why the demand itself fell short. Skip
+    // the whole subtree outright. Concretely fixes case 173's 888_F37_2024_08_VIRTUAL-class
+    // violations under max_methods=3: a second, wholly-abandoned top-level candidate
+    // (work_order failed=true) still had its own T1-T4-style AND-siblings correctly detected
+    // as "genuinely short" against that candidate's own 2110-unit ask, incorrectly surfacing
+    // 283-0110-27/29/31/33 as live dominators for a demand whose actual, kept result never
+    // touched that candidate at all.
+    if (tree["type"] == "work_order" && tree["failed"] == true) return
     val nextDemandId = if (tree["type"] == "demand") (tree["demand_id"] as? String ?: demandId) else demandId
+    // Only a genuinely-short "demand" node (its own committed_qty < quantity, a real gap
+    // between what THIS node was asked and what it actually delivered) represents a live claim
+    // about a shortfall. A fully-satisfied node's own quantity_dominator, if present, is stale
+    // drill-down detail preserved from an earlier, differently-scaled exploration pass (see
+    // plan()'s/planMethodSlot's first-pass-preservation doc) — a record of what once bottlenecked
+    // this node's OWN sub-exploration, not a claim that it's currently constraining anything.
+    // Gating both collection AND further recursion on this check naturally follows only the
+    // tied-min AND-sibling / under-delivering OR-candidate chain all the way down: a fully-
+    // satisfied sibling can never be "the" bottleneck at its own parent's level, so it — and
+    // everything beneath it — is correctly excluded, without needing to separately model AND vs
+    // OR composition here. Concretely fixes case 173's 888_F37_2024_09_VIRTUAL-class violations:
+    // 280-1786 (a fully-satisfied AND-sibling, 889.50 asked = 889.50 delivered) was carrying a
+    // stale dominator naming 283-0226, and its own children T1-T4 each independently carried
+    // their OWN stale dominators (283-0110-27/29/31/33) from THEIR OWN earlier, larger-ask
+    // exploration — none of which any longer explain any real shortfall once the tree converged.
+    if (tree["type"] == "demand") {
+        val quantity = (tree["quantity"] as? Number)?.toDouble()
+        val committed = (tree["committed_qty"] as? Number)?.toDouble()
+        val genuinelyShort = quantity != null && committed != null && quantity > committed + 1e-6
+        if (!genuinelyShort) return
+    }
     val dominator = tree["quantity_dominator"] as? List<Map<String, Any?>>
     if (nextDemandId != null && dominator != null) {
         for (ref in dominator) {
             if (ref["kind"] != "bom_child") continue
             val pid = (ref["product_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: continue
-            into.add(nextDemandId to pid)
+            val sid = (ref["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+            into.add(Triple(nextDemandId, pid, sid))
         }
     }
     for (c in (tree["children"] as? List<Map<String, Any?>>) ?: emptyList()) collectDominatedMaterials(c, nextDemandId, into, depth + 1)
@@ -1381,20 +1420,30 @@ internal fun collectDominatedMaterials(
  * Scoped to lots the demand has an actual budgeted entitlement for — [qty_allocated] is
  * null for non-critical (purchasable) lots, which are FIFO-consumed with no allocation
  * concept and so are silently skipped (a purchasable material is never "used up" in this
- * sense — see reconcile()'s own purchase-elasticity rule). Aggregated at the PRODUCT level
- * (summed across every lot of that material the demand touches), matching the claim's own
- * granularity — a demand's entitlement for a critical material spans multiple lots, and the
- * dominator names the material, not necessarily every one of its lots individually.
+ * sense — see reconcile()'s own purchase-elasticity rule).
  *
- * @param dominatedPairs (demandId, productId) pairs from [collectDominatedMaterials], across
- *        every pegging entry in the run.
+ * Checked at the SAME granularity the dominator ref itself names: when [collectDominatedMaterials]
+ * captured a specific `supply_id` (the common case — a genuine draw always names the lot it drew
+ * from), the check is per-(demand, lot) — a citation naming one specific lot must have THAT lot's
+ * own allocated budget used up, not just the product's aggregate across every lot the demand
+ * happens to touch. Product-level aggregation previously let a citation of lot A (genuinely
+ * exhausted) get silently paired with lot B's own unrelated slack (or vice versa) whenever a
+ * demand touched multiple lots of the same critical material — either masking a real per-lot
+ * violation behind a healthy aggregate, or (rarer) diffusing one lot's real gap across several
+ * lots' combined totals. Falls back to the product-level aggregate only for the "no supply
+ * method" dead-end fallback (no specific lot was ever reachable — see rawDominatorRefs' own doc),
+ * which has nothing more specific to check against.
+ *
+ * @param dominatedPairs (demandId, productId, supplyId) triples from [collectDominatedMaterials],
+ *        across every pegging entry in the run — supplyId is null only for the lot-less
+ *        "no supply method" fallback.
  * @param supplyAllocations the run's per-(demand, supply_id) `qty_consumed`/`qty_allocated`
  *        records — see [extractSupplyAllocations]'s own doc for why `qty_allocated` is the
  *        actual enforced cap, not a re-derived estimate.
  * @param supplies case supply rows, for supply_id → product_id resolution.
  */
 internal fun verifyDominatorBudgetExhausted(
-    dominatedPairs: Set<Pair<String, String>>,
+    dominatedPairs: Set<Triple<String, String, String?>>,
     supplyAllocations: List<Map<String, Any?>>,
     supplies: List<Map<String, Any?>>,
     tolerance: Double = 1e-6,
@@ -1408,7 +1457,11 @@ internal fun verifyDominatorBudgetExhausted(
     }.toMap()
 
     class Totals { var allocated = 0.0; var consumed = 0.0 }
-    val totals = mutableMapOf<Pair<String, String>, Totals>()
+    // Per-lot: (demandId, supplyId) -> Totals — the primary granularity, matching what a
+    // genuine draw's own dominator ref names.
+    val lotTotals = mutableMapOf<Pair<String, String>, Totals>()
+    // Per-product: (demandId, productId) -> Totals — fallback for lot-less dominator refs.
+    val productTotals = mutableMapOf<Pair<String, String>, Totals>()
     for (a in supplyAllocations) {
         val demandId = a["demand_id"] as? String ?: continue
         val supplyId = a["supply_id"] as? String ?: continue
@@ -1418,22 +1471,35 @@ internal fun verifyDominatorBudgetExhausted(
         val qtyAllocated = (a["qty_allocated"] as? Number)?.toDouble() ?: continue
         val productId = productBySupplyId[supplyId] ?: continue
         val qtyConsumed = (a["qty_consumed"] as? Number)?.toDouble() ?: 0.0
-        val t = totals.getOrPut(demandId to productId) { Totals() }
-        t.allocated += qtyAllocated
-        t.consumed += qtyConsumed
+        lotTotals.getOrPut(demandId to supplyId) { Totals() }.let { it.allocated += qtyAllocated; it.consumed += qtyConsumed }
+        productTotals.getOrPut(demandId to productId) { Totals() }.let { it.allocated += qtyAllocated; it.consumed += qtyConsumed }
     }
 
     val violations = mutableListOf<Violation>()
-    for (pair in dominatedPairs) {
-        val t = totals[pair] ?: continue
+    for ((demandId, productId, supplyId) in dominatedPairs) {
+        val (t, label) = if (supplyId != null) {
+            (lotTotals[demandId to supplyId] ?: continue) to "$productId ($supplyId)"
+        } else {
+            (productTotals[demandId to productId] ?: continue) to productId
+        }
         val gap = t.allocated - t.consumed
-        val tol = maxOf(tolerance, 1e-9 * t.allocated)
+        // A relative tolerance of 1e-9 * allocated is negligible against a deep pegging tree —
+        // each BOM level's own fractional rate multiplication compounds a little floating-point
+        // drift, and a demand's own committed_qty can sit 7-8 levels down (matching the same
+        // "deep tree compounds each level's fractional loss" rationale documented on
+        // PlanningEngine.kt's own andMinTolerance). Observed live on case 173's
+        // 688_F35_2024_08_VIRTUAL/888_F35_2024_08_VIRTUAL: allocated 2742/1567, gap 5.24/2.71
+        // (~0.2% of allocated) with 99.8% utilization and every drawn unit landing at the
+        // correct location — pure accumulation noise, not a real unused-budget signal. Genuine
+        // violations this rule exists to catch run far larger in both absolute and relative
+        // terms (hundreds of units, tens of percent) — a 0.5% relative floor comfortably absorbs
+        // the former without masking the latter.
+        val tol = maxOf(tolerance, 5e-3 * t.allocated)
         if (gap > tol) {
-            val (demandId, productId) = pair
             violations.add(Violation(
                 rule = "R13_dominator_budget_exhausted",
                 nodePath = "demand:$demandId",
-                message = "$productId is named as demand $demandId's own quantity_dominator, but its allocated " +
+                message = "$label is named as demand $demandId's own quantity_dominator, but its allocated " +
                     "budget (%.4f) isn't used up (consumed %.4f, gap %.4f).".format(t.allocated, t.consumed, gap),
                 expected = t.allocated,
                 actual = t.consumed,
@@ -1441,6 +1507,29 @@ internal fun verifyDominatorBudgetExhausted(
         }
     }
     return violations
+}
+
+/**
+ * R13 helper — back-patches [demandReports] with the dominator-budget violations found for
+ * each demand. Without this, a demand whose own `quantity_dominator` names a critical material
+ * with an unexhausted budget still gates `overallSound` (via [dominatorBudgetViolations] at the
+ * report level) but shows `sound: true` with an empty `violations` list in its OWN entry —
+ * [dominatorBudgetViolations] is computed after the per-demand walk that builds [demandReports],
+ * as a separate cross-cutting pass (same as R10/R11/R12), so it was never folded back in. Matches
+ * each violation's `nodePath` ("demand:$demandId", set in [verifyDominatorBudgetExhausted]) against
+ * [DemandSoundness.demandId] to attach it to the right entry.
+ */
+internal fun applyDominatorBudgetViolations(
+    demandReports: MutableList<DemandSoundness>,
+    dominatorBudgetViolations: List<Violation>,
+) {
+    if (dominatorBudgetViolations.isEmpty()) return
+    val byDemandId = dominatorBudgetViolations.groupBy { it.nodePath.removePrefix("demand:") }
+    for (i in demandReports.indices) {
+        val dr = demandReports[i]
+        val extra = byDemandId[dr.demandId] ?: continue
+        demandReports[i] = dr.copy(sound = false, violations = dr.violations + extra)
+    }
 }
 
 /**
@@ -1710,7 +1799,7 @@ internal fun checkRunSoundnessStreaming(
     var anyPeggingEntry = false
 
     val orphanGids = mutableSetOf<String>()                            // R11
-    val dominatedMaterials = mutableSetOf<Pair<String, String>>()      // R13
+    val dominatedMaterials = mutableSetOf<Triple<String, String, String?>>()      // R13
 
     // ── Single streaming pass ─────────────────────────────────────────────────
     forEachEntry { entry ->
@@ -1892,6 +1981,7 @@ internal fun checkRunSoundnessStreaming(
         if (supplyAllocations.isNotEmpty())
             verifyDominatorBudgetExhausted(dominatedMaterials, supplyAllocations, supplies, config.tolerance)
         else emptyList()
+    applyDominatorBudgetViolations(demandReports, dominatorBudgetViolations)
 
     val soundCount = demandReports.count { it.sound }
     val overallSound = soundCount == demandReports.size &&
