@@ -1282,8 +1282,21 @@ fun Routing.allocateRoutes() {
         data class LotTotal(var qtyAllocated: Double?, var qtyConsumed: Double)
         val bySupply = LinkedHashMap<String, LotTotal>()
         for ((supplyId, qtyAllocated, qtyConsumed) in rows) {
-            val acc = bySupply.getOrPut(supplyId) { LotTotal(qtyAllocated, 0.0) }
+            val acc = bySupply.getOrPut(supplyId) { LotTotal(null, 0.0) }
             acc.qtyConsumed += qtyConsumed
+            // extractSupplyAllocations only records the lot's entitlement on ONE of its several
+            // per-leaf rows (the rest carry qty_allocated=0/null for that specific leaf, since
+            // the entitlement is a per-LOT, not per-leaf, concept) — `getOrPut`'s old "keep
+            // whichever row arrived first" silently threw away the real value whenever that
+            // first row happened to be one of the zero/null ones (observed live on case 173's
+            // 858_F35_2024_08_VIRTUAL: the UI's "Qty limited by" table showed Allocated=0 for
+            // every lot despite the DB holding a real, non-zero entitlement on a later row).
+            // Every genuine entitlement for one lot is identical across its rows (per this
+            // route's own doc), so taking the max of whatever non-null values appear is safe —
+            // it just needs to not settle on a placeholder 0/null when a real value exists.
+            if (qtyAllocated != null && (acc.qtyAllocated == null || qtyAllocated > acc.qtyAllocated!!)) {
+                acc.qtyAllocated = qtyAllocated
+            }
         }
         call.respond(buildJsonObject {
             put("demand_id", demandId)
