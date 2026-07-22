@@ -9,7 +9,7 @@ package com.allocator.services
  * For every (product_id, location_id) node, every alternative (one per method-type,
  * further split one-per-BOM-alt_group for "make" methods with multiple alt_groups —
  * the exact same enumeration [expandWaterfallCandidates] already does for planning)
- * is scored on two axes, walking its own children down to a configurable
+ * is scored on three axes, walking its own children down to a configurable
  * `max_bom_depth`:
  *
  *  - **Inventory coverage** — how many units of the parent this alternative could
@@ -19,12 +19,24 @@ package com.allocator.services
  *    scores 0 (no children, no stock draw by definition).
  *  - **Delivery performance** — cumulative lead time along the critical (slowest)
  *    path down the same subtree, via [leadDaysForMethod].
+ *  - **Critical-material usage** — total count of BOM edges anywhere in the subtree
+ *    whose child is a critical material ([isRawCriticalPosition]), summed across the
+ *    whole subtree and NOT deduplicated by material identity (the same physical
+ *    material reused by 3 different components counts 3). Higher usage is worse —
+ *    an alternative that leans on more scarce, non-elastic materials should rank
+ *    lower, all else equal.
  *
- * Deliberately NOT coupled to `purchase_allowed`/`purchasable_materials` — those
- * admission gates are already applied upstream of [expandWaterfallCandidates] during
- * planning, so a KB entry only ever matters for candidates that already passed them.
- * Scoring every alternative structurally, independent of any one run's config, keeps
- * the KB a pure function of case data — required for "build once, use many times."
+ * The first two axes are deliberately NOT coupled to `purchase_allowed`/
+ * `purchasable_materials` — those admission gates are already applied upstream of
+ * [expandWaterfallCandidates] during planning, so a KB entry only ever matters for
+ * candidates that already passed them. The third axis is a deliberate, precedented
+ * exception: [isRawCriticalPosition] itself depends on `config` (criterion 2, "bought
+ * but excluded from purchasable_materials"), so a case's `config` is now threaded
+ * through the whole build — the exact same tradeoff `Allocation.kt`'s
+ * `generateAndSeedCaseAllocation` already makes for the identical reason. As with
+ * that precedent, this means critical-material scores can go stale if
+ * `purchase_allowed`/`purchasable_materials` changes after a KB is generated, until
+ * the KB is regenerated — the first two axes remain a pure function of case data.
  *
  * This file is intentionally DB-free (pure functions over `data`); persistence lives
  * in `api/Preferences.kt`, mirroring how [buildSupplyAllocation] (pure) is split from
@@ -33,11 +45,16 @@ package com.allocator.services
 
 /**
  * A node's structural best-case, per axis, INDEPENDENTLY (the alternative that
- * maximizes coverage need not be the same alternative that minimizes lead time).
- * This keeps the metric weight-independent and cheaply reusable by parents,
- * regardless of what delivery/inventory weights a later scoring pass applies.
+ * maximizes coverage need not be the same alternative that minimizes lead time, nor
+ * the one using the fewest critical materials). This keeps the metric weight-independent
+ * and cheaply reusable by parents, regardless of what delivery/inventory/critical-material
+ * weights a later scoring pass applies.
  */
-internal data class NodeMetrics(val bestCoverageUnits: Double, val bestCumulativeLeadDays: Double)
+internal data class NodeMetrics(
+    val bestCoverageUnits: Double,
+    val bestCumulativeLeadDays: Double,
+    val bestCriticalMaterialUsage: Double,
+)
 
 internal data class PreferenceCandidateRow(
     val productId: String,
@@ -47,6 +64,7 @@ internal data class PreferenceCandidateRow(
     val preference: Int,
     val inventoryScore: Double?,
     val deliveryScore: Double?,
+    val criticalMaterialScore: Double?,
 )
 
 /** One persisted alternative's KB row, as consulted at planning time: the canonical ordinal
@@ -61,16 +79,18 @@ data class PreferenceKbEntry(
     val preference: Int,
     val inventoryScore: Double?,
     val deliveryScore: Double?,
+    val criticalMaterialScore: Double?,
 )
 
-/** Runtime view of a case's Preferences KB: per-alternative entries plus the delivery/inventory
- *  weights used to build them (needed to recombine [PreferenceKbEntry]'s raw axis values back
- *  into a comparable score — see [reconstructNodeScores]). Not `internal`, for the same reason
- *  as [PreferenceKbEntry]. */
+/** Runtime view of a case's Preferences KB: per-alternative entries plus the delivery/
+ *  inventory/critical-material weights used to build them (needed to recombine
+ *  [PreferenceKbEntry]'s raw axis values back into a comparable score — see
+ *  [reconstructNodeScores]). Not `internal`, for the same reason as [PreferenceKbEntry]. */
 data class PreferenceKb(
     val entries: Map<Triple<String, String, String>, PreferenceKbEntry>,
     val deliveryWeight: Double,
     val inventoryWeight: Double,
+    val criticalMaterialWeight: Double,
 )
 
 /** Sentinel for "unreachable" (a cycle, or no method and no stock) — always ranks last,
@@ -93,28 +113,33 @@ internal fun preferenceMethodKey(method: Map<String, Any?>, altKey: String?): St
 private fun supplyOnHand(productId: String, locationId: String, supplyByNode: Map<Pair<String, String>, Double>): Double =
     supplyByNode[productId to locationId] ?: 0.0
 
-/** One raw (coverageUnits, cumulativeLeadDays) computation for a single alternative at
- *  (productId, locationId) — shared by [computeNodeMetrics]'s per-candidate loop and
- *  [scoreNodeCandidates], so the two can never disagree on how an alternative is scored. */
+/** One raw (coverageUnits, cumulativeLeadDays, criticalMaterialUsage) computation for a single
+ *  alternative at (productId, locationId) — shared by [computeNodeMetrics]'s per-candidate loop
+ *  and [scoreNodeCandidates], so the two can never disagree on how an alternative is scored.
+ *  [config] is only consulted for the critical-material axis (via [isRawCriticalPosition]) —
+ *  the other two axes remain config-independent, see this file's own header doc. */
 private fun candidateRawMetrics(
     method: Map<String, Any?>,
     altKey: String?,
     productId: String,
     locationId: String,
     data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
     maxBomDepth: Int,
     supplyByNode: Map<Pair<String, String>, Double>,
     cache: MutableMap<Pair<Pair<String, String>, Int>, NodeMetrics>,
     inProgress: MutableSet<Pair<String, String>>,
     remainingDepth: Int,
-): Pair<Double, Double> = when (method["type"]) {
-    "purchase" -> Pair(0.0, leadDaysForMethod(method))
+): Triple<Double, Double, Double> = when (method["type"]) {
+    "purchase" -> Triple(0.0, leadDaysForMethod(method), 0.0)
     "move" -> {
         val fromLid = (method["from_location_id"] as? String)?.trim()
-        if (fromLid.isNullOrBlank()) Pair(0.0, INFEASIBLE_LEAD_DAYS)
+        if (fromLid.isNullOrBlank()) Triple(0.0, INFEASIBLE_LEAD_DAYS, 0.0)
         else {
-            val src = computeNodeMetrics(productId, fromLid, data, maxBomDepth, supplyByNode, cache, inProgress, remainingDepth - 1)
-            Pair(src.bestCoverageUnits, leadDaysForMethod(method) + src.bestCumulativeLeadDays)
+            val src = computeNodeMetrics(productId, fromLid, data, config, maxBomDepth, supplyByNode, cache, inProgress, remainingDepth - 1)
+            // Relocating the same product isn't a new material-usage edge — pass the source's
+            // own critical-material count through unchanged, same as coverage.
+            Triple(src.bestCoverageUnits, leadDaysForMethod(method) + src.bestCumulativeLeadDays, src.bestCriticalMaterialUsage)
         }
     }
     "make" -> {
@@ -122,27 +147,33 @@ private fun candidateRawMetrics(
         val variants = variantsForMake(productId, productionLocation, 1.0, method, data)
         val childList = if (altKey != null) variants.firstOrNull { it.first == altKey }?.second ?: emptyList()
                         else variants.flatMap { it.second }
-        if (childList.isEmpty()) Pair(0.0, leadDaysForMethod(method))
+        if (childList.isEmpty()) Triple(0.0, leadDaysForMethod(method), 0.0)
         else {
             var minCoverage = Double.MAX_VALUE
             var maxChildLead = 0.0
             var feasible = true
+            // Cost tally, not an achievability bottleneck — summed across every required
+            // child's own edge (this child, if critical) plus whatever critical materials its
+            // own subtree already uses.
+            var sumCriticalUsage = 0.0
             for (child in childList) {
                 val cPid = (child["product_id"] as? String)?.trim() ?: continue
                 val cLid = (child["location_id"] as? String)?.trim() ?: continue
                 val rate = (child["quantity"] as? Number)?.toDouble() ?: 1.0
                 if (rate <= 0) continue
-                val cm = computeNodeMetrics(cPid, cLid, data, maxBomDepth, supplyByNode, cache, inProgress, remainingDepth - 1)
+                val cm = computeNodeMetrics(cPid, cLid, data, config, maxBomDepth, supplyByNode, cache, inProgress, remainingDepth - 1)
                 val coverageInParentUnits = cm.bestCoverageUnits / rate
                 if (coverageInParentUnits < minCoverage) minCoverage = coverageInParentUnits
                 if (cm.bestCumulativeLeadDays >= INFEASIBLE_LEAD_DAYS) feasible = false
                 else if (cm.bestCumulativeLeadDays > maxChildLead) maxChildLead = cm.bestCumulativeLeadDays
+                val childOwnEdge = if (isRawCriticalPosition(cPid, cLid, data, config)) 1.0 else 0.0
+                sumCriticalUsage += childOwnEdge + cm.bestCriticalMaterialUsage
             }
             if (minCoverage == Double.MAX_VALUE) minCoverage = 0.0
-            Pair(minCoverage, if (feasible) leadDaysForMethod(method) + maxChildLead else INFEASIBLE_LEAD_DAYS)
+            Triple(minCoverage, if (feasible) leadDaysForMethod(method) + maxChildLead else INFEASIBLE_LEAD_DAYS, sumCriticalUsage)
         }
     }
-    else -> Pair(0.0, INFEASIBLE_LEAD_DAYS)
+    else -> Triple(0.0, INFEASIBLE_LEAD_DAYS, 0.0)
 }
 
 /**
@@ -165,6 +196,7 @@ internal fun computeNodeMetrics(
     productId: String,
     locationId: String,
     data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
     maxBomDepth: Int,
     supplyByNode: Map<Pair<String, String>, Double>,
     cache: MutableMap<Pair<Pair<String, String>, Int>, NodeMetrics>,
@@ -181,11 +213,11 @@ internal fun computeNodeMetrics(
     val directSupply = supplyOnHand(productId, locationId, supplyByNode)
     if (!inProgress.add(node)) {
         // Cycle: this path can't resolve further via methods, but direct stock still counts.
-        return if (directSupply > 0) NodeMetrics(directSupply, 0.0) else NodeMetrics(0.0, INFEASIBLE_LEAD_DAYS)
+        return if (directSupply > 0) NodeMetrics(directSupply, 0.0, 0.0) else NodeMetrics(0.0, INFEASIBLE_LEAD_DAYS, 0.0)
     }
     try {
         if (remainingDepth < 0) {
-            return NodeMetrics(directSupply, 0.0).also { cache[cacheKey] = it }
+            return NodeMetrics(directSupply, 0.0, 0.0).also { cache[cacheKey] = it }
         }
         val methods = getMethods(productId, locationId, data)
         // Dedupe by natural key: identical (type, methodKey) candidates are structurally
@@ -196,15 +228,20 @@ internal fun computeNodeMetrics(
             .distinctBy { c -> c.method["type"] to preferenceMethodKey(c.method, c.altKey) }
         var bestCoverage = directSupply
         var bestLead = if (directSupply > 0) 0.0 else INFEASIBLE_LEAD_DAYS
+        // On-hand stock needs 0 further critical materials — a "free" option, same rationale
+        // as bestLead's 0.0 init. Collapsed back from the sentinel below if no candidate beats it.
+        var bestCriticalUsage = if (directSupply > 0) 0.0 else Double.MAX_VALUE
         for (c in candidates) {
-            val (cov, lead) = candidateRawMetrics(
-                c.method, c.altKey, productId, locationId, data, maxBomDepth,
+            val (cov, lead, criticalUsage) = candidateRawMetrics(
+                c.method, c.altKey, productId, locationId, data, config, maxBomDepth,
                 supplyByNode, cache, inProgress, remainingDepth,
             )
             if (cov > bestCoverage) bestCoverage = cov
             if (lead < bestLead) bestLead = lead
+            if (criticalUsage < bestCriticalUsage) bestCriticalUsage = criticalUsage
         }
-        val nm = NodeMetrics(bestCoverage, bestLead)
+        if (bestCriticalUsage == Double.MAX_VALUE) bestCriticalUsage = 0.0
+        val nm = NodeMetrics(bestCoverage, bestLead, bestCriticalUsage)
         cache[cacheKey] = nm
         return nm
     } finally {
@@ -212,21 +249,26 @@ internal fun computeNodeMetrics(
     }
 }
 
-/** Normalize two weights to sum to 1; falls back to an even 0.5/0.5 split when both are
+/** Normalize three weights to sum to 1; falls back to an even 1/3 each split when all three are
  *  non-positive (mirrors the deleted normalizeScoreWeights precedent). Internal (not private):
  *  reused by [reconstructNodeScores] to recombine axes with the exact same formula
  *  [scoreNodeCandidates] used at build time. */
-internal fun normalizeWeights(deliveryWeight: Double, inventoryWeight: Double): Pair<Double, Double> {
-    val total = deliveryWeight + inventoryWeight
-    return if (total <= 0.0) Pair(0.5, 0.5) else Pair(deliveryWeight / total, inventoryWeight / total)
+internal fun normalizeWeights(
+    deliveryWeight: Double,
+    inventoryWeight: Double,
+    criticalMaterialWeight: Double,
+): Triple<Double, Double, Double> {
+    val total = deliveryWeight + inventoryWeight + criticalMaterialWeight
+    return if (total <= 0.0) Triple(1.0 / 3, 1.0 / 3, 1.0 / 3)
+           else Triple(deliveryWeight / total, inventoryWeight / total, criticalMaterialWeight / total)
 }
 
 /**
  * Ranks every alternative at (productId, locationId): computes each candidate's own raw
- * (coverage, leadDays) via [candidateRawMetrics], min-max normalizes both axes across this
- * node's sibling set, combines via the given weights, and assigns canonical preference
- * 10, 20, 30, ... in descending-score order. Ties keep the input candidate order (Kotlin's
- * `sortedWith` is stable), which itself follows BOM/method declaration order via
+ * (coverage, leadDays, criticalMaterialUsage) via [candidateRawMetrics], min-max normalizes all
+ * three axes across this node's sibling set, combines via the given weights, and assigns
+ * canonical preference 10, 20, 30, ... in descending-score order. Ties keep the input candidate
+ * order (Kotlin's `sortedWith` is stable), which itself follows BOM/method declaration order via
  * [expandWaterfallCandidates] / [getMethods] — deterministic for a fixed data snapshot.
  *
  * Returns an empty list when the node has no methods (nothing to rank/persist).
@@ -235,9 +277,11 @@ internal fun scoreNodeCandidates(
     productId: String,
     locationId: String,
     data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
     maxBomDepth: Int,
     deliveryWeight: Double,
     inventoryWeight: Double,
+    criticalMaterialWeight: Double,
     supplyByNode: Map<Pair<String, String>, Double>,
     cache: MutableMap<Pair<Pair<String, String>, Int>, NodeMetrics>,
 ): List<PreferenceCandidateRow> {
@@ -255,28 +299,34 @@ internal fun scoreNodeCandidates(
         .distinctBy { c -> c.method["type"] to preferenceMethodKey(c.method, c.altKey) }
     if (candidates.isEmpty()) return emptyList()
 
+    data class Raw(val c: WaterfallCandidate, val cov: Double, val lead: Double, val critical: Double)
     val raw = candidates.map { c ->
-        val (cov, lead) = candidateRawMetrics(
-            c.method, c.altKey, productId, locationId, data, maxBomDepth,
+        val (cov, lead, critical) = candidateRawMetrics(
+            c.method, c.altKey, productId, locationId, data, config, maxBomDepth,
             supplyByNode, cache, mutableSetOf(productId to locationId), maxBomDepth,
         )
-        Triple(c, cov, lead)
+        Raw(c, cov, lead, critical)
     }
 
-    val covMax = raw.maxOf { it.second }
-    val covMin = raw.minOf { it.second }
+    val covMax = raw.maxOf { it.cov }
+    val covMin = raw.minOf { it.cov }
     val covSpan = (covMax - covMin).let { if (it <= 0.0) 1.0 else it }
-    val finiteLeads = raw.map { it.third }.filter { it < INFEASIBLE_LEAD_DAYS }
+    val finiteLeads = raw.map { it.lead }.filter { it < INFEASIBLE_LEAD_DAYS }
     val leadMax = finiteLeads.maxOrNull() ?: 0.0
     val leadMin = finiteLeads.minOrNull() ?: 0.0
     val leadSpan = (leadMax - leadMin).let { if (it <= 0.0) 1.0 else it }
-    val (dw, iw) = normalizeWeights(deliveryWeight, inventoryWeight)
+    val critMax = raw.maxOf { it.critical }
+    val critMin = raw.minOf { it.critical }
+    val critSpan = (critMax - critMin).let { if (it <= 0.0) 1.0 else it }
+    val (dw, iw, cw) = normalizeWeights(deliveryWeight, inventoryWeight, criticalMaterialWeight)
 
-    data class Scored(val c: WaterfallCandidate, val cov: Double, val lead: Double, val score: Double)
-    val scored = raw.map { (c, cov, lead) ->
-        val normCov = ((cov - covMin) / covSpan).coerceIn(0.0, 1.0)
-        val normDelivery = if (lead >= INFEASIBLE_LEAD_DAYS) 0.0 else (1.0 - (lead - leadMin) / leadSpan).coerceIn(0.0, 1.0)
-        Scored(c, cov, lead, dw * normDelivery + iw * normCov)
+    data class Scored(val c: WaterfallCandidate, val cov: Double, val lead: Double, val critical: Double, val score: Double)
+    val scored = raw.map { r ->
+        val normCov = ((r.cov - covMin) / covSpan).coerceIn(0.0, 1.0)
+        val normDelivery = if (r.lead >= INFEASIBLE_LEAD_DAYS) 0.0 else (1.0 - (r.lead - leadMin) / leadSpan).coerceIn(0.0, 1.0)
+        // Inverted, same convention as delivery — lower critical-material usage is better.
+        val normCritical = (1.0 - (r.critical - critMin) / critSpan).coerceIn(0.0, 1.0)
+        Scored(r.c, r.cov, r.lead, r.critical, dw * normDelivery + iw * normCov + cw * normCritical)
     }
     val ranked = scored.sortedWith(compareByDescending { it.score })
 
@@ -289,6 +339,10 @@ internal fun scoreNodeCandidates(
             preference = (i + 1) * 10,
             inventoryScore = s.cov.takeIf { it.isFinite() },
             deliveryScore = s.lead.takeIf { it < INFEASIBLE_LEAD_DAYS },
+            // Always well-defined at build time (no infeasible state for this axis) — unlike
+            // the other two, no takeIf filter; stays nullable at the type/DB level purely to
+            // represent legacy rows persisted before this axis existed.
+            criticalMaterialScore = s.critical,
         )
     }
 }
@@ -300,9 +354,11 @@ internal fun scoreNodeCandidates(
  */
 internal fun buildPreferenceKb(
     data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
     maxBomDepth: Int,
     deliveryWeight: Double,
     inventoryWeight: Double,
+    criticalMaterialWeight: Double,
 ): List<PreferenceCandidateRow> {
     val demands = data["demand"] ?: emptyList()
     val nodes = buildBomGraph(demands, data).topoOrder
@@ -317,7 +373,7 @@ internal fun buildPreferenceKb(
 
     val cache = mutableMapOf<Pair<Pair<String, String>, Int>, NodeMetrics>()
     return nodes.flatMap { (pid, lid) ->
-        scoreNodeCandidates(pid, lid, data, maxBomDepth, deliveryWeight, inventoryWeight, supplyByNode, cache)
+        scoreNodeCandidates(pid, lid, data, config, maxBomDepth, deliveryWeight, inventoryWeight, criticalMaterialWeight, supplyByNode, cache)
     }
 }
 
@@ -331,9 +387,14 @@ internal fun buildPreferenceKb(
  * reconstructed scores stay consistent with the ranking already visible in `preference`.
  *
  * Returns `null` — defer to the caller's own fallback — unless every one of [candidates] has
- * a KB entry with a non-null [PreferenceKbEntry.inventoryScore] (the "per-alternative
- * fallback" principle used elsewhere: partial coverage at this node isn't enough to trust a
- * reconstructed magnitude comparison across candidates).
+ * a KB entry with a non-null [PreferenceKbEntry.inventoryScore] AND non-null
+ * [PreferenceKbEntry.criticalMaterialScore] (the "per-alternative fallback" principle used
+ * elsewhere: partial coverage at this node isn't enough to trust a reconstructed magnitude
+ * comparison across candidates). Critical-material score gets the same strict, all-or-nothing
+ * treatment as inventory score (not the lenient per-candidate handling used for delivery/lead,
+ * which is allowed to be individually null for a genuinely infeasible candidate) — a null
+ * critical-material score can only mean the KB predates this axis, never "infeasible," so a
+ * mix of real and missing values here would make span-normalization meaningless.
  */
 internal fun reconstructNodeScores(
     productId: String,
@@ -345,6 +406,7 @@ internal fun reconstructNodeScores(
         preferenceKb.entries[Triple(productId, locationId, preferenceMethodKey(c.method, c.altKey))] ?: return null
     }
     if (entries.any { it.inventoryScore == null }) return null
+    if (entries.any { it.criticalMaterialScore == null }) return null
 
     val covs = entries.map { it.inventoryScore!! }
     val covMax = covs.max()
@@ -355,11 +417,16 @@ internal fun reconstructNodeScores(
     val leadMax = finiteLeads.maxOrNull() ?: 0.0
     val leadMin = finiteLeads.minOrNull() ?: 0.0
     val leadSpan = (leadMax - leadMin).let { if (it <= 0.0) 1.0 else it }
-    val (dw, iw) = normalizeWeights(preferenceKb.deliveryWeight, preferenceKb.inventoryWeight)
+    val crits = entries.map { it.criticalMaterialScore!! }
+    val critMax = crits.max()
+    val critMin = crits.min()
+    val critSpan = (critMax - critMin).let { if (it <= 0.0) 1.0 else it }
+    val (dw, iw, cw) = normalizeWeights(preferenceKb.deliveryWeight, preferenceKb.inventoryWeight, preferenceKb.criticalMaterialWeight)
 
     return entries.indices.map { i ->
         val normCov = ((covs[i] - covMin) / covSpan).coerceIn(0.0, 1.0)
         val normDelivery = leads[i]?.let { (1.0 - (it - leadMin) / leadSpan).coerceIn(0.0, 1.0) } ?: 0.0
-        dw * normDelivery + iw * normCov
+        val normCritical = (1.0 - (crits[i] - critMin) / critSpan).coerceIn(0.0, 1.0)
+        dw * normDelivery + iw * normCov + cw * normCritical
     }
 }

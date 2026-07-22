@@ -98,8 +98,9 @@ export function PreferencesPage() {
   const [editValue, setEditValue] = useState('');
 
   const [maxBomDepth, setMaxBomDepth] = useState(3);
-  const [deliveryWeight, setDeliveryWeight] = useState(0.5);
-  const [inventoryWeight, setInventoryWeight] = useState(0.5);
+  const [deliveryWeight, setDeliveryWeight] = useState(0.3);
+  const [inventoryWeight, setInventoryWeight] = useState(0.3);
+  const [criticalMaterialWeight, setCriticalMaterialWeight] = useState(0.4);
 
   // Lookup panel: search by product + location, view/reorder all its alternatives together.
   const [lookupProduct, setLookupProduct] = useState('');
@@ -127,6 +128,7 @@ export function PreferencesPage() {
           setMaxBomDepth(res.config.max_bom_depth);
           setDeliveryWeight(res.config.delivery_weight);
           setInventoryWeight(res.config.inventory_weight);
+          setCriticalMaterialWeight(res.config.critical_material_weight);
         }
       })
       .catch((e) => setError(String(e)));
@@ -210,6 +212,7 @@ export function PreferencesPage() {
     try {
       const newRows = await generatePreferences(caseId, {
         max_bom_depth: maxBomDepth, delivery_weight: deliveryWeight, inventory_weight: inventoryWeight,
+        critical_material_weight: criticalMaterialWeight,
       });
       setRows(newRows);
       clearPending();
@@ -354,49 +357,78 @@ export function PreferencesPage() {
     },
     { key: 'inventory_score', label: t('colInventoryScore'), sortable: true, render: (row) => fmtScore(row.inventory_score) },
     { key: 'delivery_score', label: t('colDeliveryScore'), sortable: true, render: (row) => fmtScore(row.delivery_score) },
+    { key: 'critical_material_score', label: t('colCriticalMaterialScore'), sortable: true, render: (row) => fmtScore(row.critical_material_score) },
   ];
 
   return (
     <div style={{ padding: '1.25rem 1.5rem', minHeight: '100vh', background: '#0e0e10', color: '#e4e4e7' }}>
 
-      {/* Action bar */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '0.5rem' }}>
-        <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.8rem', color: '#a1a1aa' }}>
-          {t('maxBomDepthLabel')}
-          <input type="number" min={1} max={10} value={maxBomDepth}
-            onChange={(e) => setMaxBomDepth(Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 3)))}
-            style={numInput} />
-        </label>
-        <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.8rem', color: '#a1a1aa' }}>
-          {t('deliveryWeightLabel')}
-          <input type="number" min={0} max={1} step={0.1} value={deliveryWeight}
-            onChange={(e) => setDeliveryWeight(Math.max(0, Math.min(1, parseFloat(e.target.value) || 0)))}
-            style={numInput} />
-        </label>
-        <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.8rem', color: '#a1a1aa' }}>
-          {t('inventoryWeightLabel')}
-          <input type="number" min={0} max={1} step={0.1} value={inventoryWeight}
-            onChange={(e) => setInventoryWeight(Math.max(0, Math.min(1, parseFloat(e.target.value) || 0)))}
-            style={numInput} />
-        </label>
-        <button style={btn('primary')} onClick={handleGenerate} disabled={generating}>
-          {generating ? t('generating') : t('generate')}
-        </button>
-        <button style={btn()} onClick={() => importRef.current?.click()} disabled={importLoading}>
-          {importLoading ? t('uploading') : t('uploadCsv')}
-        </button>
-        <input ref={importRef} type="file" accept=".csv,text/csv" style={{ display: 'none' }} onChange={handleImport} />
-        <button style={btn()} onClick={handleExport} disabled={!rows.length}>{t('downloadCsv')}</button>
-        <button style={btn('danger')} onClick={handleClear} disabled={clearing || !rows.length}>
-          {clearing ? t('clearing') : t('clear')}
-        </button>
-        {!!rows.length && (
-          <button
-            style={{ ...btn(hasPending ? 'save' : 'ghost'), opacity: hasPending ? 1 : 0.35 }}
-            onClick={handleSave} disabled={!hasPending || saving} title={t('saveTitle')}>
-            {saving ? t('saving') : hasPending ? t('saveWithCount', { count: pendingChanges.size }) : t('save')}
+      {/* Scoring parameters */}
+      <div style={{ border: '1px solid #27272a', borderRadius: 6, padding: '0.6rem 0.75rem', marginBottom: '0.5rem' }}>
+        <div style={{ fontSize: '0.7rem', color: '#71717a', textTransform: 'uppercase', letterSpacing: '0.03em', marginBottom: '0.4rem' }}>
+          {t('configSectionLabel')}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+          <label
+            title={t('maxBomDepthTooltip')}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.8rem', color: '#a1a1aa', cursor: 'help' }}>
+            {t('maxBomDepthLabel')}
+            <input type="number" min={1} max={10} value={maxBomDepth}
+              onChange={(e) => setMaxBomDepth(Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 3)))}
+              style={numInput} />
+          </label>
+          <label
+            title={t('deliveryWeightTooltip')}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.8rem', color: '#a1a1aa', cursor: 'help' }}>
+            {t('deliveryWeightLabel')}
+            <input type="number" min={0} max={1} step={0.1} value={deliveryWeight}
+              onChange={(e) => setDeliveryWeight(Math.max(0, Math.min(1, parseFloat(e.target.value) || 0)))}
+              style={numInput} />
+          </label>
+          <label
+            title={t('inventoryWeightTooltip')}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.8rem', color: '#a1a1aa', cursor: 'help' }}>
+            {t('inventoryWeightLabel')}
+            <input type="number" min={0} max={1} step={0.1} value={inventoryWeight}
+              onChange={(e) => setInventoryWeight(Math.max(0, Math.min(1, parseFloat(e.target.value) || 0)))}
+              style={numInput} />
+          </label>
+          <label
+            title={t('criticalMaterialWeightTooltip')}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.8rem', color: '#a1a1aa', cursor: 'help' }}>
+            {t('criticalMaterialWeightLabel')}
+            <input type="number" min={0} max={1} step={0.1} value={criticalMaterialWeight}
+              onChange={(e) => setCriticalMaterialWeight(Math.max(0, Math.min(1, parseFloat(e.target.value) || 0)))}
+              style={numInput} />
+          </label>
+        </div>
+      </div>
+
+      {/* Actions */}
+      <div style={{ marginBottom: '0.5rem' }}>
+        <div style={{ fontSize: '0.7rem', color: '#71717a', textTransform: 'uppercase', letterSpacing: '0.03em', marginBottom: '0.4rem' }}>
+          {t('actionsSectionLabel')}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+          <button style={btn('primary')} onClick={handleGenerate} disabled={generating}>
+            {generating ? t('generating') : t('generate')}
           </button>
-        )}
+          <button style={btn()} onClick={() => importRef.current?.click()} disabled={importLoading}>
+            {importLoading ? t('uploading') : t('uploadCsv')}
+          </button>
+          <input ref={importRef} type="file" accept=".csv,text/csv" style={{ display: 'none' }} onChange={handleImport} />
+          <button style={btn()} onClick={handleExport} disabled={!rows.length}>{t('downloadCsv')}</button>
+          <button style={btn('danger')} onClick={handleClear} disabled={clearing || !rows.length}>
+            {clearing ? t('clearing') : t('clear')}
+          </button>
+          {!!rows.length && (
+            <button
+              style={{ ...btn(hasPending ? 'save' : 'ghost'), opacity: hasPending ? 1 : 0.35 }}
+              onClick={handleSave} disabled={!hasPending || saving} title={t('saveTitle')}>
+              {saving ? t('saving') : hasPending ? t('saveWithCount', { count: pendingChanges.size }) : t('save')}
+            </button>
+          )}
+        </div>
       </div>
 
       {generating && (
@@ -478,6 +510,7 @@ export function PreferencesPage() {
                     <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem' }}>{t('colPreference')}</th>
                     <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem' }}>{t('colInventoryScore')}</th>
                     <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem' }}>{t('colDeliveryScore')}</th>
+                    <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem' }}>{t('colCriticalMaterialScore')}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -523,6 +556,7 @@ export function PreferencesPage() {
                         </td>
                         <td style={{ padding: '0.25rem 0.5rem', textAlign: 'right', color: '#a1a1aa' }}>{fmtScore(row.inventory_score)}</td>
                         <td style={{ padding: '0.25rem 0.5rem', textAlign: 'right', color: '#a1a1aa' }}>{fmtScore(row.delivery_score)}</td>
+                        <td style={{ padding: '0.25rem 0.5rem', textAlign: 'right', color: '#a1a1aa' }}>{fmtScore(row.critical_material_score)}</td>
                       </tr>
                     );
                   })}
