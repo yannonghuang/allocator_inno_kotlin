@@ -230,23 +230,29 @@ export function SinglePeggingTreePanel({
   const rootQtyDominators = dedupBySupply(tree.quantity_dominator ?? []);
   const rootTimeDominators = dedupBySupply(tree.time_dominator ?? []);
 
-  // Totals for the qty-dominator table's footer. Both columns are summed over the SAME row
-  // subset — rows with a genuine budget entitlement (qty_allocated != null). A non-critical/
-  // purchasable lot has no allocation concept at all (FIFO-consumed — see qty_allocated's own
-  // doc) and shows "–" in Allocated; its own qty_consumed isn't part of the "was the allocated
-  // budget used up" story this footer exists to answer, and summing it into Consumed alongside
-  // an Allocated total that excludes it made Consumed exceed Allocated for reasons that have
-  // nothing to do with any budget ever being exceeded (a non-critical row can consume plenty
-  // while carrying no allocation at all). Both are unavailable until caseId/runId let them be
-  // fetched (see supplyAllocByLot's own doc) — an entirely-empty column renders "–" rather than
-  // a misleading 0.
-  let totalAllocated: number | null = null;
-  let totalConsumed = 0;
-  for (const d of rootQtyDominators) {
-    const alloc = d.supply_id ? supplyAllocByLot?.get(d.supply_id) : undefined;
-    if (alloc?.qty_allocated == null) continue;
-    totalAllocated = (totalAllocated ?? 0) + alloc.qty_allocated;
-    totalConsumed += alloc.qty_consumed ?? 0;
+  // Group qty-dominator rows by the material they name (product_id@location_id) rather than
+  // one flat list with one combined footer. Two DIFFERENT materials showing up as dominators
+  // at once are two INDEPENDENT causes/budgets, not one shared pool — e.g. one method
+  // alternative bottlenecked on X while a sibling elsewhere bottlenecked on Y. Summing their
+  // Allocated/Consumed into a single "Total" made that single number meaningless (apples plus
+  // oranges) and, worse, visually implied the two materials were jointly responsible for one
+  // shortfall rather than each independently explaining its own. A ref with no product_id
+  // (rare — only shared_supply_budget/resource_contention lack one) groups under its own label
+  // instead, so it still gets its own subtotal rather than silently joining an unrelated group.
+  const qtyDominatorGroups: { key: string; label: string; refs: DominatorRef[] }[] = [];
+  {
+    const byKey = new Map<string, { key: string; label: string; refs: DominatorRef[] }>();
+    for (const d of rootQtyDominators) {
+      const key = d.product_id ? `${d.product_id}@${d.location_id ?? ''}` : `__${d.label}`;
+      const label = d.product_id ? `${d.product_id}${d.location_id ? `@${d.location_id}` : ''}` : d.label;
+      let group = byKey.get(key);
+      if (!group) {
+        group = { key, label, refs: [] };
+        byKey.set(key, group);
+        qtyDominatorGroups.push(group);
+      }
+      group.refs.push(d);
+    }
   }
   const showAllocCols = caseId != null && runId != null;
 
@@ -258,55 +264,77 @@ export function SinglePeggingTreePanel({
           border: '1px solid #3d3d40', borderRadius: 4,
           display: 'flex', flexDirection: 'column', gap: 4, fontSize: '0.78rem',
         }}>
-          {rootQtyDominators.length > 0 && (
-            <table style={{ borderCollapse: 'collapse', width: '100%' }}>
-              <thead>
-                <tr>
-                  <th style={{ textAlign: 'left', fontWeight: 400, color: '#71717a', padding: '2px 8px 2px 0' }}>Qty limited by</th>
-                  {showAllocCols && (
-                    <>
-                      <th style={{ textAlign: 'right', fontWeight: 400, color: '#71717a', padding: '2px 8px' }}>Allocated</th>
-                      <th style={{ textAlign: 'right', fontWeight: 400, color: '#71717a', padding: '2px 0' }}>Consumed</th>
-                    </>
-                  )}
-                </tr>
-              </thead>
-              <tbody>
-                {rootQtyDominators.map((d, i) => {
+          {qtyDominatorGroups.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {qtyDominatorGroups.map((group) => {
+                // Per-group subtotal — see qtyDominatorGroups' own doc for why this must NOT
+                // be combined across groups. Same "only sum rows with a genuine budget
+                // entitlement" rule as before (a non-critical/purchasable lot has no
+                // allocation concept at all — see qty_allocated's own doc).
+                let groupAllocated: number | null = null;
+                let groupConsumed = 0;
+                for (const d of group.refs) {
                   const alloc = d.supply_id ? supplyAllocByLot?.get(d.supply_id) : undefined;
-                  return (
-                    <tr key={`rq-${i}`}>
-                      <td style={{ padding: '2px 8px 2px 0' }}>
-                        <DominatorLink kind="quantity" dominator={d} onClick={handleDominatorClick} contextDemandId={contextDemandId ?? tree.demand_id} showPrefix={false} />
-                      </td>
-                      {showAllocCols && (
-                        <>
-                          <td style={{ textAlign: 'right', padding: '2px 8px', color: '#d4d4d8' }}>
-                            {alloc?.qty_allocated != null ? qtyFmt(alloc.qty_allocated) : '–'}
+                  if (alloc?.qty_allocated == null) continue;
+                  groupAllocated = (groupAllocated ?? 0) + alloc.qty_allocated;
+                  groupConsumed += alloc.qty_consumed ?? 0;
+                }
+                return (
+                  <table key={group.key} style={{ borderCollapse: 'collapse', width: '100%' }}>
+                    <thead>
+                      <tr>
+                        <th style={{ textAlign: 'left', fontWeight: 400, color: '#71717a', padding: '2px 8px 2px 0' }}>
+                          {qtyDominatorGroups.length > 1 ? `Qty limited by — ${group.label}` : 'Qty limited by'}
+                        </th>
+                        {showAllocCols && (
+                          <>
+                            <th style={{ textAlign: 'right', fontWeight: 400, color: '#71717a', padding: '2px 8px' }}>Allocated</th>
+                            <th style={{ textAlign: 'right', fontWeight: 400, color: '#71717a', padding: '2px 0' }}>Consumed</th>
+                          </>
+                        )}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {group.refs.map((d, i) => {
+                        const alloc = d.supply_id ? supplyAllocByLot?.get(d.supply_id) : undefined;
+                        return (
+                          <tr key={`rq-${group.key}-${i}`}>
+                            <td style={{ padding: '2px 8px 2px 0' }}>
+                              <DominatorLink kind="quantity" dominator={d} onClick={handleDominatorClick} contextDemandId={contextDemandId ?? tree.demand_id} showPrefix={false} />
+                            </td>
+                            {showAllocCols && (
+                              <>
+                                <td style={{ textAlign: 'right', padding: '2px 8px', color: '#d4d4d8' }}>
+                                  {alloc?.qty_allocated != null ? qtyFmt(alloc.qty_allocated) : '–'}
+                                </td>
+                                <td style={{ textAlign: 'right', padding: '2px 0', color: '#d4d4d8' }}>
+                                  {alloc ? qtyFmt(alloc.qty_consumed) : '–'}
+                                </td>
+                              </>
+                            )}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                    {showAllocCols && (
+                      <tfoot>
+                        <tr style={{ borderTop: '1px solid #3d3d40' }}>
+                          <td style={{ padding: '4px 8px 0 0', color: '#a1a1aa' }}>
+                            {qtyDominatorGroups.length > 1 ? 'Subtotal' : 'Total'}
                           </td>
-                          <td style={{ textAlign: 'right', padding: '2px 0', color: '#d4d4d8' }}>
-                            {alloc ? qtyFmt(alloc.qty_consumed) : '–'}
+                          <td style={{ textAlign: 'right', padding: '4px 8px 0', color: '#fafafa', fontWeight: 600 }}>
+                            {groupAllocated != null ? qtyFmt(groupAllocated) : '–'}
                           </td>
-                        </>
-                      )}
-                    </tr>
-                  );
-                })}
-              </tbody>
-              {showAllocCols && (
-                <tfoot>
-                  <tr style={{ borderTop: '1px solid #3d3d40' }}>
-                    <td style={{ padding: '4px 8px 0 0', color: '#a1a1aa' }}>Total</td>
-                    <td style={{ textAlign: 'right', padding: '4px 8px 0', color: '#fafafa', fontWeight: 600 }}>
-                      {totalAllocated != null ? qtyFmt(totalAllocated) : '–'}
-                    </td>
-                    <td style={{ textAlign: 'right', padding: '4px 0 0', color: '#fafafa', fontWeight: 600 }}>
-                      {qtyFmt(totalConsumed)}
-                    </td>
-                  </tr>
-                </tfoot>
-              )}
-            </table>
+                          <td style={{ textAlign: 'right', padding: '4px 0 0', color: '#fafafa', fontWeight: 600 }}>
+                            {qtyFmt(groupConsumed)}
+                          </td>
+                        </tr>
+                      </tfoot>
+                    )}
+                  </table>
+                );
+              })}
+            </div>
           )}
           {rootTimeDominators.map((d, i) => (
             <DominatorLink key={`rt-${i}`} kind="time" dominator={d} onClick={handleDominatorClick} contextDemandId={contextDemandId ?? tree.demand_id} />

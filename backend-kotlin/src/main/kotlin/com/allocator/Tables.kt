@@ -33,6 +33,13 @@ object Boms : Table("bom") {
     val elemIx = integer("elem_ix").nullable()
     val altGroup = varchar("alt_group", 255).nullable()
     val rate = double("rate").nullable()
+    // Rows are always fully replaced (delete + reinsert) by CsvImportService, never
+    // partially updated — so this stamps "last (re)imported at," which is exactly what's
+    // needed to answer "did this case's data change between two given timestamps" after
+    // the fact. See the 68.7%→62% fill-rate investigation this was added for: none of the
+    // core case tables (bom/demand/supply/method_*) carried any audit trail at all, so a
+    // real data change couldn't be distinguished from code/KB/non-determinism effects.
+    val updatedAt = timestamp("updated_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 }
 
@@ -78,6 +85,8 @@ object Demands : Table("demand") {
     val productId = varchar("product_id", 255)
     val locationId = varchar("location_id", 255).nullable()
     val quantity = double("quantity")
+    // See Boms.updatedAt's own doc — same "last (re)imported at" audit trail.
+    val updatedAt = timestamp("updated_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 }
 
@@ -90,6 +99,8 @@ object MethodBuys : Table("method_buy") {
     val leadDaysSupply = integer("lead_days_supply").nullable()
     val cycleDaysSupply = integer("cycle_days_supply").nullable()
     val vendorId = varchar("vendor_id", 255).nullable()
+    // See Boms.updatedAt's own doc — same "last (re)imported at" audit trail.
+    val updatedAt = timestamp("updated_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 }
 
@@ -101,6 +112,8 @@ object MethodMakes : Table("method_make") {
     val locationId = varchar("location_id", 255)
     val preference = integer("preference").nullable()
     val leadTime = integer("lead_time").nullable()
+    // See Boms.updatedAt's own doc — same "last (re)imported at" audit trail.
+    val updatedAt = timestamp("updated_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 }
 
@@ -157,6 +170,8 @@ object Supplies : Table("supply") {
     val productId = varchar("product_id", 255)
     val supplyDate = varchar("supply_date", 64).nullable()
     val qty = double("qty")
+    // See Boms.updatedAt's own doc — same "last (re)imported at" audit trail.
+    val updatedAt = timestamp("updated_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 }
 
@@ -169,6 +184,8 @@ object MethodMoves : Table("method_move") {
     val transitTime = double("transit_time").nullable()
     val transitTimeUom = varchar("transit_time_uom", 32).nullable()
     val preference = integer("preference").nullable()
+    // See Boms.updatedAt's own doc — same "last (re)imported at" audit trail.
+    val updatedAt = timestamp("updated_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 }
 
