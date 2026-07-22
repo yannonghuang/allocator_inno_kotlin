@@ -4,6 +4,7 @@ import com.allocator.services.DemandBlueprint
 import com.allocator.services.DominatorRef
 import com.allocator.services.NodeBlueprint
 import com.allocator.services.plan
+import com.allocator.services.reconcile
 import com.allocator.services.runPlanning
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.doubles.plusOrMinus
@@ -232,6 +233,48 @@ class DominatorTest : FunSpec({
             dominators[0]["product_id"] shouldBe "X"
             dominators[0]["location_id"] shouldBe "L"
         }
+    }
+
+    test("reconcile() drops a stale quantity_dominator once a shrunken target is fully met, but preserves it when still genuinely short") {
+        // Regression for case 173's 818_F30_2024_08_VIRTUAL / 500-6417@2000 (run 1404): plan()'s
+        // own inline pass genuinely fell short against an ORIGINAL ask of 100 (only 60
+        // achieved — one candidate delivered 60 of its own 60-unit share, a second, entirely
+        // abandoned candidate contributed 0 and was blocked) — legitimately tagging
+        // commit_reason="partial" and a 2-ref quantity_dominator naming BOTH the winning
+        // candidate's own material (X) and the abandoned candidate's (Y, never actually used).
+        // A parent above then reconciled this node's target DOWN to 60 — exactly what the
+        // surviving candidate alone already delivers in full — so the dominator (and "partial"
+        // reason) must be dropped: nothing is short any more, and Y was never really the cause.
+        val refX = mapOf<String, Any?>("kind" to "bom_child", "product_id" to "X", "location_id" to "L", "supply_id" to "X_L_1")
+        val refY = mapOf<String, Any?>("kind" to "bom_child", "product_id" to "Y", "location_id" to "L", "supply_id" to "Y_L_1")
+        fun staleNode() = mapOf<String, Any?>(
+            "type" to "demand",
+            "product_id" to "P", "location_id" to "L",
+            "quantity" to 100.0, "committed_qty" to 60.0,
+            "commit_reason" to "partial",
+            "quantity_dominator" to listOf(refX, refY),
+            "children" to listOf(
+                mapOf<String, Any?>("type" to "work_order", "method" to "make", "quantity" to 60.0, "quantity_precise" to 60.0, "children" to emptyList<Any>()),
+                mapOf<String, Any?>("type" to "work_order", "method" to "make", "quantity" to 0.0, "failed" to true, "children" to emptyList<Any>()),
+            ),
+        )
+
+        // Target reconciled DOWN to exactly what the surviving candidate delivers: stale.
+        val (shrunk, committedShrunk) = reconcile(staleNode(), 60.0, emptyMap(), null)
+        committedShrunk shouldBe (60.0 plusOrMinus 1e-9)
+        shrunk["quantity"] shouldBe (60.0 plusOrMinus 1e-9)
+        shrunk["committed_qty"] shouldBe (60.0 plusOrMinus 1e-9)
+        shrunk["quantity_dominator"] shouldBe null
+        shrunk["commit_reason"] shouldBe null
+
+        // Target UNCHANGED from the original (still 100): genuinely still short — preserve
+        // the original dominator verbatim (nothing to re-derive after the fact).
+        val (stillShort, committedStillShort) = reconcile(staleNode(), 100.0, emptyMap(), null)
+        committedStillShort shouldBe (60.0 plusOrMinus 1e-9)
+        @Suppress("UNCHECKED_CAST")
+        val preserved = stillShort["quantity_dominator"] as? List<Map<String, Any?>>
+        preserved?.size shouldBe 2
+        stillShort["commit_reason"] shouldBe "partial"
     }
 
     test("priority ordering: branchDominator wins over the sketch-phase fallback (ownDominator)") {

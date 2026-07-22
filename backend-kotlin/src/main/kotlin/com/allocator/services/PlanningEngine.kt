@@ -3939,6 +3939,15 @@ internal fun reconcile(
             // re-derive after the fact.
             @Suppress("UNCHECKED_CAST")
             val existingDominator = (node["quantity_dominator"] as? List<Map<String, Any?>>)?.takeIf { it.isNotEmpty() }
+            // Was this node ALREADY short at plan()-time, against its OWN original ask (before
+            // this call collapses "quantity" to whatever gets committed here)? An AND-sibling
+            // pre-capped by a shared critical material (computeAndSiblingCaps) is typically
+            // already fully self-consistent here (quantity == committed_qty from the moment
+            // plan() built it) — its dominator explains the CAP itself, not a shortfall, and
+            // must survive regardless of what this reconcile call's own `target` happens to be.
+            val origQuantity = (node["quantity"] as? Number)?.toDouble()
+            val origCommitted = (node["committed_qty"] as? Number)?.toDouble()
+            val wasOriginallyShort = origQuantity != null && origCommitted != null && origCommitted < origQuantity - 1e-6
             var remaining = target
             val newChildren = allChildren.map { ch ->
                 val cm = ch as? Map<String, Any?> ?: return@map ch
@@ -3948,6 +3957,27 @@ internal fun reconcile(
                 nc
             }
             val committed = (target - remaining).coerceAtLeast(0.0)
+            // A prior existingDominator (set inline during planning, against THIS node's
+            // ORIGINAL, pre-reconcile ask) — or a freshly-derived union below — only goes stale
+            // when BOTH: (a) the node was genuinely short at plan()-time (wasOriginallyShort —
+            // an AND-sibling pre-capped by a shared critical material is typically NOT this;
+            // see its own doc above) AND (b) it's no longer short of the ask actually being
+            // reconciled here (`target`, handed down from the parent — which can be smaller
+            // than what plan() originally asked this node for, e.g. because a sibling elsewhere
+            // released capacity). "Quantity" gets collapsed to `committed` just below regardless
+            // (see that comment), so once BOTH hold, a dominator computed against the old,
+            // larger ask no longer explains anything about the (redefined) quantity this node
+            // now reports — it names a shortfall, and possibly an abandoned alternative, that
+            // the reconciled node no longer has. Confirmed live on case 173's
+            // 818_F30_2024_08_VIRTUAL / 500-6417@2000: plan()'s own inline pass genuinely fell
+            // short against an original ask (residual ~2530, blaming both 160-1291 and an
+            // entirely-abandoned 283-0046-31 fallback candidate that was later blocked); a
+            // parent above then reconciled this node's target down to ~1789 — fully satisfiable
+            // by the surviving candidate alone — yet the stale 8-ref dominator (including
+            // 283-0046-31, never actually used at the reconciled quantity) survived verbatim
+            // because this branch preserved it unconditionally.
+            val genuinelyShort = committed < target - 1e-6
+            val staleDominator = wasOriginallyShort && !genuinelyShort
             // "The contributing WO's dominator is the dominator": on a genuine overall
             // shortfall, collect from whichever children already carry their own dominator —
             // set inline, during planning, at the exact point THEY were constrained — rather
@@ -3957,7 +3987,7 @@ internal fun reconcile(
             // pre-assigned share up front, not "the entire remaining amount," so a child that
             // fully delivered its own assignment carries no dominator of its own and
             // contributes nothing — exactly right, since it wasn't the cause.
-            val qtyDominatorRefs = if (existingDominator == null && committed < target - 1e-6) {
+            val qtyDominatorRefs = if (existingDominator == null && genuinelyShort) {
                 newChildren.flatMap { ch ->
                     (ch as? Map<String, Any?>)?.let { rawDominatorRefs(it, "quantity_dominator", "bom_child", data, config) } ?: emptyList()
                 }.dedupBySupply()
@@ -3965,10 +3995,11 @@ internal fun reconcile(
             // Collapse the request to the commitment so the reconciled tree is fully consistent
             // (quantity == committed_qty for every internal node). The caller restores the root's
             // original request for the requested-vs-committed display.
-            val nn = node + mapOf("children" to newChildren, "quantity" to committed, "committed_qty" to committed) +
-                (if (existingDominator != null) mapOf("quantity_dominator" to existingDominator)
-                 else if (qtyDominatorRefs.isNotEmpty()) mapOf("quantity_dominator" to qtyDominatorRefs.toJsonList())
-                 else emptyMap())
+            val base = node + mapOf("children" to newChildren, "quantity" to committed, "committed_qty" to committed)
+            val nn = if (staleDominator) base - "quantity_dominator" - "commit_reason"
+                else if (existingDominator != null) base + mapOf("quantity_dominator" to existingDominator)
+                else if (qtyDominatorRefs.isNotEmpty()) base + mapOf("quantity_dominator" to qtyDominatorRefs.toJsonList())
+                else base
             return nn to committed
         }
         "work_order" -> {
