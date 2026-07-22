@@ -329,6 +329,9 @@ object CasePreferences : Table("case_preference") {
     val preference   = integer("preference")         // canonical 10, 20, 30, ... — lower = more preferred
     val inventoryScore = double("inventory_score").nullable()
     val deliveryScore  = double("delivery_score").nullable()
+    // Nullable purely for rows persisted before this axis existed — freshly built rows always
+    // populate it (see PreferenceBuilder.kt's own doc on why this axis has no infeasible state).
+    val criticalMaterialScore = double("critical_material_score").nullable()
     override val primaryKey = PrimaryKey(id)
     init {
         index("ix_case_preference_case", false, caseId)
@@ -336,14 +339,19 @@ object CasePreferences : Table("case_preference") {
     }
 }
 
-/** One row per case: the max_bom_depth/delivery_weight/inventory_weight last used to (re)build
- *  [CasePreferences] — shown when reopening the Preferences page and carried into CSV export. */
+/** One row per case: the max_bom_depth/delivery_weight/inventory_weight/critical_material_weight
+ *  last used to (re)build [CasePreferences] — shown when reopening the Preferences page and
+ *  carried into CSV export. */
 object CasePreferenceConfigs : Table("case_preference_config") {
     val id             = integer("id").autoIncrement()
     val caseId         = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE).uniqueIndex()
     val maxBomDepth    = integer("max_bom_depth")
     val deliveryWeight = double("delivery_weight")
     val inventoryWeight = double("inventory_weight")
+    // DB-level default (not the new feature's own UI/API default of 0.4) so this non-nullable
+    // column can be added against already-populated case_preference_config rows — those rows
+    // implicitly "had no critical-material axis," which 0.0 correctly represents.
+    val criticalMaterialWeight = double("critical_material_weight").default(0.0)
     val generatedAt    = timestamp("generated_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 }

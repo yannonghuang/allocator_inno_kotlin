@@ -39,7 +39,7 @@ class PreferenceBuilderTest : FunSpec({
                 mapOf<String, Any?>("demand_id" to "D1", "product_id" to "P", "location_id" to "L", "quantity" to 10.0),
             ),
         )
-        val rows = buildPreferenceKb(data, maxBomDepth = 3, deliveryWeight = 0.5, inventoryWeight = 0.5)
+        val rows = buildPreferenceKb(data, config = null, maxBomDepth = 3, deliveryWeight = 0.5, inventoryWeight = 0.5, criticalMaterialWeight = 0.0)
         val pRows = rows.filter { it.productId == "P" && it.locationId == "L" }.sortedBy { it.preference }
         pRows.size shouldBe 2
         pRows[0].methodKey.startsWith("B1") shouldBe true
@@ -65,7 +65,7 @@ class PreferenceBuilderTest : FunSpec({
                 mapOf<String, Any?>("demand_id" to "D1", "product_id" to "X", "location_id" to "L1", "quantity" to 10.0),
             ),
         )
-        val rows = buildPreferenceKb(data, maxBomDepth = 3, deliveryWeight = 0.5, inventoryWeight = 0.5)
+        val rows = buildPreferenceKb(data, config = null, maxBomDepth = 3, deliveryWeight = 0.5, inventoryWeight = 0.5, criticalMaterialWeight = 0.0)
         val xRows = rows.filter { it.productId == "X" && it.locationId == "L1" }.sortedBy { it.preference }
         xRows.size shouldBe 2
         xRows[0].methodType shouldBe "purchase"
@@ -97,11 +97,11 @@ class PreferenceBuilderTest : FunSpec({
             ),
         )
         val shallowCache = mutableMapOf<Pair<Pair<String, String>, Int>, com.allocator.services.NodeMetrics>()
-        val shallow = computeNodeMetrics("P", "L", data, maxBomDepth = 1, supplyByNode = mapOf("C4" to "L" to 50.0), cache = shallowCache)
+        val shallow = computeNodeMetrics("P", "L", data, config = null, maxBomDepth = 1, supplyByNode = mapOf("C4" to "L" to 50.0), cache = shallowCache)
         shallow.bestCoverageUnits shouldBe 0.0
 
         val deepCache = mutableMapOf<Pair<Pair<String, String>, Int>, com.allocator.services.NodeMetrics>()
-        val deep = computeNodeMetrics("P", "L", data, maxBomDepth = 5, supplyByNode = mapOf("C4" to "L" to 50.0), cache = deepCache)
+        val deep = computeNodeMetrics("P", "L", data, config = null, maxBomDepth = 5, supplyByNode = mapOf("C4" to "L" to 50.0), cache = deepCache)
         deep.bestCoverageUnits shouldBe 50.0
     }
 
@@ -167,10 +167,10 @@ class PreferenceBuilderTest : FunSpec({
         )
         val preferenceKb = PreferenceKb(
             entries = mapOf(
-                Triple("P1", "L", "B1_P1:__null__") to PreferenceKbEntry(preference = 20, inventoryScore = 0.0, deliveryScore = 10.0),
-                Triple("P1", "L", "B2_P1:__null__") to PreferenceKbEntry(preference = 10, inventoryScore = 100.0, deliveryScore = 0.0),
+                Triple("P1", "L", "B1_P1:__null__") to PreferenceKbEntry(preference = 20, inventoryScore = 0.0, deliveryScore = 10.0, criticalMaterialScore = 0.0),
+                Triple("P1", "L", "B2_P1:__null__") to PreferenceKbEntry(preference = 10, inventoryScore = 100.0, deliveryScore = 0.0, criticalMaterialScore = 0.0),
             ),
-            deliveryWeight = 0.5, inventoryWeight = 0.5,
+            deliveryWeight = 0.5, inventoryWeight = 0.5, criticalMaterialWeight = 0.0,
         )
 
         val (_, wosP1, _) = plan(demandFor("P1", "D1"), mutableListOf(), combined, requestTimeDt = null,
@@ -211,11 +211,11 @@ class PreferenceBuilderTest : FunSpec({
         )
         val kb = PreferenceKb(
             entries = mapOf(
-                Triple("P", "L", "B1:") to PreferenceKbEntry(10, inventoryScore = 100.0, deliveryScore = 0.0),
-                Triple("P", "L", "B2:") to PreferenceKbEntry(20, inventoryScore = 50.0, deliveryScore = 5.0),
-                Triple("P", "L", "B3:") to PreferenceKbEntry(30, inventoryScore = 0.0, deliveryScore = 10.0),
+                Triple("P", "L", "B1:") to PreferenceKbEntry(10, inventoryScore = 100.0, deliveryScore = 0.0, criticalMaterialScore = 0.0),
+                Triple("P", "L", "B2:") to PreferenceKbEntry(20, inventoryScore = 50.0, deliveryScore = 5.0, criticalMaterialScore = 0.0),
+                Triple("P", "L", "B3:") to PreferenceKbEntry(30, inventoryScore = 0.0, deliveryScore = 10.0, criticalMaterialScore = 0.0),
             ),
-            deliveryWeight = 0.5, inventoryWeight = 0.5,
+            deliveryWeight = 0.5, inventoryWeight = 0.5, criticalMaterialWeight = 0.0,
         )
         val scores = reconstructNodeScores("P", "L", candidates, kb)
         scores shouldNotBe null
@@ -227,9 +227,55 @@ class PreferenceBuilderTest : FunSpec({
 
         // Missing coverage for one candidate -> null (defer to caller's own fallback).
         val partialKb = PreferenceKb(
-            entries = mapOf(Triple("P", "L", "B1:") to PreferenceKbEntry(10, 100.0, 0.0)),
-            deliveryWeight = 0.5, inventoryWeight = 0.5,
+            entries = mapOf(Triple("P", "L", "B1:") to PreferenceKbEntry(10, 100.0, 0.0, 0.0)),
+            deliveryWeight = 0.5, inventoryWeight = 0.5, criticalMaterialWeight = 0.0,
         )
         reconstructNodeScores("P", "L", candidates, partialKb) shouldBe null
+    }
+
+    test("critical material usage sums across sibling sub-assemblies, not deduplicated by material identity") {
+        // R made from two required siblings SA1 and SA2 (both AND-mandatory), each in turn
+        // requiring the SAME raw critical material CM. CM has no make/buy methods at all, so
+        // isRawCriticalPosition(CM, L, ...) is true unconditionally (criterion 1: no make, no
+        // buy) — no config needed. Expected: CM's own edge is counted once per component that
+        // uses it (SA1 and SA2 each contribute 1), so R's own usage sums to 2, not deduplicated
+        // down to 1 for the shared physical material.
+        val data = mapOf(
+            "method_make" to listOf(
+                mapOf<String, Any?>("bom_id" to "BR", "product_id" to "R", "location_id" to "L", "preference" to 1, "lead_time" to 0.0),
+                mapOf<String, Any?>("bom_id" to "BSA1", "product_id" to "SA1", "location_id" to "L", "preference" to 1, "lead_time" to 0.0),
+                mapOf<String, Any?>("bom_id" to "BSA2", "product_id" to "SA2", "location_id" to "L", "preference" to 1, "lead_time" to 0.0),
+            ),
+            "method_buy" to emptyList<Map<String, Any?>>(),
+            "method_move" to emptyList<Map<String, Any?>>(),
+            "bom" to listOf(
+                mapOf<String, Any?>("bom_id" to "BR", "parent_id" to "R", "child_id" to "SA1", "alt_group" to null, "rate" to 1.0),
+                mapOf<String, Any?>("bom_id" to "BR", "parent_id" to "R", "child_id" to "SA2", "alt_group" to null, "rate" to 1.0),
+                mapOf<String, Any?>("bom_id" to "BSA1", "parent_id" to "SA1", "child_id" to "CM", "alt_group" to null, "rate" to 1.0),
+                mapOf<String, Any?>("bom_id" to "BSA2", "parent_id" to "SA2", "child_id" to "CM", "alt_group" to null, "rate" to 1.0),
+            ),
+            "productlocation" to emptyList<Map<String, Any?>>(),
+            "supply" to emptyList<Map<String, Any?>>(),
+            "demand" to listOf(
+                mapOf<String, Any?>("demand_id" to "D1", "product_id" to "R", "location_id" to "L", "quantity" to 10.0),
+            ),
+        )
+        val cache = mutableMapOf<Pair<Pair<String, String>, Int>, com.allocator.services.NodeMetrics>()
+        val cm = computeNodeMetrics("CM", "L", data, config = null, maxBomDepth = 3, supplyByNode = emptyMap(), cache = cache)
+        cm.bestCriticalMaterialUsage shouldBe 0.0 // leaf: no methods, no stock
+
+        val sa1 = computeNodeMetrics("SA1", "L", data, config = null, maxBomDepth = 3, supplyByNode = emptyMap(), cache = cache)
+        sa1.bestCriticalMaterialUsage shouldBe 1.0 // CM is critical -> 1 edge
+
+        val r = computeNodeMetrics("R", "L", data, config = null, maxBomDepth = 3, supplyByNode = emptyMap(), cache = cache)
+        // SA1 and SA2 are each NOT critical (they have their own make method -> elastic), so
+        // each contributes only its own recursive usage (1.0) -> summed to 2.0, not deduped.
+        r.bestCriticalMaterialUsage shouldBe 2.0
+
+        // Also cover the persisted-row path: R's own PreferenceCandidateRow should carry the
+        // same total.
+        val rows = buildPreferenceKb(data, config = null, maxBomDepth = 3, deliveryWeight = 0.3, inventoryWeight = 0.3, criticalMaterialWeight = 0.4)
+        val rRow = rows.first { it.productId == "R" && it.locationId == "L" }
+        rRow.criticalMaterialScore shouldBe 2.0
     }
 })

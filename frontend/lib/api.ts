@@ -2056,6 +2056,7 @@ export type PreferenceRow = {
   preference: number;
   inventory_score: number | null;
   delivery_score: number | null;
+  critical_material_score: number | null;
   prod_area: string | null;
 };
 
@@ -2063,6 +2064,7 @@ export type PreferenceConfig = {
   max_bom_depth: number;
   delivery_weight: number;
   inventory_weight: number;
+  critical_material_weight: number;
   generated_at: string;
 };
 
@@ -2070,6 +2072,7 @@ export type PreferenceGenerateParams = {
   max_bom_depth: number;
   delivery_weight: number;
   inventory_weight: number;
+  critical_material_weight: number;
 };
 
 /** GET /cases/{id}/preferences — null when no Preferences KB exists yet (204). */
