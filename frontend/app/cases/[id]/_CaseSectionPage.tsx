@@ -10068,7 +10068,27 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 if (!tree) {
                   const cacheState = demandPeggingCache[demandIdNorm];
                   if (cacheState === 'loading') return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>Loading pegging tree…</p>;
-                  if (cacheState === 'error') return <p style={{ color: '#f87171', fontSize: '0.9rem' }}>Failed to load pegging tree for this demand.</p>;
+                  if (cacheState === 'error') {
+                    return (
+                      <div style={{ color: '#f87171', fontSize: '0.9rem' }}>
+                        <p>Failed to load pegging tree for this demand.</p>
+                        <button
+                          onClick={() => setDemandPeggingCache((prev) => {
+                            // Clear this demand's own entry (not the whole cache) so the lazy-fetch
+                            // effect's guard sees no cached value and retries on the next render —
+                            // same recovery path as the 'no-run' retry, just user-triggered instead
+                            // of waiting for currentPlanRunId/freshPlanRunId to settle.
+                            const next = { ...prev };
+                            delete next[demandIdNorm];
+                            return next;
+                          })}
+                          style={{ marginTop: '0.5rem', padding: '4px 10px', background: '#27272a', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, cursor: 'pointer', fontSize: '0.8rem' }}
+                        >
+                          Retry
+                        </button>
+                      </div>
+                    );
+                  }
                   if (cacheState === 'no-run') {
                     return (
                       <div style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>
