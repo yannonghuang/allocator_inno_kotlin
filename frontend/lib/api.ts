@@ -915,11 +915,25 @@ export async function getPlanRun(caseId: number, runId: number): Promise<PlanRun
 }
 
 export async function getPlanRunPegging(caseId: number, runId: number, demandId: string): Promise<{ planning_pegging: unknown[] }> {
-  const r = await fetch(`${API}/cases/${caseId}/plan-runs/${runId}/pegging/${encodeURIComponent(demandId)}`);
-  if (!r.ok) throw new Error(await r.text());
-  // Backend returns the raw pegging entry JSON; wrap it in an array to match the old bulk shape.
-  const entry = await r.json();
-  return { planning_pegging: [entry] };
+  // A plain fetch with no timeout can hang indefinitely on a dropped connection or a stuck
+  // dev-server hot-reload — the caller's own cache guard (see _CaseSectionPage.tsx's
+  // demandPeggingCache) only re-fetches when there's no cached entry at all, so a request that
+  // never resolves NOR rejects leaves that demand's pegging panel permanently stuck on
+  // "Loading…" for the rest of the session. Force a rejection after a bounded wait so the
+  // caller's own .catch() can transition to a retryable 'error' state instead.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30_000);
+  try {
+    const r = await fetch(`${API}/cases/${caseId}/plan-runs/${runId}/pegging/${encodeURIComponent(demandId)}`, {
+      signal: controller.signal,
+    });
+    if (!r.ok) throw new Error(await r.text());
+    // Backend returns the raw pegging entry JSON; wrap it in an array to match the old bulk shape.
+    const entry = await r.json();
+    return { planning_pegging: [entry] };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 /** A single supply lot's allocated/consumed amounts for one demand, as persisted to
