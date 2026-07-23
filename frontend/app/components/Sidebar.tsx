@@ -20,6 +20,8 @@ export function Sidebar({ open, onToggle }: { open: boolean; onToggle: () => voi
   const inAllocation = !!caseId && pathname.startsWith(`/cases/${caseId}/allocation`);
   const inPreferences = !!caseId && pathname.startsWith(`/cases/${caseId}/preferences`);
   const inDemandOrdering = !!caseId && pathname.startsWith(`/cases/${caseId}/demand-ordering`);
+  const inPurchasableMaterials = !!caseId && pathname.startsWith(`/cases/${caseId}/purchasable-materials`);
+  const inConstraints = !!caseId && pathname.startsWith(`/cases/${caseId}/constraints`);
   const inBom = !!caseId && pathname.startsWith(`/cases/${caseId}/bom`);
   const inMaterial = !!caseId && pathname.startsWith(`/cases/${caseId}/material-impact`);
   const inEvents = inMaterial && !pathname.startsWith(`/cases/${caseId}/material-impact/criteria`);
@@ -133,6 +135,28 @@ export function Sidebar({ open, onToggle }: { open: boolean; onToggle: () => voi
             </Link>
           ) : (
             <span style={link(false, true)}>{t('demandOrdering')}</span>
+          )}
+        </div>
+
+        {/* Purchasable Materials */}
+        <div style={{ marginTop: '0.125rem' }}>
+          {caseId ? (
+            <Link href={`/cases/${caseId}/purchasable-materials`} style={link(inPurchasableMaterials)}>
+              {t('purchasableMaterials')}
+            </Link>
+          ) : (
+            <span style={link(false, true)}>{t('purchasableMaterials')}</span>
+          )}
+        </div>
+
+        {/* Constraints */}
+        <div style={{ marginTop: '0.125rem' }}>
+          {caseId ? (
+            <Link href={`/cases/${caseId}/constraints`} style={link(inConstraints)}>
+              {t('constraints')}
+            </Link>
+          ) : (
+            <span style={link(false, true)}>{t('constraints')}</span>
           )}
         </div>
 

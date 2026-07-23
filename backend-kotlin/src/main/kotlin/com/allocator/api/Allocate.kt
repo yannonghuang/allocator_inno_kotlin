@@ -3,7 +3,6 @@ package com.allocator.api
 import com.allocator.*
 import com.allocator.services.CaseLoader
 import com.allocator.services.getMethods
-import com.allocator.services.parseConstraints
 import com.allocator.services.resolveMethodSelection
 import com.allocator.services.resolveVariantSelection
 import com.allocator.services.roundQty
@@ -456,7 +455,7 @@ fun Routing.allocateRoutes() {
         // to the client for a "skipped N presets" notice.
         val coveredSigs = com.allocator.services.CaseBootstrap.coveredSignaturesFor(caseId)
         val (presets, skippedDup) = proposedPresets.partition { preset ->
-            com.allocator.services.CaseBootstrap.signatureFor(preset.config) !in coveredSigs
+            com.allocator.services.CaseBootstrap.signatureForBootstrapCandidate(preset.config, caseId) !in coveredSigs
         }
         if (presets.isEmpty()) {
             call.respond(buildJsonObject {
@@ -2660,7 +2659,7 @@ internal suspend fun runPlanBackground(
 ) {
     // Insert plan_run record at start
     val planRunId = transaction {
-        val configJson = resolveEffectiveConfig(config).toString()
+        val configJson = resolveEffectiveConfig(config, caseId, consultsOverrideTables = true).toString()
         val insertedId = PlanRuns.insert {
             it[PlanRuns.caseId] = caseId
             it[PlanRuns.jobId] = jobId
@@ -2923,8 +2922,8 @@ private suspend fun runOneBootstrapPreset(
         ?: throw IllegalStateException("Failed to convert bootstrap preset config to Map")
 
     val planRunId = transaction {
-        val configJson = resolveEffectiveConfig(configMap).toString()
-        val metadataJson = com.allocator.services.CaseBootstrap.metadataFor(preset).toString()
+        val configJson = resolveEffectiveConfig(configMap, caseId, consultsOverrideTables = false).toString()
+        val metadataJson = com.allocator.services.CaseBootstrap.metadataFor(preset, caseId).toString()
         val insertedId = PlanRuns.insert {
             it[PlanRuns.caseId] = caseId
             it[PlanRuns.status] = "running"
@@ -3151,7 +3150,16 @@ private fun markRunFailed(runId: Int, caseId: Int, error: String) {
  * self-describing — future code changes to defaults cannot alter its interpretation.
  */
 @Suppress("UNCHECKED_CAST")
-private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
+/**
+ * [consultsOverrideTables]: whether the run this config is being persisted for actually reads
+ * `case_allocation`/`case_preference`/`case_demand_order` (the regular `runPlanBackground`
+ * path does; the bootstrap-preset path does not — see `KbFingerprint.buildFingerprint`'s own
+ * doc for why this distinction matters for the KB signature). Embeds a `_kb_fingerprint`
+ * object into the resolved config — read later by `CaseBootstrap.signatureFor` — so the exact
+ * allocation/preference/demand-order state in effect AT SUBMISSION TIME survives alongside the
+ * rest of this point-in-time config snapshot, rather than being silently invisible to the KB.
+ */
+private fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int, consultsOverrideTables: Boolean): JsonObject {
     val c = config ?: emptyMap()
     val consolidation = (c["consolidation"]     as? Map<*, *>)?.let { it as Map<String, Any?> } ?: emptyMap()
     val methodCfg = resolveMethodSelection(c)
@@ -3159,17 +3167,21 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
 
     return buildJsonObject {
         put("purchase_allowed", c["purchase_allowed"] as? Boolean ?: true)
-        // Selective-purchase whitelist of buyable raw-material product_ids. Empty ⇒ all
-        // raw materials are purchasable (default). Persist so the dropdown round-trips.
+        // Selective-purchase whitelist and customer-BOM constraints are case-level persisted
+        // settings now (CasePurchasableMaterials / CaseConstraints — "promoted out" of this
+        // config blob, see those tables' own doc in Tables.kt), not something the caller
+        // submits per plan run. Read fresh from the case's own tables here — UNCONDITIONALLY,
+        // on both the regular and bootstrap submission paths (unlike casealloc/pref/ord's
+        // consultsOverrideTables gate): these are real business/data constraints, not
+        // planning-strategy axes bootstrap deliberately varies, so bootstrap presets should
+        // respect them too. Whatever the caller submitted for these two keys is ignored.
+        // Empty ⇒ all raw materials purchasable / no constraints — the exact same convention
+        // the old embedded arrays used for an empty list.
         putJsonArray("purchasable_materials") {
-            (c["purchasable_materials"] as? List<*>)?.forEach { pid ->
-                (pid as? String)?.trim()?.takeIf { it.isNotEmpty() }?.let { add(it) }
-            }
+            loadPurchasableMaterialIds(caseId).sorted().forEach { add(it) }
         }
-        // Customer-specific BOM-alternative constraints. Persist so the UI rule list
-        // round-trips and the rule is reapplied on replan/reload.
         putJsonArray("constraints") {
-            parseConstraints(c).forEach { k ->
+            loadCaseConstraintRows(caseId).forEach { k ->
                 addJsonObject {
                     put("customer", k.customerId)
                     put("parent", k.parent)
@@ -3215,6 +3227,14 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?): JsonObject {
                 val v = consolidation[key]?.toString()
                 if (v != null && v in validScales) put(key, v)
             }
+        }
+        val fp = com.allocator.services.KbFingerprint.buildFingerprint(caseId, consultsOverrideTables)
+        putJsonObject("_kb_fingerprint") {
+            put("casealloc", fp.casealloc)
+            put("pref", fp.pref)
+            put("ord", fp.ord)
+            put("purchmat", fp.purchmat)
+            put("constr", fp.constr)
         }
     }
 }

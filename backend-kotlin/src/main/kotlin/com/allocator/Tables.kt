@@ -329,6 +329,61 @@ object CaseAllocations : Table("case_allocation") {
 }
 
 /**
+ * Case-level "Purchasable Materials" whitelist — promoted out of the ad-hoc plan_run.config
+ * blob (was `config.purchasable_materials: string[]`) into its own persisted, case-scoped
+ * setting, mirroring [CaseAllocations]' pattern. Zero rows for a case = "allow all" (the exact
+ * same convention the old embedded array used for an empty list). Read fresh into every plan
+ * run's resolved config at submission time (both regular and bootstrap paths — see
+ * `Allocate.kt`'s `resolveEffectiveConfig`) rather than trusted from whatever the caller submits.
+ */
+object CasePurchasableMaterials : Table("case_purchasable_material") {
+    val id        = integer("id").autoIncrement()
+    val caseId    = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val productId = varchar("product_id", 255)
+    override val primaryKey = PrimaryKey(id)
+    init { uniqueIndex("ux_case_purchasable_material_key", caseId, productId) }
+}
+
+/** Content-fingerprint tracker for [CasePurchasableMaterials] — see
+ *  [CasePreferenceConfigs.contentHash]'s own doc for the full "why" (cheap KB-signature lookup,
+ *  not live table hashing). No generation params of its own (unlike Preferences) — purely a
+ *  hash-tracking companion, same as [CaseAllocationConfigs]. */
+object CasePurchasableMaterialConfigs : Table("case_purchasable_material_config") {
+    val id          = integer("id").autoIncrement()
+    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE).uniqueIndex()
+    val contentHash = varchar("content_hash", 32).nullable()
+    val generatedAt = timestamp("generated_at").defaultExpression(CurrentTimestamp)
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
+ * Case-level customer-specific BOM-alternative constraints — promoted out of
+ * plan_run.config's `constraints: {customer, parent, location, child}[]` array, same rationale
+ * and pattern as [CasePurchasableMaterials]. `location = "*"` means "any location", matching the
+ * existing convention `parseConstraints` (PlanningEngine.kt) already expects.
+ */
+object CaseConstraints : Table("case_constraint") {
+    val id         = integer("id").autoIncrement()
+    val caseId     = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val customerId = varchar("customer_id", 255)
+    val parent     = varchar("parent", 255)
+    val location   = varchar("location", 255)
+    val child      = varchar("child", 255)
+    override val primaryKey = PrimaryKey(id)
+    init { uniqueIndex("ux_case_constraint_key", caseId, customerId, parent, location, child) }
+}
+
+/** Content-fingerprint tracker for [CaseConstraints] — see [CasePurchasableMaterialConfigs]'s
+ *  own doc; identical shape/rationale. */
+object CaseConstraintConfigs : Table("case_constraint_config") {
+    val id          = integer("id").autoIncrement()
+    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE).uniqueIndex()
+    val contentHash = varchar("content_hash", 32).nullable()
+    val generatedAt = timestamp("generated_at").defaultExpression(CurrentTimestamp)
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
  * Precomputed method/BOM-variant preference ranking — a "Preferences KB". Built once (via the
  * Generate action) from case data, independent of any plan run, and consulted by the planner
  * in place of the raw CSV `preference` column when present (falls back to raw CSV per-alternative
@@ -370,6 +425,13 @@ object CasePreferenceConfigs : Table("case_preference_config") {
     // implicitly "had no critical-material axis," which 0.0 correctly represents.
     val criticalMaterialWeight = double("critical_material_weight").default(0.0)
     val generatedAt    = timestamp("generated_at").defaultExpression(CurrentTimestamp)
+    // Truncated-SHA-256 fingerprint of the CURRENT case_preference row set (see
+    // CaseAllocationConfigs' own doc — same "cheap lookup, not live hashing" rationale).
+    // Null when case_preference has zero rows for this case. Read by the KB signature
+    // (CaseBootstrap.signatureFor) via the plan-submission fingerprint injection, NOT read
+    // live/directly — a plan_run's own embedded copy is always what's authoritative for that
+    // run, this column only feeds a FRESH submission's fingerprint.
+    val contentHash    = varchar("content_hash", 32).nullable()
     override val primaryKey = PrimaryKey(id)
 }
 
@@ -397,6 +459,26 @@ object CaseDemandOrders : Table("case_demand_order") {
 object CaseDemandOrderConfigs : Table("case_demand_order_config") {
     val id          = integer("id").autoIncrement()
     val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE).uniqueIndex()
+    val generatedAt = timestamp("generated_at").defaultExpression(CurrentTimestamp)
+    // See CasePreferenceConfigs.contentHash's own doc — same fingerprint-for-the-KB-signature
+    // rationale, hashing case_demand_order's current (demand_id, order) row set for this case.
+    val contentHash = varchar("content_hash", 32).nullable()
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
+ * Content-fingerprint tracker for [CaseAllocations] ("Critical Raw Allocation") — mirrors
+ * [CaseDemandOrderConfigs]' shape. Allocation has no separate generation PARAMETERS of its own
+ * (unlike Preferences' max_bom_depth/weights) — this table exists purely to hold a cheap,
+ * incrementally-maintained hash of the current case_allocation row set, read by the KB
+ * signature's fingerprint injection at plan-submission time (see CaseBootstrap.signatureFor
+ * and Allocate.kt's resolveEffectiveConfig) without needing to re-hash the full table on every
+ * submission.
+ */
+object CaseAllocationConfigs : Table("case_allocation_config") {
+    val id          = integer("id").autoIncrement()
+    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE).uniqueIndex()
+    val contentHash = varchar("content_hash", 32).nullable()
     val generatedAt = timestamp("generated_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 }

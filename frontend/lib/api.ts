@@ -2060,6 +2060,104 @@ export async function exportAllocationCsv(caseId: number): Promise<string> {
   return r.text();
 }
 
+// ── Purchasable Materials (promoted out of the inline plan config) ───────────────
+// No "generate" — pure user input, no algorithm computes a default. See
+// PurchasableMaterials.kt's own doc.
+
+export type PurchasableMaterialRow = { product_id: string };
+
+/** GET /cases/{id}/purchasable-materials — the persisted whitelist (empty = allow all). */
+export async function getPurchasableMaterials(caseId: number): Promise<PurchasableMaterialRow[]> {
+  const r = await fetch(`${API}/cases/${caseId}/purchasable-materials`);
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return data.rows as PurchasableMaterialRow[];
+}
+
+/** PUT /cases/{id}/purchasable-materials — replaces the whole set. */
+export async function updatePurchasableMaterials(caseId: number, productIds: string[]): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/purchasable-materials`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ product_ids: productIds }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+/** DELETE /cases/{id}/purchasable-materials — clear (revert to "allow all"). */
+export async function deletePurchasableMaterials(caseId: number): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/purchasable-materials`, { method: 'DELETE' });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+export async function importPurchasableMaterialsCsv(caseId: number, csvText: string): Promise<PurchasableMaterialRow[]> {
+  const r = await fetch(`${API}/cases/${caseId}/purchasable-materials/import`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: csvText,
+  });
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return data.rows as PurchasableMaterialRow[];
+}
+
+export async function exportPurchasableMaterialsCsv(caseId: number): Promise<string> {
+  const r = await fetch(`${API}/cases/${caseId}/purchasable-materials/export`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.text();
+}
+
+// ── Constraints (promoted out of the inline plan config) ─────────────────────────
+// Same rationale as Purchasable Materials — no "generate", pure user input.
+
+export type ConstraintRuleRow = {
+  customer_id: string;
+  parent: string;
+  location: string;
+  child: string;
+};
+
+/** GET /cases/{id}/constraints — the persisted rule set (empty = no constraints). */
+export async function getCaseConstraints(caseId: number): Promise<ConstraintRuleRow[]> {
+  const r = await fetch(`${API}/cases/${caseId}/constraints`);
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return data.rows as ConstraintRuleRow[];
+}
+
+/** PUT /cases/{id}/constraints — replaces the whole rule set. */
+export async function updateCaseConstraints(caseId: number, rows: ConstraintRuleRow[]): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/constraints`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rows }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+/** DELETE /cases/{id}/constraints — clear all rules. */
+export async function deleteCaseConstraints(caseId: number): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/constraints`, { method: 'DELETE' });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+export async function importCaseConstraintsCsv(caseId: number, csvText: string): Promise<ConstraintRuleRow[]> {
+  const r = await fetch(`${API}/cases/${caseId}/constraints/import`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: csvText,
+  });
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return data.rows as ConstraintRuleRow[];
+}
+
+export async function exportCaseConstraintsCsv(caseId: number): Promise<string> {
+  const r = await fetch(`${API}/cases/${caseId}/constraints/export`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.text();
+}
+
 // ── Preferences KB ───────────────────────────────────────────────────────────────
 
 export type PreferenceRow = {

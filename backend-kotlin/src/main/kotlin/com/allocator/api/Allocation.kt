@@ -1,10 +1,12 @@
 package com.allocator.api
 
+import com.allocator.CaseAllocationConfigs
 import com.allocator.CaseAllocations
 import com.allocator.Cases
 import com.allocator.Demands
 import com.allocator.PlanRuns
 import com.allocator.services.CaseLoader
+import com.allocator.services.KbFingerprint
 import com.allocator.services.buildAllocationBudgetRows
 import com.allocator.services.buildSupplyAllocation
 import io.ktor.http.*
@@ -62,6 +64,37 @@ internal fun buildBudgetsFromCaseAlloc(
 }
 
 /**
+ * Recompute and persist case_allocation's content-hash fingerprint for [caseId] — call after
+ * any write to [CaseAllocations], inside the SAME transaction as the row mutation so hash and
+ * rows commit atomically. Re-reads the FULL current row set (not a delta) so PUT's partial
+ * row-by-row edits still produce a hash reflecting the true final table state. Read later by
+ * the KB signature's plan-submission fingerprint injection (CaseBootstrap.signatureFor /
+ * Allocate.kt's resolveEffectiveConfig), not by anything in the live planning path itself.
+ *
+ * Known accepted limitation: does not take a row lock before recomputing, so two genuinely
+ * concurrent writers on the same case (double-click Save, two tabs) could each compute a hash
+ * from a snapshot that doesn't include the other's edit, and the transaction that commits last
+ * "wins" the hash column. Low-probability given the UI's stage-then-Save-once pattern; revisit
+ * with a `SELECT ... FOR UPDATE` on the config row if this proves to matter in practice.
+ */
+private fun recomputeCaseAllocationHash(caseId: Int) {
+    val rows = CaseAllocations.selectAll().where { CaseAllocations.caseId eq caseId }
+        .map { "${it[CaseAllocations.supplyId]}|${it[CaseAllocations.demandId] ?: ""}|${it[CaseAllocations.qtyAllocated]}" }
+    val hash = KbFingerprint.hashRows(rows)
+    val existing = CaseAllocationConfigs.selectAll().where { CaseAllocationConfigs.caseId eq caseId }.firstOrNull()
+    if (existing != null) {
+        CaseAllocationConfigs.update({ CaseAllocationConfigs.caseId eq caseId }) {
+            it[CaseAllocationConfigs.contentHash] = hash
+        }
+    } else {
+        CaseAllocationConfigs.insert {
+            it[CaseAllocationConfigs.caseId] = caseId
+            it[CaseAllocationConfigs.contentHash] = hash
+        }
+    }
+}
+
+/**
  * Run the supply allocation for [caseId] using [data] and [config], persist the result to
  * case_allocation, and return the saved rows. Config is required for purchasable_materials
  * filtering — pass null only when no plan run has been run yet for the case.
@@ -87,6 +120,7 @@ internal fun generateAndSeedCaseAllocation(
                 this[CaseAllocations.demandId]     = row.demandId
                 this[CaseAllocations.qtyAllocated] = row.qtyAllocated
             }
+            recomputeCaseAllocationHash(caseId)
         }
     }
     return rows
@@ -244,6 +278,7 @@ fun Routing.allocationRoutes() {
                     }
                 }
             }
+            recomputeCaseAllocationHash(caseId)
         }
         call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", rows.size) })
     }
@@ -257,7 +292,9 @@ fun Routing.allocationRoutes() {
                 ?: throw NoSuchElementException("Case not found")
         }
         val deleted = transaction {
-            CaseAllocations.deleteWhere { CaseAllocations.caseId eq caseId }
+            val n = CaseAllocations.deleteWhere { CaseAllocations.caseId eq caseId }
+            CaseAllocationConfigs.deleteWhere { CaseAllocationConfigs.caseId eq caseId }
+            n
         }
         call.respond(buildJsonObject { put("deleted", deleted) })
     }
@@ -282,6 +319,7 @@ fun Routing.allocationRoutes() {
                 this[CaseAllocations.demandId]     = row.demandId
                 this[CaseAllocations.qtyAllocated] = row.qtyAllocated
             }
+            recomputeCaseAllocationHash(caseId)
         }
         val responseRows = rows.map { row ->
             buildJsonObject {

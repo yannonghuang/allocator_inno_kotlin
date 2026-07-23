@@ -30,8 +30,8 @@ import org.slf4j.LoggerFactory
  *      signatures comparable.
  *
  * The migration ALSO recomputes signatures — without it, KB dedup breaks:
- * the new signatureFor() format ("m=...|max=...|d=...|bom=3|w=...|alloc=...|
- * cons=...|p=...|purch=...") drops the `dopt=`/`scope=` segments that old
+ * the new signatureFor() format ("m=...|max=...|d=...|bom=3|w=...|
+ * cons=...|p=...|purch=...|casealloc=...|pref=...|ord=...") drops the `dopt=`/`scope=` segments that old
  * signatures carry, so a re-saved equivalent run would produce a fresh row
  * instead of matching its KB ancestor. Recomputing the stored signature on
  * old rows aligns them with new ones for the comparison/dedup paths used by
