@@ -917,12 +917,20 @@ object KbStore {
             val kpisB = parseKpiSnapshot(recB.kpisSnapshotJson)
 
             // Decompose signatures to find differing knobs.
-            // Signature format: "m=mode|max=methods|d=depth|bom=bomDepth|w=wC,wI,wP|alloc=mode|cons=enabled|p=period|purch=purchase"
+            // Signature format (see CaseBootstrap.signatureFor): "m=mode|max=methods|d=depth|
+            // bom=bomDepth|w=wC,wI,wP|cons=enabled|p=period|purch=purchase|casealloc=X|pref=Y|
+            // ord=Z|purchmat=U|constr=V" — casealloc/pref/ord/purchmat/constr are content-hash
+            // fingerprints (or "none"/"na"/"legacy" sentinels), not decomposable into a finer
+            // per-row diff here; naming the axis is as far as this can go without a row-level
+            // diff tool (accepted v1 limitation).
+            // NOTE: there is no "alloc=" key in the real format above (that would be
+            // consolidation.allocation_mode, itself not currently in the signature at all — an
+            // unrelated, pre-existing gap) — don't confuse it with the new "casealloc=" key.
             val partsA = sigA.split("|").associateBy({ it.substringBefore("=") }, { it.substringAfter("=") })
             val partsB = sigB.split("|").associateBy({ it.substringBefore("=") }, { it.substringAfter("=") })
 
             val diffs = mutableListOf<Map<String, String>>()
-            val knobOrder = listOf("m", "max", "d", "bom", "w", "alloc", "cons", "p", "purch")
+            val knobOrder = listOf("m", "max", "d", "bom", "w", "cons", "p", "purch", "casealloc", "pref", "ord", "purchmat", "constr")
             for (knob in knobOrder) {
                 val vA = partsA[knob] ?: ""
                 val vB = partsB[knob] ?: ""
@@ -976,10 +984,14 @@ object KbStore {
             "d" -> "method depth"
             "bom" -> "make fallback depth"
             "w" -> "scoring weights"
-            "alloc" -> "allocation mode"
             "cons" -> "consolidation"
             "p" -> "consolidation period"
             "purch" -> "purchase"
+            "casealloc" -> "critical raw allocation overrides"
+            "pref" -> "supply preferences"
+            "ord" -> "demand ordering"
+            "purchmat" -> "purchasable materials"
+            "constr" -> "customer constraints"
             else -> "unknown knob"
         }
 

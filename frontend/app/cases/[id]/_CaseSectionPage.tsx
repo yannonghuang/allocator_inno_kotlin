@@ -333,6 +333,8 @@ export function PlanKpiDashboard({
 }
 
 import { SortFilterTable } from '@/app/components/SortFilterTable';
+import { RawMaterialPicker } from '@/app/components/RawMaterialPicker';
+import { ConfigDetailView } from '@/app/components/ConfigDetailView';
 import { AssessmentHistoryTable } from '@/app/components/AssessmentHistoryTable';
 
 /** Extract a human-readable message from an API error.
@@ -431,283 +433,11 @@ function renderCopilotText(text: string): React.ReactNode[] {
   return out;
 }
 
-/**
- * Searchable, multi-valued picker for the "selective purchase" whitelist. Shared by
- * the plan-conditions config panel and the copilot `/raw` slash command. Filters on
- * product_id / description / vendor / SKU series. An empty selection means "all raw
- * materials are purchasable" (the default).
- */
-function RawMaterialPicker({
-  options,
-  selected,
-  onChange,
-  initialFilter,
-  defaultCollapsed,
-  tP,
-}: {
-  options: PurchasableRawMaterial[];
-  selected: string[];
-  onChange: (next: string[]) => void;
-  initialFilter?: string;
-  defaultCollapsed?: boolean;
-  tP: (k: string) => string;
-}) {
-  const [collapsed, setCollapsed] = useState(defaultCollapsed ?? false);
-  const [filter, setFilter] = useState(initialFilter ?? '');
-  const sel = new Set(selected);
-  const f = filter.trim().toLowerCase();
-  // Wildcard-aware match: a query containing `*` is treated as a glob anchored at the
-  // start of product_id (e.g. `160-*` → every 160- series id). Otherwise substring match
-  // across id / description / vendor / sku series (the original behavior).
-  const matches = (o: PurchasableRawMaterial): boolean => {
-    if (!f) return true;
-    if (f.includes('*')) {
-      const rx = new RegExp('^' + f.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*'), 'i');
-      return rx.test(o.product_id);
-    }
-    return o.product_id.toLowerCase().includes(f) ||
-      (o.description ?? '').toLowerCase().includes(f) ||
-      (o.vendor_id ?? '').toLowerCase().includes(f) ||
-      (o.sku_pattern ?? '').toLowerCase().includes(f);
-  };
-  const shown = f ? options.filter(matches) : options;
-  const shownIds = shown.map((o) => o.product_id);
-  const toggle = (id: string) => {
-    const next = new Set(sel);
-    if (next.has(id)) next.delete(id);
-    else next.add(id);
-    onChange(Array.from(next));
-  };
-  const selectIds = (ids: string[]) => { const next = new Set(sel); ids.forEach((i) => next.add(i)); onChange(Array.from(next)); };
-  const deselectIds = (ids: string[]) => { const next = new Set(sel); ids.forEach((i) => next.delete(i)); onChange(Array.from(next)); };
-  const btnStyle: React.CSSProperties = { fontSize: '0.7rem', color: '#d4d4d8', background: '#27272a', border: '1px solid #3f3f46', borderRadius: 4, padding: '2px 7px', cursor: 'pointer' };
-  return (
-    <div style={{ marginTop: '0.4rem' }}>
-      {/* Toggle button — show/hide the full list; the selection count stays visible either way.
-          The ⓘ explains the (surprising) whitelist semantics: empty ≡ all selected. */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-        <button
-          type="button"
-          onClick={() => setCollapsed((c) => !c)}
-          style={{ display: 'inline-flex', alignItems: 'center', gap: 6, background: '#27272a', border: '1px solid #3f3f46', borderRadius: 4, padding: '3px 9px', color: '#d4d4d8', fontSize: '0.72rem', cursor: 'pointer' }}
-        >
-          <span>{collapsed ? '▸' : '▾'}</span>
-          <span>{collapsed ? tP('config.purchasableShowList') : tP('config.purchasableHideList')}</span>
-          <span style={{ color: sel.size === 0 ? '#fbbf24' : '#a1a1aa' }}>
-            {`(${sel.size} / ${options.length} ${tP('config.purchasableSelected')})`}
-            {sel.size === 0 && ` — ${tP('config.purchasableAllHint')}`}
-          </span>
-        </button>
-        <span
-          title={tP('config.purchasableSemantics')}
-          style={{ fontSize: '0.78rem', color: '#71717a', cursor: 'help', border: '1px solid #52525b', borderRadius: '50%', width: 15, height: 15, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', lineHeight: 1 }}
-        >
-          i
-        </span>
-      </div>
-      {!collapsed && (
-        <div style={{ marginTop: 4 }}>
-          <input
-            type="text"
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            placeholder={tP('config.purchasableSearchPlaceholder')}
-            style={{ width: '100%', padding: '4px 8px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem', marginBottom: 4 }}
-          />
-          {/* Bulk actions. Select all / Clear always apply to the WHOLE list; the wildcard
-              pair (shown only when a filter is active) applies to the matched set — so
-              `160-*` + Deselect matching removes just that series. The two are complementary:
-              e.g. Select all, then filter 160-* → Deselect matching, filter 283-* → Deselect
-              matching ⇒ everything except those series. */}
-          <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginBottom: 4 }}>
-            <button type="button" style={btnStyle} onClick={() => onChange(options.map((o) => o.product_id))}>
-              {tP('config.purchasableSelectAll')}
-            </button>
-            <button type="button" style={btnStyle} onClick={() => onChange([])}>
-              {tP('config.purchasableClear')}
-            </button>
-            {f && (
-              <>
-                <span style={{ color: '#52525b' }}>|</span>
-                <button type="button" style={btnStyle} onClick={() => selectIds(shownIds)}>
-                  {`${tP('config.purchasableSelectShown')} (${shown.length})`}
-                </button>
-                <button type="button" style={btnStyle} onClick={() => deselectIds(shownIds)}>
-                  {`${tP('config.purchasableDeselectShown')} (${shown.length})`}
-                </button>
-              </>
-            )}
-          </div>
-          <div style={{ maxHeight: 160, overflowY: 'auto', border: '1px solid #3f3f46', borderRadius: 4, padding: '2px 4px' }}>
-            {shown.length === 0 && (
-              <div style={{ fontSize: '0.75rem', color: '#71717a', padding: '4px' }}>{tP('config.purchasableNone')}</div>
-            )}
-            {shown.map((o) => (
-              <label key={o.product_id}
-                style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0', cursor: 'pointer', fontSize: '0.78rem' }}>
-                <input type="checkbox" checked={sel.has(o.product_id)} onChange={() => toggle(o.product_id)} />
-                <span style={{ fontFamily: 'monospace', color: '#e4e4e7' }}>{o.product_id}</span>
-                {o.description && <span style={{ color: '#a1a1aa' }}>— {o.description}</span>}
-              </label>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-type ConstraintRule = { customer: string; parent: string; location: string; child: string };
-
-/** Builder for customer-specific BOM-alternative constraints: four cascading dropdowns
- *  (customer → parent → location → child) + Add, with a removable list of added rules. */
-/** Single-select dropdown with a type-to-filter input — for long option lists (customers,
- *  parent products) in the constraint editor. */
-function SearchableSelect({ value, onChange, options, placeholder, disabled, width, tP }: {
-  value: string;
-  onChange: (v: string) => void;
-  options: { value: string; label: string }[];
-  placeholder: string;
-  disabled?: boolean;
-  width?: number;
-  tP: (k: string) => string;
-}) {
-  const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState('');
-  const w = width ?? 220;
-  const selectedLabel = options.find((o) => o.value === value)?.label ?? '';
-  const q = query.trim().toLowerCase();
-  const shown = q ? options.filter((o) => o.value.toLowerCase().includes(q) || o.label.toLowerCase().includes(q)) : options;
-  return (
-    <div style={{ position: 'relative', display: 'inline-block' }}>
-      <input
-        type="text"
-        disabled={disabled}
-        value={open ? query : selectedLabel}
-        placeholder={placeholder}
-        onChange={(e) => { setQuery(e.target.value); if (!open) setOpen(true); }}
-        onFocus={() => { setOpen(true); setQuery(''); }}
-        onBlur={() => setTimeout(() => setOpen(false), 120)}
-        style={{ padding: '3px 18px 3px 6px', background: disabled ? '#1f1f22' : '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.78rem', width: w }}
-      />
-      {value && !open && !disabled && (
-        <button type="button" title={tP('config.constraintRemove')} onMouseDown={(e) => { e.preventDefault(); onChange(''); }}
-          style={{ position: 'absolute', right: 4, top: 2, background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '0.85rem', lineHeight: 1, padding: 0 }}>×</button>
-      )}
-      {open && !disabled && (
-        <div style={{ position: 'absolute', zIndex: 30, top: '100%', left: 0, width: w, maxHeight: 220, overflowY: 'auto', background: '#1f1f22', border: '1px solid #3f3f46', borderRadius: 4, marginTop: 2 }}>
-          {shown.length === 0 && <div style={{ padding: '4px 6px', fontSize: '0.75rem', color: '#71717a' }}>{tP('config.constraintNoMatch')}</div>}
-          {shown.slice(0, 300).map((o) => (
-            <div key={o.value} onMouseDown={(e) => { e.preventDefault(); onChange(o.value); setOpen(false); setQuery(''); }}
-              style={{ padding: '3px 6px', fontSize: '0.78rem', color: '#e4e4e7', cursor: 'pointer', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', background: o.value === value ? '#3730a3' : 'transparent' }}>
-              {o.label}
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ConstraintPicker({
-  options,
-  constraints,
-  onChange,
-  defaultCollapsed,
-  tP,
-}: {
-  options: ConstraintOptions;
-  constraints: ConstraintRule[];
-  onChange: (next: ConstraintRule[]) => void;
-  defaultCollapsed?: boolean;
-  tP: (k: string) => string;
-}) {
-  const [collapsed, setCollapsed] = useState(defaultCollapsed ?? false);
-  const [customer, setCustomer] = useState('');
-  const [parent, setParent] = useState('');
-  const [location, setLocation] = useState('*');
-  const [child, setChild] = useState('');
-
-  const parentOpt = options.parents.find((p) => p.parent === parent);
-  const locationOpts = parentOpt?.locations ?? [];
-  const childOpts = parentOpt?.children ?? [];
-  const canAdd = !!(customer && parent && child);
-
-  const selStyle: React.CSSProperties = { padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.78rem', maxWidth: 240 };
-  const btnStyle: React.CSSProperties = { fontSize: '0.7rem', color: '#d4d4d8', background: '#27272a', border: '1px solid #3f3f46', borderRadius: 4, padding: '3px 9px', cursor: 'pointer' };
-  const anyLoc = (l: string) => (l === '*' || !l ? tP('config.constraintLocationAny') : l);
-  const custLabel = (cid: string) => { const c = options.customers.find((x) => x.customer_id === cid); return c?.description ? `${cid} — ${c.description}` : cid; };
-
-  const addRule = () => {
-    if (!canAdd) return;
-    const rule: ConstraintRule = { customer, parent, location: location || '*', child };
-    if (constraints.some((r) => r.customer === rule.customer && r.parent === rule.parent && r.location === rule.location && r.child === rule.child)) return;
-    onChange([...constraints, rule]);
-    setChild('');   // keep customer/parent so the user can add sibling rules quickly
-  };
-
-  return (
-    <div style={{ marginTop: '0.4rem' }}>
-      <button type="button" onClick={() => setCollapsed((c) => !c)}
-        style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', background: 'none', border: 'none', padding: 0, color: 'inherit', fontSize: '0.875rem', cursor: 'pointer' }}>
-        <span style={{ fontSize: '0.7rem', color: '#a1a1aa' }}>{collapsed ? '▸' : '▾'}</span>
-        <span>{collapsed ? tP('config.constraintShow') : tP('config.constraintHide')}</span>
-        <span style={{ color: '#a1a1aa' }}>{`(${constraints.length})`}</span>
-      </button>
-      {!collapsed && (
-        <div style={{ marginTop: '0.35rem', marginLeft: '1.5rem' }}>
-          <div style={{ fontSize: '0.7rem', color: '#71717a', marginBottom: 4 }}>{tP('config.constraintHint')}</div>
-          {options.parents.length === 0 ? (
-            <div style={{ fontSize: '0.72rem', color: '#71717a' }}>{tP('config.constraintNoAlternatives')}</div>
-          ) : (
-            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 6 }}>
-              <SearchableSelect
-                value={customer}
-                onChange={setCustomer}
-                options={options.customers.map((c) => ({ value: c.customer_id, label: custLabel(c.customer_id) }))}
-                placeholder={`${tP('config.constraintCustomer')}…`}
-                width={220}
-                tP={tP}
-              />
-              <SearchableSelect
-                value={parent}
-                onChange={(v) => { setParent(v); setLocation('*'); setChild(''); }}
-                options={options.parents.map((p) => ({ value: p.parent, label: p.parent }))}
-                placeholder={`${tP('config.constraintParent')}…`}
-                width={260}
-                tP={tP}
-              />
-              <select value={location} onChange={(e) => setLocation(e.target.value)} disabled={!parent} style={selStyle}>
-                <option value="*">{tP('config.constraintLocationAny')}</option>
-                {locationOpts.map((l) => <option key={l} value={l}>{l}</option>)}
-              </select>
-              <select value={child} onChange={(e) => setChild(e.target.value)} disabled={!parent} style={selStyle}>
-                <option value="">{tP('config.constraintChild')}…</option>
-                {childOpts.map((c) => <option key={c} value={c}>{c}</option>)}
-              </select>
-              <button type="button" onClick={addRule} disabled={!canAdd} style={{ ...btnStyle, opacity: canAdd ? 1 : 0.4, cursor: canAdd ? 'pointer' : 'default' }}>{tP('config.constraintAdd')}</button>
-            </div>
-          )}
-          {constraints.length === 0 ? (
-            <div style={{ fontSize: '0.72rem', color: '#71717a' }}>{tP('config.constraintEmpty')}</div>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
-              {constraints.map((r, i) => (
-                <div key={`${r.customer}|${r.parent}|${r.location}|${r.child}`} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.76rem' }}>
-                  <span style={{ fontFamily: 'monospace', color: '#e4e4e7' }}>
-                    {r.customer} · {r.parent} @ {anyLoc(r.location)} ⇒ {r.child}
-                  </span>
-                  <button type="button" title={tP('config.constraintRemove')} onClick={() => onChange(constraints.filter((_, j) => j !== i))}
-                    style={{ background: 'none', border: 'none', color: '#f87171', cursor: 'pointer', fontSize: '0.95rem', lineHeight: 1, padding: 0 }}>×</button>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
+// RawMaterialPicker / ConstraintPicker / SearchableSelect moved to shared component files
+// (frontend/app/components/RawMaterialPicker.tsx, ConstraintPicker.tsx) when their editors were
+// promoted out to dedicated pages (see PurchasableMaterials.kt / Constraints.kt). RawMaterialPicker
+// is still imported here for the copilot `/raw` chat card (see its own KNOWN GAP comment below);
+// ConstraintPicker/SearchableSelect have no remaining usage in this file.
 
 function parseApiError(raw: unknown): string {
   const s = raw instanceof Error ? raw.message : String(raw ?? 'Unknown error');
@@ -1452,25 +1182,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     });
   };
 
-  // Library baseline: the canonical config every bootstrap preset is varying
-  // from. Showing this once at the top of the dialog + a per-preset DIFF line
-  // is far less misleading than stacking 5 full JSONs that are 95% identical.
-  // Matches the cfg() defaults in CaseBootstrap.kt.
-  const presetDiffSummary = (config: Record<string, unknown>): string => {
-    const ms = (config.method_selection ?? {}) as Record<string, unknown>;
-    const cs = (config.consolidation ?? {}) as Record<string, unknown>;
-    const diffs: string[] = [];
-    if (Number(ms.max_methods) !== 1) diffs.push(`max_methods: 1 → ${ms.max_methods}`);
-    if (Number(ms.depth) !== 1) diffs.push(`depth: 1 → ${ms.depth}`);
-    const defaultScale = 'weekly';
-    const globalFb = (cs.wo_batch_scale as string) ?? defaultScale;
-    (['make', 'move', 'purchase'] as const).forEach((k) => {
-      const cur = ((cs as Record<string, unknown>)[`${k}_batch_scale`] as string) ?? globalFb;
-      if (cur !== defaultScale) diffs.push(`${k}-batch: weekly → ${cur}`);
-    });
-    if (config.purchase_allowed === true) diffs.push(`purchase: off → on`);
-    return diffs.join(' · ');
-  };
   /**
    * Self-describing summary of a config — always emits the same set of axes,
    * regardless of any baseline. Used in the KB / Already-covered list, where
@@ -4740,38 +4451,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 />
                 <span style={{ fontSize: '0.875rem' }}>{tP('config.purchaseAllowed')}</span>
               </label>
-              {planningConfig.purchase_allowed !== false && (
-                <div style={{ marginTop: '0.35rem', marginLeft: '1.5rem' }}>
-                  <div style={{ fontSize: '0.72rem', color: '#a1a1aa', marginBottom: 2 }}>
-                    {tP('config.purchasableMaterials')}
-                  </div>
-                  {purchasableOptions.length === 0 ? (
-                    <div style={{ fontSize: '0.72rem', color: '#71717a' }}>{tP('config.purchasableNone')}</div>
-                  ) : (
-                    <RawMaterialPicker
-                      options={purchasableOptions}
-                      selected={planningConfig.purchasable_materials ?? []}
-                      onChange={(next) => setPlanningConfig((c) => ({ ...c, purchasable_materials: next }))}
-                      defaultCollapsed
-                      tP={tP}
-                    />
-                  )}
-                </div>
-              )}
-            </div>
-
-            {/* ── Constraints ── */}
-            <div style={{ marginTop: '0.65rem', borderTop: '1px solid #27272a', paddingTop: '0.4rem' }}>
-              <div style={{ fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.3rem' }}>
-                {tP('config.subheadConstraints')}
-              </div>
-              <ConstraintPicker
-                options={constraintOptions}
-                constraints={planningConfig.constraints ?? []}
-                onChange={(next) => setPlanningConfig((c) => ({ ...c, constraints: next }))}
-                defaultCollapsed
-                tP={tP}
-              />
+              {/* Purchasable Materials whitelist and Constraints are fully promoted out to their
+                  own sidebar pages (PurchasableMaterials.kt / Constraints.kt) — no summary/link
+                  here anymore; this section only shows the planner's own inline toggle. */}
             </div>
           </fieldset>
 
@@ -8024,9 +7706,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           <thead>
                             <tr style={{ color: '#a1a1aa', borderBottom: '1px solid #3d3d40' }}>
                               <th style={{ width: 18, padding: '4px 6px' }} />
-                              <th style={{ padding: '4px 6px', textAlign: 'left', whiteSpace: 'nowrap' }}>{tP('bootstrap.kbCol.preset')}</th>
-                              <th style={{ padding: '4px 6px', textAlign: 'left' }}>{tP('bootstrap.kbCol.axis')}</th>
-                              <th style={{ padding: '4px 6px', textAlign: 'left' }}>{tP('bootstrap.kbCol.diff')}</th>
                               {kpiCols.map((c) => (
                                 <th key={String(c.key)} style={{ padding: '4px 6px', textAlign: 'right', whiteSpace: 'nowrap' }}>
                                   <button
@@ -8044,10 +7723,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           <tbody>
                             {sorted.map((p) => {
                               const expanded = bootstrapExpandedPresets.has(p.preset_id);
-                              // Self-describing config summary (no baseline framing) — see
-                              // presetConfigSummary above. Storage is full JSON; this is
-                              // purely how it's rendered in the row.
-                              const summary = presetConfigSummary(p.config);
                               const renderKpi = (k: keyof BootstrapPreset, fmt: (v: number) => string) => {
                                 const v = p[k];
                                 if (v == null) return <span style={{ color: '#52525b' }}>–</span>;
@@ -8059,38 +7734,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                     <td style={{ padding: '4px 6px', width: 18, cursor: 'pointer', color: '#71717a', verticalAlign: 'top' }}
                                         onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
                                       {expanded ? '▾' : '▸'}
-                                    </td>
-                                    <td style={{ padding: '4px 6px', fontFamily: 'monospace', color: '#a1a1aa', cursor: 'pointer', verticalAlign: 'top', whiteSpace: 'nowrap' }}
-                                        onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
-                                      {p.preset_label}
-                                      {(() => {
-                                        // Axis-diff count vs the static baseline (cfg() defaults). The
-                                        // single-axis property is what the agent uses for clean
-                                        // comparative pairs; surface it as a glanceable badge so users
-                                        // can quickly find diagnostic-quality rows.
-                                        const diffStr = presetDiffSummary(p.config);
-                                        const axisCount = diffStr ? diffStr.split(' · ').length : 0;
-                                        const tone = axisCount === 0
-                                          ? { bg: '#1e3a8a', fg: '#bfdbfe' }   // baseline itself
-                                          : axisCount === 1
-                                            ? { bg: '#14532d', fg: '#bbf7d0' } // single-axis (curated quality)
-                                            : { bg: '#3f3f46', fg: '#a1a1aa' }; // multi-axis
-                                        return (
-                                          <span title={tP('bootstrap.axisDiffTooltip', { n: axisCount })}
-                                            style={{ marginLeft: 4, fontSize: '0.62rem', background: tone.bg, color: tone.fg, borderRadius: 4, padding: '0px 5px' }}>
-                                            {tP('bootstrap.axisDiffBadge', { n: axisCount })}
-                                          </span>
-                                        );
-                                      })()}
-                                      {p.source_plan_run_deleted && (
-                                        <span title={tP('bootstrap.kbSourceDeleted')} style={{ marginLeft: 4, fontSize: '0.62rem', color: '#71717a', fontStyle: 'italic' }}>(orphan)</span>
-                                      )}
-                                    </td>
-                                    <td style={{ padding: '4px 6px', verticalAlign: 'top', whiteSpace: 'nowrap' }}>
-                                      <span style={{ fontSize: '0.66rem', background: '#3f3f46', borderRadius: 4, padding: '1px 6px', color: '#a1a1aa' }}>{p.primary_axis}</span>
-                                    </td>
-                                    <td style={{ padding: '4px 6px', fontFamily: 'monospace', fontSize: '0.68rem', color: '#a1a1aa', verticalAlign: 'top' }}>
-                                      {summary}
                                     </td>
                                     {kpiCols.map((c) => (
                                       <td key={String(c.key)} style={{ padding: '4px 6px', color: '#a78bfa', textAlign: 'right', verticalAlign: 'top', whiteSpace: 'nowrap' }}>
@@ -8121,14 +7764,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                   </tr>
                                   {expanded && (
                                     <tr style={{ borderBottom: '1px solid #27272a' }}>
-                                      <td colSpan={6 + kpiCols.length} style={{ padding: '0 6px 6px 26px' }}>
-                                        <pre style={{
-                                          margin: 0, fontSize: '0.66rem', color: '#a1a1aa',
-                                          background: '#0a0a0a', padding: '6px 8px', borderRadius: 4,
-                                          overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                      <td colSpan={3 + kpiCols.length} style={{ padding: '0 6px 6px 26px' }}>
+                                        <div style={{
+                                          margin: 0, background: '#0a0a0a', padding: '8px 10px', borderRadius: 4,
+                                          overflowX: 'auto',
                                         }}>
-                                          {JSON.stringify(p.config, null, 2)}
-                                        </pre>
+                                          <ConfigDetailView config={p.config as Record<string, unknown>} caseId={id} />
+                                        </div>
                                       </td>
                                     </tr>
                                   )}
@@ -8520,7 +8162,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   </div>
                   {expandedTab === 'config' && (
                     run.config && Object.keys(run.config).length > 0 ? (
-                      <pre style={{ margin: '0.4rem 0 0', fontSize: '0.7rem', color: '#a1a1aa', whiteSpace: 'pre-wrap', background: '#111113', padding: '0.5rem', borderRadius: 4 }}>{JSON.stringify(run.config, null, 2)}</pre>
+                      <div style={{ margin: '0.4rem 0 0', background: '#111113', padding: '0.5rem 0.6rem', borderRadius: 4 }}>
+                        <ConfigDetailView config={run.config as Record<string, unknown>} caseId={id} />
+                      </div>
                     ) : (
                       <p style={{ margin: '0.4rem 0 0', fontSize: '0.72rem', color: '#71717a' }}>{tP('runHistory.details.noConfig')}</p>
                     )
@@ -9379,6 +9023,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <div key={i} style={{ marginBottom: '0.75rem' }}>
                   <span style={{ fontWeight: 600, color: m.role === 'user' ? '#a78bfa' : '#67e8f9', fontSize: '0.8rem' }}>{m.role === 'user' ? tP('copilot.roleUser') : tP('copilot.roleCopilot')}: </span>
                   <span style={{ fontSize: '0.875rem' }}>{renderCopilotText(m.text)}</span>
+                  {/* KNOWN GAP (tracked, not silently broken): purchasable_materials is now a
+                      case-level persisted setting (PurchasableMaterials.kt) — the backend
+                      always overwrites whatever's in planningConfig.purchasable_materials at
+                      submission time, so edits made here no longer affect a plan run. This
+                      copilot NL card needs rewiring to call updatePurchasableMaterials()
+                      directly instead of patching planningConfig — deferred as a same-sized
+                      follow-up (see this branch's own plan notes) to keep that change reviewable
+                      separately from the page-promotion work. */}
                   {m.kind === 'raw_picker' && (
                     purchasableOptions.length === 0 ? (
                       <div style={{ fontSize: '0.78rem', color: '#71717a', marginTop: '0.3rem' }}>{tP('config.purchasableNone')}</div>

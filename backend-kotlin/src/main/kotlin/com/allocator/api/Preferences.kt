@@ -5,6 +5,7 @@ import com.allocator.CasePreferences
 import com.allocator.Cases
 import com.allocator.PlanRuns
 import com.allocator.services.CaseLoader
+import com.allocator.services.KbFingerprint
 import com.allocator.services.PreferenceCandidateRow
 import com.allocator.services.PreferenceKb
 import com.allocator.services.PreferenceKbEntry
@@ -91,6 +92,41 @@ private fun toRows(candidates: List<PreferenceCandidateRow>): List<CasePreferenc
     CasePreferenceRow(it.productId, it.locationId, it.methodType, it.methodKey, it.preference, it.inventoryScore, it.deliveryScore, it.criticalMaterialScore)
 }
 
+/** Canonical hash string for one case_preference row — see KbFingerprint's own doc for why
+ *  this exists (KB signature fingerprinting) and its accepted concurrency limitation. */
+private fun CasePreferenceRow.canonicalString(): String =
+    "$productId|$locationId|$methodType|$methodKey|$preference"
+
+/** Recompute and persist case_preference's content-hash fingerprint for [caseId] from the given
+ *  full current row set — call after any write, inside the SAME transaction as the row
+ *  mutation. Takes [rows] directly rather than re-querying, since every call site already has
+ *  the full post-write row set in hand (unlike Allocation's PUT, which only touches a subset —
+ *  Preferences' PUT re-reads below for exactly that reason).
+ *
+ *  Upserts rather than update-only: PUT/import can touch case_preference without a
+ *  case_preference_config row ever existing (import never created one, unlike generate) — the
+ *  hash must still be recorded in that case, so insert a placeholder config row (generate's own
+ *  defaults) purely to hold it when absent. Those placeholder weights are meaningless until a
+ *  real /generate call sets them for real; only the hash is load-bearing here. */
+private fun recomputeCasePreferenceHash(caseId: Int, rows: List<CasePreferenceRow>) {
+    val hash = KbFingerprint.hashRows(rows.map { it.canonicalString() })
+    val existing = CasePreferenceConfigs.selectAll().where { CasePreferenceConfigs.caseId eq caseId }.singleOrNull()
+    if (existing != null) {
+        CasePreferenceConfigs.update({ CasePreferenceConfigs.caseId eq caseId }) {
+            it[CasePreferenceConfigs.contentHash] = hash
+        }
+    } else {
+        CasePreferenceConfigs.insert {
+            it[CasePreferenceConfigs.caseId] = caseId
+            it[CasePreferenceConfigs.maxBomDepth] = 3
+            it[CasePreferenceConfigs.deliveryWeight] = 0.3
+            it[CasePreferenceConfigs.inventoryWeight] = 0.3
+            it[CasePreferenceConfigs.criticalMaterialWeight] = 0.4
+            it[CasePreferenceConfigs.contentHash] = hash
+        }
+    }
+}
+
 /**
  * Runs [buildPreferenceKb] for [caseId] and persists the result — full delete + batch-insert
  * into case_preference, plus an upsert of case_preference_config. Called only from the
@@ -141,6 +177,7 @@ internal fun generateAndSeedCasePreferences(
                 it[CasePreferenceConfigs.criticalMaterialWeight] = criticalMaterialWeight
             }
         }
+        recomputeCasePreferenceHash(caseId, rows)
     }
     return rows
 }
@@ -300,6 +337,8 @@ fun Routing.preferenceRoutes() {
                     (CasePreferences.methodKey eq methodKey)
                 }) { it[CasePreferences.preference] = preference }
             }
+            val currentRows = loadCasePreferenceRows(caseId) ?: emptyList()
+            recomputeCasePreferenceHash(caseId, currentRows)
         }
         call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", edits.size) })
     }
@@ -340,6 +379,7 @@ fun Routing.preferenceRoutes() {
                     this[CasePreferences.criticalMaterialScore] = row.criticalMaterialScore
                 }
             }
+            recomputeCasePreferenceHash(caseId, rows)
         }
         val prodAreaByPl = prodAreaByProductLocation(caseId)
         call.respond(buildJsonObject { put("rows", JsonArray(rows.map { rowJson(it, prodAreaByPl) })) })

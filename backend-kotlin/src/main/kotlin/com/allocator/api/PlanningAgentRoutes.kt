@@ -624,8 +624,11 @@ L3 WORKFLOW RULES (these govern recommend_config and suggest_next_batch chains):
 
   - **Sourced Configs and Rationales**: (a) Any signature in your reply MUST appear in the
     immediate tool output — either from recommend_config / suggest_next_batch / query_kb_runs,
-    or from the KB. If you self-construct a signature, round-trip it through is_signature_in_kb
-    before mentioning it. (b) Any rationale for "why this config" MUST cite either a
+    or from the KB. NEVER self-construct a signature — the format includes per-case content
+    fingerprints (critical raw allocation overrides, supply preferences, demand ordering) you
+    have no tool visibility into, so a self-assembled signature could never match what a real
+    submission would actually get; always obtain one from a tool's returned output instead.
+    (b) Any rationale for "why this config" MUST cite either a
     plan_run_id from KB evidence or a query_design_docs quote — never both, never neither.
     No self-authored mechanism stories ("this will help because…"); always ground in evidence.
 
@@ -1039,7 +1042,14 @@ internal val TOOLS: List<LlmTool> = listOf(
             "Use this BEFORE recommending a 'config to try next' to confirm the proposal is " +
             "actually novel — never propose a signature that returns exists=true. The signature " +
             "format is the canonical pipe-delimited string emitted by the planner " +
-            "(e.g. 'm=preference|max=2|d=1|bom=3|...|alloc=fair|cons=true|p=0|purch=false'). " +
+            "(e.g. 'm=preference|max=2|d=1|bom=3|w=0.4,0.35,0.25|cons=true|p=0|purch=false|" +
+            "casealloc=none|pref=none|ord=none|purchmat=none|constr=none'). NEVER self-construct " +
+            "one — the casealloc/pref/ord/purchmat/constr segments are per-case content " +
+            "fingerprints (critical raw allocation overrides / supply preferences / demand " +
+            "ordering / purchasable materials / customer constraints) with no tool exposing " +
+            "their underlying table contents, so a guessed signature could never match a real " +
+            "submission. Always obtain a signature from another tool's returned output " +
+            "(suggest_next_batch / recommend_config / query_kb_runs) and pass it here verbatim. " +
             "Returns {exists: bool, total_in_kb: int}.",
         buildJsonObject {
             put("type", "object")
@@ -2373,7 +2383,7 @@ private fun toolSuggestNextBatch(caseId: Int, args: JsonObject, locale: String):
                         put("preset_id", p.presetId)
                         put("label", p.label)
                         put("primary_axis", p.primaryAxis)
-                        put("signature", CaseBootstrap.signatureFor(p.config))
+                        put("signature", CaseBootstrap.signatureForBootstrapCandidate(p.config, caseId))
                         put("config", p.config)
                     })
                 }

@@ -382,7 +382,7 @@ object CaseBootstrap {
         val coveredSigs = listCoveredSignatures(caseId)
         return AXIS_CATALOG.map { spec ->
             val nextUncovered = spec.variations.firstOrNull { value ->
-                signatureFor(buildConfigForAxisValue(spec.name, value)) !in coveredSigs
+                signatureForBootstrapCandidate(buildConfigForAxisValue(spec.name, value), caseId) !in coveredSigs
             }
             if (nextUncovered != null) spec.copy(defaultSeed = nextUncovered) else spec
         }
@@ -428,7 +428,7 @@ object CaseBootstrap {
         // suggestion time so the user only ever sees fresh runs.
         // Round-robin across axes for dimensional breadth.
         val seed = bestConfigFor(caseId, criterion)
-        val seedSignature = signatureFor(seed)
+        val seedSignature = signatureForBootstrapCandidate(seed, caseId)
         val coveredSignatures = listCoveredSignatures(caseId)
 
         val candidatesByAxis: MutableMap<String, MutableList<BootstrapPreset>> = linkedMapOf()
@@ -436,7 +436,7 @@ object CaseBootstrap {
         for (axis in AXIS_CATALOG) {
             for (value in axis.variations) {
                 val config = applyAxisToSeed(seed, axis.name, value)
-                val sig = signatureFor(config)
+                val sig = signatureForBootstrapCandidate(config, caseId)
                 if (sig == seedSignature) continue            // no-op vs seed
                 if (sig in coveredSignatures) continue         // already in KB
                 val valueLabel = (value as? JsonPrimitive)?.contentOrNull ?: value.toString()
@@ -566,8 +566,52 @@ object CaseBootstrap {
         val consEnabled = cs.bool("enabled", true)
         val period = cs.int("period_days", 0)
         val purch = config.bool("purchase_allowed", false)
+        // Fingerprint segments — see KbFingerprint.buildFingerprint's own doc. Read verbatim
+        // from an already-persisted config (real run: real hash/"none" values, or "na" for a
+        // bootstrap-submitted run); "legacy" when the key is missing entirely — a config that
+        // predates this whole fingerprint scheme (no data migration for these: allocation/
+        // preference/demand-order state at the time an old run executed was never captured
+        // anywhere and can't be reconstructed after the fact — see this file's own module doc
+        // and CaseBootstrap's git history for the incident that motivated this).
+        val fp = (config["_kb_fingerprint"] as? JsonObject)
+        val caseAlloc = fp?.get("casealloc")?.jsonPrimitive?.contentOrNull ?: "legacy"
+        val pref = fp?.get("pref")?.jsonPrimitive?.contentOrNull ?: "legacy"
+        val ord = fp?.get("ord")?.jsonPrimitive?.contentOrNull ?: "legacy"
+        val purchMat = fp?.get("purchmat")?.jsonPrimitive?.contentOrNull ?: "legacy"
+        val constr = fp?.get("constr")?.jsonPrimitive?.contentOrNull ?: "legacy"
         return "m=$mode|max=$maxM|d=$depth|bom=$bomDepth|w=$wC,$wI,$wP|" +
-            "cons=$consEnabled|p=$period|purch=$purch"
+            "cons=$consEnabled|p=$period|purch=$purch|casealloc=$caseAlloc|pref=$pref|ord=$ord|" +
+            "purchmat=$purchMat|constr=$constr"
+    }
+
+    /**
+     * Signature for a NOT-YET-SUBMITTED bootstrap candidate config (library preset, axis
+     * variation, or a seed cloned from the case's current best). Every config that flows
+     * through this file is eventually submitted via the bootstrap path
+     * (`runOneBootstrapPreset`), which always runs `runPlanning` with allocation/preference/
+     * demand-order overrides left null regardless of what those tables actually contain (see
+     * `KbFingerprint.buildFingerprint`'s own doc) — so a candidate's predicted signature must
+     * use the same fixed `"na"` sentinel for those three fingerprint segments that the real
+     * submission will get, NOT a live per-case hash. Using a live hash there would make
+     * dedup/preview disagree with what actually gets persisted the moment the user clicks
+     * Start. `purchmat`/`constr` are NOT gated this way — bootstrap presets DO respect the
+     * case's real purchasable-materials/constraints (see `KbFingerprint.buildFingerprint`'s own
+     * doc), so the preview must reflect the case's CURRENT live values for those two, same as a
+     * real submission would get — hence this needs [caseId], unlike before.
+     */
+    fun signatureForBootstrapCandidate(config: JsonObject, caseId: Int): String {
+        val fp = KbFingerprint.buildFingerprint(caseId, consultsOverrideTables = false)
+        val withFingerprint = buildJsonObject {
+            config.entries.forEach { (k, v) -> if (k != "_kb_fingerprint") put(k, v) }
+            putJsonObject("_kb_fingerprint") {
+                put("casealloc", fp.casealloc)
+                put("pref", fp.pref)
+                put("ord", fp.ord)
+                put("purchmat", fp.purchmat)
+                put("constr", fp.constr)
+            }
+        }
+        return signatureFor(withFingerprint)
     }
 
     /** Wrap a preset's metadata bundle for plan_run.metadata. The signature is
@@ -575,13 +619,13 @@ object CaseBootstrap {
      *  filter by signature without re-parsing every plan_run.config; bootstrap
      *  selection itself doesn't use it (it computes signatures on-the-fly so
      *  user-driven runs without metadata.signature still match). */
-    fun metadataFor(preset: BootstrapPreset): JsonObject = buildJsonObject {
+    fun metadataFor(preset: BootstrapPreset, caseId: Int): JsonObject = buildJsonObject {
         put("bootstrap", true)
         put("preset_id", preset.presetId)
         put("preset_label", preset.label)
         put("preset_index", preset.index)
         put("primary_axis", preset.primaryAxis)
-        put("signature", signatureFor(preset.config))
+        put("signature", signatureForBootstrapCandidate(preset.config, caseId))
     }
 
     /** Public-shape JSON for a preset (frontend confirm dialog).
@@ -663,8 +707,8 @@ object CaseBootstrap {
     fun statusFor(caseId: Int, batchSize: Int = 5, criterion: String = CRITERION_FILL_RATE): JsonObject {
         KbStore.backfillForCase(caseId)
         val kbRecordsBySig = KbStore.listForCase(caseId)
-        val librarySigs = LIBRARY.associateBy { signatureFor(it.config) }
-        val coveredPresets = LIBRARY.filter { signatureFor(it.config) in kbRecordsBySig.keys }
+        val librarySigs = LIBRARY.associateBy { signatureForBootstrapCandidate(it.config, caseId) }
+        val coveredPresets = LIBRARY.filter { signatureForBootstrapCandidate(it.config, caseId) in kbRecordsBySig.keys }
         val offLibraryRecords = kbRecordsBySig.filterKeys { sig -> sig !in librarySigs.keys }.values
         val nextBatch = selectNextBatch(caseId, batchSize, criterion)
         return buildJsonObject {
@@ -675,7 +719,7 @@ object CaseBootstrap {
             put("batch_size", batchSize)
             putJsonArray("already_run") {
                 coveredPresets.forEach { preset ->
-                    val sig = signatureFor(preset.config)
+                    val sig = signatureForBootstrapCandidate(preset.config, caseId)
                     add(toJsonWithRun(preset, kbRecordsBySig[sig]))
                 }
                 offLibraryRecords.forEach { add(toJsonOffLibrary(it)) }

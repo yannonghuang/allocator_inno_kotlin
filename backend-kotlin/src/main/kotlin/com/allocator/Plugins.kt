@@ -5,6 +5,7 @@ import com.allocator.api.allocateRoutes
 import com.allocator.api.assessmentRoutes
 import com.allocator.api.bomGraphRoutes
 import com.allocator.api.caseRoutes
+import com.allocator.api.constraintsRoutes
 import com.allocator.api.demandOrderingRoutes
 import com.allocator.api.explanationRoutes
 import com.allocator.api.peggingRoutes
@@ -21,6 +22,7 @@ import com.allocator.api.planningAgentRoutes
 import com.allocator.api.planningCopilotRoutes
 import com.allocator.api.preferenceRoutes
 import com.allocator.api.productRoutes
+import com.allocator.api.purchasableMaterialsRoutes
 import com.allocator.api.supplyRoutes
 import com.allocator.api.viewRoutes
 import io.ktor.http.*
@@ -105,6 +107,8 @@ fun Application.configureRouting() {
         allocationRoutes()
         preferenceRoutes()
         demandOrderingRoutes()
+        purchasableMaterialsRoutes()
+        constraintsRoutes()
         allocateRoutes()
         peggingRoutes()
         resourceUtilizationRoutes()

@@ -5,6 +5,7 @@ import com.allocator.CaseDemandOrders
 import com.allocator.Cases
 import com.allocator.services.CaseLoader
 import com.allocator.services.DemandOrderRow
+import com.allocator.services.KbFingerprint
 import com.allocator.services.buildDemandOrder
 import io.ktor.http.*
 import io.ktor.server.application.*
@@ -48,6 +49,25 @@ internal fun loadDemandOrderMap(caseId: Int): Map<String, Int>? =
 private fun toRows(candidates: List<DemandOrderRow>): List<CaseDemandOrderRow> =
     candidates.map { CaseDemandOrderRow(it.demandId, it.order) }
 
+/** Recompute and persist case_demand_order's content-hash fingerprint for [caseId] from the
+ *  given full current row set — see Preferences.kt's recomputeCasePreferenceHash for the same
+ *  upsert-not-update-only rationale (import here never created a config row before this
+ *  either). */
+private fun recomputeCaseDemandOrderHash(caseId: Int, rows: List<CaseDemandOrderRow>) {
+    val hash = KbFingerprint.hashRows(rows.map { "${it.demandId}|${it.order}" })
+    val existing = CaseDemandOrderConfigs.selectAll().where { CaseDemandOrderConfigs.caseId eq caseId }.singleOrNull()
+    if (existing != null) {
+        CaseDemandOrderConfigs.update({ CaseDemandOrderConfigs.caseId eq caseId }) {
+            it[CaseDemandOrderConfigs.contentHash] = hash
+        }
+    } else {
+        CaseDemandOrderConfigs.insert {
+            it[CaseDemandOrderConfigs.caseId] = caseId
+            it[CaseDemandOrderConfigs.contentHash] = hash
+        }
+    }
+}
+
 /**
  * Runs [buildDemandOrder] for [caseId] and persists the result — full delete + batch-insert
  * into case_demand_order, plus an upsert of case_demand_order_config.generated_at. Called only
@@ -80,6 +100,7 @@ internal fun generateAndSeedCaseDemandOrder(
                 it[CaseDemandOrderConfigs.caseId] = caseId
             }
         }
+        recomputeCaseDemandOrderHash(caseId, rows)
     }
     return rows
 }
@@ -190,6 +211,8 @@ fun Routing.demandOrderingRoutes() {
                     (CaseDemandOrders.caseId eq caseId) and (CaseDemandOrders.demandId eq demandId)
                 }) { it[CaseDemandOrders.order] = order }
             }
+            val currentRows = loadCaseDemandOrderRows(caseId) ?: emptyList()
+            recomputeCaseDemandOrderHash(caseId, currentRows)
         }
         call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", edits.size) })
     }
@@ -224,6 +247,7 @@ fun Routing.demandOrderingRoutes() {
                     this[CaseDemandOrders.order] = row.order
                 }
             }
+            recomputeCaseDemandOrderHash(caseId, rows)
         }
         val ctxById = demandContextByIdFor(caseId)
         call.respond(buildJsonObject { put("rows", JsonArray(rows.sortedBy { it.order }.map { rowJson(it, ctxById[it.demandId]) })) })
