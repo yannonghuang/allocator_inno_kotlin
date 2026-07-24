@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
-import { useParams } from 'next/navigation';
+import { useParams, useSearchParams } from 'next/navigation';
 import { useTranslations } from 'next-intl';
 import {
   getPurchasableMaterials,
@@ -10,9 +10,15 @@ import {
   importPurchasableMaterialsCsv,
   exportPurchasableMaterialsCsv,
   getPurchasableRawMaterials,
+  listPurchasableMaterialsVersions,
+  createPurchasableMaterialsVersion,
+  updatePurchasableMaterialsVersion,
+  deletePurchasableMaterialsVersion,
   type PurchasableRawMaterial,
+  type ConfigVersion,
 } from '../../../../lib/api';
 import { RawMaterialPicker } from '@/app/components/RawMaterialPicker';
+import { VersionSwitcher } from '@/app/components/VersionSwitcher';
 
 /**
  * Dedicated "Purchasable Materials" page — the whitelist promoted out of the Planning page's
@@ -22,6 +28,9 @@ import { RawMaterialPicker } from '@/app/components/RawMaterialPicker';
 export function PurchasableMaterialsPage() {
   const params = useParams();
   const caseId = Number(params.id);
+  // Optional ?version_id= — set when arriving from ConfigDetailView's "Open full page" link for
+  // a specific historical version (see CaseConfigVersions' own doc).
+  const initialVersionId = Number(useSearchParams().get('version_id')) || undefined;
   const t = useTranslations('purchasableMaterialsPage');
   const tP = useTranslations('planning');  // RawMaterialPicker's own labels live under planning.config.*
 
@@ -29,6 +38,10 @@ export function PurchasableMaterialsPage() {
   const [saved, setSaved] = useState<string[] | null>(null);
   const [draft, setDraft] = useState<string[]>([]);
   const [dirty, setDirty] = useState(false);
+
+  const [versions, setVersions] = useState<ConfigVersion[]>([]);
+  const [versionId, setVersionId] = useState<number | null>(null);
+  const referenced = versions.find((v) => v.id === versionId)?.referenced ?? false;
 
   const [importLoading, setImportLoading] = useState(false);
   const [clearing, setClearing] = useState(false);
@@ -38,19 +51,23 @@ export function PurchasableMaterialsPage() {
 
   // ── Load ──────────────────────────────────────────────────────────────────
 
-  useEffect(() => {
+  const loadVersion = React.useCallback((vId: number | undefined) => {
     if (!caseId || isNaN(caseId)) return;
     setSaved(null);
-    Promise.all([getPurchasableMaterials(caseId), getPurchasableRawMaterials(caseId)])
-      .then(([rows, catalog]) => {
+    Promise.all([getPurchasableMaterials(caseId, vId), getPurchasableRawMaterials(caseId), listPurchasableMaterialsVersions(caseId)])
+      .then(([rows, catalog, vs]) => {
         const ids = rows.map((r) => r.product_id);
         setSaved(ids);
         setDraft(ids);
         setDirty(false);
         setOptions(catalog.materials);
+        setVersions(vs);
+        setVersionId(vId ?? vs.find((v) => v.is_default)?.id ?? vs[0]?.id ?? null);
       })
       .catch((e) => setError(String(e)));
   }, [caseId]);
+
+  useEffect(() => { loadVersion(initialVersionId); }, [loadVersion, initialVersionId]);
 
   // ── Navigation guards ─────────────────────────────────────────────────────
 
@@ -81,11 +98,11 @@ export function PurchasableMaterialsPage() {
   const saveRef = useRef<() => void>(() => {});
 
   const handleSave = React.useCallback(async () => {
-    if (!dirty) return;
+    if (!dirty || referenced) return;
     setSaving(true);
     setError(null);
     try {
-      await updatePurchasableMaterials(caseId, draft);
+      await updatePurchasableMaterials(caseId, draft, versionId ?? undefined);
       setSaved(draft);
       setDirty(false);
     } catch (e) {
@@ -93,7 +110,7 @@ export function PurchasableMaterialsPage() {
     } finally {
       setSaving(false);
     }
-  }, [dirty, draft, caseId]);
+  }, [dirty, draft, caseId, versionId, referenced]);
 
   useEffect(() => { saveRef.current = handleSave; }, [handleSave]);
 
@@ -115,12 +132,12 @@ export function PurchasableMaterialsPage() {
 
   const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
+    if (!file || referenced) return;
     if (dirty && !confirm(t('confirmDiscard'))) { e.target.value = ''; return; }
     setImportLoading(true); setError(null);
     try {
       const text = await file.text();
-      const rows = await importPurchasableMaterialsCsv(caseId, text);
+      const rows = await importPurchasableMaterialsCsv(caseId, text, versionId ?? undefined);
       const ids = rows.map((r) => r.product_id);
       setSaved(ids); setDraft(ids); setDirty(false);
     } catch (err) { setError(String(err)); }
@@ -129,7 +146,7 @@ export function PurchasableMaterialsPage() {
 
   const handleExport = async () => {
     try {
-      const csv = await exportPurchasableMaterialsCsv(caseId);
+      const csv = await exportPurchasableMaterialsCsv(caseId, versionId ?? undefined);
       const blob = new Blob([csv], { type: 'text/csv' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -139,13 +156,52 @@ export function PurchasableMaterialsPage() {
   };
 
   const handleClear = async () => {
-    if (!confirm(t('confirmClear'))) return;
+    if (referenced || !confirm(t('confirmClear'))) return;
     setClearing(true); setError(null);
     try {
-      await deletePurchasableMaterials(caseId);
+      await deletePurchasableMaterials(caseId, versionId ?? undefined);
       setSaved([]); setDraft([]); setDirty(false);
     } catch (e) { setError(String(e)); }
     finally { setClearing(false); }
+  };
+
+  // ── Versioning ────────────────────────────────────────────────────────────
+
+  const handleSwitchVersion = (vId: number) => { setVersionId(vId); loadVersion(vId); };
+
+  const handleSaveAs = async (name: string | undefined, comments: string | undefined) => {
+    setSaving(true); setError(null);
+    try {
+      const v = await createPurchasableMaterialsVersion(caseId, { name, comments, product_ids: draft });
+      loadVersion(v.id);
+    } catch (e) { setError(String(e)); }
+    finally { setSaving(false); }
+  };
+
+  const handleSetDefault = async (vId: number) => {
+    try {
+      await updatePurchasableMaterialsVersion(caseId, vId, { is_default: true });
+      const vs = await listPurchasableMaterialsVersions(caseId);
+      setVersions(vs);
+    } catch (e) { setError(String(e)); }
+  };
+
+  const handleRename = async (vId: number, name: string | undefined, comments: string | undefined) => {
+    try {
+      await updatePurchasableMaterialsVersion(caseId, vId, { name: name ?? null, comments: comments ?? null });
+      const vs = await listPurchasableMaterialsVersions(caseId);
+      setVersions(vs);
+    } catch (e) { setError(String(e)); }
+  };
+
+  const handleDeleteVersion = async (vId: number) => {
+    try {
+      await deletePurchasableMaterialsVersion(caseId, vId);
+      if (vId === versionId) { loadVersion(undefined); } else {
+        const vs = await listPurchasableMaterialsVersions(caseId);
+        setVersions(vs);
+      }
+    } catch (e) { setError(String(e)); }
   };
 
   if (saved === null) {
@@ -167,18 +223,28 @@ export function PurchasableMaterialsPage() {
         </div>
       )}
 
+      <VersionSwitcher
+        versions={versions}
+        currentVersionId={versionId}
+        onSwitch={handleSwitchVersion}
+        onSaveAs={handleSaveAs}
+        onSetDefault={handleSetDefault}
+        onRename={handleRename}
+        onDelete={handleDeleteVersion}
+      />
+
       <RawMaterialPicker options={options} selected={draft} onChange={onChangeDraft} defaultCollapsed={false} tP={tP} />
 
       <div style={{ display: 'flex', gap: 8, marginTop: '1rem', flexWrap: 'wrap' }}>
         <button
           onClick={handleSave}
-          disabled={!dirty || saving}
+          disabled={!dirty || saving || referenced}
           title={t('saveTitle')}
           style={{ padding: '6px 14px', background: dirty ? '#2563eb' : '#27272a', color: dirty ? '#fff' : '#71717a', border: 'none', borderRadius: 4, cursor: dirty ? 'pointer' : 'default', fontSize: '0.85rem' }}
         >
           {saving ? t('saving') : t('save')}
         </button>
-        <button onClick={() => importRef.current?.click()} disabled={importLoading}
+        <button onClick={() => importRef.current?.click()} disabled={importLoading || referenced}
           style={{ padding: '6px 14px', background: '#27272a', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, cursor: 'pointer', fontSize: '0.85rem' }}>
           {importLoading ? t('uploading') : t('uploadCsv')}
         </button>
@@ -187,7 +253,7 @@ export function PurchasableMaterialsPage() {
           style={{ padding: '6px 14px', background: '#27272a', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 4, cursor: 'pointer', fontSize: '0.85rem' }}>
           {t('downloadCsv')}
         </button>
-        <button onClick={handleClear} disabled={clearing}
+        <button onClick={handleClear} disabled={clearing || referenced}
           style={{ padding: '6px 14px', background: '#27272a', color: '#f87171', border: '1px solid #3d3d40', borderRadius: 4, cursor: 'pointer', fontSize: '0.85rem' }}>
           {clearing ? t('clearing') : t('clear')}
         </button>

@@ -3,6 +3,7 @@ package com.allocator.services
 import com.allocator.PlanRuns
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.booleanOrNull
@@ -28,12 +29,17 @@ import org.jetbrains.exposed.sql.transactions.transaction
  * when answering "what config should I use?" / "why is X better than Y?"
  * before the user has done any of their own experiments.
  *
- * Bootstrap is invoked from the planning page in batches of 5–6 (chunk size
- * matches the natural compute budget — case-171 takes ~2 min/run, so a
- * chunk is a coffee-break commitment, not a half-hour wait). Each click
- * runs the next-unrun configs from the library; multiple clicks accumulate
- * coverage. After the library is exhausted, the user can ask the agent for
- * ad-hoc explorations.
+ * Two independent producers populate this library-based system today:
+ *   1. The planning AGENT's own `suggest_next_batch` tool (`PlanningAgentRoutes.kt`) and
+ *      `KbStore`'s `novelOnly` auto-seeding branch — both call [selectNextBatch] directly,
+ *      round-robining across [AXIS_CATALOG] off the case's current best run.
+ *   2. The human-facing "Knowledge Base" dialog, which — as of the seeding redesign — no longer
+ *      uses this round-robin system at all; see [SeedForm]/[generateNetNewBatch] for its own,
+ *      deliberately different approach (one fixed config + a full max_methods sweep over a
+ *      user-given range, actually consulting the case's real external-config state). The two
+ *      systems share [signatureFor]/[signatureForBootstrapCandidate] but use DIFFERENT dedup
+ *      sets — round-robin's own [selectNextBatch] checks plan_run history too, while the seeding
+ *      dialog checks only the KB record set (see [generateNetNewBatch]'s own doc for why).
  *
  * Library design: each preset varies one load-bearing knob off a clean
  * baseline (preference, max=1, leaf-only, fair, no purchase, consolidation
@@ -111,6 +117,59 @@ private fun cfg(
     put("purchase_allowed", purchaseAllowed)
     put("analyze_criticality", false)
     put("check_soundness", true)
+}
+
+/** Build a config JsonObject for one KB-SEEDING run (the human-facing dialog's own generator —
+ *  see [CaseBootstrap.SeedForm]/[CaseBootstrap.generateNetNewBatch]): the seeding form's fixed
+ *  knobs plus one swept [maxMethods] value. Mirrors exactly what the Planning page's
+ *  own manual-run form submits (mode=preference, depth=1, leaf-only, balanced weights) — those
+ *  axes were never exposed on that form either, so seeding doesn't expose them now. Distinct
+ *  from [cfg] (the round-robin library/agent-tool's own config builder, which varies one of
+ *  several DIFFERENT axes off a baseline) — this one only ever varies max_methods. */
+private fun seedCfg(
+    maxMethods: Int,
+    purchaseAllowed: Boolean,
+    makeBatchScale: String,
+    moveBatchScale: String,
+    purchaseBatchScale: String,
+    analyzeCriticality: Boolean,
+    checkSoundness: Boolean,
+): JsonObject = buildJsonObject {
+    putJsonObject("method_selection") {
+        put("mode", "preference")
+        put("depth", 1)
+        put("multiple", false)
+        put("elaborate", false)
+        put("max_methods", maxMethods)
+        put("max_bom_depth", 3)
+        putJsonObject("score_weights") {
+            put("commit_time", 0.4)
+            put("inventory_consumed", 0.35)
+            put("purchase", 0.25)
+        }
+    }
+    putJsonObject("consolidation") {
+        put("enabled", true)
+        put("make_batch_scale", makeBatchScale)
+        put("move_batch_scale", moveBatchScale)
+        put("purchase_batch_scale", purchaseBatchScale)
+        // Single shared window derived from the "make" scale — same "last-touched-ish" fallback
+        // convention the Planning page's own WO-batch-frequency selects already use.
+        put("period_days", seedBatchScaleDays(makeBatchScale))
+    }
+    putJsonObject("variant_selection") {
+        put("multiple", true)
+    }
+    put("purchase_allowed", purchaseAllowed)
+    put("analyze_criticality", analyzeCriticality)
+    put("check_soundness", checkSoundness)
+}
+
+private fun seedBatchScaleDays(scale: String): Int = when (scale) {
+    "weekly" -> 7
+    "biweekly" -> 14
+    "monthly" -> 30
+    else -> 0  // "none" / "all" / unrecognized
 }
 
 object CaseBootstrap {
@@ -419,6 +478,10 @@ object CaseBootstrap {
      *   4. If axes run out, fill remaining slots from any remaining presets.
      *
      * Empty result = library exhausted for this case.
+     *
+     * Used by the planning agent's own `suggest_next_batch` tool
+     * (`PlanningAgentRoutes.kt`) and `KbStore`'s `novelOnly` auto-seeding branch — NOT by the
+     * human-facing "Knowledge Base" dialog anymore (see [generateNetNewBatch] for that).
      */
     fun selectNextBatch(caseId: Int, batchSize: Int = 5, criterion: String = CRITERION_FILL_RATE): List<BootstrapPreset> {
         // Single-knob variations off the case's CURRENT BEST config (per
@@ -461,7 +524,9 @@ object CaseBootstrap {
         return picked
     }
 
-    /** Signatures considered "covered" for next-batch dedup. Two sources:
+    /** Signatures considered "covered" for the round-robin agent tool's next-batch dedup
+     *  ([selectNextBatch]/[axisSpecsForCase] only — the seeding dialog uses a KB-only check
+     *  instead, see [generateNetNewBatch]'s own doc for why). Two sources:
      *
      *   1. kb_records — the dissociated KB store. A row here means we have a
      *      KPI snapshot regardless of whether the source plan_run still exists.
@@ -470,14 +535,7 @@ object CaseBootstrap {
      *      tried manually) even if they haven't been promoted to a kb_record.
      *
      *  Failed plan_runs do NOT count: bootstrap should retry them next click.
-     *
-     *  Public so the start-bootstrap handler can re-check at submission time
-     *  (preview is computed on dialog open and may be stale by the time the
-     *  user clicks Start, especially when configs were edited or a parallel
-     *  job ran).
      */
-    fun coveredSignaturesFor(caseId: Int): Set<String> = listCoveredSignatures(caseId)
-
     private fun listCoveredSignatures(caseId: Int): Set<String> = transaction {
         val planRunSigs = PlanRuns.selectAll()
             .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status neq "failed") }
@@ -567,12 +625,12 @@ object CaseBootstrap {
         val period = cs.int("period_days", 0)
         val purch = config.bool("purchase_allowed", false)
         // Fingerprint segments — see KbFingerprint.buildFingerprint's own doc. Read verbatim
-        // from an already-persisted config (real run: real hash/"none" values, or "na" for a
-        // bootstrap-submitted run); "legacy" when the key is missing entirely — a config that
-        // predates this whole fingerprint scheme (no data migration for these: allocation/
-        // preference/demand-order state at the time an old run executed was never captured
-        // anywhere and can't be reconstructed after the fact — see this file's own module doc
-        // and CaseBootstrap's git history for the incident that motivated this).
+        // from an already-persisted config (real run: real hash/"none" values); "legacy" when
+        // the key is missing entirely — a config that predates this whole fingerprint scheme
+        // (no data migration for these: allocation/preference/demand-order state at the time an
+        // old run executed was never captured anywhere and can't be reconstructed after the
+        // fact — see this file's own module doc and CaseBootstrap's git history for the
+        // incident that motivated this).
         val fp = (config["_kb_fingerprint"] as? JsonObject)
         val caseAlloc = fp?.get("casealloc")?.jsonPrimitive?.contentOrNull ?: "legacy"
         val pref = fp?.get("pref")?.jsonPrimitive?.contentOrNull ?: "legacy"
@@ -585,33 +643,42 @@ object CaseBootstrap {
     }
 
     /**
-     * Signature for a NOT-YET-SUBMITTED bootstrap candidate config (library preset, axis
-     * variation, or a seed cloned from the case's current best). Every config that flows
-     * through this file is eventually submitted via the bootstrap path
-     * (`runOneBootstrapPreset`), which always runs `runPlanning` with allocation/preference/
-     * demand-order overrides left null regardless of what those tables actually contain (see
-     * `KbFingerprint.buildFingerprint`'s own doc) — so a candidate's predicted signature must
-     * use the same fixed `"na"` sentinel for those three fingerprint segments that the real
-     * submission will get, NOT a live per-case hash. Using a live hash there would make
-     * dedup/preview disagree with what actually gets persisted the moment the user clicks
-     * Start. `purchmat`/`constr` are NOT gated this way — bootstrap presets DO respect the
-     * case's real purchasable-materials/constraints (see `KbFingerprint.buildFingerprint`'s own
-     * doc), so the preview must reflect the case's CURRENT live values for those two, same as a
-     * real submission would get — hence this needs [caseId], unlike before.
+     * Signature for a NOT-YET-SUBMITTED bootstrap/seeding candidate config (library preset, axis
+     * variation, a seed cloned from the case's current best, or a random seeding draw). Reads
+     * the same 5 `*_version_id` keys `Allocate.kt`'s `resolveEffectiveConfig` reads directly off
+     * [config] (falling back to the case's current default when a key is absent) so this preview
+     * signature always matches what submission will actually produce — every run now genuinely
+     * consults the case's Critical Raw Allocation / Supply Preferences / Demand Ordering /
+     * Purchasable Materials / Constraints state (see `runOneBootstrapPreset`'s own doc), so
+     * there is no "na"-sentinel/non-consulting path left to special-case here.
      */
     fun signatureForBootstrapCandidate(config: JsonObject, caseId: Int): String {
-        val fp = KbFingerprint.buildFingerprint(caseId, consultsOverrideTables = false)
-        val withFingerprint = buildJsonObject {
-            config.entries.forEach { (k, v) -> if (k != "_kb_fingerprint") put(k, v) }
-            putJsonObject("_kb_fingerprint") {
-                put("casealloc", fp.casealloc)
-                put("pref", fp.pref)
-                put("ord", fp.ord)
-                put("purchmat", fp.purchmat)
-                put("constr", fp.constr)
-            }
+        fun explicitVersionId(key: String): Int? = (config[key] as? JsonPrimitive)?.intOrNull
+        val fp = KbFingerprint.buildFingerprint(
+            caseAllocVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.CASEALLOC, explicitVersionId("case_alloc_version_id")),
+            prefVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.PREF, explicitVersionId("pref_version_id")),
+            ordVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.ORD, explicitVersionId("demand_order_version_id")),
+            purchMatVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.PURCHMAT, explicitVersionId("purchasable_material_version_id")),
+            constrVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.CONSTR, explicitVersionId("constraint_version_id")),
+        )
+        return signatureFor(embedFingerprint(config, fp))
+    }
+
+    /** Overlay already-resolved fingerprint [fp] segments onto [config]'s `_kb_fingerprint` key.
+     *  Factored out of [signatureForBootstrapCandidate] so a caller sweeping many candidate
+     *  configs that share the same 5 external-config version ids (e.g. [generateNetNewBatch],
+     *  which only varies max_methods) can resolve the fingerprint ONCE instead of once per
+     *  candidate — each resolution is a handful of DB round-trips, so doing it per-candidate
+     *  turned a sweep over N values into an O(N) multiple of that cost for no reason. */
+    private fun embedFingerprint(config: JsonObject, fp: KbFingerprint.Segments): JsonObject = buildJsonObject {
+        config.entries.forEach { (k, v) -> if (k != "_kb_fingerprint") put(k, v) }
+        putJsonObject("_kb_fingerprint") {
+            put("casealloc", fp.casealloc)
+            put("pref", fp.pref)
+            put("ord", fp.ord)
+            put("purchmat", fp.purchmat)
+            put("constr", fp.constr)
         }
-        return signatureFor(withFingerprint)
     }
 
     /** Wrap a preset's metadata bundle for plan_run.metadata. The signature is
@@ -628,54 +695,33 @@ object CaseBootstrap {
         put("signature", signatureForBootstrapCandidate(preset.config, caseId))
     }
 
-    /** Public-shape JSON for a preset (frontend confirm dialog).
-     *  When [alreadyCovered] is true the dialog renders an "in KB" hint so
-     *  the user knows clicking Start without editing this entry will skip
-     *  it via the submit-time dedup. */
-    fun toJson(preset: BootstrapPreset, alreadyCovered: Boolean = false): JsonObject = buildJsonObject {
+    /** Public-shape JSON for a preset (frontend confirm dialog). */
+    fun toJson(preset: BootstrapPreset): JsonObject = buildJsonObject {
         put("preset_id", preset.presetId)
         put("preset_label", preset.label)
         put("preset_index", preset.index)
         put("primary_axis", preset.primaryAxis)
         put("config", preset.config)
-        if (alreadyCovered) put("already_covered", true)
     }
 
-    /** Same as [toJson] but enriched with the matching KB record — id (for
-     *  the KB delete endpoint), full KPI snapshot, soundness, and the source
-     *  plan_run_id (or its tombstone). Reads from `kb_records` rather than
-     *  `plan_runs`, so coverage survives plan_run deletion. */
-    fun toJsonWithRun(preset: BootstrapPreset, kb: KbStore.KbRecord?): JsonObject = buildJsonObject {
-        put("preset_id", preset.presetId)
-        put("preset_label", preset.label)
-        put("preset_index", preset.index)
-        put("primary_axis", preset.primaryAxis)
-        put("config", preset.config)
-        if (kb != null) {
-            put("kb_record_id", kb.id)
-            put("soundness_status", kb.soundnessStatus)
-            // Source plan_run pointer (may be null if the run was deleted —
-            // sourcePlanRunDeleted=true distinguishes "never had one" from
-            // "had one, gone now"). Frontend uses this for an optional
-            // "go to plan run" affordance.
-            kb.sourcePlanRunId?.let { put("plan_run_id", it) }
-            put("source_plan_run_deleted", kb.sourcePlanRunDeleted)
-            // Inline the KPI snapshot so the dialog doesn't need a second fetch.
-            val kpis = runCatching { kotlinx.serialization.json.Json.parseToJsonElement(kb.kpisSnapshotJson).jsonObject }
-                .getOrNull() ?: buildJsonObject { }
-            kpis.entries.forEach { (k, v) -> put(k, v) }
-        }
+    /** Which version of each of the 5 external config objects [kb]'s source run used (see
+     *  CaseConfigVersions' own doc) — lets the frontend's ConfigDetailView drilldown fetch the
+     *  EXACT historical version instead of "whatever is live now". Omits a key entirely when
+     *  null (legacy record, predates versioning) rather than emitting a JSON null. */
+    private fun JsonObjectBuilder.putVersionRefs(kb: KbStore.KbRecord) {
+        kb.caseAllocVersionId?.let { put("case_alloc_version_id", it) }
+        kb.prefVersionId?.let { put("pref_version_id", it) }
+        kb.ordVersionId?.let { put("demand_order_version_id", it) }
+        kb.purchMatVersionId?.let { put("purchasable_material_version_id", it) }
+        kb.constrVersionId?.let { put("constraint_version_id", it) }
     }
 
-    /** JSON shape for a KB record whose config doesn't match any LIBRARY
-     *  preset. Synthesizes preset-shaped fields from the kb_record itself
-     *  so the frontend can render it in the same table — uniformly with
-     *  library-aligned rows. KB rows are KB rows; the UI no longer
-     *  distinguishes "library" vs "custom". */
-    private fun toJsonOffLibrary(kb: KbStore.KbRecord): JsonObject = buildJsonObject {
-        // No library preset to anchor to; use the source plan_run's name
-        // (carried in kb.presetLabel for bootstrap-tagged rows, null otherwise)
-        // or a truncated signature suffix as a deterministic fallback.
+    /** JSON shape for one KB record, for the KB-seeding dialog's "already run" list.
+     *  Synthesizes preset-shaped fields from the kb_record itself (source plan_run's name for
+     *  bootstrap-tagged rows, or a truncated signature suffix as a deterministic fallback) so the
+     *  frontend can render every KB record uniformly regardless of how it was produced (a random
+     *  seeding batch, a manual run, or the agent's own `suggest_next_batch`-driven run). */
+    private fun toJsonKbRecord(kb: KbStore.KbRecord): JsonObject = buildJsonObject {
         val displayLabel = kb.presetLabel
             ?: ("kb-" + kb.signature.takeLast(6))
         put("preset_id", kb.presetId ?: kb.signature)
@@ -691,44 +737,124 @@ object CaseBootstrap {
         val kpis = runCatching { kotlinx.serialization.json.Json.parseToJsonElement(kb.kpisSnapshotJson).jsonObject }
             .getOrNull() ?: buildJsonObject { }
         kpis.entries.forEach { (k, v) -> put(k, v) }
+        // Legacy snapshot without timing fields — read them off the source plan_run while it lives.
+        if ("run_created_at" !in kpis && kb.sourcePlanRunId != null && !kb.sourcePlanRunDeleted) {
+            KbStore.timingFromPlanRun(kb.sourcePlanRunId)?.entries?.forEach { (k, v) -> put(k, v) }
+        }
+        putVersionRefs(kb)
     }
 
-    /** Whole-KB status snapshot for a case: every KB record (library + off-
-     *  library) plus the next batch of uncovered library presets. Calls
-     *  KbStore.backfillForCase first so historical successful + sound runs
-     *  surface even if they predate the kb_records table.
+    // ── KB seeding (human-facing "Knowledge Base" dialog) ─────────────────────
+    // Deliberately independent of the LIBRARY/AXIS_CATALOG round-robin system above (still
+    // used by the planning agent's own suggest_next_batch tool and KbStore's novelOnly branch).
+    // See this class's own module doc for the two systems' relationship.
+
+    /** One form filled in by the user, describing a single fixed config to seed a batch of KB
+     *  runs from — `max_methods` sweeps every integer in [maxMethodsMin, maxMethodsMax] (one run
+     *  per value; running the same max_methods twice would just collide on the same signature,
+     *  so there is no separate "how many runs" knob), everything else held fixed across the
+     *  whole batch. The 5 version ids are nullable — null means "use the case's current default"
+     *  for that external config object, same convention as [CaseConfigVersioning.resolveVersionId]. */
+    data class SeedForm(
+        val maxMethodsMin: Int,
+        val maxMethodsMax: Int,
+        val purchaseAllowed: Boolean,
+        val makeBatchScale: String,
+        val moveBatchScale: String,
+        val purchaseBatchScale: String,
+        val analyzeCriticality: Boolean,
+        val checkSoundness: Boolean,
+        val caseAllocVersionId: Int?,
+        val prefVersionId: Int?,
+        val ordVersionId: Int?,
+        val purchMatVersionId: Int?,
+        val constrVersionId: Int?,
+    )
+
+    /** Overlay [form]'s external-config version picks onto [config] — only non-null picks are
+     *  written, so an unset pick leaves that object to resolve to the case's default (see
+     *  [CaseConfigVersioning.resolveVersionId]'s own doc), exactly like a manual Plan Run
+     *  submission that never touched that picker would. */
+    private fun withVersionPicks(config: JsonObject, form: SeedForm): JsonObject = buildJsonObject {
+        config.entries.forEach { (k, v) -> put(k, v) }
+        form.caseAllocVersionId?.let { put("case_alloc_version_id", it) }
+        form.prefVersionId?.let { put("pref_version_id", it) }
+        form.ordVersionId?.let { put("demand_order_version_id", it) }
+        form.purchMatVersionId?.let { put("purchasable_material_version_id", it) }
+        form.constrVersionId?.let { put("constraint_version_id", it) }
+    }
+
+    /** One entry per integer in [SeedForm.maxMethodsMin, SeedForm.maxMethodsMax] whose resulting
+     *  config signature is NOT in [kbSigs] — the net-new subset actually worth running.
      *
-     *  - already_run         : ALL KB records (library and user-driven configs).
-     *  - already_run_count   : library-aligned subset (preserved for the
-     *                          "expand library coverage" hint).
-     *  - kb_record_count     : total KB rows on this case.
-     *  - next_batch          : library presets not yet covered.
-     */
-    fun statusFor(caseId: Int, batchSize: Int = 5, criterion: String = CRITERION_FILL_RATE): JsonObject {
+     *  Deliberately checks ONLY the KB record set, not [coveredSignaturesFor]'s broader union
+     *  with raw plan_run history — the seeding dialog's own KB/plan_run relationship is:
+     *  (1) replicate on creation — a successful+sound plan_run always gets mirrored into KB
+     *      ([KbStore.backfillForCase], called by [statusFor] right before this), so any run
+     *      worth counting as "covered" already has a KB row; (2) independent on delete —
+     *      deleting a KB record does NOT touch its source plan_run, and by the same token should
+     *      NOT permanently block that signature from being seeded again either. Using the
+     *      broader plan_run-inclusive set here would make a deleted KB row's signature stay
+     *      "covered" forever (since its source plan_run is still around), silently undoing the
+     *      point of letting the user delete it. */
+    fun generateNetNewBatch(caseId: Int, form: SeedForm, kbSigs: Set<String>): List<BootstrapPreset> {
+        val lo = minOf(form.maxMethodsMin, form.maxMethodsMax)
+        val hi = maxOf(form.maxMethodsMin, form.maxMethodsMax)
+        // Resolve the 5 external-config version ids ONCE — they depend only on caseId + form,
+        // not on max_methods, so they're invariant across the whole sweep. Each resolution is a
+        // handful of DB round-trips; doing this per-value (as an earlier version did, via
+        // signatureForBootstrapCandidate) turned a sweep over N values into an O(N) multiple of
+        // that cost for no reason — the dominant cost behind the dialog's multi-second latency.
+        val fp = KbFingerprint.buildFingerprint(
+            caseAllocVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.CASEALLOC, form.caseAllocVersionId),
+            prefVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.PREF, form.prefVersionId),
+            ordVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.ORD, form.ordVersionId),
+            purchMatVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.PURCHMAT, form.purchMatVersionId),
+            constrVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.CONSTR, form.constrVersionId),
+        )
+        var index = 1
+        return (lo..hi).mapNotNull { maxMethods ->
+            val config = embedFingerprint(
+                withVersionPicks(
+                    seedCfg(
+                        maxMethods = maxMethods,
+                        purchaseAllowed = form.purchaseAllowed,
+                        makeBatchScale = form.makeBatchScale,
+                        moveBatchScale = form.moveBatchScale,
+                        purchaseBatchScale = form.purchaseBatchScale,
+                        analyzeCriticality = form.analyzeCriticality,
+                        checkSoundness = form.checkSoundness,
+                    ),
+                    form,
+                ),
+                fp,
+            )
+            if (signatureFor(config) in kbSigs) return@mapNotNull null
+            BootstrapPreset(
+                presetId = "seed-max=$maxMethods",
+                label = "Max methods: $maxMethods",
+                index = index++,
+                primaryAxis = "max_methods",
+                config = config,
+            )
+        }
+    }
+
+    /** Whole-KB status snapshot for the seeding dialog: every KB record plus the net-new
+     *  max_methods sweep for [form] (see [generateNetNewBatch]). Calls KbStore.backfillForCase
+     *  first so historical successful + sound runs surface even if they predate the kb_records
+     *  table. */
+    fun statusFor(caseId: Int, form: SeedForm): JsonObject {
         KbStore.backfillForCase(caseId)
         val kbRecordsBySig = KbStore.listForCase(caseId)
-        val librarySigs = LIBRARY.associateBy { signatureForBootstrapCandidate(it.config, caseId) }
-        val coveredPresets = LIBRARY.filter { signatureForBootstrapCandidate(it.config, caseId) in kbRecordsBySig.keys }
-        val offLibraryRecords = kbRecordsBySig.filterKeys { sig -> sig !in librarySigs.keys }.values
-        val nextBatch = selectNextBatch(caseId, batchSize, criterion)
+        val nextBatch = generateNetNewBatch(caseId, form, kbRecordsBySig.keys)
         return buildJsonObject {
-            put("library_size", LIBRARY.size)
-            put("already_run_count", coveredPresets.size)
-            put("remaining_count", LIBRARY.size - coveredPresets.size)
             put("kb_record_count", kbRecordsBySig.size)
-            put("batch_size", batchSize)
             putJsonArray("already_run") {
-                coveredPresets.forEach { preset ->
-                    val sig = signatureForBootstrapCandidate(preset.config, caseId)
-                    add(toJsonWithRun(preset, kbRecordsBySig[sig]))
-                }
-                offLibraryRecords.forEach { add(toJsonOffLibrary(it)) }
+                kbRecordsBySig.values.forEach { add(toJsonKbRecord(it)) }
             }
             putJsonArray("next_batch") {
-                // selectNextBatch already filters duplicates; we still pass
-                // alreadyCovered=false explicitly so the response shape is
-                // stable for clients that read the flag.
-                nextBatch.forEach { preset -> add(toJson(preset, alreadyCovered = false)) }
+                nextBatch.forEach { preset -> add(toJson(preset)) }
             }
         }
     }

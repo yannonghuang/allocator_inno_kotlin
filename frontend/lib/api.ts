@@ -465,6 +465,16 @@ export type PlanningConfig = {
   analyze_criticality?: boolean;
   /** When true, automatically run the soundness check (always deep) after each successful plan. Default: true. */
   check_soundness?: boolean;
+  /**
+   * Explicit version picks for the 5 "external config objects" (see CaseConfigVersions' own doc
+   * in Tables.kt) — omit any to use the case's current default version for that object. Resolved
+   * server-side by `resolveEffectiveConfig`/`CaseConfigVersioning.resolveVersionId`.
+   */
+  case_alloc_version_id?: number;
+  pref_version_id?: number;
+  demand_order_version_id?: number;
+  purchasable_material_version_id?: number;
+  constraint_version_id?: number;
 };
 
 export type PlanSupplyAllocation = {
@@ -864,6 +874,13 @@ export type PlanRun = {
   total_requested?: number;
   manufacturing_total_quantity?: number;
   inventory_consumed_total?: number;
+  // Which version of each of the 5 external config objects this run used (see
+  // CaseConfigVersions' own doc) — undefined for pre-versioning runs.
+  case_alloc_version_id?: number;
+  pref_version_id?: number;
+  demand_order_version_id?: number;
+  purchasable_material_version_id?: number;
+  constraint_version_id?: number;
 };
 
 export type SoundnessViolation = {
@@ -1849,10 +1866,6 @@ export type BootstrapPreset = {
   preset_index: number;
   primary_axis: string;
   config: Record<string, unknown>;
-  /** Set on `next_batch[]` entries: this preset's config is already in the KB,
-   *  so submitting it unchanged will be skipped at the dedup step. The dialog
-   *  surfaces an "in KB" hint and offers Edit-config to make it unique. */
-  already_covered?: boolean;
   // Present only on items in `already_run[]` — carries the KB record id (for
   // delete) + the source plan_run pointer (may be deleted) + headline KPIs.
   // KB rows are dissociated from plan_runs; the source link can be severed
@@ -1861,6 +1874,11 @@ export type BootstrapPreset = {
   plan_run_id?: number;
   source_plan_run_deleted?: boolean;
   soundness_status?: string;
+  /** Source run timing, snapshotted into the KB record (falls back to the live
+   *  plan_run for legacy rows while it still exists). */
+  duration_ms?: number;
+  run_created_at?: string;
+  run_finished_at?: string;
   fill_rate_pct?: number;
   gini?: number;
   p10_fill_ratio?: number;
@@ -1871,48 +1889,27 @@ export type BootstrapPreset = {
   total_requested?: number;
   manufacturing_total_quantity?: number;
   inventory_consumed_total?: number;
+  // Which version of each of the 5 external config objects the source run used (see
+  // CaseConfigVersions' own doc) — present only when a kb_record backs this entry.
+  case_alloc_version_id?: number;
+  pref_version_id?: number;
+  demand_order_version_id?: number;
+  purchasable_material_version_id?: number;
+  constraint_version_id?: number;
 };
 
 export type BootstrapPreview = {
-  library_size: number;
-  already_run_count: number;
-  remaining_count: number;
-  /** Total KB rows on this case (library + user-driven). Backend addition;
-   *  may be undefined when talking to an older backend. */
+  /** Total KB rows on this case. */
   kb_record_count?: number;
-  batch_size: number;
   already_run: BootstrapPreset[];
+  /** A freshly-generated random batch — see [SeedForm]'s own doc. Re-fetch (or bump the reroll
+   *  nonce) to get a new set of draws; the server never regenerates its own batch at submit
+   *  time, so whatever's here is exactly what Start will run. */
   next_batch: BootstrapPreset[];
-  /** Axis-level metadata for the dialog's next-batch UI. One entry per
-   *  knob the user can vary off the baseline. */
-  axes?: BootstrapAxisSpec[];
-};
-
-export type BootstrapAxisSpec = {
-  /** Canonical knob id (matches the backend's switch in buildConfigForAxisValue). */
-  name: string;
-  /** Display label. */
-  label: string;
-  /** Short help text. */
-  description: string;
-  /** "int" | "bool" | "enum" — drives the input widget. */
-  value_type: 'int' | 'bool' | 'enum';
-  /** Populated for value_type='enum'. */
-  enum_values?: string[];
-  /** Value at the baseline — shown as a "varies from X" hint. */
-  baseline_value: unknown;
-  /** Suggested initial value when the user enables this axis (next-uncovered). */
-  default_seed: unknown;
-  /** Values the curated library enumerates (datalist suggestions). */
-  variations: unknown[];
-  /** Group id — axes in the same group share a collapsible header in the
-   *  dialog. Captures logical dependencies (e.g. consolidation cluster). */
-  group: string;
 };
 
 export type BootstrapStartResponse =
-  | { status: 'library_exhausted'; library_size: number; message: string }
-  | { status: 'all_already_covered'; library_size: number; message: string; skipped: BootstrapPreset[] }
+  | { status: 'all_already_covered'; message: string; skipped: BootstrapPreset[] }
   | { bootstrap_job_id: string; total: number; presets: BootstrapPreset[]; skipped: BootstrapPreset[] };
 
 export type BootstrapJobStatus = {
@@ -1926,38 +1923,54 @@ export type BootstrapJobStatus = {
   errors: string[];
 };
 
-/** "Best run" criterion that drives the suggestion seed in the KB dialog.
- *  • fill_rate → seed = highest fill_rate_pct (tiebreak gini asc)
- *  • fairness  → seed = lowest gini (tiebreak fill_rate desc)
- *  • pareto    → seed = balanced winner: max (fill_rate_pct/100 - gini) */
-export type BootstrapCriterion = 'fill_rate' | 'fairness' | 'pareto';
+/** One fixed config to seed a batch of KB runs from — `max_methods` is the only value drawn
+ *  randomly per run (uniformly from [maxMethodsMin, maxMethodsMax]); everything else is held
+ *  fixed across the whole batch. Mirrors the Planning page's own manual-run form knobs, plus
+ *  the 5 external-config version picks (undefined = use the case's current default). */
+export type SeedForm = {
+  max_methods_min: number;
+  max_methods_max: number;
+  purchase_allowed: boolean;
+  make_batch_scale: string;
+  move_batch_scale: string;
+  purchase_batch_scale: string;
+  analyze_criticality: boolean;
+  check_soundness: boolean;
+  case_alloc_version_id?: number;
+  pref_version_id?: number;
+  demand_order_version_id?: number;
+  purchasable_material_version_id?: number;
+  constraint_version_id?: number;
+};
 
+/** Fetch the net-new max_methods sweep for the KB dialog — read-only, does not run anything.
+ *  Sweeps every integer in [form]'s max_methods range, excluding any value whose resulting
+ *  config already matches a KB/plan_run signature (no separate "how many runs" input — the
+ *  range implies it, and running the same max_methods twice wouldn't make sense). */
 export async function getBootstrapPreview(
   caseId: number,
-  batchSize = 5,
-  criterion: BootstrapCriterion = 'fill_rate',
+  form: SeedForm,
 ): Promise<BootstrapPreview> {
-  const r = await fetch(`${API}/cases/${caseId}/bootstrap?batch_size=${batchSize}&criterion=${criterion}`);
+  const r = await fetch(`${API}/cases/${caseId}/bootstrap/preview`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(form),
+  });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
 
-/** Start a KB expansion batch.
- *  When `presets` is provided, those override the system's selectNextBatch —
- *  use this when the user has reviewed/edited the suggested configs in the
- *  KB dialog. Each entry needs preset_id, preset_label, primary_axis, config.
- *  When omitted, the server picks the next round-robin batch from the library. */
+/** Start a KB-seeding batch. `presets` must be exactly what a preceding [getBootstrapPreview]
+ *  call returned in `next_batch` (or a client-edited variant of it) — the server never
+ *  re-computes its own batch at submit time, so what was previewed is what runs. */
 export async function startBootstrap(
   caseId: number,
-  batchSize = 5,
-  presets?: Array<Pick<BootstrapPreset, 'preset_id' | 'preset_label' | 'primary_axis' | 'config'>>,
+  presets: Array<Pick<BootstrapPreset, 'preset_id' | 'preset_label' | 'primary_axis' | 'config'>>,
 ): Promise<BootstrapStartResponse> {
-  const body: Record<string, unknown> = { batch_size: batchSize };
-  if (presets && presets.length > 0) body.presets = presets;
   const r = await fetch(`${API}/cases/${caseId}/bootstrap`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ presets, batch_size: presets.length }),
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
@@ -2000,6 +2013,65 @@ export async function getCaseDemands(caseId: number): Promise<CaseDemandRow[]> {
   return data.demands as CaseDemandRow[];
 }
 
+// ── Config versioning (shared across the 5 "external config objects") ──────────
+// See CaseConfigVersions' own doc in Tables.kt. Every one of the 5 objects below
+// (Critical Raw Allocation / Supply Preferences / Demand Ordering / Purchasable
+// Materials / Constraints) can have multiple named/commented versions per case,
+// exactly one marked default; a version can only be edited-in-place or deleted
+// while unreferenced by any plan run (in KB or history) — otherwise "Save As" a
+// new one. `versionId` is accepted as an optional trailing arg by the existing
+// get/update/delete/import/generate functions below (omit to use the case's
+// current default).
+
+export type ConfigVersion = {
+  id: number;
+  name: string | null;
+  comments: string | null;
+  is_default: boolean;
+  referenced: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+function withVersion(url: string, versionId?: number): string {
+  return versionId != null ? `${url}?version_id=${versionId}` : url;
+}
+
+async function listConfigVersions(kindPath: string, caseId: number): Promise<ConfigVersion[]> {
+  const r = await fetch(`${API}/cases/${caseId}/${kindPath}/versions`);
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return data.versions as ConfigVersion[];
+}
+
+async function createConfigVersion(kindPath: string, caseId: number, body: Record<string, unknown>): Promise<ConfigVersion> {
+  const r = await fetch(`${API}/cases/${caseId}/${kindPath}/versions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+async function updateConfigVersion(
+  kindPath: string, caseId: number, versionId: number,
+  body: { name?: string | null; comments?: string | null; is_default?: boolean },
+): Promise<ConfigVersion> {
+  const r = await fetch(`${API}/cases/${caseId}/${kindPath}/versions/${versionId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+async function deleteConfigVersion(kindPath: string, caseId: number, versionId: number): Promise<void> {
+  const r = await fetch(`${API}/cases/${caseId}/${kindPath}/versions/${versionId}`, { method: 'DELETE' });
+  if (!r.ok) throw new Error(await r.text());
+}
+
 // ── Allocation map ─────────────────────────────────────────────────────────────
 
 export type AllocationRow = {
@@ -2009,25 +2081,27 @@ export type AllocationRow = {
 };
 
 /** GET /cases/{id}/allocation — null when no allocation exists yet (204). */
-export async function getAllocation(caseId: number): Promise<AllocationRow[] | null> {
-  const r = await fetch(`${API}/cases/${caseId}/allocation`);
+export async function getAllocation(caseId: number, versionId?: number): Promise<AllocationRow[] | null> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/allocation`, versionId));
   if (r.status === 204) return null;
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
   return data.rows as AllocationRow[];
 }
 
-/** POST /cases/{id}/allocation/generate — runs SupplyAllocator and saves result. */
-export async function generateAllocation(caseId: number): Promise<AllocationRow[]> {
-  const r = await fetch(`${API}/cases/${caseId}/allocation/generate`, { method: 'POST' });
+/** POST /cases/{id}/allocation/generate — runs SupplyAllocator and saves result. 409 if the
+ *  target version is referenced by an existing plan run. */
+export async function generateAllocation(caseId: number, versionId?: number): Promise<AllocationRow[]> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/allocation/generate`, versionId), { method: 'POST' });
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
   return data.rows as AllocationRow[];
 }
 
-/** PUT /cases/{id}/allocation — upsert (partial or full) rows. */
-export async function updateAllocationRows(caseId: number, rows: AllocationRow[]): Promise<void> {
-  const r = await fetch(`${API}/cases/${caseId}/allocation`, {
+/** PUT /cases/{id}/allocation — upsert (partial or full) rows. 409 if the target version is
+ *  referenced by an existing plan run — use createAllocationVersion ("Save As") instead. */
+export async function updateAllocationRows(caseId: number, rows: AllocationRow[], versionId?: number): Promise<void> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/allocation`, versionId), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ rows }),
@@ -2035,15 +2109,15 @@ export async function updateAllocationRows(caseId: number, rows: AllocationRow[]
   if (!r.ok) throw new Error(await r.text());
 }
 
-/** DELETE /cases/{id}/allocation — clear all rows. */
-export async function deleteAllocation(caseId: number): Promise<void> {
-  const r = await fetch(`${API}/cases/${caseId}/allocation`, { method: 'DELETE' });
+/** DELETE /cases/{id}/allocation — clear the target version's rows. */
+export async function deleteAllocation(caseId: number, versionId?: number): Promise<void> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/allocation`, versionId), { method: 'DELETE' });
   if (!r.ok) throw new Error(await r.text());
 }
 
 /** POST /cases/{id}/allocation/import — upload CSV, replace all rows. */
-export async function importAllocationCsv(caseId: number, csvText: string): Promise<AllocationRow[]> {
-  const r = await fetch(`${API}/cases/${caseId}/allocation/import`, {
+export async function importAllocationCsv(caseId: number, csvText: string, versionId?: number): Promise<AllocationRow[]> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/allocation/import`, versionId), {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain' },
     body: csvText,
@@ -2054,11 +2128,18 @@ export async function importAllocationCsv(caseId: number, csvText: string): Prom
 }
 
 /** GET /cases/{id}/allocation/export — download CSV text. */
-export async function exportAllocationCsv(caseId: number): Promise<string> {
-  const r = await fetch(`${API}/cases/${caseId}/allocation/export`);
+export async function exportAllocationCsv(caseId: number, versionId?: number): Promise<string> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/allocation/export`, versionId));
   if (!r.ok) throw new Error(await r.text());
   return r.text();
 }
+
+export const listAllocationVersions = (caseId: number) => listConfigVersions('allocation', caseId);
+export const createAllocationVersion = (caseId: number, body: { name?: string; comments?: string; rows: AllocationRow[] }) =>
+  createConfigVersion('allocation', caseId, body);
+export const updateAllocationVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null; is_default?: boolean }) =>
+  updateConfigVersion('allocation', caseId, versionId, body);
+export const deleteAllocationVersion = (caseId: number, versionId: number) => deleteConfigVersion('allocation', caseId, versionId);
 
 // ── Purchasable Materials (promoted out of the inline plan config) ───────────────
 // No "generate" — pure user input, no algorithm computes a default. See
@@ -2067,16 +2148,17 @@ export async function exportAllocationCsv(caseId: number): Promise<string> {
 export type PurchasableMaterialRow = { product_id: string };
 
 /** GET /cases/{id}/purchasable-materials — the persisted whitelist (empty = allow all). */
-export async function getPurchasableMaterials(caseId: number): Promise<PurchasableMaterialRow[]> {
-  const r = await fetch(`${API}/cases/${caseId}/purchasable-materials`);
+export async function getPurchasableMaterials(caseId: number, versionId?: number): Promise<PurchasableMaterialRow[]> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/purchasable-materials`, versionId));
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
   return data.rows as PurchasableMaterialRow[];
 }
 
-/** PUT /cases/{id}/purchasable-materials — replaces the whole set. */
-export async function updatePurchasableMaterials(caseId: number, productIds: string[]): Promise<void> {
-  const r = await fetch(`${API}/cases/${caseId}/purchasable-materials`, {
+/** PUT /cases/{id}/purchasable-materials — replaces the whole set. 409 if the target version is
+ *  referenced by an existing plan run — use createPurchasableMaterialsVersion ("Save As") instead. */
+export async function updatePurchasableMaterials(caseId: number, productIds: string[], versionId?: number): Promise<void> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/purchasable-materials`, versionId), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ product_ids: productIds }),
@@ -2084,14 +2166,15 @@ export async function updatePurchasableMaterials(caseId: number, productIds: str
   if (!r.ok) throw new Error(await r.text());
 }
 
-/** DELETE /cases/{id}/purchasable-materials — clear (revert to "allow all"). */
-export async function deletePurchasableMaterials(caseId: number): Promise<void> {
-  const r = await fetch(`${API}/cases/${caseId}/purchasable-materials`, { method: 'DELETE' });
+/** DELETE /cases/{id}/purchasable-materials — clear the target version's rows (revert to
+ *  "allow all"). */
+export async function deletePurchasableMaterials(caseId: number, versionId?: number): Promise<void> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/purchasable-materials`, versionId), { method: 'DELETE' });
   if (!r.ok) throw new Error(await r.text());
 }
 
-export async function importPurchasableMaterialsCsv(caseId: number, csvText: string): Promise<PurchasableMaterialRow[]> {
-  const r = await fetch(`${API}/cases/${caseId}/purchasable-materials/import`, {
+export async function importPurchasableMaterialsCsv(caseId: number, csvText: string, versionId?: number): Promise<PurchasableMaterialRow[]> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/purchasable-materials/import`, versionId), {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain' },
     body: csvText,
@@ -2101,11 +2184,18 @@ export async function importPurchasableMaterialsCsv(caseId: number, csvText: str
   return data.rows as PurchasableMaterialRow[];
 }
 
-export async function exportPurchasableMaterialsCsv(caseId: number): Promise<string> {
-  const r = await fetch(`${API}/cases/${caseId}/purchasable-materials/export`);
+export async function exportPurchasableMaterialsCsv(caseId: number, versionId?: number): Promise<string> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/purchasable-materials/export`, versionId));
   if (!r.ok) throw new Error(await r.text());
   return r.text();
 }
+
+export const listPurchasableMaterialsVersions = (caseId: number) => listConfigVersions('purchasable-materials', caseId);
+export const createPurchasableMaterialsVersion = (caseId: number, body: { name?: string; comments?: string; product_ids: string[] }) =>
+  createConfigVersion('purchasable-materials', caseId, body);
+export const updatePurchasableMaterialsVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null; is_default?: boolean }) =>
+  updateConfigVersion('purchasable-materials', caseId, versionId, body);
+export const deletePurchasableMaterialsVersion = (caseId: number, versionId: number) => deleteConfigVersion('purchasable-materials', caseId, versionId);
 
 // ── Constraints (promoted out of the inline plan config) ─────────────────────────
 // Same rationale as Purchasable Materials — no "generate", pure user input.
@@ -2118,16 +2208,17 @@ export type ConstraintRuleRow = {
 };
 
 /** GET /cases/{id}/constraints — the persisted rule set (empty = no constraints). */
-export async function getCaseConstraints(caseId: number): Promise<ConstraintRuleRow[]> {
-  const r = await fetch(`${API}/cases/${caseId}/constraints`);
+export async function getCaseConstraints(caseId: number, versionId?: number): Promise<ConstraintRuleRow[]> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/constraints`, versionId));
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
   return data.rows as ConstraintRuleRow[];
 }
 
-/** PUT /cases/{id}/constraints — replaces the whole rule set. */
-export async function updateCaseConstraints(caseId: number, rows: ConstraintRuleRow[]): Promise<void> {
-  const r = await fetch(`${API}/cases/${caseId}/constraints`, {
+/** PUT /cases/{id}/constraints — replaces the whole rule set. 409 if the target version is
+ *  referenced by an existing plan run — use createCaseConstraintsVersion ("Save As") instead. */
+export async function updateCaseConstraints(caseId: number, rows: ConstraintRuleRow[], versionId?: number): Promise<void> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/constraints`, versionId), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ rows }),
@@ -2135,14 +2226,14 @@ export async function updateCaseConstraints(caseId: number, rows: ConstraintRule
   if (!r.ok) throw new Error(await r.text());
 }
 
-/** DELETE /cases/{id}/constraints — clear all rules. */
-export async function deleteCaseConstraints(caseId: number): Promise<void> {
-  const r = await fetch(`${API}/cases/${caseId}/constraints`, { method: 'DELETE' });
+/** DELETE /cases/{id}/constraints — clear the target version's rules. */
+export async function deleteCaseConstraints(caseId: number, versionId?: number): Promise<void> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/constraints`, versionId), { method: 'DELETE' });
   if (!r.ok) throw new Error(await r.text());
 }
 
-export async function importCaseConstraintsCsv(caseId: number, csvText: string): Promise<ConstraintRuleRow[]> {
-  const r = await fetch(`${API}/cases/${caseId}/constraints/import`, {
+export async function importCaseConstraintsCsv(caseId: number, csvText: string, versionId?: number): Promise<ConstraintRuleRow[]> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/constraints/import`, versionId), {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain' },
     body: csvText,
@@ -2152,11 +2243,18 @@ export async function importCaseConstraintsCsv(caseId: number, csvText: string):
   return data.rows as ConstraintRuleRow[];
 }
 
-export async function exportCaseConstraintsCsv(caseId: number): Promise<string> {
-  const r = await fetch(`${API}/cases/${caseId}/constraints/export`);
+export async function exportCaseConstraintsCsv(caseId: number, versionId?: number): Promise<string> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/constraints/export`, versionId));
   if (!r.ok) throw new Error(await r.text());
   return r.text();
 }
+
+export const listCaseConstraintsVersions = (caseId: number) => listConfigVersions('constraints', caseId);
+export const createCaseConstraintsVersion = (caseId: number, body: { name?: string; comments?: string; rows: ConstraintRuleRow[] }) =>
+  createConfigVersion('constraints', caseId, body);
+export const updateCaseConstraintsVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null; is_default?: boolean }) =>
+  updateConfigVersion('constraints', caseId, versionId, body);
+export const deleteCaseConstraintsVersion = (caseId: number, versionId: number) => deleteConfigVersion('constraints', caseId, versionId);
 
 // ── Preferences KB ───────────────────────────────────────────────────────────────
 
@@ -2188,17 +2286,18 @@ export type PreferenceGenerateParams = {
 };
 
 /** GET /cases/{id}/preferences — null when no Preferences KB exists yet (204). */
-export async function getPreferences(caseId: number): Promise<{ rows: PreferenceRow[]; config: PreferenceConfig | null } | null> {
-  const r = await fetch(`${API}/cases/${caseId}/preferences`);
+export async function getPreferences(caseId: number, versionId?: number): Promise<{ rows: PreferenceRow[]; config: PreferenceConfig | null } | null> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/preferences`, versionId));
   if (r.status === 204) return null;
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
   return { rows: data.rows as PreferenceRow[], config: (data.config ?? null) as PreferenceConfig | null };
 }
 
-/** POST /cases/{id}/preferences/generate — builds the KB from case data and saves it. */
-export async function generatePreferences(caseId: number, params: PreferenceGenerateParams): Promise<PreferenceRow[]> {
-  const r = await fetch(`${API}/cases/${caseId}/preferences/generate`, {
+/** POST /cases/{id}/preferences/generate — builds the KB from case data and saves it. 409 if
+ *  the target version is referenced by an existing plan run. */
+export async function generatePreferences(caseId: number, params: PreferenceGenerateParams, versionId?: number): Promise<PreferenceRow[]> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/preferences/generate`, versionId), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params),
@@ -2208,9 +2307,11 @@ export async function generatePreferences(caseId: number, params: PreferenceGene
   return data.rows as PreferenceRow[];
 }
 
-/** PUT /cases/{id}/preferences — upsert edited preference values by natural key. */
-export async function updatePreferenceRows(caseId: number, rows: PreferenceRow[]): Promise<void> {
-  const r = await fetch(`${API}/cases/${caseId}/preferences`, {
+/** PUT /cases/{id}/preferences — upsert edited preference values by natural key. 409 if the
+ *  target version is referenced by an existing plan run — use createPreferencesVersion
+ *  ("Save As") instead. */
+export async function updatePreferenceRows(caseId: number, rows: PreferenceRow[], versionId?: number): Promise<void> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/preferences`, versionId), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ rows }),
@@ -2218,15 +2319,15 @@ export async function updatePreferenceRows(caseId: number, rows: PreferenceRow[]
   if (!r.ok) throw new Error(await r.text());
 }
 
-/** DELETE /cases/{id}/preferences — clear the KB. */
-export async function deletePreferences(caseId: number): Promise<void> {
-  const r = await fetch(`${API}/cases/${caseId}/preferences`, { method: 'DELETE' });
+/** DELETE /cases/{id}/preferences — clear the target version's rows. */
+export async function deletePreferences(caseId: number, versionId?: number): Promise<void> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/preferences`, versionId), { method: 'DELETE' });
   if (!r.ok) throw new Error(await r.text());
 }
 
 /** POST /cases/{id}/preferences/import — upload CSV, replace all rows. */
-export async function importPreferencesCsv(caseId: number, csvText: string): Promise<PreferenceRow[]> {
-  const r = await fetch(`${API}/cases/${caseId}/preferences/import`, {
+export async function importPreferencesCsv(caseId: number, csvText: string, versionId?: number): Promise<PreferenceRow[]> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/preferences/import`, versionId), {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain' },
     body: csvText,
@@ -2237,11 +2338,18 @@ export async function importPreferencesCsv(caseId: number, csvText: string): Pro
 }
 
 /** GET /cases/{id}/preferences/export — download CSV text. */
-export async function exportPreferencesCsv(caseId: number): Promise<string> {
-  const r = await fetch(`${API}/cases/${caseId}/preferences/export`);
+export async function exportPreferencesCsv(caseId: number, versionId?: number): Promise<string> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/preferences/export`, versionId));
   if (!r.ok) throw new Error(await r.text());
   return r.text();
 }
+
+export const listPreferencesVersions = (caseId: number) => listConfigVersions('preferences', caseId);
+export const createPreferencesVersion = (caseId: number, body: { name?: string; comments?: string; rows: PreferenceRow[] }) =>
+  createConfigVersion('preferences', caseId, body);
+export const updatePreferencesVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null; is_default?: boolean }) =>
+  updateConfigVersion('preferences', caseId, versionId, body);
+export const deletePreferencesVersion = (caseId: number, versionId: number) => deleteConfigVersion('preferences', caseId, versionId);
 
 // ── Demand Ordering ─────────────────────────────────────────────────────────────
 
@@ -2259,25 +2367,28 @@ export type DemandOrderConfig = {
 };
 
 /** GET /cases/{id}/demand-ordering — null when no Demand Ordering KB exists yet (204). */
-export async function getDemandOrdering(caseId: number): Promise<{ rows: DemandOrderRow[]; config: DemandOrderConfig | null } | null> {
-  const r = await fetch(`${API}/cases/${caseId}/demand-ordering`);
+export async function getDemandOrdering(caseId: number, versionId?: number): Promise<{ rows: DemandOrderRow[]; config: DemandOrderConfig | null } | null> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/demand-ordering`, versionId));
   if (r.status === 204) return null;
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
   return { rows: data.rows as DemandOrderRow[], config: (data.config ?? null) as DemandOrderConfig | null };
 }
 
-/** POST /cases/{id}/demand-ordering/generate — builds the order from case data and saves it. */
-export async function generateDemandOrdering(caseId: number): Promise<DemandOrderRow[]> {
-  const r = await fetch(`${API}/cases/${caseId}/demand-ordering/generate`, { method: 'POST' });
+/** POST /cases/{id}/demand-ordering/generate — builds the order from case data and saves it.
+ *  409 if the target version is referenced by an existing plan run. */
+export async function generateDemandOrdering(caseId: number, versionId?: number): Promise<DemandOrderRow[]> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/demand-ordering/generate`, versionId), { method: 'POST' });
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
   return data.rows as DemandOrderRow[];
 }
 
-/** PUT /cases/{id}/demand-ordering — upsert edited order values by demand_id. */
-export async function updateDemandOrderRows(caseId: number, rows: { demand_id: string; order: number }[]): Promise<void> {
-  const r = await fetch(`${API}/cases/${caseId}/demand-ordering`, {
+/** PUT /cases/{id}/demand-ordering — upsert edited order values by demand_id. 409 if the target
+ *  version is referenced by an existing plan run — use createDemandOrderingVersion ("Save As")
+ *  instead. */
+export async function updateDemandOrderRows(caseId: number, rows: { demand_id: string; order: number }[], versionId?: number): Promise<void> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/demand-ordering`, versionId), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ rows }),
@@ -2285,15 +2396,15 @@ export async function updateDemandOrderRows(caseId: number, rows: { demand_id: s
   if (!r.ok) throw new Error(await r.text());
 }
 
-/** DELETE /cases/{id}/demand-ordering — clear the KB. */
-export async function deleteDemandOrdering(caseId: number): Promise<void> {
-  const r = await fetch(`${API}/cases/${caseId}/demand-ordering`, { method: 'DELETE' });
+/** DELETE /cases/{id}/demand-ordering — clear the target version's rows. */
+export async function deleteDemandOrdering(caseId: number, versionId?: number): Promise<void> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/demand-ordering`, versionId), { method: 'DELETE' });
   if (!r.ok) throw new Error(await r.text());
 }
 
 /** POST /cases/{id}/demand-ordering/import — upload CSV, replace all rows. */
-export async function importDemandOrderingCsv(caseId: number, csvText: string): Promise<DemandOrderRow[]> {
-  const r = await fetch(`${API}/cases/${caseId}/demand-ordering/import`, {
+export async function importDemandOrderingCsv(caseId: number, csvText: string, versionId?: number): Promise<DemandOrderRow[]> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/demand-ordering/import`, versionId), {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain' },
     body: csvText,
@@ -2304,8 +2415,15 @@ export async function importDemandOrderingCsv(caseId: number, csvText: string): 
 }
 
 /** GET /cases/{id}/demand-ordering/export — download CSV text. */
-export async function exportDemandOrderingCsv(caseId: number): Promise<string> {
-  const r = await fetch(`${API}/cases/${caseId}/demand-ordering/export`);
+export async function exportDemandOrderingCsv(caseId: number, versionId?: number): Promise<string> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/demand-ordering/export`, versionId));
   if (!r.ok) throw new Error(await r.text());
   return r.text();
 }
+
+export const listDemandOrderingVersions = (caseId: number) => listConfigVersions('demand-ordering', caseId);
+export const createDemandOrderingVersion = (caseId: number, body: { name?: string; comments?: string; rows: { demand_id: string; order: number }[] }) =>
+  createConfigVersion('demand-ordering', caseId, body);
+export const updateDemandOrderingVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null; is_default?: boolean }) =>
+  updateConfigVersion('demand-ordering', caseId, versionId, body);
+export const deleteDemandOrderingVersion = (caseId: number, versionId: number) => deleteConfigVersion('demand-ordering', caseId, versionId);

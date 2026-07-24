@@ -1,5 +1,6 @@
 package com.allocator.services
 
+import com.allocator.KbDeletedSignatures
 import com.allocator.KbRecords
 import com.allocator.PlanRuns
 import kotlinx.datetime.Clock
@@ -48,6 +49,15 @@ object KbStore {
         val sourcePlanRunId: Int?,
         val sourcePlanRunDeleted: Boolean,
         val soundnessStatus: String,
+        // Which version of each of the 5 external config objects this record's source run used
+        // (see CaseConfigVersions' own doc) — defaulted to null so the other constructor call
+        // sites (narrateTradeoff's rowToKbRecord, BootstrapPreset.toKbRecordShape's synthetic
+        // preview) don't need updating; only listForCase populates these for real.
+        val caseAllocVersionId: Int? = null,
+        val prefVersionId: Int? = null,
+        val ordVersionId: Int? = null,
+        val purchMatVersionId: Int? = null,
+        val constrVersionId: Int? = null,
     )
 
     /** Headline KPI snapshot extracted from a plan_run.result JSON tree.
@@ -105,6 +115,25 @@ object KbStore {
         return Triple(presetId ?: return null, presetLabel, primaryAxis)
     }
 
+    private fun formatRunTs(ts: kotlinx.datetime.Instant): String =
+        java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME.withZone(java.time.ZoneOffset.UTC)
+            .format(java.time.Instant.ofEpochMilli(ts.toEpochMilliseconds()))
+
+    /** `duration_ms` / `run_created_at` / `run_finished_at` fields snapshotted alongside the KPIs. */
+    private fun runTimingObject(createdAt: kotlinx.datetime.Instant, finishedAt: kotlinx.datetime.Instant?): JsonObject =
+        buildJsonObject {
+            finishedAt?.let { put("duration_ms", JsonPrimitive(it.toEpochMilliseconds() - createdAt.toEpochMilliseconds())) }
+            put("run_created_at", JsonPrimitive(formatRunTs(createdAt)))
+            finishedAt?.let { put("run_finished_at", JsonPrimitive(formatRunTs(it))) }
+        }
+
+    /** Timing for a legacy KB row whose snapshot predates the timing fields — read live from the
+     *  source plan_run while it still exists. Null when the run is gone. */
+    fun timingFromPlanRun(planRunId: Int): JsonObject? = transaction {
+        val row = PlanRuns.selectAll().where { PlanRuns.id eq planRunId }.firstOrNull() ?: return@transaction null
+        runTimingObject(row[PlanRuns.createdAt], row[PlanRuns.finishedAt])
+    }
+
     /**
      * Read a plan_run and upsert the corresponding KB record. Idempotent;
      * safe to call repeatedly. Returns the row id, or null if the plan_run
@@ -121,7 +150,12 @@ object KbStore {
         val configJson = runCatching { json.parseToJsonElement(configRaw).jsonObject }.getOrNull()
             ?: return@transaction null
         val signature = CaseBootstrap.signatureFor(configJson)
-        val kpisSnapshot = extractKpis(row[PlanRuns.result]).toString()
+        // Timing rides in the snapshot (not KPI-extracted from the result tree) so it, like the
+        // KPIs, survives deletion of the source plan_run.
+        val kpisSnapshot = buildJsonObject {
+            extractKpis(row[PlanRuns.result]).entries.forEach { (k, v) -> put(k, v) }
+            runTimingObject(row[PlanRuns.createdAt], row[PlanRuns.finishedAt]).entries.forEach { (k, v) -> put(k, v) }
+        }.toString()
         val configString = configJson.toString()
         val soundness = row[PlanRuns.soundnessStatus]
         val bootstrapMeta = parseBootstrapMetadata(row[PlanRuns.metadata])
@@ -129,6 +163,13 @@ object KbStore {
         val existing = KbRecords.selectAll()
             .where { (KbRecords.caseId eq caseId) and (KbRecords.signature eq signature) }
             .firstOrNull()
+        // Mirrors PlanRuns' own 5 version-reference columns — see that table's own doc.
+        val caseAllocVersionId = row[PlanRuns.caseAllocVersionId]
+        val prefVersionId = row[PlanRuns.prefVersionId]
+        val ordVersionId = row[PlanRuns.ordVersionId]
+        val purchMatVersionId = row[PlanRuns.purchMatVersionId]
+        val constrVersionId = row[PlanRuns.constrVersionId]
+
         if (existing == null) {
             KbRecords.insert {
                 it[KbRecords.caseId] = caseId
@@ -141,6 +182,11 @@ object KbStore {
                 it[KbRecords.sourcePlanRunId] = planRunId
                 it[KbRecords.sourcePlanRunDeleted] = false
                 it[KbRecords.soundnessStatus] = soundness
+                it[KbRecords.caseAllocVersionId] = caseAllocVersionId
+                it[KbRecords.prefVersionId] = prefVersionId
+                it[KbRecords.ordVersionId] = ordVersionId
+                it[KbRecords.purchMatVersionId] = purchMatVersionId
+                it[KbRecords.constrVersionId] = constrVersionId
             }[KbRecords.id]
         } else {
             val existingId = existing[KbRecords.id]
@@ -153,6 +199,11 @@ object KbStore {
                 it[KbRecords.sourcePlanRunId] = planRunId
                 it[KbRecords.sourcePlanRunDeleted] = false
                 it[KbRecords.soundnessStatus] = soundness
+                it[KbRecords.caseAllocVersionId] = caseAllocVersionId
+                it[KbRecords.prefVersionId] = prefVersionId
+                it[KbRecords.ordVersionId] = ordVersionId
+                it[KbRecords.purchMatVersionId] = purchMatVersionId
+                it[KbRecords.constrVersionId] = constrVersionId
                 if (bootstrapMeta != null) {
                     it[KbRecords.presetId] = bootstrapMeta.first
                     it[KbRecords.presetLabel] = bootstrapMeta.second
@@ -169,11 +220,20 @@ object KbStore {
      * yet have a corresponding kb_record, create one. Idempotent. Called
      * lazily on KB read so historical successful runs surface in the KB
      * (the agent and dedup both rely on the entire KB).
+     *
+     * Skips signatures the user explicitly deleted ([KbDeletedSignatures], written by
+     * [deleteRecord]) — without this check, a deleted KB row whose source plan_run is still
+     * successful+sound would get silently re-created the very next time this runs (e.g. the KB
+     * dialog re-opening), undoing the deletion.
      */
     fun backfillForCase(caseId: Int) = transaction {
         val existingSigs = KbRecords.selectAll()
             .where { KbRecords.caseId eq caseId }
             .map { it[KbRecords.signature] }
+            .toSet()
+        val deletedSigs = KbDeletedSignatures.selectAll()
+            .where { KbDeletedSignatures.caseId eq caseId }
+            .map { it[KbDeletedSignatures.signature] }
             .toSet()
         val candidateRuns = PlanRuns.selectAll()
             .where {
@@ -187,6 +247,7 @@ object KbStore {
             val configJson = runCatching { json.parseToJsonElement(configRaw).jsonObject }.getOrNull() ?: continue
             val sig = CaseBootstrap.signatureFor(configJson)
             if (sig in existingSigs) continue
+            if (sig in deletedSigs) continue
             upsertFromPlanRun(row[PlanRuns.id])
         }
     }
@@ -386,6 +447,11 @@ object KbStore {
                     sourcePlanRunId = row[KbRecords.sourcePlanRunId],
                     sourcePlanRunDeleted = row[KbRecords.sourcePlanRunDeleted],
                     soundnessStatus = row[KbRecords.soundnessStatus],
+                    caseAllocVersionId = row[KbRecords.caseAllocVersionId],
+                    prefVersionId = row[KbRecords.prefVersionId],
+                    ordVersionId = row[KbRecords.ordVersionId],
+                    purchMatVersionId = row[KbRecords.purchMatVersionId],
+                    constrVersionId = row[KbRecords.constrVersionId],
                 )
                 rec.signature to rec
             }
@@ -403,7 +469,26 @@ object KbStore {
 
     /** Hard-delete a KB record. Returns true if a row was removed. */
     fun deleteRecord(caseId: Int, recordId: Int): Boolean = transaction {
-        KbRecords.deleteWhere { (KbRecords.caseId eq caseId) and (KbRecords.id eq recordId) } > 0
+        val sig = KbRecords.selectAll()
+            .where { (KbRecords.caseId eq caseId) and (KbRecords.id eq recordId) }
+            .singleOrNull()?.get(KbRecords.signature)
+            ?: return@transaction false
+        val deleted = KbRecords.deleteWhere { (KbRecords.caseId eq caseId) and (KbRecords.id eq recordId) } > 0
+        if (deleted) {
+            // Tombstone the signature so backfillForCase doesn't silently resurrect it from the
+            // still-successful+sound source plan_run on the very next call (see that function's
+            // own doc for why it would otherwise do exactly that).
+            val alreadyTombstoned = KbDeletedSignatures.selectAll()
+                .where { (KbDeletedSignatures.caseId eq caseId) and (KbDeletedSignatures.signature eq sig) }
+                .firstOrNull() != null
+            if (!alreadyTombstoned) {
+                KbDeletedSignatures.insert {
+                    it[KbDeletedSignatures.caseId] = caseId
+                    it[KbDeletedSignatures.signature] = sig
+                }
+            }
+        }
+        deleted
     }
 
     // ── Query / Pareto frontier (planning-agent KB tools) ────────────────────

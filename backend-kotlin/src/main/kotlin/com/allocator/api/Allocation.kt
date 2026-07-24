@@ -5,7 +5,9 @@ import com.allocator.CaseAllocations
 import com.allocator.Cases
 import com.allocator.Demands
 import com.allocator.PlanRuns
+import com.allocator.services.CaseConfigVersioning
 import com.allocator.services.CaseLoader
+import com.allocator.services.ConfigVersionKind
 import com.allocator.services.KbFingerprint
 import com.allocator.services.buildAllocationBudgetRows
 import com.allocator.services.buildSupplyAllocation
@@ -21,15 +23,17 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import org.slf4j.LoggerFactory
 
 private val log = LoggerFactory.getLogger("com.allocator.AllocationRoute")
+private val KIND = ConfigVersionKind.CASEALLOC
 
 // ── Helper: load case_allocation rows as perLotBudgets ───────────────────────
 
 data class CaseAllocRow(val supplyId: String, val demandId: String?, val qtyAllocated: Double)
 
-/** Loads case_allocation rows for [caseId]. Returns null when none exist (planning falls back to SupplyAllocator). */
-internal fun loadCaseAllocRows(caseId: Int): List<CaseAllocRow>? = transaction {
+/** Loads case_allocation rows for [versionId]. Returns null when none exist (planning falls back
+ *  to SupplyAllocator). */
+internal fun loadCaseAllocRows(versionId: Int): List<CaseAllocRow>? = transaction {
     val rows = CaseAllocations.selectAll()
-        .where { CaseAllocations.caseId eq caseId }
+        .where { CaseAllocations.versionId eq versionId }
         .map { CaseAllocRow(it[CaseAllocations.supplyId], it[CaseAllocations.demandId], it[CaseAllocations.qtyAllocated]) }
     if (rows.isEmpty()) null else rows
 }
@@ -64,7 +68,7 @@ internal fun buildBudgetsFromCaseAlloc(
 }
 
 /**
- * Recompute and persist case_allocation's content-hash fingerprint for [caseId] — call after
+ * Recompute and persist case_allocation's content-hash fingerprint for [versionId] — call after
  * any write to [CaseAllocations], inside the SAME transaction as the row mutation so hash and
  * rows commit atomically. Re-reads the FULL current row set (not a delta) so PUT's partial
  * row-by-row edits still produce a hash reflecting the true final table state. Read later by
@@ -72,38 +76,56 @@ internal fun buildBudgetsFromCaseAlloc(
  * Allocate.kt's resolveEffectiveConfig), not by anything in the live planning path itself.
  *
  * Known accepted limitation: does not take a row lock before recomputing, so two genuinely
- * concurrent writers on the same case (double-click Save, two tabs) could each compute a hash
+ * concurrent writers on the same version (double-click Save, two tabs) could each compute a hash
  * from a snapshot that doesn't include the other's edit, and the transaction that commits last
  * "wins" the hash column. Low-probability given the UI's stage-then-Save-once pattern; revisit
  * with a `SELECT ... FOR UPDATE` on the config row if this proves to matter in practice.
  */
-private fun recomputeCaseAllocationHash(caseId: Int) {
-    val rows = CaseAllocations.selectAll().where { CaseAllocations.caseId eq caseId }
+private fun recomputeCaseAllocationHash(caseId: Int, versionId: Int) {
+    val rows = CaseAllocations.selectAll().where { CaseAllocations.versionId eq versionId }
         .map { "${it[CaseAllocations.supplyId]}|${it[CaseAllocations.demandId] ?: ""}|${it[CaseAllocations.qtyAllocated]}" }
     val hash = KbFingerprint.hashRows(rows)
-    val existing = CaseAllocationConfigs.selectAll().where { CaseAllocationConfigs.caseId eq caseId }.firstOrNull()
+    val existing = CaseAllocationConfigs.selectAll().where { CaseAllocationConfigs.versionId eq versionId }.firstOrNull()
     if (existing != null) {
-        CaseAllocationConfigs.update({ CaseAllocationConfigs.caseId eq caseId }) {
+        CaseAllocationConfigs.update({ CaseAllocationConfigs.versionId eq versionId }) {
             it[CaseAllocationConfigs.contentHash] = hash
         }
     } else {
         CaseAllocationConfigs.insert {
             it[CaseAllocationConfigs.caseId] = caseId
+            it[CaseAllocationConfigs.versionId] = versionId
             it[CaseAllocationConfigs.contentHash] = hash
         }
     }
 }
 
+private fun versionJson(caseId: Int, versionId: Int): JsonObject {
+    val summary = CaseConfigVersioning.listVersions(caseId, KIND).firstOrNull { it.id == versionId }
+    return buildJsonObject {
+        put("id", versionId)
+        put("name", summary?.name)
+        put("comments", summary?.comments)
+        put("is_default", summary?.isDefault ?: false)
+        put("referenced", summary?.referenced ?: false)
+    }
+}
+
 /**
- * Run the supply allocation for [caseId] using [data] and [config], persist the result to
- * case_allocation, and return the saved rows. Config is required for purchasable_materials
- * filtering — pass null only when no plan run has been run yet for the case.
+ * Run the supply allocation for [caseId]/[versionId] using [data] and [config], persist the
+ * result into that version's rows, and return the saved rows. Config is required for
+ * purchasable_materials filtering — pass null only when no plan run has been run yet for the
+ * case. Deliberately does NOT check "is this version referenced" — see call sites: the Generate
+ * route checks before calling this; `runPlanBackground`'s auto-seed-on-first-run path is an
+ * internal write performed by the very run that just referenced this version, not a user-
+ * initiated edit of pre-existing data, so it must stay unconditional (matches this function's
+ * pre-versioning behavior exactly).
  *
  * This is the single shared implementation used by both the Generate endpoint and the
  * plan-run seeding path in runPlanBackground.
  */
 internal fun generateAndSeedCaseAllocation(
     caseId: Int,
+    versionId: Int,
     data: Map<String, List<Map<String, Any?>>>,
     config: Map<String, Any?>?,
 ): List<CaseAllocRow> {
@@ -113,14 +135,15 @@ internal fun generateAndSeedCaseAllocation(
                       .map { (sid, did, qty) -> CaseAllocRow(sid, did, qty) }
     if (rows.isNotEmpty()) {
         transaction {
-            CaseAllocations.deleteWhere { CaseAllocations.caseId eq caseId }
+            CaseAllocations.deleteWhere { CaseAllocations.versionId eq versionId }
             CaseAllocations.batchInsert(rows) { row ->
                 this[CaseAllocations.caseId]       = caseId
+                this[CaseAllocations.versionId]    = versionId
                 this[CaseAllocations.supplyId]     = row.supplyId
                 this[CaseAllocations.demandId]     = row.demandId
                 this[CaseAllocations.qtyAllocated] = row.qtyAllocated
             }
-            recomputeCaseAllocationHash(caseId)
+            recomputeCaseAllocationHash(caseId, versionId)
         }
     }
     return rows
@@ -130,14 +153,23 @@ internal fun generateAndSeedCaseAllocation(
 
 fun Routing.allocationRoutes() {
 
+    fun requireCase(caseId: Int) = transaction {
+        Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
+            ?: throw NoSuchElementException("Case not found")
+    }
+
+    fun requireCaseId(call: ApplicationCall): Int {
+        val caseId = call.parameters["case_id"]?.toIntOrNull() ?: throw IllegalArgumentException("Invalid case_id")
+        requireCase(caseId)
+        return caseId
+    }
+
+    fun resolvedVersionId(call: ApplicationCall, caseId: Int): Int =
+        CaseConfigVersioning.resolveVersionId(caseId, KIND, call.request.queryParameters["version_id"]?.toIntOrNull())
+
     // ── GET /cases/{case_id}/demands ─────────────────────────────────────────
     get("/cases/{case_id}/demands") {
-        val caseId = call.parameters["case_id"]?.toIntOrNull()
-            ?: throw IllegalArgumentException("Invalid case_id")
-        transaction {
-            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
-                ?: throw NoSuchElementException("Case not found")
-        }
+        val caseId = requireCaseId(call)
         val rows = transaction {
             Demands.selectAll().where { Demands.caseId eq caseId }
                 .orderBy(Demands.demandId to SortOrder.ASC)
@@ -157,15 +189,11 @@ fun Routing.allocationRoutes() {
 
     // ── GET /cases/{case_id}/allocation ──────────────────────────────────────
     get("/cases/{case_id}/allocation") {
-        val caseId = call.parameters["case_id"]?.toIntOrNull()
-            ?: throw IllegalArgumentException("Invalid case_id")
-        transaction {
-            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
-                ?: throw NoSuchElementException("Case not found")
-        }
+        val caseId = requireCaseId(call)
+        val versionId = resolvedVersionId(call, caseId)
         val rows = transaction {
             CaseAllocations.selectAll()
-                .where { CaseAllocations.caseId eq caseId }
+                .where { CaseAllocations.versionId eq versionId }
                 .orderBy(CaseAllocations.supplyId to SortOrder.ASC, CaseAllocations.demandId to SortOrder.ASC)
                 .map { row ->
                     buildJsonObject {
@@ -176,20 +204,16 @@ fun Routing.allocationRoutes() {
                     }
                 }
         }
-        if (rows.isEmpty()) {
-            call.respond(HttpStatusCode.NoContent)
-        } else {
-            call.respond(buildJsonObject { put("rows", JsonArray(rows)) })
-        }
+        call.respond(buildJsonObject { put("rows", JsonArray(rows)); put("version", versionJson(caseId, versionId)) })
     }
 
     // ── POST /cases/{case_id}/allocation/generate ─────────────────────────────
     post("/cases/{case_id}/allocation/generate") {
-        val caseId = call.parameters["case_id"]?.toIntOrNull()
-            ?: throw IllegalArgumentException("Invalid case_id")
-        transaction {
-            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
-                ?: throw NoSuchElementException("Case not found")
+        val caseId = requireCaseId(call)
+        val versionId = resolvedVersionId(call, caseId)
+        if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
+            call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
+            return@post
         }
         val data = transaction { CaseLoader.load(caseId) }
         if ((data["demand"] ?: emptyList()).isEmpty()) throw IllegalArgumentException("No demand data for case $caseId")
@@ -221,8 +245,8 @@ fun Routing.allocationRoutes() {
             }
         }
 
-        log.info("[allocation] generating allocation for case {}", caseId)
-        val newRows = generateAndSeedCaseAllocation(caseId, data, config)
+        log.info("[allocation] generating allocation for case {} version {}", caseId, versionId)
+        val newRows = generateAndSeedCaseAllocation(caseId, versionId, data, config)
         log.info("[allocation] generated {} rows for case {} ({} critical supply lots)", newRows.size, caseId, newRows.map { it.supplyId }.distinct().size)
 
         val responseRows = newRows.map { row ->
@@ -239,11 +263,11 @@ fun Routing.allocationRoutes() {
     // Body: { "rows": [{ "supply_id", "demand_id", "qty_allocated" }] }
     // Upserts (insert-or-replace) the given rows; leaves other rows unchanged.
     put("/cases/{case_id}/allocation") {
-        val caseId = call.parameters["case_id"]?.toIntOrNull()
-            ?: throw IllegalArgumentException("Invalid case_id")
-        transaction {
-            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
-                ?: throw NoSuchElementException("Case not found")
+        val caseId = requireCaseId(call)
+        val versionId = resolvedVersionId(call, caseId)
+        if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
+            call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
+            return@put
         }
         val body = call.receiveText()
         val payload = Json.parseToJsonElement(body).jsonObject
@@ -259,41 +283,44 @@ fun Routing.allocationRoutes() {
         transaction {
             for (row in rows) {
                 val existing = CaseAllocations.selectAll().where {
-                    (CaseAllocations.caseId eq caseId) and
+                    (CaseAllocations.versionId eq versionId) and
                     (CaseAllocations.supplyId eq row.supplyId) and
                     (if (row.demandId != null) CaseAllocations.demandId eq row.demandId else CaseAllocations.demandId.isNull())
                 }.singleOrNull()
                 if (existing != null) {
                     CaseAllocations.update({
-                        (CaseAllocations.caseId eq caseId) and
+                        (CaseAllocations.versionId eq versionId) and
                         (CaseAllocations.supplyId eq row.supplyId) and
                         (if (row.demandId != null) CaseAllocations.demandId eq row.demandId else CaseAllocations.demandId.isNull())
                     }) { it[CaseAllocations.qtyAllocated] = row.qtyAllocated }
                 } else {
                     CaseAllocations.insert {
                         it[CaseAllocations.caseId]       = caseId
+                        it[CaseAllocations.versionId]    = versionId
                         it[CaseAllocations.supplyId]     = row.supplyId
                         it[CaseAllocations.demandId]     = row.demandId
                         it[CaseAllocations.qtyAllocated] = row.qtyAllocated
                     }
                 }
             }
-            recomputeCaseAllocationHash(caseId)
+            recomputeCaseAllocationHash(caseId, versionId)
         }
         call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", rows.size) })
     }
 
     // ── DELETE /cases/{case_id}/allocation ────────────────────────────────────
+    // "Clear" — empties the resolved version's rows (does not delete the version itself; use
+    // DELETE .../versions/{id} for that).
     delete("/cases/{case_id}/allocation") {
-        val caseId = call.parameters["case_id"]?.toIntOrNull()
-            ?: throw IllegalArgumentException("Invalid case_id")
-        transaction {
-            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
-                ?: throw NoSuchElementException("Case not found")
+        val caseId = requireCaseId(call)
+        val versionId = resolvedVersionId(call, caseId)
+        if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
+            call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
+            return@delete
         }
         val deleted = transaction {
-            val n = CaseAllocations.deleteWhere { CaseAllocations.caseId eq caseId }
-            CaseAllocationConfigs.deleteWhere { CaseAllocationConfigs.caseId eq caseId }
+            val n = CaseAllocations.deleteWhere { CaseAllocations.versionId eq versionId }
+            recomputeCaseAllocationHash(caseId, versionId)
             n
         }
         call.respond(buildJsonObject { put("deleted", deleted) })
@@ -302,24 +329,25 @@ fun Routing.allocationRoutes() {
     // ── POST /cases/{case_id}/allocation/import ───────────────────────────────
     // Body: CSV text with header row: supply_id,demand_id,qty_allocated
     post("/cases/{case_id}/allocation/import") {
-        val caseId = call.parameters["case_id"]?.toIntOrNull()
-            ?: throw IllegalArgumentException("Invalid case_id")
-        transaction {
-            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
-                ?: throw NoSuchElementException("Case not found")
+        val caseId = requireCaseId(call)
+        val versionId = resolvedVersionId(call, caseId)
+        if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
+            call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
+            return@post
         }
         val csvText = call.receiveText()
         val rows = parseCsvAllocation(csvText)
-        log.info("[allocation] importing {} rows for case {}", rows.size, caseId)
+        log.info("[allocation] importing {} rows for case {} version {}", rows.size, caseId, versionId)
         transaction {
-            CaseAllocations.deleteWhere { CaseAllocations.caseId eq caseId }
+            CaseAllocations.deleteWhere { CaseAllocations.versionId eq versionId }
             CaseAllocations.batchInsert(rows) { row ->
                 this[CaseAllocations.caseId]       = caseId
+                this[CaseAllocations.versionId]    = versionId
                 this[CaseAllocations.supplyId]     = row.supplyId
                 this[CaseAllocations.demandId]     = row.demandId
                 this[CaseAllocations.qtyAllocated] = row.qtyAllocated
             }
-            recomputeCaseAllocationHash(caseId)
+            recomputeCaseAllocationHash(caseId, versionId)
         }
         val responseRows = rows.map { row ->
             buildJsonObject {
@@ -333,15 +361,11 @@ fun Routing.allocationRoutes() {
 
     // ── GET /cases/{case_id}/allocation/export ────────────────────────────────
     get("/cases/{case_id}/allocation/export") {
-        val caseId = call.parameters["case_id"]?.toIntOrNull()
-            ?: throw IllegalArgumentException("Invalid case_id")
-        transaction {
-            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
-                ?: throw NoSuchElementException("Case not found")
-        }
+        val caseId = requireCaseId(call)
+        val versionId = resolvedVersionId(call, caseId)
         val rows = transaction {
             CaseAllocations.selectAll()
-                .where { CaseAllocations.caseId eq caseId }
+                .where { CaseAllocations.versionId eq versionId }
                 .orderBy(CaseAllocations.supplyId to SortOrder.ASC, CaseAllocations.demandId to SortOrder.ASC)
                 .map { CaseAllocRow(it[CaseAllocations.supplyId], it[CaseAllocations.demandId], it[CaseAllocations.qtyAllocated]) }
         }
@@ -356,6 +380,84 @@ fun Routing.allocationRoutes() {
         }
         call.response.headers.append(HttpHeaders.ContentDisposition, "attachment; filename=\"allocation_case_$caseId.csv\"")
         call.respondText(sb.toString(), ContentType.Text.CSV)
+    }
+
+    // ── GET /cases/{case_id}/allocation/versions ──────────────────────────────
+    get("/cases/{case_id}/allocation/versions") {
+        val caseId = requireCaseId(call)
+        val versions = CaseConfigVersioning.listVersions(caseId, KIND)
+        call.respond(buildJsonObject {
+            put("versions", JsonArray(versions.map { v ->
+                buildJsonObject {
+                    put("id", v.id); put("name", v.name); put("comments", v.comments)
+                    put("is_default", v.isDefault); put("referenced", v.referenced)
+                    put("created_at", v.createdAt); put("updated_at", v.updatedAt)
+                }
+            }))
+        })
+    }
+
+    // ── POST /cases/{case_id}/allocation/versions ("Save As") ─────────────────
+    // Body: { name?, comments?, rows: [{ supply_id, demand_id, qty_allocated }] }
+    post("/cases/{case_id}/allocation/versions") {
+        val caseId = requireCaseId(call)
+        val body = call.receiveText()
+        val payload = Json.parseToJsonElement(body).jsonObject
+        val name = payload["name"]?.jsonPrimitive?.contentOrNull
+        val comments = payload["comments"]?.jsonPrimitive?.contentOrNull
+        val rows = (payload["rows"]?.jsonArray ?: JsonArray(emptyList())).map { el ->
+            val obj = el.jsonObject
+            CaseAllocRow(
+                supplyId     = obj["supply_id"]?.jsonPrimitive?.content ?: throw IllegalArgumentException("Missing supply_id"),
+                demandId     = obj["demand_id"]?.takeIf { it !is JsonNull }?.jsonPrimitive?.content,
+                qtyAllocated = obj["qty_allocated"]?.jsonPrimitive?.double ?: throw IllegalArgumentException("Missing qty_allocated"),
+            )
+        }
+        val versionId = transaction {
+            val newId = CaseConfigVersioning.createVersion(caseId, KIND, name, comments)
+            if (rows.isNotEmpty()) {
+                CaseAllocations.batchInsert(rows) { row ->
+                    this[CaseAllocations.caseId]       = caseId
+                    this[CaseAllocations.versionId]    = newId
+                    this[CaseAllocations.supplyId]     = row.supplyId
+                    this[CaseAllocations.demandId]     = row.demandId
+                    this[CaseAllocations.qtyAllocated] = row.qtyAllocated
+                }
+            }
+            recomputeCaseAllocationHash(caseId, newId)
+            newId
+        }
+        call.respond(HttpStatusCode.Created, versionJson(caseId, versionId))
+    }
+
+    // ── PUT /cases/{case_id}/allocation/versions/{version_id} ─────────────────
+    // Body: { name?, comments?, is_default? } — rename/comment/set-default, always allowed.
+    put("/cases/{case_id}/allocation/versions/{version_id}") {
+        val caseId = requireCaseId(call)
+        val versionId = call.parameters["version_id"]?.toIntOrNull() ?: throw IllegalArgumentException("Invalid version_id")
+        val body = call.receiveText()
+        val payload = Json.parseToJsonElement(body).jsonObject
+        if (payload.containsKey("name") || payload.containsKey("comments")) {
+            CaseConfigVersioning.renameVersion(versionId, payload["name"]?.jsonPrimitive?.contentOrNull, payload["comments"]?.jsonPrimitive?.contentOrNull)
+        }
+        if (payload["is_default"]?.jsonPrimitive?.booleanOrNull == true) {
+            CaseConfigVersioning.setDefaultVersion(caseId, KIND, versionId)
+        }
+        call.respond(versionJson(caseId, versionId))
+    }
+
+    // ── DELETE /cases/{case_id}/allocation/versions/{version_id} ──────────────
+    delete("/cases/{case_id}/allocation/versions/{version_id}") {
+        val caseId = requireCaseId(call)
+        val versionId = call.parameters["version_id"]?.toIntOrNull() ?: throw IllegalArgumentException("Invalid version_id")
+        try {
+            CaseConfigVersioning.deleteVersion(caseId, KIND, versionId)
+            call.respond(HttpStatusCode.OK, buildJsonObject { put("deleted", true) })
+        } catch (e: CaseConfigVersioning.VersionInUseException) {
+            call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
+        } catch (e: CaseConfigVersioning.VersionIsDefaultException) {
+            call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_is_default") })
+        }
     }
 }
 

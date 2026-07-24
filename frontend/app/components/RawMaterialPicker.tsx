@@ -17,13 +17,19 @@ export function RawMaterialPicker({
   initialFilter,
   defaultCollapsed,
   tP,
+  readOnly = false,
 }: {
   options: PurchasableRawMaterial[];
   selected: string[];
-  onChange: (next: string[]) => void;
+  /** Required unless [readOnly] — a read-only render never calls this. */
+  onChange?: (next: string[]) => void;
   initialFilter?: string;
   defaultCollapsed?: boolean;
   tP: (k: string) => string;
+  /** Hides Select all/Clear/wildcard bulk actions and disables the checkboxes — the search
+   *  filter and collapse toggle stay live. Used by the version-preview popup so it can reuse
+   *  this exact picker instead of a separate simplified viewer. */
+  readOnly?: boolean;
 }) {
   const [collapsed, setCollapsed] = useState(defaultCollapsed ?? false);
   const [filter, setFilter] = useState(initialFilter ?? '');
@@ -46,13 +52,14 @@ export function RawMaterialPicker({
   const shown = f ? options.filter(matches) : options;
   const shownIds = shown.map((o) => o.product_id);
   const toggle = (id: string) => {
+    if (readOnly) return;
     const next = new Set(sel);
     if (next.has(id)) next.delete(id);
     else next.add(id);
-    onChange(Array.from(next));
+    onChange?.(Array.from(next));
   };
-  const selectIds = (ids: string[]) => { const next = new Set(sel); ids.forEach((i) => next.add(i)); onChange(Array.from(next)); };
-  const deselectIds = (ids: string[]) => { const next = new Set(sel); ids.forEach((i) => next.delete(i)); onChange(Array.from(next)); };
+  const selectIds = (ids: string[]) => { const next = new Set(sel); ids.forEach((i) => next.add(i)); onChange?.(Array.from(next)); };
+  const deselectIds = (ids: string[]) => { const next = new Set(sel); ids.forEach((i) => next.delete(i)); onChange?.(Array.from(next)); };
   const btnStyle: React.CSSProperties = { fontSize: '0.7rem', color: '#d4d4d8', background: '#27272a', border: '1px solid #3f3f46', borderRadius: 4, padding: '2px 7px', cursor: 'pointer' };
   return (
     <div style={{ marginTop: '0.4rem' }}>
@@ -92,33 +99,35 @@ export function RawMaterialPicker({
               `160-*` + Deselect matching removes just that series. The two are complementary:
               e.g. Select all, then filter 160-* → Deselect matching, filter 283-* → Deselect
               matching ⇒ everything except those series. */}
-          <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginBottom: 4 }}>
-            <button type="button" style={btnStyle} onClick={() => onChange(options.map((o) => o.product_id))}>
-              {tP('config.purchasableSelectAll')}
-            </button>
-            <button type="button" style={btnStyle} onClick={() => onChange([])}>
-              {tP('config.purchasableClear')}
-            </button>
-            {f && (
-              <>
-                <span style={{ color: '#52525b' }}>|</span>
-                <button type="button" style={btnStyle} onClick={() => selectIds(shownIds)}>
-                  {`${tP('config.purchasableSelectShown')} (${shown.length})`}
-                </button>
-                <button type="button" style={btnStyle} onClick={() => deselectIds(shownIds)}>
-                  {`${tP('config.purchasableDeselectShown')} (${shown.length})`}
-                </button>
-              </>
-            )}
-          </div>
+          {!readOnly && (
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginBottom: 4 }}>
+              <button type="button" style={btnStyle} onClick={() => onChange?.(options.map((o) => o.product_id))}>
+                {tP('config.purchasableSelectAll')}
+              </button>
+              <button type="button" style={btnStyle} onClick={() => onChange?.([])}>
+                {tP('config.purchasableClear')}
+              </button>
+              {f && (
+                <>
+                  <span style={{ color: '#52525b' }}>|</span>
+                  <button type="button" style={btnStyle} onClick={() => selectIds(shownIds)}>
+                    {`${tP('config.purchasableSelectShown')} (${shown.length})`}
+                  </button>
+                  <button type="button" style={btnStyle} onClick={() => deselectIds(shownIds)}>
+                    {`${tP('config.purchasableDeselectShown')} (${shown.length})`}
+                  </button>
+                </>
+              )}
+            </div>
+          )}
           <div style={{ maxHeight: 160, overflowY: 'auto', border: '1px solid #3f3f46', borderRadius: 4, padding: '2px 4px' }}>
             {shown.length === 0 && (
               <div style={{ fontSize: '0.75rem', color: '#71717a', padding: '4px' }}>{tP('config.purchasableNone')}</div>
             )}
             {shown.map((o) => (
               <label key={o.product_id}
-                style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0', cursor: 'pointer', fontSize: '0.78rem' }}>
-                <input type="checkbox" checked={sel.has(o.product_id)} onChange={() => toggle(o.product_id)} />
+                style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0', cursor: readOnly ? 'default' : 'pointer', fontSize: '0.78rem' }}>
+                <input type="checkbox" checked={sel.has(o.product_id)} disabled={readOnly} onChange={() => toggle(o.product_id)} />
                 <span style={{ fontFamily: 'monospace', color: '#e4e4e7' }}>{o.product_id}</span>
                 {o.description && <span style={{ color: '#a1a1aa' }}>— {o.description}</span>}
               </label>

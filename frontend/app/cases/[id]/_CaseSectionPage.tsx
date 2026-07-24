@@ -49,6 +49,12 @@ import {
   type PurchasableRawMaterial,
   getConstraintOptions,
   type ConstraintOptions,
+  type ConfigVersion,
+  listAllocationVersions,
+  listPreferencesVersions,
+  listDemandOrderingVersions,
+  listPurchasableMaterialsVersions,
+  listCaseConstraintsVersions,
   getWorkOrderPegging,
   type Case as CaseType,
   type AllocationRun as RunType,
@@ -93,7 +99,7 @@ import {
   type BootstrapPreset,
   type BootstrapPreview,
   type BootstrapJobStatus,
-  type BootstrapCriterion,
+  type SeedForm,
   getResourceUtilization,
   type ResourceUtilization,
   type DominatorRef,
@@ -334,7 +340,7 @@ export function PlanKpiDashboard({
 
 import { SortFilterTable } from '@/app/components/SortFilterTable';
 import { RawMaterialPicker } from '@/app/components/RawMaterialPicker';
-import { ConfigDetailView } from '@/app/components/ConfigDetailView';
+import { ConfigDetailView, ExternalConfigDrilldown, type ExternalKind } from '@/app/components/ConfigDetailView';
 import { AssessmentHistoryTable } from '@/app/components/AssessmentHistoryTable';
 
 /** Extract a human-readable message from an API error.
@@ -1094,6 +1100,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // Buyable raw materials for the selective-purchase whitelist dropdown + copilot /raw picker.
   const [purchasableOptions, setPurchasableOptions] = useState<PurchasableRawMaterial[]>([]);
   const [constraintOptions, setConstraintOptions] = useState<ConstraintOptions>({ customers: [], parents: [] });
+  // Versions of the 5 "external config objects" (see CaseConfigVersions' own doc), for the
+  // Planning page's compact version pickers — one row per kind, defaulting to whichever the
+  // case marks default.
+  const [externalConfigVersions, setExternalConfigVersions] = useState<{
+    casealloc: ConfigVersion[]; pref: ConfigVersion[]; ord: ConfigVersion[]; purchmat: ConfigVersion[]; constr: ConfigVersion[];
+  }>({ casealloc: [], pref: [], ord: [], purchmat: [], constr: [] });
+  // Read-only preview popup for the currently-selected version of one external config object —
+  // opened via the "Preview" link next to each picker's dropdown. Rendered as a movable/resizable
+  // floating window (not anchored to an edge like the other slide-in panels) so it can sit
+  // alongside the Planning page's own config form while the user compares them.
+  const [externalConfigPreview, setExternalConfigPreview] = useState<{ kind: ExternalKind; versionId?: number } | null>(null);
+  const [previewWindowRect, setPreviewWindowRect] = useState({ x: 260, y: 90, w: 640, h: 560 });
+  const previewDragRef = useRef<{ startX: number; startY: number; origX: number; origY: number } | null>(null);
+  const previewResizeRef = useRef<{ startX: number; startY: number; origW: number; origH: number } | null>(null);
+  const [previewDragging, setPreviewDragging] = useState(false);
+  const [previewResizing, setPreviewResizing] = useState(false);
   const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' }, purchase_allowed: false, purchasable_materials: [], constraints: [], analyze_criticality: false, check_soundness: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<PlanStatusResponse['progress'] | null>(null);
@@ -1148,7 +1170,32 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [bootstrapDialogOpen, setBootstrapDialogOpen] = useState(false);
   const [bootstrapPreview, setBootstrapPreview] = useState<BootstrapPreview | null>(null);
   const [bootstrapPreviewLoading, setBootstrapPreviewLoading] = useState(false);
-  const [bootstrapBatchSize, setBootstrapBatchSize] = useState(5);
+  // Seeding form — mirrors the Planning page's own manual-run knobs (see planningConfig), plus
+  // the max_methods RANGE (swept net-new, see SeedForm's own doc) and the same 5 external-config
+  // version pickers used on the Planning page.
+  const [bootstrapMaxMethodsMin, setBootstrapMaxMethodsMin] = useState(1);
+  const [bootstrapMaxMethodsMax, setBootstrapMaxMethodsMax] = useState(5);
+  const [bootstrapPurchaseAllowed, setBootstrapPurchaseAllowed] = useState(true);
+  const [bootstrapMakeBatchScale, setBootstrapMakeBatchScale] = useState<'none' | 'weekly' | 'biweekly' | 'monthly' | 'all'>('weekly');
+  const [bootstrapMoveBatchScale, setBootstrapMoveBatchScale] = useState<'none' | 'weekly' | 'biweekly' | 'monthly' | 'all'>('weekly');
+  const [bootstrapPurchaseBatchScale, setBootstrapPurchaseBatchScale] = useState<'none' | 'weekly' | 'biweekly' | 'monthly' | 'all'>('weekly');
+  const [bootstrapAnalyzeCriticality, setBootstrapAnalyzeCriticality] = useState(false);
+  const [bootstrapCheckSoundness, setBootstrapCheckSoundness] = useState(true);
+  const [bootstrapVersionPicks, setBootstrapVersionPicks] = useState<{
+    case_alloc_version_id?: number; pref_version_id?: number; demand_order_version_id?: number;
+    purchasable_material_version_id?: number; constraint_version_id?: number;
+  }>({});
+  const buildSeedForm = (): SeedForm => ({
+    max_methods_min: bootstrapMaxMethodsMin,
+    max_methods_max: bootstrapMaxMethodsMax,
+    purchase_allowed: bootstrapPurchaseAllowed,
+    make_batch_scale: bootstrapMakeBatchScale,
+    move_batch_scale: bootstrapMoveBatchScale,
+    purchase_batch_scale: bootstrapPurchaseBatchScale,
+    analyze_criticality: bootstrapAnalyzeCriticality,
+    check_soundness: bootstrapCheckSoundness,
+    ...bootstrapVersionPicks,
+  });
   const [bootstrapStarting, setBootstrapStarting] = useState(false);
   const [bootstrapJobId, setBootstrapJobId] = useState<string | null>(null);
   const [bootstrapJobStatus, setBootstrapJobStatus] = useState<BootstrapJobStatus | null>(null);
@@ -1158,22 +1205,18 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // when the dialog reopens or the user dismisses.
   const [bootstrapSkippedNotice, setBootstrapSkippedNotice] = useState<BootstrapPreset[] | null>(null);
   const bootstrapPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Pending auto-dismiss of the completed progress banner — tracked so a new
+  // batch (or unmount) can cancel it before it clears the fresh banner.
+  const bootstrapDismissRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Last completed-count seen by the poll — lets it refresh the KB table once per
+  // finished run (each run has already upserted its KB record by the time the
+  // job's completed counter moves) instead of only at batch end.
+  const bootstrapCompletedRef = useRef(0);
   const [bootstrapExpandedPresets, setBootstrapExpandedPresets] = useState<Set<string>>(new Set());
   // KB-inspector sort state. `key` matches a BootstrapPreset KPI field name;
   // null = no sort (preserve backend / library order).
   const [bootstrapKbSort, setBootstrapKbSort] = useState<{ key: string; dir: 'asc' | 'desc' } | null>(null);
   const [bootstrapKbSoundOnly, setBootstrapKbSoundOnly] = useState(false);
-  // Which "best run" criterion drives the suggestion seed. Default fill_rate;
-  // user can switch to fairness (lowest gini) or pareto (balanced score).
-  const [bootstrapCriterion, setBootstrapCriterion] = useState<BootstrapCriterion>('fill_rate');
-  // Per-row config overrides. The backend suggests N single-knob variations
-  // around the best KB run; users can alter any row's config via the
-  // planning-page-style mini-form (max_methods dropdown, mode toggle, etc.)
-  // before submitting. Empty = use system suggestion as-is. Edits get
-  // re-dedup'd against KB on save.
-  const [bootstrapEditedConfigs, setBootstrapEditedConfigs] = useState<Record<string, Record<string, unknown>>>({});
-  // Set of preset_ids whose row is expanded to show the edit form.
-  const [bootstrapEditingRows, setBootstrapEditingRows] = useState<Set<string>>(new Set());
   const toggleBootstrapPresetExpanded = (presetId: string) => {
     setBootstrapExpandedPresets((prev) => {
       const next = new Set(prev);
@@ -1194,68 +1237,24 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     const cs = (config.consolidation ?? {}) as Record<string, unknown>;
     const parts: string[] = [];
     parts.push(`max=${ms.max_methods ?? 2}`);
-    parts.push(`d=${ms.depth ?? 1}`);
-    parts.push(`wo_batch=${cs.enabled === false ? 'off' : 'on'}`);
     const globalFb = (cs.wo_batch_scale as string) ?? 'weekly';
     const mScale  = ((cs as Record<string, unknown>).make_batch_scale as string) ?? globalFb;
     const mvScale = ((cs as Record<string, unknown>).move_batch_scale as string) ?? globalFb;
     const pScale  = ((cs as Record<string, unknown>).purchase_batch_scale as string) ?? globalFb;
+    // No wo_batch on/off part: batching state is already fully described by the three
+    // batch scales (all "none" = off) — a separate flag was pure noise.
     parts.push(`batch=${mScale}/${mvScale}/${pScale}`);
     parts.push(`purch=${config.purchase_allowed === true ? 'on' : 'off'}`);
     return parts.join(' · ');
   };
-  /** Canonical baseline config (mirrors the Kotlin cfg() defaults). */
-  const makeBaselineConfig = (): Record<string, unknown> => ({
-    method_selection: {
-      mode: 'preference',
-      depth: 1,
-      multiple: false,
-      max_methods: 1,
-    },
-    consolidation: {
-      enabled: true,
-      period_days: 7,
-      make_batch_scale: 'weekly',
-      move_batch_scale: 'weekly',
-      purchase_batch_scale: 'weekly',
-    },
-    variant_selection: { multiple: true },
-    purchase_allowed: false,
-    analyze_criticality: false,
-    check_soundness: true,
-  });
-  /** Build a full PlanningConfig from baseline + a single axis-value override.
-   *  Mirrors the Kotlin buildConfigForAxisValue. The axis names must match
-   *  the backend's AXIS_CATALOG entries. */
-  const buildConfigFromAxisValue = (axisName: string, value: unknown): Record<string, unknown> => {
-    const cfg = makeBaselineConfig();
-    const ms = cfg.method_selection as Record<string, unknown>;
-    const cs = cfg.consolidation as Record<string, unknown>;
-    switch (axisName) {
-      case 'max_methods':         ms.max_methods = value; break;
-      case 'depth':               ms.depth = value; break;
-      case 'scope':               cs.scope = value; break;
-      case 'consolidation_enabled': cs.enabled = value; break;
-      case 'period_days': {
-        cs.period_days = value;
-        const snapped = value === 0 ? 'all' : value === 7 ? 'weekly' : value === 14 ? 'biweekly' : 'monthly';
-        (cs as Record<string, unknown>).make_batch_scale = snapped;
-        (cs as Record<string, unknown>).move_batch_scale = snapped;
-        (cs as Record<string, unknown>).purchase_batch_scale = snapped;
-        break;
-      }
-      case 'purchase_allowed':    cfg.purchase_allowed = value; break;
-    }
-    return cfg;
-  };
   const handleDeleteKbRecord = async (recordId: number) => {
     if (!id) return;
+    if (!window.confirm(tP('bootstrap.confirmDeleteKbRecord'))) return;
     try {
       await deleteKbRecord(id, recordId);
       // Refresh preview so the deleted KB row drops out of "already covered".
       // The underlying plan_run (if any) is untouched — KB is dissociated.
-      const preview = await getBootstrapPreview(id, bootstrapBatchSize, bootstrapCriterion);
-      setBootstrapPreview(preview);
+      await refreshBootstrapPreview();
     } catch (e) {
       console.error('Failed to delete KB record', e);
     }
@@ -1696,6 +1695,24 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     getConstraintOptions(id)
       .then((res) => { if (!cancelled) setConstraintOptions({ customers: res.customers ?? [], parents: res.parents ?? [] }); })
       .catch(() => { if (!cancelled) setConstraintOptions({ customers: [], parents: [] }); });
+    return () => { cancelled = true; };
+  }, [id]);
+
+  // Load the version list for each of the 5 external config objects, so the Planning page can
+  // offer an explicit version picker per object (defaulting to the case's default version when
+  // the user doesn't pick one — see resolveEffectiveConfig's own doc).
+  useEffect(() => {
+    if (!id) return;
+    let cancelled = false;
+    Promise.all([
+      listAllocationVersions(id).catch(() => []),
+      listPreferencesVersions(id).catch(() => []),
+      listDemandOrderingVersions(id).catch(() => []),
+      listPurchasableMaterialsVersions(id).catch(() => []),
+      listCaseConstraintsVersions(id).catch(() => []),
+    ]).then(([casealloc, pref, ord, purchmat, constr]) => {
+      if (!cancelled) setExternalConfigVersions({ casealloc, pref, ord, purchmat, constr });
+    });
     return () => { cancelled = true; };
   }, [id]);
 
@@ -2344,6 +2361,37 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     window.addEventListener('mouseup', onUp);
     return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
   }, [woExplainResizing]);
+
+  // External-config preview window: drag-to-move (title bar) + drag-to-resize (corner handle).
+  useEffect(() => {
+    if (!previewDragging) return;
+    const onMove = (e: MouseEvent) => {
+      const r = previewDragRef.current;
+      if (!r) return;
+      setPreviewWindowRect((prev) => ({ ...prev, x: r.origX + (e.clientX - r.startX), y: r.origY + (e.clientY - r.startY) }));
+    };
+    const onUp = () => { previewDragRef.current = null; setPreviewDragging(false); window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+  }, [previewDragging]);
+
+  useEffect(() => {
+    if (!previewResizing) return;
+    const onMove = (e: MouseEvent) => {
+      const r = previewResizeRef.current;
+      if (!r) return;
+      setPreviewWindowRect((prev) => ({
+        ...prev,
+        w: Math.max(360, r.origW + (e.clientX - r.startX)),
+        h: Math.max(260, r.origH + (e.clientY - r.startY)),
+      }));
+    };
+    const onUp = () => { previewResizeRef.current = null; setPreviewResizing(false); window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+  }, [previewResizing]);
 
   useEffect(() => {
     if (!supExplainResizing) return;
@@ -3495,62 +3543,65 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     }
   };
 
-  // ── Bootstrap handlers ──────────────────────────────────────────────────
-  const openBootstrapDialog = async () => {
+  // ── Bootstrap (KB seeding) handlers ──────────────────────────────────────
+  // Form edits (range, purchase allowed, WO batch, external config picks, ...) do NOT
+  // auto-refetch the next_batch — the user clicks "Generate next batch" explicitly once the
+  // form reflects what they want to sweep. This also avoids a network round-trip on every
+  // keystroke while adjusting the range.
+  //
+  // refreshBootstrapPreview is the single fetch path for every caller (initial dialog-open
+  // effect, the explicit Generate button, the post-delete refresh, and the post-run refresh) —
+  // a generation counter (not a per-call `cancelled` closure) makes it safe to call from
+  // multiple places without any of them stepping on a fresher in-flight call: only the reply
+  // matching the CURRENT generation is applied. Also gates bootstrapPreviewLoading so Start
+  // stays disabled until the displayed next_batch is guaranteed to match the last fetch.
+  const bootstrapPreviewGenRef = useRef(0);
+  const refreshBootstrapPreview = async () => {
     if (!id) return;
-    setBootstrapDialogOpen(true);
+    const gen = ++bootstrapPreviewGenRef.current;
     setBootstrapPreviewLoading(true);
-    setBootstrapSkippedNotice(null);
     try {
-      const preview = await getBootstrapPreview(id, bootstrapBatchSize, bootstrapCriterion);
-      setBootstrapPreview(preview);
-    } catch {
-      setBootstrapPreview(null);
-    } finally {
-      setBootstrapPreviewLoading(false);
-    }
+      const preview = await getBootstrapPreview(id, buildSeedForm());
+      if (gen === bootstrapPreviewGenRef.current) setBootstrapPreview(preview);
+    } catch { /* keep prior preview */ }
+    finally { if (gen === bootstrapPreviewGenRef.current) setBootstrapPreviewLoading(false); }
   };
 
-  // Re-fetch the preview whenever batch size changes while the dialog is open
-  // — the next-batch list shifts as the user dials the size up/down.
+  const openBootstrapDialog = () => {
+    if (!id) return;
+    setBootstrapDialogOpen(true);
+    setBootstrapSkippedNotice(null);
+  };
+
+  // Fetch once when the dialog opens, so it isn't empty — subsequent form edits wait for the
+  // explicit "Generate next batch" button instead of refetching automatically.
   useEffect(() => {
     if (!bootstrapDialogOpen || !id) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const preview = await getBootstrapPreview(id, bootstrapBatchSize, bootstrapCriterion);
-        if (!cancelled) setBootstrapPreview(preview);
-      } catch { /* keep prior preview */ }
-    })();
-    return () => { cancelled = true; };
-  }, [bootstrapBatchSize, bootstrapCriterion, bootstrapDialogOpen, id]);
+    refreshBootstrapPreview();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bootstrapDialogOpen, id]);
 
   const handleStartBootstrap = async () => {
-    if (!id) return;
+    if (!id || !bootstrapPreview) return;
     setBootstrapStarting(true);
     try {
-      // Build presets[] from the dialog's next_batch suggestions, applying
-      // any per-row edits the user has made. When no edits exist, omit the
-      // override so the backend re-runs selectNextBatch fresh.
-      const hasEdits = Object.keys(bootstrapEditedConfigs).length > 0;
-      const customPresets = hasEdits && bootstrapPreview
-        ? bootstrapPreview.next_batch.map((p) => ({
-            preset_id: p.preset_id,
-            preset_label: p.preset_label,
-            primary_axis: p.primary_axis,
-            config: bootstrapEditedConfigs[p.preset_id] ?? p.config,
-          }))
-        : undefined;
-      const r = await startBootstrap(id, bootstrapBatchSize, customPresets);
+      // Submit exactly what the preview showed — the server never recomputes its own batch at
+      // submit time (see startBootstrap's own doc).
+      const presets = bootstrapPreview.next_batch.map((p) => ({
+        preset_id: p.preset_id,
+        preset_label: p.preset_label,
+        primary_axis: p.primary_axis,
+        config: p.config,
+      }));
+      const r = await startBootstrap(id, presets);
       if ('status' in r) {
-        // Either library_exhausted or all submitted presets matched existing
-        // KB entries. Refresh the preview so the dialog shows the appropriate
-        // message; surface the skipped list if present.
+        // next_batch is already pre-filtered to net-new configs, so this should be rare — only
+        // a race (another manual/agent run created a matching KB entry between preview and
+        // submit). Surface the skipped list and refresh the preview to a now-accurate net-new list.
         if (r.status === 'all_already_covered' && r.skipped.length > 0) {
           setBootstrapSkippedNotice(r.skipped);
         }
-        const preview = await getBootstrapPreview(id, bootstrapBatchSize, bootstrapCriterion);
-        setBootstrapPreview(preview);
+        refreshBootstrapPreview();
         return;
       }
       // Partial dedup: some submitted presets ran, some were skipped. Show
@@ -3570,10 +3621,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         plan_run_ids: [],
         errors: [],
       });
-      // Edits have been submitted — clear local override state so the next
-      // dialog open shows fresh system suggestions.
-      setBootstrapEditedConfigs({});
-      setBootstrapEditingRows(new Set());
     } catch (e) {
       console.error('Bootstrap start failed', e);
     } finally {
@@ -3600,22 +3647,41 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       try {
         const status = await getBootstrapJobStatus(id, bootstrapJobId);
         setBootstrapJobStatus(status);
+        // Incremental table rows: refresh the KB preview each time another run
+        // finishes mid-batch, so its row appears as soon as it's ready.
+        if (status.status === 'running' && status.completed > bootstrapCompletedRef.current) {
+          refreshBootstrapPreview();
+        }
+        bootstrapCompletedRef.current = status.completed;
         if (status.status === 'completed' || status.status === 'cancelled') {
           if (bootstrapPollRef.current) { clearInterval(bootstrapPollRef.current); bootstrapPollRef.current = null; }
           setBootstrapCancelling(false);
           // Refresh the preview + run history now that new runs exist (some
           // presets may have completed even on a cancelled run).
-          getBootstrapPreview(id, bootstrapBatchSize, bootstrapCriterion).then(setBootstrapPreview).catch(() => {});
+          refreshBootstrapPreview();
           loadPlanRunHistory();
+          // Clean completion: linger briefly, then drop the banner — the refreshed
+          // KB table already shows the outcome. Cancelled/errored jobs keep their
+          // banner up so the interruption/error detail isn't silently lost.
+          if (status.status === 'completed' && status.errors.length === 0 && !bootstrapDismissRef.current) {
+            bootstrapDismissRef.current = setTimeout(() => {
+              bootstrapDismissRef.current = null;
+              setBootstrapJobStatus(null);
+            }, 4000);
+          }
         }
       } catch { /* keep polling on transient errors */ }
     };
+    if (bootstrapDismissRef.current) { clearTimeout(bootstrapDismissRef.current); bootstrapDismissRef.current = null; }
+    bootstrapCompletedRef.current = 0;
     tick();
     bootstrapPollRef.current = setInterval(tick, 3000);
     return () => {
       if (bootstrapPollRef.current) { clearInterval(bootstrapPollRef.current); bootstrapPollRef.current = null; }
+      if (bootstrapDismissRef.current) { clearTimeout(bootstrapDismissRef.current); bootstrapDismissRef.current = null; }
     };
-  }, [bootstrapJobId, id, bootstrapBatchSize]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bootstrapJobId, id]);
 
   const closeBootstrapDialog = () => {
     setBootstrapDialogOpen(false);
@@ -4454,6 +4520,57 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               {/* Purchasable Materials whitelist and Constraints are fully promoted out to their
                   own sidebar pages (PurchasableMaterials.kt / Constraints.kt) — no summary/link
                   here anymore; this section only shows the planner's own inline toggle. */}
+            </div>
+          </fieldset>
+
+          {/* ── External config object version pickers — explicit pick, else the case's default
+              (see resolveEffectiveConfig's own doc). Each object's own data lives on its
+              dedicated page; this is just "which version does THIS run use." ── */}
+          <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
+            <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              {tP('config.groupExternalVersions')}
+            </legend>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+              {([
+                { kind: 'casealloc', externalKind: 'allocation', label: tP('config.externalAllocation'), configKey: 'case_alloc_version_id' },
+                { kind: 'pref', externalKind: 'preferences', label: tP('config.externalPreferences'), configKey: 'pref_version_id' },
+                { kind: 'ord', externalKind: 'demandOrdering', label: tP('config.externalDemandOrdering'), configKey: 'demand_order_version_id' },
+                { kind: 'purchmat', externalKind: 'purchasableMaterials', label: tP('config.externalPurchasableMaterials'), configKey: 'purchasable_material_version_id' },
+                { kind: 'constr', externalKind: 'constraints', label: tP('config.externalConstraints'), configKey: 'constraint_version_id' },
+              ] as const).map(({ kind, externalKind, label, configKey }) => {
+                const versions = externalConfigVersions[kind];
+                const selectedId: number | undefined = planningConfig[configKey] ?? versions.find((v) => v.is_default)?.id;
+                return (
+                  <div key={kind} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.82rem' }}>
+                    <span style={{ color: '#a1a1aa', minWidth: 170 }}>{label}</span>
+                    <select
+                      value={selectedId ?? ''}
+                      disabled={versions.length === 0}
+                      onChange={(e) => {
+                        const v = e.target.value ? Number(e.target.value) : undefined;
+                        setPlanningConfig((c) => ({ ...c, [configKey]: v }));
+                      }}
+                      style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem' }}
+                    >
+                      {versions.length === 0 && <option value="">{tP('config.externalDefault')}</option>}
+                      {versions.map((v) => (
+                        <option key={v.id} value={v.id}>
+                          {v.name || tP('config.externalVersionLabel', { id: v.id })}{v.is_default ? ` (${tP('config.externalDefault')})` : ''}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      disabled={selectedId == null}
+                      onClick={() => setExternalConfigPreview({ kind: externalKind, versionId: selectedId })}
+                      title={tP('config.externalPreviewTooltip')}
+                      style={{ background: 'none', border: 'none', color: '#93c5fd', cursor: selectedId == null ? 'default' : 'pointer', fontSize: '0.76rem', padding: 0, opacity: selectedId == null ? 0.4 : 1 }}
+                    >
+                      {tP('config.externalPreview')}
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           </fieldset>
 
@@ -7311,88 +7428,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               {tP('bootstrap.intro')}
             </p>
 
-            {/* Progress block (visible while a bootstrap job is running) */}
-            {bootstrapJobStatus && (() => {
-              const total = bootstrapJobStatus.total;
-              const completed = bootstrapJobStatus.completed;
-              const pct = total > 0 ? (completed / total) * 100 : 0;
-              const isCancelled = bootstrapJobStatus.status === 'cancelled';
-              const isCompleted = bootstrapJobStatus.status === 'completed';
-              const isCancelInFlight = bootstrapJobStatus.cancelled === true && !isCancelled && !isCompleted;
-              const accentBg = isCancelled ? '#3a1f0c' : '#0c1f3a';
-              const accentBorder = isCancelled ? '#b45309' : '#1d4ed8';
-              const accentText = isCancelled ? '#fdba74' : '#93c5fd';
-              const barFill = isCancelled ? '#b45309' : isCancelInFlight ? '#fbbf24' : '#3b82f6';
-              const barTrack = isCancelled ? '#451a03' : '#1e3a8a';
-              return (
-                <div style={{ marginBottom: '0.75rem', padding: '0.6rem 0.75rem', background: accentBg, border: `1px solid ${accentBorder}`, borderRadius: 6 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.35rem' }}>
-                    <div style={{ fontWeight: 600, color: accentText, fontSize: '0.85rem' }}>
-                      {isCancelled
-                        ? tP('bootstrap.progressCancelled')
-                        : isCompleted
-                          ? tP('bootstrap.progressTitleDone')
-                          : tP('bootstrap.progressTitle')}
-                    </div>
-                    {!isCompleted && !isCancelled && (
-                      <button
-                        type="button"
-                        onClick={handleCancelBootstrap}
-                        disabled={bootstrapCancelling || isCancelInFlight}
-                        title={tP('bootstrap.interruptTooltip')}
-                        style={{
-                          fontSize: '0.72rem', padding: '2px 10px',
-                          background: isCancelInFlight ? '#27272a' : 'transparent',
-                          color: isCancelInFlight ? '#71717a' : '#fbbf24',
-                          border: '1px solid #b45309', borderRadius: 4,
-                          cursor: bootstrapCancelling || isCancelInFlight ? 'default' : 'pointer',
-                          opacity: bootstrapCancelling || isCancelInFlight ? 0.7 : 1,
-                        }}
-                      >
-                        {isCancelInFlight ? tP('bootstrap.interruptInflight') : tP('bootstrap.interrupt')}
-                      </button>
-                    )}
-                  </div>
-                  <div style={{ fontSize: '0.82rem', color: '#e4e4e7', marginBottom: '0.5rem' }}>
-                    {isCancelled
-                      ? tP('bootstrap.progressCancelledLine', { completed, total })
-                      : isCompleted
-                        ? tP('bootstrap.progressDone', { completed })
-                        : tP('bootstrap.progressLine', {
-                            completed,
-                            total,
-                            current: bootstrapJobStatus.current_preset_label,
-                          })}
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <div style={{ flex: 1, height: 12, background: barTrack, borderRadius: 6, overflow: 'hidden' }}>
-                      <div style={{
-                        height: '100%', background: barFill,
-                        width: `${pct}%`,
-                        transition: 'width 0.3s',
-                      }} />
-                    </div>
-                    <span style={{ fontSize: '0.78rem', color: '#a1a1aa', minWidth: 56, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
-                      {`${completed}/${total} (${pct.toFixed(0)}%)`}
-                    </span>
-                  </div>
-                  {isCancelInFlight && (
-                    <div style={{ marginTop: '0.4rem', fontSize: '0.72rem', color: '#fbbf24' }}>
-                      {tP('bootstrap.interruptHint')}
-                    </div>
-                  )}
-                  {bootstrapJobStatus.errors.length > 0 && (
-                    <div style={{ marginTop: '0.4rem', fontSize: '0.75rem', color: '#f87171' }}>
-                      <div style={{ fontWeight: 600 }}>{tP('bootstrap.progressErrors', { n: bootstrapJobStatus.errors.length })}</div>
-                      <ul style={{ margin: '0.2rem 0 0 1rem', padding: 0 }}>
-                        {bootstrapJobStatus.errors.map((e, i) => (<li key={i}>{e}</li>))}
-                      </ul>
-                    </div>
-                  )}
-                </div>
-              );
-            })()}
-
             {/* Skipped-dup notice — server-side dedup at start time dropped
                 some submitted presets because their config signature matched
                 an existing KB record. */}
@@ -7417,202 +7452,205 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               </div>
             )}
 
-            {/* Coverage + library-exhausted state */}
+            {/* KB coverage */}
             {bootstrapPreview && (
               <p style={{ fontSize: '0.82rem', color: '#a1a1aa', margin: '0 0 0.75rem' }}>
-                {bootstrapPreview.remaining_count === 0
-                  ? tP('bootstrap.exhausted', { total: bootstrapPreview.library_size })
-                  : tP('bootstrap.coverage', {
-                      kbCount: bootstrapPreview.kb_record_count ?? 0,
-                      covered: bootstrapPreview.already_run_count,
-                      total: bootstrapPreview.library_size,
-                    })}
+                {tP('bootstrap.coverage', { kbCount: bootstrapPreview.kb_record_count ?? 0 })}
               </p>
             )}
 
-            {/* Batch size + Start. Always rendered — even when the library is
-                fully in KB, the user can edit a preset to define a new variation. */}
+            {/* Seeding form — a direct copy of the Planning page's own "Configurations" +
+                "Post-Plan Handling" fieldsets (same config.* translations, same structure/
+                style), with exactly two differences: this first fieldset's legend reads
+                "Seed Config" instead of "Configurations", and its max-methods control is a
+                RANGE (two inputs) instead of Planning's single integer — everything else
+                (labels, subheadings, WO batch selects, checkboxes) is identical. */}
             {bootstrapPreview && (
               <>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
-                  <label style={{ fontSize: '0.82rem', color: '#e4e4e7' }}>
-                    {tP('bootstrap.batchSizeLabel')}:
-                    <input
-                      type="number" min={1} value={bootstrapBatchSize}
-                      onChange={(e) => setBootstrapBatchSize(Math.max(1, Number(e.target.value) || 5))}
-                      style={{
-                        marginLeft: '0.5rem', width: 60, padding: '3px 6px',
-                        background: '#27272a', color: '#e4e4e7',
-                        border: '1px solid #52525b', borderRadius: 4, fontSize: '0.82rem',
-                      }}
-                    />
-                  </label>
-                  <label style={{ fontSize: '0.82rem', color: '#e4e4e7' }} title={tP('bootstrap.criterionTooltip')}>
-                    {tP('bootstrap.criterionLabel')}:
-                    <select
-                      value={bootstrapCriterion}
-                      onChange={(e) => setBootstrapCriterion(e.target.value as BootstrapCriterion)}
-                      style={{
-                        marginLeft: '0.5rem', padding: '3px 6px',
-                        background: '#27272a', color: '#e4e4e7',
-                        border: '1px solid #52525b', borderRadius: 4, fontSize: '0.82rem',
-                      }}
-                    >
-                      <option value="fill_rate">{tP('bootstrap.criterionFillRate')}</option>
-                      <option value="fairness">{tP('bootstrap.criterionFairness')}</option>
-                      <option value="pareto">{tP('bootstrap.criterionPareto')}</option>
-                    </select>
-                  </label>
-                  <span style={{ fontSize: '0.75rem', color: '#71717a' }}>{tP('bootstrap.batchSizeHint')}</span>
-                </div>
-
-                <details style={{ marginBottom: '0.5rem', fontSize: '0.75rem', color: '#71717a' }}>
-                  <summary style={{ cursor: 'pointer' }}>
-                    {tP('bootstrap.baselineHeading')}
-                  </summary>
-                  <div style={{ marginTop: '0.25rem', padding: '4px 8px', background: '#0a0a0a', borderRadius: 4, fontFamily: 'monospace', fontSize: '0.7rem', color: '#a1a1aa' }}>
-                    {tP('bootstrap.baselineSummary')}
+                <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.65rem', margin: '0 0 0.55rem' }}>
+                  <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                    {tP('bootstrap.seedFormHeading')}
+                  </legend>
+                  {/* ── Method ── */}
+                  <div style={{ fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.3rem' }}>
+                    {tP('config.subheadMethod')}
                   </div>
-                </details>
-                <div style={{ marginBottom: '0.5rem', fontSize: '0.82rem', color: '#a1a1aa', fontWeight: 600 }}>
-                  {tP('bootstrap.nextBatchHeading')}
-                </div>
-                {/* Preset list: server suggests N single-knob variations
-                    around the case's current best (or BASELINE on cold-start).
-                    Each row is collapsed by default; expanding shows a
-                    planning-page-style mini config form so users can alter
-                    knobs before submitting. Edits get re-dedup'd at submit. */}
-                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.78rem', marginBottom: '0.75rem' }}>
-                  <tbody>
-                    {bootstrapPreview.next_batch.map((p) => {
-                      const editing = bootstrapEditingRows.has(p.preset_id);
-                      const editedConfig = bootstrapEditedConfigs[p.preset_id];
-                      const effectiveConfig = (editedConfig ?? p.config) as Record<string, unknown>;
-                      const isEdited = editedConfig != null;
-                      const summary = presetConfigSummary(effectiveConfig);
-                      const ms = (effectiveConfig.method_selection ?? {}) as Record<string, unknown>;
-                      const cs = (effectiveConfig.consolidation ?? {}) as Record<string, unknown>;
-                      const updateConfig = (mutator: (cfg: Record<string, unknown>) => void) => {
-                        const next = JSON.parse(JSON.stringify(effectiveConfig)) as Record<string, unknown>;
-                        mutator(next);
-                        setBootstrapEditedConfigs((prev) => ({ ...prev, [p.preset_id]: next }));
-                      };
-                      const resetConfig = () => {
-                        setBootstrapEditedConfigs((prev) => { const n = { ...prev }; delete n[p.preset_id]; return n; });
-                      };
-                      const toggleEditing = () => {
-                        setBootstrapEditingRows((prev) => {
-                          const n = new Set(prev);
-                          if (n.has(p.preset_id)) n.delete(p.preset_id); else n.add(p.preset_id);
-                          return n;
-                        });
-                      };
-                      const inputStyle: React.CSSProperties = {
-                        padding: '2px 6px', background: '#27272a', color: '#e4e4e7',
-                        border: '1px solid #3d3d40', borderRadius: 4, fontSize: '0.78rem',
-                      };
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+                    <label
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', cursor: 'pointer' }}
+                      title={tP('bootstrap.maxMethodsRangeTooltip')}
+                    >
+                      <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.maxMethodsRangeLabel')}</span>
+                      <input
+                        type="number" min={1} value={bootstrapMaxMethodsMin}
+                        onChange={(e) => setBootstrapMaxMethodsMin(Math.max(1, parseInt(e.target.value, 10) || 1))}
+                        style={{ width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+                      />
+                      <span style={{ color: '#71717a' }}>–</span>
+                      <input
+                        type="number" min={1} value={bootstrapMaxMethodsMax}
+                        onChange={(e) => setBootstrapMaxMethodsMax(Math.max(1, parseInt(e.target.value, 10) || 1))}
+                        style={{ width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+                      />
+                    </label>
+                  </div>
+
+                  {/* ── Purchase ── */}
+                  <div style={{ marginTop: '0.65rem', borderTop: '1px solid #27272a', paddingTop: '0.4rem' }}>
+                    <div style={{ fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.3rem' }}>
+                      {tP('config.subheadPurchase')}
+                    </div>
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={bootstrapPurchaseAllowed}
+                        onChange={(e) => setBootstrapPurchaseAllowed(e.target.checked)}
+                      />
+                      <span style={{ fontSize: '0.875rem' }}>{tP('config.purchaseAllowed')}</span>
+                    </label>
+                  </div>
+                </fieldset>
+
+                {/* External config object version pickers — same pattern as the Planning page's
+                    own fieldset (see its own comment). One fixed pick for the whole batch. */}
+                <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
+                  <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                    {tP('config.groupExternalVersions')}
+                  </legend>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+                    {([
+                      { kind: 'casealloc', externalKind: 'allocation', label: tP('config.externalAllocation'), configKey: 'case_alloc_version_id' },
+                      { kind: 'pref', externalKind: 'preferences', label: tP('config.externalPreferences'), configKey: 'pref_version_id' },
+                      { kind: 'ord', externalKind: 'demandOrdering', label: tP('config.externalDemandOrdering'), configKey: 'demand_order_version_id' },
+                      { kind: 'purchmat', externalKind: 'purchasableMaterials', label: tP('config.externalPurchasableMaterials'), configKey: 'purchasable_material_version_id' },
+                      { kind: 'constr', externalKind: 'constraints', label: tP('config.externalConstraints'), configKey: 'constraint_version_id' },
+                    ] as const).map(({ kind, externalKind, label, configKey }) => {
+                      const versions = externalConfigVersions[kind];
+                      const selectedId: number | undefined = bootstrapVersionPicks[configKey] ?? versions.find((v) => v.is_default)?.id;
                       return (
-                        <React.Fragment key={p.preset_id}>
-                          <tr style={{ borderBottom: editing ? 'none' : '1px solid #27272a', background: isEdited ? 'rgba(251,146,60,0.06)' : undefined }}>
-                            <td style={{ padding: '4px 6px', width: 18, cursor: 'pointer', color: '#71717a', verticalAlign: 'top' }}
-                                onClick={toggleEditing}>
-                              {editing ? '▾' : '▸'}
-                            </td>
-                            <td style={{ padding: '4px 6px', fontFamily: 'monospace', color: '#67e8f9', cursor: 'pointer', verticalAlign: 'top', whiteSpace: 'nowrap' }}
-                                onClick={toggleEditing}>
-                              {p.preset_label}
-                              {isEdited && (
-                                <span title={tP('bootstrap.editedTooltip')} style={{ marginLeft: 5, fontSize: '0.62rem', background: '#7c2d12', color: '#fed7aa', borderRadius: 4, padding: '0px 5px' }}>
-                                  {tP('bootstrap.editedBadge')}
-                                </span>
-                              )}
-                            </td>
-                            <td style={{ padding: '4px 6px', verticalAlign: 'top', whiteSpace: 'nowrap' }}>
-                              <span style={{ fontSize: '0.7rem', background: '#3f3f46', borderRadius: 4, padding: '1px 6px', color: '#a1a1aa' }}>{p.primary_axis}</span>
-                            </td>
-                            <td style={{ padding: '4px 6px', fontFamily: 'monospace', fontSize: '0.7rem', color: '#a1a1aa', verticalAlign: 'top' }}>
-                              {summary}
-                            </td>
-                          </tr>
-                          {editing && (
-                            <tr style={{ borderBottom: '1px solid #27272a', background: '#0a0a0a' }}>
-                              <td colSpan={4} style={{ padding: '8px 12px 12px 28px' }}>
-                                {/* Method selection (supply side) */}
-                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'center', fontSize: '0.78rem', marginBottom: 6 }}>
-                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editMaxMethods')}</span>
-                                    <select value={Number(ms.max_methods ?? 1)}
-                                      onChange={(e) => updateConfig((c) => {
-                                        const m = (c.method_selection ?? {}) as Record<string, unknown>;
-                                        m.max_methods = parseInt(e.target.value, 10) || 1;
-                                        c.method_selection = m;
-                                      })}
-                                      style={inputStyle}>
-                                      {[1,2,3,4,5,6,7,8].map((n) => (<option key={n} value={n}>{n}</option>))}
-                                    </select>
-                                  </label>
-                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editDepth')}</span>
-                                    <input type="number" min={1} max={10}
-                                      value={Number(ms.depth ?? 1)}
-                                      onChange={(e) => updateConfig((c) => {
-                                        const m = (c.method_selection ?? {}) as Record<string, unknown>;
-                                        m.depth = Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 1));
-                                        c.method_selection = m;
-                                      })}
-                                      style={{ ...inputStyle, width: 56 }} />
-                                  </label>
-                                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                                    <input type="checkbox" checked={effectiveConfig.purchase_allowed === true}
-                                      onChange={(e) => updateConfig((c) => { c.purchase_allowed = e.target.checked; })} />
-                                    <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.editPurchase')}</span>
-                                  </label>
-                                </div>
-                                {/* Consolidation (WO batch window per type) */}
-                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'center', fontSize: '0.78rem', marginBottom: 6 }}>
-                                  {(['make', 'move', 'purchase'] as const).map((type) => {
-                                    const configKey = `${type}_batch_scale`;
-                                    const labelKey = `woBatch${type.charAt(0).toUpperCase() + type.slice(1)}` as 'woBatchMake' | 'woBatchMove' | 'woBatchPurchase';
-                                    const globalFb = (cs.wo_batch_scale as string) ?? 'weekly';
-                                    const val = ((cs as Record<string, unknown>)[configKey] as string) ?? globalFb;
-                                    return (
-                                      <label key={type} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                                        <span style={{ color: '#a1a1aa' }}>{tP(`config.${labelKey}`)}</span>
-                                        <select
-                                          value={val}
-                                          onChange={(e) => updateConfig((c) => {
-                                            const v = e.target.value as 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
-                                            const days = v === 'weekly' ? 7 : v === 'biweekly' ? 14 : v === 'monthly' ? 30 : 0;
-                                            const con = (c.consolidation ?? {}) as Record<string, unknown>;
-                                            con[configKey] = v;
-                                            con.period_days = days;
-                                            c.consolidation = con;
-                                          })}
-                                          style={{ ...inputStyle }}>
-                                          <option value="none">{tP('config.woBatchNone')}</option>
-                                          <option value="weekly">{tP('config.woBatchWeekly')}</option>
-                                          <option value="biweekly">{tP('config.woBatchBiweekly')}</option>
-                                          <option value="monthly">{tP('config.woBatchMonthly')}</option>
-                                          <option value="all">{tP('config.woBatchAll')}</option>
-                                        </select>
-                                      </label>
-                                    );
-                                  })}
-                                </div>
-                                {isEdited && (
-                                  <div style={{ marginTop: 6 }}>
-                                    <button type="button" onClick={resetConfig}
-                                      style={{ fontSize: '0.7rem', padding: '2px 8px', background: 'transparent', color: '#a1a1aa', border: '1px solid #3d3d40', borderRadius: 4, cursor: 'pointer' }}>
-                                      {tP('bootstrap.editReset')}
-                                    </button>
-                                  </div>
-                                )}
-                              </td>
-                            </tr>
-                          )}
-                        </React.Fragment>
+                        <div key={kind} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.82rem' }}>
+                          <span style={{ color: '#a1a1aa', minWidth: 170 }}>{label}</span>
+                          <select
+                            value={selectedId ?? ''}
+                            disabled={versions.length === 0}
+                            onChange={(e) => {
+                              const v = e.target.value ? Number(e.target.value) : undefined;
+                              setBootstrapVersionPicks((c) => ({ ...c, [configKey]: v }));
+                            }}
+                            style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem' }}
+                          >
+                            {versions.length === 0 && <option value="">{tP('config.externalDefault')}</option>}
+                            {versions.map((v) => (
+                              <option key={v.id} value={v.id}>
+                                {v.name || tP('config.externalVersionLabel', { id: v.id })}{v.is_default ? ` (${tP('config.externalDefault')})` : ''}
+                              </option>
+                            ))}
+                          </select>
+                          <button
+                            type="button"
+                            disabled={selectedId == null}
+                            onClick={() => setExternalConfigPreview({ kind: externalKind, versionId: selectedId })}
+                            title={tP('config.externalPreviewTooltip')}
+                            style={{ background: 'none', border: 'none', color: '#93c5fd', cursor: selectedId == null ? 'default' : 'pointer', fontSize: '0.76rem', padding: 0, opacity: selectedId == null ? 0.4 : 1 }}
+                          >
+                            {tP('config.externalPreview')}
+                          </button>
+                        </div>
                       );
                     })}
+                  </div>
+                </fieldset>
+
+                {/* Post-plan handling — identical copy of the Planning page's own fieldset
+                    (WO batch frequency, analyze criticality, check soundness). */}
+                <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
+                  <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                    {tP('config.groupPostPlan')}
+                  </legend>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '1.25rem', flexWrap: 'wrap' }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                      <span style={{ fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.04em' }}>{tP('config.woBatchFrequency')}</span>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', padding: '4px 10px', border: '1px solid #3f3f46', borderRadius: 5 }}>
+                        {(['make', 'move', 'purchase'] as const).map((type) => {
+                          const labelKey = `woBatch${type.charAt(0).toUpperCase() + type.slice(1)}` as 'woBatchMake' | 'woBatchMove' | 'woBatchPurchase';
+                          const val = type === 'make' ? bootstrapMakeBatchScale : type === 'move' ? bootstrapMoveBatchScale : bootstrapPurchaseBatchScale;
+                          const setVal = type === 'make' ? setBootstrapMakeBatchScale : type === 'move' ? setBootstrapMoveBatchScale : setBootstrapPurchaseBatchScale;
+                          return (
+                            <label key={type}
+                              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.875rem' }}
+                              title={tP('config.woBatchScaleTooltip')}
+                            >
+                              <span style={{ color: '#a1a1aa' }}>{tP(`config.${labelKey}`)}</span>
+                              <select
+                                value={val}
+                                onChange={(e) => setVal(e.target.value as 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all')}
+                                style={{ padding: '3px 4px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+                              >
+                                <option value="none">{tP('config.woBatchNone')}</option>
+                                <option value="weekly">{tP('config.woBatchWeekly')}</option>
+                                <option value="biweekly">{tP('config.woBatchBiweekly')}</option>
+                                <option value="monthly">{tP('config.woBatchMonthly')}</option>
+                                <option value="all">{tP('config.woBatchAll')}</option>
+                              </select>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    </div>
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={bootstrapAnalyzeCriticality}
+                        onChange={(e) => setBootstrapAnalyzeCriticality(e.target.checked)}
+                      />
+                      <span style={{ fontSize: '0.875rem' }}>{tP('config.analyzeCriticality')}</span>
+                    </label>
+                    <label
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}
+                      title={tP('config.checkSoundnessTooltip')}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={bootstrapCheckSoundness}
+                        onChange={(e) => setBootstrapCheckSoundness(e.target.checked)}
+                      />
+                      <span style={{ fontSize: '0.875rem' }}>{tP('config.checkSoundness')}</span>
+                    </label>
+                  </div>
+                </fieldset>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
+                  <button type="button" onClick={refreshBootstrapPreview}
+                    disabled={bootstrapPreviewLoading}
+                    title={tP('bootstrap.generateNextBatchTooltip')}
+                    style={{ padding: '4px 10px', background: '#27272a', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: bootstrapPreviewLoading ? 'default' : 'pointer', fontSize: '0.82rem', opacity: bootstrapPreviewLoading ? 0.6 : 1 }}>
+                    {bootstrapPreviewLoading ? tP('bootstrap.generatingNextBatch') : tP('bootstrap.generateNextBatch')}
+                  </button>
+                  {(() => {
+                    const span = Math.abs(bootstrapMaxMethodsMax - bootstrapMaxMethodsMin) + 1;
+                    const skipped = span - bootstrapPreview.next_batch.length;
+                    return skipped > 0 ? (
+                      <span style={{ fontSize: '0.75rem', color: '#71717a' }}>
+                        {tP('bootstrap.netNewHint', { skipped, span })}
+                      </span>
+                    ) : null;
+                  })()}
+                </div>
+                {/* One row per max_methods value in the range above that ISN'T already in KB —
+                    the range itself determines the run count (no separate "how many" input,
+                    and no point running the same max_methods twice). */}
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.78rem', marginBottom: '0.75rem' }}>
+                  <tbody>
+                    {bootstrapPreview.next_batch.map((p) => (
+                      <tr key={p.preset_id} style={{ borderBottom: '1px solid #27272a' }}>
+                        <td style={{ padding: '4px 6px', fontFamily: 'monospace', color: '#67e8f9', whiteSpace: 'nowrap' }}>
+                          {p.preset_label}
+                        </td>
+                        <td style={{ padding: '4px 6px', fontFamily: 'monospace', fontSize: '0.7rem', color: '#a1a1aa' }}>
+                          {presetConfigSummary(p.config as Record<string, unknown>)}
+                        </td>
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
 
@@ -7622,22 +7660,103 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     {tP('bootstrap.cancel')}
                   </button>
                   <button type="button" onClick={handleStartBootstrap}
-                    disabled={bootstrapStarting || bootstrapJobStatus?.status === 'running' || bootstrapPreviewLoading}
+                    disabled={bootstrapStarting || bootstrapJobStatus?.status === 'running' || bootstrapPreviewLoading || bootstrapPreview.next_batch.length === 0}
                     style={{
                       padding: '5px 14px', background: '#16a34a', color: '#fff',
                       border: 'none', borderRadius: 6, cursor: 'pointer',
-                      fontWeight: 600, opacity: bootstrapStarting || bootstrapJobStatus?.status === 'running' ? 0.6 : 1,
+                      fontWeight: 600, opacity: (bootstrapStarting || bootstrapJobStatus?.status === 'running' || bootstrapPreview.next_batch.length === 0) ? 0.6 : 1,
                     }}>
                     {(() => {
                       if (bootstrapStarting) return tP('bootstrap.starting');
-                      // Count actual runs: sum of values across checked axes.
-                      // The server has already filtered duplicates; every
-                      // suggestion in next_batch becomes a run on Start.
                       const willRun = bootstrapPreview.next_batch.length;
                       return tP('bootstrap.start', { n: willRun });
                     })()}
                   </button>
                 </div>
+
+                {/* Progress block — sits right below the Start button that launched the batch,
+                    above the KB table its runs land in. Auto-dismissed shortly after a clean
+                    completion (see the poll effect); stays up for cancels/errors. */}
+                {bootstrapJobStatus && (() => {
+                  const total = bootstrapJobStatus.total;
+                  const completed = bootstrapJobStatus.completed;
+                  const pct = total > 0 ? (completed / total) * 100 : 0;
+                  const isCancelled = bootstrapJobStatus.status === 'cancelled';
+                  const isCompleted = bootstrapJobStatus.status === 'completed';
+                  const isCancelInFlight = bootstrapJobStatus.cancelled === true && !isCancelled && !isCompleted;
+                  const accentBg = isCancelled ? '#3a1f0c' : '#0c1f3a';
+                  const accentBorder = isCancelled ? '#b45309' : '#1d4ed8';
+                  const accentText = isCancelled ? '#fdba74' : '#93c5fd';
+                  const barFill = isCancelled ? '#b45309' : isCancelInFlight ? '#fbbf24' : '#3b82f6';
+                  const barTrack = isCancelled ? '#451a03' : '#1e3a8a';
+                  return (
+                    <div style={{ margin: '0.75rem 0', padding: '0.6rem 0.75rem', background: accentBg, border: `1px solid ${accentBorder}`, borderRadius: 6 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.35rem' }}>
+                        <div style={{ fontWeight: 600, color: accentText, fontSize: '0.85rem' }}>
+                          {isCancelled
+                            ? tP('bootstrap.progressCancelled')
+                            : isCompleted
+                              ? tP('bootstrap.progressTitleDone')
+                              : tP('bootstrap.progressTitle')}
+                        </div>
+                        {!isCompleted && !isCancelled && (
+                          <button
+                            type="button"
+                            onClick={handleCancelBootstrap}
+                            disabled={bootstrapCancelling || isCancelInFlight}
+                            title={tP('bootstrap.interruptTooltip')}
+                            style={{
+                              fontSize: '0.72rem', padding: '2px 10px',
+                              background: isCancelInFlight ? '#27272a' : 'transparent',
+                              color: isCancelInFlight ? '#71717a' : '#fbbf24',
+                              border: '1px solid #b45309', borderRadius: 4,
+                              cursor: bootstrapCancelling || isCancelInFlight ? 'default' : 'pointer',
+                              opacity: bootstrapCancelling || isCancelInFlight ? 0.7 : 1,
+                            }}
+                          >
+                            {isCancelInFlight ? tP('bootstrap.interruptInflight') : tP('bootstrap.interrupt')}
+                          </button>
+                        )}
+                      </div>
+                      <div style={{ fontSize: '0.82rem', color: '#e4e4e7', marginBottom: '0.5rem' }}>
+                        {isCancelled
+                          ? tP('bootstrap.progressCancelledLine', { completed, total })
+                          : isCompleted
+                            ? tP('bootstrap.progressDone', { completed })
+                            : tP('bootstrap.progressLine', {
+                                completed,
+                                total,
+                                current: bootstrapJobStatus.current_preset_label,
+                              })}
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <div style={{ flex: 1, height: 12, background: barTrack, borderRadius: 6, overflow: 'hidden' }}>
+                          <div style={{
+                            height: '100%', background: barFill,
+                            width: `${pct}%`,
+                            transition: 'width 0.3s',
+                          }} />
+                        </div>
+                        <span style={{ fontSize: '0.78rem', color: '#a1a1aa', minWidth: 56, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                          {`${completed}/${total} (${pct.toFixed(0)}%)`}
+                        </span>
+                      </div>
+                      {isCancelInFlight && (
+                        <div style={{ marginTop: '0.4rem', fontSize: '0.72rem', color: '#fbbf24' }}>
+                          {tP('bootstrap.interruptHint')}
+                        </div>
+                      )}
+                      {bootstrapJobStatus.errors.length > 0 && (
+                        <div style={{ marginTop: '0.4rem', fontSize: '0.75rem', color: '#f87171' }}>
+                          <div style={{ fontWeight: 600 }}>{tP('bootstrap.progressErrors', { n: bootstrapJobStatus.errors.length })}</div>
+                          <ul style={{ margin: '0.2rem 0 0 1rem', padding: 0 }}>
+                            {bootstrapJobStatus.errors.map((e, i) => (<li key={i}>{e}</li>))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
 
                 {bootstrapPreview.already_run.length > 0 && (() => {
                   // KPI columns: 'asc' direction = lower-is-better (gini, starvation),
@@ -7649,6 +7768,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     { key: 'on_time_count',                label: tP('bootstrap.kpi.onTime'),      better: 'desc', fmt: (v) => String(v) },
                     { key: 'manufacturing_total_quantity', label: tP('bootstrap.kpi.mfg'),         better: 'desc', fmt: (v) => qtyFmt(v) },
                     { key: 'inventory_consumed_total',     label: tP('bootstrap.kpi.invConsumed'), better: 'desc', fmt: (v) => qtyFmt(v) },
+                    { key: 'duration_ms',                  label: tP('bootstrap.kpi.elapsed'),     better: 'asc',  fmt: (v) => formatElapsedMs(v) },
                   ];
                   const filtered = bootstrapKbSoundOnly
                     ? bootstrapPreview.already_run.filter((p) => p.soundness_status === 'sound')
@@ -7661,7 +7781,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         if (av == null && bv == null) return 0;
                         if (av == null) return 1;   // missing always sinks
                         if (bv == null) return -1;
-                        const cmp = Number(av) - Number(bv);
+                        // ISO timestamps sort correctly as strings; everything else is numeric.
+                        const cmp = typeof av === 'string' && typeof bv === 'string'
+                          ? av.localeCompare(bv)
+                          : Number(av) - Number(bv);
                         return bootstrapKbSort.dir === 'asc' ? cmp : -cmp;
                       })
                     : filtered;
@@ -7716,7 +7839,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                   >{c.label}{sortIndicator(String(c.key))}</button>
                                 </th>
                               ))}
-                              <th style={{ padding: '4px 6px' }} />
+                              <th style={{ padding: '4px 6px', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                                <button
+                                  type="button"
+                                  onClick={() => handleSortClick('run_created_at', 'desc')}
+                                  style={{ background: 'none', border: 'none', color: bootstrapKbSort?.key === 'run_created_at' ? '#e4e4e7' : '#a1a1aa', cursor: 'pointer', padding: 0, fontSize: '0.72rem', fontWeight: bootstrapKbSort?.key === 'run_created_at' ? 600 : 400 }}
+                                >{tP('bootstrap.kpi.timestamp')}{sortIndicator('run_created_at')}</button>
+                              </th>
+                              <th style={{ padding: '4px 6px', textAlign: 'center', whiteSpace: 'nowrap' }}>{tP('bootstrap.kpi.soundness')}</th>
                               <th style={{ padding: '4px 6px' }} />
                             </tr>
                           </thead>
@@ -7729,7 +7859,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                 return <span>{fmt(Number(v))}</span>;
                               };
                               return (
-                                <React.Fragment key={p.preset_id}>
+                                <React.Fragment key={p.kb_record_id ?? p.preset_id}>
                                   <tr style={{ borderBottom: expanded ? 'none' : '1px solid #27272a' }}>
                                     <td style={{ padding: '4px 6px', width: 18, cursor: 'pointer', color: '#71717a', verticalAlign: 'top' }}
                                         onClick={() => toggleBootstrapPresetExpanded(p.preset_id)}>
@@ -7740,7 +7870,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                         {renderKpi(c.key, c.fmt)}
                                       </td>
                                     ))}
-                                    <td style={{ padding: '4px 6px', verticalAlign: 'top' }}>
+                                    <td style={{ padding: '4px 6px', color: '#a1a1aa', textAlign: 'right', verticalAlign: 'top', whiteSpace: 'nowrap' }}
+                                        title={p.run_created_at && p.run_finished_at ? `${p.run_created_at} → ${p.run_finished_at}` : p.run_created_at}>
+                                      {p.run_created_at ? new Date(p.run_created_at).toLocaleString() : <span style={{ color: '#52525b' }}>–</span>}
+                                    </td>
+                                    <td style={{ padding: '4px 6px', textAlign: 'center', verticalAlign: 'top' }}>
                                       {p.soundness_status === 'sound' && <span style={{ color: '#34d399', fontSize: '0.7rem' }}>✓</span>}
                                       {p.soundness_status === 'unsound' && <span style={{ color: '#f87171', fontSize: '0.7rem' }}>✗</span>}
                                       {p.soundness_status === 'unchecked' && <span style={{ color: '#71717a', fontSize: '0.7rem' }}>—</span>}
@@ -7764,12 +7898,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                                   </tr>
                                   {expanded && (
                                     <tr style={{ borderBottom: '1px solid #27272a' }}>
-                                      <td colSpan={3 + kpiCols.length} style={{ padding: '0 6px 6px 26px' }}>
+                                      <td colSpan={4 + kpiCols.length} style={{ padding: '0 6px 6px 26px' }}>
                                         <div style={{
                                           margin: 0, background: '#0a0a0a', padding: '8px 10px', borderRadius: 4,
                                           overflowX: 'auto',
                                         }}>
-                                          <ConfigDetailView config={p.config as Record<string, unknown>} caseId={id} />
+                                          <ConfigDetailView config={p.config as Record<string, unknown>} caseId={id} versionRefs={p} />
                                         </div>
                                       </td>
                                     </tr>
@@ -8163,7 +8297,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   {expandedTab === 'config' && (
                     run.config && Object.keys(run.config).length > 0 ? (
                       <div style={{ margin: '0.4rem 0 0', background: '#111113', padding: '0.5rem 0.6rem', borderRadius: 4 }}>
-                        <ConfigDetailView config={run.config as Record<string, unknown>} caseId={id} />
+                        <ConfigDetailView config={run.config as Record<string, unknown>} caseId={id} versionRefs={run} />
                       </div>
                     ) : (
                       <p style={{ margin: '0.4rem 0 0', fontSize: '0.72rem', color: '#71717a' }}>{tP('runHistory.details.noConfig')}</p>
@@ -10060,6 +10194,64 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               />
             )}
             {!peggingLoading && !peggingData && <p style={{ color: '#a1a1aa' }}>Could not load pegging.</p>}
+          </div>
+        </div>,
+        document.body
+      )}
+      {externalConfigPreview && typeof document !== 'undefined' && createPortal(
+        <div style={{ position: 'fixed', inset: 0, zIndex: 9998 }} role="dialog" aria-label="External config preview">
+          <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.25)' }} onClick={() => setExternalConfigPreview(null)} aria-hidden />
+          <div
+            style={{
+              position: 'absolute', left: previewWindowRect.x, top: previewWindowRect.y,
+              width: previewWindowRect.w, height: previewWindowRect.h,
+              display: 'flex', flexDirection: 'column', background: '#1c1c1e', color: '#e4e4e7',
+              borderRadius: 8, border: '1px solid #3d3d40', boxShadow: '0 8px 32px rgba(0,0,0,0.5)', overflow: 'hidden',
+            }}
+          >
+            <div
+              onMouseDown={(e) => {
+                e.preventDefault();
+                previewDragRef.current = { startX: e.clientX, startY: e.clientY, origX: previewWindowRect.x, origY: previewWindowRect.y };
+                setPreviewDragging(true);
+              }}
+              style={{
+                padding: '8px 12px', background: '#27272a', borderBottom: '1px solid #3d3d40',
+                cursor: previewDragging ? 'grabbing' : 'grab', display: 'flex', justifyContent: 'space-between',
+                alignItems: 'center', flexShrink: 0, userSelect: 'none',
+              }}
+            >
+              <span style={{ fontSize: '0.78rem', color: '#a1a1aa' }}>{tP('config.externalPreview')}</span>
+              <button
+                type="button"
+                onClick={() => setExternalConfigPreview(null)}
+                style={{ background: 'none', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '1rem', padding: '0 4px', lineHeight: 1 }}
+              >
+                ✕
+              </button>
+            </div>
+            <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
+              <ExternalConfigDrilldown
+                kind={externalConfigPreview.kind}
+                caseId={id}
+                versionId={externalConfigPreview.versionId}
+                onBack={() => setExternalConfigPreview(null)}
+                context="live"
+                showBackLink={false}
+              />
+            </div>
+            <div
+              onMouseDown={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                previewResizeRef.current = { startX: e.clientX, startY: e.clientY, origW: previewWindowRect.w, origH: previewWindowRect.h };
+                setPreviewResizing(true);
+              }}
+              style={{
+                position: 'absolute', right: 0, bottom: 0, width: 18, height: 18, cursor: 'nwse-resize',
+                background: 'linear-gradient(135deg, transparent 50%, #52525b 50%)',
+              }}
+            />
           </div>
         </div>,
         document.body

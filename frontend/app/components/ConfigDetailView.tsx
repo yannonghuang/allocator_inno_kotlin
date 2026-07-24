@@ -1,20 +1,51 @@
 'use client';
 
 import React, { useEffect, useState } from 'react';
+import { useTranslations } from 'next-intl';
 import {
   getAllocation,
   getPreferences,
   getDemandOrdering,
   getPurchasableMaterials,
   getCaseConstraints,
+  getCaseSupplies,
+  getCaseDemands,
+  getPurchasableRawMaterials,
+  getConstraintOptions,
+  listAllocationVersions,
+  listPreferencesVersions,
+  listDemandOrderingVersions,
+  listPurchasableMaterialsVersions,
+  listCaseConstraintsVersions,
   type AllocationRow,
   type PreferenceRow,
   type DemandOrderRow,
   type PurchasableMaterialRow,
   type ConstraintRuleRow,
+  type ConfigVersion,
+  type CaseSupplyRow,
+  type CaseDemandRow,
+  type PurchasableRawMaterial,
+  type ConstraintOptions,
 } from '@/lib/api';
+import { RawMaterialPicker } from './RawMaterialPicker';
+import { ConstraintPicker } from './ConstraintPicker';
+import { PreferenceTable } from './PreferenceTable';
+import { DemandOrderTable } from './DemandOrderTable';
+import { AllocationMatrixView } from './AllocationMatrixView';
 
-type ExternalKind = 'allocation' | 'preferences' | 'demandOrdering' | 'purchasableMaterials' | 'constraints';
+export type ExternalKind = 'allocation' | 'preferences' | 'demandOrdering' | 'purchasableMaterials' | 'constraints';
+
+/** The 5 version-reference fields carried by `PlanRun`/`BootstrapPreset` (see CaseConfigVersions'
+ *  own doc) — which version of each external config object a given run actually used. Undefined
+ *  for pre-versioning ("legacy") runs. */
+type VersionRefs = {
+  case_alloc_version_id?: number;
+  pref_version_id?: number;
+  demand_order_version_id?: number;
+  purchasable_material_version_id?: number;
+  constraint_version_id?: number;
+};
 
 const EXTERNAL_LABELS: Record<ExternalKind, string> = {
   allocation: 'Critical Raw Allocation',
@@ -24,12 +55,20 @@ const EXTERNAL_LABELS: Record<ExternalKind, string> = {
   constraints: 'Constraints',
 };
 
-const EXTERNAL_PAGE_PATH: Record<ExternalKind, string> = {
-  allocation: 'allocation',
-  preferences: 'preferences',
-  demandOrdering: 'demand-ordering',
-  purchasableMaterials: 'purchasable-materials',
-  constraints: 'constraints',
+const VERSION_REF_KEY: Record<ExternalKind, keyof VersionRefs> = {
+  allocation: 'case_alloc_version_id',
+  preferences: 'pref_version_id',
+  demandOrdering: 'demand_order_version_id',
+  purchasableMaterials: 'purchasable_material_version_id',
+  constraints: 'constraint_version_id',
+};
+
+const listVersionsFor: Record<ExternalKind, (caseId: number) => Promise<ConfigVersion[]>> = {
+  allocation: listAllocationVersions,
+  preferences: listPreferencesVersions,
+  demandOrdering: listDemandOrderingVersions,
+  purchasableMaterials: listPurchasableMaterialsVersions,
+  constraints: listCaseConstraintsVersions,
 };
 
 /**
@@ -41,17 +80,17 @@ const EXTERNAL_PAGE_PATH: Record<ExternalKind, string> = {
  * consolidation/variant_selection — the "run config parameters on UI" bucket), plus a hyperlink
  * per "external" config object (critical raw allocation / supply preferences / demand ordering /
  * purchasable materials / constraints — the case-level settings promoted out of this blob).
- * Clicking a link drills into a read-only preview of that object's CURRENT content within this
- * same slide-in (not a page navigation) — a "← Back" link returns to this view. The preview is
- * necessarily of the object's LIVE state, not a historical snapshot from when this particular run
- * executed — only a content-hash fingerprint of that historical state was ever captured (see
- * KbFingerprint.kt's own doc), not the row-level data itself.
+ * Clicking a link drills into a read-only preview within this same slide-in (not a page
+ * navigation) — a "← Back" link returns to this view. When [versionRefs] carries this run's
+ * resolved version id for that object (see CaseConfigVersions' own doc), the preview fetches that
+ * EXACT historical version — no longer "whatever is live now." Falls back to the case's current
+ * default version for legacy (pre-versioning) runs, where no version id was ever recorded.
  */
-export function ConfigDetailView({ config, caseId }: { config: Record<string, unknown>; caseId: number }) {
+export function ConfigDetailView({ config, caseId, versionRefs }: { config: Record<string, unknown>; caseId: number; versionRefs?: VersionRefs }) {
   const [drill, setDrill] = useState<ExternalKind | null>(null);
 
   if (drill) {
-    return <ExternalConfigDrilldown kind={drill} caseId={caseId} onBack={() => setDrill(null)} />;
+    return <ExternalConfigDrilldown kind={drill} caseId={caseId} versionId={versionRefs?.[VERSION_REF_KEY[drill]]} onBack={() => setDrill(null)} />;
   }
 
   const ms = (config.method_selection ?? {}) as Record<string, unknown>;
@@ -82,163 +121,167 @@ export function ConfigDetailView({ config, caseId }: { config: Record<string, un
         <span style={{ fontSize: '0.62rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 2 }}>
           External configs (case-level, not part of this run's own parameters)
         </span>
-        {(Object.keys(EXTERNAL_LABELS) as ExternalKind[]).map((k) => (
-          <button
-            key={k}
-            type="button"
-            onClick={() => setDrill(k)}
-            style={{ textAlign: 'left', background: 'none', border: 'none', color: '#93c5fd', cursor: 'pointer', fontSize: '0.76rem', padding: '2px 0' }}
-          >
-            {EXTERNAL_LABELS[k]} →
-          </button>
-        ))}
+        {(Object.keys(EXTERNAL_LABELS) as ExternalKind[]).map((k) => {
+          const vId = versionRefs?.[VERSION_REF_KEY[k]];
+          return (
+            <button
+              key={k}
+              type="button"
+              onClick={() => setDrill(k)}
+              style={{ textAlign: 'left', background: 'none', border: 'none', color: '#93c5fd', cursor: 'pointer', fontSize: '0.76rem', padding: '2px 0' }}
+            >
+              {EXTERNAL_LABELS[k]}{vId != null && <span style={{ color: '#71717a', fontFamily: 'monospace' }}> (v{vId})</span>} →
+            </button>
+          );
+        })}
       </div>
     </div>
   );
 }
 
-function ExternalConfigDrilldown({ kind, caseId, onBack }: { kind: ExternalKind; caseId: number; onBack: () => void }) {
+type AllocationAux = { supplies: CaseSupplyRow[]; demands: CaseDemandRow[] };
+
+/** Read-only preview of one external config object's content, for [versionId] if given, else the
+ *  case's current default. Reused directly (not just from within ConfigDetailView's own drill-in
+ *  flow) by the Planning page's per-object version picker — its "← Back" doubles as a plain close
+ *  action there.
+ *
+ *  Renders the EXACT same view component as the object's own dedicated (editable) page — just in
+ *  read-only mode — rather than a separate simplified viewer, so filters/search/sort (critical
+ *  for the long lists like Preferences and Purchasable Materials) work identically here. */
+export function ExternalConfigDrilldown({ kind, caseId, versionId, onBack, context = 'run', showBackLink = true }: {
+  kind: ExternalKind; caseId: number; versionId?: number; onBack: () => void;
+  /** 'run' (default): the caption frames [versionId] as "what this run used" — for ConfigDetailView's
+   *  own drill-in from a KB/history entry. 'live': frames it as just the currently-selected
+   *  version — for the Planning page's own picker preview, which isn't tied to any past run. */
+  context?: 'run' | 'live';
+  /** Hide the "← Back" link — for callers (the Planning page's standalone preview window) that
+   *  already have their own close affordance and aren't drilling in from a list. */
+  showBackLink?: boolean;
+}) {
+  const tPlanning = useTranslations('planning');
+  const tPreferences = useTranslations('preferencesPage');
+  const tDemandOrdering = useTranslations('demandOrderingPage');
+  const tAllocation = useTranslations('allocationPage');
+
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [rows, setRows] = useState<unknown[]>([]);
+  const [aux, setAux] = useState<unknown>(null);
+  const [versionMeta, setVersionMeta] = useState<ConfigVersion | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    const load = async (): Promise<unknown[]> => {
+    const load = async (): Promise<{ rows: unknown[]; aux: unknown }> => {
       switch (kind) {
-        case 'allocation': return (await getAllocation(caseId)) ?? [];
-        case 'preferences': { const r = await getPreferences(caseId); return r?.rows ?? []; }
-        case 'demandOrdering': { const r = await getDemandOrdering(caseId); return r?.rows ?? []; }
-        case 'purchasableMaterials': return await getPurchasableMaterials(caseId);
-        case 'constraints': return await getCaseConstraints(caseId);
+        case 'allocation': {
+          const [a, supplies, demandRows] = await Promise.all([
+            getAllocation(caseId, versionId), getCaseSupplies(caseId), getCaseDemands(caseId),
+          ]);
+          return { rows: a ?? [], aux: { supplies, demands: demandRows } satisfies AllocationAux };
+        }
+        case 'preferences': {
+          const r = await getPreferences(caseId, versionId);
+          return { rows: r?.rows ?? [], aux: null };
+        }
+        case 'demandOrdering': {
+          const r = await getDemandOrdering(caseId, versionId);
+          return { rows: r?.rows ?? [], aux: null };
+        }
+        case 'purchasableMaterials': {
+          const [pmRows, catalog] = await Promise.all([
+            getPurchasableMaterials(caseId, versionId), getPurchasableRawMaterials(caseId),
+          ]);
+          return { rows: pmRows, aux: catalog.materials };
+        }
+        case 'constraints': {
+          const [cRows, opts] = await Promise.all([
+            getCaseConstraints(caseId, versionId), getConstraintOptions(caseId),
+          ]);
+          return { rows: cRows, aux: opts };
+        }
       }
     };
     load()
-      .then((r) => { if (!cancelled) setRows(r); })
+      .then(({ rows: r, aux: a }) => { if (!cancelled) { setRows(r); setAux(a); } })
       .catch((e) => { if (!cancelled) setError(String(e)); })
       .finally(() => { if (!cancelled) setLoading(false); });
+    if (versionId != null) {
+      listVersionsFor[kind](caseId)
+        .then((vs) => { if (!cancelled) setVersionMeta(vs.find((v) => v.id === versionId) ?? null); })
+        .catch(() => { if (!cancelled) setVersionMeta(null); });
+    } else {
+      setVersionMeta(null);
+    }
     return () => { cancelled = true; };
-  }, [kind, caseId]);
+  }, [kind, caseId, versionId]);
 
-  const MAX_PREVIEW = 50;
-  const preview = rows.slice(0, MAX_PREVIEW);
+  const renderView = () => {
+    switch (kind) {
+      case 'allocation': {
+        const a = aux as AllocationAux | null;
+        return <AllocationMatrixView rows={rows as AllocationRow[]} supplies={a?.supplies ?? []} demands={a?.demands ?? []} t={tAllocation} />;
+      }
+      case 'preferences':
+        return <PreferenceTable rows={rows as PreferenceRow[]} t={tPreferences} />;
+      case 'demandOrdering':
+        return <DemandOrderTable rows={rows as DemandOrderRow[]} t={tDemandOrdering} />;
+      case 'purchasableMaterials':
+        return (
+          <RawMaterialPicker
+            options={(aux as PurchasableRawMaterial[] | null) ?? []}
+            selected={(rows as PurchasableMaterialRow[]).map((r) => r.product_id)}
+            readOnly
+            defaultCollapsed={false}
+            tP={tPlanning}
+          />
+        );
+      case 'constraints':
+        return (
+          <ConstraintPicker
+            options={(aux as ConstraintOptions | null) ?? { customers: [], parents: [] }}
+            constraints={rows as ConstraintRuleRow[]}
+            readOnly
+            defaultCollapsed={false}
+            tP={tPlanning}
+          />
+        );
+    }
+  };
 
   return (
     <div style={{ fontSize: '0.74rem' }}>
-      <button
-        type="button"
-        onClick={onBack}
-        style={{ background: 'none', border: 'none', color: '#93c5fd', cursor: 'pointer', fontSize: '0.76rem', padding: 0, marginBottom: 8 }}
-      >
-        ← Back
-      </button>
-      <div style={{ fontWeight: 600, color: '#fafafa', marginBottom: 4 }}>{EXTERNAL_LABELS[kind]}</div>
+      {showBackLink && (
+        <button
+          type="button"
+          onClick={onBack}
+          style={{ background: 'none', border: 'none', color: '#93c5fd', cursor: 'pointer', fontSize: '0.76rem', padding: 0, marginBottom: 8 }}
+        >
+          ← Back
+        </button>
+      )}
+      <div style={{ fontWeight: 600, color: '#fafafa', marginBottom: 4 }}>
+        {EXTERNAL_LABELS[kind]}
+        {versionId != null && <span style={{ color: '#71717a', fontWeight: 400 }}> — {versionMeta?.name || `Version ${versionId}`}</span>}
+      </div>
       <div style={{ color: '#71717a', fontSize: '0.68rem', marginBottom: 6 }}>
-        Live current state — a historical run only captured a content fingerprint, not this
-        row-level data (see KbFingerprint.kt).
+        {versionId != null
+          ? (context === 'run'
+              ? `Historical version this run actually used${versionMeta?.comments ? ` — ${versionMeta.comments}` : ''}.`
+              : `Selected version${versionMeta?.comments ? ` — ${versionMeta.comments}` : ''}.`)
+          : (context === 'run'
+              ? 'Live current default version — this run predates version tracking, so its exact historical state was never captured (see ExternalConfigVersioningMigration.kt).'
+              : "Case's current default version.")}
       </div>
       {loading && <div style={{ color: '#71717a' }}>Loading…</div>}
       {error && <div style={{ color: '#f87171' }}>{error}</div>}
       {!loading && !error && (
-        <>
-          <div style={{ color: '#a1a1aa', marginBottom: 4 }}>
-            {rows.length === 0 ? 'No rows.' : `${rows.length} row${rows.length === 1 ? '' : 's'}${rows.length > MAX_PREVIEW ? ` (showing first ${MAX_PREVIEW})` : ''}`}
-          </div>
-          {preview.length > 0 && (
-            <div style={{ maxHeight: 260, overflowY: 'auto', background: '#0a0a0a', borderRadius: 4, padding: '4px 6px' }}>
-              <RowsTable kind={kind} rows={preview} />
-            </div>
-          )}
-          <a
-            href={`/cases/${caseId}/${EXTERNAL_PAGE_PATH[kind]}`}
-            style={{ display: 'inline-block', marginTop: 8, color: '#93c5fd', fontSize: '0.72rem' }}
-          >
-            Open full {EXTERNAL_LABELS[kind]} page →
-          </a>
-        </>
+        <div style={{ color: '#e4e4e7' }}>
+          {renderView()}
+        </div>
       )}
     </div>
   );
-}
-
-function RowsTable({ kind, rows }: { kind: ExternalKind; rows: unknown[] }) {
-  switch (kind) {
-    case 'allocation': {
-      const r = rows as AllocationRow[];
-      return (
-        <table style={{ width: '100%', fontFamily: 'monospace', fontSize: '0.68rem' }}>
-          <tbody>
-            {r.map((row, i) => (
-              <tr key={i}>
-                <td style={{ color: '#e4e4e7', padding: '1px 4px' }}>{row.supply_id}</td>
-                <td style={{ color: '#a1a1aa', padding: '1px 4px' }}>{row.demand_id ?? '—'}</td>
-                <td style={{ color: '#a78bfa', padding: '1px 4px', textAlign: 'right' }}>{row.qty_allocated}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      );
-    }
-    case 'preferences': {
-      const r = rows as PreferenceRow[];
-      return (
-        <table style={{ width: '100%', fontFamily: 'monospace', fontSize: '0.68rem' }}>
-          <tbody>
-            {r.map((row, i) => (
-              <tr key={i}>
-                <td style={{ color: '#e4e4e7', padding: '1px 4px' }}>{row.product_id}@{row.location_id}</td>
-                <td style={{ color: '#a1a1aa', padding: '1px 4px' }}>{row.method_type}</td>
-                <td style={{ color: '#a78bfa', padding: '1px 4px', textAlign: 'right' }}>{row.preference}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      );
-    }
-    case 'demandOrdering': {
-      const r = rows as DemandOrderRow[];
-      return (
-        <table style={{ width: '100%', fontFamily: 'monospace', fontSize: '0.68rem' }}>
-          <tbody>
-            {r.map((row, i) => (
-              <tr key={i}>
-                <td style={{ color: '#a78bfa', padding: '1px 4px' }}>{row.order}</td>
-                <td style={{ color: '#e4e4e7', padding: '1px 4px' }}>{row.demand_id}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      );
-    }
-    case 'purchasableMaterials': {
-      const r = rows as PurchasableMaterialRow[];
-      return (
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-          {r.map((row, i) => (
-            <span key={i} style={{ color: '#e4e4e7', fontFamily: 'monospace', background: '#1c1c1e', borderRadius: 3, padding: '1px 5px' }}>
-              {row.product_id}
-            </span>
-          ))}
-        </div>
-      );
-    }
-    case 'constraints': {
-      const r = rows as ConstraintRuleRow[];
-      return (
-        <table style={{ width: '100%', fontFamily: 'monospace', fontSize: '0.68rem' }}>
-          <tbody>
-            {r.map((row, i) => (
-              <tr key={i}>
-                <td style={{ color: '#e4e4e7', padding: '1px 4px' }}>{row.customer_id}</td>
-                <td style={{ color: '#a1a1aa', padding: '1px 4px' }}>{row.parent}@{row.location}</td>
-                <td style={{ color: '#a78bfa', padding: '1px 4px' }}>⇒ {row.child}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      );
-    }
-  }
 }

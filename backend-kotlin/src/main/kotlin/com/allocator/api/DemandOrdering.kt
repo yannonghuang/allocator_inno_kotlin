@@ -3,7 +3,9 @@ package com.allocator.api
 import com.allocator.CaseDemandOrderConfigs
 import com.allocator.CaseDemandOrders
 import com.allocator.Cases
+import com.allocator.services.CaseConfigVersioning
 import com.allocator.services.CaseLoader
+import com.allocator.services.ConfigVersionKind
 import com.allocator.services.DemandOrderRow
 import com.allocator.services.KbFingerprint
 import com.allocator.services.buildDemandOrder
@@ -19,6 +21,7 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import org.slf4j.LoggerFactory
 
 private val log = LoggerFactory.getLogger("com.allocator.DemandOrderingRoute")
+private val KIND = ConfigVersionKind.ORD
 
 // ── Helper: load/persist case_demand_order rows ──────────────────────────────
 
@@ -31,82 +34,99 @@ data class CaseDemandOrderConfig(
     val generatedAt: String,
 )
 
-/** Loads case_demand_order rows for [caseId]. Returns null when none exist (planning falls back
- *  to raw `(priority, demand_id)` sort, per-demand). */
-internal fun loadCaseDemandOrderRows(caseId: Int): List<CaseDemandOrderRow>? = transaction {
+/** Loads case_demand_order rows for [versionId]. Returns null when none exist (planning falls
+ *  back to raw `(priority, demand_id)` sort, per-demand). */
+internal fun loadCaseDemandOrderRows(versionId: Int): List<CaseDemandOrderRow>? = transaction {
     val rows = CaseDemandOrders.selectAll()
-        .where { CaseDemandOrders.caseId eq caseId }
+        .where { CaseDemandOrders.versionId eq versionId }
         .map { CaseDemandOrderRow(demandId = it[CaseDemandOrders.demandId], order = it[CaseDemandOrders.order]) }
     if (rows.isEmpty()) null else rows
 }
 
 /** Loads the lookup structure threaded into planning: demand_id -> canonical order. Returns
- *  null when no KB exists for this case (planning falls back to raw `(priority, demand_id)`
+ *  null when no KB exists for [versionId] (planning falls back to raw `(priority, demand_id)`
  *  sort, per-demand). */
-internal fun loadDemandOrderMap(caseId: Int): Map<String, Int>? =
-    loadCaseDemandOrderRows(caseId)?.associate { it.demandId to it.order }
+internal fun loadDemandOrderMap(versionId: Int): Map<String, Int>? =
+    loadCaseDemandOrderRows(versionId)?.associate { it.demandId to it.order }
 
 private fun toRows(candidates: List<DemandOrderRow>): List<CaseDemandOrderRow> =
     candidates.map { CaseDemandOrderRow(it.demandId, it.order) }
 
-/** Recompute and persist case_demand_order's content-hash fingerprint for [caseId] from the
+/** Recompute and persist case_demand_order's content-hash fingerprint for [versionId] from the
  *  given full current row set — see Preferences.kt's recomputeCasePreferenceHash for the same
  *  upsert-not-update-only rationale (import here never created a config row before this
  *  either). */
-private fun recomputeCaseDemandOrderHash(caseId: Int, rows: List<CaseDemandOrderRow>) {
+private fun recomputeCaseDemandOrderHash(caseId: Int, versionId: Int, rows: List<CaseDemandOrderRow>) {
     val hash = KbFingerprint.hashRows(rows.map { "${it.demandId}|${it.order}" })
-    val existing = CaseDemandOrderConfigs.selectAll().where { CaseDemandOrderConfigs.caseId eq caseId }.singleOrNull()
+    val existing = CaseDemandOrderConfigs.selectAll().where { CaseDemandOrderConfigs.versionId eq versionId }.singleOrNull()
     if (existing != null) {
-        CaseDemandOrderConfigs.update({ CaseDemandOrderConfigs.caseId eq caseId }) {
+        CaseDemandOrderConfigs.update({ CaseDemandOrderConfigs.versionId eq versionId }) {
             it[CaseDemandOrderConfigs.contentHash] = hash
         }
     } else {
         CaseDemandOrderConfigs.insert {
             it[CaseDemandOrderConfigs.caseId] = caseId
+            it[CaseDemandOrderConfigs.versionId] = versionId
             it[CaseDemandOrderConfigs.contentHash] = hash
         }
     }
 }
 
+private fun versionJson(caseId: Int, versionId: Int): JsonObject {
+    val summary = CaseConfigVersioning.listVersions(caseId, KIND).firstOrNull { it.id == versionId }
+    return buildJsonObject {
+        put("id", versionId)
+        put("name", summary?.name)
+        put("comments", summary?.comments)
+        put("is_default", summary?.isDefault ?: false)
+        put("referenced", summary?.referenced ?: false)
+    }
+}
+
 /**
- * Runs [buildDemandOrder] for [caseId] and persists the result — full delete + batch-insert
- * into case_demand_order, plus an upsert of case_demand_order_config.generated_at. Called only
- * from the Generate endpoint — deliberately NOT auto-seeded from the plan-run background job,
- * since Demand Ordering is optional-by-design (planning falls back to raw `(priority,
- * demand_id)` sort when absent; auto-seeding would silently change that fallback behavior
- * without user action).
+ * Runs [buildDemandOrder] for [caseId]/[versionId] and persists the result — full delete +
+ * batch-insert into case_demand_order, plus an upsert of case_demand_order_config.generated_at.
+ * Called only from the Generate endpoint — deliberately NOT auto-seeded from the plan-run
+ * background job, since Demand Ordering is optional-by-design (planning falls back to raw
+ * `(priority, demand_id)` sort when absent; auto-seeding would silently change that fallback
+ * behavior without user action). Deliberately does NOT check "is this version referenced" — see
+ * Allocation.kt's generateAndSeedCaseAllocation's own doc for why that guard belongs in the
+ * route layer, not here.
  */
 internal fun generateAndSeedCaseDemandOrder(
     caseId: Int,
+    versionId: Int,
     data: Map<String, List<Map<String, Any?>>>,
 ): List<CaseDemandOrderRow> {
     val rows = toRows(buildDemandOrder(data))
     transaction {
-        CaseDemandOrders.deleteWhere { CaseDemandOrders.caseId eq caseId }
+        CaseDemandOrders.deleteWhere { CaseDemandOrders.versionId eq versionId }
         if (rows.isNotEmpty()) {
             CaseDemandOrders.batchInsert(rows) { row ->
                 this[CaseDemandOrders.caseId] = caseId
+                this[CaseDemandOrders.versionId] = versionId
                 this[CaseDemandOrders.demandId] = row.demandId
                 this[CaseDemandOrders.order] = row.order
             }
         }
-        val existing = CaseDemandOrderConfigs.selectAll().where { CaseDemandOrderConfigs.caseId eq caseId }.singleOrNull()
+        val existing = CaseDemandOrderConfigs.selectAll().where { CaseDemandOrderConfigs.versionId eq versionId }.singleOrNull()
         if (existing != null) {
-            CaseDemandOrderConfigs.update({ CaseDemandOrderConfigs.caseId eq caseId }) {
+            CaseDemandOrderConfigs.update({ CaseDemandOrderConfigs.versionId eq versionId }) {
                 it[CaseDemandOrderConfigs.generatedAt] = kotlinx.datetime.Clock.System.now()
             }
         } else {
             CaseDemandOrderConfigs.insert {
                 it[CaseDemandOrderConfigs.caseId] = caseId
+                it[CaseDemandOrderConfigs.versionId] = versionId
             }
         }
-        recomputeCaseDemandOrderHash(caseId, rows)
+        recomputeCaseDemandOrderHash(caseId, versionId, rows)
     }
     return rows
 }
 
-internal fun loadCaseDemandOrderConfig(caseId: Int): CaseDemandOrderConfig? = transaction {
-    CaseDemandOrderConfigs.selectAll().where { CaseDemandOrderConfigs.caseId eq caseId }.singleOrNull()?.let {
+internal fun loadCaseDemandOrderConfig(versionId: Int): CaseDemandOrderConfig? = transaction {
+    CaseDemandOrderConfigs.selectAll().where { CaseDemandOrderConfigs.versionId eq versionId }.singleOrNull()?.let {
         CaseDemandOrderConfig(generatedAt = it[CaseDemandOrderConfigs.generatedAt].toString())
     }
 }
@@ -141,6 +161,15 @@ fun Routing.demandOrderingRoutes() {
             ?: throw NoSuchElementException("Case not found")
     }
 
+    fun requireCaseId(call: ApplicationCall): Int {
+        val caseId = call.parameters["case_id"]?.toIntOrNull() ?: throw IllegalArgumentException("Invalid case_id")
+        requireCase(caseId)
+        return caseId
+    }
+
+    fun resolvedVersionId(call: ApplicationCall, caseId: Int): Int =
+        CaseConfigVersioning.resolveVersionId(caseId, KIND, call.request.queryParameters["version_id"]?.toIntOrNull())
+
     fun rowJson(row: CaseDemandOrderRow, ctx: DemandContext?): JsonObject = buildJsonObject {
         put("demand_id", row.demandId)
         put("order", row.order)
@@ -156,32 +185,35 @@ fun Routing.demandOrderingRoutes() {
 
     // ── GET /cases/{case_id}/demand-ordering ──────────────────────────────────
     get("/cases/{case_id}/demand-ordering") {
-        val caseId = call.parameters["case_id"]?.toIntOrNull()
-            ?: throw IllegalArgumentException("Invalid case_id")
-        requireCase(caseId)
-        val rows = loadCaseDemandOrderRows(caseId)
+        val caseId = requireCaseId(call)
+        val versionId = resolvedVersionId(call, caseId)
+        val rows = loadCaseDemandOrderRows(versionId)
         if (rows == null) {
             call.respond(HttpStatusCode.NoContent)
         } else {
             val ctxById = demandContextByIdFor(caseId)
-            val cfg = loadCaseDemandOrderConfig(caseId)
+            val cfg = loadCaseDemandOrderConfig(versionId)
             call.respond(buildJsonObject {
                 put("rows", JsonArray(rows.sortedBy { it.order }.map { rowJson(it, ctxById[it.demandId]) }))
                 if (cfg != null) put("config", configJson(cfg)) else put("config", JsonNull)
+                put("version", versionJson(caseId, versionId))
             })
         }
     }
 
     // ── POST /cases/{case_id}/demand-ordering/generate ────────────────────────
     post("/cases/{case_id}/demand-ordering/generate") {
-        val caseId = call.parameters["case_id"]?.toIntOrNull()
-            ?: throw IllegalArgumentException("Invalid case_id")
-        requireCase(caseId)
+        val caseId = requireCaseId(call)
+        val versionId = resolvedVersionId(call, caseId)
+        if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
+            call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
+            return@post
+        }
         val data = transaction { CaseLoader.load(caseId) }
         if ((data["demand"] ?: emptyList()).isEmpty()) throw IllegalArgumentException("No demand data for case $caseId")
 
-        log.info("[demand-ordering] generating for case {}", caseId)
-        val newRows = generateAndSeedCaseDemandOrder(caseId, data)
+        log.info("[demand-ordering] generating for case {} version {}", caseId, versionId)
+        val newRows = generateAndSeedCaseDemandOrder(caseId, versionId, data)
         log.info("[demand-ordering] generated {} rows for case {}", newRows.size, caseId)
 
         val ctxById = demandContextByIdFor(caseId)
@@ -193,9 +225,12 @@ fun Routing.demandOrderingRoutes() {
     // Upserts by natural key (demand_id); context columns (request_due_time/priority/product_id/
     // customer_id) are read-only/derived and not settable here.
     put("/cases/{case_id}/demand-ordering") {
-        val caseId = call.parameters["case_id"]?.toIntOrNull()
-            ?: throw IllegalArgumentException("Invalid case_id")
-        requireCase(caseId)
+        val caseId = requireCaseId(call)
+        val versionId = resolvedVersionId(call, caseId)
+        if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
+            call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
+            return@put
+        }
         val body = call.receiveText()
         val payload = Json.parseToJsonElement(body).jsonObject
         val rowsJson = payload["rows"]?.jsonArray ?: throw IllegalArgumentException("Missing 'rows'")
@@ -208,23 +243,29 @@ fun Routing.demandOrderingRoutes() {
         transaction {
             for ((demandId, order) in edits) {
                 CaseDemandOrders.update({
-                    (CaseDemandOrders.caseId eq caseId) and (CaseDemandOrders.demandId eq demandId)
+                    (CaseDemandOrders.versionId eq versionId) and (CaseDemandOrders.demandId eq demandId)
                 }) { it[CaseDemandOrders.order] = order }
             }
-            val currentRows = loadCaseDemandOrderRows(caseId) ?: emptyList()
-            recomputeCaseDemandOrderHash(caseId, currentRows)
+            val currentRows = loadCaseDemandOrderRows(versionId) ?: emptyList()
+            recomputeCaseDemandOrderHash(caseId, versionId, currentRows)
         }
         call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", edits.size) })
     }
 
     // ── DELETE /cases/{case_id}/demand-ordering ───────────────────────────────
+    // "Clear" — empties the resolved version's rows (does not delete the version itself; use
+    // DELETE .../versions/{id} for that).
     delete("/cases/{case_id}/demand-ordering") {
-        val caseId = call.parameters["case_id"]?.toIntOrNull()
-            ?: throw IllegalArgumentException("Invalid case_id")
-        requireCase(caseId)
+        val caseId = requireCaseId(call)
+        val versionId = resolvedVersionId(call, caseId)
+        if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
+            call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
+            return@delete
+        }
         val deleted = transaction {
-            CaseDemandOrderConfigs.deleteWhere { CaseDemandOrderConfigs.caseId eq caseId }
-            CaseDemandOrders.deleteWhere { CaseDemandOrders.caseId eq caseId }
+            val n = CaseDemandOrders.deleteWhere { CaseDemandOrders.versionId eq versionId }
+            recomputeCaseDemandOrderHash(caseId, versionId, emptyList())
+            n
         }
         call.respond(buildJsonObject { put("deleted", deleted) })
     }
@@ -232,22 +273,26 @@ fun Routing.demandOrderingRoutes() {
     // ── POST /cases/{case_id}/demand-ordering/import ──────────────────────────
     // Body: CSV text, header: demand_id,order
     post("/cases/{case_id}/demand-ordering/import") {
-        val caseId = call.parameters["case_id"]?.toIntOrNull()
-            ?: throw IllegalArgumentException("Invalid case_id")
-        requireCase(caseId)
+        val caseId = requireCaseId(call)
+        val versionId = resolvedVersionId(call, caseId)
+        if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
+            call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
+            return@post
+        }
         val csvText = call.receiveText()
         val rows = parseCsvDemandOrder(csvText)
-        log.info("[demand-ordering] importing {} rows for case {}", rows.size, caseId)
+        log.info("[demand-ordering] importing {} rows for case {} version {}", rows.size, caseId, versionId)
         transaction {
-            CaseDemandOrders.deleteWhere { CaseDemandOrders.caseId eq caseId }
+            CaseDemandOrders.deleteWhere { CaseDemandOrders.versionId eq versionId }
             if (rows.isNotEmpty()) {
                 CaseDemandOrders.batchInsert(rows) { row ->
                     this[CaseDemandOrders.caseId] = caseId
+                    this[CaseDemandOrders.versionId] = versionId
                     this[CaseDemandOrders.demandId] = row.demandId
                     this[CaseDemandOrders.order] = row.order
                 }
             }
-            recomputeCaseDemandOrderHash(caseId, rows)
+            recomputeCaseDemandOrderHash(caseId, versionId, rows)
         }
         val ctxById = demandContextByIdFor(caseId)
         call.respond(buildJsonObject { put("rows", JsonArray(rows.sortedBy { it.order }.map { rowJson(it, ctxById[it.demandId]) })) })
@@ -255,12 +300,11 @@ fun Routing.demandOrderingRoutes() {
 
     // ── GET /cases/{case_id}/demand-ordering/export ───────────────────────────
     get("/cases/{case_id}/demand-ordering/export") {
-        val caseId = call.parameters["case_id"]?.toIntOrNull()
-            ?: throw IllegalArgumentException("Invalid case_id")
-        requireCase(caseId)
+        val caseId = requireCaseId(call)
+        val versionId = resolvedVersionId(call, caseId)
         val rows = transaction {
             CaseDemandOrders.selectAll()
-                .where { CaseDemandOrders.caseId eq caseId }
+                .where { CaseDemandOrders.versionId eq versionId }
                 .orderBy(CaseDemandOrders.order to SortOrder.ASC)
                 .map { CaseDemandOrderRow(it[CaseDemandOrders.demandId], it[CaseDemandOrders.order]) }
         }
@@ -272,6 +316,86 @@ fun Routing.demandOrderingRoutes() {
         }
         call.response.headers.append(HttpHeaders.ContentDisposition, "attachment; filename=\"demand_ordering_case_$caseId.csv\"")
         call.respondText(sb.toString(), ContentType.Text.CSV)
+    }
+
+    // ── GET /cases/{case_id}/demand-ordering/versions ─────────────────────────
+    get("/cases/{case_id}/demand-ordering/versions") {
+        val caseId = requireCaseId(call)
+        val versions = CaseConfigVersioning.listVersions(caseId, KIND)
+        call.respond(buildJsonObject {
+            put("versions", JsonArray(versions.map { v ->
+                buildJsonObject {
+                    put("id", v.id); put("name", v.name); put("comments", v.comments)
+                    put("is_default", v.isDefault); put("referenced", v.referenced)
+                    put("created_at", v.createdAt); put("updated_at", v.updatedAt)
+                }
+            }))
+        })
+    }
+
+    // ── POST /cases/{case_id}/demand-ordering/versions ("Save As") ────────────
+    // Body: { name?, comments?, rows: [{ demand_id, order }] }
+    post("/cases/{case_id}/demand-ordering/versions") {
+        val caseId = requireCaseId(call)
+        val body = call.receiveText()
+        val payload = Json.parseToJsonElement(body).jsonObject
+        val name = payload["name"]?.jsonPrimitive?.contentOrNull
+        val comments = payload["comments"]?.jsonPrimitive?.contentOrNull
+        val rows = (payload["rows"]?.jsonArray ?: JsonArray(emptyList())).map { el ->
+            val obj = el.jsonObject
+            CaseDemandOrderRow(
+                demandId = obj["demand_id"]?.jsonPrimitive?.content ?: throw IllegalArgumentException("Missing demand_id"),
+                order = obj["order"]?.jsonPrimitive?.intOrNull ?: throw IllegalArgumentException("Missing order"),
+            )
+        }
+        val versionId = transaction {
+            val newId = CaseConfigVersioning.createVersion(caseId, KIND, name, comments)
+            if (rows.isNotEmpty()) {
+                CaseDemandOrders.batchInsert(rows) { row ->
+                    this[CaseDemandOrders.caseId] = caseId
+                    this[CaseDemandOrders.versionId] = newId
+                    this[CaseDemandOrders.demandId] = row.demandId
+                    this[CaseDemandOrders.order] = row.order
+                }
+            }
+            CaseDemandOrderConfigs.insert {
+                it[CaseDemandOrderConfigs.caseId] = caseId
+                it[CaseDemandOrderConfigs.versionId] = newId
+            }
+            recomputeCaseDemandOrderHash(caseId, newId, rows)
+            newId
+        }
+        call.respond(HttpStatusCode.Created, versionJson(caseId, versionId))
+    }
+
+    // ── PUT /cases/{case_id}/demand-ordering/versions/{version_id} ────────────
+    // Body: { name?, comments?, is_default? } — rename/comment/set-default, always allowed.
+    put("/cases/{case_id}/demand-ordering/versions/{version_id}") {
+        val caseId = requireCaseId(call)
+        val versionId = call.parameters["version_id"]?.toIntOrNull() ?: throw IllegalArgumentException("Invalid version_id")
+        val body = call.receiveText()
+        val payload = Json.parseToJsonElement(body).jsonObject
+        if (payload.containsKey("name") || payload.containsKey("comments")) {
+            CaseConfigVersioning.renameVersion(versionId, payload["name"]?.jsonPrimitive?.contentOrNull, payload["comments"]?.jsonPrimitive?.contentOrNull)
+        }
+        if (payload["is_default"]?.jsonPrimitive?.booleanOrNull == true) {
+            CaseConfigVersioning.setDefaultVersion(caseId, KIND, versionId)
+        }
+        call.respond(versionJson(caseId, versionId))
+    }
+
+    // ── DELETE /cases/{case_id}/demand-ordering/versions/{version_id} ─────────
+    delete("/cases/{case_id}/demand-ordering/versions/{version_id}") {
+        val caseId = requireCaseId(call)
+        val versionId = call.parameters["version_id"]?.toIntOrNull() ?: throw IllegalArgumentException("Invalid version_id")
+        try {
+            CaseConfigVersioning.deleteVersion(caseId, KIND, versionId)
+            call.respond(HttpStatusCode.OK, buildJsonObject { put("deleted", true) })
+        } catch (e: CaseConfigVersioning.VersionInUseException) {
+            call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
+        } catch (e: CaseConfigVersioning.VersionIsDefaultException) {
+            call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_is_default") })
+        }
     }
 }
 

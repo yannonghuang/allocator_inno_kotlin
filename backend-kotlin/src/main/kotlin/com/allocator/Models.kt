@@ -112,6 +112,14 @@ data class PlanRunResponse(
     @SerialName("total_requested") val totalRequested: Double? = null,
     @SerialName("manufacturing_total_quantity") val mfgTotalQty: Double? = null,
     @SerialName("inventory_consumed_total") val invConsumedTotal: Double? = null,
+    // Which version of each of the 5 external config objects this run used (see
+    // CaseConfigVersions' own doc) — lets ConfigDetailView's drilldown fetch the EXACT
+    // historical version instead of "whatever is live now". Null for pre-versioning runs.
+    @SerialName("case_alloc_version_id") val caseAllocVersionId: Int? = null,
+    @SerialName("pref_version_id") val prefVersionId: Int? = null,
+    @SerialName("demand_order_version_id") val demandOrderVersionId: Int? = null,
+    @SerialName("purchasable_material_version_id") val purchasableMaterialVersionId: Int? = null,
+    @SerialName("constraint_version_id") val constraintVersionId: Int? = null,
 )
 
 @Serializable

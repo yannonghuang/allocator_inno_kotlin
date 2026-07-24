@@ -1,22 +1,32 @@
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
-import { useParams } from 'next/navigation';
+import { useParams, useSearchParams } from 'next/navigation';
 import { useTranslations } from 'next-intl';
 import {
   DemandOrderRow,
   DemandOrderConfig,
+  ConfigVersion,
+  createDemandOrderingVersion,
   deleteDemandOrdering,
+  deleteDemandOrderingVersion,
   exportDemandOrderingCsv,
   generateDemandOrdering,
   getDemandOrdering,
   importDemandOrderingCsv,
+  listDemandOrderingVersions,
   updateDemandOrderRows,
+  updateDemandOrderingVersion,
 } from '../../../../lib/api';
+import { VersionSwitcher } from '@/app/components/VersionSwitcher';
+import { DemandOrderTable } from '@/app/components/DemandOrderTable';
 
 export function DemandOrderingPage() {
   const params = useParams();
   const caseId = Number(params.id);
+  // Optional ?version_id= — set when arriving from ConfigDetailView's "Open full page" link for
+  // a specific historical version (see CaseConfigVersions' own doc).
+  const initialVersionId = Number(useSearchParams().get('version_id')) || undefined;
   const t = useTranslations('demandOrderingPage');
 
   const [rows, setRows] = useState<DemandOrderRow[] | null>(null);
@@ -24,10 +34,6 @@ export function DemandOrderingPage() {
 
   // Pending edit buffer — demand_id -> new order value, separate from committed `rows` until Save.
   const [pendingChanges, setPendingChanges] = useState<Map<string, number>>(new Map());
-  const [editingKey, setEditingKey] = useState<string | null>(null);
-  const [editValue, setEditValue] = useState('');
-
-  const [search, setSearch] = useState('');
 
   const [generating, setGenerating] = useState(false);
   const [importLoading, setImportLoading] = useState(false);
@@ -36,20 +42,28 @@ export function DemandOrderingPage() {
   const [error, setError] = useState<string | null>(null);
   const importRef = useRef<HTMLInputElement>(null);
 
+  const [versions, setVersions] = useState<ConfigVersion[]>([]);
+  const [versionId, setVersionId] = useState<number | null>(null);
+  const referenced = versions.find((v) => v.id === versionId)?.referenced ?? false;
+
   const hasPending = pendingChanges.size > 0;
 
   // ── Load ──────────────────────────────────────────────────────────────────
 
-  useEffect(() => {
+  const loadVersion = React.useCallback((vId: number | undefined) => {
     if (!caseId || isNaN(caseId)) return;
     setRows(null);
-    getDemandOrdering(caseId)
-      .then((res) => {
+    Promise.all([getDemandOrdering(caseId, vId), listDemandOrderingVersions(caseId)])
+      .then(([res, vs]) => {
         setRows(res?.rows ?? []);
         setConfig(res?.config ?? null);
+        setVersions(vs);
+        setVersionId(vId ?? vs.find((v) => v.is_default)?.id ?? vs[0]?.id ?? null);
       })
       .catch((e) => setError(String(e)));
   }, [caseId]);
+
+  useEffect(() => { loadVersion(initialVersionId); }, [loadVersion, initialVersionId]);
 
   // ── Navigation guards ─────────────────────────────────────────────────────
 
@@ -80,7 +94,7 @@ export function DemandOrderingPage() {
   const saveRef = useRef<() => void>(() => {});
 
   const handleSave = React.useCallback(async () => {
-    if (!pendingChanges.size || !rows) return;
+    if (!pendingChanges.size || !rows || referenced) return;
     setSaving(true);
     setError(null);
     try {
@@ -89,7 +103,7 @@ export function DemandOrderingPage() {
         const base = byId.get(demandId)!;
         return { ...base, order };
       });
-      await updateDemandOrderRows(caseId, updated.map((r) => ({ demand_id: r.demand_id, order: r.order })));
+      await updateDemandOrderRows(caseId, updated.map((r) => ({ demand_id: r.demand_id, order: r.order })), versionId ?? undefined);
       setRows((prev) => {
         if (!prev) return prev;
         const next = [...prev];
@@ -105,32 +119,32 @@ export function DemandOrderingPage() {
     } finally {
       setSaving(false);
     }
-  }, [pendingChanges, rows, caseId]);
+  }, [pendingChanges, rows, caseId, versionId, referenced]);
 
   useEffect(() => { saveRef.current = handleSave; }, [handleSave]);
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
-      if (editingKey) return;
       const mod = e.metaKey || e.ctrlKey;
       if (mod && e.key === 's') { e.preventDefault(); saveRef.current(); }
     };
     window.addEventListener('keydown', h);
     return () => window.removeEventListener('keydown', h);
-  }, [editingKey]);
+  }, []);
 
   // ── Actions ───────────────────────────────────────────────────────────────
 
   const clearPending = () => setPendingChanges(new Map());
 
   const handleGenerate = async () => {
+    if (referenced) return;
     if (hasPending && !confirm(t('confirmDiscard'))) return;
     setGenerating(true); setError(null);
     try {
-      const newRows = await generateDemandOrdering(caseId);
+      const newRows = await generateDemandOrdering(caseId, versionId ?? undefined);
       setRows(newRows);
       clearPending();
-      const res = await getDemandOrdering(caseId);
+      const res = await getDemandOrdering(caseId, versionId ?? undefined);
       setConfig(res?.config ?? null);
     } catch (e) { setError(String(e)); }
     finally { setGenerating(false); }
@@ -138,20 +152,20 @@ export function DemandOrderingPage() {
 
   const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
+    if (!file || referenced) return;
     if (hasPending && !confirm(t('confirmDiscard'))) {
       if (importRef.current) importRef.current.value = '';
       return;
     }
     setImportLoading(true); setError(null);
-    try { setRows(await importDemandOrderingCsv(caseId, await file.text())); clearPending(); }
+    try { setRows(await importDemandOrderingCsv(caseId, await file.text(), versionId ?? undefined)); clearPending(); }
     catch (e) { setError(String(e)); }
     finally { setImportLoading(false); if (importRef.current) importRef.current.value = ''; }
   };
 
   const handleExport = async () => {
     try {
-      const csv = await exportDemandOrderingCsv(caseId);
+      const csv = await exportDemandOrderingCsv(caseId, versionId ?? undefined);
       const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
       const a = Object.assign(document.createElement('a'), { href: url, download: `demand_ordering_case_${caseId}.csv` });
       a.click(); URL.revokeObjectURL(url);
@@ -159,11 +173,48 @@ export function DemandOrderingPage() {
   };
 
   const handleClear = async () => {
-    if (!confirm(t('confirmClear'))) return;
+    if (referenced || !confirm(t('confirmClear'))) return;
     setClearing(true);
-    try { await deleteDemandOrdering(caseId); setRows([]); setConfig(null); clearPending(); }
+    try { await deleteDemandOrdering(caseId, versionId ?? undefined); setRows([]); setConfig(null); clearPending(); }
     catch (e) { setError(String(e)); }
     finally { setClearing(false); }
+  };
+
+  // ── Versioning ────────────────────────────────────────────────────────────
+
+  const handleSwitchVersion = (vId: number) => { setVersionId(vId); loadVersion(vId); };
+
+  const handleSaveAs = async (name: string | undefined, comments: string | undefined) => {
+    setSaving(true); setError(null);
+    try {
+      const v = await createDemandOrderingVersion(caseId, { name, comments, rows: (rows ?? []).map((r) => ({ demand_id: r.demand_id, order: r.order })) });
+      clearPending();
+      loadVersion(v.id);
+    } catch (e) { setError(String(e)); }
+    finally { setSaving(false); }
+  };
+
+  const handleSetDefault = async (vId: number) => {
+    try {
+      await updateDemandOrderingVersion(caseId, vId, { is_default: true });
+      setVersions(await listDemandOrderingVersions(caseId));
+    } catch (e) { setError(String(e)); }
+  };
+
+  const handleRename = async (vId: number, name: string | undefined, comments: string | undefined) => {
+    try {
+      await updateDemandOrderingVersion(caseId, vId, { name: name ?? null, comments: comments ?? null });
+      setVersions(await listDemandOrderingVersions(caseId));
+    } catch (e) { setError(String(e)); }
+  };
+
+  const handleDeleteVersion = async (vId: number) => {
+    try {
+      await deleteDemandOrderingVersion(caseId, vId);
+      if (vId === versionId) { loadVersion(undefined); } else {
+        setVersions(await listDemandOrderingVersions(caseId));
+      }
+    } catch (e) { setError(String(e)); }
   };
 
   // ── Styles ────────────────────────────────────────────────────────────────
@@ -176,29 +227,6 @@ export function DemandOrderingPage() {
               : v === 'save'   ? '#064e3b'  : '#1c1c1f',
     color: v === 'danger' ? '#fca5a5' : v === 'save' ? '#6ee7b7' : '#e4e4e7',
   });
-
-  const numInput: React.CSSProperties = {
-    width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40',
-    borderRadius: 4, color: '#fafafa', fontSize: '0.8rem',
-  };
-
-  // ── Derived data (hooks — must run unconditionally, before any early return) ─
-
-  const effectiveOrder = (r: DemandOrderRow): number => pendingChanges.get(r.demand_id) ?? r.order;
-
-  // Always sorted by effective order (so up/down swap-with-neighbor is well-defined), optionally
-  // narrowed by a free-text search across demand_id/customer_id/product_id.
-  const visibleRows: DemandOrderRow[] = React.useMemo(() => {
-    const q = search.trim().toLowerCase();
-    const filtered = q
-      ? (rows ?? []).filter((r) =>
-          r.demand_id.toLowerCase().includes(q) ||
-          r.customer_id.toLowerCase().includes(q) ||
-          r.product_id.toLowerCase().includes(q))
-      : (rows ?? []);
-    return [...filtered].sort((a, b) => effectiveOrder(a) - effectiveOrder(b));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rows, search, pendingChanges]);
 
   // ── Render ────────────────────────────────────────────────────────────────
 
@@ -213,40 +241,36 @@ export function DemandOrderingPage() {
     });
   };
 
-  const swapWithNeighbor = (index: number, direction: -1 | 1) => {
-    const other = index + direction;
-    if (other < 0 || other >= visibleRows.length) return;
-    const a = visibleRows[index];
-    const b = visibleRows[other];
-    const aOrder = effectiveOrder(a), bOrder = effectiveOrder(b);
-    setPendingChanges((prev) => {
-      const next = new Map(prev);
-      if (bOrder === a.order) next.delete(a.demand_id); else next.set(a.demand_id, bOrder);
-      if (aOrder === b.order) next.delete(b.demand_id); else next.set(b.demand_id, aOrder);
-      return next;
-    });
-  };
-
   return (
     <div style={{ padding: '1.25rem 1.5rem', minHeight: '100vh', background: '#0e0e10', color: '#e4e4e7' }}>
 
+      <VersionSwitcher
+        versions={versions}
+        currentVersionId={versionId}
+        onSwitch={handleSwitchVersion}
+        onSaveAs={handleSaveAs}
+        onSetDefault={handleSetDefault}
+        onRename={handleRename}
+        onDelete={handleDeleteVersion}
+      />
+
       {/* Action bar */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '0.5rem' }}>
-        <button style={btn('primary')} onClick={handleGenerate} disabled={generating}>
+        <button style={btn('primary')} onClick={handleGenerate} disabled={generating || referenced}>
           {generating ? t('generating') : t('generate')}
         </button>
-        <button style={btn()} onClick={() => importRef.current?.click()} disabled={importLoading}>
+        <button style={btn()} onClick={() => importRef.current?.click()} disabled={importLoading || referenced}>
           {importLoading ? t('uploading') : t('uploadCsv')}
         </button>
         <input ref={importRef} type="file" accept=".csv,text/csv" style={{ display: 'none' }} onChange={handleImport} />
         <button style={btn()} onClick={handleExport} disabled={!rows.length}>{t('downloadCsv')}</button>
-        <button style={btn('danger')} onClick={handleClear} disabled={clearing || !rows.length}>
+        <button style={btn('danger')} onClick={handleClear} disabled={clearing || !rows.length || referenced}>
           {clearing ? t('clearing') : t('clear')}
         </button>
         {!!rows.length && (
           <button
             style={{ ...btn(hasPending ? 'save' : 'ghost'), opacity: hasPending ? 1 : 0.35 }}
-            onClick={handleSave} disabled={!hasPending || saving} title={t('saveTitle')}>
+            onClick={handleSave} disabled={!hasPending || saving || referenced} title={t('saveTitle')}>
             {saving ? t('saving') : hasPending ? t('saveWithCount', { count: pendingChanges.size }) : t('save')}
           </button>
         )}
@@ -297,78 +321,9 @@ export function DemandOrderingPage() {
         <div style={{ padding: '3rem 1rem', textAlign: 'center', color: '#52525b', fontSize: '0.875rem' }}>
           {t('emptyHint')} <strong style={{ color: '#93c5fd' }}>{t('generate')}</strong> {t('emptyHintMiddle')} <strong style={{ color: '#93c5fd' }}>{t('uploadCsv')}</strong> {t('emptyHintAfter')}
         </div>
-      ) : (<>
-        <div style={{ marginBottom: '0.75rem' }}>
-          <input
-            placeholder={t('searchPlaceholder')}
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            style={{ ...numInput, width: 260 }}
-          />
-        </div>
-
-        <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: '0.8rem' }}>
-          <thead>
-            <tr style={{ borderBottom: '1px solid #27272a', color: '#71717a' }}>
-              <th style={{ textAlign: 'left', padding: '0.25rem 0.5rem' }}></th>
-              <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem' }}>{t('colOrder')}</th>
-              <th style={{ textAlign: 'left', padding: '0.25rem 0.5rem' }}>{t('colDemandId')}</th>
-              <th style={{ textAlign: 'left', padding: '0.25rem 0.5rem' }}>{t('colCustomer')}</th>
-              <th style={{ textAlign: 'left', padding: '0.25rem 0.5rem' }}>{t('colProduct')}</th>
-              <th style={{ textAlign: 'left', padding: '0.25rem 0.5rem' }}>{t('colDueTime')}</th>
-              <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem' }}>{t('colPriority')}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {visibleRows.map((row, i) => {
-              const k = row.demand_id;
-              const val = effectiveOrder(row);
-              const dirty = pendingChanges.has(k);
-              return (
-                <tr key={k} style={{ borderBottom: '1px solid #1c1c1f' }}>
-                  <td style={{ padding: '0.25rem 0.5rem', whiteSpace: 'nowrap' }}>
-                    <button
-                      onClick={() => swapWithNeighbor(i, -1)} disabled={i === 0}
-                      title={t('moveUp')}
-                      style={{ ...btn(), padding: '1px 6px', opacity: i === 0 ? 0.3 : 1 }}
-                    >▲</button>
-                    <button
-                      onClick={() => swapWithNeighbor(i, 1)} disabled={i === visibleRows.length - 1}
-                      title={t('moveDown')}
-                      style={{ ...btn(), padding: '1px 6px', marginLeft: 4, opacity: i === visibleRows.length - 1 ? 0.3 : 1 }}
-                    >▼</button>
-                  </td>
-                  <td style={{ padding: '0.25rem 0.5rem', textAlign: 'right' }}>
-                    {editingKey === k ? (
-                      <input
-                        autoFocus type="number" value={editValue}
-                        onChange={(e) => setEditValue(e.target.value)}
-                        onBlur={() => {
-                          const n = parseInt(editValue, 10);
-                          setEditingKey(null);
-                          if (!isNaN(n)) stageOrder(k, n, row.order);
-                        }}
-                        onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); if (e.key === 'Escape') setEditingKey(null); }}
-                        style={numInput}
-                      />
-                    ) : (
-                      <span
-                        onClick={() => { setEditingKey(k); setEditValue(String(val)); }}
-                        style={{ cursor: 'pointer', color: dirty ? '#fdba74' : '#e4e4e7', fontVariantNumeric: 'tabular-nums' }}
-                      >{val}</span>
-                    )}
-                  </td>
-                  <td style={{ padding: '0.25rem 0.5rem', fontFamily: 'monospace', fontSize: '0.75rem' }}>{row.demand_id}</td>
-                  <td style={{ padding: '0.25rem 0.5rem' }}>{row.customer_id}</td>
-                  <td style={{ padding: '0.25rem 0.5rem' }}>{row.product_id}</td>
-                  <td style={{ padding: '0.25rem 0.5rem', color: '#a1a1aa' }}>{row.request_due_time ?? '—'}</td>
-                  <td style={{ padding: '0.25rem 0.5rem', textAlign: 'right', color: '#a1a1aa' }}>{row.priority}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </>)}
+      ) : (
+        <DemandOrderTable rows={rows} pendingChanges={pendingChanges} onStageOrder={stageOrder} t={t} />
+      )}
     </div>
   );
 }
