@@ -1,27 +1,25 @@
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
-import { useParams } from 'next/navigation';
+import { useParams, useSearchParams } from 'next/navigation';
 import { useTranslations } from 'next-intl';
 import {
   PreferenceRow,
   PreferenceConfig,
+  ConfigVersion,
+  createPreferencesVersion,
   deletePreferences,
+  deletePreferencesVersion,
   exportPreferencesCsv,
   generatePreferences,
   getPreferences,
   importPreferencesCsv,
+  listPreferencesVersions,
   updatePreferenceRows,
+  updatePreferencesVersion,
 } from '../../../../lib/api';
-import { SortFilterTable, Column } from '../../../components/SortFilterTable';
-
-function rowKey(r: Pick<PreferenceRow, 'product_id' | 'location_id' | 'method_type' | 'method_key'>): string {
-  return `${r.product_id}|${r.location_id}|${r.method_type}|${r.method_key}`;
-}
-
-/** SortFilterTable needs a single unique field for React keys — PreferenceRow's uniqueness is
- *  a composite of 4 fields, so we attach the computed natural key as `_key` before rendering. */
-type TableRow = PreferenceRow & { _key: string };
+import { VersionSwitcher } from '@/app/components/VersionSwitcher';
+import { PreferenceTable, rowKey, effectivePreference as effectivePreferenceOf } from '@/app/components/PreferenceTable';
 
 function fmtScore(v: number | null): string {
   if (v === null) return '—';
@@ -87,6 +85,9 @@ function LookupAutocomplete({
 export function PreferencesPage() {
   const params = useParams();
   const caseId = Number(params.id);
+  // Optional ?version_id= — set when arriving from ConfigDetailView's "Open full page" link for
+  // a specific historical version (see CaseConfigVersions' own doc).
+  const initialVersionId = Number(useSearchParams().get('version_id')) || undefined;
   const t = useTranslations('preferencesPage');
 
   const [rows, setRows] = useState<PreferenceRow[] | null>(null);
@@ -113,15 +114,19 @@ export function PreferencesPage() {
   const [error, setError] = useState<string | null>(null);
   const importRef = useRef<HTMLInputElement>(null);
 
+  const [versions, setVersions] = useState<ConfigVersion[]>([]);
+  const [versionId, setVersionId] = useState<number | null>(null);
+  const referenced = versions.find((v) => v.id === versionId)?.referenced ?? false;
+
   const hasPending = pendingChanges.size > 0;
 
   // ── Load ──────────────────────────────────────────────────────────────────
 
-  useEffect(() => {
+  const loadVersion = React.useCallback((vId: number | undefined) => {
     if (!caseId || isNaN(caseId)) return;
     setRows(null);
-    getPreferences(caseId)
-      .then((res) => {
+    Promise.all([getPreferences(caseId, vId), listPreferencesVersions(caseId)])
+      .then(([res, vs]) => {
         setRows(res?.rows ?? []);
         setConfig(res?.config ?? null);
         if (res?.config) {
@@ -130,9 +135,13 @@ export function PreferencesPage() {
           setInventoryWeight(res.config.inventory_weight);
           setCriticalMaterialWeight(res.config.critical_material_weight);
         }
+        setVersions(vs);
+        setVersionId(vId ?? vs.find((v) => v.is_default)?.id ?? vs[0]?.id ?? null);
       })
       .catch((e) => setError(String(e)));
   }, [caseId]);
+
+  useEffect(() => { loadVersion(initialVersionId); }, [loadVersion, initialVersionId]);
 
   // ── Navigation guards ─────────────────────────────────────────────────────
 
@@ -163,7 +172,7 @@ export function PreferencesPage() {
   const saveRef = useRef<() => void>(() => {});
 
   const handleSave = React.useCallback(async () => {
-    if (!pendingChanges.size || !rows) return;
+    if (!pendingChanges.size || !rows || referenced) return;
     setSaving(true);
     setError(null);
     try {
@@ -172,7 +181,7 @@ export function PreferencesPage() {
         const base = byKey.get(key)!;
         return { ...base, preference };
       });
-      await updatePreferenceRows(caseId, updated);
+      await updatePreferenceRows(caseId, updated, versionId ?? undefined);
       setRows((prev) => {
         if (!prev) return prev;
         const next = [...prev];
@@ -188,7 +197,7 @@ export function PreferencesPage() {
     } finally {
       setSaving(false);
     }
-  }, [pendingChanges, rows, caseId]);
+  }, [pendingChanges, rows, caseId, versionId, referenced]);
 
   useEffect(() => { saveRef.current = handleSave; }, [handleSave]);
 
@@ -207,16 +216,17 @@ export function PreferencesPage() {
   const clearPending = () => setPendingChanges(new Map());
 
   const handleGenerate = async () => {
+    if (referenced) return;
     if (hasPending && !confirm(t('confirmDiscard'))) return;
     setGenerating(true); setError(null);
     try {
       const newRows = await generatePreferences(caseId, {
         max_bom_depth: maxBomDepth, delivery_weight: deliveryWeight, inventory_weight: inventoryWeight,
         critical_material_weight: criticalMaterialWeight,
-      });
+      }, versionId ?? undefined);
       setRows(newRows);
       clearPending();
-      const res = await getPreferences(caseId);
+      const res = await getPreferences(caseId, versionId ?? undefined);
       setConfig(res?.config ?? null);
     } catch (e) { setError(String(e)); }
     finally { setGenerating(false); }
@@ -224,20 +234,20 @@ export function PreferencesPage() {
 
   const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
+    if (!file || referenced) return;
     if (hasPending && !confirm(t('confirmDiscard'))) {
       if (importRef.current) importRef.current.value = '';
       return;
     }
     setImportLoading(true); setError(null);
-    try { setRows(await importPreferencesCsv(caseId, await file.text())); clearPending(); }
+    try { setRows(await importPreferencesCsv(caseId, await file.text(), versionId ?? undefined)); clearPending(); }
     catch (e) { setError(String(e)); }
     finally { setImportLoading(false); if (importRef.current) importRef.current.value = ''; }
   };
 
   const handleExport = async () => {
     try {
-      const csv = await exportPreferencesCsv(caseId);
+      const csv = await exportPreferencesCsv(caseId, versionId ?? undefined);
       const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
       const a = Object.assign(document.createElement('a'), { href: url, download: `preferences_case_${caseId}.csv` });
       a.click(); URL.revokeObjectURL(url);
@@ -245,11 +255,48 @@ export function PreferencesPage() {
   };
 
   const handleClear = async () => {
-    if (!confirm(t('confirmClear'))) return;
+    if (referenced || !confirm(t('confirmClear'))) return;
     setClearing(true);
-    try { await deletePreferences(caseId); setRows([]); setConfig(null); clearPending(); }
+    try { await deletePreferences(caseId, versionId ?? undefined); setRows([]); setConfig(null); clearPending(); }
     catch (e) { setError(String(e)); }
     finally { setClearing(false); }
+  };
+
+  // ── Versioning ────────────────────────────────────────────────────────────
+
+  const handleSwitchVersion = (vId: number) => { setVersionId(vId); loadVersion(vId); };
+
+  const handleSaveAs = async (name: string | undefined, comments: string | undefined) => {
+    setSaving(true); setError(null);
+    try {
+      const v = await createPreferencesVersion(caseId, { name, comments, rows: rows ?? [] });
+      clearPending();
+      loadVersion(v.id);
+    } catch (e) { setError(String(e)); }
+    finally { setSaving(false); }
+  };
+
+  const handleSetDefault = async (vId: number) => {
+    try {
+      await updatePreferencesVersion(caseId, vId, { is_default: true });
+      setVersions(await listPreferencesVersions(caseId));
+    } catch (e) { setError(String(e)); }
+  };
+
+  const handleRename = async (vId: number, name: string | undefined, comments: string | undefined) => {
+    try {
+      await updatePreferencesVersion(caseId, vId, { name: name ?? null, comments: comments ?? null });
+      setVersions(await listPreferencesVersions(caseId));
+    } catch (e) { setError(String(e)); }
+  };
+
+  const handleDeleteVersion = async (vId: number) => {
+    try {
+      await deletePreferencesVersion(caseId, vId);
+      if (vId === versionId) { loadVersion(undefined); } else {
+        setVersions(await listPreferencesVersions(caseId));
+      }
+    } catch (e) { setError(String(e)); }
   };
 
   // ── Styles ────────────────────────────────────────────────────────────────
@@ -270,7 +317,7 @@ export function PreferencesPage() {
 
   // ── Derived data (hooks — must run unconditionally, before any early return) ─
 
-  const effectivePreference = (r: PreferenceRow): number => pendingChanges.get(rowKey(r)) ?? r.preference;
+  const effectivePreference = (r: PreferenceRow): number => effectivePreferenceOf(r, pendingChanges);
 
   const productOptions = React.useMemo(
     () => Array.from(new Set((rows ?? []).map((r) => r.product_id))).sort(), [rows]);
@@ -291,8 +338,6 @@ export function PreferencesPage() {
 
   if (rows === null)
     return <div style={{ padding: '2rem', color: '#71717a', fontSize: '0.875rem' }}>{t('loading')}</div>;
-
-  const tableRows: TableRow[] = rows.map((r) => ({ ...r, _key: rowKey(r) }));
 
   const stagePreference = (key: string, value: number, committed: number) => {
     setPendingChanges((prev) => {
@@ -317,51 +362,18 @@ export function PreferencesPage() {
     });
   };
 
-  const columns: Column<TableRow>[] = [
-    { key: 'product_id', label: t('colProduct'), sortable: true },
-    { key: 'location_id', label: t('colLocation'), sortable: true },
-    { key: 'prod_area', label: t('colProdArea'), sortable: true },
-    { key: 'method_type', label: t('colMethodType'), sortable: true },
-    { key: 'method_key', label: t('colMethodKey'), sortable: true },
-    {
-      key: 'preference', label: t('colPreference'), sortable: true,
-      sortValue: (row) => effectivePreference(row),
-      render: (row) => {
-        const k = rowKey(row);
-        const val = effectivePreference(row);
-        const dirty = pendingChanges.has(k);
-        if (editingKey === k) {
-          return (
-            <input
-              autoFocus type="number" value={editValue}
-              onChange={(e) => setEditValue(e.target.value)}
-              onBlur={() => {
-                const n = parseInt(editValue, 10);
-                setEditingKey(null);
-                if (!isNaN(n)) stagePreference(k, n, row.preference);
-              }}
-              onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); if (e.key === 'Escape') setEditingKey(null); }}
-              style={numInput}
-            />
-          );
-        }
-        return (
-          <span
-            onClick={() => { setEditingKey(k); setEditValue(String(val)); }}
-            style={{ cursor: 'pointer', color: dirty ? '#fdba74' : '#e4e4e7', fontVariantNumeric: 'tabular-nums' }}
-          >
-            {val}
-          </span>
-        );
-      },
-    },
-    { key: 'inventory_score', label: t('colInventoryScore'), sortable: true, render: (row) => fmtScore(row.inventory_score) },
-    { key: 'delivery_score', label: t('colDeliveryScore'), sortable: true, render: (row) => fmtScore(row.delivery_score) },
-    { key: 'critical_material_score', label: t('colCriticalMaterialScore'), sortable: true, render: (row) => fmtScore(row.critical_material_score) },
-  ];
-
   return (
     <div style={{ padding: '1.25rem 1.5rem', minHeight: '100vh', background: '#0e0e10', color: '#e4e4e7' }}>
+
+      <VersionSwitcher
+        versions={versions}
+        currentVersionId={versionId}
+        onSwitch={handleSwitchVersion}
+        onSaveAs={handleSaveAs}
+        onSetDefault={handleSetDefault}
+        onRename={handleRename}
+        onDelete={handleDeleteVersion}
+      />
 
       {/* Scoring parameters */}
       <div style={{ border: '1px solid #27272a', borderRadius: 6, padding: '0.6rem 0.75rem', marginBottom: '0.5rem' }}>
@@ -410,21 +422,21 @@ export function PreferencesPage() {
           {t('actionsSectionLabel')}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
-          <button style={btn('primary')} onClick={handleGenerate} disabled={generating}>
+          <button style={btn('primary')} onClick={handleGenerate} disabled={generating || referenced}>
             {generating ? t('generating') : t('generate')}
           </button>
-          <button style={btn()} onClick={() => importRef.current?.click()} disabled={importLoading}>
+          <button style={btn()} onClick={() => importRef.current?.click()} disabled={importLoading || referenced}>
             {importLoading ? t('uploading') : t('uploadCsv')}
           </button>
           <input ref={importRef} type="file" accept=".csv,text/csv" style={{ display: 'none' }} onChange={handleImport} />
           <button style={btn()} onClick={handleExport} disabled={!rows.length}>{t('downloadCsv')}</button>
-          <button style={btn('danger')} onClick={handleClear} disabled={clearing || !rows.length}>
+          <button style={btn('danger')} onClick={handleClear} disabled={clearing || !rows.length || referenced}>
             {clearing ? t('clearing') : t('clear')}
           </button>
           {!!rows.length && (
             <button
               style={{ ...btn(hasPending ? 'save' : 'ghost'), opacity: hasPending ? 1 : 0.35 }}
-              onClick={handleSave} disabled={!hasPending || saving} title={t('saveTitle')}>
+              onClick={handleSave} disabled={!hasPending || saving || referenced} title={t('saveTitle')}>
               {saving ? t('saving') : hasPending ? t('saveWithCount', { count: pendingChanges.size }) : t('save')}
             </button>
           )}
@@ -566,14 +578,11 @@ export function PreferencesPage() {
           )}
         </div>
 
-        <SortFilterTable
-          columns={columns}
-          rows={tableRows}
-          filterKeys={['product_id', 'location_id', 'prod_area', 'method_type', 'method_key']}
-          filterPlaceholder={t('filterPlaceholder')}
-          defaultSortKey="preference"
-          idKey="_key"
-          rowId={(r) => r._key}
+        <PreferenceTable
+          rows={rows}
+          pendingChanges={pendingChanges}
+          onStagePreference={stagePreference}
+          t={t}
         />
       </>)}
     </div>

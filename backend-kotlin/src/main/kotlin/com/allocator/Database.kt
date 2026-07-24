@@ -89,6 +89,10 @@ fun initDatabase() {
     // recomputes signatures so dedup survives.
     com.allocator.services.ScopeRenameMigration.run()
     com.allocator.services.ConfigRetirementMigration.run()
+    // Backfills version_id for the 5 external config objects (Critical Raw Allocation/Supply
+    // Preferences/Demand Ordering/Purchasable Materials/Constraints) — see its own doc.
+    // Independent of the two migrations above; order relative to them doesn't matter.
+    com.allocator.services.ExternalConfigVersioningMigration.run()
 }
 
 /** Create the application database via a connection to the 'postgres' maintenance DB. */
@@ -101,15 +105,50 @@ private fun createDatabase(jdbcUrl: String, user: String, password: String, dbNa
     log.info("Database '$dbName' created.")
 }
 
+/**
+ * Versioning (this session) repurposed 4 existing unique-constraint NAMES to cover a different
+ * column set: `ux_case_preference_key`/`ux_case_demand_order_key`/
+ * `ux_case_purchasable_material_key`/`ux_case_constraint_key` moved from `(case_id, ...)` to
+ * `(version_id, ...)` — see CaseConfigVersions' own doc. `SchemaUtils.createMissingTablesAndColumns`
+ * only ADDS constraints it doesn't recognize; it has no notion of "this name's definition
+ * changed," so on a database that already has the old (case_id-based) constraint it would try to
+ * ADD the new one under the same name and fail with a duplicate-relation error. Worse, leaving
+ * the stale case_id-based constraint in place would incorrectly reject legitimate rows once a
+ * case has more than one version with overlapping natural keys (the common case — "Save As"
+ * typically starts from a near-duplicate of the source version). Dropping them first (no-op via
+ * IF EXISTS on a fresh database, or any database that already migrated) makes both problems
+ * disappear before schema creation runs.
+ */
+private fun dropLegacyExternalConfigConstraints() {
+    val drops = listOf(
+        "ALTER TABLE case_preference DROP CONSTRAINT IF EXISTS ux_case_preference_key",
+        "ALTER TABLE case_demand_order DROP CONSTRAINT IF EXISTS ux_case_demand_order_key",
+        "ALTER TABLE case_purchasable_material DROP CONSTRAINT IF EXISTS ux_case_purchasable_material_key",
+        "ALTER TABLE case_constraint DROP CONSTRAINT IF EXISTS ux_case_constraint_key",
+        // The 5 companion "config" tables were previously unique-per-case (one row per case);
+        // now unique-per-version (one row per version) — same stale-constraint hazard as above,
+        // Exposed auto-named these `{table}_case_id_unique` from the old `caseId.uniqueIndex()`.
+        "ALTER TABLE case_allocation_config DROP CONSTRAINT IF EXISTS case_allocation_config_case_id_unique",
+        "ALTER TABLE case_preference_config DROP CONSTRAINT IF EXISTS case_preference_config_case_id_unique",
+        "ALTER TABLE case_demand_order_config DROP CONSTRAINT IF EXISTS case_demand_order_config_case_id_unique",
+        "ALTER TABLE case_purchasable_material_config DROP CONSTRAINT IF EXISTS case_purchasable_material_config_case_id_unique",
+        "ALTER TABLE case_constraint_config DROP CONSTRAINT IF EXISTS case_constraint_config_case_id_unique",
+    )
+    for (sql in drops) {
+        runCatching { org.jetbrains.exposed.sql.transactions.TransactionManager.current().exec(sql) }
+    }
+}
+
 private fun createTables() {
+    dropLegacyExternalConfigConstraints()
     SchemaUtils.createMissingTablesAndColumns(
-        Cases, Boms, Customers, Locations, Products, Vendors,
+        Cases, CaseConfigVersions, Boms, Customers, Locations, Products, Vendors,
         Demands, MethodBuys, MethodMakes, ProductLocations,
         Operations, Bors, Resources,
         Supplies, MethodMoves, AllocationRuns, AllocationActions,
         PlanRuns, MaterialEvents, WoScheduleEvents, MaterialImpactAssessments,
         PlanPegging, PlanSupplyAllocations, CaseAllocations, NegotiationWaits, PlanRunEvents, AgentMemory,
-        KbRecords, CasePreferences, CasePreferenceConfigs,
+        KbRecords, KbDeletedSignatures, CasePreferences, CasePreferenceConfigs,
         CaseDemandOrders, CaseDemandOrderConfigs, CaseAllocationConfigs,
         CasePurchasableMaterials, CasePurchasableMaterialConfigs, CaseConstraints, CaseConstraintConfigs
     )

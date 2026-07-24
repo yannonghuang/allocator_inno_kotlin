@@ -42,11 +42,9 @@ internal object KbFingerprint {
      *  `_kb_fingerprint` object at submission time, and later read back verbatim by
      *  [CaseBootstrap.signatureFor] — see its own doc for the full "why" (point-in-time
      *  correctness: a signature must reflect what was true when a run actually executed, not
-     *  what's live in these tables NOW). [purchmat]/[constr] are always real (hash or "none")
-     *  on both submission paths — unlike [casealloc]/[pref]/[ord], purchasable-materials and
-     *  constraints are real business/data constraints that bootstrap presets also respect (see
-     *  this class's own doc on [buildFingerprint]'s `consultsOverrideTables` for why those
-     *  three differ). */
+     *  what's live in these tables NOW). Every run — manual Plan Run submission or KB-seeding —
+     *  consults all 5 external config objects (see `runOneBootstrapPreset`'s own doc), so all 5
+     *  segments are always real (a hash, or `"none"` for a genuinely empty resolved version). */
     data class Segments(
         val casealloc: String,
         val pref: String,
@@ -56,41 +54,31 @@ internal object KbFingerprint {
     )
 
     /**
-     * Build the fingerprint segments for [caseId] to embed in a NEWLY SUBMITTED run's config.
+     * Build the fingerprint segments to embed in a NEWLY SUBMITTED run's config, given the
+     * already-resolved (explicit-or-default — see [com.allocator.services.CaseConfigVersioning
+     * .resolveVersionId]) version id for each of the 5 external config objects.
      *
-     * [consultsOverrideTables] gates ONLY `casealloc`/`pref`/`ord` — it must be `false` for the
-     * bootstrap-preset submission path (`runOneBootstrapPreset`) — bootstrap runs `runPlanning`
-     * with allocation/preference/demand-order overrides left `null` regardless of what's in
-     * those tables (confirmed via `PlanningEngine.kt`'s `runPlanning` defaults), so embedding a
-     * real, live-state-dependent hash there would make two byte-identical bootstrap presets, run
-     * weeks apart, collide onto DIFFERENT KB signatures for a distinction that never affected
-     * their actual output — false novelty, the mirror-image bug of the one this fingerprint
-     * exists to fix. Those three segments become the fixed sentinel `"na"` in that case,
-     * regardless of live table state.
-     *
-     * `purchmat`/`constr` are NOT gated by this flag — `Allocate.kt`'s `resolveEffectiveConfig`
-     * reads purchasable-materials/constraints from their own tables unconditionally on both
-     * submission paths (bootstrap presets respect real business constraints too), so these two
-     * segments are always computed live regardless of [consultsOverrideTables].
-     *
-     * `"none"` (distinct from `"na"`) means: this run DOES consult the table, and the table is
-     * genuinely empty for this case — a real, meaningful value, not "not applicable."
+     * `"none"` means: the resolved version is genuinely empty — a real, meaningful value, not
+     * "not applicable."
      */
-    fun buildFingerprint(caseId: Int, consultsOverrideTables: Boolean): Segments = transaction {
+    fun buildFingerprint(
+        caseAllocVersionId: Int,
+        prefVersionId: Int,
+        ordVersionId: Int,
+        purchMatVersionId: Int,
+        constrVersionId: Int,
+    ): Segments = transaction {
         val purchMatHash = CasePurchasableMaterialConfigs.selectAll()
-            .where { CasePurchasableMaterialConfigs.caseId eq caseId }
+            .where { CasePurchasableMaterialConfigs.versionId eq purchMatVersionId }
             .singleOrNull()?.get(CasePurchasableMaterialConfigs.contentHash)
         val constrHash = CaseConstraintConfigs.selectAll()
-            .where { CaseConstraintConfigs.caseId eq caseId }
+            .where { CaseConstraintConfigs.versionId eq constrVersionId }
             .singleOrNull()?.get(CaseConstraintConfigs.contentHash)
-        if (!consultsOverrideTables) {
-            return@transaction Segments("na", "na", "na", purchMatHash ?: "none", constrHash ?: "none")
-        }
-        val allocHash = CaseAllocationConfigs.selectAll().where { CaseAllocationConfigs.caseId eq caseId }
+        val allocHash = CaseAllocationConfigs.selectAll().where { CaseAllocationConfigs.versionId eq caseAllocVersionId }
             .singleOrNull()?.get(CaseAllocationConfigs.contentHash)
-        val prefCfg = CasePreferenceConfigs.selectAll().where { CasePreferenceConfigs.caseId eq caseId }
+        val prefCfg = CasePreferenceConfigs.selectAll().where { CasePreferenceConfigs.versionId eq prefVersionId }
             .singleOrNull()
-        val ordHash = CaseDemandOrderConfigs.selectAll().where { CaseDemandOrderConfigs.caseId eq caseId }
+        val ordHash = CaseDemandOrderConfigs.selectAll().where { CaseDemandOrderConfigs.versionId eq ordVersionId }
             .singleOrNull()?.get(CaseDemandOrderConfigs.contentHash)
         val prefSegment = if (prefCfg == null) "none" else {
             val depth = prefCfg[CasePreferenceConfigs.maxBomDepth]

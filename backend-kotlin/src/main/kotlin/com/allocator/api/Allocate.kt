@@ -1,7 +1,9 @@
 package com.allocator.api
 
 import com.allocator.*
+import com.allocator.services.CaseConfigVersioning
 import com.allocator.services.CaseLoader
+import com.allocator.services.ConfigVersionKind
 import com.allocator.services.getMethods
 import com.allocator.services.resolveMethodSelection
 import com.allocator.services.resolveVariantSelection
@@ -55,6 +57,37 @@ internal val peggingSaveInfo = ConcurrentHashMap<Int, Triple<Int, Int, Int>>()
 // plan_run with metadata.bootstrap=true, then triggers the soundness check.
 // Frontend polls /bootstrap/status/{job_id} for progress.
 internal val bootstrapJobs = ConcurrentHashMap<String, MutableMap<String, Any?>>()
+
+/** Parse a KB-seeding form payload (see `CaseBootstrap.SeedForm`'s own doc) from the
+ *  `/bootstrap/preview` POST body. Mirrors the exact knobs the Planning page's own manual-run
+ *  form exposes (purchase allowed, per-type WO batch scale, analyze criticality, check
+ *  soundness) plus the 5 external-config version picks — everything else about a submitted
+ *  config (mode/depth/max_bom_depth/weights) is fixed at Planning's own defaults, same as a
+ *  manual submission that never touched those. */
+private fun parseSeedForm(payload: JsonObject): com.allocator.services.CaseBootstrap.SeedForm {
+    fun str(key: String, default: String): String =
+        payload[key]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: default
+    fun bool(key: String, default: Boolean): Boolean =
+        payload[key]?.jsonPrimitive?.booleanOrNull ?: default
+    fun versionId(key: String): Int? = payload[key]?.jsonPrimitive?.intOrNull
+    val maxMethodsMin = payload["max_methods_min"]?.jsonPrimitive?.intOrNull ?: 1
+    val maxMethodsMax = payload["max_methods_max"]?.jsonPrimitive?.intOrNull ?: maxMethodsMin
+    return com.allocator.services.CaseBootstrap.SeedForm(
+        maxMethodsMin = maxMethodsMin.coerceAtLeast(1),
+        maxMethodsMax = maxMethodsMax.coerceAtLeast(1),
+        purchaseAllowed = bool("purchase_allowed", true),
+        makeBatchScale = str("make_batch_scale", "weekly"),
+        moveBatchScale = str("move_batch_scale", "weekly"),
+        purchaseBatchScale = str("purchase_batch_scale", "weekly"),
+        analyzeCriticality = bool("analyze_criticality", false),
+        checkSoundness = bool("check_soundness", true),
+        caseAllocVersionId = versionId("case_alloc_version_id"),
+        prefVersionId = versionId("pref_version_id"),
+        ordVersionId = versionId("demand_order_version_id"),
+        purchMatVersionId = versionId("purchasable_material_version_id"),
+        constrVersionId = versionId("constraint_version_id"),
+    )
+}
 
 /**
  * Allocation run routes — port of api/allocate.py.
@@ -361,40 +394,40 @@ fun Routing.allocateRoutes() {
         }
 
         casePlanResults.remove(caseId)  // release previous result before allocating a new one
-        val result = runPlanning(data, config = config)
+        val syncEffective = transaction { resolveEffectiveConfig(config, caseId) }
+        val result = runPlanning(data, config = planningConfig(config, syncEffective))
         val enriched = enrichPlanResultWithData(caseId, result.output, data)
         casePlanResults[caseId] = enriched - "planning_pegging"
         call.respond(anyToJson(enriched))
     }
 
-    // ── GET /cases/{case_id}/bootstrap — preview of the next batch ────────────
-    // Read-only: returns which presets are already covered for this case and
-    // which would run next. Used by the confirm dialog before the user clicks
-    // "Bootstrap KB". Does NOT trigger any planning.
-    get("/cases/{case_id}/bootstrap") {
+    // ── POST /cases/{case_id}/bootstrap/preview — net-new max_methods sweep ───
+    // Read-only: sweeps every max_methods value in the submitted SeedForm's range, keeping only
+    // the ones NOT already covered in KB/plan_run history (running a duplicate wouldn't make
+    // sense), and reports the net-new batch alongside the existing KB. Used by the KB-seeding
+    // dialog to show what Start would actually run, before the user commits. Does NOT trigger
+    // any planning. A POST body (not a GET query string) because the form is a full
+    // plan-config-shaped payload — same shape /cases/{id}/plan accepts, plus the 5
+    // external-config version picks and the max_methods range.
+    post("/cases/{case_id}/bootstrap/preview") {
         val caseId = call.parameters["case_id"]?.toIntOrNull()
             ?: throw IllegalArgumentException("Invalid case_id")
         transaction {
             Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
                 ?: throw NoSuchElementException("Case not found")
         }
-        val batchSize = (call.request.queryParameters["batch_size"]?.toIntOrNull() ?: 5).coerceIn(1, com.allocator.services.CaseBootstrap.LIBRARY.size)
-        val criterion = call.request.queryParameters["criterion"]
-            ?.takeIf { it in setOf(
-                com.allocator.services.CaseBootstrap.CRITERION_FILL_RATE,
-                com.allocator.services.CaseBootstrap.CRITERION_FAIRNESS,
-                com.allocator.services.CaseBootstrap.CRITERION_PARETO,
-            ) }
-            ?: com.allocator.services.CaseBootstrap.CRITERION_FILL_RATE
-        call.respond(com.allocator.services.CaseBootstrap.statusFor(caseId, batchSize, criterion))
+        val body = runCatching { call.receiveText() }.getOrElse { "" }
+        val payload = if (body.isBlank()) JsonObject(emptyMap())
+                      else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrElse { JsonObject(emptyMap()) }
+        val form = parseSeedForm(payload)
+        call.respond(com.allocator.services.CaseBootstrap.statusFor(caseId, form))
     }
 
-    // ── POST /cases/{case_id}/bootstrap — fire next batch of preset runs ──────
-    // Body: { "batch_size": int (default 5, capped 1..15) }
-    // Picks the next un-run presets from the bootstrap library, fires each as
-    // an end-to-end planning + persist + soundness sequence (sequential —
-    // planner is single-threaded per JVM anyway), and returns immediately with
-    // a bootstrap_job_id for progress polling.
+    // ── POST /cases/{case_id}/bootstrap — fire a batch of KB-seeding runs ─────
+    // Body: { "presets": [...] } — the exact batch the preview endpoint showed (or a
+    // client-edited variant of it). Required: KB seeding is now a random draw per run, so the
+    // server never silently re-generates its own batch at submission time — what the user
+    // previewed is what runs.
     post("/cases/{case_id}/bootstrap") {
         val caseId = call.parameters["case_id"]?.toIntOrNull()
             ?: throw IllegalArgumentException("Invalid case_id")
@@ -409,18 +442,8 @@ fun Routing.allocateRoutes() {
         val body = runCatching { call.receiveText() }.getOrElse { "" }
         val payload = if (body.isBlank()) JsonObject(emptyMap())
                       else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrElse { JsonObject(emptyMap()) }
-        // Batch size is uncapped (well, sanity-bounded) — KB is uncapped too,
-        // and selectNextBatch naturally returns at most as many uncovered
-        // library presets as exist. Higher values just let the user start a
-        // larger run when they have many edits queued.
-        val batchSize = (payload["batch_size"]?.jsonPrimitive?.intOrNull ?: 5).coerceIn(1, 100)
 
-        // Optional client-supplied preset list. When present, these replace
-        // selectNextBatch wholesale — the user has reviewed and possibly edited
-        // the system suggestions in the dialog. Each entry must carry preset_id,
-        // preset_label, primary_axis, and a config JsonObject. Anything missing
-        // falls back to selectNextBatch.
-        val presetsOverride: List<com.allocator.services.BootstrapPreset>? = (payload["presets"] as? JsonArray)?.let { arr ->
+        val proposedPresets: List<com.allocator.services.BootstrapPreset> = (payload["presets"] as? JsonArray)?.let { arr ->
             arr.mapIndexedNotNull { idx, el ->
                 val obj = el as? JsonObject ?: return@mapIndexedNotNull null
                 val cfg = obj["config"] as? JsonObject ?: return@mapIndexedNotNull null
@@ -429,40 +452,32 @@ fun Routing.allocateRoutes() {
                 val label = obj["preset_label"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
                     ?: pid
                 val axis = obj["primary_axis"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
-                    ?: "user-driven"
+                    ?: "max_methods"
                 com.allocator.services.BootstrapPreset(
                     presetId = pid, label = label, index = idx + 1,
                     primaryAxis = axis, config = cfg,
                 )
-            }.takeIf { it.isNotEmpty() }
-        }
-
-        val proposedPresets = presetsOverride ?: com.allocator.services.CaseBootstrap.selectNextBatch(caseId, batchSize)
+            }
+        } ?: emptyList()
         if (proposedPresets.isEmpty()) {
-            call.respond(buildJsonObject {
-                put("status", "library_exhausted")
-                put("library_size", com.allocator.services.CaseBootstrap.LIBRARY.size)
-                put("message", "All bootstrap presets have been run for this case. " +
-                    "The case's knowledge base now spans the curated library — use the planning agent " +
-                    "for ad-hoc explorations, or run plans manually for case-specific tuning.")
-            })
-            return@post
+            throw IllegalArgumentException("\"presets\" is required and must be non-empty — call /bootstrap/preview first")
         }
-        // Final dedup at submission time. The next_batch suggestions are
-        // computed on dialog open and may be stale (parallel run, edits that
-        // collide with an existing kb_record, etc.). Drop any preset whose
-        // config signature is already covered. The skipped list is returned
-        // to the client for a "skipped N presets" notice.
-        val coveredSigs = com.allocator.services.CaseBootstrap.coveredSignaturesFor(caseId)
+        // Final dedup at submission time. The preview is computed on dialog open/Generate and
+        // may be stale (parallel run, a manual run that collided, etc.). Drop any preset whose
+        // config signature is already in KB — same KB-only check the preview itself uses (see
+        // CaseBootstrap.generateNetNewBatch's own doc for why this is KB-only, not the broader
+        // plan_run-inclusive coveredSignaturesFor). The skipped list is returned to the client
+        // for a "skipped N presets" notice.
+        com.allocator.services.KbStore.backfillForCase(caseId)
+        val kbSigs = com.allocator.services.KbStore.listForCase(caseId).keys
         val (presets, skippedDup) = proposedPresets.partition { preset ->
-            com.allocator.services.CaseBootstrap.signatureForBootstrapCandidate(preset.config, caseId) !in coveredSigs
+            com.allocator.services.CaseBootstrap.signatureForBootstrapCandidate(preset.config, caseId) !in kbSigs
         }
         if (presets.isEmpty()) {
             call.respond(buildJsonObject {
                 put("status", "all_already_covered")
-                put("library_size", com.allocator.services.CaseBootstrap.LIBRARY.size)
-                put("message", "All submitted presets match a config already covered in the Knowledge Base. " +
-                    "Edit the configs to differ from existing entries, or use the planning agent for analysis.")
+                put("message", "All submitted runs match a config already covered in the Knowledge Base. " +
+                    "Reroll for a fresh random batch, or use the planning agent for analysis.")
                 putJsonArray("skipped") {
                     skippedDup.forEach { add(com.allocator.services.CaseBootstrap.toJson(it)) }
                 }
@@ -973,6 +988,8 @@ fun Routing.allocateRoutes() {
                 PlanRuns.createdAt, PlanRuns.finishedAt,
                 PlanRuns.chosenDepth, PlanRuns.attempts,
                 PlanRuns.soundnessStatus, PlanRuns.soundnessCheckedAt,
+                PlanRuns.caseAllocVersionId, PlanRuns.prefVersionId, PlanRuns.ordVersionId,
+                PlanRuns.purchMatVersionId, PlanRuns.constrVersionId,
             )
             val rows = PlanRuns.select(listColumns).where { (PlanRuns.caseId eq caseId) and (PlanRuns.status neq "ready") and (PlanRuns.status neq "running") }
                 .orderBy(PlanRuns.createdAt, SortOrder.DESC)
@@ -1039,6 +1056,11 @@ fun Routing.allocateRoutes() {
                     totalRequested = n("total_requested"),
                     mfgTotalQty = n("manufacturing_total_quantity"),
                     invConsumedTotal = n("inventory_consumed_total"),
+                    caseAllocVersionId = row[PlanRuns.caseAllocVersionId],
+                    prefVersionId = row[PlanRuns.prefVersionId],
+                    demandOrderVersionId = row[PlanRuns.ordVersionId],
+                    purchasableMaterialVersionId = row[PlanRuns.purchMatVersionId],
+                    constraintVersionId = row[PlanRuns.constrVersionId],
                 )
             }
         }
@@ -2658,13 +2680,19 @@ internal suspend fun runPlanBackground(
     autoSave: Boolean = false,
 ) {
     // Insert plan_run record at start
+    lateinit var effectiveConfig: EffectiveConfig
     val planRunId = transaction {
-        val configJson = resolveEffectiveConfig(config, caseId, consultsOverrideTables = true).toString()
+        effectiveConfig = resolveEffectiveConfig(config, caseId)
         val insertedId = PlanRuns.insert {
             it[PlanRuns.caseId] = caseId
             it[PlanRuns.jobId] = jobId
             it[PlanRuns.status] = "running"
-            it[PlanRuns.config] = configJson
+            it[PlanRuns.config] = effectiveConfig.json.toString()
+            it[PlanRuns.caseAllocVersionId] = effectiveConfig.caseAllocVersionId
+            it[PlanRuns.prefVersionId] = effectiveConfig.prefVersionId
+            it[PlanRuns.ordVersionId] = effectiveConfig.ordVersionId
+            it[PlanRuns.purchMatVersionId] = effectiveConfig.purchMatVersionId
+            it[PlanRuns.constrVersionId] = effectiveConfig.constrVersionId
         }[PlanRuns.id]
         com.allocator.services.emitPlanRunEvent(caseId, insertedId, "created", buildJsonObject {
             put("source", "plan")
@@ -2711,26 +2739,26 @@ internal suspend fun runPlanBackground(
             }
         }
 
-        val caseAllocRows = loadCaseAllocRows(caseId)
+        val caseAllocRows = loadCaseAllocRows(effectiveConfig.caseAllocVersionId)
         val precomputedBudgets = if (caseAllocRows != null) {
             log.info("[plan] case {} has {} case_allocation rows — using as budget override", caseId, caseAllocRows.size)
             buildBudgetsFromCaseAlloc(caseAllocRows, data["supply"] ?: emptyList())
         } else null
-        val preferenceKb = loadPreferenceKb(caseId)
+        val preferenceKb = loadPreferenceKb(effectiveConfig.prefVersionId)
         if (preferenceKb != null) {
             log.info("[plan] case {} has {} case_preference rows — using as method/variant ranking override", caseId, preferenceKb.entries.size)
         }
-        val demandOrder = loadDemandOrderMap(caseId)
+        val demandOrder = loadDemandOrderMap(effectiveConfig.ordVersionId)
         if (demandOrder != null) {
             log.info("[plan] case {} has {} case_demand_order rows — using as demand processing order override", caseId, demandOrder.size)
         }
-        val raw = runPlanning(data, config = config, progressCallback = progressCb, precomputedBudgets = precomputedBudgets, preferenceKb = preferenceKb, demandOrder = demandOrder)
+        val raw = runPlanning(data, config = planningConfig(config, effectiveConfig), progressCallback = progressCb, precomputedBudgets = precomputedBudgets, preferenceKb = preferenceKb, demandOrder = demandOrder)
         log.info("[plan] runPlanning done for run {}", planRunId)
         // Seed case_allocation only when no user allocation existed.
         // Uses the same generateAndSeedCaseAllocation() function as the Generate endpoint
         // so the allocation is computed and filtered identically in both paths.
         if (precomputedBudgets == null) {
-            val allocRows = generateAndSeedCaseAllocation(caseId, data, config)
+            val allocRows = generateAndSeedCaseAllocation(caseId, effectiveConfig.caseAllocVersionId, data, config)
             log.info("[plan] seeded case_allocation with {} rows for case {}", allocRows.size, caseId)
         }
         // Hint GC to collect planning intermediates (reconciledTrees, workingTrees, nodeLevelWos,
@@ -2911,7 +2939,13 @@ internal suspend fun runBootstrapBatchBackground(
     }
 }
 
-/** Run one preset end-to-end: insert plan_run, run planner, persist, soundness. */
+/** Run one preset end-to-end: insert plan_run, run planner, persist, soundness. Reads the
+ *  preset's resolved Critical Raw Allocation / Supply Preferences / Demand Ordering version the
+ *  same way a manual Plan Run does (`loadCaseAllocRows`/`loadPreferenceKb`/`loadDemandOrderMap`,
+ *  see `runPlanBackground`'s identical wiring) — every KB-seeding run genuinely consults the
+ *  case's actual (picked-or-default) business data, not a fixed "na" placeholder. Deliberately
+ *  read-only: unlike the interactive plan path, this never calls `generateAndSeedCaseAllocation`
+ *  — a batch seeding job must not mutate the case's persisted `case_allocation` as a side effect. */
 private suspend fun runOneBootstrapPreset(
     caseId: Int,
     preset: com.allocator.services.BootstrapPreset,
@@ -2921,15 +2955,21 @@ private suspend fun runOneBootstrapPreset(
     val configMap = jsonElementToNative(preset.config) as? Map<String, Any?>
         ?: throw IllegalStateException("Failed to convert bootstrap preset config to Map")
 
+    lateinit var effectiveConfig: EffectiveConfig
     val planRunId = transaction {
-        val configJson = resolveEffectiveConfig(configMap, caseId, consultsOverrideTables = false).toString()
+        effectiveConfig = resolveEffectiveConfig(configMap, caseId)
         val metadataJson = com.allocator.services.CaseBootstrap.metadataFor(preset, caseId).toString()
         val insertedId = PlanRuns.insert {
             it[PlanRuns.caseId] = caseId
             it[PlanRuns.status] = "running"
-            it[PlanRuns.config] = configJson
+            it[PlanRuns.config] = effectiveConfig.json.toString()
             it[PlanRuns.metadata] = metadataJson
             it[PlanRuns.name] = preset.label
+            it[PlanRuns.caseAllocVersionId] = effectiveConfig.caseAllocVersionId
+            it[PlanRuns.prefVersionId] = effectiveConfig.prefVersionId
+            it[PlanRuns.ordVersionId] = effectiveConfig.ordVersionId
+            it[PlanRuns.purchMatVersionId] = effectiveConfig.purchMatVersionId
+            it[PlanRuns.constrVersionId] = effectiveConfig.constrVersionId
         }[PlanRuns.id]
         com.allocator.services.emitPlanRunEvent(caseId, insertedId, "created", buildJsonObject {
             put("source", "bootstrap")
@@ -2939,7 +2979,11 @@ private suspend fun runOneBootstrapPreset(
     }
 
     try {
-        val raw = runPlanning(data, config = configMap)
+        val caseAllocRows = loadCaseAllocRows(effectiveConfig.caseAllocVersionId)
+        val precomputedBudgets = caseAllocRows?.let { buildBudgetsFromCaseAlloc(it, data["supply"] ?: emptyList()) }
+        val preferenceKb = loadPreferenceKb(effectiveConfig.prefVersionId)
+        val demandOrder = loadDemandOrderMap(effectiveConfig.ordVersionId)
+        val raw = runPlanning(data, config = planningConfig(configMap, effectiveConfig), precomputedBudgets = precomputedBudgets, preferenceKb = preferenceKb, demandOrder = demandOrder)
         val enriched = enrichPlanResultWithData(caseId, raw.output, data)
         val resultJson = serializeResultOrNull(enriched)
         val serializeFailed = resultJson == null
@@ -3149,39 +3193,68 @@ private fun markRunFailed(runId: Int, caseId: Int, error: String) {
  * defaults.  Persisting this instead of the raw config means a stored plan run is
  * self-describing — future code changes to defaults cannot alter its interpretation.
  */
+/** [resolveEffectiveConfig]'s return value: the resolved JSON plus the 5 version ids it
+ *  resolved (explicit-pick-or-default) for each external config object — callers need these to
+ *  (a) populate `PlanRuns`'s 5 version-reference columns and (b) read the SAME version's rows
+ *  for planning overrides / auto-seeding, without re-resolving (and risking a different answer
+ *  if the case's default changed between two separate resolutions within the same submission). */
+internal data class EffectiveConfig(
+    val json: JsonObject,
+    val caseAllocVersionId: Int,
+    val prefVersionId: Int,
+    val ordVersionId: Int,
+    val purchMatVersionId: Int,
+    val constrVersionId: Int,
+)
+
 @Suppress("UNCHECKED_CAST")
 /**
- * [consultsOverrideTables]: whether the run this config is being persisted for actually reads
- * `case_allocation`/`case_preference`/`case_demand_order` (the regular `runPlanBackground`
- * path does; the bootstrap-preset path does not — see `KbFingerprint.buildFingerprint`'s own
- * doc for why this distinction matters for the KB signature). Embeds a `_kb_fingerprint`
- * object into the resolved config — read later by `CaseBootstrap.signatureFor` — so the exact
- * allocation/preference/demand-order state in effect AT SUBMISSION TIME survives alongside the
- * rest of this point-in-time config snapshot, rather than being silently invisible to the KB.
+ * Resolves the full effective PlanningConfig — including which VERSION of each of the 5
+ * external config objects this run uses (see CaseConfigVersions' own doc): an explicit pick
+ * from [config]'s `*_version_id` keys if valid for this case, else the case's current default.
+ * Every submission path (manual Plan Run, agent-driven, KB-seeding) resolves and actually
+ * CONSULTS all 5 the same way — reads `case_allocation`/`case_preference`/`case_demand_order`/
+ * `case_purchasable_material`/`case_constraint` from the resolved version and feeds them into
+ * planning, so an explicit pick genuinely changes the run's output on every path.
+ *
+ * Embeds a `_kb_fingerprint` object into the resolved config — read later by
+ * `CaseBootstrap.signatureFor` — so the exact allocation/preference/demand-order state in effect
+ * AT SUBMISSION TIME survives alongside the rest of this point-in-time config snapshot, rather
+ * than being silently invisible to the KB.
  */
-private fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int, consultsOverrideTables: Boolean): JsonObject {
+private fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int): EffectiveConfig {
     val c = config ?: emptyMap()
     val consolidation = (c["consolidation"]     as? Map<*, *>)?.let { it as Map<String, Any?> } ?: emptyMap()
     val methodCfg = resolveMethodSelection(c)
     val variantCfg = resolveVariantSelection(c)
 
-    return buildJsonObject {
+    fun explicitVersionId(key: String): Int? = (c[key] as? Number)?.toInt()
+
+    val caseAllocVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.CASEALLOC,
+        explicitVersionId("case_alloc_version_id"))
+    val prefVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.PREF,
+        explicitVersionId("pref_version_id"))
+    val ordVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.ORD,
+        explicitVersionId("demand_order_version_id"))
+    val purchMatVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.PURCHMAT,
+        explicitVersionId("purchasable_material_version_id"))
+    val constrVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.CONSTR,
+        explicitVersionId("constraint_version_id"))
+
+    val json = buildJsonObject {
         put("purchase_allowed", c["purchase_allowed"] as? Boolean ?: true)
         // Selective-purchase whitelist and customer-BOM constraints are case-level persisted
         // settings now (CasePurchasableMaterials / CaseConstraints — "promoted out" of this
         // config blob, see those tables' own doc in Tables.kt), not something the caller
-        // submits per plan run. Read fresh from the case's own tables here — UNCONDITIONALLY,
-        // on both the regular and bootstrap submission paths (unlike casealloc/pref/ord's
-        // consultsOverrideTables gate): these are real business/data constraints, not
-        // planning-strategy axes bootstrap deliberately varies, so bootstrap presets should
-        // respect them too. Whatever the caller submitted for these two keys is ignored.
-        // Empty ⇒ all raw materials purchasable / no constraints — the exact same convention
-        // the old embedded arrays used for an empty list.
+        // submits per plan run. Read fresh from the resolved version's own rows here, on every
+        // submission path — these are real business/data constraints, not planning-strategy
+        // axes. Empty ⇒ all raw materials purchasable / no constraints — the exact same
+        // convention the old embedded arrays used for an empty list.
         putJsonArray("purchasable_materials") {
-            loadPurchasableMaterialIds(caseId).sorted().forEach { add(it) }
+            loadPurchasableMaterialIds(purchMatVersionId).sorted().forEach { add(it) }
         }
         putJsonArray("constraints") {
-            loadCaseConstraintRows(caseId).forEach { k ->
+            loadCaseConstraintRows(constrVersionId).forEach { k ->
                 addJsonObject {
                     put("customer", k.customerId)
                     put("parent", k.parent)
@@ -3228,7 +3301,9 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int, cons
                 if (v != null && v in validScales) put(key, v)
             }
         }
-        val fp = com.allocator.services.KbFingerprint.buildFingerprint(caseId, consultsOverrideTables)
+        val fp = com.allocator.services.KbFingerprint.buildFingerprint(
+            caseAllocVersionId, prefVersionId, ordVersionId, purchMatVersionId, constrVersionId,
+        )
         putJsonObject("_kb_fingerprint") {
             put("casealloc", fp.casealloc)
             put("pref", fp.pref)
@@ -3237,7 +3312,26 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int, cons
             put("constr", fp.constr)
         }
     }
+    return EffectiveConfig(json, caseAllocVersionId, prefVersionId, ordVersionId, purchMatVersionId, constrVersionId)
 }
+
+/**
+ * The config map actually handed to [runPlanning]: the raw caller [config] (planner knobs the
+ * resolver doesn't model must pass through untouched) with the two version-resolved, case-level
+ * settings the planner reads out of its config map — `purchasable_materials` and `constraints` —
+ * overlaid from [effective]'s resolved versions. Callers don't submit these per run (see
+ * [resolveEffectiveConfig]); without the overlay, any submission path that didn't happen to embed
+ * them itself (KB seeding, agent/bare-API calls) silently planned with no purchase whitelist and
+ * no customer constraints, while the persisted config snapshot claimed the resolved versions were
+ * in effect.
+ */
+private fun planningConfig(config: Map<String, Any?>?, effective: EffectiveConfig): Map<String, Any?> =
+    (config ?: emptyMap()) + mapOf(
+        "purchasable_materials" to loadPurchasableMaterialIds(effective.purchMatVersionId).sorted(),
+        "constraints" to loadCaseConstraintRows(effective.constrVersionId).map { k ->
+            mapOf("customer" to k.customerId, "parent" to k.parent, "location" to k.location, "child" to k.child)
+        },
+    )
 
 /** Resolve bom.csv path — walks up from working directory. */
 private fun resolveBomCsv() = run {

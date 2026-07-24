@@ -277,6 +277,17 @@ object PlanRuns : Table("plan_run") {
     val inventoryEffectiveInitial = text("inventory_effective_initial").nullable()
     /** JSON: inventory snapshot AFTER all planning passes (physical supply leftover). Used by R7e soundness check. */
     val inventoryLeftover = text("inventory_leftover").nullable()
+    // Which version of each of the 5 "external config objects" this run used (see
+    // CaseConfigVersions' own doc). No onDelete override (defaults to Postgres NO ACTION) —
+    // deliberately the OPPOSITE relationship from CaseAllocations.versionId et al.: a run's
+    // reference to a version must BLOCK that version's deletion, not cascade with it. Nullable
+    // for pre-versioning ("legacy") runs — see ExternalConfigVersioningMigration's own doc for
+    // why even those get backfilled rather than staying null in practice.
+    val caseAllocVersionId = integer("case_alloc_version_id").references(CaseConfigVersions.id).nullable()
+    val prefVersionId       = integer("pref_version_id").references(CaseConfigVersions.id).nullable()
+    val ordVersionId        = integer("ord_version_id").references(CaseConfigVersions.id).nullable()
+    val purchMatVersionId   = integer("purch_mat_version_id").references(CaseConfigVersions.id).nullable()
+    val constrVersionId     = integer("constr_version_id").references(CaseConfigVersions.id).nullable()
     override val primaryKey = PrimaryKey(id)
 }
 
@@ -317,10 +328,40 @@ object PlanSupplyAllocations : Table("plan_supply_allocation") {
     override val primaryKey = PrimaryKey(id)
 }
 
+/**
+ * Version registry for the 5 "external config objects" (Critical Raw Allocation, Supply
+ * Preferences, Demand Ordering, Purchasable Materials, Constraints). Each object can have
+ * multiple named/commented versions per case, exactly one marked `isDefault` at a time
+ * (enforced in application code — see `CaseConfigVersioning.kt` — not a DB constraint, matching
+ * this file's existing style of no partial unique indexes). `kind` reuses the exact segment
+ * names [com.allocator.services.KbFingerprint.Segments] already uses ("casealloc"/"pref"/"ord"/
+ * "purchmat"/"constr") so the two vocabularies stay in sync.
+ *
+ * The actual data tables (CaseAllocations et al.) and their companion "config" tables each carry
+ * a `versionId` pointing back at a row here; `PlanRuns`/`KbRecords` each carry 5 nullable
+ * version-id columns (one per kind) recording exactly which version a run used — see those
+ * tables' own doc for why that's a *different*, non-cascading FK relationship than the one here.
+ */
+object CaseConfigVersions : Table("case_config_version") {
+    val id        = integer("id").autoIncrement()
+    val caseId    = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val kind      = varchar("kind", 16)
+    val name      = varchar("name", 255).nullable()
+    val comments  = text("comments").nullable()
+    val isDefault = bool("is_default").default(false)
+    val createdAt = timestamp("created_at").defaultExpression(CurrentTimestamp)
+    val updatedAt = timestamp("updated_at").defaultExpression(CurrentTimestamp)
+    override val primaryKey = PrimaryKey(id)
+    init { index("ix_case_config_version_case_kind", false, caseId, kind) }
+}
+
 /** Standalone allocation map for a case — independent of any plan run lifecycle. */
 object CaseAllocations : Table("case_allocation") {
     val id           = integer("id").autoIncrement()
     val caseId       = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    // Nullable only until ExternalConfigVersioningMigration backfills pre-existing rows — see
+    // CaseConfigVersions' own doc. Always populated for rows created after this feature shipped.
+    val versionId    = integer("version_id").references(CaseConfigVersions.id, onDelete = ReferenceOption.CASCADE).nullable()
     val supplyId     = varchar("supply_id", 255)
     val demandId     = varchar("demand_id", 255).nullable()
     val qtyAllocated = double("qty_allocated")
@@ -339,18 +380,21 @@ object CaseAllocations : Table("case_allocation") {
 object CasePurchasableMaterials : Table("case_purchasable_material") {
     val id        = integer("id").autoIncrement()
     val caseId    = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val versionId = integer("version_id").references(CaseConfigVersions.id, onDelete = ReferenceOption.CASCADE).nullable()
     val productId = varchar("product_id", 255)
     override val primaryKey = PrimaryKey(id)
-    init { uniqueIndex("ux_case_purchasable_material_key", caseId, productId) }
+    init { uniqueIndex("ux_case_purchasable_material_key", versionId, productId) }
 }
 
 /** Content-fingerprint tracker for [CasePurchasableMaterials] — see
  *  [CasePreferenceConfigs.contentHash]'s own doc for the full "why" (cheap KB-signature lookup,
  *  not live table hashing). No generation params of its own (unlike Preferences) — purely a
- *  hash-tracking companion, same as [CaseAllocationConfigs]. */
+ *  hash-tracking companion, same as [CaseAllocationConfigs]. One row per *version* now (not per
+ *  case) — see [CaseConfigVersions]. */
 object CasePurchasableMaterialConfigs : Table("case_purchasable_material_config") {
     val id          = integer("id").autoIncrement()
-    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE).uniqueIndex()
+    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val versionId   = integer("version_id").references(CaseConfigVersions.id, onDelete = ReferenceOption.CASCADE).nullable().uniqueIndex()
     val contentHash = varchar("content_hash", 32).nullable()
     val generatedAt = timestamp("generated_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
@@ -365,19 +409,22 @@ object CasePurchasableMaterialConfigs : Table("case_purchasable_material_config"
 object CaseConstraints : Table("case_constraint") {
     val id         = integer("id").autoIncrement()
     val caseId     = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val versionId  = integer("version_id").references(CaseConfigVersions.id, onDelete = ReferenceOption.CASCADE).nullable()
     val customerId = varchar("customer_id", 255)
     val parent     = varchar("parent", 255)
     val location   = varchar("location", 255)
     val child      = varchar("child", 255)
     override val primaryKey = PrimaryKey(id)
-    init { uniqueIndex("ux_case_constraint_key", caseId, customerId, parent, location, child) }
+    init { uniqueIndex("ux_case_constraint_key", versionId, customerId, parent, location, child) }
 }
 
 /** Content-fingerprint tracker for [CaseConstraints] — see [CasePurchasableMaterialConfigs]'s
- *  own doc; identical shape/rationale. */
+ *  own doc; identical shape/rationale. One row per *version* now (not per case) — see
+ *  [CaseConfigVersions]. */
 object CaseConstraintConfigs : Table("case_constraint_config") {
     val id          = integer("id").autoIncrement()
-    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE).uniqueIndex()
+    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val versionId   = integer("version_id").references(CaseConfigVersions.id, onDelete = ReferenceOption.CASCADE).nullable().uniqueIndex()
     val contentHash = varchar("content_hash", 32).nullable()
     val generatedAt = timestamp("generated_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
@@ -392,6 +439,7 @@ object CaseConstraintConfigs : Table("case_constraint_config") {
 object CasePreferences : Table("case_preference") {
     val id           = integer("id").autoIncrement()
     val caseId       = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val versionId    = integer("version_id").references(CaseConfigVersions.id, onDelete = ReferenceOption.CASCADE).nullable()
     val productId    = varchar("product_id", 255)
     val locationId   = varchar("location_id", 255)
     val methodType   = varchar("method_type", 16)   // "make" | "move" | "purchase"
@@ -407,16 +455,18 @@ object CasePreferences : Table("case_preference") {
     override val primaryKey = PrimaryKey(id)
     init {
         index("ix_case_preference_case", false, caseId)
-        uniqueIndex("ux_case_preference_key", caseId, productId, locationId, methodType, methodKey)
+        uniqueIndex("ux_case_preference_key", versionId, productId, locationId, methodType, methodKey)
     }
 }
 
-/** One row per case: the max_bom_depth/delivery_weight/inventory_weight/critical_material_weight
- *  last used to (re)build [CasePreferences] — shown when reopening the Preferences page and
- *  carried into CSV export. */
+/** One row per *version* (not per case — see [CaseConfigVersions]): the
+ *  max_bom_depth/delivery_weight/inventory_weight/critical_material_weight last used to (re)build
+ *  that version's [CasePreferences] rows — shown when reopening the Preferences page and carried
+ *  into CSV export. */
 object CasePreferenceConfigs : Table("case_preference_config") {
     val id             = integer("id").autoIncrement()
-    val caseId         = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE).uniqueIndex()
+    val caseId         = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val versionId      = integer("version_id").references(CaseConfigVersions.id, onDelete = ReferenceOption.CASCADE).nullable().uniqueIndex()
     val maxBomDepth    = integer("max_bom_depth")
     val deliveryWeight = double("delivery_weight")
     val inventoryWeight = double("inventory_weight")
@@ -444,24 +494,27 @@ object CasePreferenceConfigs : Table("case_preference_config") {
 object CaseDemandOrders : Table("case_demand_order") {
     val id       = integer("id").autoIncrement()
     val caseId   = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val versionId = integer("version_id").references(CaseConfigVersions.id, onDelete = ReferenceOption.CASCADE).nullable()
     val demandId = varchar("demand_id", 255)
     val order    = integer("order")   // canonical 10, 20, 30, ... — lower = processed earlier
     override val primaryKey = PrimaryKey(id)
     init {
         index("ix_case_demand_order_case", false, caseId)
-        uniqueIndex("ux_case_demand_order_key", caseId, demandId)
+        uniqueIndex("ux_case_demand_order_key", versionId, demandId)
     }
 }
 
-/** One row per case: when [CaseDemandOrders] was last (re)built — shown when reopening the
- *  Demand Ordering page. No build params (unlike [CasePreferenceConfigs]) — the ordering rule
- *  (due_time, then priority) is fixed. */
+/** One row per *version* (not per case — see [CaseConfigVersions]): when that version's
+ *  [CaseDemandOrders] rows were last (re)built — shown when reopening the Demand Ordering page.
+ *  No build params (unlike [CasePreferenceConfigs]) — the ordering rule (due_time, then
+ *  priority) is fixed. */
 object CaseDemandOrderConfigs : Table("case_demand_order_config") {
     val id          = integer("id").autoIncrement()
-    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE).uniqueIndex()
+    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val versionId   = integer("version_id").references(CaseConfigVersions.id, onDelete = ReferenceOption.CASCADE).nullable().uniqueIndex()
     val generatedAt = timestamp("generated_at").defaultExpression(CurrentTimestamp)
     // See CasePreferenceConfigs.contentHash's own doc — same fingerprint-for-the-KB-signature
-    // rationale, hashing case_demand_order's current (demand_id, order) row set for this case.
+    // rationale, hashing this version's current (demand_id, order) row set.
     val contentHash = varchar("content_hash", 32).nullable()
     override val primaryKey = PrimaryKey(id)
 }
@@ -473,11 +526,12 @@ object CaseDemandOrderConfigs : Table("case_demand_order_config") {
  * incrementally-maintained hash of the current case_allocation row set, read by the KB
  * signature's fingerprint injection at plan-submission time (see CaseBootstrap.signatureFor
  * and Allocate.kt's resolveEffectiveConfig) without needing to re-hash the full table on every
- * submission.
+ * submission. One row per *version* now (not per case) — see [CaseConfigVersions].
  */
 object CaseAllocationConfigs : Table("case_allocation_config") {
     val id          = integer("id").autoIncrement()
-    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE).uniqueIndex()
+    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val versionId   = integer("version_id").references(CaseConfigVersions.id, onDelete = ReferenceOption.CASCADE).nullable().uniqueIndex()
     val contentHash = varchar("content_hash", 32).nullable()
     val generatedAt = timestamp("generated_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
@@ -600,9 +654,34 @@ object KbRecords : Table("kb_record") {
     val sourcePlanRunId       = integer("source_plan_run_id").nullable()
     val sourcePlanRunDeleted  = bool("source_plan_run_deleted").default(false)
     val soundnessStatus       = varchar("soundness_status", 16).default("unchecked")
+    // Mirrors PlanRuns' own 5 version-reference columns — see that table's own doc. Copied
+    // straight from the source plan_run by KbStore.upsertFromPlanRun.
+    val caseAllocVersionId = integer("case_alloc_version_id").references(CaseConfigVersions.id).nullable()
+    val prefVersionId       = integer("pref_version_id").references(CaseConfigVersions.id).nullable()
+    val ordVersionId        = integer("ord_version_id").references(CaseConfigVersions.id).nullable()
+    val purchMatVersionId   = integer("purch_mat_version_id").references(CaseConfigVersions.id).nullable()
+    val constrVersionId     = integer("constr_version_id").references(CaseConfigVersions.id).nullable()
     val createdAt             = timestamp("created_at").defaultExpression(CurrentTimestamp)
     val updatedAt             = timestamp("updated_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
 
     init { uniqueIndex("uq_kb_record_case_signature", caseId, signature) }
+}
+
+/** Tombstones for KB records the user explicitly deleted via [KbStore.deleteRecord] — checked
+ *  by [KbStore.backfillForCase] so a deleted signature doesn't get silently RE-created the very
+ *  next time the KB dialog opens (backfillForCase re-derives any missing KB row from a still-
+ *  successful+sound plan_run with a matching signature; without this tombstone, that re-derivation
+ *  would instantly undo the deletion). Deliberately a separate table rather than a soft-delete
+ *  flag on [KbRecords] itself — every existing read of that table already assumes every row is
+ *  live, so a soft-delete flag would need auditing every one of those call sites; this is a
+ *  narrower, additive check in the one place resurrection actually happens. */
+object KbDeletedSignatures : Table("kb_deleted_signature") {
+    val id = integer("id").autoIncrement()
+    val caseId = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val signature = varchar("signature", 512)
+    val deletedAt = timestamp("deleted_at").defaultExpression(CurrentTimestamp)
+    override val primaryKey = PrimaryKey(id)
+
+    init { uniqueIndex("uq_kb_deleted_signature_case_sig", caseId, signature) }
 }
