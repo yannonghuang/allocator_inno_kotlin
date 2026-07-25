@@ -42,7 +42,7 @@ class LlmNotConfiguredException(msg: String) : IllegalStateException(msg)
 private val llmHttpClient: HttpClient by lazy {
     HttpClient(CIO) {
         install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
-        install(HttpTimeout) { requestTimeoutMillis = 90_000 }
+        install(HttpTimeout) { requestTimeoutMillis = com.allocator.config.llmRequestTimeoutMs }
     }
 }
 
@@ -108,6 +108,7 @@ suspend fun llmChat(
             "openai" -> openAiChat(systemPrompt, messages, maxTokens, temperature, resolvedModel)
             "anthropic" -> anthropicChat(systemPrompt, messages, maxTokens, temperature, resolvedModel)
             "nanogpt" -> nanoGptChat(systemPrompt, messages, maxTokens, temperature, resolvedModel)
+            "dashscope" -> dashScopeChat(systemPrompt, messages, maxTokens, temperature, resolvedModel)
             else -> openClawChat(systemPrompt, messages, maxTokens, temperature, resolvedModel)
         }
     } catch (e: java.nio.channels.UnresolvedAddressException) {
@@ -134,6 +135,9 @@ private fun defaultModelForProvider(provider: String): String = when (provider) 
     "openai" -> "gpt-4o-mini"
     "anthropic" -> "claude-haiku-4-5-20251001"
     "nanogpt" -> "minimax/minimax-m2.7"
+    // Sane fallback only — a dedicated/reserved-capacity MaaS deployment expects its own
+    // specific model id; set ASSESSMENT_MODEL to override.
+    "dashscope" -> "qwen-plus"
     // openclaw gateway forwards model ids through to its configured provider. The gateway's
     // agent default is "anthropic/claude-sonnet-4-6" (openclaw.json.template), so we use the
     // same id here — pickable also via ASSESSMENT_MODEL=anthropic/<id>.
@@ -224,6 +228,34 @@ private suspend fun nanoGptChat(
         ?: throw IllegalStateException("NanoGPT response contained no content")
 }
 
+private suspend fun dashScopeChat(
+    systemPrompt: String?,
+    messages: List<LlmMessage>,
+    maxTokens: Int,
+    temperature: Double,
+    model: String,
+): String {
+    val apiKey = config.dashscopeApiKey
+        ?: throw LlmNotConfiguredException("DASHSCOPE_API_KEY is not configured")
+
+    val all = buildList {
+        if (!systemPrompt.isNullOrBlank()) add(OpenAiMsg("system", systemPrompt))
+        messages.forEach { add(OpenAiMsg(it.role, it.content)) }
+    }
+
+    val resp = llmHttpClient.post("${config.dashscopeBaseUrl}/chat/completions") {
+        header("Authorization", "Bearer $apiKey")
+        contentType(ContentType.Application.Json)
+        setBody(OpenAiReq(model = model, maxTokens = maxTokens, temperature = temperature, messages = all))
+    }
+
+    if (!resp.status.isSuccess()) {
+        throw IllegalStateException("DashScope API error ${resp.status.value}: ${resp.bodyAsText()}")
+    }
+    return resp.body<OpenAiResp>().choices.firstOrNull()?.message?.content
+        ?: throw IllegalStateException("DashScope response contained no content")
+}
+
 private suspend fun anthropicChat(
     systemPrompt: String?,
     messages: List<LlmMessage>,
@@ -277,6 +309,9 @@ private suspend fun anthropicChat(
 //                  the caller's `tools` array, so the model sees a merged
 //                  list. Fine for OpenClaw-native agents; use "nanogpt" for
 //                  external agents that own their tool list.
+//   - "dashscope"→ ${DASHSCOPE_BASE_URL}/chat/completions (Alibaba Cloud
+//                  DashScope's OpenAI-compatible endpoint; Qwen models).
+//                  Requires DASHSCOPE_API_KEY.
 // Anthropic-direct is a stub — set LLM_PROVIDER=openclaw to reach Claude.
 
 /** A function-callable tool advertised to the model. `parameters` is JSON Schema. */
@@ -378,11 +413,21 @@ suspend fun llmChatWithTools(
                 providerLabel = "OpenClaw",
             )
         }
+        "dashscope" -> {
+            val apiKey = config.dashscopeApiKey
+                ?: throw LlmNotConfiguredException("DASHSCOPE_API_KEY is not configured")
+            postChatCompletionsAndParse(
+                url = "${config.dashscopeBaseUrl}/chat/completions",
+                authHeaderValue = "Bearer $apiKey",
+                body = body,
+                providerLabel = "DashScope",
+            )
+        }
         "anthropic" -> throw LlmNotConfiguredException(
             "llmChatWithTools(anthropic) is not implemented — use LLM_PROVIDER=openclaw to reach Claude via the gateway.",
         )
         else -> throw LlmNotConfiguredException(
-            "llmChatWithTools: unknown provider '$effectiveProvider'. Supported: openai, nanogpt, openclaw.",
+            "llmChatWithTools: unknown provider '$effectiveProvider'. Supported: openai, nanogpt, openclaw, dashscope.",
         )
     }
 }

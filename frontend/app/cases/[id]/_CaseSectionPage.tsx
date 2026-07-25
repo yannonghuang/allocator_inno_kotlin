@@ -342,6 +342,7 @@ import { SortFilterTable } from '@/app/components/SortFilterTable';
 import { RawMaterialPicker } from '@/app/components/RawMaterialPicker';
 import { ConfigDetailView, ExternalConfigDrilldown, type ExternalKind } from '@/app/components/ConfigDetailView';
 import { AssessmentHistoryTable } from '@/app/components/AssessmentHistoryTable';
+import { MovableResizablePopup } from '@/app/components/MovableResizablePopup';
 
 /** Extract a human-readable message from an API error.
  *  The backend often returns JSON bodies like {"detail":"..."} or {"error":"..."}.
@@ -381,7 +382,12 @@ function renderCopilotInline(text: string, keyPrefix: string): React.ReactNode {
   ));
 }
 
-function renderCopilotText(text: string): React.ReactNode[] {
+// Matches a table header cell naming the demand-id column, e.g. from
+// find_demands_for_product's `| Demand | Product | ... |` reply — used to make just that
+// column clickable (see renderCopilotText's onDemandClick param), not every cell.
+const DEMAND_COLUMN_HEADER_RE = /^demand(\s*id)?$/i;
+
+function renderCopilotText(text: string, onDemandClick?: (demandId: string) => void): React.ReactNode[] {
   const lines = text.split('\n');
   const out: React.ReactNode[] = [];
   let bufStart = 0;
@@ -409,6 +415,7 @@ function renderCopilotText(text: string): React.ReactNode[] {
         body.push(lines[j].trim().slice(1, -1).split('|').map((s) => s.trim()));
         j++;
       }
+      const demandColIdx = onDemandClick ? header.findIndex((h) => DEMAND_COLUMN_HEADER_RE.test(h)) : -1;
       out.push(
         <table key={`tbl${i}`} style={{ borderCollapse: 'collapse', margin: '0.4rem 0', fontSize: '0.85rem' }}>
           <thead>
@@ -422,7 +429,18 @@ function renderCopilotText(text: string): React.ReactNode[] {
             {body.map((row, ri) => (
               <tr key={ri}>{row.map((c, ci) => (
                 <td key={ci} style={{ padding: '0.2rem 0.9rem 0.2rem 0', verticalAlign: 'top' }}>
-                  {renderCopilotInline(c, `td${i}-${ri}-${ci}`)}
+                  {ci === demandColIdx && c
+                    ? (
+                      <button
+                        type="button"
+                        onClick={() => onDemandClick!(c)}
+                        style={{ background: 'none', border: 'none', padding: 0, color: '#60a5fa', cursor: 'pointer', textDecoration: 'underline', font: 'inherit' }}
+                        title={`Show pegging tree for ${c}`}
+                      >
+                        {c}
+                      </button>
+                    )
+                    : renderCopilotInline(c, `td${i}-${ri}-${ci}`)}
                 </td>
               ))}</tr>
             ))}
@@ -951,7 +969,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // distinct from 'error' (fetch attempted and failed) so the UI can say why, instead of
   // spinning on "Loading…" forever with no request ever sent.
   const [demandPeggingCache, setDemandPeggingCache] = useState<Record<string, PlanningPeggingEntry | 'loading' | 'error' | 'no-run'>>({});
-  const [planPeggingPanelWidth, setPlanPeggingPanelWidth] = useState(420);
   const [planWorkOrderPeggingCache, setPlanWorkOrderPeggingCache] = useState<Record<string, PlanningPeggingNode>>({});
   // Active demand for WO pegging panel; null = use the row's own demand_id (default)
   const [woPeggingActiveDemandId, setWoPeggingActiveDemandId] = useState<string | null>(null);
@@ -973,8 +990,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [previousDemandPeggingContext, setPreviousDemandPeggingContext] = useState<typeof planPeggingContext>(null);
   const [planWorkOrderPeggingLoading, setPlanWorkOrderPeggingLoading] = useState<string | null>(null);
   const [planWorkOrderPeggingError, setPlanWorkOrderPeggingError] = useState<string | null>(null);
-  const planPeggingResizeRef = useRef<{ startX: number; startW: number } | null>(null);
-  const [planPeggingResizing, setPlanPeggingResizing] = useState(false);
   const [planResultTab, setPlanResultTab] = useState<'demands' | 'work_orders' | 'supplies' | 'resourceUtilization'>('demands');
   // ID of the plan run currently loaded in planResult; null = freshly-run (not from history)
   const [currentPlanRunId, setCurrentPlanRunId] = useState<number | null>(null);
@@ -2304,28 +2319,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       window.removeEventListener('mouseup', onUp);
     };
   }, [peggingResizing]);
-
-  useEffect(() => {
-    if (!planPeggingResizing) return;
-    const onMove = (e: MouseEvent) => {
-      const r = planPeggingResizeRef.current;
-      if (!r) return;
-      const delta = r.startX - e.clientX;
-      setPlanPeggingPanelWidth(Math.min(window.innerWidth * 0.9, Math.max(320, r.startW + delta)));
-    };
-    const onUp = () => {
-      planPeggingResizeRef.current = null;
-      setPlanPeggingResizing(false);
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-    return () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-  }, [planPeggingResizing]);
 
   useEffect(() => {
     if (!copilotResizing) return;
@@ -9156,15 +9149,55 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               {copilotMessages.map((m, i) => (
                 <div key={i} style={{ marginBottom: '0.75rem' }}>
                   <span style={{ fontWeight: 600, color: m.role === 'user' ? '#a78bfa' : '#67e8f9', fontSize: '0.8rem' }}>{m.role === 'user' ? tP('copilot.roleUser') : tP('copilot.roleCopilot')}: </span>
-                  <span style={{ fontSize: '0.875rem' }}>{renderCopilotText(m.text)}</span>
-                  {/* KNOWN GAP (tracked, not silently broken): purchasable_materials is now a
-                      case-level persisted setting (PurchasableMaterials.kt) — the backend
-                      always overwrites whatever's in planningConfig.purchasable_materials at
-                      submission time, so edits made here no longer affect a plan run. This
-                      copilot NL card needs rewiring to call updatePurchasableMaterials()
-                      directly instead of patching planningConfig — deferred as a same-sized
-                      follow-up (see this branch's own plan notes) to keep that change reviewable
-                      separately from the page-promotion work. */}
+                  <span style={{ fontSize: '0.875rem' }}>{renderCopilotText(m.text, (demandIdRaw) => {
+                    // Mirrors the Work Orders table's demand-pegging link (same lookup +
+                    // popup-open pattern) — only opens when the demand is in the currently
+                    // loaded plan result; the copilot may have answered from a different/older
+                    // run than what's active on the page.
+                    //
+                    // KNOWN MODEL QUIRK: the LLM formatting the reply table routinely strips a
+                    // real demand_id's trailing "_VIRTUAL" suffix (a consolidation-bucket
+                    // marker, e.g. real id "828_M51_2024_09_VIRTUAL" gets written as
+                    // "828_M51_2024_09") — confirmed live, not something prompt wording fixes
+                    // reliably (same class of unreliability as the "plan started" honesty
+                    // guard). Try the exact text first, then the _VIRTUAL variant, before
+                    // giving up — deterministic, not dependent on the model behaving.
+                    const demands = planResult?.committed_demands;
+                    const demandId = demandIdRaw.endsWith('_VIRTUAL') ? demandIdRaw : `${demandIdRaw}_VIRTUAL`;
+                    const demandRow =
+                      demands?.find((d) => d.demand_id === demandIdRaw) ??
+                      demands?.find((d) => d.demand_id === demandId) ??
+                      null;
+                    if (!demandRow) {
+                      // eslint-disable-next-line no-console
+                      console.warn('[copilot demand link] no match', {
+                        demandIdRaw,
+                        triedVirtual: demandId,
+                        planResultLoaded: !!planResult,
+                        committedDemandsCount: planResult?.committed_demands?.length ?? null,
+                        sampleIds: planResult?.committed_demands?.slice(0, 5).map((d) => d.demand_id),
+                      });
+                      window.alert(
+                        planResult
+                          ? `Demand "${demandIdRaw}" is not in the currently loaded plan result (${planResult.committed_demands?.length ?? 0} demands loaded) — tried the _VIRTUAL variant too. The copilot may have answered from a different run, or this demand genuinely has no committed status in this run.`
+                          : `No plan result is loaded yet — can't show pegging for "${demandIdRaw}".`
+                      );
+                      return;
+                    }
+                    setPreviousPeggingContext(null);
+                    setPreviousSupExplainRow(null);
+                    setPreviousWoExplainRow(null);
+                    setPreviousManifestWoRow(null);
+                    setPlanPeggingContext({ type: 'demand', row: demandRow });
+                    setPlanPeggingOpen(true);
+                  })}</span>
+                  {/* DESIGN DECISION (2026-07-25): the copilot does NOT edit purchasable-
+                      materials content — the whitelist is versioned case master data owned by
+                      the Purchasable Materials page; the copilot only PICKS versions
+                      (purchasable_material_version_id). This /raw picker card predates that
+                      decision and writes only the dead display field
+                      (planningConfig.purchasable_materials) — it should be removed or turned
+                      into a link to the Purchasable Materials page. */}
                   {m.kind === 'raw_picker' && (
                     purchasableOptions.length === 0 ? (
                       <div style={{ fontSize: '0.78rem', color: '#71717a', marginTop: '0.3rem' }}>{tP('config.purchasableNone')}</div>
@@ -9248,6 +9281,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     constraints: 'constraints' in cu ? cu.constraints : prev.constraints,
                     consolidation: cu.consolidation ? { ...prev.consolidation, ...cu.consolidation } : prev.consolidation,
                   }));
+                  // Preference tuning (resolvePreferenceTuning) and an explicit allocation
+                  // regenerate (maybeRegenerateAllocation) both mint a new version server-side —
+                  // refresh that picker's options so the newly selected version shows with its
+                  // label. The other external configs are only ever PICKED by the copilot
+                  // (existing versions, already listed).
+                  if ('pref_version_id' in cu && id) {
+                    listPreferencesVersions(id)
+                      .then((pref) => setExternalConfigVersions((prev) => ({ ...prev, pref })))
+                      .catch(() => { /* dropdown just shows the raw id until the next reload */ });
+                  }
+                  if ('case_alloc_version_id' in cu && id) {
+                    listAllocationVersions(id)
+                      .then((casealloc) => setExternalConfigVersions((prev) => ({ ...prev, casealloc })))
+                      .catch(() => { /* dropdown just shows the raw id until the next reload */ });
+                  }
                 };
                 try {
                   // Try the full agent first; fall back to copilot if it 5xxs (e.g. OPENAI key missing).
@@ -9327,104 +9375,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         </button>,
         document.body
       )}
-      {planPeggingOpen && planPeggingContext && typeof document !== 'undefined' && (planPeggingContext.type === 'demand' ? !!planResult : true) && createPortal(
-        <div
-          style={{
-            position: 'fixed',
-            inset: 0,
-            zIndex: 9998,
-            display: 'flex',
-            justifyContent: 'flex-end',
-            pointerEvents: 'auto',
-          }}
-          role="dialog"
-          aria-label="Planning pegging"
+      {planPeggingOpen && planPeggingContext && typeof document !== 'undefined' && (planPeggingContext.type === 'demand' ? !!planResult : true) && (
+        <MovableResizablePopup
+          ariaLabel="Planning pegging"
+          initialWidth={420}
+          initialHeight={700}
+          reserveRight={480}
+          title={
+            planPeggingContext.type === 'supply'
+              ? tP('supplyView.peggingPanel.title', { supplyId: planPeggingContext.supplyId })
+              : planPeggingContext.type === 'demand'
+                ? tP('peggingPanel.titleDemand', { label: planPeggingContext.row.demand_id ?? planPeggingContext.row.product_id ?? '' })
+                : tP('peggingPanel.titleWorkOrder', { product: planPeggingContext.row.product_id ?? '', location: planPeggingContext.row.location_id ?? '' })
+          }
+          onClose={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setPreviousManifestWoRow(null); }}
         >
-          <div
-            style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 0, pointerEvents: 'auto' }}
-            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setWoPeggingRowKey(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setPreviousManifestWoRow(null); }}
-            aria-hidden
-          />
-          <div
-            onMouseDown={(e) => e.stopPropagation()}
-            onClick={(e) => e.stopPropagation()}
-            style={{
-              position: 'relative',
-              zIndex: 10,
-              width: planPeggingPanelWidth,
-              maxWidth: '90vw',
-              minWidth: 320,
-              height: '100vh',
-              overflow: 'hidden',
-              background: '#1c1c1e',
-              color: '#e4e4e7',
-              boxShadow: '-4px 0 24px rgba(0,0,0,0.4)',
-              padding: '1.25rem',
-              pointerEvents: 'auto',
-              display: 'flex',
-              flexDirection: 'column',
-            }}
-          >
-            <div
-              role="separator"
-              aria-label="Resize planning pegging panel"
-              title="Drag to resize"
-              onMouseDown={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                planPeggingResizeRef.current = { startX: e.clientX, startW: planPeggingPanelWidth };
-                setPlanPeggingResizing(true);
-              }}
-              style={{
-                position: 'absolute',
-                left: 0,
-                top: 0,
-                bottom: 0,
-                width: 8,
-                cursor: 'col-resize',
-                zIndex: 11,
-                background: planPeggingResizing ? 'rgba(56, 189, 248, 0.45)' : 'rgba(255, 255, 255, 0.05)',
-                borderLeft: planPeggingResizing ? '1px solid #38bdf8' : '1px solid rgba(255, 255, 255, 0.08)',
-                transition: planPeggingResizing ? 'none' : 'background 120ms ease, border-color 120ms ease',
-              }}
-              onMouseEnter={(e) => {
-                if (planPeggingResizing) return;
-                (e.currentTarget as HTMLDivElement).style.background = 'rgba(56, 189, 248, 0.25)';
-                (e.currentTarget as HTMLDivElement).style.borderLeftColor = 'rgba(56, 189, 248, 0.6)';
-              }}
-              onMouseLeave={(e) => {
-                if (planPeggingResizing) return;
-                (e.currentTarget as HTMLDivElement).style.background = 'rgba(255, 255, 255, 0.05)';
-                (e.currentTarget as HTMLDivElement).style.borderLeftColor = 'rgba(255, 255, 255, 0.08)';
-              }}
-            >
-              {/* Subtle vertical grip dots, vertically centered, fade in on hover. */}
-              <div
-                style={{
-                  position: 'absolute',
-                  left: '50%',
-                  top: '50%',
-                  transform: 'translate(-50%, -50%)',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: 3,
-                  pointerEvents: 'none',
-                  opacity: planPeggingResizing ? 1 : 0.5,
-                }}
-              >
-                {[0, 1, 2, 3].map((i) => (
-                  <span
-                    key={i}
-                    style={{
-                      width: 2,
-                      height: 2,
-                      borderRadius: '50%',
-                      background: planPeggingResizing ? '#bae6fd' : '#71717a',
-                    }}
-                  />
-                ))}
-              </div>
-            </div>
             {previousPeggingContext && (
               <div style={{ marginBottom: '0.5rem' }}>
                 <button
@@ -9502,16 +9467,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 </button>
               </div>
             )}
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-              <h3 style={{ margin: 0, color: '#fafafa' }}>
-                {planPeggingContext.type === 'supply'
-                  ? tP('supplyView.peggingPanel.title', { supplyId: planPeggingContext.supplyId })
-                  : planPeggingContext.type === 'demand'
-                    ? tP('peggingPanel.titleDemand', { label: planPeggingContext.row.demand_id ?? planPeggingContext.row.product_id ?? '' })
-                    : tP('peggingPanel.titleWorkOrder', { product: planPeggingContext.row.product_id ?? '', location: planPeggingContext.row.location_id ?? '' })}
-              </h3>
-              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); setPreviousPeggingContext(null); setPreviousSupExplainRow(null); setPreviousWoExplainRow(null); setPreviousManifestWoRow(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tc('close')}</button>
-            </div>
             <p style={{ margin: 0, marginBottom: '0.5rem', fontSize: '0.8rem', color: '#71717a' }}>
               {planPeggingContext.type === 'supply'
                 ? tP('supplyView.peggingPanel.description')
@@ -9904,9 +9859,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 />
               ) : null;
             })()}
-          </div>
-        </div>,
-        document.body
+        </MovableResizablePopup>
       )}
       {(basketSlideInRow != null || basketShowingFinal) && (
         <div

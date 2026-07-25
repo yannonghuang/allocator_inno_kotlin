@@ -545,6 +545,13 @@ EXECUTION RULES:
     tool to fetch the result; the user will see the completion message
     automatically. Do NOT fabricate KPIs; the result is posted by the
     chat panel, not by you.
+  - **Chaining a config change with "run/generate a plan".** When the user's message asks for
+    BOTH a config change AND to run/generate a new plan (e.g. "set max methods to 3 and run a
+    plan", "increase delivery weight then generate a new plan"), you MUST call `run_plan_async`
+    as well as `update_config` before your final reply — either as a second tool call in the
+    SAME response, or in the very next turn once you see `update_config`'s result. Do NOT stop
+    after only `update_config` and then describe a plan as running; that violates the HONESTY
+    RULES below.
   - When the user asks to run a candidate from `suggest_next_batch`, you
     MUST pass the candidate's `config` object to `update_config` VERBATIM
     — every top-level key AND every nested field, even ones unchanged from
@@ -561,6 +568,13 @@ HONESTY RULES (these override "be helpful"):
     the KB from chat — click the 'Expand KB' button on the planning page, then ask me
     again." Do NOT pretend the expansion happened. Do NOT silently fall through to
     query_kb_runs and present existing rows as 'newly added'.
+  - Specifically: NEVER say "plan started" / "running the plan now" / any phrasing implying a
+    plan is executing unless `run_plan_async` actually appears in THIS turn's tool calls —
+    check what you actually called, not what you intended to call. If the user asked for a
+    config change AND a plan run but you only called `update_config` so far, either call
+    `run_plan_async` now before replying, or say plainly "I updated the config but haven't
+    started a plan yet — want me to run it?" Do not conflate "I changed the config that will
+    be used for the next plan" with "a plan is running".
   - When the user asks for "configs to try next" / "what should I explore?" /
     "recommend new configurations": you MUST call suggest_next_batch. That tool is the
     ONLY source of NOVEL proposals (single-axis variations off the current best,
@@ -900,6 +914,24 @@ internal val TOOLS: List<LlmTool> = listOf(
         "read_current_config",
         "Returns the working planning config for this conversation (most-recent saved or in-flight).",
         emptyParams(),
+    ),
+    tool(
+        "update_config",
+        "Apply a partial patch to the working planning config for this conversation. Deep-merges " +
+            "`partial` onto the current working config — set only the keys that change (method_selection, " +
+            "purchase_allowed, purchasable_materials, consolidation, analyze_criticality, check_soundness). " +
+            "Does NOT run a plan by itself — call run_plan_async afterward if the user wants the change " +
+            "applied. Returns the merged config as confirmation.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("partial") {
+                    put("type", "object")
+                    put("description", "Config keys to merge in, e.g. {\"method_selection\": {\"max_methods\": 3}}")
+                }
+            }
+            put("required", buildJsonArray { add("partial") })
+        },
     ),
     tool(
         "run_plan_async",
@@ -2652,7 +2684,7 @@ private fun toolGetDemandPegging(caseId: Int, args: JsonObject, locale: String):
         ?: return toolError("`run_id` is required", locale)
     val demandId = args["demand_id"]?.jsonPrimitive?.contentOrNull
         ?: return toolError("`demand_id` is required", locale)
-    val result = loadPlanResultFromDb(caseId, runId)
+    val result = loadPlanResultWithPeggingFromDb(caseId, runId)
         ?: return toolError("plan run $runId not found for case $caseId", locale)
     @Suppress("UNCHECKED_CAST")
     val pegging = result["planning_pegging"] as? List<Map<String, Any?>> ?: emptyList()
@@ -3086,7 +3118,7 @@ private fun toolGetLeafCompetition(caseId: Int, args: JsonObject, locale: String
         return toolError("`product_id` and `location_id` cannot be blank", locale)
     }
 
-    val result = loadPlanResultFromDb(caseId, runId)
+    val result = loadPlanResultWithPeggingFromDb(caseId, runId)
         ?: return toolError("plan run $runId not found for case $caseId", locale)
 
     // Defensive: catch the common LLM input-parsing error where a hyphenated
@@ -3688,7 +3720,7 @@ private fun toolGetComponentAllocationByDemand(caseId: Int, args: JsonObject, lo
         )
     }
 
-    val result = loadPlanResultFromDb(caseId, runId)
+    val result = loadPlanResultWithPeggingFromDb(caseId, runId)
         ?: return toolError("plan run $runId not found for case $caseId", locale)
 
     @Suppress("UNCHECKED_CAST")
@@ -4405,7 +4437,7 @@ private fun toolExplainMethodChoice(caseId: Int, args: JsonObject, locale: Strin
     }
     val demandFilter = args["demand_id"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotBlank() }
 
-    val result = loadPlanResultFromDb(caseId, runId)
+    val result = loadPlanResultWithPeggingFromDb(caseId, runId)
         ?: return toolError("plan run $runId not found for case $caseId", locale)
 
     @Suppress("UNCHECKED_CAST")
@@ -4940,9 +4972,10 @@ private suspend fun runAgentLoop(
         // No tool calls → final reply.
         if (resp.toolCalls.isEmpty()) {
             val rawReply = resp.text ?: "(empty reply)"
-            val (finalReply, finalSteps) = applyOption12SafetyNet(
+            val (safetyNetReply, finalSteps) = applyOption12SafetyNet(
                 caseId, userMessage, rawReply, steps, locale,
             )
+            val finalReply = applyPlanStartedHonestyCheck(safetyNetReply, finalSteps, locale)
             return AgentResponse(
                 reply = finalReply,
                 steps = finalSteps,
@@ -4999,9 +5032,10 @@ private suspend fun runAgentLoop(
         // token-budget truncation — sending it back through the LLM would
         // just re-narrate it more expensively.
         if (earlyTerminalReply != null) {
-            val (finalReply, finalSteps) = applyOption12SafetyNet(
+            val (safetyNetReply, finalSteps) = applyOption12SafetyNet(
                 caseId, userMessage, earlyTerminalReply!!, steps, locale,
             )
+            val finalReply = applyPlanStartedHonestyCheck(safetyNetReply, finalSteps, locale)
             return AgentResponse(
                 reply = finalReply,
                 steps = finalSteps,
@@ -5016,15 +5050,47 @@ private suspend fun runAgentLoop(
     log.warn("planning-agent hit MAX_TOOL_ITERATIONS={}", MAX_TOOL_ITERATIONS)
     val capReply = "(I ran out of reasoning steps after $MAX_TOOL_ITERATIONS tool calls. " +
         "Try a more specific request.)"
-    val (finalCapReply, finalCapSteps) = applyOption12SafetyNet(
+    val (safetyNetCapReply, finalCapSteps) = applyOption12SafetyNet(
         caseId, userMessage, capReply, steps, locale,
     )
+    val finalCapReply = applyPlanStartedHonestyCheck(safetyNetCapReply, finalCapSteps, locale)
     return AgentResponse(
         reply = finalCapReply,
         steps = finalCapSteps,
         configUpdate = workingConfig.takeIf { it != initialConfig },
         freshRunId = freshRunId,
         pendingJobId = pendingJobId,
+    )
+}
+
+// Post-loop honesty guard: the system prompt instructs the model to never claim a plan is
+// running unless it actually called run_plan_async, but smaller local models don't reliably
+// follow that instruction (observed on qwen2.5:7b: narrates "Plan started" after calling only
+// update_config). Whether run_plan_async fired this turn is a plain fact the backend already
+// has in `steps` — enforcing the claim deterministically here is more reliable than depending
+// solely on the model to police itself, consistent with keeping deterministic checks in
+// Kotlin rather than the prompt (mirrors the Allocation<->Purchasable coupling handling).
+private val PLAN_STARTED_CLAIM_RE = Regex(
+    "plan (has )?(started|running|been started)|running (the|a) (new )?plan|" +
+        "started (the|a) (new )?plan|计划(已|正在)(开始|运行|启动)|正在(运行|生成)计划",
+    RegexOption.IGNORE_CASE,
+)
+
+private fun applyPlanStartedHonestyCheck(
+    reply: String,
+    steps: List<AgentStep>,
+    locale: String,
+): String {
+    if (!PLAN_STARTED_CLAIM_RE.containsMatchIn(reply)) return reply
+    val actuallyRanPlan = steps.any { it.tool == "run_plan_async" || it.tool == "wait_for_plan" }
+    if (actuallyRanPlan) return reply
+    return reply + "\n\n" + loc(
+        "(Correction: I described running a plan but didn't actually call the plan tool this " +
+            "turn — no plan is running. Say \"run it\" / \"generate a plan\" if you'd like me to " +
+            "start one now.)",
+        "（更正：我描述了正在运行计划，但本轮实际上并未调用计划工具 — 目前没有计划在运行。如需现在" +
+            "启动，请告诉我「运行」或「生成计划」。）",
+        locale,
     )
 }
 
@@ -5063,6 +5129,7 @@ private suspend fun dispatchTool(
 ): Pair<ToolResult, JsonObject> {
     return when (call.name) {
         "read_current_config" -> Pair(toolReadCurrentConfig(workingConfig, locale), workingConfig)
+        "update_config" -> toolUpdateConfig(workingConfig, args, locale)
         "run_plan_async" -> Pair(toolRunPlanAsync(caseId, workingConfig, locale), workingConfig)
         "wait_for_plan" -> Pair(toolWaitForPlan(args, locale), workingConfig)
         "list_plan_runs" -> Pair(toolListPlanRuns(caseId, args, locale), workingConfig)
@@ -6289,7 +6356,7 @@ private fun toolFindDemandsForProduct(caseId: Int, args: JsonObject, locale: Str
     val planRunId = args["plan_run_id"]?.jsonPrimitive?.intOrNull
     val limit = (args["limit"]?.jsonPrimitive?.intOrNull ?: 50).coerceIn(1, 500)
 
-    val result = loadPlanResultFromDb(caseId, planRunId)
+    val result = loadPlanResultWithPeggingFromDb(caseId, planRunId)
         ?: return ToolResult(
             summary = loc("no baseline plan run; run plan first", "尚无基线计划，请先生成计划", locale),
             payload = buildJsonObject { put("error", "no_baseline") },

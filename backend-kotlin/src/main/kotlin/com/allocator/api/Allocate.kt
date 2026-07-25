@@ -2047,33 +2047,55 @@ private fun jsonToAny(v: JsonElement): Any? = when (v) {
     is JsonArray  -> v.map { jsonToAny(it) }
 }
 
+private data class PlanResultRow(val resultJson: String, val resolvedRunId: Int)
+
+private fun loadPlanResultRowFromDb(caseId: Int, runId: Int?): PlanResultRow? = transaction {
+    if (runId != null) {
+        PlanRuns.selectAll()
+            .where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }
+            .firstOrNull()
+            ?.let { r -> r[PlanRuns.result]?.let { json -> PlanResultRow(json, runId) } }
+    } else {
+        PlanRuns.selectAll()
+            .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
+            .orderBy(PlanRuns.id, SortOrder.DESC)
+            .firstOrNull()
+            ?.let { r -> r[PlanRuns.result]?.let { json -> PlanResultRow(json, r[PlanRuns.id]) } }
+    }
+}
+
 /**
  * Load a plan result for a case from the DB.
  * - If [runId] is provided, load that specific run (any status).
- * - Otherwise, load the latest successful run and warm up [casePlanResults].
+ * - Otherwise, load the latest successful run.
  * Returns null if not found or the stored result cannot be parsed.
+ *
+ * The returned map never has a `planning_pegging` key — every save path persists the result
+ * with it explicitly stripped (`serializeResultOrNull`'s `enriched - "planning_pegging"`; those
+ * trees are saved separately, asynchronously, into the `plan_pegging` table — see
+ * `savePlanPeggingRows`'s own doc for why). Callers that need pegging must use
+ * [loadPlanResultWithPeggingFromDb] instead — attaching multi-GB pegging trees on every call
+ * here would regress every OTHER caller that just wants work orders/KPIs.
  */
 @Suppress("UNCHECKED_CAST")
 internal fun loadPlanResultFromDb(caseId: Int, runId: Int? = null): Map<String, Any>? {
-    data class DbRow(val resultJson: String, val resolvedRunId: Int)
-    val row = transaction {
-        if (runId != null) {
-            PlanRuns.selectAll()
-                .where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }
-                .firstOrNull()
-                ?.let { r -> r[PlanRuns.result]?.let { json -> DbRow(json, runId) } }
-        } else {
-            PlanRuns.selectAll()
-                .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
-                .orderBy(PlanRuns.id, SortOrder.DESC)
-                .firstOrNull()
-                ?.let { r -> r[PlanRuns.result]?.let { json -> DbRow(json, r[PlanRuns.id]) } }
-        }
-    } ?: return null
+    val row = loadPlanResultRowFromDb(caseId, runId) ?: return null
+    return runCatching {
+        jsonToAny(Json.parseToJsonElement(row.resultJson)) as? Map<String, Any>
+    }.getOrNull()
+}
+
+/** Same as [loadPlanResultFromDb], but with `planning_pegging` re-attached from the
+ *  `plan_pegging` table — for the handful of callers (pegging-tree tools) that actually need
+ *  it. Empty list (not absent) when the run's async pegging save hasn't completed yet or was
+ *  interrupted (e.g. by a backend restart mid-save — that job doesn't resume). */
+@Suppress("UNCHECKED_CAST")
+internal fun loadPlanResultWithPeggingFromDb(caseId: Int, runId: Int? = null): Map<String, Any>? {
+    val row = loadPlanResultRowFromDb(caseId, runId) ?: return null
     val base = runCatching {
         jsonToAny(Json.parseToJsonElement(row.resultJson)) as? Map<String, Any>
     }.getOrNull() ?: return null
-    return base
+    return base + ("planning_pegging" to loadPlanPeggingFromDb(row.resolvedRunId))
 }
 
 /** Load all pegging entries for a run from the plan_pegging table. */
@@ -3222,7 +3244,7 @@ internal data class EffectiveConfig(
  * AT SUBMISSION TIME survives alongside the rest of this point-in-time config snapshot, rather
  * than being silently invisible to the KB.
  */
-private fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int): EffectiveConfig {
+internal fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int): EffectiveConfig {
     val c = config ?: emptyMap()
     val consolidation = (c["consolidation"]     as? Map<*, *>)?.let { it as Map<String, Any?> } ?: emptyMap()
     val methodCfg = resolveMethodSelection(c)
@@ -3325,7 +3347,7 @@ private fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int): Eff
  * no customer constraints, while the persisted config snapshot claimed the resolved versions were
  * in effect.
  */
-private fun planningConfig(config: Map<String, Any?>?, effective: EffectiveConfig): Map<String, Any?> =
+internal fun planningConfig(config: Map<String, Any?>?, effective: EffectiveConfig): Map<String, Any?> =
     (config ?: emptyMap()) + mapOf(
         "purchasable_materials" to loadPurchasableMaterialIds(effective.purchMatVersionId).sorted(),
         "constraints" to loadCaseConstraintRows(effective.constrVersionId).map { k ->

@@ -4,7 +4,8 @@ package com.allocator
  * Application configuration loaded from environment variables.
  * Mirrors Python's pydantic-settings Config class.
  *
- * LLM provider: controlled by LLM_PROVIDER (openclaw | anthropic | openai | nanogpt, default openclaw).
+ * LLM provider: controlled by LLM_PROVIDER (openclaw | anthropic | openai | nanogpt | dashscope,
+ * default openclaw).
  *   openclaw  — route chat completions through OpenClaw's gateway using OPENCLAW_TOKEN.
  *               Reuses whatever provider OpenClaw is configured for (e.g. Anthropic via
  *               an OAuth subscription token) so no separate API key is needed.
@@ -15,6 +16,12 @@ package com.allocator
  *               thin OpenAI-shape passthrough, so the caller's `tools` array isn't merged with
  *               OpenClaw's built-in tool manifest. Used by the planning agent to keep its 35-tool
  *               decision space clean.
+ *   dashscope — call Alibaba Cloud DashScope's OpenAI-compatible endpoint with
+ *               DASHSCOPE_API_KEY (Qwen models). DASHSCOPE_BASE_URL defaults to the shared
+ *               public endpoint (https://dashscope.aliyuncs.com/compatible-mode/v1); override
+ *               for a dedicated/reserved-capacity MaaS deployment (e.g.
+ *               https://<workspace-id>.<region>.maas.aliyuncs.com/compatible-mode/v1) — set
+ *               ASSESSMENT_MODEL to the exact model id the deployment expects.
  * ASSESSMENT_MODEL overrides the default model for whichever provider is active.
  *
  * ALLOCATOR_LLM_PROVIDER (default nanogpt) is the shared pin used by all three
@@ -32,10 +39,16 @@ data class AppConfig(
     val anthropicApiKey: String?,
     val nanogptApiKey: String?,
     val nanogptBaseUrl: String,
+    val dashscopeApiKey: String?,
+    val dashscopeBaseUrl: String,
     val assessmentModel: String,
     val openClawUrl: String,
     val openClawToken: String?,
     val openClawMaterialAgent: String,
+    /** HTTP request timeout for every LLM call (LlmClient.kt), millis. Default 90s. Override
+     *  with LLM_REQUEST_TIMEOUT_MS if a provider/route ever needs longer (unaffected unless
+     *  explicitly set). */
+    val llmRequestTimeoutMs: Long,
 ) {
     companion object {
         // Treat empty env values as unset — docker-compose's `${VAR:-}` pattern
@@ -49,6 +62,9 @@ data class AppConfig(
                 "openai" -> "gpt-4o-mini"
                 "anthropic" -> "claude-haiku-4-5-20251001"
                 "nanogpt" -> "minimax/minimax-m2.7"
+                // Sane fallback only — a dedicated/reserved-capacity MaaS deployment expects
+                // its own specific model id; set ASSESSMENT_MODEL to override.
+                "dashscope" -> "qwen-plus"
                 // OpenClaw gateway's /v1/chat/completions only accepts "openclaw"
                 // (raw default LLM, no agent wrap) or "openclaw/<agentId>".
                 // Raw completion is what impact-assessment + planning-copilot want.
@@ -65,10 +81,14 @@ data class AppConfig(
                 nanogptApiKey = env("NANOGPT_API_KEY"),
                 nanogptBaseUrl = env("NANOGPT_BASE_URL")
                     ?: "https://nano-gpt.com/api/subscription/v1",
+                dashscopeApiKey = env("DASHSCOPE_API_KEY"),
+                dashscopeBaseUrl = env("DASHSCOPE_BASE_URL")
+                    ?: "https://dashscope.aliyuncs.com/compatible-mode/v1",
                 assessmentModel = env("ASSESSMENT_MODEL") ?: defaultModel,
                 openClawUrl = env("OPENCLAW_URL") ?: "http://openclaw:18789",
                 openClawToken = env("OPENCLAW_TOKEN"),
                 openClawMaterialAgent = env("OPENCLAW_MATERIAL_AGENT") ?: "openclaw:material",
+                llmRequestTimeoutMs = env("LLM_REQUEST_TIMEOUT_MS")?.toLongOrNull() ?: 90_000L,
             )
         }
     }
