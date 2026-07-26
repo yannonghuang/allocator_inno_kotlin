@@ -48,6 +48,14 @@ internal data class MethodSelectionConfig(
      *  exceeds this cap is skipped without recursing — too deep to attempt
      *  productively. Default 3 (covers typical case-171 patterns). */
     val maxBomDepth: Int = DEFAULT_MAX_BOM_DEPTH,
+    /** Default true (2026-07: promoted from the `explore/root-alt-waterfall` A/B — measured
+     *  +0.59pp fill-rate, +3 on-time demands, lower Gini, and 22% fewer manufacturing WOs vs.
+     *  the old root-split default on case 173, at equal 208/208 soundness). When true, the
+     *  root-only proportional/equal split (`rootSplitWeights` in [plan]) is disabled, so a root
+     *  demand with cap > 1 uses the SAME ordinary sequential 100%-then-spillover waterfall every
+     *  non-root node already uses, instead of dividing its quantity up-front across
+     *  alternatives. Set false to restore the legacy root-split behavior. */
+    val rootWaterfall: Boolean = true,
 ) {
     val elaborate: Boolean get() = mode == "elaborate"
 }
@@ -161,6 +169,9 @@ internal fun resolveMethodSelection(config: Map<String, Any?>?): MethodSelection
         vs?.get("score_weights") as? Map<String, Any?>
     }
     val maxBomDepth = parseMaxBomDepth(raw["max_bom_depth"])
+    // Default true — see MethodSelectionConfig.rootWaterfall's own doc. Only an explicit
+    // `false` opts back into the legacy root-split behavior.
+    val rootWaterfall = raw["root_waterfall"] != false
     return MethodSelectionConfig(
         mode = mode,
         depth = depth,
@@ -168,6 +179,7 @@ internal fun resolveMethodSelection(config: Map<String, Any?>?): MethodSelection
         maxMethods = maxMethods,
         scoreWeights = weights,
         maxBomDepth = maxBomDepth,
+        rootWaterfall = rootWaterfall,
     )
 }
 
@@ -3407,13 +3419,17 @@ fun plan(
     // type after a partial success — matching the historical root-only waterfall's behavior,
     // which had no such restriction.
     val isRoot = depth == MAX_PLAN_DEPTH
-    // Root-only proportional/equal split among the top `cap` candidates: rather than the
-    // ordinary sequential 100%-then-spillover waterfall, a root demand with cap > 1 always
-    // gets its quantity divided up-front across its top-ranked alternatives — weighted by
-    // each candidate's reconstructed Preferences-KB score when one is fully available for
-    // every candidate in play, otherwise an even split. Never applied below the root (that's
-    // exactly the 2^N fan-out risk the historical proactive waterfall was root-only to avoid).
-    val rootSplitWeights: List<Double>? = if (isRoot && cap > 1) {
+    // Legacy root-only proportional/equal split among the top `cap` candidates (opt-in via
+    // method_selection.root_waterfall=false): rather than the ordinary sequential
+    // 100%-then-spillover waterfall, a root demand with cap > 1 gets its quantity divided
+    // up-front across its top-ranked alternatives — weighted by each candidate's reconstructed
+    // Preferences-KB score when one is fully available for every candidate in play, otherwise
+    // an even split. Never applied below the root (that's exactly the 2^N fan-out risk the
+    // historical proactive waterfall was root-only to avoid). methodCfg.rootWaterfall defaults
+    // true, forcing this to null — every downstream reference already has a null-safe fallback
+    // to the ordinary sequential `residual` target, so this single condition cleanly degrades
+    // the root to the SAME waterfall every non-root node uses, across-the-board.
+    val rootSplitWeights: List<Double>? = if (isRoot && cap > 1 && !methodCfg.rootWaterfall) {
         val scored = preferenceKb?.let { reconstructNodeScores(productId, locationId, candidates, it) }
             ?.take(cap)?.let { topScores ->
                 val sum = topScores.sum()
