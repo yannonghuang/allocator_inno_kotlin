@@ -3265,6 +3265,14 @@ internal fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int): Ef
 
     val json = buildJsonObject {
         put("purchase_allowed", c["purchase_allowed"] as? Boolean ?: true)
+        // Materialized here (not left to fall through the raw-config passthrough in
+        // planningConfig()) so a reloaded/viewed run's config actually shows what was really
+        // used — this whitelist-reconstructed `json` (not the caller's raw submitted map) is
+        // what gets persisted to plan_run.config and read back by the UI's "load this run's
+        // config" paths and by ConfigDetailView (KB + Run History display). Omitting a
+        // planning-behavior field here means it silently vanishes on reload even though it
+        // demonstrably changed the run's own output.
+        put("reallocate_critical_leftover", c["reallocate_critical_leftover"] as? Boolean ?: false)
         // Selective-purchase whitelist and customer-BOM constraints are case-level persisted
         // settings now (CasePurchasableMaterials / CaseConstraints — "promoted out" of this
         // config blob, see those tables' own doc in Tables.kt), not something the caller
@@ -3291,6 +3299,7 @@ internal fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int): Ef
             put("elaborate", methodCfg.elaborate)  // legacy mirror — consumers still read this
             put("multiple",  methodCfg.multiple)   // legacy mirror — soft-deprecated, see max_methods
             put("max_methods",   methodCfg.maxMethods)
+            put("root_waterfall", methodCfg.rootWaterfall)
             put("max_bom_depth", methodCfg.maxBomDepth)
             // Always materialize score_weights (with engine defaults) so the persisted
             // snapshot is self-describing — viewing config later shows the exact weights

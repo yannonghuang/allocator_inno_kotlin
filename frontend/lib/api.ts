@@ -441,6 +441,16 @@ export type PlanningConfig = {
   /** When false, the buy/purchase method is excluded from planning. Default: true. */
   purchase_allowed?: boolean;
   /**
+   * EXPERIMENTAL (default false, unvalidated). When true, a second planning pass runs after the
+   * first: demands that came up short get an extra share of each critical material's leftover
+   * (unconsumed) supply, sized to close that demand's own remaining gap at the same
+   * material-per-committed-unit rate it already exhibited (capped by what's actually left when
+   * multiple short demands compete for the same material) — then the whole plan re-runs with
+   * that combined budget, replacing pass 1's result entirely. See PlanningEngine.kt's
+   * runPlanning/reallocateCriticalLeftoverBudget.
+   */
+  reallocate_critical_leftover?: boolean;
+  /**
    * Selective-purchase whitelist of buyable raw-material product_ids. Only meaningful
    * when purchase_allowed !== false. Empty/absent ⇒ all raw materials are purchasable
    * (default). Non-empty ⇒ strict whitelist: only listed materials keep their buy
