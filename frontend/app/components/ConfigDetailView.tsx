@@ -111,6 +111,7 @@ export function ConfigDetailView({ config, caseId, versionRefs }: { config: Reco
   return (
     <div style={{ fontSize: '0.74rem' }}>
       <div style={{ marginBottom: 10 }}>
+        {row('Root waterfall', String(ms.root_waterfall !== false))}
         {row('Max methods', String(ms.max_methods ?? 1))}
         {row('Purchase allowed', String(config.purchase_allowed === true))}
         {row('WO batch (make/move/buy)', `${(cs.make_batch_scale as string) ?? globalBatchFb} / ${(cs.move_batch_scale as string) ?? globalBatchFb} / ${(cs.purchase_batch_scale as string) ?? globalBatchFb}`)}

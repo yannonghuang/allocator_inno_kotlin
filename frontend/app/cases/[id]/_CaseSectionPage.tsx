@@ -4458,14 +4458,35 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               {tP('config.subheadMethod')}
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+              {(() => {
+                const rootWaterfall = planningConfig.method_selection?.root_waterfall !== false;
+                return (
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }} title={tP('config.rootWaterfallTooltip')}>
+                    <input
+                      type="checkbox"
+                      checked={rootWaterfall}
+                      onChange={(e) => setPlanningConfig((c) => ({
+                        ...c,
+                        method_selection: { ...c.method_selection, root_waterfall: e.target.checked },
+                      }))}
+                    />
+                    <span style={{ fontSize: '0.875rem' }}>{tP('config.rootWaterfall')}</span>
+                  </label>
+                );
+              })()}
               <label
-                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', cursor: 'pointer' }}
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem',
+                  cursor: planningConfig.method_selection?.root_waterfall === false ? 'pointer' : 'default',
+                  opacity: planningConfig.method_selection?.root_waterfall === false ? 1 : 0.5,
+                }}
                 title={tP('config.methodMaxCountTooltip')}
               >
                 <span style={{ color: '#a1a1aa' }}>{tP('config.methodMaxCount')}</span>
                 <input
                   type="number"
                   min={1}
+                  disabled={planningConfig.method_selection?.root_waterfall !== false}
                   value={(() => {
                     const ms = planningConfig.method_selection;
                     if (typeof ms?.max_methods === 'number') return Math.max(1, Math.trunc(ms.max_methods));
@@ -4506,11 +4527,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           {/* ── External config object version pickers — explicit pick, else the case's default
               (see resolveEffectiveConfig's own doc). Each object's own data lives on its
               dedicated page; this is just "which version does THIS run use." ── */}
-          <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
-            <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+          <details open style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
+            <summary style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em', cursor: 'pointer' }}>
               {tP('config.groupExternalVersions')}
-            </legend>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+            </summary>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', marginTop: '0.4rem' }}>
               {([
                 { kind: 'casealloc', externalKind: 'allocation', label: tP('config.externalAllocation'), configKey: 'case_alloc_version_id' },
                 { kind: 'pref', externalKind: 'preferences', label: tP('config.externalPreferences'), configKey: 'pref_version_id' },
@@ -4552,7 +4573,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 );
               })}
             </div>
-          </fieldset>
+          </details>
 
           {/* ── Group 2: Post-plan handling (run AFTER planning, do not affect planner) ── */}
           <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
@@ -7493,11 +7514,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
 
                 {/* External config object version pickers — same pattern as the Planning page's
                     own fieldset (see its own comment). One fixed pick for the whole batch. */}
-                <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
-                  <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                <details open style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
+                  <summary style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em', cursor: 'pointer' }}>
                     {tP('config.groupExternalVersions')}
-                  </legend>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+                  </summary>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', marginTop: '0.4rem' }}>
                     {([
                       { kind: 'casealloc', externalKind: 'allocation', label: tP('config.externalAllocation'), configKey: 'case_alloc_version_id' },
                       { kind: 'pref', externalKind: 'preferences', label: tP('config.externalPreferences'), configKey: 'pref_version_id' },
@@ -7539,7 +7560,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       );
                     })}
                   </div>
-                </fieldset>
+                </details>
 
                 {/* Post-plan handling — identical copy of the Planning page's own fieldset
                     (WO batch frequency, analyze criticality, check soundness). */}

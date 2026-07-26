@@ -412,6 +412,15 @@ export type PlanningConfig = {
      */
     multiple?: boolean;
     /**
+     * When true (default), the root demand uses the SAME ordinary sequential waterfall every
+     * non-root node uses (100% to the best-ranked method, spillover residual to the next).
+     * When false, the root instead splits its quantity up-front, proportionally, across its
+     * top `max_methods` alternatives (the legacy behavior) — `max_methods` only controls that
+     * split shape when this is false; with root_waterfall true it still bounds fallback depth,
+     * but the form disables editing it since the effect is secondary in waterfall mode.
+     */
+    root_waterfall?: boolean;
+    /**
      * Waterfall cap: how many ranked methods may be tried before giving up.
      * Integer >= 1. Default 2 (in sync with the backend default).
      *   1 = single best method (no fallback)
