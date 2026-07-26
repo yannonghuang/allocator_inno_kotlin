@@ -5829,7 +5829,37 @@ internal fun legacyCommit(
             diamondRecipients = diamondRecipients,
             diamondCriticalEntitlement = diamondCriticalEntitlement?.get(demandId),
         )
-        committedDemands.addAll(solvedList)
+        // plan()'s `quantity <= 0` early return produces a COMPLETELY empty result (no
+        // committed_demands row, no work order, no pegging tree) — correct when a demand
+        // genuinely requested 0, but this same path also fires when nodeQtyCaps capped an
+        // originally-positive request down to exactly 0 (e.g. no make/buy/move path reaches
+        // the demand's location at all — total, structural infeasibility). Every OTHER kind
+        // of failure (no_methods mid-tree, depth_limit, cycle_stopped) gets a visible
+        // committed_demands row; this one silently vanished, undercounting `demand` vs
+        // `committed_demands` (root-caused live on case 173, run 1492: 208 requested vs 200
+        // committed — all 8 missing were exactly this shape, Negative_Inventory_* pseudo-
+        // demands at a location with zero reachable supply chain). Synthesize the same
+        // "quantity=0, hard failure" row shape every other total-failure path already
+        // produces, so this demand is never silently dropped. No fabricated pegging tree —
+        // SoundnessChecker.kt's anyBenignRowByDemand/hardFailureDemandIds already treats "a
+        // hard-failure committed_demands row with no pegging tree" as the expected, legitimate
+        // shape (see its own Negative_Inventory_* comment) — this fix just makes the row exist.
+        val originalQty = (d["quantity"] as? Number)?.toDouble() ?: 0.0
+        val effectiveSolvedList = if (solvedList.isEmpty() && originalQty > 0.0) {
+            listOf(buildMap<String, Any?> {
+                put("demand_id", demandId)
+                put("customer_id", d["customer_id"])
+                put("customer", d["customer"])
+                put("product_id", d["product_id"])
+                put("location_id", d["location_id"])
+                put("quantity", 0.0)
+                put("quantity_precise", 0.0)
+                put("request_time", reqStr)
+                put("commit_time", null)
+                put("commit_reason", "no_methods")
+            })
+        } else solvedList
+        committedDemands.addAll(effectiveSolvedList)
         workOrders.addAll(wos)
         if (peggingNode != null && demandId != null) {
             planningPegging.add(mapOf("demand_id" to demandId, "tree" to peggingNode))
