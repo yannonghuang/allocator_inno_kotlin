@@ -5915,8 +5915,11 @@ data class RunPlanningResult(
 /**
  * Plan all demands. Returns (committedDemands, workOrders, planningPegging).
  * Port of planning_engine.run_planning().
+ *
+ * Single planning pass — see [runPlanning] (the public entry point) for the optional second-pass
+ * critical-material leftover reallocation wrapped around this.
  */
-fun runPlanning(
+private fun runPlanningOnePass(
     data: Map<String, List<Map<String, Any?>>>,
     config: Map<String, Any?>? = null,
     progressCallback: ((Map<String, Any?>) -> Unit)? = null,
@@ -5985,8 +5988,26 @@ fun runPlanning(
     // Step 1+2: pure allocation — BOM reachability walk + proportional supply split.
     val sgAllocationBase = buildSupplyAllocation(demands, data, config)
     val sgAllocation = if (precomputedBudgets != null) {
-        log.info("[supply-guided] using case_allocation override: {} demand budget entries", precomputedBudgets.size)
-        sgAllocationBase.copy(perLotBudgets = precomputedBudgets)
+        // Merge, don't replace: precomputedBudgets (from reallocateCriticalLeftoverBudget) only
+        // has entries for demands that drew nonzero critical material somewhere in pass 1 — any
+        // demand that drew ZERO critical material anywhere in pass 1 is entirely absent from it.
+        // A plain `.copy(perLotBudgets = precomputedBudgets)` replacement previously left such
+        // demands with budget == null for this whole call, which consumeFromInventory treats as
+        // fully UNCAPPED (perLotBudget == null -> no per-lot restriction at all) — letting them
+        // freely drain leftover critical-material lots ahead of the demands the reallocation was
+        // actually trying to help, even though sgAllocationBase's own default entitlement system
+        // would have given them a real (smaller) cap. Falling back to sgAllocationBase's entry
+        // for any demand precomputedBudgets doesn't mention restores that default cap instead of
+        // leaving them unbounded. Demands precomputedBudgets DOES cover keep its (already
+        // original+additional) entry unchanged — reallocateCriticalLeftoverBudget's originalBudgets
+        // loop already captures every critical-material lot such a demand touched in pass 1.
+        val merged = precomputedBudgets.toMutableMap()
+        for ((did, lotMap) in sgAllocationBase.perLotBudgets) {
+            if (did !in merged) merged[did] = lotMap.toMutableMap()
+        }
+        log.info("[supply-guided] using case_allocation override: {} demand budget entries ({} backfilled from default)",
+            precomputedBudgets.size, merged.size - precomputedBudgets.size)
+        sgAllocationBase.copy(perLotBudgets = merged)
     } else {
         sgAllocationBase
     }
@@ -6432,6 +6453,282 @@ fun runPlanning(
         inventoryLeftover = inventory.map { it.toMap() },
         producedByComponent = producedByComponent,
     )
+}
+
+/**
+ * Public entry point — see [runPlanningOnePass] for the actual single-pass algorithm.
+ *
+ * EXPERIMENTAL (default off, opt-in via `config["reallocate_critical_leftover"] == true`,
+ * unvalidated — see `explore/critical-leftover-reallocation` branch). When enabled, wraps a
+ * SECOND pass around the first: demands that came up short (Σcommitted < requested_qty) get an
+ * extra share of each critical material's LEFTOVER (unconsumed) supply — sized to close that
+ * demand's own remaining gap at the SAME material-per-committed-unit rate it already exhibited,
+ * capped by what's actually left when multiple short demands compete for the same material — see
+ * [reallocateCriticalLeftoverBudget]'s own doc for the exact formula. The combined
+ * (original-entitlement + additional) budget is fed back in as `precomputedBudgets` for a full
+ * second run, whose result REPLACES pass 1's entirely, matching the design spec: "re-apply the
+ * same planning algorithm with the adjusted allocation." Skips the second pass (returns pass 1
+ * unchanged) when there's nothing to add — no short demands, or none of them drew any critical
+ * material.
+ */
+fun runPlanning(
+    data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>? = null,
+    progressCallback: ((Map<String, Any?>) -> Unit)? = null,
+    precomputedBudgets: Map<Any?, MutableMap<String, Double>>? = null,
+    preferenceKb: PreferenceKb? = null,
+    demandOrder: Map<String, Int>? = null,
+): RunPlanningResult {
+    val pass1 = runPlanningOnePass(data, config, progressCallback, precomputedBudgets, preferenceKb, demandOrder)
+    if (config?.get("reallocate_critical_leftover") != true) return pass1
+
+    val demands = data["demand"] ?: emptyList()
+    // Only used to derive criticalPids (which (pid, lid) pairs are critical) — cheap, pure,
+    // read-only BOM walk, same call buildSupplyAllocation itself made at the top of pass 1.
+    val criticalPids = buildSupplyAllocation(demands, data, config).criticalMatrix.byColumn.keys
+        .map { it.productId }.toSet()
+
+    val combinedBudgets = reallocateCriticalLeftoverBudget(pass1, data, criticalPids)
+    if (combinedBudgets == null) {
+        log.info("[reallocate-critical-leftover] no short demand drew any critical material with leftover — skipping second pass")
+        return pass1
+    }
+    log.info("[reallocate-critical-leftover] re-running with adjusted budget ({} demand entries)", combinedBudgets.size)
+    return runPlanningOnePass(data, config, progressCallback, combinedBudgets, preferenceKb, demandOrder)
+}
+
+/**
+ * Computes the SECOND-PASS `precomputedBudgets` for the "reallocate critical leftover" optional
+ * step (see [runPlanning]'s own doc). For every demand D_i short on its request in [pass1], for
+ * every critical material c_j it drew from:
+ *
+ *   utilization_rate(D_i, c_j) = commit(D_i) / used(D_i, c_j)   — product units per material unit,
+ *                                                                  at D_i's own observed rate
+ *   desired(D_i, c_j) = (request(D_i) - commit(D_i)) / utilization_rate(D_i, c_j)
+ *                     = (request(D_i) - commit(D_i)) * used(D_i, c_j) / commit(D_i)
+ *   allocation = original_allocation + additional_allocation
+ *
+ * `desired` is how much MORE of c_j this demand would take, at the same material-per-unit rate
+ * it already exhibited, to close its own remaining gap entirely.
+ *
+ * TWO fixes, both learned from live regressions on case 173, both resolved by treating this as a
+ * REVISED, self-consistent Critical Raw Allocation table computed up front — the SAME way a real
+ * one is computed — rather than pass-1 output patched after the fact:
+ *
+ * 1. `original_allocation` is built from every demand's ACTUAL pass-1 CONSUMPTION
+ *    (`qty_consumed`), not its pristine, often-partly-unused fair-share entitlement ceiling — the
+ *    latter caused fill rate to collapse 63.35% -> 41.24%: summed across demands, the pristine
+ *    entitlement for a lot already totals roughly the lot's FULL physical qty, so adding extra
+ *    cap on top over-subscribed it — whichever demand pass 2's (unchanged) processing order
+ *    reached first could grab stock a LATER, unboosted demand had an unchanged legitimate claim
+ *    on. Actual consumption as the baseline makes this impossible BY CONSTRUCTION:
+ *    Σ actual_consumed(lot) + leftover(lot) == lot's physical total, always.
+ *
+ * 2. `additional_allocation` is computed by running [allocate] — the EXACT SAME proportional-
+ *    split function [allocateSuppliesPerLot] uses to build the original entitlement — ONCE per
+ *    leftover LOT (not once per material, spread across its lots by lot SIZE, which was tried
+ *    second and still under-guaranteed things: capping the sum across a material's lots doesn't
+ *    cap any ONE of those lots individually — many demands could each contribute a small slice
+ *    to the same small lot and collectively oversubscribe just that lot, each demand's own
+ *    material-wide total still looking fine). A single [allocate] call per lot, among only the
+ *    demands that already drew from THAT EXACT lot in pass 1 (proven structural ability to draw
+ *    from it — not just the material in the abstract), weighted by each one's `desired` qty,
+ *    guarantees by construction that the sum handed out for any one lot never exceeds that lot's
+ *    own leftover — independent of demand-processing order, because the cap for every demand is
+ *    fixed BEFORE pass 2 ever starts consuming, not discovered by racing through it.
+ *
+ * pass 2 is NOT "pass 1 continued" — runPlanning's own doc covers this, but worth repeating here
+ * since this function is the one computing pass 2's only input delta: pass 2 is a fully
+ * independent invocation of [runPlanningOnePass] on the SAME (data, config) with a FRESH
+ * inventory rebuilt from `data["supply"]` and freshly recomputed blueprint/sibling-caps/caches —
+ * nothing residual carries over from pass 1 except the combined budget this function returns.
+ *
+ * Returns null when there's nothing to add (no short demands, none of them drew any critical
+ * material, or no critical material has any leftover) — the caller should skip the second pass.
+ */
+private fun reallocateCriticalLeftoverBudget(
+    pass1: RunPlanningResult,
+    data: Map<String, List<Map<String, Any?>>>,
+    criticalPids: Set<String>,
+): Map<Any?, MutableMap<String, Double>>? {
+    val supplyMeta: Map<String, Pair<String, String>> = (data["supply"] ?: emptyList()).associate { s ->
+        ((s["supply_id"] as? String)?.trim() ?: "") to
+            Pair((s["product_id"] as? String)?.trim() ?: "", (s["location_id"] as? String)?.trim() ?: "")
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    val committedDemands = pass1.output["committed_demands"] as? List<Map<String, Any?>> ?: emptyList()
+    @Suppress("UNCHECKED_CAST")
+    val supplyAllocations = pass1.output["supply_allocations"] as? List<Map<String, Any?>> ?: emptyList()
+
+    // Short demands: Σ committed qty (a demand can carry multiple committed_demands rows, e.g.
+    // waterfall fallback slots) < requested qty. `committed_demands` rows don't carry
+    // `requested_qty` at this stage — that field is added by a POST-processing enrichment step
+    // in Allocate.kt that runs AFTER runPlanning() returns (see enrichCommittedDemands's own
+    // doc), which is later than this function ever sees. Read "requested" straight from the raw
+    // `demand` input table instead — the authoritative source enrichCommittedDemands itself
+    // reads from, so this can't disagree with what the UI eventually shows as requested_qty.
+    // Exclude failure-reason rows from the committed sum — matching enrichCommittedDemands's
+    // OWN FAILURE_REASONS exactly (depth_limit / cycle_stopped / no_methods / no_preferred_method
+    // / child_failed:*), NOT isHardPlanningFailure (a different function, one file over, that
+    // deliberately treats cycle_stopped as benign for a DIFFERENT purpose — bottleneck
+    // calculation). A root-level failure row's own "quantity" field can equal the FULL requested
+    // amount (see plan()'s depth_limit/cycle_stopped/no_methods early returns), not what was
+    // actually delivered — including it here would make a totally-failed demand look fully
+    // committed and never register as short.
+    val reallocFailureReasons = setOf("depth_limit", "cycle_stopped", "no_methods", "no_preferred_method")
+    fun isReallocFailureReason(reason: String?) =
+        reason != null && (reason in reallocFailureReasons || reason.startsWith("child_failed:"))
+    val committedByDemand = mutableMapOf<String, Double>()
+    for (row in committedDemands) {
+        if (isReallocFailureReason(row["commit_reason"] as? String)) continue
+        val did = row["demand_id"]?.toString() ?: continue
+        committedByDemand[did] = (committedByDemand[did] ?: 0.0) + ((row["quantity"] as? Number)?.toDouble() ?: 0.0)
+    }
+    val requestedByDemand = mutableMapOf<String, Double>()
+    for (row in (data["demand"] ?: emptyList())) {
+        val did = row["demand_id"]?.toString() ?: continue
+        val qty = (row["quantity"] as? Number)?.toDouble() ?: continue
+        requestedByDemand[did] = qty
+    }
+    val shortDemandIds = requestedByDemand.filterValues { req -> req > 1e-9 }
+        .filter { (did, req) -> (committedByDemand[did] ?: 0.0) < req - 1e-6 }
+        .keys
+    log.info("[reallocate-critical-leftover][diag] criticalPids={} shortDemandIds={} supplyAllocations.size={}",
+        criticalPids.size, shortDemandIds.size, supplyAllocations.size)
+    if (shortDemandIds.isEmpty()) return null
+
+    // used(D_i, c_j) [material-level, for the desired() formula] AND used(D_i, lot) [exact-lot
+    // level, for per-lot candidacy below] — both from real physical draws (qty_consumed), not a
+    // theoretical entitlement.
+    val usedByDemandMaterial = mutableMapOf<Pair<String, String>, Double>()
+    val usedByDemandLot = mutableMapOf<Pair<String, String>, Double>()   // (demandId, supplyId) -> qty
+    for (row in supplyAllocations) {
+        val sid = row["supply_id"]?.toString() ?: continue
+        val (pid, _) = supplyMeta[sid] ?: continue
+        if (pid !in criticalPids) continue
+        val did = row["demand_id"]?.toString()?.takeIf { it.isNotBlank() } ?: continue
+        val qty = (row["qty_consumed"] as? Number)?.toDouble() ?: 0.0
+        if (qty <= 1e-9) continue
+        usedByDemandMaterial[did to pid] = (usedByDemandMaterial[did to pid] ?: 0.0) + qty
+        usedByDemandLot[did to sid] = (usedByDemandLot[did to sid] ?: 0.0) + qty
+    }
+    log.info("[reallocate-critical-leftover][diag] usedByDemandMaterial.size={}", usedByDemandMaterial.size)
+    if (usedByDemandMaterial.isEmpty()) return null
+
+    // leftover(c_j) — physical inventory nobody drew, restricted to critical materials. Flat list
+    // (not grouped by pid) since the fix below allocates each LOT independently.
+    data class LeftoverLot(val pid: String, val lid: String, val supplyId: String, val qty: Double)
+    val leftoverLots: List<LeftoverLot> = pass1.inventoryLeftover.mapNotNull { row ->
+        val pid = (row["product_id"] as? String)?.trim()?.takeIf { it in criticalPids } ?: return@mapNotNull null
+        val qty = (row["qty"] as? Number)?.toDouble() ?: 0.0
+        if (qty <= 1e-9) return@mapNotNull null
+        val lid = (row["location_id"] as? String)?.trim() ?: return@mapNotNull null
+        val sid = (row["supply_id"] as? String)?.trim() ?: return@mapNotNull null
+        LeftoverLot(pid, lid, sid, qty)
+    }
+    log.info("[reallocate-critical-leftover][diag] leftoverLots.size={}", leftoverLots.size)
+    if (leftoverLots.isEmpty()) return null
+
+    // desired(D_i, c_j): how much MORE of c_j this demand would take, AT THE SAME
+    // material-per-committed-unit rate it already exhibited, to close its own remaining gap
+    // (request - commit) entirely:
+    //
+    //   utilization_rate(D_i, c_j) = commit(D_i) / used(D_i, c_j)      — product units per material unit
+    //   desired(D_i, c_j) = (request(D_i) - commit(D_i)) / utilization_rate(D_i, c_j)
+    //                     = (request(D_i) - commit(D_i)) * used(D_i, c_j) / commit(D_i)
+    //
+    // commit(D_i) <= 0 is skipped — no observed rate to extrapolate a zero-output demand from.
+    val desiredByDemandMaterial = mutableMapOf<Pair<String, String>, Double>()
+    for (did in shortDemandIds) {
+        val commit = committedByDemand[did] ?: 0.0
+        if (commit <= 1e-9) continue
+        val requested = requestedByDemand[did] ?: continue
+        val shortfall = requested - commit
+        if (shortfall <= 1e-9) continue
+        for (pid in criticalPids) {
+            val used = usedByDemandMaterial[did to pid] ?: continue
+            if (used <= 1e-9) continue
+            val rate = commit / used
+            if (rate <= 1e-12) continue
+            val desiredQty = shortfall / rate
+            if (desiredQty > 1e-9) desiredByDemandMaterial[did to pid] = desiredQty
+        }
+    }
+    if (desiredByDemandMaterial.isEmpty()) return null
+
+    // additional_allocation: for EACH leftover lot independently, split it — proportional to
+    // each candidate's desired(D_i, c_j) weight — among the short demands that already drew from
+    // THAT EXACT lot in pass 1. Deliberately allocates the lot's FULL leftover (exhausts the
+    // supply) rather than capping each candidate at its own `desired` value and leaving any
+    // excess unallocated: an individual demand's cap is a CEILING, not a consumption target — the
+    // planning pass itself won't draw past what a demand's own (request - commit) need actually
+    // allows, so handing out extra cap here is harmless, and NOT exhausting the leftover would
+    // just strand usable supply unnecessarily. This is why a plain proportional-by-weight split
+    // is used directly here rather than calling the shared [allocate] helper — its own
+    // "proportional" mode intentionally caps each candidate at its stated need when supply is
+    // abundant (correct for the ORIGINAL entitlement computation in [allocateSuppliesPerLot],
+    // wrong here).
+    //
+    // Splitting per LOT (not per material, spread across lots by lot SIZE — tried first) still
+    // guarantees, by construction, that the sum handed out for one lot never exceeds that lot's
+    // own leftover qty (shares are exact fractions of lot.qty, summing to lot.qty) — a PER-LOT
+    // guarantee, not just a per-material one: many demands each contributing a small slice to the
+    // SAME small lot could otherwise collectively oversubscribe just that lot even when no single
+    // demand's own material-wide total was ever too big. Restricting candidacy to demands that
+    // already drew from this EXACT lot (not just the material) also means a demand only ever gets
+    // extra cap on a lot it has a proven, structural ability to draw from.
+    val additional = mutableMapOf<Any?, MutableMap<String, Double>>()
+    for (lot in leftoverLots) {
+        val candidates = shortDemandIds.mapNotNull { did ->
+            val lotUsed = usedByDemandLot[did to lot.supplyId]
+            if (lotUsed == null || lotUsed <= 1e-9) return@mapNotNull null
+            val desired = desiredByDemandMaterial[did to lot.pid] ?: return@mapNotNull null
+            did to desired
+        }
+        if (candidates.isEmpty()) continue
+        val totalDesired = candidates.sumOf { it.second }
+        if (totalDesired <= 1e-12) continue
+        for ((did, desired) in candidates) {
+            val qty = lot.qty * (desired / totalDesired)
+            if (qty <= 1e-9) continue
+            val aggKey = "${lot.pid}|${lot.lid}"
+            val lotKey = "$aggKey|${lot.supplyId}"
+            val budget = additional.getOrPut(did) { mutableMapOf() }
+            budget[lotKey] = (budget[lotKey] ?: 0.0) + qty
+            budget[aggKey] = (budget[aggKey] ?: 0.0) + qty
+        }
+    }
+    if (additional.isEmpty()) return null
+
+    // original_allocation: each demand's cap starts at what it ACTUALLY consumed in pass 1 (not
+    // its unused entitlement ceiling — see this function's own doc for why that over-subscribes).
+    val originalBudgets = mutableMapOf<Any?, MutableMap<String, Double>>()
+    for (row in supplyAllocations) {
+        val sid = row["supply_id"]?.toString() ?: continue
+        val (pid, lid) = supplyMeta[sid] ?: continue
+        if (pid !in criticalPids) continue
+        val did = row["demand_id"]?.toString()?.takeIf { it.isNotBlank() } ?: continue
+        val qty = (row["qty_consumed"] as? Number)?.toDouble() ?: 0.0
+        if (qty <= 1e-9) continue
+        val aggKey = "$pid|$lid"
+        val lotKey = "$aggKey|$sid"
+        val budget = originalBudgets.getOrPut(did) { mutableMapOf() }
+        budget[lotKey] = (budget[lotKey] ?: 0.0) + qty
+        budget[aggKey] = (budget[aggKey] ?: 0.0) + qty
+    }
+
+    // allocation = original_allocation + additional_allocation (per-demand, per-lot-key sum).
+    val combined = mutableMapOf<Any?, MutableMap<String, Double>>()
+    for ((did, lotMap) in originalBudgets) {
+        val dst = combined.getOrPut(did) { mutableMapOf() }
+        for ((k, v) in lotMap) dst[k] = (dst[k] ?: 0.0) + v
+    }
+    for ((did, lotMap) in additional) {
+        val dst = combined.getOrPut(did) { mutableMapOf() }
+        for ((k, v) in lotMap) dst[k] = (dst[k] ?: 0.0) + v
+    }
+    return combined
 }
 
 /**

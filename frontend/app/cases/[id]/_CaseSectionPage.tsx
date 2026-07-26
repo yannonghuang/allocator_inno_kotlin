@@ -4522,6 +4522,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   own sidebar pages (PurchasableMaterials.kt / Constraints.kt) — no summary/link
                   here anymore; this section only shows the planner's own inline toggle. */}
             </div>
+
+            {/* ── Critical materials ── */}
+            <div style={{ marginTop: '0.65rem', borderTop: '1px solid #27272a', paddingTop: '0.4rem' }}>
+              <div style={{ fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.3rem' }}>
+                {tP('config.subheadCriticalMaterials')}
+              </div>
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }} title={tP('config.reallocateCriticalLeftoverTooltip')}>
+                <input
+                  type="checkbox"
+                  checked={planningConfig.reallocate_critical_leftover === true}
+                  onChange={(e) => setPlanningConfig((c) => ({ ...c, reallocate_critical_leftover: e.target.checked }))}
+                />
+                <span style={{ fontSize: '0.875rem' }}>{tP('config.reallocateCriticalLeftover')}</span>
+              </label>
+            </div>
           </fieldset>
 
           {/* ── External config object version pickers — explicit pick, else the case's default
