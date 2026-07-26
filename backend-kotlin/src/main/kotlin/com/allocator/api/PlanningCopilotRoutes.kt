@@ -4,8 +4,6 @@ import com.allocator.Cases
 import com.allocator.config
 import com.allocator.services.LlmMessage
 import com.allocator.services.LlmNotConfiguredException
-import com.allocator.services.PurchasableMaterial
-import com.allocator.services.RawMaterials
 import com.allocator.services.llmChat
 import io.ktor.http.*
 import io.ktor.server.application.*
@@ -55,7 +53,7 @@ private data class PlanningCopilotResponse(
 
 private const val SYSTEM_PROMPT = """You are a friendly planning configuration assistant. Users express their requirements in many different ways, in English or Chinese. Your job is to infer their intent from whatever wording they use—do not expect or require specific phrases. Be conversational and natural. Mirror the user's language (reply in Chinese if they wrote in Chinese).
 
-The plan config has three groups plus two post-plan UI toggles: **method_selection** (how make/move/buy methods are chosen), **purchase_allowed** (top-level boolean) and **purchasable_materials** (top-level array — selective whitelist of buyable raw materials), **consolidation** (WO batch window — groups same-component work orders that start within N days into fewer larger orders), **analyze_criticality** (top-level boolean, post-plan auto-analysis), and **check_soundness** (top-level boolean, post-plan auto-validation). Any of these can appear in `config_update`. (BOM variants are modeled as distinct make methods, so there is no separate variant config.)
+The plan config has three groups plus two post-plan UI toggles: **method_selection** (how make/move/buy methods are chosen), **purchase_allowed** (top-level boolean — purchasing on/off as a whole), **consolidation** (WO batch window — groups same-component work orders that start within N days into fewer larger orders), **analyze_criticality** (top-level boolean, post-plan auto-analysis), and **check_soundness** (top-level boolean, post-plan auto-validation). Any of these can appear in `config_update`. (BOM variants are modeled as distinct make methods, so there is no separate variant config.) Beyond these, a case also has 5 versioned external config objects (Critical Raw Allocation, Supply Preferences, Demand Ordering, Purchasable Materials, Constraints) — see (18)-(20) below for how the copilot deals with those: version-picking for all five, plus regeneration for the two that are computed (Supply Preferences via parameter tuning, Critical Raw Allocation on request). **Purchasable Materials CONTENT is never edited from this chat** — see (6s).
 
 Intent → config mapping (interpret any phrasing that conveys the same intent):
 
@@ -77,24 +75,14 @@ these keys.
 6) **Disallow / disable / forbid purchase (buy)** (e.g. "no purchase", "disable purchase", "without buy", "禁用采购", "不采购", "不允许采购")
    → purchase_allowed: false.
 
-6s) **Selective purchase — restrict WHICH raw materials may be bought.** The user can narrow or
-   widen the set of purchasable raw materials *however they phrase it* — by name/id, by attribute
-   (vendor, lead time, SKU series, description keyword), or by set algebra (everything except X).
-   A separate "Purchasable raw materials catalog" message lists the case's buyable raw materials
-   as `product_id — description — vendor — lead_days — series`; resolve the user's condition
-   against THAT catalog and emit the **complete resulting list** of product_ids:
-   → purchasable_materials: ["<id>", …], and also set purchase_allowed: true whenever the list is
-     non-empty (a whitelist implies purchasing is on).
-   Rules:
-   - "only buy X (and Y)" / "限制采购为X" / "只采购钢材" → the resolved id list.
-   - "also allow buying Z" / "再加上Z" / "add Z" → current purchasable_materials ∪ {resolved Z}.
-   - "don't buy X" / "不采购X" / "remove X" → current list minus {X}; if the current list is empty
-     (meaning "all"), return the full catalog minus {X}.
-   - "buy all raw materials" / "remove the restriction" / "采购所有原材料" / "不限制采购"
-     → purchasable_materials: [] (and purchase_allowed: true).
-   Only emit product_ids that appear in the catalog. In `reply`, name the resolved materials by
-   description so the user can confirm. This list of phrasings is NOT exhaustive — interpret any
-   equivalent intent.
+6s) **Selective purchase (WHICH raw materials may be bought) is not edited here.** The
+   purchasable-materials whitelist is versioned case master data, maintained deliberately on
+   the Purchasable Materials page — a chat message must never rewrite it. When the user asks to
+   change which materials may be bought ("only buy the 1xx series", "不采购某供应商的材料",
+   "all except aluminum"), emit NO config keys for it: explain in `reply` that the whitelist is
+   edited on the Purchasable Materials page, and that a saved version can then be selected for
+   a run here ("use purchasable materials version N" — see (18)). Turning purchasing on/off as
+   a whole remains (5)/(6).
 
 7) **Enable WO batching (consolidation)** (e.g. "enable consolidation", "batch work orders", "启用合并", "开启合并", "批量合并工单")
    → consolidation: { "enabled": true }.
@@ -125,10 +113,41 @@ these keys.
 17) **Disable post-plan soundness check** (e.g. "no soundness check", "skip soundness", "soundness off", "关闭完整性校验", "不做合理性检查")
     → check_soundness: false.
 
+18) **Pick a version of an external config object.** Each case has 5 versioned external config
+    objects — Critical Raw Allocation, Supply Preferences, Demand Ordering, Purchasable
+    Materials, Constraints — and a run can pin a specific version of each (e.g. "use allocation
+    version 2", "plan with constraints version 6", "用偏好版本 3", "切换到需求排序版本 5"):
+    → the matching key with the integer id the user named:
+      case_alloc_version_id | pref_version_id | demand_order_version_id |
+      purchasable_material_version_id | constraint_version_id
+    Only when the user explicitly names a numeric version. The backend rejects ids that don't
+    exist for that object. (To CHANGE purchasable materials content, use (6s); to TUNE
+    Supply Preferences, use (19) — not this.)
+
+19) **Tune Supply Preferences.** Preferences are a GENERATED ranking, tuned via weights on three
+    scoring axes (delivery lead time / inventory coverage / critical-material usage) plus a BOM
+    walk depth — the user tunes parameters, never edits ranking rows (e.g. "favor delivery
+    speed", "weight inventory coverage higher", "rebuild preferences with bom depth 4",
+    "偏好更看重交期", "重新生成偏好，库存权重 0.5"):
+    → preference_tuning: {
+        "delivery_weight": D,           // optional, 0..1
+        "inventory_weight": I,          // optional, 0..1
+        "critical_material_weight": C,  // optional, 0..1
+        "max_bom_depth": N              // optional, 1..10
+      }
+    Emit only the parameters the user wants changed — the backend starts from the currently
+    selected version's stored values, applies your changes, renormalizes the three weights to
+    sum 1, regenerates the ranking as a NEW preferences version, and selects it for the next
+    run. For qualitative asks ("favor X", "care more about Y") set that weight to a clearly
+    dominant value (e.g. 0.6) and let renormalization handle the rest.
+
+20) **Regenerate Critical Raw Allocation** (e.g. "regenerate allocation", "refresh the critical raw allocation", "重新生成分配", "刷新关键原材料分配") — also the right move whenever the user just changed which materials are purchasable, since which supply positions are "critical" (and so get an allocation budget) depends on that. Acknowledge in `reply`; emit NO config_update key for this yourself — the backend detects the request from your wording directly and regenerates. (Do not confuse with (18)'s case_alloc_version_id, which only PICKS an existing version.)
+
 Valid config_update keys:
 - method_selection: object with optional "multiple" (bool, legacy), "mode" ("preference" — the only supported mode), "max_methods" (int ≥ 1; default 2; waterfall cap — how many ranked alternatives, across method type and BOM variant, to try before giving up).
 - purchase_allowed: boolean (top-level, not nested).
-- purchasable_materials: array of product_id strings (top-level). Empty ⇒ all raw materials buyable (default). Non-empty ⇒ strict whitelist; only listed raw materials may be bought. Resolve only against the supplied catalog.
+- case_alloc_version_id / pref_version_id / demand_order_version_id / purchasable_material_version_id / constraint_version_id: integer (top-level) — see (18); explicit version picks only. Never emit a purchasable_materials array or per-material keys — whitelist content is not editable from this chat (see (6s)).
+- preference_tuning: object (top-level) — see (19). The ONLY way to change Supply Preferences; never emit preference rows.
 - consolidation: object with optional "enabled" (bool), "make_batch_scale", "move_batch_scale", "purchase_batch_scale" (each "none"|"weekly"|"biweekly"|"monthly"|"all"; per-type scales), "wo_batch_scale" (legacy global fallback), "period_days" (int 0..365; supply-side bucket width; 0 = single bucket).
 - analyze_criticality: boolean (top-level). Post-plan UI toggle, does not affect the planner itself.
 - check_soundness: boolean (top-level). Post-plan UI toggle, does not affect the planner itself.
@@ -143,25 +162,12 @@ private suspend fun llmParse(
     message: String,
     currentConfig: JsonObject,
     history: List<CopilotHistoryItem>,
-    catalog: List<PurchasableMaterial>,
 ): Pair<String, JsonObject?>? {
-    // Catalog of buyable raw materials so the model can resolve selective-purchase
-    // conditions ("only buy steel", "from vendor ACME", "the 1xx series", "all
-    // except aluminum") to concrete product_ids. Capped to bound prompt size.
-    val catalogMsg = if (catalog.isEmpty()) {
-        "Purchasable raw materials catalog: (none — this case has no buyable raw materials; " +
-            "purchase selection is unavailable)."
-    } else {
-        val rows = catalog.take(200).joinToString("\n") { m ->
-            "${m.productId} — ${m.description ?: "?"} — vendor=${m.vendorId ?: "?"} — " +
-                "lead_days=${m.leadDaysSupply ?: "?"} — series=${m.skuPattern ?: "?"}"
-        }
-        val more = if (catalog.size > 200) "\n…(${catalog.size - 200} more)" else ""
-        "Purchasable raw materials catalog (product_id — description — vendor — lead_days — series):\n$rows$more"
-    }
+    // No catalog in the prompt: whitelist content is not editable from the copilot
+    // at all (prompt §6s) — the model never sees product ids, so it can neither
+    // hallucinate them nor be tempted to emit lists. Also keeps the prompt small.
     val msgs = buildList<LlmMessage> {
         add(LlmMessage("user", "Current config: $currentConfig"))
-        add(LlmMessage("user", catalogMsg))
         history.takeLast(10).forEach { h ->
             val t = h.messageText()
             if (t.isNotBlank()) add(LlmMessage(h.role, t))
@@ -198,30 +204,16 @@ private suspend fun llmParse(
     val reply = parsed["reply"]?.jsonPrimitive?.contentOrNull
         ?: "I didn't quite get that. Could you rephrase?"
     val configUpdate = parsed["config_update"] as? JsonObject
-    val catalogIds = catalog.map { it.productId }.toSet()
     val valid = configUpdate?.let { cuRaw ->
-        // Sanitize purchasable_materials: intersect with the real catalog so a
-        // hallucinated/typo'd id can never silently widen or corrupt the whitelist.
-        var cu = cuRaw
-        var pmOk = false
-        (cuRaw["purchasable_materials"] as? JsonArray)?.let { arr ->
-            val requested = arr.mapNotNull { it.jsonPrimitive.contentOrNull?.trim()?.takeIf { s -> s.isNotEmpty() } }
-            val sanitized = requested.filter { it in catalogIds }
-            when {
-                requested.isEmpty() -> pmOk = true  // explicit clear → all raw materials
-                sanitized.isNotEmpty() -> {
-                    pmOk = true
-                    if (sanitized.size != requested.size) {
-                        cu = JsonObject(cu.toMutableMap().apply {
-                            put("purchasable_materials", JsonArray(sanitized.map { JsonPrimitive(it) }))
-                        })
-                    }
-                }
-                // requested non-empty but nothing matched the catalog → drop the
-                // key so we don't accidentally apply an empty (=all) whitelist.
-                else -> cu = JsonObject(cu.toMutableMap().apply { remove("purchasable_materials") })
-            }
-        }
+        // Whitelist content is not editable from the copilot (prompt §6s): a raw
+        // purchasable_materials list — and the retired purchasable_filter predicate —
+        // are contract violations, dropped outright so a hallucinated id can never
+        // touch the whitelist. Whitelist changes happen on the Purchasable Materials
+        // page; runs pin them via purchasable_material_version_id (§18).
+        val cu = JsonObject(cuRaw.toMutableMap().apply {
+            remove("purchasable_materials")
+            remove("purchasable_filter")
+        })
         val ms = cu["method_selection"] as? JsonObject
         val cs = cu["consolidation"] as? JsonObject
         val pa = cu["purchase_allowed"]?.jsonPrimitive?.booleanOrNull
@@ -229,10 +221,12 @@ private suspend fun llmParse(
         val sc = cu["check_soundness"]?.jsonPrimitive?.booleanOrNull
         val msOk = ms?.let { "multiple" in it || "elaborate" in it || "mode" in it || "depth" in it || "max_methods" in it || "max_bom_depth" in it || "score_weights" in it } == true
         val csOk = cs?.let { "enabled" in it || "period_days" in it || "wo_batch_scale" in it || "make_batch_scale" in it || "move_batch_scale" in it || "purchase_batch_scale" in it } == true
+        val ptOk = cu["preference_tuning"] is JsonObject
+        val verOk = EXTERNAL_VERSION_KEYS.keys.any { (cu[it] as? JsonPrimitive)?.intOrNull != null }
         val paOk = pa != null
         val acOk = ac != null
         val scOk = sc != null
-        if (msOk || csOk || paOk || acOk || scOk || pmOk) cu else null
+        if (msOk || csOk || paOk || acOk || scOk || ptOk || verOk) cu else null
     }
     return reply to valid
 }
@@ -264,7 +258,6 @@ private fun mergeConsolidation(current: JsonObject, patch: Map<String, JsonEleme
 private fun ruleBasedParse(
     message: String,
     current: JsonObject,
-    catalog: List<PurchasableMaterial> = emptyList(),
 ): Pair<String, JsonObject?> {
     val raw = message.trim()
     val t = raw.lowercase()
@@ -272,38 +265,18 @@ private fun ruleBasedParse(
     val cs = (current["consolidation"] as? JsonObject) ?: JsonObject(emptyMap())
     val purchaseAllowed = current["purchase_allowed"]?.jsonPrimitive?.booleanOrNull
 
-    // ── Selective purchase (no-LLM fallback) ──────────────────────────────────
-    // Full conditional/named resolution needs the LLM; the fallback handles only
-    // the two unambiguous cases: clear-the-restriction, and exact product-id
-    // tokens that literally appear in the message.
-    if (Regex("all raw|all materials|no restriction|every raw|采购所有原材料|不限制采购|所有原材料").containsMatchIn(t) ||
-        Regex("采购所有原材料|不限制采购|所有原材料").containsMatchIn(raw)
+    // ── Selective purchase — deliberately NOT editable from the copilot ──────
+    // The whitelist is versioned case master data (PurchasableMaterials.kt); chat
+    // only redirects to its page. Patterns stay material-specific so plain
+    // "no purchase"/"不采购" still reaches the purchase-toggle branches below.
+    if (Regex("purchasable|only buy|whitelist|all raw materials|no restriction|采购所有原材料|不限制采购|只采购|限制采购").containsMatchIn(t) ||
+        Regex("只采购|限制采购|采购所有原材料|不限制采购").containsMatchIn(raw)
     ) {
-        val patch = buildJsonObject {
-            put("purchase_allowed", true)
-            putJsonArray("purchasable_materials") {}
-        }
         return bi(
-            "Cleared the purchase restriction — all raw materials are now purchasable.",
-            "已清除采购限制 — 现在可采购所有原材料。",
+            "Which raw materials may be bought is managed on the Purchasable Materials page (it's versioned case data, not a per-run setting). Save your whitelist there, then tell me e.g. \"use purchasable materials version 5\" to pin it for the next run.",
+            "可采购的原材料在「可采购材料」页面维护（它是有版本的案例数据，不是单次运行参数）。请先在该页面保存白名单版本，然后告诉我例如「使用可采购材料版本 5」以用于下次运行。",
             raw,
-        ) to patch
-    }
-    if (catalog.isNotEmpty()) {
-        val ids = catalog.map { it.productId }
-        val hit = ids.filter { id -> raw.contains(id) }
-        if (hit.isNotEmpty()) {
-            val patch = buildJsonObject {
-                put("purchase_allowed", true)
-                putJsonArray("purchasable_materials") { hit.forEach { add(it) } }
-            }
-            return bi(
-                "Restricting purchase to: ${hit.joinToString(", ")}. (For richer conditions like " +
-                    "by vendor or \"all except X\", configure the LLM provider.)",
-                "已将采购限制为：${hit.joinToString("、")}。（如需按供应商或「除 X 外全部」等更复杂条件，请配置 LLM。）",
-                raw,
-            ) to patch
-        }
+        ) to null
     }
 
     if (t.isBlank()) {
@@ -605,6 +578,20 @@ private fun ruleBasedParse(
         ) to JsonObject(mapOf("check_soundness" to JsonPrimitive(false)))
     }
 
+    // ── Regenerate allocation — acknowledge only; maybeRegenerateAllocation (which runs
+    // regardless of what this function returns, per the same regex) does the actual work and
+    // appends its own outcome. Without this branch the request falls through to the "I'm not
+    // sure" catch-all below, which would read oddly concatenated with the real success note. ──
+    if (Regex("regenerate.*allocation|refresh.*allocation").containsMatchIn(t) ||
+        Regex("重新生成.*分配|刷新.*分配").containsMatchIn(raw)
+    ) {
+        return bi(
+            "On it — regenerating Critical Raw Allocation.",
+            "好的 — 正在重新生成关键原材料分配。",
+            raw,
+        ) to null
+    }
+
     // ── Reset ──
     if (Regex("reset|default|clear").containsMatchIn(t) ||
         Regex("重置|默认|清除").containsMatchIn(raw)
@@ -639,6 +626,233 @@ private fun ruleBasedParse(
     ) to null
 }
 
+// ── External-config version picks ────────────────────────────────────────────
+
+/** config_update key → which of the 5 versioned external config objects it pins (see prompt §18). */
+private val EXTERNAL_VERSION_KEYS: Map<String, com.allocator.services.ConfigVersionKind> = mapOf(
+    "case_alloc_version_id" to com.allocator.services.ConfigVersionKind.CASEALLOC,
+    "pref_version_id" to com.allocator.services.ConfigVersionKind.PREF,
+    "demand_order_version_id" to com.allocator.services.ConfigVersionKind.ORD,
+    "purchasable_material_version_id" to com.allocator.services.ConfigVersionKind.PURCHMAT,
+    "constraint_version_id" to com.allocator.services.ConfigVersionKind.CONSTR,
+)
+
+/** Strip any LLM-picked *_version_id that doesn't exist for this case (a hallucinated or
+ *  misheard id must never silently fall back to the default at submit time and look applied),
+ *  appending an explanation to the reply. Valid picks pass through untouched. */
+private fun validateVersionPicks(
+    caseId: Int,
+    userMessage: String,
+    reply: String,
+    configUpdate: JsonObject?,
+): Pair<String, JsonObject?> {
+    val cuIn: JsonObject = configUpdate ?: return reply to null
+    val picked = EXTERNAL_VERSION_KEYS.filterKeys { (cuIn[it] as? JsonPrimitive)?.intOrNull != null }
+    if (picked.isEmpty()) return reply to cuIn
+    var cu: JsonObject = cuIn
+    var out = reply
+    for ((key, kind) in picked) {
+        val id = (cuIn[key] as? JsonPrimitive)?.intOrNull ?: continue
+        val exists = com.allocator.services.CaseConfigVersioning.listVersions(caseId, kind).any { it.id == id }
+        if (!exists) {
+            cu = JsonObject(cu.toMutableMap().apply { remove(key) })
+            out += "\n" + bi(
+                "(Version $id doesn't exist for ${kind.name.lowercase()} on this case — that pick was skipped.)",
+                "（此案例的 ${kind.name.lowercase()} 不存在版本 $id — 已跳过该选择。）",
+                userMessage,
+            )
+        }
+    }
+    return out to cu.takeIf { it.isNotEmpty() }
+}
+
+// ── Preference tuning ────────────────────────────────────────────────────────
+//
+// Supply Preferences are a GENERATED artifact (PreferenceBuilder), so the copilot
+// operates at its config-parameter level — never on ranking rows and never by
+// asking the LLM for a version number: the model emits a preference_tuning
+// object with just the parameters the user wants changed; the backend overlays
+// them on the currently-selected version's stored config, renormalizes the three
+// axis weights, regenerates into a freshly minted PREF version (a referenced
+// version is never mutated — same discipline as the generate route's 409), and
+// selects it via pref_version_id in config_update.
+
+/** If [configUpdate] carries preference_tuning, regenerate preferences into a new version. */
+private fun resolvePreferenceTuning(
+    caseId: Int,
+    userMessage: String,
+    currentConfig: JsonObject,
+    reply: String,
+    configUpdate: JsonObject?,
+): Pair<String, JsonObject?> {
+    val ptJson = configUpdate?.get("preference_tuning") as? JsonObject ?: return reply to configUpdate
+    val rest = JsonObject(configUpdate.toMutableMap().apply { remove("preference_tuning") })
+    fun restOrNull() = rest.takeIf { it.isNotEmpty() }
+    fun note(en: String, zh: String) = "$reply\n${bi(en, zh, userMessage)}"
+
+    fun dbl(k: String) = (ptJson[k] as? JsonPrimitive)?.doubleOrNull?.takeIf { it in 0.0..1.0 }
+    val dW = dbl("delivery_weight")
+    val iW = dbl("inventory_weight")
+    val cW = dbl("critical_material_weight")
+    val depth = (ptJson["max_bom_depth"] as? JsonPrimitive)?.intOrNull?.coerceIn(1, 10)
+    if (dW == null && iW == null && cW == null && depth == null) {
+        return note(
+            "(I couldn't tune preferences — no valid parameter in the request. Weights are 0..1; depth is 1..10.)",
+            "（无法调整偏好 — 请求中没有有效参数。权重取值 0..1，深度取值 1..10。）",
+        ) to restOrNull()
+    }
+
+    // Baseline = the currently-selected version's stored generation config.
+    val effective = transaction { resolveEffectiveConfig(currentConfig, caseId) }
+    val base = loadCasePreferenceConfig(effective.prefVersionId)
+    var d = dW ?: base?.deliveryWeight ?: 0.3
+    var i = iW ?: base?.inventoryWeight ?: 0.3
+    var c = cW ?: base?.criticalMaterialWeight ?: 0.4
+    val sum = d + i + c
+    if (sum <= 0.0) {
+        return note(
+            "(All three preference weights came out zero — nothing to rank by. Preferences unchanged.)",
+            "（三个偏好权重全为零 — 无法排序。偏好未更改。）",
+        ) to restOrNull()
+    }
+    fun r4(v: Double) = Math.round(v / sum * 10000.0) / 10000.0
+    d = r4(d); i = r4(i); c = r4(c)
+    val newDepth = depth ?: base?.maxBomDepth ?: 3
+
+    val data = transaction { com.allocator.services.CaseLoader.load(caseId) }
+    if ((data["demand"] ?: emptyList()).isEmpty()) {
+        return note(
+            "(This case has no demand data — preferences can't be generated.)",
+            "（此案例没有需求数据 — 无法生成偏好。）",
+        ) to restOrNull()
+    }
+    // Critical-material axis needs purchase_allowed/purchasable_materials/constraints — resolved
+    // for real from the effective versions (planningConfig), NOT the frontend's currentConfig:
+    // planningConfig.purchasable_materials there is a dead display field (see (6s)/§18), so
+    // trusting it here would silently reintroduce the same "unrestricted purchase" class of bug
+    // fixed in runPlanning earlier — just for the critical-material scoring axis instead of the
+    // planner itself.
+    @Suppress("UNCHECKED_CAST")
+    val currentConfigMap = runCatching { jsonElementToNative(currentConfig) as? Map<String, Any?> }.getOrNull()
+    val cfgMap = planningConfig(currentConfigMap, effective)
+
+    val label = "copilot: prefs w=${d}/${i}/${c} d=$newDepth".take(60)
+    val newVersionId = transaction {
+        com.allocator.services.CaseConfigVersioning.createVersion(
+            caseId, com.allocator.services.ConfigVersionKind.PREF, label,
+            "Created by planning copilot from: \"${userMessage.take(200)}\"",
+        )
+    }
+    val rows = generateAndSeedCasePreferences(
+        caseId, newVersionId, data, cfgMap,
+        maxBomDepth = newDepth, deliveryWeight = d, inventoryWeight = i, criticalMaterialWeight = c,
+    )
+
+    val outCu = JsonObject(rest.toMutableMap().apply {
+        put("pref_version_id", JsonPrimitive(newVersionId))
+    })
+    return note(
+        "Regenerated Supply Preferences (${rows.size} rows) with weights delivery=$d / inventory=$i / critical=$c, bom depth $newDepth — saved as version $newVersionId and selected it for the next run.",
+        "已按权重 交期=$d / 库存=$i / 关键材料=$c、BOM深度 $newDepth 重新生成偏好（${rows.size} 行）— 已保存为版本 $newVersionId 并选作下次运行。",
+    ) to outCu
+}
+
+// ── Allocation ↔ Purchasable coupling ────────────────────────────────────────
+//
+// Critical Raw Allocation and Purchasable Materials are NOT independent: a supply
+// position is "critical" (gets an allocation budget row at all) only when it has
+// no make method AND is not an admitted buy — see isRawCriticalPosition in
+// PlanningEngine.kt, criterion 2. So switching purchasable_material_version_id
+// changes exactly which positions the Allocation's budget rows cover; an
+// Allocation generated under the OLD selection can now be silently wrong (over-
+// or under-covering) for the new one. There's no stored link recording which
+// purchmat content an Allocation version was built from (case_allocation_config's
+// content_hash covers only the allocation's own rows), so this can't be detected
+// automatically — every purchasable_material_version_id pick gets a standing
+// invitation to regenerate.
+
+/** After a purchasable_material_version_id pick, invite (not force) an Allocation refresh —
+ *  offers the explicit copilot command as well as the page, since regenerating is one call.
+ *  [justRegenerated] must come from [maybeRegenerateAllocation]'s own return, NOT be inferred
+ *  from `case_alloc_version_id` merely being present in configUpdate: an ordinary explicit pick
+ *  of an (unrelated, possibly stale) allocation version in the SAME message — e.g. "use
+ *  allocation version 2 and purchasable materials version 4" — would also leave that key set,
+ *  and picking an old version is exactly the case that still needs the invitation. */
+private fun invitePurchasableCoupledAllocationRefresh(
+    userMessage: String,
+    reply: String,
+    configUpdate: JsonObject?,
+    justRegenerated: Boolean,
+): String {
+    if (configUpdate?.get("purchasable_material_version_id") == null) return reply
+    if (justRegenerated) return reply
+    return "$reply\n" + bi(
+        "Heads up: Critical Raw Allocation depends on which materials are purchasable — a " +
+            "budget built under the old selection may no longer be accurate. Regenerate it on " +
+            "the Critical Raw Allocation page, or tell me \"regenerate allocation\".",
+        "提示：关键原材料分配取决于哪些材料可采购 — 基于旧选择生成的分配可能已不准确。" +
+            "请在「关键原材料分配」页面重新生成，或告诉我「重新生成分配」。",
+        userMessage,
+    )
+}
+
+/** Explicit "regenerate allocation" request — regenerates into a NEW Critical Raw Allocation
+ *  version using the currently-effective purchasable/constraints selection (never mutates a
+ *  referenced version, matching the Generate route's own discipline) and selects it. Third
+ *  return value is true only when THIS call actually minted a new version — the signal
+ *  [invitePurchasableCoupledAllocationRefresh] needs to avoid a redundant nag; deliberately not
+ *  inferred from `case_alloc_version_id`'s mere presence, which an unrelated explicit pick in
+ *  the same message would also leave set. */
+private fun maybeRegenerateAllocation(
+    caseId: Int,
+    userMessage: String,
+    currentConfig: JsonObject,
+    reply: String,
+    configUpdate: JsonObject?,
+): Triple<String, JsonObject?, Boolean> {
+    val t = userMessage.trim().lowercase()
+    val wantsRegen = Regex("regenerate.*allocation|refresh.*allocation|重新生成.*分配|刷新.*分配").containsMatchIn(t) ||
+        Regex("重新生成.*分配|刷新.*分配").containsMatchIn(userMessage)
+    if (!wantsRegen) return Triple(reply, configUpdate, false)
+
+    val effective = transaction { resolveEffectiveConfig(currentConfig, caseId) }
+    val data = transaction { com.allocator.services.CaseLoader.load(caseId) }
+    if ((data["demand"] ?: emptyList()).isEmpty() || (data["supply"] ?: emptyList()).isEmpty()) {
+        return Triple(
+            "$reply\n" + bi(
+                "(Can't regenerate allocation — this case has no demand/supply data.)",
+                "（无法重新生成分配 — 此案例没有需求/供应数据。）",
+                userMessage,
+            ),
+            configUpdate, false,
+        )
+    }
+    @Suppress("UNCHECKED_CAST")
+    val currentConfigMap = runCatching { jsonElementToNative(currentConfig) as? Map<String, Any?> }.getOrNull()
+    val cfgMap = planningConfig(currentConfigMap, effective)
+
+    val label = "copilot: allocation refresh".take(60)
+    val newVersionId = transaction {
+        com.allocator.services.CaseConfigVersioning.createVersion(
+            caseId, com.allocator.services.ConfigVersionKind.CASEALLOC, label,
+            "Created by planning copilot from: \"${userMessage.take(200)}\"",
+        )
+    }
+    val rows = generateAndSeedCaseAllocation(caseId, newVersionId, data, cfgMap)
+
+    val outCu = JsonObject((configUpdate ?: JsonObject(emptyMap())).toMutableMap().apply {
+        put("case_alloc_version_id", JsonPrimitive(newVersionId))
+    })
+    return Triple(
+        "$reply\n" + bi(
+            "Regenerated Critical Raw Allocation (${rows.size} rows) against the currently selected purchasable materials — saved as version $newVersionId and selected it for the next run.",
+            "已根据当前选定的可采购材料重新生成关键原材料分配（${rows.size} 行）— 已保存为版本 $newVersionId 并选作下次运行。",
+            userMessage,
+        ),
+        outCu, true,
+    )
+}
+
 // ── Route ────────────────────────────────────────────────────────────────────
 
 fun Routing.planningCopilotRoutes() {
@@ -661,14 +875,20 @@ fun Routing.planningCopilotRoutes() {
         }
         val currentConfig = req.currentConfig ?: JsonObject(emptyMap())
         val history = req.history ?: emptyList()
-        // Buyable raw-material catalog — lets the LLM resolve selective-purchase
-        // conditions ("only buy steel", "from vendor ACME", "all except aluminum")
-        // to concrete product_ids. Also drives the rule-based fallback's id-token scan.
-        val catalog = com.allocator.services.RawMaterials.purchasable(caseId)
+        val (rawReply, rawUpdate) = llmParse(message, currentConfig, history)
+            ?: ruleBasedParse(message, currentConfig)
+        // Validate explicit version picks first, then preference tuning and an explicit
+        // allocation-regenerate request — the version ids they mint are valid by construction.
+        val (pickedReply, pickedUpdate) = validateVersionPicks(caseId, message, rawReply, rawUpdate)
+        val (tunedReply, tunedUpdate) =
+            resolvePreferenceTuning(caseId, message, currentConfig, pickedReply, pickedUpdate)
+        val (regenReply, regenUpdate, justRegenerated) =
+            maybeRegenerateAllocation(caseId, message, currentConfig, tunedReply, tunedUpdate)
+        // Last: if a purchasable_material_version_id pick is going out this turn (and the user
+        // didn't just regenerate allocation to match it), invite an Allocation refresh — see
+        // "Allocation ↔ Purchasable coupling" above.
+        val reply = invitePurchasableCoupledAllocationRefresh(message, regenReply, regenUpdate, justRegenerated)
 
-        val (reply, configUpdate) = llmParse(message, currentConfig, history, catalog)
-            ?: ruleBasedParse(message, currentConfig, catalog)
-
-        call.respond(PlanningCopilotResponse(reply = reply, configUpdate = configUpdate))
+        call.respond(PlanningCopilotResponse(reply = reply, configUpdate = regenUpdate))
     }
 }
