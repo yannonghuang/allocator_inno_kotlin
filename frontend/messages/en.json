@@ -396,7 +396,7 @@
       }
     },
     "tabs": {
-      "committedDemands": "Committed demands",
+      "committedDemands": "Demands",
       "workOrders": "Work orders",
       "supplies": "Supplies ({count})",
       "resourceUtilization": "Resource utilization"
@@ -448,7 +448,7 @@
       "contentionPushedTooltip": "Cross-WO arbitration found at least one WO whose required resources were already reserved at its original start. Those WOs were shifted to the earliest free window. Each pushed WO cascades into its parent demand's commit_time (later)."
     },
     "committedDemands": {
-      "heading": "Committed demands",
+      "heading": "Demands",
       "filterRealMake": "Only demands with pegging including a real make (non-virtual BOM link)",
       "filterBuy": "Only demands with pegging including a buy work order (purchase)",
       "filterRealMove": "Only demands with pegging including a real move (TRANSIT_TIME > 0)",

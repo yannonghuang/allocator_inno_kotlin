@@ -396,7 +396,7 @@
       }
     },
     "tabs": {
-      "committedDemands": "已承诺需求",
+      "committedDemands": "需求",
       "workOrders": "生产订单",
       "supplies": "供应（{count}）",
       "resourceUtilization": "资源利用"
@@ -448,7 +448,7 @@
       "contentionPushedTooltip": "跨工单仲裁发现至少一个工单的所需资源在原定开始时已被占用，将其推迟到最早空闲窗口。每个被推后的工单都会级联影响其父需求的承诺时间。"
     },
     "committedDemands": {
-      "heading": "已承诺需求",
+      "heading": "需求",
       "filterRealMake": "仅显示追溯中包含真实制造（非虚拟 BOM 链接）的需求",
       "filterBuy": "仅显示追溯中包含采购生产订单的需求",
       "filterRealMove": "仅显示追溯中包含真实调拨（TRANSIT_TIME > 0）的需求",
