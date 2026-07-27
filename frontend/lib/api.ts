@@ -396,15 +396,12 @@ export type PlanKpis = {
 /** Config for planning. Sent in POST body to /plan. */
 export type PlanningConfig = {
   /**
-   * Method selection shape: `mode` + `depth` + `multiple`.
-   * `mode: "elaborate"` scores each candidate by commit_time/inventory/purchase;
-   * `depth` (≥1, default 1) controls how many recursion levels elaborate applies at.
-   * Legacy `elaborate: boolean` is still accepted by the backend.
+   * Method selection shape: `max_methods` + `root_waterfall` (+ legacy `multiple`).
+   * An `elaborate`-scoring mode (`mode`/`depth`/`elaborate`/`score_weights`) and
+   * `max_bom_depth` used to live here — all confirmed dead server-side (no live
+   * consumer; real scoring comes from the case-level Preferences KB) and removed.
    */
   method_selection?: {
-    mode?: 'preference' | 'elaborate';
-    depth?: number;
-    elaborate?: boolean;
     /**
      * @deprecated use `max_methods` instead. Kept for back-compat reading of
      * legacy saved configs. The UI no longer writes this field — saving a
@@ -413,30 +410,20 @@ export type PlanningConfig = {
     multiple?: boolean;
     /**
      * When true (default), the root demand uses the SAME ordinary sequential waterfall every
-     * non-root node uses (100% to the best-ranked method, spillover residual to the next).
-     * When false, the root instead splits its quantity up-front, proportionally, across its
-     * top `max_methods` alternatives (the legacy behavior) — `max_methods` only controls that
-     * split shape when this is false; with root_waterfall true it still bounds fallback depth,
-     * but the form disables editing it since the effect is secondary in waterfall mode.
+     * non-root node uses (100% to the best-ranked method, spillover residual to the next) —
+     * genuinely unbounded, tries every ranked alternative. When false, the root instead splits
+     * its quantity up-front, proportionally, across its top `max_methods` alternatives (the
+     * legacy behavior) — `max_methods` only has any effect in this mode; the form disables
+     * editing it while root_waterfall is true because it's genuinely inert there.
      */
     root_waterfall?: boolean;
     /**
-     * Waterfall cap: how many ranked methods may be tried before giving up.
-     * Integer >= 1. Default 2 (in sync with the backend default).
-     *   1 = single best method (no fallback)
-     *   2-4 = exhaust best, then resort to lesser only if demand isn't met
-     * Methods are ranked once at the call site (preference int asc, or
-     * elaborate score desc). Inventory carries forward across slots.
+     * Root-split cap: how many top-ranked alternatives the root's up-front proportional split
+     * divides its quantity across. Only has any effect when root_waterfall is false — ordinary
+     * waterfall (root_waterfall true, or any non-root node, unconditionally) tries every
+     * available alternative regardless of this value. Integer >= 1. Default 2.
      */
     max_methods?: number;
-    /**
-     * Maximum real-make recursion depth admitted at the reactive make-fallback
-     * site. Default 3; clamped 1..10 by the backend. A make alternative whose
-     * precomputed maxMakeDepth exceeds this cap is skipped without recursing.
-     */
-    max_bom_depth?: number;
-    /** Relative weights for elaborate scoring. Backend normalizes so absolute values don't matter. */
-    score_weights?: { commit_time?: number; inventory_consumed?: number; purchase?: number };
   };
   /** When false, the buy/purchase method is excluded from planning. Default: true. */
   purchase_allowed?: boolean;
@@ -473,6 +460,12 @@ export type PlanningConfig = {
     make_batch_scale?:     'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
     move_batch_scale?:     'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
     purchase_batch_scale?: 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
+    /** Independent kill-switch: even with enabled=true, false disables WO consolidation
+     *  (falls back to 1:1 node-level WOs). Default true — only explicit false disables. No UI
+     *  control; settable via the planning copilot. */
+    consolidate_wos?: boolean;
+    /** Legacy window-size key — takes priority over period_days when both are set. No UI control. */
+    wo_window_days?: number;
   };
   /**
    * Post-plan UI behavior toggles. These do not affect planner output — they

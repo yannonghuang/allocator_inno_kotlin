@@ -6,7 +6,6 @@ import com.allocator.services.CaseLoader
 import com.allocator.services.ConfigVersionKind
 import com.allocator.services.getMethods
 import com.allocator.services.resolveMethodSelection
-import com.allocator.services.resolveVariantSelection
 import com.allocator.services.roundQty
 import com.allocator.services.runAllocation
 import com.allocator.services.runPlanning
@@ -3248,7 +3247,6 @@ internal fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int): Ef
     val c = config ?: emptyMap()
     val consolidation = (c["consolidation"]     as? Map<*, *>)?.let { it as Map<String, Any?> } ?: emptyMap()
     val methodCfg = resolveMethodSelection(c)
-    val variantCfg = resolveVariantSelection(c)
 
     fun explicitVersionId(key: String): Int? = (c[key] as? Number)?.toInt()
 
@@ -3294,37 +3292,20 @@ internal fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int): Ef
             }
         }
         putJsonObject("method_selection") {
-            put("mode",      methodCfg.mode)
-            put("depth",     methodCfg.depth)
-            put("elaborate", methodCfg.elaborate)  // legacy mirror — consumers still read this
             put("multiple",  methodCfg.multiple)   // legacy mirror — soft-deprecated, see max_methods
             put("max_methods",   methodCfg.maxMethods)
             put("root_waterfall", methodCfg.rootWaterfall)
-            put("max_bom_depth", methodCfg.maxBomDepth)
-            // Always materialize score_weights (with engine defaults) so the persisted
-            // snapshot is self-describing — viewing config later shows the exact weights
-            // that were in effect, not a hole the reader has to know to fill in.
-            val w = methodCfg.scoreWeights
-            putJsonObject("score_weights") {
-                put("commit_time",        (w?.get("commit_time")        as? Number)?.toDouble() ?: 0.4)
-                put("inventory_consumed", (w?.get("inventory_consumed") as? Number)?.toDouble() ?: 0.35)
-                put("purchase",           (w?.get("purchase")           as? Number)?.toDouble() ?: 0.25)
-            }
-        }
-        putJsonObject("variant_selection") {
-            put("multiple", variantCfg.multiple ?: true)
-            variantCfg.scoreWeights?.let { put("score_weights", anyToJson(it)) }
-            variantCfg.topN?.let { put("top_n", it) }
         }
         putJsonObject("consolidation") {
             put("enabled",         consolidation["enabled"]      as? Boolean ?: false)
             // 0 = single-bucket sentinel (collapses every demand into LocalDate.EPOCH); legal value, do NOT clamp up to 1.
             put("period_days",     ((consolidation["period_days"] as? Number)?.toInt() ?: 30).coerceIn(0, 365))
-            put("allocation_mode", when (consolidation["allocation_mode"]?.toString()) {
-                "proportional"   -> "proportional"
-                "priority_first" -> "priority_first"
-                else             -> "fair"
-            })
+            // consolidate_wos/wo_window_days are both live (PlanningEngine.kt reads them
+            // directly off this same sub-map) but were previously absent from this whitelist —
+            // a run submitted with either set would behave correctly live but silently look
+            // like defaults were used on reload. Persisting them now closes that gap.
+            put("consolidate_wos", consolidation["consolidate_wos"] as? Boolean ?: true)
+            (consolidation["wo_window_days"] as? Number)?.toInt()?.let { put("wo_window_days", it) }
             // Per-type WO batch scales — persist when present so reloading a run restores what was run.
             val validScales = setOf("none", "weekly", "biweekly", "monthly", "all")
             listOf("wo_batch_scale", "make_batch_scale", "move_batch_scale", "purchase_batch_scale").forEach { key ->

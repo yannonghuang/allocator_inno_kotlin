@@ -1455,15 +1455,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 setPlanRunSaveError(null);
                 setPlanWorkOrderPeggingCache({});
                 if (full.config) {
-                  const cfg = full.config as PlanningConfig;
-                  const chosen = full.chosen_depth ?? null;
-                  setPlanningConfig(normalizePlanningConfig({
-                    ...cfg,
-                    method_selection: {
-                      ...cfg.method_selection,
-                      depth: chosen ?? cfg.method_selection?.depth ?? 1,
-                    },
-                  }));
+                  setPlanningConfig(normalizePlanningConfig(full.config as PlanningConfig));
                 }
                 listPlanRuns(id).then(setPlanRunHistory).catch(() => { /* ignore */ });
               } catch {
@@ -2101,15 +2093,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         setCurrentPlanRunId(chosen.id);
         setPlanWorkOrderPeggingCache({});
         if (full.config) {
-          const cfg = full.config as PlanningConfig;
-          const chosenDepth = full.chosen_depth ?? null;
-          setPlanningConfig(normalizePlanningConfig({
-            ...cfg,
-            method_selection: {
-              ...cfg.method_selection,
-              depth: chosenDepth ?? cfg.method_selection?.depth ?? 1,
-            },
-          }));
+          setPlanningConfig(normalizePlanningConfig(full.config as PlanningConfig));
         }
         restoreCriticality(chosen.id);
       }
@@ -3681,19 +3665,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         setPlanRunSaveError(null);
         setPlanWorkOrderPeggingCache({});
         if (full.config) {
-          // Default the depth to the run's chosen_depth (legacy, set when the
-          // retired optimal-depth search ran) when present; fall back to 1 so
-          // the form starts from a sane baseline rather than carrying over
-          // whatever depth was in the saved config snapshot.
-          const cfg = full.config as PlanningConfig;
-          const chosen = full.chosen_depth ?? null;
-          setPlanningConfig(normalizePlanningConfig({
-            ...cfg,
-            method_selection: {
-              ...cfg.method_selection,
-              depth: chosen ?? 1,
-            },
-          }));
+          setPlanningConfig(normalizePlanningConfig(full.config as PlanningConfig));
         }
         setPlanRunHistoryOpen(false);
       }

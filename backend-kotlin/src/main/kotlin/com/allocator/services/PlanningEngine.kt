@@ -18,36 +18,22 @@ private val DATE_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd")
 private val BENIGN_REASONS = setOf("cycle_stopped", "cycle_detected", "inventory")
 private val LATE_DATE = LocalDate.of(9999, 12, 31)
 
-// ── Selection config (method_selection / variant_selection) ───────────────────
+// ── Selection config (method_selection) ────────────────────────────────────────
 //
-// Method-level selection supports two modes: `preference` (cheap, preference-
-// ordered cascade) and `elaborate` (scored against each candidate's simulated
-// sub-plan). `depth` controls how many recursion levels elaborate applies at
-// (≥ 1, default 1 = root only). Legacy shape `{ elaborate: true }` is accepted.
-//
-// Runtime mapping: engine `depth` counts *down* from `MAX_PLAN_DEPTH` at root,
-// so level k has depth == MAX_PLAN_DEPTH - k. Elaborate applies when
-// `depth > MAX_PLAN_DEPTH - methodCfg.depth` (N=1 → root only; N=2 → root +
-// one level down; etc.). See `shouldElaborateAtDepth`.
-//
-// Variants are NOT rectified symmetrically: BOM-level variety is now modeled
-// as distinct make methods, so there is no "variant mode" or "variant depth"
-// concept. Variant config is just the equal-split / scoring knobs it has
-// always been (`multiple`, `score_weights`, `top_n`).
+// Method-level selection uses a single ranking source: preference-ordered
+// cascade. An `elaborate` (scored-against-simulated-sub-plan) mode, a `depth`
+// gate for it, `max_bom_depth`, `score_weights`, and the whole `variant_selection`
+// top-level key all used to exist here — all confirmed dead (no live consumer
+// anywhere in the planning path; real waterfall scoring comes from the
+// case-level Preferences KB instead) and removed, along with
+// `resolveVariantSelection`/`VariantSelectionConfig`, `shouldElaborateAtDepth`,
+// `parseMethodDepth`, and `parseMaxBomDepth`.
 
 /** Effective method_selection config. */
 internal data class MethodSelectionConfig(
-    val mode: String,        // "preference" | "elaborate"  — ranking source for waterfall
-    val depth: Int,          // >= 1                        — gate for both elaborate and waterfall
     val multiple: Boolean,                                 //   legacy back-compat parse only
     /** Cap on how many methods waterfall may invoke per demand. >= 1; default 2. */
     val maxMethods: Int,
-    val scoreWeights: Map<String, Any?>?,  // drives elaborate scoring (commit_time / inventory_consumed / purchase)
-    /** Maximum real-make recursion depth admitted at the reactive make-fallback
-     *  site in plan(). A make alternative whose precomputed [maxMakeDepth]
-     *  exceeds this cap is skipped without recursing — too deep to attempt
-     *  productively. Default 3 (covers typical case-171 patterns). */
-    val maxBomDepth: Int = DEFAULT_MAX_BOM_DEPTH,
     /** Default true (2026-07: promoted from the `explore/root-alt-waterfall` A/B — measured
      *  +0.59pp fill-rate, +3 on-time demands, lower Gini, and 22% fewer manufacturing WOs vs.
      *  the old root-split default on case 173, at equal 208/208 soundness). When true, the
@@ -56,29 +42,7 @@ internal data class MethodSelectionConfig(
      *  non-root node already uses, instead of dividing its quantity up-front across
      *  alternatives. Set false to restore the legacy root-split behavior. */
     val rootWaterfall: Boolean = true,
-) {
-    val elaborate: Boolean get() = mode == "elaborate"
-}
-
-internal const val DEFAULT_MAX_BOM_DEPTH = 3
-
-/** Effective variant_selection config. */
-internal data class VariantSelectionConfig(
-    val multiple: Boolean?,                 // null → equal-split among feasible; false → single best
-    val scoreWeights: Map<String, Any?>?,
-    val topN: Int?,
 )
-
-/** Clamp method_selection.depth to int ≥ 1; warn and default to 1 on garbage input. */
-private fun parseMethodDepth(raw: Any?): Int {
-    if (raw == null) return 1
-    val n = (raw as? Number)?.toInt()
-    if (n == null || n < 1) {
-        log.warn("Invalid method_selection.depth={}; clamping to 1", raw)
-        return 1
-    }
-    return n
-}
 
 /**
  * Resolve the effective `max_methods` cap.
@@ -98,24 +62,6 @@ private const val DEFAULT_MAX_METHODS = 2
  *  bottleneck-rounding leftovers. */
 private const val MIN_WATERFALL_RESIDUAL = 0.5
 
-/** Parse `method_selection.max_bom_depth`: integer ≥ 1, defaults to
- *  [DEFAULT_MAX_BOM_DEPTH] (3). Caps at 10 to bound recursion cost.
- *
- *  This is the maximum real-make recursion depth admitted at the reactive
- *  make-fallback site in plan(). A `make` alternative whose precomputed
- *  [maxMakeDepth] exceeds this cap is structurally too deep to attempt —
- *  the make would either recurse uselessly or compound. */
-private const val MAX_BOM_DEPTH_HARD_CAP = 10
-private fun parseMaxBomDepth(raw: Any?): Int {
-    if (raw == null) return DEFAULT_MAX_BOM_DEPTH
-    val n = (raw as? Number)?.toInt()
-    if (n == null) {
-        log.warn("Invalid method_selection.max_bom_depth={}; defaulting to {}", raw, DEFAULT_MAX_BOM_DEPTH)
-        return DEFAULT_MAX_BOM_DEPTH
-    }
-    return n.coerceIn(1, MAX_BOM_DEPTH_HARD_CAP)
-}
-
 private fun parseMaxMethods(rawMax: Any?, multiple: Boolean, multiplePresent: Boolean): Int {
     if (rawMax != null) {
         val n = (rawMax as? Number)?.toInt()
@@ -133,77 +79,22 @@ private fun parseMaxMethods(rawMax: Any?, multiple: Boolean, multiplePresent: Bo
     return DEFAULT_MAX_METHODS
 }
 
-/**
- * Resolve the effective method_selection config.
- *
- * Accepts both the new shape (`mode`, `depth`, `score_weights`) and the legacy shape
- * (`elaborate: bool`). When both are present, `mode` wins. Score weights fall back
- * to `variant_selection.score_weights` when not set at the method level, since the
- * two groups used to share weights before the variant surface was removed.
- */
+/** Resolve the effective method_selection config. */
 internal fun resolveMethodSelection(config: Map<String, Any?>?): MethodSelectionConfig {
     val raw = (config?.get("method_selection") as? Map<*, *>)?.let {
         @Suppress("UNCHECKED_CAST") it as? Map<String, Any?>
     } ?: emptyMap()
-    val modeStr = (raw["mode"] as? String)?.trim()?.lowercase()
-    val mode = when (modeStr) {
-        "preference" -> modeStr
-        "elaborate" -> { log.warn("method_selection.mode='elaborate' is deprecated; using preference"); "preference" }
-        null -> "preference"
-        else -> {
-            log.warn("Invalid method_selection.mode='{}'; defaulting to preference", modeStr)
-            "preference"
-        }
-    }
-    val depth = parseMethodDepth(raw["depth"])
     val multiple = raw["multiple"] == true
     val multiplePresent = raw.containsKey("multiple") && raw["multiple"] is Boolean
     val maxMethods = parseMaxMethods(raw["max_methods"], multiple, multiplePresent)
-    @Suppress("UNCHECKED_CAST")
-    val methodWeights = raw["score_weights"] as? Map<String, Any?>
-    val weights = methodWeights ?: run {
-        val vs = (config?.get("variant_selection") as? Map<*, *>)?.let {
-            @Suppress("UNCHECKED_CAST") it as? Map<String, Any?>
-        }
-        @Suppress("UNCHECKED_CAST")
-        vs?.get("score_weights") as? Map<String, Any?>
-    }
-    val maxBomDepth = parseMaxBomDepth(raw["max_bom_depth"])
     // Default true — see MethodSelectionConfig.rootWaterfall's own doc. Only an explicit
     // `false` opts back into the legacy root-split behavior.
     val rootWaterfall = raw["root_waterfall"] != false
     return MethodSelectionConfig(
-        mode = mode,
-        depth = depth,
         multiple = multiple,
         maxMethods = maxMethods,
-        scoreWeights = weights,
-        maxBomDepth = maxBomDepth,
         rootWaterfall = rootWaterfall,
     )
-}
-
-/**
- * True when we are still within the top `levels` recursion levels and should
- * therefore run elaborate/cascade scoring rather than plain preference lookup.
- *
- * Engine `depth` counts down from `MAX_PLAN_DEPTH`; level 0 (root) has
- * depth == MAX_PLAN_DEPTH, level 1 has depth == MAX_PLAN_DEPTH - 1, etc.
- * For `levels = N` we want to cover levels 0..N-1, i.e. depth > MAX_PLAN_DEPTH - N.
- */
-internal fun shouldElaborateAtDepth(depth: Int, levels: Int): Boolean =
-    depth > MAX_PLAN_DEPTH - levels.coerceAtLeast(1)
-
-/** Resolve the effective variant_selection config. */
-internal fun resolveVariantSelection(config: Map<String, Any?>?): VariantSelectionConfig {
-    val raw = (config?.get("variant_selection") as? Map<*, *>)?.let {
-        @Suppress("UNCHECKED_CAST") it as? Map<String, Any?>
-    } ?: emptyMap()
-    val multiple = raw["multiple"] as? Boolean
-    @Suppress("UNCHECKED_CAST")
-    val scoreWeights = raw["score_weights"] as? Map<String, Any?>
-    val topN = (raw["top_n"] as? Number)?.toInt()?.let { max(1, it) }
-    return VariantSelectionConfig(multiple = multiple, scoreWeights = scoreWeights, topN = topN)
 }
 
 /** Round a quantity-like double to a whole-unit double for API emission.
