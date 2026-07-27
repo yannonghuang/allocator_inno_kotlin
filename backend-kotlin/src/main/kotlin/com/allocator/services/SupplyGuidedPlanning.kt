@@ -16,47 +16,36 @@ private val log = LoggerFactory.getLogger("com.allocator.SupplyGuidedPlanning")
  *   Step 2  — supply allocation across all demands simultaneously
  *   Loop 2  — bottom-up commitment with per-supply budget caps
  *   Step 3c — GC of unused budgets via compensation passes
+ *
+ * Step 2's allocation policy is fixed, not configurable: critical raw materials
+ * are pre-allocated (proportional to raw demand quantity — see [ALLOCATION_MODE]),
+ * everything else is plain FIFO (no allocation concept — see consumeFromInventory's
+ * own doc). A configurable `allocation_mode`/`enabled` pair used to live here; both
+ * were dead (no UI ever set them, `enabled` never gated anything) and removed.
+ *
+ * Step 3c's compensation-pass count used to be configurable too (`max_compensation_passes`)
+ * — removed: WO-consolidation-by-wave converges naturally in a single pass, so there was
+ * never a real need for more than one.
  */
 data class SupplyGuidedConfig(
-    val enabled: Boolean = true,
-    /**
-     * Allocation mode for Step 2.
-     *
-     * `"demand_qty"` (default) — proportional to raw demand quantity:
-     *   allocation(d, s) = qty(s) × (qty(d) / Σ_competing qty(dd))
-     * This gives each demand a fair share of every supply regardless of BOM rates.
-     *
-     * Other modes (`"fair"`, `"proportional"`, `"priority_first"`) delegate to
-     * the existing [allocate] policies.
-     */
-    val allocationMode: String = "demand_qty",
-    /**
-     * Number of compensation passes after Loop 2 to GC unused budgets.
-     * Each pass identifies allocations that went unused (because an upstream
-     * supply satisfied the demand before recursion reached the allocated supply)
-     * and redistributes the slack to cap-bound demands with residual need.
-     * Range [0, 10]; default 1.
-     */
-    val maxCompensationPasses: Int = 1,
     /** Enable post-planning lot-draw trace + compensation telemetry. Off by default — can OOM on large runs. */
     val traceLots: Boolean = false,
 )
+
+/**
+ * Step 2's fixed allocation policy for critical raw materials — proportional to
+ * raw demand quantity: allocation(d, s) = qty(s) × (qty(d) / Σ_competing qty(dd)).
+ * Gives each demand a fair share of every supply regardless of BOM rates. See
+ * [allocate]'s own doc for the other (dead, no longer reachable) policy names.
+ */
+const val ALLOCATION_MODE = "demand_qty"
 
 fun parseSupplyGuidedConfig(config: Map<String, Any?>?): SupplyGuidedConfig {
     val sub = (config?.get("supply_guided") as? Map<*, *>) ?: return SupplyGuidedConfig()
     @Suppress("UNCHECKED_CAST")
     val m = sub as? Map<String, Any?> ?: return SupplyGuidedConfig()
-    val enabled = m["enabled"] as? Boolean ?: true
-    val allocationMode = when (m["allocation_mode"]?.toString()) {
-        "fair"           -> "fair"
-        "proportional"   -> "proportional"
-        "priority_first" -> "priority_first"
-        "demand_qty"     -> "demand_qty"
-        else             -> "demand_qty"
-    }
-    val maxCompensationPasses = ((m["max_compensation_passes"] as? Number)?.toInt() ?: 1).coerceIn(0, 10)
     val traceLots = m["trace_lots"] as? Boolean ?: false
-    return SupplyGuidedConfig(enabled, allocationMode, maxCompensationPasses, traceLots)
+    return SupplyGuidedConfig(traceLots)
 }
 
 // ── Allocation result ──────────────────────────────────────────────────────────
@@ -155,12 +144,12 @@ internal fun buildSupplyAllocation(
         matrix           = criticalMatrix,
         supplyTotals     = supplyTotals,
         demandPriorities = demandPriorities,
-        mode             = sgConfig.allocationMode,
+        mode             = ALLOCATION_MODE,
         demandQuantities = demandQuantities,
     )
     log.info(
         "[supply-guided] initial allocation: {} demand rows, {} cells, mode={}",
-        allocations.byRow.size, allocations.cellCount(), sgConfig.allocationMode,
+        allocations.byRow.size, allocations.cellCount(), ALLOCATION_MODE,
     )
 
     // Log contested critical supplies.
@@ -214,7 +203,7 @@ internal fun buildSupplyAllocation(
         matrix           = criticalMatrix,
         supplies         = data["supply"] ?: emptyList(),
         demandPriorities = demandPriorities,
-        mode             = sgConfig.allocationMode,
+        mode             = ALLOCATION_MODE,
         demandDates      = demandDates,
         demandQuantities = demandQuantities,
     )
@@ -1334,7 +1323,7 @@ internal fun computeAndSiblingCaps(
             if (availableAgg <= 1e-9) continue
 
             val (shares, dominatorByBranch) =
-                allocateSiblingGroup(sk, byBranch, availableAgg, allocation.sgConfig.allocationMode, demandBudgets, demand, config, data, preferenceKb)  // (b) + (c)
+                allocateSiblingGroup(sk, byBranch, availableAgg, ALLOCATION_MODE, demandBudgets, demand, config, data, preferenceKb)  // (b) + (c)
 
             // Known v1 limitation: projects one flat ratio onto every one of the demand's
             // existing per-lot entries for this supply key — doesn't re-check per-lot date
@@ -1404,21 +1393,16 @@ internal fun logSupplyGuidedTrace(
             pid, lid, sid, lotDateStr, lotQty.toLong(), lines.joinToString(", "))
     }
 
-    // Compensation-pass telemetry (re-planning with updated caps is deferred; this is diagnostics only).
-    if (allocation.sgConfig.maxCompensationPasses > 0) {
-        val actualDraws = extractActualDrawsFromPegging(pegging)
-        var allocations = allocation.allocations
-        var changed = false
-        repeat(allocation.sgConfig.maxCompensationPasses) { pass ->
-            val cr = compensate(allocations, actualDraws, allocation.criticalMatrix,
-                                allocation.demandPriorities, allocation.sgConfig.allocationMode)
-            if (!cr.redistributed) return@repeat
-            log.info("[supply-guided] compensation pass {}: supplies={} redistributed={:.2f} absorbed={:.2f}",
-                pass + 1, cr.supplyCount, cr.qtyRedistributed, cr.qtyAbsorbed)
-            allocations = cr.allocations
-            changed = true
-        }
-        if (changed) log.info("[supply-guided] compensation complete; re-plan with updated caps is TODO (convergence loop)")
+    // Compensation pass telemetry (re-planning with updated caps is deferred; this is diagnostics
+    // only). A single pass — WO-consolidation-by-wave converges naturally, so a configurable
+    // multi-pass count (removed) was never actually needed.
+    val actualDraws = extractActualDrawsFromPegging(pegging)
+    val cr = compensate(allocation.allocations, actualDraws, allocation.criticalMatrix,
+                        allocation.demandPriorities, ALLOCATION_MODE)
+    if (cr.redistributed) {
+        log.info("[supply-guided] compensation pass: supplies={} redistributed={:.2f} absorbed={:.2f}",
+            cr.supplyCount, cr.qtyRedistributed, cr.qtyAbsorbed)
+        log.info("[supply-guided] compensation complete; re-plan with updated caps is TODO (convergence loop)")
     }
 }
 

@@ -396,47 +396,31 @@ export type PlanKpis = {
 /** Config for planning. Sent in POST body to /plan. */
 export type PlanningConfig = {
   /**
-   * Method selection shape: `mode` + `depth` + `multiple`.
-   * `mode: "elaborate"` scores each candidate by commit_time/inventory/purchase;
-   * `depth` (≥1, default 1) controls how many recursion levels elaborate applies at.
-   * Legacy `elaborate: boolean` is still accepted by the backend.
+   * Method selection shape: `max_methods` + `root_waterfall`.
+   * An `elaborate`-scoring mode (`mode`/`depth`/`elaborate`/`score_weights`),
+   * `max_bom_depth`, and a legacy `multiple` boolean fallback for `max_methods`
+   * used to live here — all confirmed dead/redundant server-side (no live
+   * consumer for the former; `multiple` was confusing and redundant with
+   * `max_methods` directly) and removed. Legacy saved configs may still carry
+   * a stray `multiple` key — `normalizeMethodSelection` strips it on submit.
    */
   method_selection?: {
-    mode?: 'preference' | 'elaborate';
-    depth?: number;
-    elaborate?: boolean;
-    /**
-     * @deprecated use `max_methods` instead. Kept for back-compat reading of
-     * legacy saved configs. The UI no longer writes this field — saving a
-     * legacy `multiple: true` config from the form re-emits `max_methods`.
-     */
-    multiple?: boolean;
     /**
      * When true (default), the root demand uses the SAME ordinary sequential waterfall every
-     * non-root node uses (100% to the best-ranked method, spillover residual to the next).
-     * When false, the root instead splits its quantity up-front, proportionally, across its
-     * top `max_methods` alternatives (the legacy behavior) — `max_methods` only controls that
-     * split shape when this is false; with root_waterfall true it still bounds fallback depth,
-     * but the form disables editing it since the effect is secondary in waterfall mode.
+     * non-root node uses (100% to the best-ranked method, spillover residual to the next) —
+     * genuinely unbounded, tries every ranked alternative. When false, the root instead splits
+     * its quantity up-front, proportionally, across its top `max_methods` alternatives (the
+     * legacy behavior) — `max_methods` only has any effect in this mode; the form disables
+     * editing it while root_waterfall is true because it's genuinely inert there.
      */
     root_waterfall?: boolean;
     /**
-     * Waterfall cap: how many ranked methods may be tried before giving up.
-     * Integer >= 1. Default 2 (in sync with the backend default).
-     *   1 = single best method (no fallback)
-     *   2-4 = exhaust best, then resort to lesser only if demand isn't met
-     * Methods are ranked once at the call site (preference int asc, or
-     * elaborate score desc). Inventory carries forward across slots.
+     * Root-split cap: how many top-ranked alternatives the root's up-front proportional split
+     * divides its quantity across. Only has any effect when root_waterfall is false — ordinary
+     * waterfall (root_waterfall true, or any non-root node, unconditionally) tries every
+     * available alternative regardless of this value. Integer >= 1. Default 2.
      */
     max_methods?: number;
-    /**
-     * Maximum real-make recursion depth admitted at the reactive make-fallback
-     * site. Default 3; clamped 1..10 by the backend. A make alternative whose
-     * precomputed maxMakeDepth exceeds this cap is skipped without recursing.
-     */
-    max_bom_depth?: number;
-    /** Relative weights for elaborate scoring. Backend normalizes so absolute values don't matter. */
-    score_weights?: { commit_time?: number; inventory_consumed?: number; purchase?: number };
   };
   /** When false, the buy/purchase method is excluded from planning. Default: true. */
   purchase_allowed?: boolean;
@@ -451,25 +435,26 @@ export type PlanningConfig = {
    */
   reallocate_critical_leftover?: boolean;
   /**
-   * Selective-purchase whitelist of buyable raw-material product_ids. Only meaningful
-   * when purchase_allowed !== false. Empty/absent ⇒ all raw materials are purchasable
-   * (default). Non-empty ⇒ strict whitelist: only listed materials keep their buy
-   * method; every other product's buy method is dropped.
+   * Purchasable-materials whitelist and customer-BOM constraints used to be embedded here
+   * as raw arrays (`purchasable_materials`/`constraints`) — removed. Both are external,
+   * versioned case master data now, handled uniformly with the other 3 external config
+   * objects: the caller only ever picks a version (`purchasable_material_version_id`/
+   * `constraint_version_id`), never submits content directly. The backend always
+   * overwrites any raw array a caller submits with the resolved version's own rows
+   * (see Allocate.kt's planningConfig()), so submitting one here was already a no-op.
    */
-  purchasable_materials?: string[];
   /**
-   * Customer-specific BOM-alternative constraints. Each rule pins which child a given
-   * customer's demand must resolve to for a parent product (location empty/'*' = any).
+   * Consolidate shared component demands within a time bucket before planning.
+   * A `wo_batch_scale` legacy global fallback, an independent `consolidate_wos`
+   * kill-switch, and a legacy `wo_window_days` override used to live here too —
+   * all removed: consolidation always runs when enabled, and per-type scales
+   * are always explicitly specified (never left to a global fallback).
    */
-  constraints?: { customer: string; parent: string; location: string; child: string }[];
-  /** Consolidate shared component demands within a time bucket before planning. */
   consolidation?: {
     enabled?: boolean;
     /** Width of the supply-side time bucket in days (0–365). */
     period_days?: number;
-    /** Legacy global WO batch scale — used as fallback when per-type scales are absent. */
-    wo_batch_scale?: 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
-    /** Per-type WO batch scales. Override wo_batch_scale when present. */
+    /** Per-type WO batch scales. */
     make_batch_scale?:     'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
     move_batch_scale?:     'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
     purchase_batch_scale?: 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
@@ -675,11 +660,11 @@ export async function getWorkOrderPegging(
 /** Start async plan; returns job_id. Poll getPlanStatus(caseId, job_id) for progress and result. */
 /**
  * Normalize method_selection so the backend always receives canonical
- * `max_methods` instead of the legacy `multiple` boolean. Mirrors the form
- * defaults: `multiple: false` (no max_methods) → 1; `multiple: true` (no
- * max_methods) → 2; nothing set → 2. Strips legacy `multiple` and the
- * obsolete `split_mechanism` (proportional split removed in favor of
- * waterfall) from the outgoing config so saved runs migrate forward.
+ * `max_methods` (default 2 when absent/invalid). Strips the legacy `multiple`
+ * boolean (confusing and redundant with `max_methods` directly — removed
+ * server-side too) and the obsolete `split_mechanism` (proportional split
+ * removed in favor of waterfall) from the outgoing config so saved runs
+ * migrate forward.
  */
 function normalizeMethodSelection(config: PlanningConfig | null | undefined): PlanningConfig | null | undefined {
   if (!config) return config;
@@ -688,11 +673,12 @@ function normalizeMethodSelection(config: PlanningConfig | null | undefined): Pl
     return { ...config, method_selection: { max_methods: 2 } };
   }
   // Drop legacy `multiple` + obsolete `split_mechanism`. Derive `max_methods` if absent.
-  const { multiple: legacyMultiple, split_mechanism: _drop, ...rest } = ms as typeof ms & { split_mechanism?: unknown };
-  void _drop;
+  const { multiple: _dropMultiple, split_mechanism: _dropSplit, ...rest } =
+    ms as typeof ms & { multiple?: unknown; split_mechanism?: unknown };
+  void _dropMultiple; void _dropSplit;
   let max = rest.max_methods;
   if (typeof max !== 'number' || !Number.isFinite(max) || max < 1) {
-    max = legacyMultiple === false ? 1 : 2;
+    max = 2;
   }
   return { ...config, method_selection: { ...rest, max_methods: max } };
 }
@@ -766,11 +752,6 @@ export type PlanningCopilotMessage = {
   steps?: PlanningAgentStep[];
   /** plan_run_id if this assistant turn ran a fresh plan (planning-agent only). */
   fresh_run_id?: number | null;
-  /** Special render mode. 'raw_picker' renders the interactive purchasable-raw-material
-   *  selector (from the `/raw` slash command) instead of plain text. */
-  kind?: 'raw_picker';
-  /** Optional pre-applied text filter for the 'raw_picker' (from `/raw <filter>`). */
-  filter?: string;
 };
 
 export type PlanningCopilotResponse = { reply: string; config_update: PlanningConfig | null };

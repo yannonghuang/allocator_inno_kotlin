@@ -77,7 +77,7 @@ const listVersionsFor: Record<ExternalKind, (caseId: number) => Promise<ConfigVe
  * showing the whole `_kb_fingerprint` object and every embedded array indiscriminately).
  *
  * Now shows only the planner's OWN inline parameters directly (method_selection/purchase_allowed/
- * consolidation/variant_selection — the "run config parameters on UI" bucket), plus a hyperlink
+ * consolidation — the "run config parameters on UI" bucket), plus a hyperlink
  * per "external" config object (critical raw allocation / supply preferences / demand ordering /
  * purchasable materials / constraints — the case-level settings promoted out of this blob).
  * Clicking a link drills into a read-only preview within this same slide-in (not a page
@@ -105,9 +105,12 @@ export function ConfigDetailView({ config, caseId, versionRefs }: { config: Reco
   );
 
   // Only fields that actually appear as editable inline parameters on the Planning page's own
-  // config form (see _CaseSectionPage.tsx's "CONFIGURATIONS" fieldset) — mode/depth/max_bom_depth/
-  // score_weights/variant_selection/consolidation.enabled are real config keys but aren't
-  // themselves surfaced there, so they're deliberately left out here too.
+  // config form (see _CaseSectionPage.tsx's "CONFIGURATIONS" fieldset) — consolidation.enabled
+  // is a real, live config key but isn't itself surfaced there (always true from the UI's
+  // perspective; the batch-scale selects are the real on/off control), so it's deliberately
+  // left out here too. mode/depth/max_bom_depth/score_weights/variant_selection — the
+  // previously-dead keys this comment used to list as "real but unsurfaced" — have since been
+  // removed from the backend entirely (confirmed dead, no live consumer anywhere).
   return (
     <div style={{ fontSize: '0.74rem' }}>
       <div style={{ marginBottom: 10 }}>
