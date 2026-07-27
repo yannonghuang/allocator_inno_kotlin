@@ -4491,6 +4491,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   style={{ width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
                 />
               </label>
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }} title={tP('config.rawMaterialSourcingTooltip')}>
+                <input
+                  type="checkbox"
+                  checked={planningConfig.method_selection?.raw_material_sourcing === 'equal_split'}
+                  onChange={(e) => setPlanningConfig((c) => ({
+                    ...c,
+                    method_selection: { ...c.method_selection, raw_material_sourcing: e.target.checked ? 'equal_split' : 'waterfall' },
+                  }))}
+                />
+                <span style={{ fontSize: '0.875rem' }}>{tP('config.rawMaterialSourcing')}</span>
+              </label>
             </div>
 
             {/* ── Purchase ── */}

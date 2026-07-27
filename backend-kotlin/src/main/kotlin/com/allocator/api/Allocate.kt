@@ -3294,6 +3294,7 @@ internal fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int): Ef
         putJsonObject("method_selection") {
             put("max_methods",   methodCfg.maxMethods)
             put("root_waterfall", methodCfg.rootWaterfall)
+            put("raw_material_sourcing", if (methodCfg.equalSplitRawMaterials) "equal_split" else "waterfall")
         }
         putJsonObject("consolidation") {
             put("enabled",         consolidation["enabled"]      as? Boolean ?: false)

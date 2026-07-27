@@ -41,6 +41,18 @@ internal data class MethodSelectionConfig(
      *  non-root node already uses, instead of dividing its quantity up-front across
      *  alternatives. Set false to restore the legacy root-split behavior. */
     val rootWaterfall: Boolean = true,
+    /** Default false (waterfall). When true, PURCHASABLE-RAW-MATERIAL alternatives for the SAME
+     *  BOM slot (e.g. two substitutable raw materials both filling one component position, each
+     *  with no method_make of its own and admitted as a buy) get an EQUAL, fixed share of
+     *  whatever quantity that slot's position would have received, instead of the ordinary
+     *  sequential 100%-then-spillover waterfall. Deliberately narrow: alternatives that are
+     *  themselves manufacturable (have a method_make — real sub-assemblies with their own
+     *  capacity/lead-time limits) are NEVER grouped, even when structurally identical to a
+     *  qualifying raw-material run (same productId/locationId, consecutive, alt_group siblings)
+     *  — splitting demand across those can genuinely change fill rate, unlike a purchasable raw
+     *  material, which is elastic (more can always be bought). See [plan]'s own doc for the exact
+     *  eligibility check and the live case that motivated it. */
+    val equalSplitRawMaterials: Boolean = false,
 )
 
 /**
@@ -82,9 +94,19 @@ internal fun resolveMethodSelection(config: Map<String, Any?>?): MethodSelection
     // Default true — see MethodSelectionConfig.rootWaterfall's own doc. Only an explicit
     // `false` opts back into the legacy root-split behavior.
     val rootWaterfall = raw["root_waterfall"] != false
+    // Default false (waterfall) — see MethodSelectionConfig.equalSplitRawMaterials's own doc.
+    val equalSplitRawMaterials = when ((raw["raw_material_sourcing"] as? String)?.trim()?.lowercase()) {
+        "equal_split" -> true
+        "waterfall", null -> false
+        else -> {
+            log.warn("Invalid method_selection.raw_material_sourcing={}; defaulting to waterfall", raw["raw_material_sourcing"])
+            false
+        }
+    }
     return MethodSelectionConfig(
         maxMethods = maxMethods,
         rootWaterfall = rootWaterfall,
+        equalSplitRawMaterials = equalSplitRawMaterials,
     )
 }
 
@@ -3331,6 +3353,81 @@ fun plan(
     // is what methodMaxCountTooltip already documents ("Only affects the root's own split shape
     // when Root waterfall is off") but the loop previously didn't actually honor.
     val loopCap = if (rootSplitWeights != null) cap else candidates.size
+    // Equal-split raw-material sourcing (opt-in via method_selection.raw_material_sourcing=
+    // equal_split — see MethodSelectionConfig.equalSplitRawMaterials's own doc): detect
+    // CONSECUTIVE runs of candidates that are true alt_group siblings for the SAME (productId,
+    // locationId) — e.g. VirtualProduct_X_A1's several "make" alternatives, one per bom_id, each
+    // a distinct substitute — AND whose own recipe resolves to EXACTLY ONE child that is itself a
+    // genuinely PURCHASABLE RAW MATERIAL (no method_make of its own, and admitted as a buy per
+    // purchase_allowed/the whitelist). Scoped this narrowly on purpose: equal-splitting demand
+    // across capacity-constrained MAKE alternatives (real sub-assemblies with their own lead
+    // time/component limits) can genuinely change fill rate — confirmed live, splitting
+    // 688_F35_2024_09_VIRTUAL's VirtualProduct_280-1159_A1 (6 of 7 "alternatives" are themselves
+    // make-able intermediates, only 140-0547 is a plain raw material) measurably hurt fill rate.
+    // A pure raw-material substitution is elastic (more can always be bought), so splitting
+    // demand across such alternatives should be close to fill-rate-neutral by design — the
+    // eligibility check here is what enforces that scope, not just the method TYPE. If any
+    // member of a would-be run fails the check, the WHOLE run is rejected (not just that member)
+    // — a slot mixing raw-material and make-route alternatives is ambiguous, safest left as
+    // ordinary sequential waterfall entirely.
+    //
+    // Under the default (no per-variant Preferences-KB tuning), siblings share the exact same
+    // `preference` and — via the stable sort above — stay adjacent; only adjacency is supported
+    // here. A KB override that ranks siblings apart simply isn't detected as a run (degrades
+    // safely to ordinary sequential waterfall for those candidates) rather than risking a more
+    // complex reordering scheme.
+    val runStartByIndex: Map<Int, Int>
+    val runLengthByStart: Map<Int, Int>
+    if (methodCfg.equalSplitRawMaterials) {
+        fun isPurchasableRawMaterial(pid: String, lid: String): Boolean {
+            val childMethods = getMethods(pid, lid, data)
+            if (childMethods.any { it["type"] == "make" }) return false
+            if (childMethods.none { it["type"] == "purchase" }) return false
+            val purchaseAllowed = config?.get("purchase_allowed") != false
+            val purchasable = effectivePurchasableSet(config, data)
+            return buyAdmitted(pid, purchaseAllowed, purchasable)
+        }
+        fun rawMaterialGroupKeyOf(idx: Int): Pair<String, String>? {
+            val c = candidates[idx]
+            if (c.method["type"] != "make") return null
+            val mPid = (c.method["product_id"] as? String)?.trim() ?: return null
+            val mLid = (c.method["location_id"] as? String)?.trim() ?: return null
+            val childList = variantsForMake(mPid, mLid, 1.0, c.method, data)
+                .firstOrNull { it.first == c.altKey }?.second ?: return null
+            if (childList.size != 1) return null
+            val childPid = (childList[0]["product_id"] as? String)?.trim() ?: return null
+            val childLid = (childList[0]["location_id"] as? String)?.trim() ?: return null
+            if (!isPurchasableRawMaterial(childPid, childLid)) return null
+            return mPid to mLid
+        }
+        val starts = mutableMapOf<Int, Int>()
+        val lengths = mutableMapOf<Int, Int>()
+        var i = 0
+        while (i < candidates.size) {
+            val key = rawMaterialGroupKeyOf(i)
+            if (key == null) { i++; continue }
+            var j = i + 1
+            while (j < candidates.size && rawMaterialGroupKeyOf(j) == key) j++
+            val runLength = j - i
+            if (runLength > 1) {
+                lengths[i] = runLength
+                for (k in i until j) starts[k] = i
+            }
+            i = j
+        }
+        runStartByIndex = starts
+        runLengthByStart = lengths
+    } else {
+        runStartByIndex = emptyMap()
+        runLengthByStart = emptyMap()
+    }
+    // Cached per-member equal share for the run currently being processed — computed once, live,
+    // at the run's first member (needs the CURRENT residual/rootSplitWeights-target at that
+    // point, not knowable ahead of the loop). Every other member of the same run reuses it
+    // unchanged, so one member's own shortfall never reduces another's share — a genuine,
+    // independent, fixed split, not a cascading residual like the ordinary waterfall.
+    var currentRunStart = -1
+    var currentRunPerMemberTarget = 0.0
     // Shortfall from a candidate that couldn't reach its rootSplitWeights-derived target rolls
     // forward onto the next candidate's target — the same residual-cascade idea the ordinary
     // waterfall already uses, just starting from a split target instead of a 100% target.
@@ -3342,11 +3439,23 @@ fun plan(
         if (slotIdx > 0 && !priorAttemptWasBlocked && !isRoot && candidate.method["type"] != "make") break
         // Past the precomputed split (can happen after a cycle escape lets more than `cap`
         // candidates be tried), degrade to the ordinary sequential residual for the tail.
-        val target = rootSplitWeights?.getOrNull(slotIdx)?.let { it * demandNetQty + carryForward }
+        val runStart = runStartByIndex[slotIdx]
+        val target: Double? = if (runStart != null) {
+            if (runStart != currentRunStart) {
+                currentRunStart = runStart
+                val runBaseTarget = rootSplitWeights?.getOrNull(slotIdx)?.let { it * demandNetQty + carryForward } ?: residual
+                currentRunPerMemberTarget = runBaseTarget / (runLengthByStart[runStart] ?: 1)
+            }
+            currentRunPerMemberTarget
+        } else {
+            rootSplitWeights?.getOrNull(slotIdx)?.let { it * demandNetQty + carryForward }
+        }
         val slotQty = (target ?: residual).coerceAtMost(residual)
         val mLoc = (candidate.method["location_id"] ?: candidate.method["to_location_id"] ?: "").toString()
         val label = if (slotIdx == 0) "Preference ${candidate.method["preference"] ?: "—"}: ${candidate.method["type"]}@$mLoc" +
             (candidate.altKey?.let { " variant=$it" } ?: "")
+            else if (runStart != null) "Equal-split raw-material alternative ${slotIdx - runStart + 1}/${runLengthByStart[runStart]}: ${candidate.method["type"]}@$mLoc" +
+                (candidate.altKey?.let { " variant=$it" } ?: "")
             else "Fallback slot ${slotIdx + 1}/$loopCap: ${candidate.method["type"]}@$mLoc" +
                 (candidate.altKey?.let { " variant=$it" } ?: "") + " (residual=${roundQty(residual).toLong()})"
         // Intra-demand sibling contention (the "diamond" fix), root-split side: when this
