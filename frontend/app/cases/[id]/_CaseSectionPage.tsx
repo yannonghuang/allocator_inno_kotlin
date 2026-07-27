@@ -47,6 +47,7 @@ import {
   getMovesWithTransit,
   getPurchasableRawMaterials,
   type PurchasableRawMaterial,
+  getPurchasableMaterials,
   getConstraintOptions,
   type ConstraintOptions,
   type ConfigVersion,
@@ -339,7 +340,6 @@ export function PlanKpiDashboard({
 }
 
 import { SortFilterTable } from '@/app/components/SortFilterTable';
-import { RawMaterialPicker } from '@/app/components/RawMaterialPicker';
 import { ConfigDetailView, ExternalConfigDrilldown, type ExternalKind } from '@/app/components/ConfigDetailView';
 import { AssessmentHistoryTable } from '@/app/components/AssessmentHistoryTable';
 import { MovableResizablePopup } from '@/app/components/MovableResizablePopup';
@@ -459,9 +459,11 @@ function renderCopilotText(text: string, onDemandClick?: (demandId: string) => v
 
 // RawMaterialPicker / ConstraintPicker / SearchableSelect moved to shared component files
 // (frontend/app/components/RawMaterialPicker.tsx, ConstraintPicker.tsx) when their editors were
-// promoted out to dedicated pages (see PurchasableMaterials.kt / Constraints.kt). RawMaterialPicker
-// is still imported here for the copilot `/raw` chat card (see its own KNOWN GAP comment below);
-// ConstraintPicker/SearchableSelect have no remaining usage in this file.
+// promoted out to dedicated pages (see PurchasableMaterials.kt / Constraints.kt). The copilot's
+// `/raw` chat card (the last remaining usage of RawMaterialPicker in this file) was removed —
+// whitelist content is versioned case master data, not something the copilot chat should edit
+// directly; the Purchasable Materials page + purchasable_material_version_id picker are the
+// canonical path. None of the three have any remaining usage in this file.
 
 function parseApiError(raw: unknown): string {
   const s = raw instanceof Error ? raw.message : String(raw ?? 'Unknown error');
@@ -1111,9 +1113,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [peggingSelectedProductLoc, setPeggingSelectedProductLoc] = useState<{ product: string; location: string } | null>(null);
   const [bomRealPairs, setBomRealPairs] = useState<[string, string][] | null>(null);
   const [realMoveTriples, setRealMoveTriples] = useState<[string, string, string][] | null>(null);
-  // Buyable raw materials for the selective-purchase whitelist dropdown + copilot /raw picker.
+  // Buyable raw materials for the selective-purchase whitelist dropdown.
   const [purchasableOptions, setPurchasableOptions] = useState<PurchasableRawMaterial[]>([]);
   const [constraintOptions, setConstraintOptions] = useState<ConstraintOptions>({ customers: [], parents: [] });
+  // The CURRENT effective whitelist content, for the Supply View's "critical only" filter — fetched
+  // by version id since the config no longer carries a raw purchasable_materials array (removed;
+  // the whitelist is external, versioned case master data, resolved server-side from
+  // purchasable_material_version_id, same as the other 4 external config objects).
+  const [currentWhitelist, setCurrentWhitelist] = useState<Set<string>>(new Set());
   // Versions of the 5 "external config objects" (see CaseConfigVersions' own doc), for the
   // Planning page's compact version pickers — one row per kind, defaulting to whichever the
   // case marks default.
@@ -1130,7 +1137,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const previewResizeRef = useRef<{ startX: number; startY: number; origW: number; origH: number } | null>(null);
   const [previewDragging, setPreviewDragging] = useState(false);
   const [previewResizing, setPreviewResizing] = useState(false);
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' }, purchase_allowed: false, purchasable_materials: [], constraints: [], analyze_criticality: false, check_soundness: true });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<PlanStatusResponse['progress'] | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1684,8 +1691,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   }, [id, planResult]);
 
   // Load the buyable raw-material catalog for the selective-purchase whitelist
-  // dropdown + copilot /raw picker. Independent of plan results so the options
-  // are ready before the first run.
+  // dropdown. Independent of plan results so the options are ready before the first run.
   useEffect(() => {
     if (!id) {
       setPurchasableOptions([]);
@@ -1700,6 +1706,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       .catch(() => { if (!cancelled) setConstraintOptions({ customers: [], parents: [] }); });
     return () => { cancelled = true; };
   }, [id]);
+
+  // Load the CURRENT effective whitelist content (for the Supply View's "critical only"
+  // filter), keyed by the case-level purchasable_material_version_id pick — re-fetches
+  // whenever that pick changes so the filter always reflects what a run would actually use.
+  useEffect(() => {
+    if (!id) {
+      setCurrentWhitelist(new Set());
+      return;
+    }
+    let cancelled = false;
+    getPurchasableMaterials(id, planningConfig.purchasable_material_version_id)
+      .then((rows) => { if (!cancelled) setCurrentWhitelist(new Set(rows.map((r) => r.product_id))); })
+      .catch(() => { if (!cancelled) setCurrentWhitelist(new Set()); });
+    return () => { cancelled = true; };
+  }, [id, planningConfig.purchasable_material_version_id]);
 
   // Load the version list for each of the 5 external config objects, so the Planning page can
   // offer an explicit version picker per object (defaulting to the case's default version when
@@ -4664,7 +4685,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 max_methods: 1,
               },
               purchase_allowed: false,
-              constraints: [],
               consolidation: { enabled: true, period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' },
             })}
             title={tP('config.resetDefaultsTitle')}
@@ -6690,8 +6710,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     if (planSupplyPartialOnly) rows = rows.filter((r) => r.consumedQty > 0);
                     if (planSupplyCriticalOnly) {
                       const qualifies = new Set(purchasableOptions.map((o) => o.product_id));
-                      const selected = new Set(planningConfig.purchasable_materials ?? []);
-                      rows = rows.filter((r) => qualifies.has(r.productId) && !selected.has(r.productId));
+                      rows = rows.filter((r) => qualifies.has(r.productId) && !currentWhitelist.has(r.productId));
                     }
 
                     const totalInitial = planSupplyViewRows.reduce((s, r) => s + r.qty, 0);
@@ -8698,26 +8717,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     setPlanPeggingContext({ type: 'demand', row: demandRow });
                     setPlanPeggingOpen(true);
                   })}</span>
-                  {/* DESIGN DECISION (2026-07-25): the copilot does NOT edit purchasable-
-                      materials content — the whitelist is versioned case master data owned by
-                      the Purchasable Materials page; the copilot only PICKS versions
-                      (purchasable_material_version_id). This /raw picker card predates that
-                      decision and writes only the dead display field
-                      (planningConfig.purchasable_materials) — it should be removed or turned
-                      into a link to the Purchasable Materials page. */}
-                  {m.kind === 'raw_picker' && (
-                    purchasableOptions.length === 0 ? (
-                      <div style={{ fontSize: '0.78rem', color: '#71717a', marginTop: '0.3rem' }}>{tP('config.purchasableNone')}</div>
-                    ) : (
-                      <RawMaterialPicker
-                        options={purchasableOptions}
-                        selected={planningConfig.purchasable_materials ?? []}
-                        onChange={(next) => setPlanningConfig((c) => ({ ...c, purchase_allowed: true, purchasable_materials: next }))}
-                        initialFilter={m.filter}
-                        tP={tP}
-                      />
-                    )
-                  )}
                   {m.role === 'assistant' && m.steps && m.steps.length > 0 && (
                     <div style={{ marginTop: '0.4rem', marginLeft: '0.75rem', borderLeft: '2px solid #3d3d40', paddingLeft: '0.75rem' }}>
                       {m.steps.map((s, si) => (
@@ -8760,19 +8759,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 e.preventDefault();
                 const text = copilotInput.trim();
                 if (!text || copilotLoading) return;
-                // `/raw [filter]` — local slash command: render the interactive
-                // purchasable-raw-material picker inline (no backend round-trip).
-                const rawCmd = text.match(/^\/raw(?:\s+(.*))?$/i);
-                if (rawCmd) {
-                  const filter = rawCmd[1]?.trim() || undefined;
-                  setCopilotMessages((prev) => [
-                    ...prev,
-                    { role: 'user', text },
-                    { role: 'assistant', kind: 'raw_picker', filter, text: tP('config.purchasablePickerHeading') },
-                  ]);
-                  setCopilotInput('');
-                  return;
-                }
                 setCopilotMessages((prev) => [...prev, { role: 'user', text }]);
                 setCopilotInput('');
                 setCopilotLoading(true);
@@ -8784,8 +8770,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     ...cu,
                     method_selection: cu.method_selection ? { ...prev.method_selection, ...cu.method_selection } : prev.method_selection,
                     purchase_allowed: 'purchase_allowed' in cu ? cu.purchase_allowed : prev.purchase_allowed,
-                    purchasable_materials: 'purchasable_materials' in cu ? cu.purchasable_materials : prev.purchasable_materials,
-                    constraints: 'constraints' in cu ? cu.constraints : prev.constraints,
                     consolidation: cu.consolidation ? { ...prev.consolidation, ...cu.consolidation } : prev.consolidation,
                   }));
                   // Preference tuning (resolvePreferenceTuning) and an explicit allocation

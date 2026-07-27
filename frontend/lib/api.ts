@@ -435,17 +435,14 @@ export type PlanningConfig = {
    */
   reallocate_critical_leftover?: boolean;
   /**
-   * Selective-purchase whitelist of buyable raw-material product_ids. Only meaningful
-   * when purchase_allowed !== false. Empty/absent ⇒ all raw materials are purchasable
-   * (default). Non-empty ⇒ strict whitelist: only listed materials keep their buy
-   * method; every other product's buy method is dropped.
+   * Purchasable-materials whitelist and customer-BOM constraints used to be embedded here
+   * as raw arrays (`purchasable_materials`/`constraints`) — removed. Both are external,
+   * versioned case master data now, handled uniformly with the other 3 external config
+   * objects: the caller only ever picks a version (`purchasable_material_version_id`/
+   * `constraint_version_id`), never submits content directly. The backend always
+   * overwrites any raw array a caller submits with the resolved version's own rows
+   * (see Allocate.kt's planningConfig()), so submitting one here was already a no-op.
    */
-  purchasable_materials?: string[];
-  /**
-   * Customer-specific BOM-alternative constraints. Each rule pins which child a given
-   * customer's demand must resolve to for a parent product (location empty/'*' = any).
-   */
-  constraints?: { customer: string; parent: string; location: string; child: string }[];
   /**
    * Consolidate shared component demands within a time bucket before planning.
    * A `wo_batch_scale` legacy global fallback, an independent `consolidate_wos`
@@ -755,11 +752,6 @@ export type PlanningCopilotMessage = {
   steps?: PlanningAgentStep[];
   /** plan_run_id if this assistant turn ran a fresh plan (planning-agent only). */
   fresh_run_id?: number | null;
-  /** Special render mode. 'raw_picker' renders the interactive purchasable-raw-material
-   *  selector (from the `/raw` slash command) instead of plain text. */
-  kind?: 'raw_picker';
-  /** Optional pre-applied text filter for the 'raw_picker' (from `/raw <filter>`). */
-  filter?: string;
 };
 
 export type PlanningCopilotResponse = { reply: string; config_update: PlanningConfig | null };
