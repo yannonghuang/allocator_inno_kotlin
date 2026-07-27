@@ -1319,12 +1319,15 @@ internal fun achievableExcludingMaterial(
     // work orders," so stock is pre-deterministic and doesn't recurse into make/move method
     // chains at all (a deeper make step would itself be a work order, not existing stock; a
     // deeper move step's own source is a different position's existing stock, one level down,
-    // not this position's). Scoped to [pid]@[lid]'s own top-ranked candidate(s) (capped to
-    // max_methods, matching every other achievability computation in this codebase).
-    val methodCfg = resolveMethodSelection(config)
+    // not this position's). Considers every ranked candidate at [pid]@[lid] — NOT capped to
+    // max_methods: [pid] here is always a diamond/AND-sibling RECIPIENT (never the root demand
+    // itself — see computeDiamondCapsForAttempt's own doc), and max_methods only governs the
+    // root's own split shape when root_waterfall is off (see plan()'s loopCap doc). Truncating
+    // this probe understates a recipient's true alternative capacity, which in turn overstates
+    // its computed share of the shared critical material in computeDiamondCapsForAttempt's
+    // pooled-stock split — a real, silent distortion, not a computational shortcut.
     val candidates = expandWaterfallCandidates(getMethods(pid, lid, data), pid, demand, config, data)
         .sortedBy { kbPreference(pid, lid, it.method, it.altKey, preferenceKb) }
-        .let { it.take(methodCfg.maxMethods.coerceAtMost(it.size)) }
     // Reuses consumeFromInventory itself — the exact bucket-matching + date-sort logic a real
     // draw would use — directly against the shared [inventory] snapshot (destructive: draws
     // here actually decrement it), rather than re-deriving eligibility rules here (an earlier
@@ -3437,13 +3440,22 @@ fun plan(
             }
         scored ?: List(cap) { 1.0 / cap }
     } else null
+    // Loop bound: root-split mode (rootSplitWeights != null) bounds candidate-trying at `cap` —
+    // rootSplitWeights is sized to exactly `cap` entries, so trying more candidates than that
+    // has nothing to assign them a target from. Ordinary waterfall — every OTHER case: the
+    // root when root_waterfall=true, or any non-root node (both already share this exact same
+    // loop) — tries every available alternative instead; max_methods no longer bounds how many
+    // fallback candidates get a chance, only how many the root-split shape divides across. This
+    // is what methodMaxCountTooltip already documents ("Only affects the root's own split shape
+    // when Root waterfall is off") but the loop previously didn't actually honor.
+    val loopCap = if (rootSplitWeights != null) cap else candidates.size
     // Shortfall from a candidate that couldn't reach its rootSplitWeights-derived target rolls
     // forward onto the next candidate's target — the same residual-cascade idea the ordinary
     // waterfall already uses, just starting from a split target instead of a 100% target.
     var carryForward = 0.0
     var priorAttemptWasBlocked = true
     for ((slotIdx, candidate) in candidates.withIndex()) {
-        if (slotIdx - cycleEscapes >= cap) break
+        if (slotIdx - cycleEscapes >= loopCap) break
         if (slotIdx > 0 && residual <= MIN_WATERFALL_RESIDUAL) break
         if (slotIdx > 0 && !priorAttemptWasBlocked && !isRoot && candidate.method["type"] != "make") break
         // Past the precomputed split (can happen after a cycle escape lets more than `cap`
@@ -3453,7 +3465,7 @@ fun plan(
         val mLoc = (candidate.method["location_id"] ?: candidate.method["to_location_id"] ?: "").toString()
         val label = if (slotIdx == 0) "Preference ${candidate.method["preference"] ?: "—"}: ${candidate.method["type"]}@$mLoc" +
             (candidate.altKey?.let { " variant=$it" } ?: "")
-            else "Fallback slot ${slotIdx + 1}/$cap: ${candidate.method["type"]}@$mLoc" +
+            else "Fallback slot ${slotIdx + 1}/$loopCap: ${candidate.method["type"]}@$mLoc" +
                 (candidate.altKey?.let { " variant=$it" } ?: "") + " (residual=${roundQty(residual).toLong()})"
         // Intra-demand sibling contention (the "diamond" fix), root-split side: when this
         // slot is one of rootSplitWeights' simultaneously-active candidates, look up the
