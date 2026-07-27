@@ -396,18 +396,15 @@ export type PlanKpis = {
 /** Config for planning. Sent in POST body to /plan. */
 export type PlanningConfig = {
   /**
-   * Method selection shape: `max_methods` + `root_waterfall` (+ legacy `multiple`).
-   * An `elaborate`-scoring mode (`mode`/`depth`/`elaborate`/`score_weights`) and
-   * `max_bom_depth` used to live here — all confirmed dead server-side (no live
-   * consumer; real scoring comes from the case-level Preferences KB) and removed.
+   * Method selection shape: `max_methods` + `root_waterfall`.
+   * An `elaborate`-scoring mode (`mode`/`depth`/`elaborate`/`score_weights`),
+   * `max_bom_depth`, and a legacy `multiple` boolean fallback for `max_methods`
+   * used to live here — all confirmed dead/redundant server-side (no live
+   * consumer for the former; `multiple` was confusing and redundant with
+   * `max_methods` directly) and removed. Legacy saved configs may still carry
+   * a stray `multiple` key — `normalizeMethodSelection` strips it on submit.
    */
   method_selection?: {
-    /**
-     * @deprecated use `max_methods` instead. Kept for back-compat reading of
-     * legacy saved configs. The UI no longer writes this field — saving a
-     * legacy `multiple: true` config from the form re-emits `max_methods`.
-     */
-    multiple?: boolean;
     /**
      * When true (default), the root demand uses the SAME ordinary sequential waterfall every
      * non-root node uses (100% to the best-ranked method, spillover residual to the next) —
@@ -449,23 +446,21 @@ export type PlanningConfig = {
    * customer's demand must resolve to for a parent product (location empty/'*' = any).
    */
   constraints?: { customer: string; parent: string; location: string; child: string }[];
-  /** Consolidate shared component demands within a time bucket before planning. */
+  /**
+   * Consolidate shared component demands within a time bucket before planning.
+   * A `wo_batch_scale` legacy global fallback, an independent `consolidate_wos`
+   * kill-switch, and a legacy `wo_window_days` override used to live here too —
+   * all removed: consolidation always runs when enabled, and per-type scales
+   * are always explicitly specified (never left to a global fallback).
+   */
   consolidation?: {
     enabled?: boolean;
     /** Width of the supply-side time bucket in days (0–365). */
     period_days?: number;
-    /** Legacy global WO batch scale — used as fallback when per-type scales are absent. */
-    wo_batch_scale?: 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
-    /** Per-type WO batch scales. Override wo_batch_scale when present. */
+    /** Per-type WO batch scales. */
     make_batch_scale?:     'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
     move_batch_scale?:     'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
     purchase_batch_scale?: 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
-    /** Independent kill-switch: even with enabled=true, false disables WO consolidation
-     *  (falls back to 1:1 node-level WOs). Default true — only explicit false disables. No UI
-     *  control; settable via the planning copilot. */
-    consolidate_wos?: boolean;
-    /** Legacy window-size key — takes priority over period_days when both are set. No UI control. */
-    wo_window_days?: number;
   };
   /**
    * Post-plan UI behavior toggles. These do not affect planner output — they
@@ -668,11 +663,11 @@ export async function getWorkOrderPegging(
 /** Start async plan; returns job_id. Poll getPlanStatus(caseId, job_id) for progress and result. */
 /**
  * Normalize method_selection so the backend always receives canonical
- * `max_methods` instead of the legacy `multiple` boolean. Mirrors the form
- * defaults: `multiple: false` (no max_methods) → 1; `multiple: true` (no
- * max_methods) → 2; nothing set → 2. Strips legacy `multiple` and the
- * obsolete `split_mechanism` (proportional split removed in favor of
- * waterfall) from the outgoing config so saved runs migrate forward.
+ * `max_methods` (default 2 when absent/invalid). Strips the legacy `multiple`
+ * boolean (confusing and redundant with `max_methods` directly — removed
+ * server-side too) and the obsolete `split_mechanism` (proportional split
+ * removed in favor of waterfall) from the outgoing config so saved runs
+ * migrate forward.
  */
 function normalizeMethodSelection(config: PlanningConfig | null | undefined): PlanningConfig | null | undefined {
   if (!config) return config;
@@ -681,11 +676,12 @@ function normalizeMethodSelection(config: PlanningConfig | null | undefined): Pl
     return { ...config, method_selection: { max_methods: 2 } };
   }
   // Drop legacy `multiple` + obsolete `split_mechanism`. Derive `max_methods` if absent.
-  const { multiple: legacyMultiple, split_mechanism: _drop, ...rest } = ms as typeof ms & { split_mechanism?: unknown };
-  void _drop;
+  const { multiple: _dropMultiple, split_mechanism: _dropSplit, ...rest } =
+    ms as typeof ms & { multiple?: unknown; split_mechanism?: unknown };
+  void _dropMultiple; void _dropSplit;
   let max = rest.max_methods;
   if (typeof max !== 'number' || !Number.isFinite(max) || max < 1) {
-    max = legacyMultiple === false ? 1 : 2;
+    max = 2;
   }
   return { ...config, method_selection: { ...rest, max_methods: max } };
 }

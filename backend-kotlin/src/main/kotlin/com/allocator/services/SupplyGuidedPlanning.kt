@@ -22,16 +22,12 @@ private val log = LoggerFactory.getLogger("com.allocator.SupplyGuidedPlanning")
  * everything else is plain FIFO (no allocation concept — see consumeFromInventory's
  * own doc). A configurable `allocation_mode`/`enabled` pair used to live here; both
  * were dead (no UI ever set them, `enabled` never gated anything) and removed.
+ *
+ * Step 3c's compensation-pass count used to be configurable too (`max_compensation_passes`)
+ * — removed: WO-consolidation-by-wave converges naturally in a single pass, so there was
+ * never a real need for more than one.
  */
 data class SupplyGuidedConfig(
-    /**
-     * Number of compensation passes after Loop 2 to GC unused budgets.
-     * Each pass identifies allocations that went unused (because an upstream
-     * supply satisfied the demand before recursion reached the allocated supply)
-     * and redistributes the slack to cap-bound demands with residual need.
-     * Range [0, 10]; default 1.
-     */
-    val maxCompensationPasses: Int = 1,
     /** Enable post-planning lot-draw trace + compensation telemetry. Off by default — can OOM on large runs. */
     val traceLots: Boolean = false,
 )
@@ -48,9 +44,8 @@ fun parseSupplyGuidedConfig(config: Map<String, Any?>?): SupplyGuidedConfig {
     val sub = (config?.get("supply_guided") as? Map<*, *>) ?: return SupplyGuidedConfig()
     @Suppress("UNCHECKED_CAST")
     val m = sub as? Map<String, Any?> ?: return SupplyGuidedConfig()
-    val maxCompensationPasses = ((m["max_compensation_passes"] as? Number)?.toInt() ?: 1).coerceIn(0, 10)
     val traceLots = m["trace_lots"] as? Boolean ?: false
-    return SupplyGuidedConfig(maxCompensationPasses, traceLots)
+    return SupplyGuidedConfig(traceLots)
 }
 
 // ── Allocation result ──────────────────────────────────────────────────────────
@@ -1398,21 +1393,16 @@ internal fun logSupplyGuidedTrace(
             pid, lid, sid, lotDateStr, lotQty.toLong(), lines.joinToString(", "))
     }
 
-    // Compensation-pass telemetry (re-planning with updated caps is deferred; this is diagnostics only).
-    if (allocation.sgConfig.maxCompensationPasses > 0) {
-        val actualDraws = extractActualDrawsFromPegging(pegging)
-        var allocations = allocation.allocations
-        var changed = false
-        repeat(allocation.sgConfig.maxCompensationPasses) { pass ->
-            val cr = compensate(allocations, actualDraws, allocation.criticalMatrix,
-                                allocation.demandPriorities, ALLOCATION_MODE)
-            if (!cr.redistributed) return@repeat
-            log.info("[supply-guided] compensation pass {}: supplies={} redistributed={:.2f} absorbed={:.2f}",
-                pass + 1, cr.supplyCount, cr.qtyRedistributed, cr.qtyAbsorbed)
-            allocations = cr.allocations
-            changed = true
-        }
-        if (changed) log.info("[supply-guided] compensation complete; re-plan with updated caps is TODO (convergence loop)")
+    // Compensation pass telemetry (re-planning with updated caps is deferred; this is diagnostics
+    // only). A single pass — WO-consolidation-by-wave converges naturally, so a configurable
+    // multi-pass count (removed) was never actually needed.
+    val actualDraws = extractActualDrawsFromPegging(pegging)
+    val cr = compensate(allocation.allocations, actualDraws, allocation.criticalMatrix,
+                        allocation.demandPriorities, ALLOCATION_MODE)
+    if (cr.redistributed) {
+        log.info("[supply-guided] compensation pass: supplies={} redistributed={:.2f} absorbed={:.2f}",
+            cr.supplyCount, cr.qtyRedistributed, cr.qtyAbsorbed)
+        log.info("[supply-guided] compensation complete; re-plan with updated caps is TODO (convergence loop)")
     }
 }
 

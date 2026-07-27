@@ -854,14 +854,13 @@ function buildWoMaps(pegging: PlanningPeggingEntry[]): {
 function normalizePlanningConfig(cfg: PlanningConfig): PlanningConfig {
   const cs = cfg.consolidation;
   if (!cs) return cfg;
-  const globalFb = cs.wo_batch_scale ?? 'weekly';
   return {
     ...cfg,
     consolidation: {
       ...cs,
-      make_batch_scale:     cs.make_batch_scale     ?? globalFb,
-      move_batch_scale:     cs.move_batch_scale     ?? globalFb,
-      purchase_batch_scale: cs.purchase_batch_scale ?? globalFb,
+      make_batch_scale:     cs.make_batch_scale     ?? 'weekly',
+      move_batch_scale:     cs.move_batch_scale     ?? 'weekly',
+      purchase_batch_scale: cs.purchase_batch_scale ?? 'weekly',
     },
   };
 }
@@ -4462,15 +4461,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   value={(() => {
                     const ms = planningConfig.method_selection;
                     if (typeof ms?.max_methods === 'number') return Math.max(1, Math.trunc(ms.max_methods));
-                    if (ms?.multiple === false) return 1;
                     return 2;
                   })()}
                   onChange={(e) => setPlanningConfig((c) => {
                     const v = Math.max(1, parseInt(e.target.value, 10) || 2);
-                    // Drop legacy `multiple` on save; backend resolution prefers max_methods anyway.
-                    const { multiple: _drop, ...rest } = c.method_selection ?? {};
-                    void _drop;
-                    return { ...c, method_selection: { ...rest, max_methods: v } };
+                    return { ...c, method_selection: { ...c.method_selection, max_methods: v } };
                   })}
                   style={{ width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
                 />
@@ -4575,8 +4570,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 {(['make', 'move', 'purchase'] as const).map((type) => {
                   const configKey = `${type}_batch_scale` as 'make_batch_scale' | 'move_batch_scale' | 'purchase_batch_scale';
                   const labelKey = `woBatch${type.charAt(0).toUpperCase() + type.slice(1)}` as 'woBatchMake' | 'woBatchMove' | 'woBatchPurchase';
-                  const globalFb = planningConfig.consolidation?.wo_batch_scale ?? 'weekly';
-                  const val = (planningConfig.consolidation?.[configKey] ?? globalFb) as string;
+                  const val = (planningConfig.consolidation?.[configKey] ?? 'weekly') as string;
                   return (
                     <label key={type}
                       style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.875rem' }}
@@ -4667,7 +4661,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             disabled={planLoading}
             onClick={() => setPlanningConfig({
               method_selection: {
-                multiple: false,
+                max_methods: 1,
               },
               purchase_allowed: false,
               constraints: [],
@@ -8637,16 +8631,15 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 </div>
               </div>
               <p style={{ margin: 0, fontSize: '0.8rem', color: '#a1a1aa' }}>
-                <strong>{tP('copilot.methods')}</strong> {planningConfig.method_selection?.multiple === true
+                <strong>{tP('copilot.methods')}</strong> {(planningConfig.method_selection?.max_methods ?? 2) > 1
                   ? tP('copilot.equalSplit')
                   : tP('copilot.oneByPreference')}.{' '}
                 <strong>{tP('copilot.purchase')}</strong> {planningConfig.purchase_allowed === false ? tP('copilot.disabled') : tP('copilot.allowed')}.{' '}
                 <strong>{tP('copilot.consolidation')}</strong> {planningConfig.consolidation?.enabled === true
                   ? (() => {
-                      const gfb = planningConfig.consolidation.wo_batch_scale ?? 'weekly';
                       const keyMap: Record<string, string> = { none: 'woBatchNone', weekly: 'woBatchWeekly', biweekly: 'woBatchBiweekly', monthly: 'woBatchMonthly', all: 'woBatchAll' };
                       const label = (k: 'make' | 'move' | 'purchase') => {
-                        const scl = (planningConfig.consolidation?.[`${k}_batch_scale`] ?? gfb) as string;
+                        const scl = (planningConfig.consolidation?.[`${k}_batch_scale`] ?? 'weekly') as string;
                         return tP(`config.${keyMap[scl] ?? 'woBatchWeekly'}`);
                       };
                       return tP('copilot.consolidationOnDetail', { scale: `make:${label('make')} move:${label('move')} buy:${label('purchase')}` });

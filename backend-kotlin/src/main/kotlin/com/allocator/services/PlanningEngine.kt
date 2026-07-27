@@ -31,7 +31,6 @@ private val LATE_DATE = LocalDate.of(9999, 12, 31)
 
 /** Effective method_selection config. */
 internal data class MethodSelectionConfig(
-    val multiple: Boolean,                                 //   legacy back-compat parse only
     /** Cap on how many methods waterfall may invoke per demand. >= 1; default 2. */
     val maxMethods: Int,
     /** Default true (2026-07: promoted from the `explore/root-alt-waterfall` A/B — measured
@@ -45,13 +44,11 @@ internal data class MethodSelectionConfig(
 )
 
 /**
- * Resolve the effective `max_methods` cap.
+ * Resolve the effective `max_methods` cap: explicit `max_methods` (clamped to ≥ 1;
+ * non-numeric or < 1 warns and falls back to the default), else the default.
  *
- * Priority:
- *   1. explicit `max_methods` (clamped to ≥ 1; non-numeric warns and falls back to default)
- *   2. legacy `multiple: false` (no `max_methods`)         → 1
- *   3. legacy `multiple: true`  (no `max_methods`)         → 2 (behavior change documented)
- *   4. neither set                                          → 2
+ * A legacy `multiple: boolean` fallback (true/absent → 2, false → 1) used to live
+ * here — removed as confusing and redundant with `max_methods` directly.
  *
  * Default tracks the UI default; the two are intentionally kept in sync.
  */
@@ -62,21 +59,18 @@ private const val DEFAULT_MAX_METHODS = 2
  *  bottleneck-rounding leftovers. */
 private const val MIN_WATERFALL_RESIDUAL = 0.5
 
-private fun parseMaxMethods(rawMax: Any?, multiple: Boolean, multiplePresent: Boolean): Int {
-    if (rawMax != null) {
-        val n = (rawMax as? Number)?.toInt()
-        if (n == null) {
-            log.warn("Invalid method_selection.max_methods={}; falling back to default {}", rawMax, DEFAULT_MAX_METHODS)
-            return DEFAULT_MAX_METHODS
-        }
-        if (n < 1) {
-            log.warn("method_selection.max_methods={} < 1; clamping to default {}", n, DEFAULT_MAX_METHODS)
-            return DEFAULT_MAX_METHODS
-        }
-        return n
+private fun parseMaxMethods(rawMax: Any?): Int {
+    if (rawMax == null) return DEFAULT_MAX_METHODS
+    val n = (rawMax as? Number)?.toInt()
+    if (n == null) {
+        log.warn("Invalid method_selection.max_methods={}; falling back to default {}", rawMax, DEFAULT_MAX_METHODS)
+        return DEFAULT_MAX_METHODS
     }
-    if (multiplePresent) return if (multiple) DEFAULT_MAX_METHODS else 1
-    return DEFAULT_MAX_METHODS
+    if (n < 1) {
+        log.warn("method_selection.max_methods={} < 1; clamping to default {}", n, DEFAULT_MAX_METHODS)
+        return DEFAULT_MAX_METHODS
+    }
+    return n
 }
 
 /** Resolve the effective method_selection config. */
@@ -84,14 +78,11 @@ internal fun resolveMethodSelection(config: Map<String, Any?>?): MethodSelection
     val raw = (config?.get("method_selection") as? Map<*, *>)?.let {
         @Suppress("UNCHECKED_CAST") it as? Map<String, Any?>
     } ?: emptyMap()
-    val multiple = raw["multiple"] == true
-    val multiplePresent = raw.containsKey("multiple") && raw["multiple"] is Boolean
-    val maxMethods = parseMaxMethods(raw["max_methods"], multiple, multiplePresent)
+    val maxMethods = parseMaxMethods(raw["max_methods"])
     // Default true — see MethodSelectionConfig.rootWaterfall's own doc. Only an explicit
     // `false` opts back into the legacy root-split behavior.
     val rootWaterfall = raw["root_waterfall"] != false
     return MethodSelectionConfig(
-        multiple = multiple,
         maxMethods = maxMethods,
         rootWaterfall = rootWaterfall,
     )
@@ -6116,21 +6107,21 @@ private fun runPlanningOnePass(
     // recomputing duration per wave BEFORE propagating timing to parents — so a parent is never
     // bucketed/timed until every live dependency has been finalized (replaces the old
     // consolidate-once-then-patch design, which could leave a pushed WO merged with stale
-    // bucket-mates). OFF path (consolidate_wos=false): each node-level WO acts as its own
-    // consolidated group (1:1, no cross-demand merging) — stamped with consolidated_group_id =
-    // wo_group_id so the downstream capacity-patch step below applies uniformly either way.
+    // bucket-mates). OFF path (enabled=false, or every batch scale is "none"): each node-level WO
+    // acts as its own consolidated group (1:1, no cross-demand merging) — stamped with
+    // consolidated_group_id = wo_group_id so the downstream capacity-patch step below applies
+    // uniformly either way. A `consolidate_wos` kill-switch independent of `enabled` used to exist
+    // here too — removed (confirmed redundant: consolidation is meant to always run when enabled,
+    // per-type scales are always explicitly specified, not left to a legacy global fallback).
     @Suppress("UNCHECKED_CAST")
     val consolidationCfg = config?.get("consolidation") as? Map<String, Any?>
-    val globalScale = consolidationCfg?.get("wo_batch_scale")?.toString()
-    val makeBatchScale     = (consolidationCfg?.get("make_batch_scale")?.toString() ?: globalScale) ?: "weekly"
-    val moveBatchScale     = (consolidationCfg?.get("move_batch_scale")?.toString() ?: globalScale) ?: "weekly"
-    val purchaseBatchScale = (consolidationCfg?.get("purchase_batch_scale")?.toString() ?: globalScale) ?: "weekly"
+    val makeBatchScale     = consolidationCfg?.get("make_batch_scale")?.toString() ?: "weekly"
+    val moveBatchScale     = consolidationCfg?.get("move_batch_scale")?.toString() ?: "weekly"
+    val purchaseBatchScale = consolidationCfg?.get("purchase_batch_scale")?.toString() ?: "weekly"
     val consolidateWos = consolidationConfig.enabled
-        && consolidationCfg?.get("consolidate_wos") != false
         && listOf(makeBatchScale, moveBatchScale, purchaseBatchScale).any { it != "none" }
     val waveResult = if (consolidateWos) {
-        val legacyWindowDays = (consolidationCfg?.get("wo_window_days") as? Number)?.toInt()
-            ?: consolidationConfig.periodDays
+        val legacyWindowDays = consolidationConfig.periodDays
         val woBatchConfig = WoBatchConfig(
             make     = makeBatchScale,
             move     = moveBatchScale,

@@ -3292,7 +3292,6 @@ internal fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int): Ef
             }
         }
         putJsonObject("method_selection") {
-            put("multiple",  methodCfg.multiple)   // legacy mirror — soft-deprecated, see max_methods
             put("max_methods",   methodCfg.maxMethods)
             put("root_waterfall", methodCfg.rootWaterfall)
         }
@@ -3300,15 +3299,12 @@ internal fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int): Ef
             put("enabled",         consolidation["enabled"]      as? Boolean ?: false)
             // 0 = single-bucket sentinel (collapses every demand into LocalDate.EPOCH); legal value, do NOT clamp up to 1.
             put("period_days",     ((consolidation["period_days"] as? Number)?.toInt() ?: 30).coerceIn(0, 365))
-            // consolidate_wos/wo_window_days are both live (PlanningEngine.kt reads them
-            // directly off this same sub-map) but were previously absent from this whitelist —
-            // a run submitted with either set would behave correctly live but silently look
-            // like defaults were used on reload. Persisting them now closes that gap.
-            put("consolidate_wos", consolidation["consolidate_wos"] as? Boolean ?: true)
-            (consolidation["wo_window_days"] as? Number)?.toInt()?.let { put("wo_window_days", it) }
             // Per-type WO batch scales — persist when present so reloading a run restores what was run.
+            // `consolidate_wos` (independent kill-switch) and `wo_window_days`/`wo_batch_scale`
+            // (legacy global fallbacks) used to live here too — removed: consolidation always runs
+            // when enabled, and per-type scales are always explicitly specified.
             val validScales = setOf("none", "weekly", "biweekly", "monthly", "all")
-            listOf("wo_batch_scale", "make_batch_scale", "move_batch_scale", "purchase_batch_scale").forEach { key ->
+            listOf("make_batch_scale", "move_batch_scale", "purchase_batch_scale").forEach { key ->
                 val v = consolidation[key]?.toString()
                 if (v != null && v in validScales) put(key, v)
             }
