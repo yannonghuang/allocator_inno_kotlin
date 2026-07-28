@@ -117,6 +117,7 @@ export function ConfigDetailView({ config, caseId, versionRefs }: { config: Reco
         {row('Root waterfall', String(ms.root_waterfall !== false))}
         {row('Max methods', String(ms.max_methods ?? 1))}
         {row('Raw material sourcing', (ms.raw_material_sourcing as string) === 'equal_split' ? 'Equal-split' : 'Waterfall')}
+        {row('Horizon start', (ms.horizon_start as string) ?? 'None (no parseable demand due dates)')}
         {row('Purchase allowed', String(config.purchase_allowed === true))}
         {row('Reallocate critical leftover', String(config.reallocate_critical_leftover === true))}
         {row('WO batch (make/move/buy)', `${(cs.make_batch_scale as string) ?? globalBatchFb} / ${(cs.move_batch_scale as string) ?? globalBatchFb} / ${(cs.purchase_batch_scale as string) ?? globalBatchFb}`)}

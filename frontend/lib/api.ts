@@ -441,6 +441,15 @@ export type PlanningConfig = {
      * across those can genuinely change fill rate, unlike a purchasable raw material.
      */
     raw_material_sourcing?: 'waterfall' | 'equal_split';
+    /**
+     * Planning horizon start — no work order is ever scheduled to start before this date.
+     * Undefined/blank or `"auto"` (the default): computed from the case's own demands, as the
+     * first day of the earliest month among all their due dates. An explicit `"yyyy-MM-dd"`
+     * override is used literally (not re-floored to a month start). Guards against a node's own
+     * backward lead-time math — or an unparseable/missing due date — landing a work order before
+     * the plan's own frame of reference.
+     */
+    horizon_start?: string;
   };
   /** When false, the buy/purchase method is excluded from planning. Default: true. */
   purchase_allowed?: boolean;

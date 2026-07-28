@@ -4502,6 +4502,37 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 />
                 <span style={{ fontSize: '0.875rem' }}>{tP('config.rawMaterialSourcing')}</span>
               </label>
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }} title={tP('config.horizonStartTooltip')}>
+                <span style={{ color: '#a1a1aa' }}>{tP('config.horizonStart')}</span>
+                <input
+                  type="date"
+                  value={(() => {
+                    const v = planningConfig.method_selection?.horizon_start;
+                    return (v && v.toLowerCase() !== 'auto') ? v : '';
+                  })()}
+                  onChange={(e) => setPlanningConfig((c) => ({
+                    ...c,
+                    method_selection: { ...c.method_selection, horizon_start: e.target.value || undefined },
+                  }))}
+                  placeholder={tP('config.horizonStartAuto')}
+                  style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+                />
+                {planningConfig.method_selection?.horizon_start && (
+                  <button
+                    type="button"
+                    className="secondary"
+                    title={tP('config.horizonStartClearTooltip')}
+                    onClick={() => setPlanningConfig((c) => {
+                      const rest = { ...c.method_selection };
+                      delete rest.horizon_start;
+                      return { ...c, method_selection: rest };
+                    })}
+                    style={{ fontSize: '0.72rem', padding: '2px 6px' }}
+                  >
+                    {tP('config.horizonStartClear')}
+                  </button>
+                )}
+              </label>
             </div>
 
             {/* ── Purchase ── */}

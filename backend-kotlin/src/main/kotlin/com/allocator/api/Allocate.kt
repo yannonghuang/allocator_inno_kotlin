@@ -393,7 +393,7 @@ fun Routing.allocateRoutes() {
         }
 
         casePlanResults.remove(caseId)  // release previous result before allocating a new one
-        val syncEffective = transaction { resolveEffectiveConfig(config, caseId) }
+        val syncEffective = transaction { resolveEffectiveConfig(config, caseId, data) }
         val result = runPlanning(data, config = planningConfig(config, syncEffective))
         val enriched = enrichPlanResultWithData(caseId, result.output, data)
         casePlanResults[caseId] = enriched - "planning_pegging"
@@ -2703,7 +2703,7 @@ internal suspend fun runPlanBackground(
     // Insert plan_run record at start
     lateinit var effectiveConfig: EffectiveConfig
     val planRunId = transaction {
-        effectiveConfig = resolveEffectiveConfig(config, caseId)
+        effectiveConfig = resolveEffectiveConfig(config, caseId, data)
         val insertedId = PlanRuns.insert {
             it[PlanRuns.caseId] = caseId
             it[PlanRuns.jobId] = jobId
@@ -2978,7 +2978,7 @@ private suspend fun runOneBootstrapPreset(
 
     lateinit var effectiveConfig: EffectiveConfig
     val planRunId = transaction {
-        effectiveConfig = resolveEffectiveConfig(configMap, caseId)
+        effectiveConfig = resolveEffectiveConfig(configMap, caseId, data)
         val metadataJson = com.allocator.services.CaseBootstrap.metadataFor(preset, caseId).toString()
         val insertedId = PlanRuns.insert {
             it[PlanRuns.caseId] = caseId
@@ -3242,11 +3242,21 @@ internal data class EffectiveConfig(
  * `CaseBootstrap.signatureFor` — so the exact allocation/preference/demand-order state in effect
  * AT SUBMISSION TIME survives alongside the rest of this point-in-time config snapshot, rather
  * than being silently invisible to the KB.
+ *
+ * [data]'s `demand` rows resolve `method_selection.horizon_start` (see
+ * [com.allocator.services.resolveHorizonStart]) to the SAME concrete date [legacyCommit] will
+ * actually enforce — so what KB / Run History / Planning UI display for a run is what it used,
+ * not just an echo of an "auto" placeholder.
  */
-internal fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int): EffectiveConfig {
+internal fun resolveEffectiveConfig(
+    config: Map<String, Any?>?,
+    caseId: Int,
+    data: Map<String, List<Map<String, Any?>>>,
+): EffectiveConfig {
     val c = config ?: emptyMap()
     val consolidation = (c["consolidation"]     as? Map<*, *>)?.let { it as Map<String, Any?> } ?: emptyMap()
     val methodCfg = resolveMethodSelection(c)
+    val horizonStart = com.allocator.services.resolveHorizonStart(c, data["demand"] ?: emptyList())
 
     fun explicitVersionId(key: String): Int? = (c[key] as? Number)?.toInt()
 
@@ -3295,6 +3305,7 @@ internal fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int): Ef
             put("max_methods",   methodCfg.maxMethods)
             put("root_waterfall", methodCfg.rootWaterfall)
             put("raw_material_sourcing", if (methodCfg.equalSplitRawMaterials) "equal_split" else "waterfall")
+            put("horizon_start", horizonStart?.toString())
         }
         putJsonObject("consolidation") {
             put("enabled",         consolidation["enabled"]      as? Boolean ?: false)

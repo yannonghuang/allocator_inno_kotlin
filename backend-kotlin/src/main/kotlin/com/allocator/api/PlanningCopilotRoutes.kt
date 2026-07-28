@@ -703,7 +703,7 @@ private fun resolvePreferenceTuning(
     }
 
     // Baseline = the currently-selected version's stored generation config.
-    val effective = transaction { resolveEffectiveConfig(currentConfig, caseId) }
+    val effective = transaction { resolveEffectiveConfig(currentConfig, caseId, com.allocator.services.CaseLoader.load(caseId)) }
     val base = loadCasePreferenceConfig(effective.prefVersionId)
     var d = dW ?: base?.deliveryWeight ?: 0.3
     var i = iW ?: base?.inventoryWeight ?: 0.3
@@ -815,8 +815,8 @@ private fun maybeRegenerateAllocation(
         Regex("重新生成.*分配|刷新.*分配").containsMatchIn(userMessage)
     if (!wantsRegen) return Triple(reply, configUpdate, false)
 
-    val effective = transaction { resolveEffectiveConfig(currentConfig, caseId) }
     val data = transaction { com.allocator.services.CaseLoader.load(caseId) }
+    val effective = transaction { resolveEffectiveConfig(currentConfig, caseId, data) }
     if ((data["demand"] ?: emptyList()).isEmpty() || (data["supply"] ?: emptyList()).isEmpty()) {
         return Triple(
             "$reply\n" + bi(
