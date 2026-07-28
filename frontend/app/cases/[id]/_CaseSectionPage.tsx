@@ -1137,7 +1137,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const previewResizeRef = useRef<{ startX: number; startY: number; origW: number; origH: number } | null>(null);
   const [previewDragging, setPreviewDragging] = useState(false);
   const [previewResizing, setPreviewResizing] = useState(false);
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<PlanStatusResponse['progress'] | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1196,6 +1196,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // version pickers used on the Planning page.
   const [bootstrapMaxMethodsMin, setBootstrapMaxMethodsMin] = useState(1);
   const [bootstrapMaxMethodsMax, setBootstrapMaxMethodsMax] = useState(5);
+  const [bootstrapRootWaterfall, setBootstrapRootWaterfall] = useState(true);
+  const [bootstrapEqualSplitRawMaterials, setBootstrapEqualSplitRawMaterials] = useState(false);
+  const [bootstrapHorizonStart, setBootstrapHorizonStart] = useState('');
   const [bootstrapPurchaseAllowed, setBootstrapPurchaseAllowed] = useState(true);
   const [bootstrapMakeBatchScale, setBootstrapMakeBatchScale] = useState<'none' | 'weekly' | 'biweekly' | 'monthly' | 'all'>('weekly');
   const [bootstrapMoveBatchScale, setBootstrapMoveBatchScale] = useState<'none' | 'weekly' | 'biweekly' | 'monthly' | 'all'>('weekly');
@@ -1209,6 +1212,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const buildSeedForm = (): SeedForm => ({
     max_methods_min: bootstrapMaxMethodsMin,
     max_methods_max: bootstrapMaxMethodsMax,
+    root_waterfall: bootstrapRootWaterfall,
+    raw_material_sourcing: bootstrapEqualSplitRawMaterials ? 'equal_split' : 'waterfall',
+    horizon_start: bootstrapHorizonStart || undefined,
     purchase_allowed: bootstrapPurchaseAllowed,
     make_batch_scale: bootstrapMakeBatchScale,
     move_batch_scale: bootstrapMoveBatchScale,
@@ -4502,6 +4508,37 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 />
                 <span style={{ fontSize: '0.875rem' }}>{tP('config.rawMaterialSourcing')}</span>
               </label>
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }} title={tP('config.horizonStartTooltip')}>
+                <span style={{ color: '#a1a1aa' }}>{tP('config.horizonStart')}</span>
+                <input
+                  type="date"
+                  value={(() => {
+                    const v = planningConfig.method_selection?.horizon_start;
+                    return (v && v.toLowerCase() !== 'auto') ? v : '';
+                  })()}
+                  onChange={(e) => setPlanningConfig((c) => ({
+                    ...c,
+                    method_selection: { ...c.method_selection, horizon_start: e.target.value || undefined },
+                  }))}
+                  placeholder={tP('config.horizonStartAuto')}
+                  style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+                />
+                {planningConfig.method_selection?.horizon_start && (
+                  <button
+                    type="button"
+                    className="secondary"
+                    title={tP('config.horizonStartClearTooltip')}
+                    onClick={() => setPlanningConfig((c) => {
+                      const rest = { ...c.method_selection };
+                      delete rest.horizon_start;
+                      return { ...c, method_selection: rest };
+                    })}
+                    style={{ fontSize: '0.72rem', padding: '2px 6px' }}
+                  >
+                    {tP('config.horizonStartClear')}
+                  </button>
+                )}
+              </label>
             </div>
 
             {/* ── Purchase ── */}
@@ -4696,7 +4733,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 max_methods: 1,
               },
               purchase_allowed: false,
-              consolidation: { enabled: true, period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' },
+              consolidation: { period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' },
             })}
             title={tP('config.resetDefaultsTitle')}
             style={{ padding: '6px 12px' }}
@@ -5356,31 +5393,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <div style={{ padding: '0.75rem 1rem' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '0.75rem' }}>
                     <h4 style={{ margin: 0 }}>{tP('workOrders.heading')}</h4>
-                    {/* ── Native vs Consolidated segment control ── */}
-                    <div style={{ display: 'flex', border: '1px solid #3f3f46', borderRadius: 6, overflow: 'hidden' }}>
-                      {(['consolidated', 'native'] as const).map((tab) => (
-                        <button
-                          key={tab}
-                          type="button"
-                          onClick={() => { if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'flex'; startTransition(() => setWoTableTab(tab)); }}
-                          style={{
-                            fontSize: '0.82rem',
-                            padding: '4px 14px',
-                            borderRadius: 0,
-                            border: 'none',
-                            background: woTableTab === tab ? '#3f3f46' : 'transparent',
-                            color: woTableTab === tab ? '#f4f4f5' : '#a1a1aa',
-                            fontWeight: woTableTab === tab ? 600 : 400,
-                            cursor: 'pointer',
-                          }}
-                        >
-                          {tP(tab === 'consolidated' ? 'workOrders.tabConsolidated' : 'workOrders.tabNative')}
-                          <span style={{ marginLeft: 6, opacity: 0.65, fontSize: '0.72rem' }}>
-                            {tab === 'consolidated' ? woTabEffectiveCounts.consolidated : woTabEffectiveCounts.native}
-                          </span>
-                        </button>
-                      ))}
-                    </div>
+                    <span style={{ fontSize: '0.72rem', color: '#71717a' }}>{woTabEffectiveCounts.consolidated}</span>
                   </div>
                   <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.25rem' }}>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
@@ -7488,22 +7501,65 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     {tP('config.subheadMethod')}
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }} title={tP('config.rootWaterfallTooltip')}>
+                      <input
+                        type="checkbox"
+                        checked={bootstrapRootWaterfall}
+                        onChange={(e) => setBootstrapRootWaterfall(e.target.checked)}
+                      />
+                      <span style={{ fontSize: '0.875rem' }}>{tP('config.rootWaterfall')}</span>
+                    </label>
                     <label
-                      style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem', cursor: 'pointer' }}
+                      style={{
+                        display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem',
+                        cursor: !bootstrapRootWaterfall ? 'pointer' : 'default',
+                        opacity: !bootstrapRootWaterfall ? 1 : 0.5,
+                      }}
                       title={tP('bootstrap.maxMethodsRangeTooltip')}
                     >
                       <span style={{ color: '#a1a1aa' }}>{tP('bootstrap.maxMethodsRangeLabel')}</span>
                       <input
                         type="number" min={1} value={bootstrapMaxMethodsMin}
+                        disabled={bootstrapRootWaterfall}
                         onChange={(e) => setBootstrapMaxMethodsMin(Math.max(1, parseInt(e.target.value, 10) || 1))}
                         style={{ width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
                       />
                       <span style={{ color: '#71717a' }}>–</span>
                       <input
                         type="number" min={1} value={bootstrapMaxMethodsMax}
+                        disabled={bootstrapRootWaterfall}
                         onChange={(e) => setBootstrapMaxMethodsMax(Math.max(1, parseInt(e.target.value, 10) || 1))}
                         style={{ width: 56, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
                       />
+                    </label>
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }} title={tP('config.rawMaterialSourcingTooltip')}>
+                      <input
+                        type="checkbox"
+                        checked={bootstrapEqualSplitRawMaterials}
+                        onChange={(e) => setBootstrapEqualSplitRawMaterials(e.target.checked)}
+                      />
+                      <span style={{ fontSize: '0.875rem' }}>{tP('config.rawMaterialSourcing')}</span>
+                    </label>
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }} title={tP('config.horizonStartTooltip')}>
+                      <span style={{ color: '#a1a1aa' }}>{tP('config.horizonStart')}</span>
+                      <input
+                        type="date"
+                        value={bootstrapHorizonStart}
+                        onChange={(e) => setBootstrapHorizonStart(e.target.value)}
+                        placeholder={tP('config.horizonStartAuto')}
+                        style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+                      />
+                      {bootstrapHorizonStart && (
+                        <button
+                          type="button"
+                          className="secondary"
+                          title={tP('config.horizonStartClearTooltip')}
+                          onClick={() => setBootstrapHorizonStart('')}
+                          style={{ fontSize: '0.72rem', padding: '2px 6px' }}
+                        >
+                          {tP('config.horizonStartClear')}
+                        </button>
+                      )}
                     </label>
                   </div>
 
@@ -8665,16 +8721,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   ? tP('copilot.equalSplit')
                   : tP('copilot.oneByPreference')}.{' '}
                 <strong>{tP('copilot.purchase')}</strong> {planningConfig.purchase_allowed === false ? tP('copilot.disabled') : tP('copilot.allowed')}.{' '}
-                <strong>{tP('copilot.consolidation')}</strong> {planningConfig.consolidation?.enabled === true
-                  ? (() => {
-                      const keyMap: Record<string, string> = { none: 'woBatchNone', weekly: 'woBatchWeekly', biweekly: 'woBatchBiweekly', monthly: 'woBatchMonthly', all: 'woBatchAll' };
-                      const label = (k: 'make' | 'move' | 'purchase') => {
-                        const scl = (planningConfig.consolidation?.[`${k}_batch_scale`] ?? 'weekly') as string;
-                        return tP(`config.${keyMap[scl] ?? 'woBatchWeekly'}`);
-                      };
-                      return tP('copilot.consolidationOnDetail', { scale: `make:${label('make')} move:${label('move')} buy:${label('purchase')}` });
-                    })()
-                  : tP('copilot.off')}. {tP('copilot.naturalLangInfo')}
+                <strong>{tP('copilot.consolidation')}</strong> {(() => {
+                  const keyMap: Record<string, string> = { none: 'woBatchNone', weekly: 'woBatchWeekly', biweekly: 'woBatchBiweekly', monthly: 'woBatchMonthly', all: 'woBatchAll' };
+                  const label = (k: 'make' | 'move' | 'purchase') => {
+                    const scl = (planningConfig.consolidation?.[`${k}_batch_scale`] ?? 'weekly') as string;
+                    return tP(`config.${keyMap[scl] ?? 'woBatchWeekly'}`);
+                  };
+                  return tP('copilot.consolidationOnDetail', { scale: `make:${label('make')} move:${label('move')} buy:${label('purchase')}` });
+                })()}. {tP('copilot.naturalLangInfo')}
               </p>
             </div>
             <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>

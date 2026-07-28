@@ -60,9 +60,9 @@ internal val bootstrapJobs = ConcurrentHashMap<String, MutableMap<String, Any?>>
 /** Parse a KB-seeding form payload (see `CaseBootstrap.SeedForm`'s own doc) from the
  *  `/bootstrap/preview` POST body. Mirrors the exact knobs the Planning page's own manual-run
  *  form exposes (purchase allowed, per-type WO batch scale, analyze criticality, check
- *  soundness) plus the 5 external-config version picks — everything else about a submitted
- *  config (mode/depth/max_bom_depth/weights) is fixed at Planning's own defaults, same as a
- *  manual submission that never touched those. */
+ *  soundness, root waterfall, raw-material sourcing, horizon start) plus the 5 external-config
+ *  version picks — everything else about a submitted config (mode/depth/max_bom_depth/weights)
+ *  is fixed at Planning's own defaults, same as a manual submission that never touched those. */
 private fun parseSeedForm(payload: JsonObject): com.allocator.services.CaseBootstrap.SeedForm {
     fun str(key: String, default: String): String =
         payload[key]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: default
@@ -85,6 +85,9 @@ private fun parseSeedForm(payload: JsonObject): com.allocator.services.CaseBoots
         ordVersionId = versionId("demand_order_version_id"),
         purchMatVersionId = versionId("purchasable_material_version_id"),
         constrVersionId = versionId("constraint_version_id"),
+        rootWaterfall = bool("root_waterfall", true),
+        equalSplitRawMaterials = str("raw_material_sourcing", "waterfall") == "equal_split",
+        horizonStart = payload["horizon_start"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() },
     )
 }
 
@@ -393,7 +396,7 @@ fun Routing.allocateRoutes() {
         }
 
         casePlanResults.remove(caseId)  // release previous result before allocating a new one
-        val syncEffective = transaction { resolveEffectiveConfig(config, caseId) }
+        val syncEffective = transaction { resolveEffectiveConfig(config, caseId, data) }
         val result = runPlanning(data, config = planningConfig(config, syncEffective))
         val enriched = enrichPlanResultWithData(caseId, result.output, data)
         casePlanResults[caseId] = enriched - "planning_pegging"
@@ -2703,7 +2706,7 @@ internal suspend fun runPlanBackground(
     // Insert plan_run record at start
     lateinit var effectiveConfig: EffectiveConfig
     val planRunId = transaction {
-        effectiveConfig = resolveEffectiveConfig(config, caseId)
+        effectiveConfig = resolveEffectiveConfig(config, caseId, data)
         val insertedId = PlanRuns.insert {
             it[PlanRuns.caseId] = caseId
             it[PlanRuns.jobId] = jobId
@@ -2978,7 +2981,7 @@ private suspend fun runOneBootstrapPreset(
 
     lateinit var effectiveConfig: EffectiveConfig
     val planRunId = transaction {
-        effectiveConfig = resolveEffectiveConfig(configMap, caseId)
+        effectiveConfig = resolveEffectiveConfig(configMap, caseId, data)
         val metadataJson = com.allocator.services.CaseBootstrap.metadataFor(preset, caseId).toString()
         val insertedId = PlanRuns.insert {
             it[PlanRuns.caseId] = caseId
@@ -3242,11 +3245,21 @@ internal data class EffectiveConfig(
  * `CaseBootstrap.signatureFor` — so the exact allocation/preference/demand-order state in effect
  * AT SUBMISSION TIME survives alongside the rest of this point-in-time config snapshot, rather
  * than being silently invisible to the KB.
+ *
+ * [data]'s `demand` rows resolve `method_selection.horizon_start` (see
+ * [com.allocator.services.resolveHorizonStart]) to the SAME concrete date [legacyCommit] will
+ * actually enforce — so what KB / Run History / Planning UI display for a run is what it used,
+ * not just an echo of an "auto" placeholder.
  */
-internal fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int): EffectiveConfig {
+internal fun resolveEffectiveConfig(
+    config: Map<String, Any?>?,
+    caseId: Int,
+    data: Map<String, List<Map<String, Any?>>>,
+): EffectiveConfig {
     val c = config ?: emptyMap()
     val consolidation = (c["consolidation"]     as? Map<*, *>)?.let { it as Map<String, Any?> } ?: emptyMap()
     val methodCfg = resolveMethodSelection(c)
+    val horizonStart = com.allocator.services.resolveHorizonStart(c, data["demand"] ?: emptyList())
 
     fun explicitVersionId(key: String): Int? = (c[key] as? Number)?.toInt()
 
@@ -3295,15 +3308,16 @@ internal fun resolveEffectiveConfig(config: Map<String, Any?>?, caseId: Int): Ef
             put("max_methods",   methodCfg.maxMethods)
             put("root_waterfall", methodCfg.rootWaterfall)
             put("raw_material_sourcing", if (methodCfg.equalSplitRawMaterials) "equal_split" else "waterfall")
+            put("horizon_start", horizonStart?.toString())
         }
         putJsonObject("consolidation") {
-            put("enabled",         consolidation["enabled"]      as? Boolean ?: false)
             // 0 = single-bucket sentinel (collapses every demand into LocalDate.EPOCH); legal value, do NOT clamp up to 1.
             put("period_days",     ((consolidation["period_days"] as? Number)?.toInt() ?: 30).coerceIn(0, 365))
             // Per-type WO batch scales — persist when present so reloading a run restores what was run.
-            // `consolidate_wos` (independent kill-switch) and `wo_window_days`/`wo_batch_scale`
-            // (legacy global fallbacks) used to live here too — removed: consolidation always runs
-            // when enabled, and per-type scales are always explicitly specified.
+            // `consolidate_wos` (independent kill-switch), `wo_window_days`/`wo_batch_scale` (legacy
+            // global fallbacks), and an `enabled` on/off flag all used to live here too — removed:
+            // consolidation always runs now, and per-type scales are always explicitly specified —
+            // "none" on a given type is the only real off-switch, per type.
             val validScales = setOf("none", "weekly", "biweekly", "monthly", "all")
             listOf("make_batch_scale", "move_batch_scale", "purchase_batch_scale").forEach { key ->
                 val v = consolidation[key]?.toString()

@@ -3570,7 +3570,6 @@ private fun toolGetLeafCompetition(caseId: Int, args: JsonObject, locale: String
     val consolidationConfig = (runConfigJson?.get("consolidation") as? JsonObject) ?: JsonObject(emptyMap())
     val allocationMode = consolidationConfig["allocation_mode"]?.jsonPrimitive?.contentOrNull ?: "fair"
     val periodDays = consolidationConfig["period_days"]?.jsonPrimitive?.intOrNull ?: 30
-    val consolidationEnabled = consolidationConfig["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
 
     // Classify each candidate: drawer (full / partial), zero-share (with
     // presumed reason), or walk_skipped (false positive of BOM containment).
@@ -3613,9 +3612,6 @@ private fun toolGetLeafCompetition(caseId: Int, args: JsonObject, locale: String
             }
         }
         // Walk reached, drew zero. Classify by policy + priority + shortage.
-        if (!consolidationEnabled) {
-            return "zero_share" to "consolidation disabled — share elimination didn't happen at this leaf; check upstream methods"
-        }
         if (allocationMode == "priority_first" && drawerMinPriority != null && d.priority != null && d.priority > drawerMinPriority) {
             return "priority_filtered" to "policy=priority_first; this demand's priority ${d.priority} > top drawers' priority $drawerMinPriority"
         }
@@ -3700,7 +3696,6 @@ private fun toolGetLeafCompetition(caseId: Int, args: JsonObject, locale: String
         put("zero_share_count", JsonPrimitive(zeroShareCount))
         put("members", membersJson)
         put("consolidation", buildJsonObject {
-            put("enabled", JsonPrimitive(consolidationEnabled))
             put("allocation_mode", JsonPrimitive(allocationMode))
             put("period_days", JsonPrimitive(periodDays))
         })

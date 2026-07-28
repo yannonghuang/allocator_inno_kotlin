@@ -5,6 +5,7 @@ import org.slf4j.LoggerFactory
 import java.nio.file.Paths
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
+import java.time.format.DateTimeParseException
 import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
@@ -574,17 +575,75 @@ val REAL_BOM_PAIRS: Set<Pair<String, String>> by lazy { loadRealBomPairsFromCsv(
 
 // ── Date helpers ───────────────────────────────────────────────────────────────
 
+// Fallback formats tried, in order, when the canonical ISO "yyyy-MM-dd" (DATE_FMT) fails —
+// CSV exports (e.g. from Excel under an en-US locale) commonly use "M/d/yyyy" instead. Every
+// date this engine WRITES (formatDate) is always ISO, so this only matters for raw values read
+// straight from imported CSVs (request_due_time, supply_date). Ordered by parseability, not
+// ambiguity risk: a mismatched separator/field-count throws and falls through to the next
+// formatter, so trying several is safe — none of these can silently mis-parse a string another
+// one was meant for.
+private val FALLBACK_DATE_FMTS = listOf(
+    DateTimeFormatter.ofPattern("M/d/yyyy"),
+    DateTimeFormatter.ofPattern("yyyy/M/d"),
+    DateTimeFormatter.ofPattern("M-d-yyyy"),
+)
+
 internal fun parseDate(s: String?): LocalDate? {
     if (s.isNullOrBlank()) return null
-    val raw = s.trim().take(10)
-    if (raw.length < 10) return null
-    return try { LocalDate.parse(raw, DATE_FMT) } catch (e: Exception) { null }
+    val raw = s.trim().let { if (it.length > 10) it.take(10) else it }
+    try {
+        return LocalDate.parse(raw, DATE_FMT)
+    } catch (e: DateTimeParseException) {
+        // fall through to alternate formats below
+    }
+    for (fmt in FALLBACK_DATE_FMTS) {
+        try {
+            return LocalDate.parse(raw, fmt)
+        } catch (e: DateTimeParseException) {
+            // try next format
+        }
+    }
+    log.warn("parseDate: unrecognized date format, treating as missing: '{}'", s)
+    return null
 }
 
 private fun dateAddDays(d: LocalDate?, days: Double): LocalDate? =
     if (d == null) null else d.plusDays(days.toLong())
 
 private fun formatDate(d: LocalDate?): String? = d?.format(DATE_FMT)
+
+/**
+ * The planning horizon's start: the first day of the earliest month among all demands'
+ * request_due_time/request_time. No work order should ever be scheduled to start before this —
+ * it's the floor of last resort against a node's own backward lead-time math (or an unparseable/
+ * missing due date) landing before the plan's own frame of reference. Returns null only when NOT
+ * A SINGLE demand has a parseable due date (nothing to anchor against; the floor is skipped).
+ */
+internal fun computePlanningHorizonStart(demands: List<Map<String, Any?>>): LocalDate? {
+    val earliest = demands.asSequence()
+        .mapNotNull { d -> parseDate(d["request_due_time"] as? String ?: d["request_time"] as? String) }
+        .minOrNull() ?: return null
+    return earliest.withDayOfMonth(1)
+}
+
+/**
+ * Resolves `method_selection.horizon_start` — the config-facing entry point layered on top of
+ * [computePlanningHorizonStart]. Absent, blank, or the literal string "auto" (the default) means
+ * "compute it from the case's own demands"; any other value is parsed (tolerating the same
+ * formats as [parseDate]) and used LITERALLY as the floor, not re-floored to a month start —
+ * an explicit override is respected as given. An unparseable override falls back to auto rather
+ * than silently disabling the floor. Used by both [legacyCommit] (to actually enforce the floor)
+ * and `resolveEffectiveConfig` (to persist the resolved value for KB / Run History / Planning UI
+ * display) — both must resolve identically so what's shown is what a run actually used.
+ */
+internal fun resolveHorizonStart(config: Map<String, Any?>?, demands: List<Map<String, Any?>>): LocalDate? {
+    val raw = (config?.get("method_selection") as? Map<*, *>)?.get("horizon_start") as? String
+    if (raw.isNullOrBlank() || raw.trim().lowercase() == "auto") return computePlanningHorizonStart(demands)
+    return parseDate(raw) ?: run {
+        log.warn("Invalid method_selection.horizon_start={}; falling back to auto (earliest demand month)", raw)
+        computePlanningHorizonStart(demands)
+    }
+}
 
 // ── Inventory helpers ──────────────────────────────────────────────────────────
 
@@ -1716,6 +1775,10 @@ internal fun planMethodSlot(
      *  recipient's own descent (its own BOM chain down to the critical material) is a fresh
      *  contender for the same pool, no matter how many nested OR/AND-nodes it contains. */
     insideDiamondRecipient: Boolean = false,
+    /** See [plan]'s doc — the planning horizon's start, floored against in [computeStartDt].
+     *  Threaded through unchanged to every recursive [plan] call this slot makes for its own
+     *  BOM children. */
+    horizonStart: LocalDate? = null,
 ): MethodSlotResult {
     val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
     val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
@@ -1921,7 +1984,7 @@ internal fun planMethodSlot(
         // nested fanout further down was actually tagged with.
         val isAndGroupChild = activeChildren.size > 1
         val cBranchLineage = if (isAndGroupChild) extendLineage(branchLineage, cPid, cLid) else branchLineage
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, andSiblingCaps = andSiblingCaps, branchLotCap = cBranchLotCap, branchConsumed = cBranchConsumed, branchLineage = cBranchLineage, andSiblingDominators = andSiblingDominators, branchDominator = cBranchDominator, diamondRecipientCaps = diamondRecipientCaps, diamondRecipients = diamondRecipients, diamondCriticalEntitlement = diamondCriticalEntitlement, diamondReserveFraction = diamondReserveFraction, intraBudget = intraBudget, intraBudgetBaseline = intraBudgetBaseline, insideDiamondRecipient = cInsideDiamondRecipient)
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, andSiblingCaps = andSiblingCaps, branchLotCap = cBranchLotCap, branchConsumed = cBranchConsumed, branchLineage = cBranchLineage, andSiblingDominators = andSiblingDominators, branchDominator = cBranchDominator, diamondRecipientCaps = diamondRecipientCaps, diamondRecipients = diamondRecipients, diamondCriticalEntitlement = diamondCriticalEntitlement, diamondReserveFraction = diamondReserveFraction, intraBudget = intraBudget, intraBudgetBaseline = intraBudgetBaseline, insideDiamondRecipient = cInsideDiamondRecipient, horizonStart = horizonStart)
         // Prefer the unrounded "quantity_precise" (see committedRow's doc) over the rounded
         // "quantity" — this feeds the AND-min ratio (computeRawAchievable) below, and reading
         // the rounded value here would let a genuinely-achieved fractional child (e.g. 0.4999
@@ -2368,7 +2431,7 @@ internal fun planMethodSlot(
     }
 
     // 5) Timing + work orders
-    val (startDt, startDtDominator) = computeStartDt(reqDt, leadDays, commitTimesWithSource, data, config)
+    val (startDt, startDtDominator) = computeStartDt(reqDt, leadDays, commitTimesWithSource, data, config, horizonStart)
     val woResult = buildWorkOrders(productId, productionLocation, achievableParentQty, leadDays, startDt, m, demandId, data)
     val wos = woResult.wos
     val lotCount = woResult.lotCount
@@ -2639,6 +2702,12 @@ fun plan(
      *  this makes for itself (nodeCap re-entry) — the AND-loop in [planMethodSlot] is the
      *  only place that ever flips it from false to true. */
     insideDiamondRecipient: Boolean = false,
+    /** The planning horizon's start (first day of the earliest month among all of this case's
+     *  demand due dates) — see [computePlanningHorizonStart]. No work order should ever be
+     *  scheduled to start before it; enforced as a floor in [computeStartDt]. Computed once by
+     *  [legacyCommit] and threaded through unchanged to every recursive [plan] /
+     *  [planMethodSlot] call. */
+    horizonStart: LocalDate? = null,
 ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
 
     val productId = (demand["product_id"] as? String)?.trim() ?: ""
@@ -2681,6 +2750,7 @@ fun plan(
             intraBudget = intraBudget,
             intraBudgetBaseline = intraBudgetBaseline,
             insideDiamondRecipient = insideDiamondRecipient,
+            horizonStart = horizonStart,
         )
         // No cross-demand contention tag for quantity: critical materials are fully resolved by
         // the supply-guided pre-processor (buildSupplyAllocation's perLotBudgets) before this
@@ -3595,6 +3665,7 @@ fun plan(
             intraBudget = slotIntraBudget,
             intraBudgetBaseline = slotIntraBudgetBaseline,
             insideDiamondRecipient = insideDiamondRecipient,
+            horizonStart = horizonStart,
         )
         // Intra-demand sibling contention (step c), applied directly here rather than relying
         // solely on plan()'s nodeCap-gated tagging site — same rationale as the AND-loop's
@@ -3801,8 +3872,16 @@ private fun computeStartDt(
     commitTimesWithSource: List<Pair<LocalDate, ChildPassResult>>,
     data: Map<String, List<Map<String, Any?>>>,
     config: Map<String, Any?>?,
+    horizonStart: LocalDate? = null,
 ): Pair<LocalDate, List<DominatorRef>> {
     var startDt = if (leadDays > 0) dateAddDays(reqDt, -leadDays) ?: reqDt else reqDt
+    // Planning-horizon floor: backward lead-time math (or an upstream missing/unparseable due
+    // date) can otherwise land a work order before the plan's own frame of reference — nothing
+    // should ever be scheduled to start before it. A pure floor: only ever pushes startDt LATER,
+    // never earlier, so it can't shrink a schedule that was already fine.
+    if (horizonStart != null && startDt.isBefore(horizonStart)) {
+        startDt = horizonStart
+    }
     var dominator: List<DominatorRef> = emptyList()
     if (commitTimesWithSource.isNotEmpty()) {
         val latestChild = commitTimesWithSource.maxOf { it.first }
@@ -5811,6 +5890,12 @@ internal fun legacyCommit(
         (data["bom"] ?: emptyList()).size,
     )
 
+    // Computed once for the whole commit pass — every demand's plan() walk floors its work
+    // orders against the SAME horizon (the case's own earliest due month, or an explicit
+    // method_selection.horizon_start override), not a per-demand one.
+    val horizonStart = resolveHorizonStart(config, demands)
+    log.info("legacyCommit: planning horizon start={}", horizonStart ?: "none (no parseable demand due dates)")
+
     demands.forEachIndexed { i, d ->
         val reqStr = d["request_due_time"] as? String ?: d["request_time"] as? String
         val reqDt = parseDate(reqStr)
@@ -5847,6 +5932,7 @@ internal fun legacyCommit(
             andSiblingDominators = andSiblingDominators?.get(demandId),
             diamondRecipients = diamondRecipients,
             diamondCriticalEntitlement = diamondCriticalEntitlement?.get(demandId),
+            horizonStart = horizonStart,
         )
         // plan()'s `quantity <= 0` early return produces a COMPLETELY empty result (no
         // committed_demands row, no work order, no pegging tree) — correct when a demand
@@ -6228,19 +6314,18 @@ private fun runPlanningOnePass(
     // recomputing duration per wave BEFORE propagating timing to parents — so a parent is never
     // bucketed/timed until every live dependency has been finalized (replaces the old
     // consolidate-once-then-patch design, which could leave a pushed WO merged with stale
-    // bucket-mates). OFF path (enabled=false, or every batch scale is "none"): each node-level WO
-    // acts as its own consolidated group (1:1, no cross-demand merging) — stamped with
-    // consolidated_group_id = wo_group_id so the downstream capacity-patch step below applies
-    // uniformly either way. A `consolidate_wos` kill-switch independent of `enabled` used to exist
-    // here too — removed (confirmed redundant: consolidation is meant to always run when enabled,
-    // per-type scales are always explicitly specified, not left to a legacy global fallback).
+    // bucket-mates). Consolidation always runs now — there is no `enabled` off-switch (removed:
+    // confirmed confusing, and gave a "Native (per-demand)" UI view whose only real difference
+    // from Consolidated was showing the SAME BOM-diamond-driven duplicate purchase/make/move
+    // rows unmerged). OFF path (every batch scale is "none"): each node-level WO acts as its own
+    // consolidated group (1:1, no cross-demand merging) — stamped with consolidated_group_id =
+    // wo_group_id so the downstream capacity-patch step below applies uniformly either way.
     @Suppress("UNCHECKED_CAST")
     val consolidationCfg = config?.get("consolidation") as? Map<String, Any?>
     val makeBatchScale     = consolidationCfg?.get("make_batch_scale")?.toString() ?: "weekly"
     val moveBatchScale     = consolidationCfg?.get("move_batch_scale")?.toString() ?: "weekly"
     val purchaseBatchScale = consolidationCfg?.get("purchase_batch_scale")?.toString() ?: "weekly"
-    val consolidateWos = consolidationConfig.enabled
-        && listOf(makeBatchScale, moveBatchScale, purchaseBatchScale).any { it != "none" }
+    val consolidateWos = listOf(makeBatchScale, moveBatchScale, purchaseBatchScale).any { it != "none" }
     val waveResult = if (consolidateWos) {
         val legacyWindowDays = consolidationConfig.periodDays
         val woBatchConfig = WoBatchConfig(

@@ -105,18 +105,19 @@ export function ConfigDetailView({ config, caseId, versionRefs }: { config: Reco
   );
 
   // Only fields that actually appear as editable inline parameters on the Planning page's own
-  // config form (see _CaseSectionPage.tsx's "CONFIGURATIONS" fieldset) — consolidation.enabled
-  // is a real, live config key but isn't itself surfaced there (always true from the UI's
-  // perspective; the batch-scale selects are the real on/off control), so it's deliberately
-  // left out here too. mode/depth/max_bom_depth/score_weights/variant_selection — the
-  // previously-dead keys this comment used to list as "real but unsurfaced" — have since been
-  // removed from the backend entirely (confirmed dead, no live consumer anywhere).
+  // config form (see _CaseSectionPage.tsx's "CONFIGURATIONS" fieldset). consolidation.enabled
+  // used to be a real, live config key that wasn't itself surfaced here — removed entirely now;
+  // consolidation always runs, and the batch-scale selects are the only real on/off control, per
+  // WO type. mode/depth/max_bom_depth/score_weights/variant_selection — the previously-dead keys
+  // this comment used to list as "real but unsurfaced" — have since been removed from the
+  // backend entirely (confirmed dead, no live consumer anywhere).
   return (
     <div style={{ fontSize: '0.74rem' }}>
       <div style={{ marginBottom: 10 }}>
         {row('Root waterfall', String(ms.root_waterfall !== false))}
         {row('Max methods', String(ms.max_methods ?? 1))}
         {row('Raw material sourcing', (ms.raw_material_sourcing as string) === 'equal_split' ? 'Equal-split' : 'Waterfall')}
+        {row('Horizon start', (ms.horizon_start as string) ?? 'None (no parseable demand due dates)')}
         {row('Purchase allowed', String(config.purchase_allowed === true))}
         {row('Reallocate critical leftover', String(config.reallocate_critical_leftover === true))}
         {row('WO batch (make/move/buy)', `${(cs.make_batch_scale as string) ?? globalBatchFb} / ${(cs.move_batch_scale as string) ?? globalBatchFb} / ${(cs.purchase_batch_scale as string) ?? globalBatchFb}`)}
