@@ -81,7 +81,12 @@ private fun cfg(
     depth: Int = 1,
     maxBomDepth: Int = 3,                              // make-fallback admission cap (default 3)
     weights: Triple<Double, Double, Double>? = null,   // (commit, inventory, purchase)
-    consolidationEnabled: Boolean = true,
+    /** null (default/baseline): don't emit make/move/purchase_batch_scale at all, relying on the
+     *  backend's own default-to-"weekly" — byte-identical to every preset before consolidation's
+     *  `enabled` flag was removed. Non-null: emit all three batch-scale keys set to this value —
+     *  used by the "consolidation=off" preset (batchScale = "none"), consolidation's only real
+     *  per-type on/off control now. */
+    batchScale: String? = null,
     periodDays: Int = 30,
     purchaseAllowed: Boolean = false,
 ): JsonObject = buildJsonObject {
@@ -108,7 +113,11 @@ private fun cfg(
         }
     }
     putJsonObject("consolidation") {
-        put("enabled", consolidationEnabled)
+        if (batchScale != null) {
+            put("make_batch_scale", batchScale)
+            put("move_batch_scale", batchScale)
+            put("purchase_batch_scale", batchScale)
+        }
         put("period_days", periodDays)
     }
     putJsonObject("variant_selection") {
@@ -149,7 +158,6 @@ private fun seedCfg(
         }
     }
     putJsonObject("consolidation") {
-        put("enabled", true)
         put("make_batch_scale", makeBatchScale)
         put("move_batch_scale", moveBatchScale)
         put("purchase_batch_scale", purchaseBatchScale)
@@ -218,7 +226,7 @@ object CaseBootstrap {
         for (d in listOf(2, 3, 4)) add("depth=$d", AXIS_DEPTH, cfg(depth = d))
 
         // Consolidation axis.
-        add("consolidation=off", AXIS_CONSOLID, cfg(consolidationEnabled = false))
+        add("consolidation=off", AXIS_CONSOLID, cfg(batchScale = "none"))
         for (p in listOf(7, 14, 30, 60)) add("period=$p", AXIS_CONSOLID, cfg(periodDays = p))
 
         // Purchase axis.
@@ -310,9 +318,14 @@ object CaseBootstrap {
                     ms.entries.forEach { (k, v) -> if (k != "depth") put(k, v) }
                     put("depth", JsonPrimitive((parsedValue as? Number)?.toInt() ?: 1))
                 }
-                "consolidation_enabled" -> putJsonObject("consolidation") {
-                    cs.entries.forEach { (k, v) -> if (k != "enabled") put(k, v) }
-                    put("enabled", JsonPrimitive((parsedValue as? Boolean) ?: true))
+                "consolidation_batch_scale" -> putJsonObject("consolidation") {
+                    cs.entries.forEach { (k, v) ->
+                        if (k !in setOf("make_batch_scale", "move_batch_scale", "purchase_batch_scale")) put(k, v)
+                    }
+                    val scale = JsonPrimitive((parsedValue as? String) ?: "weekly")
+                    put("make_batch_scale", scale)
+                    put("move_batch_scale", scale)
+                    put("purchase_batch_scale", scale)
                 }
                 "period_days" -> putJsonObject("consolidation") {
                     cs.entries.forEach { (k, v) -> if (k != "period_days") put(k, v) }
@@ -342,9 +355,10 @@ object CaseBootstrap {
         val variations: List<JsonElement>, // values the curated library enumerates (datalist hints)
         /** Group id — axes in the same group are rendered under one header
          *  in the dialog and can be collapsed together. Groups capture
-         *  logical dependencies: e.g. period_days only matters when
-         *  consolidation is enabled, so they share the "consolidation"
-         *  group with consolidation_enabled. */
+         *  logical dependencies: e.g. period_days is the supply-side bucket
+         *  width that pairs with consolidation_batch_scale (the per-type
+         *  WO-batch on/off + granularity control), so they share the
+         *  "consolidation" group. */
         val group: String,
     )
 
@@ -378,16 +392,17 @@ object CaseBootstrap {
             group = GROUP_METHOD,
         ),
         // ── Consolidation cluster ────────────────────────────────────────
-        // consolidation_enabled is the cluster's "primary" knob;
-        // scope and period_days are sub-knobs that live
-        // nested under consolidation in the planner config (see cfg()).
+        // consolidation_batch_scale is the cluster's "primary" knob;
+        // period_days is a sub-knob that lives nested under consolidation
+        // in the planner config (see cfg()). Consolidation always runs now —
+        // "none" is the real per-type off-switch, not a separate enabled flag.
         AxisSpec(
-            name = "consolidation_enabled", label = "Consolidation",
-            description = "Group demands by date window before allocation.",
-            valueType = "bool", enumValues = emptyList(),
-            baselineValue = JsonPrimitive(true),
-            defaultSeed = JsonPrimitive(false),
-            variations = listOf(JsonPrimitive(false)),
+            name = "consolidation_batch_scale", label = "Consolidation batch scale",
+            description = "Group demands sharing a component into fewer, larger work orders within a date window. \"none\" turns batching off.",
+            valueType = "enum", enumValues = listOf("none", "weekly", "biweekly", "monthly", "all"),
+            baselineValue = JsonPrimitive("weekly"),
+            defaultSeed = JsonPrimitive("none"),
+            variations = listOf(JsonPrimitive("none")),
             group = GROUP_CONSOLID,
         ),
         AxisSpec(
@@ -426,7 +441,7 @@ object CaseBootstrap {
         return when (axisName) {
             "max_methods" -> cfg(maxMethods = (parsedValue as? Number)?.toInt() ?: 1)
             "depth" -> cfg(depth = (parsedValue as? Number)?.toInt() ?: 1)
-            "consolidation_enabled" -> cfg(consolidationEnabled = (parsedValue as? Boolean) ?: true)
+            "consolidation_batch_scale" -> cfg(batchScale = (parsedValue as? String) ?: "weekly")
             "period_days" -> cfg(periodDays = (parsedValue as? Number)?.toInt() ?: 30)
             "purchase_allowed" -> cfg(purchaseAllowed = (parsedValue as? Boolean) ?: false)
             else -> cfg()  // unknown axis → baseline
@@ -621,7 +636,14 @@ object CaseBootstrap {
         val wC = fmtDbl(sw.dbl("commit_time", 0.4))
         val wI = fmtDbl(sw.dbl("inventory_consumed", 0.35))
         val wP = fmtDbl(sw.dbl("purchase", 0.25))
-        val consEnabled = cs.bool("enabled", true)
+        // `enabled` used to gate consolidation on/off — removed (consolidation always runs now;
+        // the per-type batch scales below are the only real on/off control, "none" being off for
+        // that type). Historical KB rows from before this change carry `enabled` but no explicit
+        // batch-scale keys, so they now hash identically to a "weekly" run on this axis — a
+        // one-time, unavoidable loss of that specific historical distinction.
+        val bsMake = cs.str("make_batch_scale", "weekly")
+        val bsMove = cs.str("move_batch_scale", "weekly")
+        val bsPurchase = cs.str("purchase_batch_scale", "weekly")
         val period = cs.int("period_days", 0)
         val purch = config.bool("purchase_allowed", false)
         // Fingerprint segments — see KbFingerprint.buildFingerprint's own doc. Read verbatim
@@ -638,7 +660,7 @@ object CaseBootstrap {
         val purchMat = fp?.get("purchmat")?.jsonPrimitive?.contentOrNull ?: "legacy"
         val constr = fp?.get("constr")?.jsonPrimitive?.contentOrNull ?: "legacy"
         return "m=$mode|max=$maxM|d=$depth|bom=$bomDepth|w=$wC,$wI,$wP|" +
-            "cons=$consEnabled|p=$period|purch=$purch|casealloc=$caseAlloc|pref=$pref|ord=$ord|" +
+            "bs=$bsMake,$bsMove,$bsPurchase|p=$period|purch=$purch|casealloc=$caseAlloc|pref=$pref|ord=$ord|" +
             "purchmat=$purchMat|constr=$constr"
     }
 

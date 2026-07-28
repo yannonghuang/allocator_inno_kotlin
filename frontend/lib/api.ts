@@ -474,13 +474,14 @@ export type PlanningConfig = {
    */
   /**
    * Consolidate shared component demands within a time bucket before planning.
-   * A `wo_batch_scale` legacy global fallback, an independent `consolidate_wos`
-   * kill-switch, and a legacy `wo_window_days` override used to live here too —
-   * all removed: consolidation always runs when enabled, and per-type scales
-   * are always explicitly specified (never left to a global fallback).
+   * Always runs — there is no on/off `enabled` flag (removed: the per-type batch
+   * scales below are the only real on/off control, "none" being off for that
+   * type). A `wo_batch_scale` legacy global fallback, an independent
+   * `consolidate_wos` kill-switch, and a legacy `wo_window_days` override used to
+   * live here too — all removed, per-type scales are always explicitly specified
+   * (never left to a global fallback).
    */
   consolidation?: {
-    enabled?: boolean;
     /** Width of the supply-side time bucket in days (0–365). */
     period_days?: number;
     /** Per-type WO batch scales. */

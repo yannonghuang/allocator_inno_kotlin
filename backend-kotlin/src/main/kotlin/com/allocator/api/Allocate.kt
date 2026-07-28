@@ -3308,13 +3308,13 @@ internal fun resolveEffectiveConfig(
             put("horizon_start", horizonStart?.toString())
         }
         putJsonObject("consolidation") {
-            put("enabled",         consolidation["enabled"]      as? Boolean ?: false)
             // 0 = single-bucket sentinel (collapses every demand into LocalDate.EPOCH); legal value, do NOT clamp up to 1.
             put("period_days",     ((consolidation["period_days"] as? Number)?.toInt() ?: 30).coerceIn(0, 365))
             // Per-type WO batch scales — persist when present so reloading a run restores what was run.
-            // `consolidate_wos` (independent kill-switch) and `wo_window_days`/`wo_batch_scale`
-            // (legacy global fallbacks) used to live here too — removed: consolidation always runs
-            // when enabled, and per-type scales are always explicitly specified.
+            // `consolidate_wos` (independent kill-switch), `wo_window_days`/`wo_batch_scale` (legacy
+            // global fallbacks), and an `enabled` on/off flag all used to live here too — removed:
+            // consolidation always runs now, and per-type scales are always explicitly specified —
+            // "none" on a given type is the only real off-switch, per type.
             val validScales = setOf("none", "weekly", "biweekly", "monthly", "all")
             listOf("make_batch_scale", "move_batch_scale", "purchase_batch_scale").forEach { key ->
                 val v = consolidation[key]?.toString()

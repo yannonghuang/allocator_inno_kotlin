@@ -1137,7 +1137,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const previewResizeRef = useRef<{ startX: number; startY: number; origW: number; origH: number } | null>(null);
   const [previewDragging, setPreviewDragging] = useState(false);
   const [previewResizing, setPreviewResizing] = useState(false);
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { enabled: true, period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<PlanStatusResponse['progress'] | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -4727,7 +4727,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 max_methods: 1,
               },
               purchase_allowed: false,
-              consolidation: { enabled: true, period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' },
+              consolidation: { period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' },
             })}
             title={tP('config.resetDefaultsTitle')}
             style={{ padding: '6px 12px' }}
@@ -5387,31 +5387,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <div style={{ padding: '0.75rem 1rem' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '0.75rem' }}>
                     <h4 style={{ margin: 0 }}>{tP('workOrders.heading')}</h4>
-                    {/* ── Native vs Consolidated segment control ── */}
-                    <div style={{ display: 'flex', border: '1px solid #3f3f46', borderRadius: 6, overflow: 'hidden' }}>
-                      {(['consolidated', 'native'] as const).map((tab) => (
-                        <button
-                          key={tab}
-                          type="button"
-                          onClick={() => { if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'flex'; startTransition(() => setWoTableTab(tab)); }}
-                          style={{
-                            fontSize: '0.82rem',
-                            padding: '4px 14px',
-                            borderRadius: 0,
-                            border: 'none',
-                            background: woTableTab === tab ? '#3f3f46' : 'transparent',
-                            color: woTableTab === tab ? '#f4f4f5' : '#a1a1aa',
-                            fontWeight: woTableTab === tab ? 600 : 400,
-                            cursor: 'pointer',
-                          }}
-                        >
-                          {tP(tab === 'consolidated' ? 'workOrders.tabConsolidated' : 'workOrders.tabNative')}
-                          <span style={{ marginLeft: 6, opacity: 0.65, fontSize: '0.72rem' }}>
-                            {tab === 'consolidated' ? woTabEffectiveCounts.consolidated : woTabEffectiveCounts.native}
-                          </span>
-                        </button>
-                      ))}
-                    </div>
+                    <span style={{ fontSize: '0.72rem', color: '#71717a' }}>{woTabEffectiveCounts.consolidated}</span>
                   </div>
                   <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.25rem' }}>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
@@ -8696,16 +8672,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   ? tP('copilot.equalSplit')
                   : tP('copilot.oneByPreference')}.{' '}
                 <strong>{tP('copilot.purchase')}</strong> {planningConfig.purchase_allowed === false ? tP('copilot.disabled') : tP('copilot.allowed')}.{' '}
-                <strong>{tP('copilot.consolidation')}</strong> {planningConfig.consolidation?.enabled === true
-                  ? (() => {
-                      const keyMap: Record<string, string> = { none: 'woBatchNone', weekly: 'woBatchWeekly', biweekly: 'woBatchBiweekly', monthly: 'woBatchMonthly', all: 'woBatchAll' };
-                      const label = (k: 'make' | 'move' | 'purchase') => {
-                        const scl = (planningConfig.consolidation?.[`${k}_batch_scale`] ?? 'weekly') as string;
-                        return tP(`config.${keyMap[scl] ?? 'woBatchWeekly'}`);
-                      };
-                      return tP('copilot.consolidationOnDetail', { scale: `make:${label('make')} move:${label('move')} buy:${label('purchase')}` });
-                    })()
-                  : tP('copilot.off')}. {tP('copilot.naturalLangInfo')}
+                <strong>{tP('copilot.consolidation')}</strong> {(() => {
+                  const keyMap: Record<string, string> = { none: 'woBatchNone', weekly: 'woBatchWeekly', biweekly: 'woBatchBiweekly', monthly: 'woBatchMonthly', all: 'woBatchAll' };
+                  const label = (k: 'make' | 'move' | 'purchase') => {
+                    const scl = (planningConfig.consolidation?.[`${k}_batch_scale`] ?? 'weekly') as string;
+                    return tP(`config.${keyMap[scl] ?? 'woBatchWeekly'}`);
+                  };
+                  return tP('copilot.consolidationOnDetail', { scale: `make:${label('make')} move:${label('move')} buy:${label('purchase')}` });
+                })()}. {tP('copilot.naturalLangInfo')}
               </p>
             </div>
             <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>

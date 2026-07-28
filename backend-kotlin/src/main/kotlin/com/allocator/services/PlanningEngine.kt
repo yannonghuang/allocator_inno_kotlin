@@ -6314,19 +6314,18 @@ private fun runPlanningOnePass(
     // recomputing duration per wave BEFORE propagating timing to parents — so a parent is never
     // bucketed/timed until every live dependency has been finalized (replaces the old
     // consolidate-once-then-patch design, which could leave a pushed WO merged with stale
-    // bucket-mates). OFF path (enabled=false, or every batch scale is "none"): each node-level WO
-    // acts as its own consolidated group (1:1, no cross-demand merging) — stamped with
-    // consolidated_group_id = wo_group_id so the downstream capacity-patch step below applies
-    // uniformly either way. A `consolidate_wos` kill-switch independent of `enabled` used to exist
-    // here too — removed (confirmed redundant: consolidation is meant to always run when enabled,
-    // per-type scales are always explicitly specified, not left to a legacy global fallback).
+    // bucket-mates). Consolidation always runs now — there is no `enabled` off-switch (removed:
+    // confirmed confusing, and gave a "Native (per-demand)" UI view whose only real difference
+    // from Consolidated was showing the SAME BOM-diamond-driven duplicate purchase/make/move
+    // rows unmerged). OFF path (every batch scale is "none"): each node-level WO acts as its own
+    // consolidated group (1:1, no cross-demand merging) — stamped with consolidated_group_id =
+    // wo_group_id so the downstream capacity-patch step below applies uniformly either way.
     @Suppress("UNCHECKED_CAST")
     val consolidationCfg = config?.get("consolidation") as? Map<String, Any?>
     val makeBatchScale     = consolidationCfg?.get("make_batch_scale")?.toString() ?: "weekly"
     val moveBatchScale     = consolidationCfg?.get("move_batch_scale")?.toString() ?: "weekly"
     val purchaseBatchScale = consolidationCfg?.get("purchase_batch_scale")?.toString() ?: "weekly"
-    val consolidateWos = consolidationConfig.enabled
-        && listOf(makeBatchScale, moveBatchScale, purchaseBatchScale).any { it != "none" }
+    val consolidateWos = listOf(makeBatchScale, moveBatchScale, purchaseBatchScale).any { it != "none" }
     val waveResult = if (consolidateWos) {
         val legacyWindowDays = consolidationConfig.periodDays
         val woBatchConfig = WoBatchConfig(
