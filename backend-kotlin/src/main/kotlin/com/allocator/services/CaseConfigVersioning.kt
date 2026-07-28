@@ -65,23 +65,58 @@ object CaseConfigVersioning {
             .singleOrNull()?.get(CaseConfigVersions.id)
     }
 
-    /** [requested] if it's a real version belonging to this case+kind, else the case's default,
-     *  lazily creating an (empty, unnamed, default) version if none exists yet at all — mirrors
-     *  how these objects previously came into existence implicitly on first Save/Generate. */
-    fun resolveVersionId(caseId: Int, kind: ConfigVersionKind, requested: Int?): Int = transaction {
+    /** [requested] if it's a real version belonging to this case+kind, else the case's current
+     *  default version id — or **null** if this case has never had a version for this kind at
+     *  all. A new case does NOT have to be associated with any of the 5 external config objects;
+     *  never creates anything. Use for GET/read routes and for planning-time resolution
+     *  (resolveEffectiveConfig/CaseBootstrap) — planning against a case that never touched a
+     *  given object just uses that object's own "empty" convention (no constraints / all
+     *  purchasable / etc.), exactly as it did before versioning existed.
+     *
+     *  Previously this eagerly created an empty default version whenever none existed — which
+     *  meant merely GET-ing a config page for a brand-new case (or submitting a plan run without
+     *  ever visiting one) silently materialized a version and immediately stamped it onto the new
+     *  plan_run row. Combined with [isVersionReferenced] counting any plan_run regardless of
+     *  status, that empty version came back "in use — read only" with no way to edit or delete it
+     *  — confirmed live on a fresh case. See [resolveOrCreateVersionId] for the one legitimate
+     *  place a version should still be created on demand: an actual Save/Generate/Import action. */
+    fun resolveVersionId(caseId: Int, kind: ConfigVersionKind, requested: Int?): Int? = transaction {
         if (requested != null) {
             val ok = CaseConfigVersions.selectAll()
                 .where { (CaseConfigVersions.id eq requested) and (CaseConfigVersions.caseId eq caseId) and (CaseConfigVersions.kind eq kind.key) }
                 .any()
             if (ok) return@transaction requested
         }
-        defaultVersionId(caseId, kind) ?: createVersion(caseId, kind, name = null, comments = null, markDefault = true)
+        defaultVersionId(caseId, kind)
     }
 
-    /** Whether [versionId] is used by any plan_run or kb_record for [kind] — the gate for
-     *  Save/Generate/Import/Clear/Delete having to become "Save As" instead. */
+    /** Same resolution as [resolveVersionId], but materializes a fresh (empty, unnamed, default)
+     *  version when the case has never had one for this kind. This is the ONE legitimate
+     *  create-on-demand moment: a caller that is actually about to WRITE data against the
+     *  version (Save / Generate / Import) — never call this from a GET/read/planning path. */
+    fun resolveOrCreateVersionId(caseId: Int, kind: ConfigVersionKind, requested: Int?): Int =
+        resolveVersionId(caseId, kind, requested)
+            ?: createVersion(caseId, kind, name = null, comments = null, markDefault = true)
+
+    /** Whether [versionId] is used by any COMPLETED plan_run or kb_record for [kind] — the gate
+     *  for Save/Generate/Import/Clear/Delete having to become "Save As" instead.
+     *
+     *  Only "success"/"contingent" plan_runs count — NOT "running" or "failed". `resolveVersionId`
+     *  (via `resolveEffectiveConfig`) resolves and stamps a case's default version onto a plan_run
+     *  row the moment a plan is SUBMITTED (status="running" at that point, before the run even
+     *  executes — see Allocate.kt's own doc on resolveEffectiveConfig/runPlanBackground). Counting
+     *  those meant a brand-new, still-empty default version — auto-created the instant a user first
+     *  clicks "Run Plan" without ever having visited this config page — became permanently "in use
+     *  — read only" even if that very first run then failed, with no way to edit or delete it
+     *  (confirmed live: a fresh case's Version N showed "in use — read only" with Save disabled).
+     *  A genuinely completed run (success, or contingent — a negotiation-branch result pending
+     *  promotion) still must lock its version: mutating the config in place would retroactively
+     *  change what that historical run says it used. kb_records don't need the same filter — a KB
+     *  record is only ever created for an already-successful, sound run (see KbStore's own doc). */
     fun isVersionReferenced(versionId: Int, kind: ConfigVersionKind): Boolean = transaction {
-        val inPlanRuns = PlanRuns.selectAll().where { planRunColumn(kind) eq versionId }.any()
+        val inPlanRuns = PlanRuns.selectAll()
+            .where { (planRunColumn(kind) eq versionId) and (PlanRuns.status inList listOf("success", "contingent")) }
+            .any()
         if (inPlanRuns) return@transaction true
         KbRecords.selectAll().where { kbRecordColumn(kind) eq versionId }.any()
     }

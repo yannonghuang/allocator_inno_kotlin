@@ -62,24 +62,37 @@ internal object KbFingerprint {
      * "not applicable."
      */
     fun buildFingerprint(
-        caseAllocVersionId: Int,
-        prefVersionId: Int,
-        ordVersionId: Int,
-        purchMatVersionId: Int,
-        constrVersionId: Int,
+        caseAllocVersionId: Int?,
+        prefVersionId: Int?,
+        ordVersionId: Int?,
+        purchMatVersionId: Int?,
+        constrVersionId: Int?,
     ): Segments = transaction {
-        val purchMatHash = CasePurchasableMaterialConfigs.selectAll()
-            .where { CasePurchasableMaterialConfigs.versionId eq purchMatVersionId }
-            .singleOrNull()?.get(CasePurchasableMaterialConfigs.contentHash)
-        val constrHash = CaseConstraintConfigs.selectAll()
-            .where { CaseConstraintConfigs.versionId eq constrVersionId }
-            .singleOrNull()?.get(CaseConstraintConfigs.contentHash)
-        val allocHash = CaseAllocationConfigs.selectAll().where { CaseAllocationConfigs.versionId eq caseAllocVersionId }
-            .singleOrNull()?.get(CaseAllocationConfigs.contentHash)
-        val prefCfg = CasePreferenceConfigs.selectAll().where { CasePreferenceConfigs.versionId eq prefVersionId }
-            .singleOrNull()
-        val ordHash = CaseDemandOrderConfigs.selectAll().where { CaseDemandOrderConfigs.versionId eq ordVersionId }
-            .singleOrNull()?.get(CaseDemandOrderConfigs.contentHash)
+        // A null version id (case never had one for this kind — see CaseConfigVersioning's own
+        // doc) is the same "genuinely empty" state as a version whose config row happens to not
+        // exist — both resolve to the same "none" segment below.
+        val purchMatHash = purchMatVersionId?.let { vid ->
+            CasePurchasableMaterialConfigs.selectAll()
+                .where { CasePurchasableMaterialConfigs.versionId eq vid }
+                .singleOrNull()?.get(CasePurchasableMaterialConfigs.contentHash)
+        }
+        val constrHash = constrVersionId?.let { vid ->
+            CaseConstraintConfigs.selectAll()
+                .where { CaseConstraintConfigs.versionId eq vid }
+                .singleOrNull()?.get(CaseConstraintConfigs.contentHash)
+        }
+        val allocHash = caseAllocVersionId?.let { vid ->
+            CaseAllocationConfigs.selectAll().where { CaseAllocationConfigs.versionId eq vid }
+                .singleOrNull()?.get(CaseAllocationConfigs.contentHash)
+        }
+        val prefCfg = prefVersionId?.let { vid ->
+            CasePreferenceConfigs.selectAll().where { CasePreferenceConfigs.versionId eq vid }
+                .singleOrNull()
+        }
+        val ordHash = ordVersionId?.let { vid ->
+            CaseDemandOrderConfigs.selectAll().where { CaseDemandOrderConfigs.versionId eq vid }
+                .singleOrNull()?.get(CaseDemandOrderConfigs.contentHash)
+        }
         val prefSegment = if (prefCfg == null) "none" else {
             val depth = prefCfg[CasePreferenceConfigs.maxBomDepth]
             val wD = prefCfg[CasePreferenceConfigs.deliveryWeight]

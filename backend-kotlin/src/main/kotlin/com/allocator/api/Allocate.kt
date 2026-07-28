@@ -2782,7 +2782,13 @@ internal suspend fun runPlanBackground(
         // Uses the same generateAndSeedCaseAllocation() function as the Generate endpoint
         // so the allocation is computed and filtered identically in both paths.
         if (precomputedBudgets == null) {
-            val allocRows = generateAndSeedCaseAllocation(caseId, effectiveConfig.caseAllocVersionId, data, config)
+            // This is itself a write action (seeding fresh allocation data for later viewing/
+            // reuse) — the one legitimate place to materialize a version on demand if the case
+            // never had one, same as an explicit Generate. Doesn't retroactively touch this
+            // plan_run's own (already-persisted) caseAllocVersionId — the run itself genuinely
+            // ran with no explicit allocation override; this just seeds a fresh snapshot.
+            val seedVersionId = CaseConfigVersioning.resolveOrCreateVersionId(caseId, ConfigVersionKind.CASEALLOC, effectiveConfig.caseAllocVersionId)
+            val allocRows = generateAndSeedCaseAllocation(caseId, seedVersionId, data, config)
             log.info("[plan] seeded case_allocation with {} rows for case {}", allocRows.size, caseId)
         }
         // Hint GC to collect planning intermediates (reconciledTrees, workingTrees, nodeLevelWos,
@@ -3224,11 +3230,15 @@ private fun markRunFailed(runId: Int, caseId: Int, error: String) {
  *  if the case's default changed between two separate resolutions within the same submission). */
 internal data class EffectiveConfig(
     val json: JsonObject,
-    val caseAllocVersionId: Int,
-    val prefVersionId: Int,
-    val ordVersionId: Int,
-    val purchMatVersionId: Int,
-    val constrVersionId: Int,
+    /** Null means this case has never had a version for that object — a legitimate, permanent
+     *  state ("a new case does not have to be associated with any external config object"), not
+     *  something [resolveEffectiveConfig] forces into existence. See [CaseConfigVersioning]'s own
+     *  doc. */
+    val caseAllocVersionId: Int?,
+    val prefVersionId: Int?,
+    val ordVersionId: Int?,
+    val purchMatVersionId: Int?,
+    val constrVersionId: Int?,
 )
 
 @Suppress("UNCHECKED_CAST")
