@@ -3,6 +3,7 @@ package com.allocator.api
 import com.allocator.*
 import com.allocator.services.CsvImportService
 import io.ktor.http.*
+import io.ktor.http.content.*
 import io.ktor.server.application.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
@@ -148,6 +149,43 @@ fun Routing.caseRoutes() {
                 }
 
                 CsvImportService.importFromFolder(caseId, folder)
+                call.respond(ImportCsvResponse(status = "ok", caseId = caseId))
+            }
+
+            // POST /cases/{case_id}/upload-csv — multipart upload of CSV files not mounted into the container
+            post("/upload-csv") {
+                val caseId = call.parameters["case_id"]?.toIntOrNull()
+                    ?: throw IllegalArgumentException("Invalid case_id")
+
+                transaction {
+                    Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
+                        ?: throw NoSuchElementException("Case not found")
+                }
+
+                val filesByName = mutableMapOf<String, ByteArray>()
+                val multipart = call.receiveMultipart()
+                var part = multipart.readPart()
+                while (part != null) {
+                    if (part is PartData.FileItem) {
+                        val filename = part.originalFileName
+                            ?.substringAfterLast('/')
+                            ?.substringAfterLast('\\')
+                            ?.lowercase()
+                        if (filename != null && filename in CsvImportService.KNOWN_FILENAMES) {
+                            filesByName[filename] = part.streamProvider().use { it.readBytes() }
+                        }
+                    }
+                    part.dispose()
+                    part = multipart.readPart()
+                }
+
+                if (filesByName.isEmpty()) {
+                    throw IllegalArgumentException(
+                        "No recognized CSV files in upload (expected one of: ${CsvImportService.KNOWN_FILENAMES.sorted().joinToString(", ")})"
+                    )
+                }
+
+                CsvImportService.importFromUploads(caseId, filesByName)
                 call.respond(ImportCsvResponse(status = "ok", caseId = caseId))
             }
         }

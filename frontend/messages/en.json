@@ -33,7 +33,12 @@
     "importCsv": "Import CSV",
     "importing": "Importing…",
     "importDisabledTooltip": "CSV already imported — delete this case to re-import",
-    "importTooltip": "Import CSV data",
+    "importTooltip": "Import CSV data from the folder mounted into the backend container",
+    "uploadCsv": "Upload CSV",
+    "uploading": "Uploading…",
+    "uploadDisabledTooltip": "CSV already imported — delete this case to re-import",
+    "uploadTooltip": "Browse a local folder and upload its CSV files to the backend",
+    "uploadNoFiles": "No recognized CSV files found in that folder",
     "columns": {
       "name": "Name",
       "type": "Type",
