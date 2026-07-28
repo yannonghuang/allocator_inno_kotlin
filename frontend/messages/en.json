@@ -303,6 +303,8 @@
       "rootWaterfallTooltip": "When on (default), the root demand uses the same ordinary waterfall every deeper node uses: 100% to the best-ranked method, spillover to the next only if it falls short. When off, the root instead splits its quantity up-front, proportionally, across its top-ranked alternatives (legacy behavior) — Max methods only controls that split shape while this is off.",
       "methodMaxCount": "Max methods",
       "methodMaxCountTooltip": "Waterfall cap: how many ranked alternatives (across method type and BOM variant) may be tried per demand. 1 = single best; N>1 = exhaust the best, resort to the next only if demand isn't met, up to N candidates. Default 2. Only affects the root's own split shape when Root waterfall is off.",
+      "rawMaterialSourcing": "Equal-split raw materials",
+      "rawMaterialSourcingTooltip": "Sourcing strategy for purchasable raw-material alternatives at the same BOM slot (e.g. two substitutable raw materials both filling one component position). Off (default): waterfall — 100% to the best-ranked alternative, spillover to the next only if short. On: divide the slot's quantity equally across all such alternatives up front. Scoped to raw materials only — alternatives that are themselves manufacturable (real sub-assemblies with their own capacity/lead-time limits) are never affected.",
       "checkSoundness": "Check soundness",
       "checkSoundnessTooltip": "Auto-validate every successful plan against the spec.md soundness rules (always deep — includes R8 leaf-to-root chain conservation). Result shown as a badge on the run; click to open the full report.",
       "purchaseAllowed": "Purchase allowed",

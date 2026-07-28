@@ -405,7 +405,7 @@ export type PlanKpis = {
 /** Config for planning. Sent in POST body to /plan. */
 export type PlanningConfig = {
   /**
-   * Method selection shape: `max_methods` + `root_waterfall`.
+   * Method selection shape: `max_methods` + `root_waterfall` + `raw_material_sourcing`.
    * An `elaborate`-scoring mode (`mode`/`depth`/`elaborate`/`score_weights`),
    * `max_bom_depth`, and a legacy `multiple` boolean fallback for `max_methods`
    * used to live here — all confirmed dead/redundant server-side (no live
@@ -430,6 +430,17 @@ export type PlanningConfig = {
      * available alternative regardless of this value. Integer >= 1. Default 2.
      */
     max_methods?: number;
+    /**
+     * Sourcing strategy for PURCHASABLE RAW MATERIAL alternatives at the same BOM slot (e.g. two
+     * substitutable raw materials both filling one component position — neither has its own
+     * method_make, both admitted as a buy). Default `"waterfall"`: 100% to the best-ranked
+     * alternative, spillover to the next only if short. `"equal_split"`: divide the slot's
+     * quantity equally across all such alternatives up front. Deliberately scoped to raw
+     * materials only — alternatives that are themselves manufacturable (real sub-assemblies with
+     * their own capacity/lead-time limits) are never affected by this setting; splitting demand
+     * across those can genuinely change fill rate, unlike a purchasable raw material.
+     */
+    raw_material_sourcing?: 'waterfall' | 'equal_split';
   };
   /** When false, the buy/purchase method is excluded from planning. Default: true. */
   purchase_allowed?: boolean;
