@@ -1971,6 +1971,13 @@ export type SeedForm = {
   demand_order_version_id?: number;
   purchasable_material_version_id?: number;
   constraint_version_id?: number;
+  /** Default true, matching the Planning page's own default. max_methods_min/max only has any
+   *  effect when this is false — same relationship as the Planning page's own form. */
+  root_waterfall?: boolean;
+  raw_material_sourcing?: 'waterfall' | 'equal_split';
+  /** Blank/undefined or "auto": computed from the case's own demands. See PlanningConfig's
+   *  identical field for the full semantics. */
+  horizon_start?: string;
 };
 
 /** Fetch the net-new max_methods sweep for the KB dialog — read-only, does not run anything.

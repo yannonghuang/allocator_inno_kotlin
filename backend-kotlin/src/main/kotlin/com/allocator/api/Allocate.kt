@@ -60,9 +60,9 @@ internal val bootstrapJobs = ConcurrentHashMap<String, MutableMap<String, Any?>>
 /** Parse a KB-seeding form payload (see `CaseBootstrap.SeedForm`'s own doc) from the
  *  `/bootstrap/preview` POST body. Mirrors the exact knobs the Planning page's own manual-run
  *  form exposes (purchase allowed, per-type WO batch scale, analyze criticality, check
- *  soundness) plus the 5 external-config version picks — everything else about a submitted
- *  config (mode/depth/max_bom_depth/weights) is fixed at Planning's own defaults, same as a
- *  manual submission that never touched those. */
+ *  soundness, root waterfall, raw-material sourcing, horizon start) plus the 5 external-config
+ *  version picks — everything else about a submitted config (mode/depth/max_bom_depth/weights)
+ *  is fixed at Planning's own defaults, same as a manual submission that never touched those. */
 private fun parseSeedForm(payload: JsonObject): com.allocator.services.CaseBootstrap.SeedForm {
     fun str(key: String, default: String): String =
         payload[key]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: default
@@ -85,6 +85,9 @@ private fun parseSeedForm(payload: JsonObject): com.allocator.services.CaseBoots
         ordVersionId = versionId("demand_order_version_id"),
         purchMatVersionId = versionId("purchasable_material_version_id"),
         constrVersionId = versionId("constraint_version_id"),
+        rootWaterfall = bool("root_waterfall", true),
+        equalSplitRawMaterials = str("raw_material_sourcing", "waterfall") == "equal_split",
+        horizonStart = payload["horizon_start"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() },
     )
 }
 

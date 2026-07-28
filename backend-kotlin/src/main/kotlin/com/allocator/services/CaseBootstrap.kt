@@ -143,6 +143,13 @@ private fun seedCfg(
     purchaseBatchScale: String,
     analyzeCriticality: Boolean,
     checkSoundness: Boolean,
+    /** Default true — matches the Planning page's own default. NOTE: [maxMethods] only has any
+     *  effect when this is false (same "disabled while root_waterfall is true" relationship the
+     *  Planning page's own form enforces) — a sweep over [maxMethods] with this left true
+     *  produces byte-identical presets. */
+    rootWaterfall: Boolean = true,
+    equalSplitRawMaterials: Boolean = false,
+    horizonStart: String? = null,
 ): JsonObject = buildJsonObject {
     putJsonObject("method_selection") {
         put("mode", "preference")
@@ -151,6 +158,9 @@ private fun seedCfg(
         put("elaborate", false)
         put("max_methods", maxMethods)
         put("max_bom_depth", 3)
+        put("root_waterfall", rootWaterfall)
+        put("raw_material_sourcing", if (equalSplitRawMaterials) "equal_split" else "waterfall")
+        if (horizonStart != null) put("horizon_start", horizonStart)
         putJsonObject("score_weights") {
             put("commit_time", 0.4)
             put("inventory_consumed", 0.35)
@@ -791,6 +801,9 @@ object CaseBootstrap {
         val ordVersionId: Int?,
         val purchMatVersionId: Int?,
         val constrVersionId: Int?,
+        val rootWaterfall: Boolean = true,
+        val equalSplitRawMaterials: Boolean = false,
+        val horizonStart: String? = null,
     )
 
     /** Overlay [form]'s external-config version picks onto [config] — only non-null picks are
@@ -846,6 +859,9 @@ object CaseBootstrap {
                         purchaseBatchScale = form.purchaseBatchScale,
                         analyzeCriticality = form.analyzeCriticality,
                         checkSoundness = form.checkSoundness,
+                        rootWaterfall = form.rootWaterfall,
+                        equalSplitRawMaterials = form.equalSplitRawMaterials,
+                        horizonStart = form.horizonStart,
                     ),
                     form,
                 ),
