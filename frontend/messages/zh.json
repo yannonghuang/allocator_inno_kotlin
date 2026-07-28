@@ -33,7 +33,12 @@
     "importCsv": "导入 CSV",
     "importing": "导入中…",
     "importDisabledTooltip": "CSV 已导入 — 请删除此方案后重新导入",
-    "importTooltip": "导入 CSV 数据",
+    "importTooltip": "从挂载到后端容器的文件夹导入 CSV 数据",
+    "uploadCsv": "上传 CSV",
+    "uploading": "上传中…",
+    "uploadDisabledTooltip": "CSV 已导入 — 请删除此方案后重新导入",
+    "uploadTooltip": "浏览本地文件夹并将其 CSV 文件上传到后端",
+    "uploadNoFiles": "该文件夹中未找到可识别的 CSV 文件",
     "columns": {
       "name": "名称",
       "type": "类型",

@@ -87,6 +87,15 @@ export async function importCsv(caseId: number, folderPath?: string): Promise<{ 
   return r.json();
 }
 
+/** Uploads CSV files browsed from the user's local machine (not mounted into the backend container). */
+export async function uploadCsv(caseId: number, files: File[]): Promise<{ status: string }> {
+  const form = new FormData();
+  for (const file of files) form.append('files', file, file.name);
+  const r = await fetch(`${API}/cases/${caseId}/upload-csv`, { method: 'POST', body: form });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
 /** Allocate starts a background job; request returns quickly with 202 and run_id. */
 const ALLOCATE_TIMEOUT_MS = 3_600_000; //30_000;
 

@@ -7,7 +7,10 @@ import org.jetbrains.exposed.sql.batchInsert
 import org.jetbrains.exposed.sql.deleteWhere
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.slf4j.LoggerFactory
+import java.io.ByteArrayInputStream
 import java.io.FileReader
+import java.io.InputStreamReader
+import java.io.Reader
 import java.nio.file.Path
 
 private val log = LoggerFactory.getLogger("com.allocator.CsvImportService")
@@ -18,43 +21,61 @@ private val log = LoggerFactory.getLogger("com.allocator.CsvImportService")
  */
 object CsvImportService {
 
+    private val TABLES = listOf(
+        "bom.csv" to ::importBom,
+        "customer.csv" to ::importCustomer,
+        "location.csv" to ::importLocation,
+        "product.csv" to ::importProduct,
+        "vendor.csv" to ::importVendor,
+        "demand.csv" to ::importDemand,
+        "method_buy.csv" to ::importMethodBuy,
+        "method_make.csv" to ::importMethodMake,
+        "productlocation.csv" to ::importProductLocation,
+        "operation.csv" to ::importOperation,
+        "bor.csv" to ::importBor,
+        "resource.csv" to ::importResource,
+        "supply.csv" to ::importSupply,
+        "method_move.csv" to ::importMethodMove,
+    )
+
+    /** Filenames recognized by [importFromFolder] / [importFromUploads]. */
+    val KNOWN_FILENAMES: Set<String> = TABLES.map { it.first }.toSet()
+
     fun importFromFolder(caseId: Int, folder: Path) {
-        val tables = listOf(
-            "bom.csv" to ::importBom,
-            "customer.csv" to ::importCustomer,
-            "location.csv" to ::importLocation,
-            "product.csv" to ::importProduct,
-            "vendor.csv" to ::importVendor,
-            "demand.csv" to ::importDemand,
-            "method_buy.csv" to ::importMethodBuy,
-            "method_make.csv" to ::importMethodMake,
-            "productlocation.csv" to ::importProductLocation,
-            "operation.csv" to ::importOperation,
-            "bor.csv" to ::importBor,
-            "resource.csv" to ::importResource,
-            "supply.csv" to ::importSupply,
-            "method_move.csv" to ::importMethodMove,
-        )
+        importFrom(caseId) { filename ->
+            val file = folder.resolve(filename).toFile()
+            if (file.exists()) FileReader(file) else null
+        }
+    }
+
+    /** Same import, but sourced from in-memory uploads (e.g. a browser multipart upload) keyed by filename. */
+    fun importFromUploads(caseId: Int, filesByName: Map<String, ByteArray>) {
+        importFrom(caseId) { filename ->
+            filesByName[filename]?.let { InputStreamReader(ByteArrayInputStream(it), Charsets.UTF_8) }
+        }
+    }
+
+    private fun importFrom(caseId: Int, openReader: (String) -> Reader?) {
         transaction {
-            for ((filename, importer) in tables) {
-                val file = folder.resolve(filename).toFile()
-                if (!file.exists()) {
-                    log.warn("CSV not found, skipping: $file")
+            for ((filename, importer) in TABLES) {
+                val reader = openReader(filename)
+                if (reader == null) {
+                    log.warn("CSV not found, skipping: $filename")
                     continue
                 }
                 log.info("Importing $filename for case $caseId...")
-                val rows = readCsv(file.absolutePath)
+                val rows = readCsv(reader)
                 importer(caseId, rows)
             }
         }
         log.info("CSV import complete for case $caseId.")
     }
 
-    private fun readCsv(path: String): List<Map<String, String>> {
+    private fun readCsv(reader: Reader): List<Map<String, String>> {
         val results = mutableListOf<Map<String, String>>()
-        CSVReaderHeaderAware(FileReader(path)).use { reader ->
+        CSVReaderHeaderAware(reader).use { r ->
             var row: Map<String, String>?
-            while (reader.readMap().also { row = it } != null) {
+            while (r.readMap().also { row = it } != null) {
                 results.add(row!!)
             }
         }

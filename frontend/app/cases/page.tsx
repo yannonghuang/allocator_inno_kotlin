@@ -1,9 +1,12 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useTranslations } from 'next-intl';
-import { listCases, createCase, deleteCase, importCsv, type Case as CaseType } from '@/lib/api';
+import { listCases, createCase, deleteCase, importCsv, uploadCsv, type Case as CaseType } from '@/lib/api';
+
+// webkitdirectory/directory (folder picker) aren't in the standard React input typings.
+type DirAttrs = { webkitdirectory?: string; directory?: string };
 
 export default function CasesPage() {
   const t = useTranslations('home');
@@ -14,6 +17,9 @@ export default function CasesPage() {
   const [newName, setNewName] = useState('');
   const [creating, setCreating] = useState(false);
   const [importingId, setImportingId] = useState<number | null>(null);
+  const [uploadingId, setUploadingId] = useState<number | null>(null);
+  const uploadTargetRef = useRef<number | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const load = async () => {
     setLoading(true);
@@ -69,9 +75,42 @@ export default function CasesPage() {
     }
   };
 
+  const handleUploadClick = (id: number) => {
+    uploadTargetRef.current = id;
+    fileInputRef.current?.click();
+  };
+
+  const handleFilesSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const id = uploadTargetRef.current;
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = ''; // allow re-selecting the same folder later
+    if (id == null || files.length === 0) return;
+
+    setUploadingId(id);
+    setError(null);
+    try {
+      const result = await uploadCsv(id, files);
+      if (result.status !== 'ok') throw new Error(t('uploadNoFiles'));
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Upload failed');
+    } finally {
+      setUploadingId(null);
+    }
+  };
+
   return (
     <div>
       <h1>{t('title')}</h1>
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        accept=".csv"
+        style={{ display: 'none' }}
+        onChange={handleFilesSelected}
+        {...({ webkitdirectory: '', directory: '' } as DirAttrs)}
+      />
       {error && <p style={{ color: '#f87171' }}>{error}</p>}
       <div style={{ marginBottom: '1rem', display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
         <input
@@ -123,6 +162,15 @@ export default function CasesPage() {
                       title={hasData ? t('importDisabledTooltip') : t('importTooltip')}
                     >
                       {importingId === c.id ? t('importing') : t('importCsv')}
+                    </button>
+                    {' '}
+                    <button
+                      className="secondary"
+                      onClick={() => handleUploadClick(c.id)}
+                      disabled={uploadingId === c.id || hasData}
+                      title={hasData ? t('uploadDisabledTooltip') : t('uploadTooltip')}
+                    >
+                      {uploadingId === c.id ? t('uploading') : t('uploadCsv')}
                     </button>
                     {' '}
                     <button className="danger" onClick={() => handleDelete(c.id)}>{tc('delete')}</button>
