@@ -1728,20 +1728,22 @@ internal val TOOLS: List<LlmTool> = listOf(
     ),
     tool(
         "find_wos",
-        "THE general lookup for actual, planner-generated work orders (make, move, AND purchase/buy) " +
+        "THE general lookup for actual, planner-generated work orders (make, move, AND purchase) " +
             "— use this for questions like 'what purchase requests/orders exist for product X', 'list " +
             "buy work orders at location Y', 'what move orders are scheduled next month', etc. Pass " +
-            "method=\"buy\" for purchase requests specifically. Also the entry point before calling " +
-            "analyze_wo_availability / analyze_wo_schedule_impact for a maintenance/downtime scenario. " +
-            "One row per wo_group_id (product_id, location_id, method, start_time, end_time, quantity). " +
-            "Filters AND together; omit any to match all. Returns up to `limit` rows (default 50, max 500).",
+            "method=\"purchase\" for purchase requests specifically (\"buy\" is also accepted as an " +
+            "alias — CSV/table name is method_buy, but WOs are stamped method=\"purchase\" at runtime). " +
+            "Also the entry point before calling analyze_wo_availability / analyze_wo_schedule_impact " +
+            "for a maintenance/downtime scenario. One row per wo_group_id (product_id, location_id, " +
+            "method, start_time, end_time, quantity). Filters AND together; omit any to match all. " +
+            "Returns up to `limit` rows (default 50, max 500).",
         buildJsonObject {
             put("type", "object")
             putJsonObject("properties") {
                 putJsonObject("prod_area")  { put("type", "string"); put("description", "Exact prod_area match.") }
                 putJsonObject("location_id"){ put("type", "string"); put("description", "Exact location_id match.") }
                 putJsonObject("product_id") { put("type", "string"); put("description", "Exact product_id match.") }
-                putJsonObject("method")     { put("type", "string"); put("description", "make / move / buy.") }
+                putJsonObject("method")     { put("type", "string"); put("description", "make / move / purchase (\"buy\" also accepted as an alias for purchase).") }
                 putJsonObject("start_after") {
                     put("type", "string")
                     put("description", "ISO yyyy-MM-dd. Include WOs whose start_time ≥ this date.")
@@ -5706,7 +5708,11 @@ internal fun toolFindWos(caseId: Int, args: JsonObject, locale: String): ToolRes
     val prodArea = args["prod_area"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
     val locationId = args["location_id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
     val productId = args["product_id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+    // WOs are stamped with method type "make"/"move"/"purchase" at runtime — never "buy" (that's
+    // only the CSV/table name, method_buy.csv/MethodBuys). Normalize so an LLM call using the
+    // CSV-derived term still matches real data instead of silently returning zero rows.
     val method = args["method"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+        ?.let { if (it.equals("buy", ignoreCase = true)) "purchase" else it }
     val startAfter = args["start_after"]?.jsonPrimitive?.contentOrNull?.let {
         runCatching { java.time.LocalDate.parse(it) }.getOrNull()
     }
