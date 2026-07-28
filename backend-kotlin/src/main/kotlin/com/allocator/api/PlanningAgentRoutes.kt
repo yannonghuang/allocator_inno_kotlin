@@ -9,6 +9,7 @@ import com.allocator.MethodBuys
 import com.allocator.MethodMakes
 import com.allocator.MethodMoves
 import com.allocator.PlanRuns
+import com.allocator.ProductLocations
 import com.allocator.Products
 import com.allocator.Supplies
 import com.allocator.WoScheduleEvents
@@ -58,6 +59,7 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.and
+import org.jetbrains.exposed.sql.or
 import org.jetbrains.exposed.sql.deleteWhere
 import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.kotlin.datetime.CurrentTimestamp
@@ -1287,16 +1289,25 @@ internal val TOOLS: List<LlmTool> = listOf(
     ),
     tool(
         "get_product_supply",
-        "Read the case's supply table for one product: every initial-inventory row " +
-            "(supply_id, location, qty, supply_date). Pair with get_product_methods to " +
-            "diagnose 'why did this demand fail?' — the typical answer is either zero " +
-            "supply at the needed (product, location) AND no make/move/buy method to " +
-            "produce it there. Returns [{supply_id, location, qty, supply_date}], sorted " +
-            "by location then supply_date.",
+        "Read the case's supply table for one product: every initial-inventory row across ALL its " +
+            "locations, with CONSUMPTION STATUS — use this to answer 'what's the consumption status " +
+            "on product X's existing stock?' in a single call (no run_id/location_id dance needed " +
+            "per location). Each row also carries `consumed_qty`/`residual_qty` (from the most recent " +
+            "successful run, or `run_id` if given) once a successful plan run exists for the case; " +
+            "response also carries `total_consumed`/`total_residual`. Rows omit those two fields (qty " +
+            "only) when no successful run exists yet. Pair with get_product_methods to diagnose 'why " +
+            "did this demand fail?' — the typical answer is either zero supply at the needed " +
+            "(product, location) AND no make/move/buy method to produce it there. Returns " +
+            "[{supply_id, location, qty, supply_date, consumed_qty?, residual_qty?}], sorted by " +
+            "location then supply_date.",
         buildJsonObject {
             put("type", "object")
             putJsonObject("properties") {
                 putJsonObject("product_id") { put("type", "string") }
+                putJsonObject("run_id") {
+                    put("type", "integer")
+                    put("description", "Which run's consumption to report. Defaults to the case's latest success run.")
+                }
             }
             put("required", buildJsonArray { add("product_id") })
         },
@@ -1327,7 +1338,7 @@ internal val TOOLS: List<LlmTool> = listOf(
             "    change period_days, change demand.priority).\n" +
             "Returns { product_id, location_id, total_initial_supply, competitor_count, " +
             "competitors: [...], member_count, zero_share_count, members: [...], " +
-            "consolidation: { enabled, allocation_mode, period_days }, override_levers }.\n" +
+            "consolidation: { allocation_mode, period_days }, override_levers }.\n" +
             "**Empty-leaf branch:** when (pid, lid) has no supply rows (e.g. the product is " +
             "made or bought rather than inventoried), the response collapses to " +
             "{ ..., note, supply_locations_for_product: [...], usages: [{ demand_id, " +
@@ -1717,10 +1728,13 @@ internal val TOOLS: List<LlmTool> = listOf(
     ),
     tool(
         "find_wos",
-        "List work orders matching the given filters, aggregated one row per wo_group_id. Use to " +
-            "identify candidates for a maintenance/downtime scenario before calling " +
-            "analyze_wo_availability / analyze_wo_schedule_impact. Filters AND together; omit any to " +
-            "match all. Returns up to `limit` rows (default 50, max 500).",
+        "THE general lookup for actual, planner-generated work orders (make, move, AND purchase/buy) " +
+            "— use this for questions like 'what purchase requests/orders exist for product X', 'list " +
+            "buy work orders at location Y', 'what move orders are scheduled next month', etc. Pass " +
+            "method=\"buy\" for purchase requests specifically. Also the entry point before calling " +
+            "analyze_wo_availability / analyze_wo_schedule_impact for a maintenance/downtime scenario. " +
+            "One row per wo_group_id (product_id, location_id, method, start_time, end_time, quantity). " +
+            "Filters AND together; omit any to match all. Returns up to `limit` rows (default 50, max 500).",
         buildJsonObject {
             put("type", "object")
             putJsonObject("properties") {
@@ -3273,16 +3287,37 @@ private fun toolGetProductSupply(caseId: Int, args: JsonObject, locale: String):
     val productId = args["product_id"]?.jsonPrimitive?.contentOrNull?.trim()
         ?: return toolError("`product_id` is required", locale)
     if (productId.isBlank()) return toolError("`product_id` cannot be blank", locale)
+    val runId = args["run_id"]?.jsonPrimitive?.intOrNull
+
+    // Consumption status (optional): aggregate qty_consumed per supply_id from the run's
+    // supply_allocations — the SAME field extractSupplyAllocations populates for every plan run
+    // (no separate pegging load needed). Silently omitted (rows carry qty only) when no
+    // successful run exists yet for this case — a fresh case has real supply but nothing to
+    // report consumption against.
+    val consumedBySupplyId: Map<String, Double> = run {
+        val result = loadPlanResultFromDb(caseId, runId) ?: return@run emptyMap()
+        @Suppress("UNCHECKED_CAST")
+        val allocations = (result["supply_allocations"] as? List<Map<String, Any?>>) ?: emptyList()
+        allocations
+            .groupBy { it["supply_id"] as? String ?: "" }
+            .mapValues { (_, entries) -> entries.sumOf { (it["qty_consumed"] as? Number)?.toDouble() ?: 0.0 } }
+    }
 
     val rows = transaction {
         Supplies.selectAll()
             .where { (Supplies.caseId eq caseId) and (Supplies.productId eq productId) }
             .map { row ->
+                val qty = row[Supplies.qty]
+                val consumed = consumedBySupplyId[row[Supplies.supplyId]]
                 buildJsonObject {
                     put("supply_id", JsonPrimitive(row[Supplies.supplyId]))
                     put("location", JsonPrimitive(row[Supplies.locationId]))
-                    put("qty", JsonPrimitive(row[Supplies.qty]))
+                    put("qty", JsonPrimitive(qty))
                     put("supply_date", JsonPrimitive(row[Supplies.supplyDate]))
+                    if (consumedBySupplyId.isNotEmpty()) {
+                        put("consumed_qty", JsonPrimitive(consumed ?: 0.0))
+                        put("residual_qty", JsonPrimitive(qty - (consumed ?: 0.0)))
+                    }
                 }
             }
             .sortedWith(compareBy(
@@ -3291,19 +3326,50 @@ private fun toolGetProductSupply(caseId: Int, args: JsonObject, locale: String):
             ))
     }
     val totalQty = rows.sumOf { (it["qty"] as? JsonPrimitive)?.contentOrNull?.toDoubleOrNull() ?: 0.0 }
+    val totalConsumed = rows.sumOf { (it["consumed_qty"] as? JsonPrimitive)?.contentOrNull?.toDoubleOrNull() ?: 0.0 }
     val payload = buildJsonObject {
         put("product_id", JsonPrimitive(productId))
         put("total_qty", JsonPrimitive(totalQty))
+        if (consumedBySupplyId.isNotEmpty()) {
+            put("total_consumed", JsonPrimitive(totalConsumed))
+            put("total_residual", JsonPrimitive(totalQty - totalConsumed))
+        }
         put("rows", JsonArray(rows))
     }
-    return ToolResult(
-        summary = loc(
+    val summary = if (consumedBySupplyId.isNotEmpty()) {
+        loc(
+            "Supply for $productId — ${rows.size} rows, total qty $totalQty, consumed $totalConsumed",
+            "$productId 的供应 — ${rows.size} 行，总量 $totalQty，已消耗 $totalConsumed",
+            locale,
+        )
+    } else {
+        loc(
             "Supply for $productId — ${rows.size} rows, total qty ${totalQty}",
             "$productId 的供应 — ${rows.size} 行，总量 ${totalQty}",
             locale,
-        ),
-        payload = payload,
-    )
+        )
+    }
+    return ToolResult(summary = summary, payload = payload)
+}
+
+/** Whether [productId] is referenced ANYWHERE in this case's data — not just the `Products`
+ *  master-data CSV (PRODUCT.csv), which can be incomplete relative to the transactional CSVs.
+ *  A product with real Supplies/BOM/method rows but missing from PRODUCT.csv is a real, in-case
+ *  product; treating it as "not found" produces a confidently wrong error. Confirmed live:
+ *  285-0612/285-0647 have real Supplies + method_buy rows but aren't in Products, so
+ *  [toolGetLeafCompetition]/[toolGetComponentAllocationByDemand]'s hyphen-split defensive check
+ *  rejected them as unknown even though [toolGetProductSupply] — which queries Supplies
+ *  directly, no Products gate — succeeded for the exact same ids. Used by both tools' checks so
+ *  a fix here covers both. */
+private fun productReferencedInCase(caseId: Int, productId: String): Boolean = transaction {
+    Products.selectAll().where { (Products.caseId eq caseId) and (Products.productId eq productId) }.limit(1).count() > 0L ||
+        Supplies.selectAll().where { (Supplies.caseId eq caseId) and (Supplies.productId eq productId) }.limit(1).count() > 0L ||
+        Demands.selectAll().where { (Demands.caseId eq caseId) and (Demands.productId eq productId) }.limit(1).count() > 0L ||
+        MethodBuys.selectAll().where { (MethodBuys.caseId eq caseId) and (MethodBuys.productId eq productId) }.limit(1).count() > 0L ||
+        MethodMakes.selectAll().where { (MethodMakes.caseId eq caseId) and (MethodMakes.productId eq productId) }.limit(1).count() > 0L ||
+        MethodMoves.selectAll().where { (MethodMoves.caseId eq caseId) and (MethodMoves.productId eq productId) }.limit(1).count() > 0L ||
+        Boms.selectAll().where { (Boms.caseId eq caseId) and ((Boms.parentId eq productId) or (Boms.childId eq productId)) }.limit(1).count() > 0L ||
+        ProductLocations.selectAll().where { (ProductLocations.caseId eq caseId) and (ProductLocations.productId eq productId) }.limit(1).count() > 0L
 }
 
 private fun toolGetLeafCompetition(caseId: Int, args: JsonObject, locale: String): ToolResult {
@@ -3326,18 +3392,10 @@ private fun toolGetLeafCompetition(caseId: Int, args: JsonObject, locale: String
     // IS a real product, return an early error pointing at the corrected identifier
     // so the agent retries with the right args instead of producing a confidently
     // wrong "no usage" answer.
-    val productExists = transaction {
-        Products.selectAll()
-            .where { (Products.caseId eq caseId) and (Products.productId eq productId) }
-            .limit(1).count() > 0L
-    }
+    val productExists = productReferencedInCase(caseId, productId)
     if (!productExists) {
         val joined = "$productId-$locationId"
-        val joinedExists = transaction {
-            Products.selectAll()
-                .where { (Products.caseId eq caseId) and (Products.productId eq joined) }
-                .limit(1).count() > 0L
-        }
+        val joinedExists = productReferencedInCase(caseId, joined)
         if (joinedExists) {
             return toolError(
                 "product_id `$productId` not found in case $caseId, but `$joined` IS a known product. " +
@@ -3889,18 +3947,10 @@ private fun toolGetComponentAllocationByDemand(caseId: Int, args: JsonObject, lo
 
     // Defensive: catch the hyphen-split LLM error (e.g. product=`502-2991` mis-passed
     // as product=`502`, location=`2991`). Mirrors [toolGetLeafCompetition].
-    val productExists = transaction {
-        Products.selectAll()
-            .where { (Products.caseId eq caseId) and (Products.productId eq productId) }
-            .limit(1).count() > 0L
-    }
+    val productExists = productReferencedInCase(caseId, productId)
     if (!productExists) {
         val joined = "$productId-$locationId"
-        val joinedExists = transaction {
-            Products.selectAll()
-                .where { (Products.caseId eq caseId) and (Products.productId eq joined) }
-                .limit(1).count() > 0L
-        }
+        val joinedExists = productReferencedInCase(caseId, joined)
         if (joinedExists) {
             return toolError(
                 "product_id `$productId` not found in case $caseId, but `$joined` IS a known product. " +
