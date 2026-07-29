@@ -40,17 +40,20 @@ data class CaseConstraintRow(
 
 /** Loads the constraint rules for [versionId]. Empty list means "no constraints" — the same
  *  convention the old embedded `constraints: []` array always used. */
-internal fun loadCaseConstraintRows(versionId: Int): List<CaseConstraintRow> = transaction {
-    CaseConstraints.selectAll()
-        .where { CaseConstraints.versionId eq versionId }
-        .map {
-            CaseConstraintRow(
-                customerId = it[CaseConstraints.customerId],
-                parent = it[CaseConstraints.parent],
-                location = it[CaseConstraints.location],
-                child = it[CaseConstraints.child],
-            )
-        }
+internal fun loadCaseConstraintRows(versionId: Int?): List<CaseConstraintRow> {
+    if (versionId == null) return emptyList()
+    return transaction {
+        CaseConstraints.selectAll()
+            .where { CaseConstraints.versionId eq versionId }
+            .map {
+                CaseConstraintRow(
+                    customerId = it[CaseConstraints.customerId],
+                    parent = it[CaseConstraints.parent],
+                    location = it[CaseConstraints.location],
+                    child = it[CaseConstraints.child],
+                )
+            }
+    }
 }
 
 /** Recompute and persist the content-hash fingerprint for [versionId]'s current constraint set —
@@ -71,8 +74,12 @@ private fun recomputeConstraintHash(caseId: Int, versionId: Int, rows: List<Case
     }
 }
 
-private fun versionJson(caseId: Int, versionId: Int): JsonObject {
-    val summary = CaseConfigVersioning.listVersions(caseId, KIND).firstOrNull { it.id == versionId }
+/** [versionId] null means this case has never had a Constraints version at all — a legitimate
+ *  "nothing yet" state (see CaseConfigVersioning's own doc), not an error. Reports as a freely
+ *  editable, unreferenced, non-default placeholder; the frontend shows "no version yet" rather
+ *  than a phantom "Version N". */
+private fun versionJson(caseId: Int, versionId: Int?): JsonObject {
+    val summary = versionId?.let { vid -> CaseConfigVersioning.listVersions(caseId, KIND).firstOrNull { it.id == vid } }
     return buildJsonObject {
         put("id", versionId)
         put("name", summary?.name)
@@ -95,8 +102,13 @@ fun Routing.constraintsRoutes() {
         return caseId
     }
 
-    fun resolvedVersionId(call: ApplicationCall, caseId: Int): Int =
+    // Read paths (GET/DELETE-clear/export): never creates. PUT/import (real writes) use
+    // resolvedOrCreatedVersionId instead — the one legitimate create-on-demand moment.
+    fun resolvedVersionId(call: ApplicationCall, caseId: Int): Int? =
         CaseConfigVersioning.resolveVersionId(caseId, KIND, call.request.queryParameters["version_id"]?.toIntOrNull())
+
+    fun resolvedOrCreatedVersionId(call: ApplicationCall, caseId: Int): Int =
+        CaseConfigVersioning.resolveOrCreateVersionId(caseId, KIND, call.request.queryParameters["version_id"]?.toIntOrNull())
 
     fun rowJson(row: CaseConstraintRow): JsonObject = buildJsonObject {
         put("customer_id", row.customerId)
@@ -131,7 +143,7 @@ fun Routing.constraintsRoutes() {
     // rule set (matches PurchasableMaterials' "checklist submits its full state" semantics).
     put("/cases/{case_id}/constraints") {
         val caseId = requireCaseId(call)
-        val versionId = resolvedVersionId(call, caseId)
+        val versionId = resolvedOrCreatedVersionId(call, caseId)
         if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@put
@@ -163,6 +175,10 @@ fun Routing.constraintsRoutes() {
     delete("/cases/{case_id}/constraints") {
         val caseId = requireCaseId(call)
         val versionId = resolvedVersionId(call, caseId)
+        if (versionId == null) {
+            call.respond(buildJsonObject { put("deleted", 0) })
+            return@delete
+        }
         if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@delete
@@ -179,7 +195,7 @@ fun Routing.constraintsRoutes() {
     // Body: CSV text, header: customer_id,parent,location,child
     post("/cases/{case_id}/constraints/import") {
         val caseId = requireCaseId(call)
-        val versionId = resolvedVersionId(call, caseId)
+        val versionId = resolvedOrCreatedVersionId(call, caseId)
         if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@post

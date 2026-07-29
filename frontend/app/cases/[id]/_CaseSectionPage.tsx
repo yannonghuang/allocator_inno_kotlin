@@ -104,6 +104,7 @@ import {
   getResourceUtilization,
   type ResourceUtilization,
   type DominatorRef,
+  getHorizonStartDefault,
 } from '@/lib/api';
 import { computeHorizon, ScheduleBar, ScheduleHorizonRuler, methodColor, BorMiniTimeline, BorTimelineRuler } from './_workOrderSchedule';
 import { WoScheduleImpactPanel, WoScheduleQuickModal } from './_woScheduleImpact';
@@ -1127,6 +1128,12 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [externalConfigVersions, setExternalConfigVersions] = useState<{
     casealloc: ConfigVersion[]; pref: ConfigVersion[]; ord: ConfigVersion[]; purchmat: ConfigVersion[]; constr: ConfigVersion[];
   }>({ casealloc: [], pref: [], ord: [], purchmat: [], constr: [] });
+  // What "auto" would resolve to right now — fetched from the server (computePlanningHorizonStart,
+  // PlanningEngine.kt), NOT recomputed client-side (demand due dates arrive in inconsistent
+  // formats only the backend's resilient parser handles). Shown as the Horizon start input's
+  // value whenever no explicit override is set; submission itself still sends nothing for "auto"
+  // (server resolves the authoritative value fresh again at plan-submit time).
+  const [defaultHorizonStart, setDefaultHorizonStart] = useState<string | null>(null);
   // Read-only preview popup for the currently-selected version of one external config object —
   // opened via the "Preview" link next to each picker's dropdown. Rendered as a movable/resizable
   // floating window (not anchored to an edge like the other slide-in panels) so it can sit
@@ -1137,7 +1144,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const previewResizeRef = useRef<{ startX: number; startY: number; origW: number; origH: number } | null>(null);
   const [previewDragging, setPreviewDragging] = useState(false);
   const [previewResizing, setPreviewResizing] = useState(false);
-  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' }, purchase_allowed: false, analyze_criticality: false, check_soundness: true });
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({ consolidation: { period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' }, purchase_allowed: true, analyze_criticality: false, check_soundness: true, method_selection: { raw_material_sourcing: 'equal_split' } });
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<PlanStatusResponse['progress'] | null>(null);
   const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1197,7 +1204,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [bootstrapMaxMethodsMin, setBootstrapMaxMethodsMin] = useState(1);
   const [bootstrapMaxMethodsMax, setBootstrapMaxMethodsMax] = useState(5);
   const [bootstrapRootWaterfall, setBootstrapRootWaterfall] = useState(true);
-  const [bootstrapEqualSplitRawMaterials, setBootstrapEqualSplitRawMaterials] = useState(false);
+  const [bootstrapEqualSplitRawMaterials, setBootstrapEqualSplitRawMaterials] = useState(true);
   const [bootstrapHorizonStart, setBootstrapHorizonStart] = useState('');
   const [bootstrapPurchaseAllowed, setBootstrapPurchaseAllowed] = useState(true);
   const [bootstrapMakeBatchScale, setBootstrapMakeBatchScale] = useState<'none' | 'weekly' | 'biweekly' | 'monthly' | 'all'>('weekly');
@@ -1208,6 +1215,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [bootstrapVersionPicks, setBootstrapVersionPicks] = useState<{
     case_alloc_version_id?: number; pref_version_id?: number; demand_order_version_id?: number;
     purchasable_material_version_id?: number; constraint_version_id?: number;
+    detached_external_configs?: string[];
   }>({});
   const buildSeedForm = (): SeedForm => ({
     max_methods_min: bootstrapMaxMethodsMin,
@@ -1743,6 +1751,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     ]).then(([casealloc, pref, ord, purchmat, constr]) => {
       if (!cancelled) setExternalConfigVersions({ casealloc, pref, ord, purchmat, constr });
     });
+    return () => { cancelled = true; };
+  }, [id]);
+
+  // Fetch what "Horizon start: auto" currently resolves to, so the input can show the actual
+  // date instead of sitting blank — see defaultHorizonStart's own doc above. Server-computed
+  // (not derived client-side from raw demand rows) since demand due dates arrive in inconsistent
+  // formats that only the backend's own resilient parser reliably handles.
+  useEffect(() => {
+    if (!id) { setDefaultHorizonStart(null); return; }
+    let cancelled = false;
+    getHorizonStartDefault(id)
+      .then((v) => { if (!cancelled) setDefaultHorizonStart(v); })
+      .catch(() => { if (!cancelled) setDefaultHorizonStart(null); });
     return () => { cancelled = true; };
   }, [id]);
 
@@ -4514,7 +4535,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   type="date"
                   value={(() => {
                     const v = planningConfig.method_selection?.horizon_start;
-                    return (v && v.toLowerCase() !== 'auto') ? v : '';
+                    return (v && v.toLowerCase() !== 'auto') ? v : (defaultHorizonStart ?? '');
                   })()}
                   onChange={(e) => setPlanningConfig((c) => ({
                     ...c,
@@ -4582,6 +4603,31 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             <summary style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em', cursor: 'pointer' }}>
               {tP('config.groupExternalVersions')}
             </summary>
+            {(() => {
+              const allKinds = ['casealloc', 'pref', 'ord', 'purchmat', 'constr'] as const;
+              const detachedSet = new Set(planningConfig.detached_external_configs ?? []);
+              const allDetached = allKinds.every((k) => detachedSet.has(k));
+              return (
+                // Mirrors each row's own flex layout (label / select / preview / detach columns,
+                // same widths + gap) with invisible spacers so "detach all" lines up exactly
+                // above the per-row Detach buttons below, instead of merely being right-aligned.
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.3rem' }}>
+                  <span style={{ minWidth: 170 }} />
+                  <span style={{ width: 200 }} />
+                  <span style={{ width: 52 }} />
+                  <button
+                    type="button"
+                    onClick={() => setPlanningConfig((c) => ({
+                      ...c,
+                      detached_external_configs: allDetached ? [] : [...allKinds],
+                    }))}
+                    style={{ background: 'none', border: '1px solid #3f3f46', borderRadius: 4, color: allDetached ? '#fbbf24' : '#a1a1aa', cursor: 'pointer', fontSize: '0.72rem', padding: '2px 8px' }}
+                  >
+                    {tP(allDetached ? 'config.externalReattachAll' : 'config.externalDetachAll')}
+                  </button>
+                </div>
+              );
+            })()}
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', marginTop: '0.4rem' }}>
               {([
                 { kind: 'casealloc', externalKind: 'allocation', label: tP('config.externalAllocation'), configKey: 'case_alloc_version_id' },
@@ -4591,18 +4637,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 { kind: 'constr', externalKind: 'constraints', label: tP('config.externalConstraints'), configKey: 'constraint_version_id' },
               ] as const).map(({ kind, externalKind, label, configKey }) => {
                 const versions = externalConfigVersions[kind];
+                const detached = (planningConfig.detached_external_configs ?? []).includes(kind);
                 const selectedId: number | undefined = planningConfig[configKey] ?? versions.find((v) => v.is_default)?.id;
                 return (
                   <div key={kind} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.82rem' }}>
                     <span style={{ color: '#a1a1aa', minWidth: 170 }}>{label}</span>
                     <select
                       value={selectedId ?? ''}
-                      disabled={versions.length === 0}
+                      disabled={versions.length === 0 || detached}
                       onChange={(e) => {
                         const v = e.target.value ? Number(e.target.value) : undefined;
                         setPlanningConfig((c) => ({ ...c, [configKey]: v }));
                       }}
-                      style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem' }}
+                      style={{ width: 200, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem', opacity: detached ? 0.4 : 1 }}
                     >
                       {versions.length === 0 && <option value="">{tP('config.externalDefault')}</option>}
                       {versions.map((v) => (
@@ -4613,12 +4660,24 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     </select>
                     <button
                       type="button"
-                      disabled={selectedId == null}
+                      disabled={selectedId == null || detached}
                       onClick={() => setExternalConfigPreview({ kind: externalKind, versionId: selectedId })}
                       title={tP('config.externalPreviewTooltip')}
-                      style={{ background: 'none', border: 'none', color: '#93c5fd', cursor: selectedId == null ? 'default' : 'pointer', fontSize: '0.76rem', padding: 0, opacity: selectedId == null ? 0.4 : 1 }}
+                      style={{ width: 52, textAlign: 'left', background: 'none', border: 'none', color: '#93c5fd', cursor: (selectedId == null || detached) ? 'default' : 'pointer', fontSize: '0.76rem', padding: 0, opacity: (selectedId == null || detached) ? 0.4 : 1 }}
                     >
                       {tP('config.externalPreview')}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPlanningConfig((c) => {
+                        const cur = new Set(c.detached_external_configs ?? []);
+                        if (detached) cur.delete(kind); else cur.add(kind);
+                        return { ...c, detached_external_configs: Array.from(cur) };
+                      })}
+                      title={tP(detached ? 'config.externalReattachTooltip' : 'config.externalDetachTooltip')}
+                      style={{ background: 'none', border: 'none', color: detached ? '#fbbf24' : '#71717a', cursor: 'pointer', fontSize: '0.76rem', padding: 0 }}
+                    >
+                      {tP(detached ? 'config.externalReattach' : 'config.externalDetach')}
                     </button>
                   </div>
                 );
@@ -4731,8 +4790,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             onClick={() => setPlanningConfig({
               method_selection: {
                 max_methods: 1,
+                raw_material_sourcing: 'equal_split',
               },
-              purchase_allowed: false,
+              purchase_allowed: true,
               consolidation: { period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' },
             })}
             title={tP('config.resetDefaultsTitle')}
@@ -7544,7 +7604,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <span style={{ color: '#a1a1aa' }}>{tP('config.horizonStart')}</span>
                       <input
                         type="date"
-                        value={bootstrapHorizonStart}
+                        value={bootstrapHorizonStart || (defaultHorizonStart ?? '')}
                         onChange={(e) => setBootstrapHorizonStart(e.target.value)}
                         placeholder={tP('config.horizonStartAuto')}
                         style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
@@ -7585,6 +7645,31 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   <summary style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em', cursor: 'pointer' }}>
                     {tP('config.groupExternalVersions')}
                   </summary>
+                  {(() => {
+                    const allKinds = ['casealloc', 'pref', 'ord', 'purchmat', 'constr'] as const;
+                    const detachedSet = new Set(bootstrapVersionPicks.detached_external_configs ?? []);
+                    const allDetached = allKinds.every((k) => detachedSet.has(k));
+                    return (
+                      // Mirrors each row's own flex layout (label / select / preview / detach
+                      // columns, same widths + gap) with invisible spacers so "detach all" lines
+                      // up exactly above the per-row Detach buttons below.
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.3rem' }}>
+                        <span style={{ minWidth: 170 }} />
+                        <span style={{ width: 200 }} />
+                        <span style={{ width: 52 }} />
+                        <button
+                          type="button"
+                          onClick={() => setBootstrapVersionPicks((c) => ({
+                            ...c,
+                            detached_external_configs: allDetached ? [] : [...allKinds],
+                          }))}
+                          style={{ background: 'none', border: '1px solid #3f3f46', borderRadius: 4, color: allDetached ? '#fbbf24' : '#a1a1aa', cursor: 'pointer', fontSize: '0.72rem', padding: '2px 8px' }}
+                        >
+                          {tP(allDetached ? 'config.externalReattachAll' : 'config.externalDetachAll')}
+                        </button>
+                      </div>
+                    );
+                  })()}
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', marginTop: '0.4rem' }}>
                     {([
                       { kind: 'casealloc', externalKind: 'allocation', label: tP('config.externalAllocation'), configKey: 'case_alloc_version_id' },
@@ -7594,18 +7679,19 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       { kind: 'constr', externalKind: 'constraints', label: tP('config.externalConstraints'), configKey: 'constraint_version_id' },
                     ] as const).map(({ kind, externalKind, label, configKey }) => {
                       const versions = externalConfigVersions[kind];
+                      const detached = (bootstrapVersionPicks.detached_external_configs ?? []).includes(kind);
                       const selectedId: number | undefined = bootstrapVersionPicks[configKey] ?? versions.find((v) => v.is_default)?.id;
                       return (
                         <div key={kind} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.82rem' }}>
                           <span style={{ color: '#a1a1aa', minWidth: 170 }}>{label}</span>
                           <select
                             value={selectedId ?? ''}
-                            disabled={versions.length === 0}
+                            disabled={versions.length === 0 || detached}
                             onChange={(e) => {
                               const v = e.target.value ? Number(e.target.value) : undefined;
                               setBootstrapVersionPicks((c) => ({ ...c, [configKey]: v }));
                             }}
-                            style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem' }}
+                            style={{ width: 200, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem', opacity: detached ? 0.4 : 1 }}
                           >
                             {versions.length === 0 && <option value="">{tP('config.externalDefault')}</option>}
                             {versions.map((v) => (
@@ -7616,12 +7702,24 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           </select>
                           <button
                             type="button"
-                            disabled={selectedId == null}
+                            disabled={selectedId == null || detached}
                             onClick={() => setExternalConfigPreview({ kind: externalKind, versionId: selectedId })}
                             title={tP('config.externalPreviewTooltip')}
-                            style={{ background: 'none', border: 'none', color: '#93c5fd', cursor: selectedId == null ? 'default' : 'pointer', fontSize: '0.76rem', padding: 0, opacity: selectedId == null ? 0.4 : 1 }}
+                            style={{ width: 52, textAlign: 'left', background: 'none', border: 'none', color: '#93c5fd', cursor: (selectedId == null || detached) ? 'default' : 'pointer', fontSize: '0.76rem', padding: 0, opacity: (selectedId == null || detached) ? 0.4 : 1 }}
                           >
                             {tP('config.externalPreview')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setBootstrapVersionPicks((c) => {
+                              const cur = new Set(c.detached_external_configs ?? []);
+                              if (detached) cur.delete(kind); else cur.add(kind);
+                              return { ...c, detached_external_configs: Array.from(cur) };
+                            })}
+                            title={tP(detached ? 'config.externalReattachTooltip' : 'config.externalDetachTooltip')}
+                            style={{ background: 'none', border: 'none', color: detached ? '#fbbf24' : '#71717a', cursor: 'pointer', fontSize: '0.76rem', padding: 0 }}
+                          >
+                            {tP(detached ? 'config.externalReattach' : 'config.externalDetach')}
                           </button>
                         </div>
                       );

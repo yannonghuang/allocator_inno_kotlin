@@ -49,22 +49,25 @@ data class CasePreferenceConfig(
 
 /** Loads case_preference rows for [versionId]. Returns null when none exist (planning falls back
  *  to raw CSV preference values, per-alternative). */
-internal fun loadCasePreferenceRows(versionId: Int): List<CasePreferenceRow>? = transaction {
-    val rows = CasePreferences.selectAll()
-        .where { CasePreferences.versionId eq versionId }
-        .map {
-            CasePreferenceRow(
-                productId = it[CasePreferences.productId],
-                locationId = it[CasePreferences.locationId],
-                methodType = it[CasePreferences.methodType],
-                methodKey = it[CasePreferences.methodKey],
-                preference = it[CasePreferences.preference],
-                inventoryScore = it[CasePreferences.inventoryScore],
-                deliveryScore = it[CasePreferences.deliveryScore],
-                criticalMaterialScore = it[CasePreferences.criticalMaterialScore],
-            )
-        }
-    if (rows.isEmpty()) null else rows
+internal fun loadCasePreferenceRows(versionId: Int?): List<CasePreferenceRow>? {
+    if (versionId == null) return null
+    return transaction {
+        val rows = CasePreferences.selectAll()
+            .where { CasePreferences.versionId eq versionId }
+            .map {
+                CasePreferenceRow(
+                    productId = it[CasePreferences.productId],
+                    locationId = it[CasePreferences.locationId],
+                    methodType = it[CasePreferences.methodType],
+                    methodKey = it[CasePreferences.methodKey],
+                    preference = it[CasePreferences.preference],
+                    inventoryScore = it[CasePreferences.inventoryScore],
+                    deliveryScore = it[CasePreferences.deliveryScore],
+                    criticalMaterialScore = it[CasePreferences.criticalMaterialScore],
+                )
+            }
+        if (rows.isEmpty()) null else rows
+    }
 }
 
 /** Loads the full lookup structure threaded into planning: per-alternative KB entries
@@ -73,7 +76,7 @@ internal fun loadCasePreferenceRows(versionId: Int): List<CasePreferenceRow>? = 
  *  candidate's continuous combined score for proportional root-level splitting (see
  *  [com.allocator.services.reconstructNodeScores]). Returns null when no KB exists for
  *  [versionId] (planning falls back to raw CSV preference values, per-alternative). */
-internal fun loadPreferenceKb(versionId: Int): PreferenceKb? {
+internal fun loadPreferenceKb(versionId: Int?): PreferenceKb? {
     val rows = loadCasePreferenceRows(versionId) ?: return null
     val cfg = loadCasePreferenceConfig(versionId)
     return PreferenceKb(
@@ -131,8 +134,10 @@ private fun recomputeCasePreferenceHash(caseId: Int, versionId: Int, rows: List<
     }
 }
 
-private fun versionJson(caseId: Int, versionId: Int): JsonObject {
-    val summary = CaseConfigVersioning.listVersions(caseId, KIND).firstOrNull { it.id == versionId }
+/** [versionId] null means this case has never had a Supply Preferences version at all — a
+ *  legitimate "nothing yet" state (see CaseConfigVersioning's own doc), not an error. */
+private fun versionJson(caseId: Int, versionId: Int?): JsonObject {
+    val summary = versionId?.let { vid -> CaseConfigVersioning.listVersions(caseId, KIND).firstOrNull { it.id == vid } }
     return buildJsonObject {
         put("id", versionId)
         put("name", summary?.name)
@@ -202,15 +207,18 @@ internal fun generateAndSeedCasePreferences(
     return rows
 }
 
-internal fun loadCasePreferenceConfig(versionId: Int): CasePreferenceConfig? = transaction {
-    CasePreferenceConfigs.selectAll().where { CasePreferenceConfigs.versionId eq versionId }.singleOrNull()?.let {
-        CasePreferenceConfig(
-            maxBomDepth = it[CasePreferenceConfigs.maxBomDepth],
-            deliveryWeight = it[CasePreferenceConfigs.deliveryWeight],
-            inventoryWeight = it[CasePreferenceConfigs.inventoryWeight],
-            criticalMaterialWeight = it[CasePreferenceConfigs.criticalMaterialWeight],
-            generatedAt = it[CasePreferenceConfigs.generatedAt].toString(),
-        )
+internal fun loadCasePreferenceConfig(versionId: Int?): CasePreferenceConfig? {
+    if (versionId == null) return null
+    return transaction {
+        CasePreferenceConfigs.selectAll().where { CasePreferenceConfigs.versionId eq versionId }.singleOrNull()?.let {
+            CasePreferenceConfig(
+                maxBomDepth = it[CasePreferenceConfigs.maxBomDepth],
+                deliveryWeight = it[CasePreferenceConfigs.deliveryWeight],
+                inventoryWeight = it[CasePreferenceConfigs.inventoryWeight],
+                criticalMaterialWeight = it[CasePreferenceConfigs.criticalMaterialWeight],
+                generatedAt = it[CasePreferenceConfigs.generatedAt].toString(),
+            )
+        }
     }
 }
 
@@ -229,8 +237,13 @@ fun Routing.preferenceRoutes() {
         return caseId
     }
 
-    fun resolvedVersionId(call: ApplicationCall, caseId: Int): Int =
+    // Read paths (GET/DELETE-clear/export): never creates. generate/PUT/import (real writes) use
+    // resolvedOrCreatedVersionId instead — the one legitimate create-on-demand moment.
+    fun resolvedVersionId(call: ApplicationCall, caseId: Int): Int? =
         CaseConfigVersioning.resolveVersionId(caseId, KIND, call.request.queryParameters["version_id"]?.toIntOrNull())
+
+    fun resolvedOrCreatedVersionId(call: ApplicationCall, caseId: Int): Int =
+        CaseConfigVersioning.resolveOrCreateVersionId(caseId, KIND, call.request.queryParameters["version_id"]?.toIntOrNull())
 
     // Read-only context joined onto each row for display/filtering — not persisted, mirrors how
     // Demand Ordering surfaces request_due_time/priority/product_id/customer_id as context.
@@ -287,7 +300,7 @@ fun Routing.preferenceRoutes() {
     //         "critical_material_weight": C, "config": {...} }
     post("/cases/{case_id}/preferences/generate") {
         val caseId = requireCaseId(call)
-        val versionId = resolvedVersionId(call, caseId)
+        val versionId = resolvedOrCreatedVersionId(call, caseId)
         if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@post
@@ -341,7 +354,7 @@ fun Routing.preferenceRoutes() {
     // read-only/derived and not settable here.
     put("/cases/{case_id}/preferences") {
         val caseId = requireCaseId(call)
-        val versionId = resolvedVersionId(call, caseId)
+        val versionId = resolvedOrCreatedVersionId(call, caseId)
         if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@put
@@ -384,6 +397,10 @@ fun Routing.preferenceRoutes() {
     delete("/cases/{case_id}/preferences") {
         val caseId = requireCaseId(call)
         val versionId = resolvedVersionId(call, caseId)
+        if (versionId == null) {
+            call.respond(buildJsonObject { put("deleted", 0) })
+            return@delete
+        }
         if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@delete
@@ -400,7 +417,7 @@ fun Routing.preferenceRoutes() {
     // Body: CSV text, header: product_id,location_id,method_type,method_key,preference[,inventory_score,delivery_score,critical_material_score]
     post("/cases/{case_id}/preferences/import") {
         val caseId = requireCaseId(call)
-        val versionId = resolvedVersionId(call, caseId)
+        val versionId = resolvedOrCreatedVersionId(call, caseId)
         if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@post
@@ -434,19 +451,8 @@ fun Routing.preferenceRoutes() {
     get("/cases/{case_id}/preferences/export") {
         val caseId = requireCaseId(call)
         val versionId = resolvedVersionId(call, caseId)
-        val rows = transaction {
-            CasePreferences.selectAll()
-                .where { CasePreferences.versionId eq versionId }
-                .orderBy(CasePreferences.productId to SortOrder.ASC, CasePreferences.locationId to SortOrder.ASC, CasePreferences.preference to SortOrder.ASC)
-                .map {
-                    CasePreferenceRow(
-                        it[CasePreferences.productId], it[CasePreferences.locationId],
-                        it[CasePreferences.methodType], it[CasePreferences.methodKey],
-                        it[CasePreferences.preference], it[CasePreferences.inventoryScore], it[CasePreferences.deliveryScore],
-                        it[CasePreferences.criticalMaterialScore],
-                    )
-                }
-        }
+        val rows = (loadCasePreferenceRows(versionId) ?: emptyList())
+            .sortedWith(compareBy({ it.productId }, { it.locationId }, { it.preference }))
         val sb = StringBuilder("product_id,location_id,method_type,method_key,preference,inventory_score,delivery_score,critical_material_score\n")
         for (row in rows) {
             sb.append(csvEscape(row.productId)).append(',')

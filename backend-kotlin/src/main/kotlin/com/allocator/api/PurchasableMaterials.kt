@@ -37,11 +37,14 @@ private val KIND = ConfigVersionKind.PURCHMAT
 /** Loads [versionId]'s whitelist as a plain set of product_ids. Empty set means "allow all"
  *  (see CasePurchasableMaterials' own doc) — callers should treat empty the same way the old
  *  embedded `purchasable_materials: []` array was always treated. */
-internal fun loadPurchasableMaterialIds(versionId: Int): Set<String> = transaction {
-    CasePurchasableMaterials.selectAll()
-        .where { CasePurchasableMaterials.versionId eq versionId }
-        .map { it[CasePurchasableMaterials.productId] }
-        .toSet()
+internal fun loadPurchasableMaterialIds(versionId: Int?): Set<String> {
+    if (versionId == null) return emptySet()
+    return transaction {
+        CasePurchasableMaterials.selectAll()
+            .where { CasePurchasableMaterials.versionId eq versionId }
+            .map { it[CasePurchasableMaterials.productId] }
+            .toSet()
+    }
 }
 
 /** Recompute and persist the content-hash fingerprint for [versionId]'s current whitelist — see
@@ -63,8 +66,10 @@ private fun recomputePurchasableMaterialHash(caseId: Int, versionId: Int, produc
     }
 }
 
-private fun versionJson(caseId: Int, versionId: Int): JsonObject {
-    val summary = CaseConfigVersioning.listVersions(caseId, KIND).firstOrNull { it.id == versionId }
+/** [versionId] null means this case has never had a Purchasable Materials version at all — a
+ *  legitimate "nothing yet" state (see CaseConfigVersioning's own doc), not an error. */
+private fun versionJson(caseId: Int, versionId: Int?): JsonObject {
+    val summary = versionId?.let { vid -> CaseConfigVersioning.listVersions(caseId, KIND).firstOrNull { it.id == vid } }
     return buildJsonObject {
         put("id", versionId)
         put("name", summary?.name)
@@ -87,8 +92,13 @@ fun Routing.purchasableMaterialsRoutes() {
         return caseId
     }
 
-    fun resolvedVersionId(call: ApplicationCall, caseId: Int): Int =
+    // Read paths (GET/DELETE-clear/export): never creates. PUT/import (real writes) use
+    // resolvedOrCreatedVersionId instead — the one legitimate create-on-demand moment.
+    fun resolvedVersionId(call: ApplicationCall, caseId: Int): Int? =
         CaseConfigVersioning.resolveVersionId(caseId, KIND, call.request.queryParameters["version_id"]?.toIntOrNull())
+
+    fun resolvedOrCreatedVersionId(call: ApplicationCall, caseId: Int): Int =
+        CaseConfigVersioning.resolveOrCreateVersionId(caseId, KIND, call.request.queryParameters["version_id"]?.toIntOrNull())
 
     // ── GET /cases/{case_id}/purchasable-materials ────────────────────────────
     get("/cases/{case_id}/purchasable-materials") {
@@ -106,7 +116,7 @@ fun Routing.purchasableMaterialsRoutes() {
     // current state, unlike Allocation/Preferences' per-row upsert PUT).
     put("/cases/{case_id}/purchasable-materials") {
         val caseId = requireCaseId(call)
-        val versionId = resolvedVersionId(call, caseId)
+        val versionId = resolvedOrCreatedVersionId(call, caseId)
         if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@put
@@ -136,6 +146,10 @@ fun Routing.purchasableMaterialsRoutes() {
     delete("/cases/{case_id}/purchasable-materials") {
         val caseId = requireCaseId(call)
         val versionId = resolvedVersionId(call, caseId)
+        if (versionId == null) {
+            call.respond(buildJsonObject { put("deleted", 0) })
+            return@delete
+        }
         if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@delete
@@ -152,7 +166,7 @@ fun Routing.purchasableMaterialsRoutes() {
     // Body: CSV text, header: product_id
     post("/cases/{case_id}/purchasable-materials/import") {
         val caseId = requireCaseId(call)
-        val versionId = resolvedVersionId(call, caseId)
+        val versionId = resolvedOrCreatedVersionId(call, caseId)
         if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@post

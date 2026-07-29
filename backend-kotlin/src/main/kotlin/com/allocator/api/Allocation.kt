@@ -31,11 +31,14 @@ data class CaseAllocRow(val supplyId: String, val demandId: String?, val qtyAllo
 
 /** Loads case_allocation rows for [versionId]. Returns null when none exist (planning falls back
  *  to SupplyAllocator). */
-internal fun loadCaseAllocRows(versionId: Int): List<CaseAllocRow>? = transaction {
-    val rows = CaseAllocations.selectAll()
-        .where { CaseAllocations.versionId eq versionId }
-        .map { CaseAllocRow(it[CaseAllocations.supplyId], it[CaseAllocations.demandId], it[CaseAllocations.qtyAllocated]) }
-    if (rows.isEmpty()) null else rows
+internal fun loadCaseAllocRows(versionId: Int?): List<CaseAllocRow>? {
+    if (versionId == null) return null
+    return transaction {
+        val rows = CaseAllocations.selectAll()
+            .where { CaseAllocations.versionId eq versionId }
+            .map { CaseAllocRow(it[CaseAllocations.supplyId], it[CaseAllocations.demandId], it[CaseAllocations.qtyAllocated]) }
+        if (rows.isEmpty()) null else rows
+    }
 }
 
 /**
@@ -65,6 +68,21 @@ internal fun buildBudgetsFromCaseAlloc(
         budget[aggKey] = (budget[aggKey] ?: 0.0) + row.qtyAllocated
     }
     return result
+}
+
+/** The set of product ids covered by [rows] (an allocation version's stored rows) — i.e. the
+ *  critical-material set that version was generated for, based on the actual supply lots it
+ *  budgeted. Compared against [computeCriticalPids][com.allocator.services.computeCriticalPids]'s
+ *  live result at plan-submit time to detect a version that's gone stale (see call sites in
+ *  Allocate.kt's `runPlanBackground`/`runOneBootstrapPreset`). */
+internal fun caseAllocMaterialSet(
+    rows: List<CaseAllocRow>,
+    supplies: List<Map<String, Any?>>,
+): Set<String> {
+    val supplyToPid = supplies.associate { s ->
+        (s["supply_id"] as? String)?.trim().orEmpty() to (s["product_id"] as? String)?.trim().orEmpty()
+    }
+    return rows.mapNotNull { supplyToPid[it.supplyId]?.takeIf { pid -> pid.isNotBlank() } }.toSet()
 }
 
 /**
@@ -99,8 +117,10 @@ private fun recomputeCaseAllocationHash(caseId: Int, versionId: Int) {
     }
 }
 
-private fun versionJson(caseId: Int, versionId: Int): JsonObject {
-    val summary = CaseConfigVersioning.listVersions(caseId, KIND).firstOrNull { it.id == versionId }
+/** [versionId] null means this case has never had a Critical Raw Allocation version at all — a
+ *  legitimate "nothing yet" state (see CaseConfigVersioning's own doc), not an error. */
+private fun versionJson(caseId: Int, versionId: Int?): JsonObject {
+    val summary = versionId?.let { vid -> CaseConfigVersioning.listVersions(caseId, KIND).firstOrNull { it.id == vid } }
     return buildJsonObject {
         put("id", versionId)
         put("name", summary?.name)
@@ -164,8 +184,13 @@ fun Routing.allocationRoutes() {
         return caseId
     }
 
-    fun resolvedVersionId(call: ApplicationCall, caseId: Int): Int =
+    // Read paths (GET/DELETE-clear/export): never creates. generate/PUT/import (real writes) use
+    // resolvedOrCreatedVersionId instead — the one legitimate create-on-demand moment.
+    fun resolvedVersionId(call: ApplicationCall, caseId: Int): Int? =
         CaseConfigVersioning.resolveVersionId(caseId, KIND, call.request.queryParameters["version_id"]?.toIntOrNull())
+
+    fun resolvedOrCreatedVersionId(call: ApplicationCall, caseId: Int): Int =
+        CaseConfigVersioning.resolveOrCreateVersionId(caseId, KIND, call.request.queryParameters["version_id"]?.toIntOrNull())
 
     // ── GET /cases/{case_id}/demands ─────────────────────────────────────────
     get("/cases/{case_id}/demands") {
@@ -191,26 +216,22 @@ fun Routing.allocationRoutes() {
     get("/cases/{case_id}/allocation") {
         val caseId = requireCaseId(call)
         val versionId = resolvedVersionId(call, caseId)
-        val rows = transaction {
-            CaseAllocations.selectAll()
-                .where { CaseAllocations.versionId eq versionId }
-                .orderBy(CaseAllocations.supplyId to SortOrder.ASC, CaseAllocations.demandId to SortOrder.ASC)
-                .map { row ->
-                    buildJsonObject {
-                        put("supply_id", row[CaseAllocations.supplyId])
-                        val did = row[CaseAllocations.demandId]
-                        if (did != null) put("demand_id", did) else put("demand_id", JsonNull)
-                        put("qty_allocated", row[CaseAllocations.qtyAllocated])
-                    }
+        val rows = (loadCaseAllocRows(versionId) ?: emptyList())
+            .sortedWith(compareBy({ it.supplyId }, { it.demandId ?: "" }))
+            .map { row ->
+                buildJsonObject {
+                    put("supply_id", row.supplyId)
+                    if (row.demandId != null) put("demand_id", row.demandId) else put("demand_id", JsonNull)
+                    put("qty_allocated", row.qtyAllocated)
                 }
-        }
+            }
         call.respond(buildJsonObject { put("rows", JsonArray(rows)); put("version", versionJson(caseId, versionId)) })
     }
 
     // ── POST /cases/{case_id}/allocation/generate ─────────────────────────────
     post("/cases/{case_id}/allocation/generate") {
         val caseId = requireCaseId(call)
-        val versionId = resolvedVersionId(call, caseId)
+        val versionId = resolvedOrCreatedVersionId(call, caseId)
         if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@post
@@ -264,7 +285,7 @@ fun Routing.allocationRoutes() {
     // Upserts (insert-or-replace) the given rows; leaves other rows unchanged.
     put("/cases/{case_id}/allocation") {
         val caseId = requireCaseId(call)
-        val versionId = resolvedVersionId(call, caseId)
+        val versionId = resolvedOrCreatedVersionId(call, caseId)
         if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@put
@@ -314,6 +335,10 @@ fun Routing.allocationRoutes() {
     delete("/cases/{case_id}/allocation") {
         val caseId = requireCaseId(call)
         val versionId = resolvedVersionId(call, caseId)
+        if (versionId == null) {
+            call.respond(buildJsonObject { put("deleted", 0) })
+            return@delete
+        }
         if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@delete
@@ -330,7 +355,7 @@ fun Routing.allocationRoutes() {
     // Body: CSV text with header row: supply_id,demand_id,qty_allocated
     post("/cases/{case_id}/allocation/import") {
         val caseId = requireCaseId(call)
-        val versionId = resolvedVersionId(call, caseId)
+        val versionId = resolvedOrCreatedVersionId(call, caseId)
         if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@post
@@ -363,12 +388,8 @@ fun Routing.allocationRoutes() {
     get("/cases/{case_id}/allocation/export") {
         val caseId = requireCaseId(call)
         val versionId = resolvedVersionId(call, caseId)
-        val rows = transaction {
-            CaseAllocations.selectAll()
-                .where { CaseAllocations.versionId eq versionId }
-                .orderBy(CaseAllocations.supplyId to SortOrder.ASC, CaseAllocations.demandId to SortOrder.ASC)
-                .map { CaseAllocRow(it[CaseAllocations.supplyId], it[CaseAllocations.demandId], it[CaseAllocations.qtyAllocated]) }
-        }
+        val rows = (loadCaseAllocRows(versionId) ?: emptyList())
+            .sortedWith(compareBy({ it.supplyId }, { it.demandId ?: "" }))
         val sb = StringBuilder("supply_id,demand_id,qty_allocated\n")
         for (row in rows) {
             sb.append(csvEscape(row.supplyId))

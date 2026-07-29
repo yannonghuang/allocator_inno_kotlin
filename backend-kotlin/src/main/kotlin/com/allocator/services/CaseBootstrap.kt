@@ -804,6 +804,9 @@ object CaseBootstrap {
         val rootWaterfall: Boolean = true,
         val equalSplitRawMaterials: Boolean = false,
         val horizonStart: String? = null,
+        /** [ConfigVersionKind.key] strings the user explicitly detached for this batch — see
+         *  `parseDetachedKinds`'s own doc (CaseConfigVersioning.kt). Empty = nothing detached. */
+        val detachedExternalConfigs: List<String> = emptyList(),
     )
 
     /** Overlay [form]'s external-config version picks onto [config] — only non-null picks are
@@ -817,6 +820,9 @@ object CaseBootstrap {
         form.ordVersionId?.let { put("demand_order_version_id", it) }
         form.purchMatVersionId?.let { put("purchasable_material_version_id", it) }
         form.constrVersionId?.let { put("constraint_version_id", it) }
+        if (form.detachedExternalConfigs.isNotEmpty()) {
+            putJsonArray("detached_external_configs") { form.detachedExternalConfigs.forEach { add(it) } }
+        }
     }
 
     /** One entry per integer in [SeedForm.maxMethodsMin, SeedForm.maxMethodsMax] whose resulting

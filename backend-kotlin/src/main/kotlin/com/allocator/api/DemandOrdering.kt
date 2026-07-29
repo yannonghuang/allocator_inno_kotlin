@@ -36,17 +36,20 @@ data class CaseDemandOrderConfig(
 
 /** Loads case_demand_order rows for [versionId]. Returns null when none exist (planning falls
  *  back to raw `(priority, demand_id)` sort, per-demand). */
-internal fun loadCaseDemandOrderRows(versionId: Int): List<CaseDemandOrderRow>? = transaction {
-    val rows = CaseDemandOrders.selectAll()
-        .where { CaseDemandOrders.versionId eq versionId }
-        .map { CaseDemandOrderRow(demandId = it[CaseDemandOrders.demandId], order = it[CaseDemandOrders.order]) }
-    if (rows.isEmpty()) null else rows
+internal fun loadCaseDemandOrderRows(versionId: Int?): List<CaseDemandOrderRow>? {
+    if (versionId == null) return null
+    return transaction {
+        val rows = CaseDemandOrders.selectAll()
+            .where { CaseDemandOrders.versionId eq versionId }
+            .map { CaseDemandOrderRow(demandId = it[CaseDemandOrders.demandId], order = it[CaseDemandOrders.order]) }
+        if (rows.isEmpty()) null else rows
+    }
 }
 
 /** Loads the lookup structure threaded into planning: demand_id -> canonical order. Returns
  *  null when no KB exists for [versionId] (planning falls back to raw `(priority, demand_id)`
  *  sort, per-demand). */
-internal fun loadDemandOrderMap(versionId: Int): Map<String, Int>? =
+internal fun loadDemandOrderMap(versionId: Int?): Map<String, Int>? =
     loadCaseDemandOrderRows(versionId)?.associate { it.demandId to it.order }
 
 private fun toRows(candidates: List<DemandOrderRow>): List<CaseDemandOrderRow> =
@@ -72,8 +75,10 @@ private fun recomputeCaseDemandOrderHash(caseId: Int, versionId: Int, rows: List
     }
 }
 
-private fun versionJson(caseId: Int, versionId: Int): JsonObject {
-    val summary = CaseConfigVersioning.listVersions(caseId, KIND).firstOrNull { it.id == versionId }
+/** [versionId] null means this case has never had a Demand Ordering version at all — a
+ *  legitimate "nothing yet" state (see CaseConfigVersioning's own doc), not an error. */
+private fun versionJson(caseId: Int, versionId: Int?): JsonObject {
+    val summary = versionId?.let { vid -> CaseConfigVersioning.listVersions(caseId, KIND).firstOrNull { it.id == vid } }
     return buildJsonObject {
         put("id", versionId)
         put("name", summary?.name)
@@ -125,9 +130,12 @@ internal fun generateAndSeedCaseDemandOrder(
     return rows
 }
 
-internal fun loadCaseDemandOrderConfig(versionId: Int): CaseDemandOrderConfig? = transaction {
-    CaseDemandOrderConfigs.selectAll().where { CaseDemandOrderConfigs.versionId eq versionId }.singleOrNull()?.let {
-        CaseDemandOrderConfig(generatedAt = it[CaseDemandOrderConfigs.generatedAt].toString())
+internal fun loadCaseDemandOrderConfig(versionId: Int?): CaseDemandOrderConfig? {
+    if (versionId == null) return null
+    return transaction {
+        CaseDemandOrderConfigs.selectAll().where { CaseDemandOrderConfigs.versionId eq versionId }.singleOrNull()?.let {
+            CaseDemandOrderConfig(generatedAt = it[CaseDemandOrderConfigs.generatedAt].toString())
+        }
     }
 }
 
@@ -167,8 +175,13 @@ fun Routing.demandOrderingRoutes() {
         return caseId
     }
 
-    fun resolvedVersionId(call: ApplicationCall, caseId: Int): Int =
+    // Read paths (GET/DELETE-clear/export): never creates. generate/PUT/import (real writes) use
+    // resolvedOrCreatedVersionId instead — the one legitimate create-on-demand moment.
+    fun resolvedVersionId(call: ApplicationCall, caseId: Int): Int? =
         CaseConfigVersioning.resolveVersionId(caseId, KIND, call.request.queryParameters["version_id"]?.toIntOrNull())
+
+    fun resolvedOrCreatedVersionId(call: ApplicationCall, caseId: Int): Int =
+        CaseConfigVersioning.resolveOrCreateVersionId(caseId, KIND, call.request.queryParameters["version_id"]?.toIntOrNull())
 
     fun rowJson(row: CaseDemandOrderRow, ctx: DemandContext?): JsonObject = buildJsonObject {
         put("demand_id", row.demandId)
@@ -204,7 +217,7 @@ fun Routing.demandOrderingRoutes() {
     // ── POST /cases/{case_id}/demand-ordering/generate ────────────────────────
     post("/cases/{case_id}/demand-ordering/generate") {
         val caseId = requireCaseId(call)
-        val versionId = resolvedVersionId(call, caseId)
+        val versionId = resolvedOrCreatedVersionId(call, caseId)
         if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@post
@@ -226,7 +239,7 @@ fun Routing.demandOrderingRoutes() {
     // customer_id) are read-only/derived and not settable here.
     put("/cases/{case_id}/demand-ordering") {
         val caseId = requireCaseId(call)
-        val versionId = resolvedVersionId(call, caseId)
+        val versionId = resolvedOrCreatedVersionId(call, caseId)
         if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@put
@@ -258,6 +271,10 @@ fun Routing.demandOrderingRoutes() {
     delete("/cases/{case_id}/demand-ordering") {
         val caseId = requireCaseId(call)
         val versionId = resolvedVersionId(call, caseId)
+        if (versionId == null) {
+            call.respond(buildJsonObject { put("deleted", 0) })
+            return@delete
+        }
         if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@delete
@@ -274,7 +291,7 @@ fun Routing.demandOrderingRoutes() {
     // Body: CSV text, header: demand_id,order
     post("/cases/{case_id}/demand-ordering/import") {
         val caseId = requireCaseId(call)
-        val versionId = resolvedVersionId(call, caseId)
+        val versionId = resolvedOrCreatedVersionId(call, caseId)
         if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@post
@@ -302,12 +319,7 @@ fun Routing.demandOrderingRoutes() {
     get("/cases/{case_id}/demand-ordering/export") {
         val caseId = requireCaseId(call)
         val versionId = resolvedVersionId(call, caseId)
-        val rows = transaction {
-            CaseDemandOrders.selectAll()
-                .where { CaseDemandOrders.versionId eq versionId }
-                .orderBy(CaseDemandOrders.order to SortOrder.ASC)
-                .map { CaseDemandOrderRow(it[CaseDemandOrders.demandId], it[CaseDemandOrders.order]) }
-        }
+        val rows = (loadCaseDemandOrderRows(versionId) ?: emptyList()).sortedBy { it.order }
         val sb = StringBuilder("demand_id,order\n")
         for (row in rows) {
             sb.append(csvEscapeDo(row.demandId)).append(',')
