@@ -161,12 +161,15 @@ object CsvImportService {
         }
     }
 
+    /** Blank/whitespace-only (or literal "*") LOCATION_ID is a meaningful wildcard — "purchasable
+     *  at any location" — not an omission to warn about. See isWildcardLocation (PlanningEngine.kt)
+     *  for how planning resolves it. */
     private fun importMethodBuy(caseId: Int, rows: List<Map<String, String>>) {
         MethodBuys.deleteWhere { MethodBuys.caseId eq caseId }
         MethodBuys.batchInsert(rows) { r ->
             this[MethodBuys.caseId] = caseId
             this[MethodBuys.productId] = r["PRODUCT_ID"] ?: ""
-            this[MethodBuys.locationId] = r["LOCATION_ID"] ?: ""
+            this[MethodBuys.locationId] = r["LOCATION_ID"]?.trim() ?: ""
             this[MethodBuys.preference] = r["PREFERENCE"].toIntOrNullSafe()
             this[MethodBuys.leadDaysSupply] = r["LEAD_DAYS_SUPPLY"].toIntOrNullSafe()
             this[MethodBuys.cycleDaysSupply] = r["CYCLE_DAYS_SUPPLY"].toIntOrNullSafe()
@@ -174,25 +177,29 @@ object CsvImportService {
         }
     }
 
+    /** Same "blank/whitespace-only/'*' LOCATION_ID = any location" wildcard as importMethodBuy. */
     private fun importMethodMake(caseId: Int, rows: List<Map<String, String>>) {
         MethodMakes.deleteWhere { MethodMakes.caseId eq caseId }
         MethodMakes.batchInsert(rows) { r ->
             this[MethodMakes.caseId] = caseId
             this[MethodMakes.bomId] = r["BOM_ID"] ?: ""
             this[MethodMakes.productId] = r["PRODUCT_ID"] ?: ""
-            this[MethodMakes.locationId] = r["LOCATION_ID"] ?: ""
+            this[MethodMakes.locationId] = r["LOCATION_ID"]?.trim() ?: ""
             this[MethodMakes.preference] = r["PREFERENCE"].toIntOrNullSafe()
             this[MethodMakes.leadTime] = r["LEAD_TIME"].toIntOrNullSafe()
         }
     }
 
+    /** Same wildcard convention as importMethodBuy — blank LOCATION_ID means this product's
+     *  PROD_AREA/MAX_LOT_SIZE apply at any location (used as a fallback when no exact-location row
+     *  exists for a queried location; see maxLotSize/getProdArea in PlanningEngine.kt). */
     private fun importProductLocation(caseId: Int, rows: List<Map<String, String>>) {
         ProductLocations.deleteWhere { ProductLocations.caseId eq caseId }
         ProductLocations.batchInsert(rows) { r ->
             this[ProductLocations.caseId] = caseId
             this[ProductLocations.productId] = r["PRODUCT_ID"] ?: ""
             this[ProductLocations.description] = r["DESCRIPTION"]?.takeIf { it.isNotBlank() }
-            this[ProductLocations.locationId] = r["LOCATION_ID"] ?: ""
+            this[ProductLocations.locationId] = r["LOCATION_ID"]?.trim() ?: ""
             this[ProductLocations.maxLotSize] = r["MAX_LOT_SIZE"].toDoubleOrNullSafe()
             this[ProductLocations.prodArea] = r["PROD_AREA"]?.takeIf { it.isNotBlank() }
         }
@@ -248,13 +255,18 @@ object CsvImportService {
         }
     }
 
+    /** Same wildcard convention as importMethodBuy, on EITHER location column: blank
+     *  TO_LOCATION_ID means "movable to any location" (mirrors make/buy); blank FROM_LOCATION_ID
+     *  means "movable from any location" and gets expanded into one concrete candidate per known
+     *  case location at planning time, since (unlike TO) the source has no other concrete value to
+     *  resolve against — see expandMoveWildcardSource in PlanningEngine.kt. */
     private fun importMethodMove(caseId: Int, rows: List<Map<String, String>>) {
         MethodMoves.deleteWhere { MethodMoves.caseId eq caseId }
         MethodMoves.batchInsert(rows) { r ->
             this[MethodMoves.caseId] = caseId
             this[MethodMoves.productId] = r["PRODUCT_ID"] ?: ""
-            this[MethodMoves.fromLocationId] = r["FROM_LOCATION_ID"] ?: ""
-            this[MethodMoves.toLocationId] = r["TO_LOCATION_ID"] ?: ""
+            this[MethodMoves.fromLocationId] = r["FROM_LOCATION_ID"]?.trim() ?: ""
+            this[MethodMoves.toLocationId] = r["TO_LOCATION_ID"]?.trim() ?: ""
             this[MethodMoves.transitTime] = r["TRANSIT_TIME"].toDoubleOrNullSafe()
             this[MethodMoves.transitTimeUom] = r["TRANSIT_TIME_UOM"]?.takeIf { it.isNotBlank() }
             this[MethodMoves.preference] = r["PREFERENCE"].toIntOrNullSafe()

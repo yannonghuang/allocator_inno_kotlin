@@ -58,6 +58,19 @@ function formatDate(d: Date, locale: string): string {
   }
 }
 
+/** Inclusive start–end range label for a weekly/biweekly bucket. Buckets are epoch-day anchored
+ *  (see epochDay's own doc) — NOT aligned to the horizon start or any calendar boundary — so a
+ *  bucket's start date alone can look like it's "in the past" relative to the run's actual
+ *  earliest work order (e.g. the week containing 2026-07-01 starts 2026-06-25). Showing the full
+ *  range makes it visually obvious the column is a partial/leading window, not a June date. */
+function formatDateRange(start: Date, end: Date, locale: string): string {
+  try {
+    return new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeZone: 'UTC' }).formatRange(start, end);
+  } catch {
+    return `${formatDate(start, locale)} – ${formatDate(end, locale)}`;
+  }
+}
+
 /** Ordered bucket list spanning every day in [minIso, maxIso] at the given scale — same key
  *  scheme as [bucketKeyFor], so a WO's bucketKeyFor(...) always matches one of these entries. */
 function buildBuckets(minIso: string, maxIso: string, scale: WoBatchScale, locale: string, allLabel: string): { key: string; label: string }[] {
@@ -85,7 +98,8 @@ function buildBuckets(minIso: string, maxIso: string, scale: WoBatchScale, local
     if (scale === 'none') {
       buckets.push({ key: dateFromEpochDay(startDay).toISOString().slice(0, 10), label: formatDate(dateFromEpochDay(startDay), locale) });
     } else {
-      buckets.push({ key: `${scale === 'weekly' ? 'w' : 'b'}${b}`, label: formatDate(dateFromEpochDay(startDay), locale) });
+      const rangeLabel = formatDateRange(dateFromEpochDay(startDay), dateFromEpochDay(startDay + step - 1), locale);
+      buckets.push({ key: `${scale === 'weekly' ? 'w' : 'b'}${b}`, label: rangeLabel });
     }
   }
   return buckets;

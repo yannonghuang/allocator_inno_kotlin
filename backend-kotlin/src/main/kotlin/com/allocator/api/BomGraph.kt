@@ -1,6 +1,7 @@
 package com.allocator.api
 
 import com.allocator.*
+import com.allocator.services.isWildcardLocation
 import io.ktor.server.application.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
@@ -107,17 +108,47 @@ internal fun buildBomGraphPure(
     productDesc:   Map<String, String?> = emptyMap(),
     locationDesc:  Map<String, String?> = emptyMap(),
 ): BomGraphResponse {
-    // Move index: (productId, toLocationId) -> list of MoveRow
-    val moveByTarget = mutableMapOf<Pair<String, String>, MutableList<MoveRow>>()
-    for (mv in moveRows) {
-        moveByTarget.getOrPut(Pair(mv.productId, mv.toLocationId)) { mutableListOf() }.add(mv)
+    // A move row's FROM_LOCATION_ID, unlike TO, has no caller-supplied concrete node to fall back
+    // on (the source becomes part of the resulting edge itself) — a wildcard FROM (see
+    // isWildcardLocation) is expanded into one concrete row per location known to this case,
+    // excluding the row's own destination, before any indexing below. Same "any location taken
+    // literally" resolution PlanningEngine.kt's getMethods/expandMoveWildcardSource uses, so the
+    // visualization graph and the real planner never disagree about what a wildcard move means.
+    val knownLocationIds = locationDesc.keys
+    val expandedMoveRows = moveRows.flatMap { mv ->
+        if (!isWildcardLocation(mv.fromLocationId)) listOf(mv)
+        else knownLocationIds.filter { it.isNotEmpty() && it != mv.toLocationId }.map { mv.copy(fromLocationId = it) }
     }
 
-    // Make index: (productId, locationId) -> list of MakeRow
-    val makeByTarget = mutableMapOf<Pair<String, String>, MutableList<MakeRow>>()
-    for (mk in makeRows) {
-        makeByTarget.getOrPut(Pair(mk.productId, mk.locationId)) { mutableListOf() }.add(mk)
+    // Move index: (productId, toLocationId) -> list of MoveRow. A row whose own TO_LOCATION_ID
+    // is a wildcard (see isWildcardLocation) is indexed separately by product alone — it matches
+    // ANY target node being explored, materializing to that node's own location, same as an
+    // exact-match row would.
+    val moveByTarget = mutableMapOf<Pair<String, String>, MutableList<MoveRow>>()
+    val moveWildcardByProduct = mutableMapOf<String, MutableList<MoveRow>>()
+    for (mv in expandedMoveRows) {
+        if (isWildcardLocation(mv.toLocationId)) {
+            moveWildcardByProduct.getOrPut(mv.productId) { mutableListOf() }.add(mv)
+        } else {
+            moveByTarget.getOrPut(Pair(mv.productId, mv.toLocationId)) { mutableListOf() }.add(mv)
+        }
     }
+
+    // Make index: (productId, locationId) -> list of MakeRow. Same wildcard treatment as move.
+    val makeByTarget = mutableMapOf<Pair<String, String>, MutableList<MakeRow>>()
+    val makeWildcardByProduct = mutableMapOf<String, MutableList<MakeRow>>()
+    for (mk in makeRows) {
+        if (isWildcardLocation(mk.locationId)) {
+            makeWildcardByProduct.getOrPut(mk.productId) { mutableListOf() }.add(mk)
+        } else {
+            makeByTarget.getOrPut(Pair(mk.productId, mk.locationId)) { mutableListOf() }.add(mk)
+        }
+    }
+
+    // buySet carries raw (productId, locationId) pairs — a wildcard-location buy row is still in
+    // there under (productId, ""/"*"); pull those out into a per-product set so any target node
+    // for that product is treated as buyable, matching the make/move wildcard treatment above.
+    val buyWildcardProducts = buySet.filter { isWildcardLocation(it.second) }.map { it.first }.toSet()
 
     val visited = mutableSetOf<Pair<String, String>>()
     val nodeEstablishedBy = mutableMapOf<Pair<String, String>, MutableSet<String>>()
@@ -134,11 +165,11 @@ internal fun buildBomGraphPure(
         if (!visited.add(node)) continue
         val (productId, locationId) = node
 
-        if (buySet.contains(node)) {
+        if (buySet.contains(node) || productId in buyWildcardProducts) {
             nodeEstablishedBy.getOrPut(node) { mutableSetOf() }.add("buy")
         }
 
-        moveByTarget[node]?.forEach { mv ->
+        (moveByTarget[node].orEmpty() + moveWildcardByProduct[productId].orEmpty()).forEach { mv ->
             val src = Pair(mv.productId, mv.fromLocationId)
             nodeEstablishedBy.getOrPut(node) { mutableSetOf() }.add("move")
             val edgeId = "move|${nodeId(src.first, src.second)}|${nodeId(productId, locationId)}"
@@ -159,7 +190,7 @@ internal fun buildBomGraphPure(
             nodeEstablishedBy.getOrPut(src) { mutableSetOf() }
         }
 
-        makeByTarget[node]?.forEach { mk ->
+        (makeByTarget[node].orEmpty() + makeWildcardByProduct[productId].orEmpty()).forEach { mk ->
             val bomGroups = bomByMakeKey[Pair(mk.bomId, mk.productId)] ?: return@forEach
             nodeEstablishedBy.getOrPut(node) { mutableSetOf() }.add("make")
             bomGroups.forEach { (altKey, children) ->

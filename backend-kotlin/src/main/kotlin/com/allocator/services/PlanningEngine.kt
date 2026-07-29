@@ -782,11 +782,29 @@ internal data class DataIndex(
     val makeByPidLid: Map<Pair<String, String>, List<Map<String, Any?>>>,
     val moveByPidToLid: Map<Pair<String, String>, List<Map<String, Any?>>>,
     val buyByPidLid: Map<Pair<String, String>, List<Map<String, Any?>>>,
+    /** Rows whose own LOCATION_ID (or TO_LOCATION_ID for move) is a wildcard (see
+     *  [isWildcardLocation]) — match ANY queried location for that product, alongside whatever
+     *  exact-location rows also exist for it. Keyed by product_id alone. Strictly disjoint from
+     *  the *ByPidLid maps above (a row is indexed into exactly one of the two). */
+    val makeWildcardByPid: Map<String, List<Map<String, Any?>>> = emptyMap(),
+    val moveWildcardByPid: Map<String, List<Map<String, Any?>>> = emptyMap(),
+    val buyWildcardByPid: Map<String, List<Map<String, Any?>>> = emptyMap(),
     /** BOM rows keyed by bom_id; secondary filter by parent_id applied at use site. */
     val bomByBomId: Map<String, List<Map<String, Any?>>>,
     /** BOM rows keyed by parent_id for the fallback (no bom_id match) case. */
     val bomByParentId: Map<String, List<Map<String, Any?>>>,
 )
+
+/** True when a raw LOCATION_ID cell means "any location" — blank/whitespace-only, or the
+ *  explicit literal `"*"` wildcard marker. Mirrors the one existing location-wildcard convention
+ *  in this codebase (CaseConstraints.location — "location = `*` means any location"). A row
+ *  carrying this sentinel is treated as an additional candidate matching every queried location
+ *  for its product, resolved against whatever concrete location is actually being explored (the
+ *  demand's / parent BOM node's location) — see getMethods and buildBomGraphPure. */
+internal fun isWildcardLocation(loc: String?): Boolean {
+    val t = loc?.trim() ?: return true
+    return t.isEmpty() || t == "*"
+}
 
 /** Wraps the data map with a [DataIndex]; detected via `data as? PlanData`. */
 internal class PlanData(
@@ -801,15 +819,24 @@ internal class IndexedInventory(
 ) : MutableList<MutableMap<String, Any?>> by list
 
 private fun buildDataIndex(data: Map<String, List<Map<String, Any?>>>): DataIndex = DataIndex(
-    makeByPidLid = (data["method_make"] ?: emptyList()).groupBy {
-        Pair(it["product_id"]?.toString()?.trim() ?: "", it["location_id"]?.toString()?.trim() ?: "")
-    },
-    moveByPidToLid = (data["method_move"] ?: emptyList()).groupBy {
-        Pair(it["product_id"]?.toString()?.trim() ?: "", it["to_location_id"]?.toString()?.trim() ?: "")
-    },
-    buyByPidLid = (data["method_buy"] ?: emptyList()).groupBy {
-        Pair(it["product_id"]?.toString()?.trim() ?: "", it["location_id"]?.toString()?.trim() ?: "")
-    },
+    makeByPidLid = (data["method_make"] ?: emptyList())
+        .filterNot { isWildcardLocation(it["location_id"] as? String) }
+        .groupBy { Pair(it["product_id"]?.toString()?.trim() ?: "", it["location_id"]?.toString()?.trim() ?: "") },
+    moveByPidToLid = (data["method_move"] ?: emptyList())
+        .filterNot { isWildcardLocation(it["to_location_id"] as? String) }
+        .groupBy { Pair(it["product_id"]?.toString()?.trim() ?: "", it["to_location_id"]?.toString()?.trim() ?: "") },
+    buyByPidLid = (data["method_buy"] ?: emptyList())
+        .filterNot { isWildcardLocation(it["location_id"] as? String) }
+        .groupBy { Pair(it["product_id"]?.toString()?.trim() ?: "", it["location_id"]?.toString()?.trim() ?: "") },
+    makeWildcardByPid = (data["method_make"] ?: emptyList())
+        .filter { isWildcardLocation(it["location_id"] as? String) }
+        .groupBy { it["product_id"]?.toString()?.trim() ?: "" },
+    moveWildcardByPid = (data["method_move"] ?: emptyList())
+        .filter { isWildcardLocation(it["to_location_id"] as? String) }
+        .groupBy { it["product_id"]?.toString()?.trim() ?: "" },
+    buyWildcardByPid = (data["method_buy"] ?: emptyList())
+        .filter { isWildcardLocation(it["location_id"] as? String) }
+        .groupBy { it["product_id"]?.toString()?.trim() ?: "" },
     bomByBomId = (data["bom"] ?: emptyList()).groupBy {
         it["bom_id"]?.toString()?.trim() ?: ""
     },
@@ -1474,6 +1501,35 @@ internal fun makeMethodProducesChild(
 private fun buyAdmitted(productId: String, purchaseAllowed: Boolean, purchasable: Set<String>?): Boolean =
     purchaseAllowed && (purchasable == null || productId.trim() in purchasable)
 
+/**
+ * A move method's FROM_LOCATION_ID is, unlike make/buy/move-TO, read directly off the matched
+ * row and propagated forward as the resulting work order's `location_source` — there is no
+ * caller-supplied concrete location to fall back on the way the target side already has (the
+ * target is always the node/demand location being explored). So a wildcard FROM_LOCATION_ID (see
+ * [isWildcardLocation]) can't just be "matched"; it has to be RESOLVED into one or more concrete
+ * candidates.
+ *
+ * Expanded here, once, at the single point [getMethods] returns move rows to every caller in the
+ * engine — every downstream consumer (reachability walks, WO builders, structural-depth caches,
+ * the existing preference/waterfall ranking that already knows how to choose among multiple move
+ * rows for the same product) sees only fully-resolved rows and needs no wildcard-awareness of its
+ * own. "Any location" is taken literally: one candidate per location known to this case (the
+ * `location` table), excluding the move's own destination.
+ */
+private fun expandMoveWildcardSource(
+    m: Map<String, Any?>,
+    toLocationId: String,
+    data: Map<String, List<Map<String, Any?>>>,
+): List<Map<String, Any?>> {
+    val fromLoc = m["from_location_id"] as? String
+    if (!isWildcardLocation(fromLoc)) return listOf(m)
+    val candidates = (data["location"] ?: emptyList())
+        .mapNotNull { (it["location_id"] as? String)?.trim() }
+        .filter { it.isNotEmpty() && it != toLocationId }
+        .distinct()
+    return candidates.map { loc -> m + ("from_location_id" to loc) }
+}
+
 /** Return all methods (buy/make/move) that can fulfill (product, location). */
 fun getMethods(productId: String, locationId: String, data: Map<String, List<Map<String, Any?>>>): List<Map<String, Any?>> {
     val pid = productId.trim()
@@ -1494,8 +1550,15 @@ fun getMethods(productId: String, locationId: String, data: Map<String, List<Map
         val result = mutableListOf<Map<String, Any?>>()
         val key = Pair(pid, loc)
         idx.buyByPidLid[key]?.forEach { m -> result.add(mapOf("type" to "purchase") + m) }
+        idx.buyWildcardByPid[pid]?.forEach { m -> result.add(mapOf("type" to "purchase") + m + ("location_id" to loc)) }
         idx.makeByPidLid[key]?.forEach { m -> result.add(mapOf("type" to "make") + m) }
-        idx.moveByPidToLid[key]?.forEach { m -> result.add(mapOf("type" to "move") + m) }
+        idx.makeWildcardByPid[pid]?.forEach { m -> result.add(mapOf("type" to "make") + m + ("location_id" to loc)) }
+        idx.moveByPidToLid[key]?.forEach { m ->
+            expandMoveWildcardSource(m, loc, data).forEach { result.add(mapOf("type" to "move") + it) }
+        }
+        idx.moveWildcardByPid[pid]?.forEach { m ->
+            expandMoveWildcardSource(m, loc, data).forEach { result.add(mapOf("type" to "move") + it + ("to_location_id" to loc)) }
+        }
         return result
     }
 
@@ -1503,19 +1566,34 @@ fun getMethods(productId: String, locationId: String, data: Map<String, List<Map
     (data["method_buy"] ?: emptyList()).forEach { m ->
         if ((m["product_id"] as? String)?.trim() == pid) {
             val mLoc = (m["location_id"] as? String)?.trim() ?: ""
-            if (mLoc == loc || emptyLocFallback) result.add(mapOf("type" to "purchase") + m)
+            // A wildcard row's own location_id is rewritten to the queried location here — the
+            // single point every buy method reaches every other caller through — so nothing
+            // downstream (WO builders, reachability walks, structural-depth caches) ever sees an
+            // unresolved "" location and needs its own wildcard-awareness. See isWildcardLocation's
+            // own doc; the demand-location-less emptyLocFallback case leaves the row untouched
+            // (there's no concrete location to resolve TO in that case).
+            if (mLoc == loc || emptyLocFallback || isWildcardLocation(mLoc)) {
+                val resolved = if (isWildcardLocation(mLoc) && !emptyLocFallback) m + ("location_id" to loc) else m
+                result.add(mapOf("type" to "purchase") + resolved)
+            }
         }
     }
     (data["method_make"] ?: emptyList()).forEach { m ->
         if ((m["product_id"] as? String)?.trim() == pid) {
             val mLoc = (m["location_id"] as? String)?.trim() ?: ""
-            if (mLoc == loc || emptyLocFallback) result.add(mapOf("type" to "make") + m)
+            if (mLoc == loc || emptyLocFallback || isWildcardLocation(mLoc)) {
+                val resolved = if (isWildcardLocation(mLoc) && !emptyLocFallback) m + ("location_id" to loc) else m
+                result.add(mapOf("type" to "make") + resolved)
+            }
         }
     }
     (data["method_move"] ?: emptyList()).forEach { m ->
-        if ((m["product_id"] as? String)?.trim() == pid &&
-            (m["to_location_id"] as? String)?.trim() == loc) {
-            result.add(mapOf("type" to "move") + m)
+        if ((m["product_id"] as? String)?.trim() == pid) {
+            val toLoc = (m["to_location_id"] as? String)?.trim() ?: ""
+            if (toLoc == loc || isWildcardLocation(toLoc)) {
+                val resolvedTo = if (isWildcardLocation(toLoc)) m + ("to_location_id" to loc) else m
+                expandMoveWildcardSource(resolvedTo, loc, data).forEach { result.add(mapOf("type" to "move") + it) }
+            }
         }
     }
     return result
@@ -2456,24 +2534,35 @@ internal fun planMethodSlot(
 
 // ── Product location helpers ───────────────────────────────────────────────────
 
+/** Exact (product, location) row wins; a wildcard-location row (see [isWildcardLocation]) for the
+ *  same product is only consulted when no exact row exists — a wildcard is a fallback fact, not
+ *  an override, since unlike make/buy/move a (product, location) can only have ONE authoritative
+ *  PROD_AREA/MAX_LOT_SIZE. */
 private fun maxLotSize(productId: String, locationId: String, data: Map<String, List<Map<String, Any?>>>): Double? {
-    for (pl in data["productlocation"] ?: emptyList()) {
-        if ((pl["product_id"] as? String)?.trim() == productId && (pl["location_id"] as? String)?.trim() == locationId) {
-            val v = pl["max_lot_size"]
-            if (v != null) return try { (v as? Number)?.toDouble() ?: v.toString().toDouble() } catch (e: Exception) { null }
+    fun scan(matchesLocation: (String?) -> Boolean): Double? {
+        for (pl in data["productlocation"] ?: emptyList()) {
+            if ((pl["product_id"] as? String)?.trim() == productId && matchesLocation((pl["location_id"] as? String)?.trim())) {
+                val v = pl["max_lot_size"]
+                if (v != null) return try { (v as? Number)?.toDouble() ?: v.toString().toDouble() } catch (e: Exception) { null }
+            }
         }
+        return null
     }
-    return null
+    return scan { it == locationId } ?: scan { isWildcardLocation(it) }
 }
 
+/** Same exact-first, wildcard-fallback rule as [maxLotSize] — see its own doc. */
 private fun getProdArea(productId: String, locationId: String, data: Map<String, List<Map<String, Any?>>>): String? {
-    for (pl in data["productlocation"] ?: emptyList()) {
-        if ((pl["product_id"] as? String)?.trim() == productId && (pl["location_id"] as? String)?.trim() == locationId) {
-            val v = pl["prod_area"]?.toString()?.trim()
-            if (!v.isNullOrBlank()) return v
+    fun scan(matchesLocation: (String?) -> Boolean): String? {
+        for (pl in data["productlocation"] ?: emptyList()) {
+            if ((pl["product_id"] as? String)?.trim() == productId && matchesLocation((pl["location_id"] as? String)?.trim())) {
+                val v = pl["prod_area"]?.toString()?.trim()
+                if (!v.isNullOrBlank()) return v
+            }
         }
+        return null
     }
-    return null
+    return scan { it == locationId } ?: scan { isWildcardLocation(it) }
 }
 
 // ── Core recursive planning function ──────────────────────────────────────────
@@ -5435,14 +5524,8 @@ private fun buildOperationChildren(
     qty: Double,
     data: Map<String, List<Map<String, Any?>>>,
 ): List<Map<String, Any?>> {
-    val prodArea = (data["productlocation"] ?: return emptyList())
-        .firstOrNull {
-            (it["product_id"] as? String)?.trim() == productId &&
-            (it["location_id"] as? String)?.trim() == locationId
-        }
-        ?.get("prod_area")?.toString()?.trim()
-        ?.takeIf { it.isNotBlank() }
-        ?: return emptyList()
+    // getProdArea already applies the exact-first, wildcard-fallback productlocation rule.
+    val prodArea = getProdArea(productId, locationId, data) ?: return emptyList()
 
     val op = (data["operation"] ?: return emptyList())
         .firstOrNull { (it["prod_area"] as? String)?.trim() == prodArea }
