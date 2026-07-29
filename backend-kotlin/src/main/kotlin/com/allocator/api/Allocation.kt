@@ -70,6 +70,21 @@ internal fun buildBudgetsFromCaseAlloc(
     return result
 }
 
+/** The set of product ids covered by [rows] (an allocation version's stored rows) — i.e. the
+ *  critical-material set that version was generated for, based on the actual supply lots it
+ *  budgeted. Compared against [computeCriticalPids][com.allocator.services.computeCriticalPids]'s
+ *  live result at plan-submit time to detect a version that's gone stale (see call sites in
+ *  Allocate.kt's `runPlanBackground`/`runOneBootstrapPreset`). */
+internal fun caseAllocMaterialSet(
+    rows: List<CaseAllocRow>,
+    supplies: List<Map<String, Any?>>,
+): Set<String> {
+    val supplyToPid = supplies.associate { s ->
+        (s["supply_id"] as? String)?.trim().orEmpty() to (s["product_id"] as? String)?.trim().orEmpty()
+    }
+    return rows.mapNotNull { supplyToPid[it.supplyId]?.takeIf { pid -> pid.isNotBlank() } }.toSet()
+}
+
 /**
  * Recompute and persist case_allocation's content-hash fingerprint for [versionId] — call after
  * any write to [CaseAllocations], inside the SAME transaction as the row mutation so hash and

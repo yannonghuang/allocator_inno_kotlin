@@ -29,6 +29,24 @@ enum class ConfigVersionKind(val key: String) {
     CONSTR("constr"),
 }
 
+/**
+ * Parses `config.detached_external_configs` — a list of [ConfigVersionKind.key] strings the
+ * caller wants EXPLICITLY excluded from this run, regardless of whether the case has an existing
+ * default version for that kind. This is a third state alongside "explicit version pick" and
+ * "use the case's current default" (the plain absence of a `*_version_id` key): detaching means
+ * "never resolve any version for this kind on this run, full stop" — the per-request analog of
+ * [CaseConfigVersioning.resolveVersionId] returning null for a case that's never had a version at
+ * all. Added specifically so a stale/no-longer-representative version (e.g. a Critical Raw
+ * Allocation auto-seeded under a since-changed `purchase_allowed`) can be bypassed for one run
+ * without deleting it or touching the case's default. Per-request only — never persisted as a
+ * case-level setting.
+ */
+internal fun parseDetachedKinds(config: Map<String, Any?>?): Set<ConfigVersionKind> {
+    val raw = config?.get("detached_external_configs") as? List<*> ?: return emptySet()
+    val keys = raw.mapNotNull { (it as? String)?.trim() }.toSet()
+    return ConfigVersionKind.values().filter { it.key in keys }.toSet()
+}
+
 data class VersionSummary(
     val id: Int,
     val name: String?,
@@ -141,16 +159,32 @@ object CaseConfigVersioning {
 
     /** Creates a new (empty) version row. Caller is responsible for populating its data rows
      *  separately (this only creates the registry entry) — see each route file's "Save As"
-     *  handler, which creates the version then writes the submitted rows against its id. */
+     *  handler, which creates the version then writes the submitted rows against its id.
+     *
+     *  Always becomes the default when it's the case+kind's FIRST version ever, regardless of
+     *  [markDefault] — every "Save As" handler (and the planning-copilot's own version-create
+     *  calls) omits [markDefault] and relies on this default of `false`, which used to mean a
+     *  case whose only interaction with an object was "Save As" ended up with a version but NO
+     *  default at all. That violates the invariant [resolveVersionId]'s own doc assumes ("a
+     *  version exists ⇒ a default exists for that kind") and silently broke both the run picker
+     *  (its Preview button reads a version's id via `versions.find(v => v.is_default)`, which
+     *  found nothing) and plan submission itself (an untouched picker resolves via the same
+     *  `is_default` lookup server-side, so the run used NO override even though the UI showed a
+     *  version). A second-or-later "Save As" still stays non-default as before — only the very
+     *  first version for a case+kind is special-cased. */
     fun createVersion(caseId: Int, kind: ConfigVersionKind, name: String?, comments: String?, markDefault: Boolean = false): Int = transaction {
+        val isFirstVersion = !CaseConfigVersions.selectAll()
+            .where { (CaseConfigVersions.caseId eq caseId) and (CaseConfigVersions.kind eq kind.key) }
+            .any()
+        val effectiveDefault = markDefault || isFirstVersion
         val id = CaseConfigVersions.insert {
             it[CaseConfigVersions.caseId] = caseId
             it[CaseConfigVersions.kind] = kind.key
             it[CaseConfigVersions.name] = name?.trim()?.takeIf { s -> s.isNotBlank() }
             it[CaseConfigVersions.comments] = comments?.trim()?.takeIf { s -> s.isNotBlank() }
-            it[CaseConfigVersions.isDefault] = markDefault
+            it[CaseConfigVersions.isDefault] = effectiveDefault
         }[CaseConfigVersions.id]
-        if (markDefault) {
+        if (effectiveDefault) {
             CaseConfigVersions.update({ (CaseConfigVersions.caseId eq caseId) and (CaseConfigVersions.kind eq kind.key) and (CaseConfigVersions.id neq id) }) {
                 it[CaseConfigVersions.isDefault] = false
             }

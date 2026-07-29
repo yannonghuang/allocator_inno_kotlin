@@ -509,6 +509,10 @@ export type PlanningConfig = {
   demand_order_version_id?: number;
   purchasable_material_version_id?: number;
   constraint_version_id?: number;
+  /** Kind keys ('casealloc' | 'pref' | 'ord' | 'purchmat' | 'constr') explicitly detached for
+   *  this run — suppresses version resolution for that object regardless of the picks above or
+   *  the case's default. See `parseDetachedKinds`'s own doc (CaseConfigVersioning.kt). */
+  detached_external_configs?: string[];
 };
 
 export type PlanSupplyAllocation = {
@@ -1978,6 +1982,8 @@ export type SeedForm = {
   /** Blank/undefined or "auto": computed from the case's own demands. See PlanningConfig's
    *  identical field for the full semantics. */
   horizon_start?: string;
+  /** See PlanningConfig's identical field — kind keys detached for this whole batch. */
+  detached_external_configs?: string[];
 };
 
 /** Fetch the net-new max_methods sweep for the KB dialog — read-only, does not run anything.
@@ -2048,6 +2054,18 @@ export async function getCaseDemands(caseId: number): Promise<CaseDemandRow[]> {
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
   return data.demands as CaseDemandRow[];
+}
+
+/** What "Horizon start: auto" currently resolves to — first day of the earliest month among
+ *  this case's demand due dates, computed server-side (reuses the same canonical date-parsing
+ *  routine `resolveHorizonStart` uses at plan-submit time — demand due dates are known to arrive
+ *  in inconsistent formats, so this deliberately isn't reimplemented client-side). Null when the
+ *  case has no demands with a parseable due date. Read-only preview for the config forms. */
+export async function getHorizonStartDefault(caseId: number): Promise<string | null> {
+  const r = await fetch(`${API}/cases/${caseId}/plan/horizon-start-default`);
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return (data.horizon_start_default as string | null) ?? null;
 }
 
 // ── Config versioning (shared across the 5 "external config objects") ──────────

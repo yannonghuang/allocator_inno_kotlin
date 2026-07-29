@@ -88,6 +88,8 @@ private fun parseSeedForm(payload: JsonObject): com.allocator.services.CaseBoots
         rootWaterfall = bool("root_waterfall", true),
         equalSplitRawMaterials = str("raw_material_sourcing", "waterfall") == "equal_split",
         horizonStart = payload["horizon_start"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() },
+        detachedExternalConfigs = (payload["detached_external_configs"] as? JsonArray)
+            ?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList(),
     )
 }
 
@@ -301,6 +303,27 @@ fun Routing.allocateRoutes() {
             }
         }
         call.respond(payload)
+    }
+
+    // ── GET /cases/{case_id}/plan/horizon-start-default ───────────────────────
+    // The date "Horizon start: auto" currently resolves to — first day of the earliest month
+    // among this case's demand due dates (see computePlanningHorizonStart, PlanningEngine.kt).
+    // Read-only preview so the Planning/KB-seeding config forms can SHOW the real date instead
+    // of sitting blank; actual plan submission is unaffected — it still resolves this fresh,
+    // server-side, via resolveHorizonStart at submit time. Deliberately reuses the canonical
+    // date-parsing routine rather than duplicating it client-side — demand due dates are known to
+    // arrive in inconsistent formats (see resolveHorizonStart's own fallback-format handling), so
+    // a naive client-side string-min would silently disagree with (or fail to parse like) what
+    // the server actually resolves.
+    get("/cases/{case_id}/plan/horizon-start-default") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val demands = transaction {
+            Demands.selectAll().where { Demands.caseId eq caseId }
+                .map { mapOf("request_due_time" to it[Demands.requestDueTime]) }
+        }
+        val horizonStart = com.allocator.services.computePlanningHorizonStart(demands)
+        call.respond(buildJsonObject { put("horizon_start_default", horizonStart?.toString()) })
     }
 
     // ── GET /cases/{case_id}/plan/constraint-options ──────────────────────────
@@ -2763,7 +2786,17 @@ internal suspend fun runPlanBackground(
             }
         }
 
-        val caseAllocRows = loadCaseAllocRows(effectiveConfig.caseAllocVersionId)
+        val caseAllocRowsRaw = loadCaseAllocRows(effectiveConfig.caseAllocVersionId)
+        val caseAllocRows = caseAllocRowsRaw?.takeIf { rows ->
+            val stored = caseAllocMaterialSet(rows, data["supply"] ?: emptyList())
+            val current = com.allocator.services.computeCriticalPids(data, config)
+            val ok = stored == current
+            if (!ok) log.info(
+                "[plan] case {} allocation version {} covers a different critical-material set than this run ({} vs {} materials) — treating as detached",
+                caseId, effectiveConfig.caseAllocVersionId, stored.size, current.size,
+            )
+            ok
+        }
         val precomputedBudgets = if (caseAllocRows != null) {
             log.info("[plan] case {} has {} case_allocation rows — using as budget override", caseId, caseAllocRows.size)
             buildBudgetsFromCaseAlloc(caseAllocRows, data["supply"] ?: emptyList())
@@ -3009,7 +3042,17 @@ private suspend fun runOneBootstrapPreset(
     }
 
     try {
-        val caseAllocRows = loadCaseAllocRows(effectiveConfig.caseAllocVersionId)
+        val caseAllocRowsRaw = loadCaseAllocRows(effectiveConfig.caseAllocVersionId)
+        val caseAllocRows = caseAllocRowsRaw?.takeIf { rows ->
+            val stored = caseAllocMaterialSet(rows, data["supply"] ?: emptyList())
+            val current = com.allocator.services.computeCriticalPids(data, configMap)
+            val ok = stored == current
+            if (!ok) log.info(
+                "[bootstrap] case {} allocation version {} covers a different critical-material set than preset {} ({} vs {} materials) — treating as detached",
+                caseId, effectiveConfig.caseAllocVersionId, preset.presetId, stored.size, current.size,
+            )
+            ok
+        }
         val precomputedBudgets = caseAllocRows?.let { buildBudgetsFromCaseAlloc(it, data["supply"] ?: emptyList()) }
         val preferenceKb = loadPreferenceKb(effectiveConfig.prefVersionId)
         val demandOrder = loadDemandOrderMap(effectiveConfig.ordVersionId)
@@ -3272,17 +3315,16 @@ internal fun resolveEffectiveConfig(
     val horizonStart = com.allocator.services.resolveHorizonStart(c, data["demand"] ?: emptyList())
 
     fun explicitVersionId(key: String): Int? = (c[key] as? Number)?.toInt()
+    val detachedKinds = com.allocator.services.parseDetachedKinds(c)
+    fun resolveOrDetach(kind: ConfigVersionKind, explicitKey: String): Int? =
+        if (kind in detachedKinds) null
+        else CaseConfigVersioning.resolveVersionId(caseId, kind, explicitVersionId(explicitKey))
 
-    val caseAllocVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.CASEALLOC,
-        explicitVersionId("case_alloc_version_id"))
-    val prefVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.PREF,
-        explicitVersionId("pref_version_id"))
-    val ordVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.ORD,
-        explicitVersionId("demand_order_version_id"))
-    val purchMatVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.PURCHMAT,
-        explicitVersionId("purchasable_material_version_id"))
-    val constrVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.CONSTR,
-        explicitVersionId("constraint_version_id"))
+    val caseAllocVersionId = resolveOrDetach(ConfigVersionKind.CASEALLOC, "case_alloc_version_id")
+    val prefVersionId = resolveOrDetach(ConfigVersionKind.PREF, "pref_version_id")
+    val ordVersionId = resolveOrDetach(ConfigVersionKind.ORD, "demand_order_version_id")
+    val purchMatVersionId = resolveOrDetach(ConfigVersionKind.PURCHMAT, "purchasable_material_version_id")
+    val constrVersionId = resolveOrDetach(ConfigVersionKind.CONSTR, "constraint_version_id")
 
     val json = buildJsonObject {
         put("purchase_allowed", c["purchase_allowed"] as? Boolean ?: true)
