@@ -107,6 +107,7 @@ import {
   getHorizonStartDefault,
 } from '@/lib/api';
 import { computeHorizon, ScheduleBar, ScheduleHorizonRuler, methodColor, BorMiniTimeline, BorTimelineRuler } from './_workOrderSchedule';
+import { CollapsedWoView } from './_collapsedWoView';
 import { WoScheduleImpactPanel, WoScheduleQuickModal } from './_woScheduleImpact';
 import type { PlanResult, PlanStatusResponse } from '../../../lib/api';
 
@@ -1017,9 +1018,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planSupplyHideDummy, setPlanSupplyHideDummy] = useState(true);
   const [planSupplyCriticalOnly, setPlanSupplyCriticalOnly] = useState(false);
   const [planWorkOrderHideDummyProdArea, setPlanWorkOrderHideDummyProdArea] = useState(true);
-  // Which WO list the table shows: the consolidated procurement view, or the native per-demand
-  // view (1:1 with the pegging). Kept as separate tables so aggregates never double-count.
-  const [woTableTab, setWoTableTab] = useState<'consolidated' | 'native'>('consolidated');
+  // Which WO list the table shows: a (product, location, method) pivot built on top of the
+  // consolidated rows, the consolidated procurement view itself, or the native per-demand view
+  // (1:1 with the pegging). Kept as separate tables so aggregates never double-count.
+  const [woTableTab, setWoTableTab] = useState<'collapsed' | 'consolidated' | 'native'>('consolidated');
   const woRefreshingRef = useRef<HTMLDivElement>(null);
   // Tracks when a new plan result is being applied to the UI.
   // resultPending=true while React renders the expensive 26k-row WO table in a non-blocking transition.
@@ -1086,6 +1088,49 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planWoMakeOnly, setPlanWoMakeOnly] = useState(false);
   const [planWoMoveOnly, setPlanWoMoveOnly] = useState(false);
   const [planWoFilterDemandId, setPlanWoFilterDemandId] = useState('');
+  // Rows fed to the Collapsed pivot (_collapsedWoView.tsx) — mirrors the flat table's own filter
+  // predicates (hide-dummy-prod-area, the 8 pegging checkboxes, demand-id) applied to the
+  // consolidated source, WITHOUT the flat-table-only lot-grouping/requested-qty enrichment that
+  // follows it below (the pivot only needs product_id/location_id/method/quantity/end_time).
+  const collapsedFilteredRows = useMemo<WorkOrder[]>(() => {
+    const source = planResult?.work_orders ?? [];
+    let out = planWorkOrderHideDummyProdArea
+      ? source.filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'))
+      : source;
+    const anyPeggingFilter = planDemandRealMakeOnly || planDemandBuyOnly || planDemandRealMoveOnly || planWoDemandedByMultiple || planWoMultiSupply || planWoPurchaseOnly || planWoMakeOnly || planWoMoveOnly;
+    if (anyPeggingFilter) {
+      out = out.filter((r) => {
+        if (planDemandRealMakeOnly && !(r.pegging_includes_real_make === true)) return false;
+        if (planDemandBuyOnly && !(r.pegging_includes_buy === true)) return false;
+        if (planDemandRealMoveOnly && !(r.pegging_includes_real_move === true)) return false;
+        if (planWoDemandedByMultiple && !(r.demanded_by_multiple === true)) return false;
+        if (planWoMultiSupply && !(r.multi_supply_available === true)) return false;
+        if (planWoPurchaseOnly) { const m = (r.method ?? '').toLowerCase(); if (m !== 'buy' && m !== 'purchase') return false; }
+        if (planWoMakeOnly && (r.method ?? '').toLowerCase() !== 'make') return false;
+        if (planWoMoveOnly && (r.method ?? '').toLowerCase() !== 'move') return false;
+        return true;
+      });
+    }
+    const demandIdFilter = planWoFilterDemandId.trim();
+    if (demandIdFilter) {
+      out = out.filter((r) => {
+        if (r.demand_id === demandIdFilter) return true;
+        return r.wo_consolidation_split_details?.some((d) => d.demand_id === demandIdFilter) ?? false;
+      });
+    }
+    return out;
+  }, [planResult, planWorkOrderHideDummyProdArea, planDemandRealMakeOnly, planDemandBuyOnly, planDemandRealMoveOnly, planWoDemandedByMultiple, planWoMultiSupply, planWoPurchaseOnly, planWoMakeOnly, planWoMoveOnly, planWoFilterDemandId]);
+  // Number of pivot rows the Collapsed tab actually renders — distinct (product, location,
+  // method) groups, NOT the raw consolidated WO count (that badge belongs to the Consolidated
+  // tab; Collapsed merges many WOs into one row per group, so its own badge must match).
+  const collapsedGroupCount = useMemo(() => {
+    const keys = new Set(
+      collapsedFilteredRows
+        .filter((r) => r.method !== 'inventory')
+        .map((r) => `${r.product_id}|${r.location_id}|${r.method}`),
+    );
+    return keys.size;
+  }, [collapsedFilteredRows]);
   const [planWoPivot, setPlanWoPivot] = useState<'none' | 'prod_area' | 'location' | 'nested' | 'demand'>('none');
   const [planWoLayoutMode, setPlanWoLayoutMode] = useState<'data' | 'split' | 'timeline'>('split');
   const [woPegHighlightRow, setWoPegHighlightRow] = useState<WoEnrichedRow | null>(null);
@@ -5452,10 +5497,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               {planResultTab === 'work_orders' && (
                 <div style={{ padding: '0.75rem 1rem' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '0.75rem' }}>
-                    <h4 style={{ margin: 0 }}>{tP('workOrders.heading')}</h4>
-                    {/* ── Native vs Consolidated segment control ── */}
+                    {/* ── Collapsed vs Consolidated vs Native segment control ── */}
                     <div style={{ display: 'flex', border: '1px solid #3f3f46', borderRadius: 6, overflow: 'hidden' }}>
-                      {(['consolidated', 'native'] as const).map((tab) => (
+                      {(['collapsed', 'consolidated', 'native'] as const).map((tab) => (
                         <button
                           key={tab}
                           type="button"
@@ -5471,9 +5515,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             cursor: 'pointer',
                           }}
                         >
-                          {tP(tab === 'consolidated' ? 'workOrders.tabConsolidated' : 'workOrders.tabNative')}
+                          {tP(tab === 'collapsed' ? 'workOrders.tabCollapsed' : tab === 'consolidated' ? 'workOrders.tabConsolidated' : 'workOrders.tabNative')}
                           <span style={{ marginLeft: 6, opacity: 0.65, fontSize: '0.72rem' }}>
-                            {tab === 'consolidated' ? woTabEffectiveCounts.consolidated : woTabEffectiveCounts.native}
+                            {tab === 'native' ? woTabEffectiveCounts.native : tab === 'collapsed' ? collapsedGroupCount : woTabEffectiveCounts.consolidated}
                           </span>
                         </button>
                       ))}
@@ -5585,7 +5629,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <span>{tP('workOrders.hideDummy')}</span>
                     </label>
                   </div>
-                  {/* ── Pivot selector ── */}
+                  {/* ── Pivot selector — applies to the flat table's own rows, or (Collapsed tab)
+                      rolls the pivot table's groups up under collapsible PROD_AREA/Location
+                      section headers ── */}
                   <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
                     <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>Pivot:</span>
                     {(['none', 'prod_area', 'location', 'nested'] as const).map((mode) => (
@@ -5600,55 +5646,66 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       </button>
                     ))}
                   </div>
-                  {/* ── Layout selector (Data / Split / Timeline) ── */}
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
-                    <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>{tP('workOrders.layout.label')}</span>
-                    {(['data', 'split', 'timeline'] as const).map((mode) => {
-                      const label = mode === 'data' ? tP('workOrders.layout.data')
-                        : mode === 'split' ? tP('workOrders.layout.split')
-                          : tP('workOrders.layout.timeline');
-                      const tooltip = mode === 'data' ? tP('workOrders.layout.dataTooltip')
-                        : mode === 'split' ? tP('workOrders.layout.splitTooltip')
-                          : tP('workOrders.layout.timelineTooltip');
-                      return (
-                        <button
-                          key={mode}
-                          type="button"
-                          className={planWoLayoutMode === mode ? '' : 'secondary'}
-                          style={{ fontSize: '0.75rem', padding: '2px 10px' }}
-                          onClick={() => setPlanWoLayoutMode(mode)}
-                          title={tooltip}
-                        >
-                          {label}
-                        </button>
-                      );
-                    })}
-                    {woPegHighlightRow && (
-                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.75rem', color: '#a1a1aa', marginLeft: '0.5rem' }}>
-                        <span>
-                          <span style={{ color: '#e4e4e7' }}>{woPegHighlightRow.product_id}</span>
-                          {' @ '}
-                          <span style={{ color: '#e4e4e7' }}>{woPegHighlightRow.location_id}</span>
-                          {' · '}
-                          <span style={{ color: '#ec4899' }}>↓ {woPegRowCounts.ancestors}</span>
-                          {' · '}
-                          <span style={{ color: '#6366f1' }}>↑ {woPegRowCounts.descendants}</span>
+                  {/* ── Layout selector (Data / Split / Timeline) — flat-table only ── */}
+                  {woTableTab !== 'collapsed' && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>{tP('workOrders.layout.label')}</span>
+                      {(['data', 'split', 'timeline'] as const).map((mode) => {
+                        const label = mode === 'data' ? tP('workOrders.layout.data')
+                          : mode === 'split' ? tP('workOrders.layout.split')
+                            : tP('workOrders.layout.timeline');
+                        const tooltip = mode === 'data' ? tP('workOrders.layout.dataTooltip')
+                          : mode === 'split' ? tP('workOrders.layout.splitTooltip')
+                            : tP('workOrders.layout.timelineTooltip');
+                        return (
+                          <button
+                            key={mode}
+                            type="button"
+                            className={planWoLayoutMode === mode ? '' : 'secondary'}
+                            style={{ fontSize: '0.75rem', padding: '2px 10px' }}
+                            onClick={() => setPlanWoLayoutMode(mode)}
+                            title={tooltip}
+                          >
+                            {label}
+                          </button>
+                        );
+                      })}
+                      {woPegHighlightRow && (
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.75rem', color: '#a1a1aa', marginLeft: '0.5rem' }}>
+                          <span>
+                            <span style={{ color: '#e4e4e7' }}>{woPegHighlightRow.product_id}</span>
+                            {' @ '}
+                            <span style={{ color: '#e4e4e7' }}>{woPegHighlightRow.location_id}</span>
+                            {' · '}
+                            <span style={{ color: '#ec4899' }}>↓ {woPegRowCounts.ancestors}</span>
+                            {' · '}
+                            <span style={{ color: '#6366f1' }}>↑ {woPegRowCounts.descendants}</span>
+                          </span>
+                          <button
+                            type="button"
+                            className="secondary"
+                            style={{ fontSize: '0.7rem', padding: '1px 8px' }}
+                            onClick={() => { setWoPegHighlightRow(null); }}
+                          >{tc('clear')}</button>
                         </span>
-                        <button
-                          type="button"
-                          className="secondary"
-                          style={{ fontSize: '0.7rem', padding: '1px 8px' }}
-                          onClick={() => { setWoPegHighlightRow(null); }}
-                        >{tc('clear')}</button>
-                      </span>
-                    )}
-                  </div>
+                      )}
+                    </div>
+                  )}
                   {/* Refreshing banner — shown via DOM ref BEFORE the expensive table re-render,
                       bypassing React's synchronous render cycle so the browser paints it first. */}
                   <div ref={woRefreshingRef} style={{ display: 'none', alignItems: 'center', gap: '0.5rem', padding: '6px 14px', marginBottom: '0.5rem', background: 'rgba(251,191,36,0.18)', border: '1px solid rgba(251,191,36,0.5)', borderRadius: 5, color: '#fbbf24', fontSize: '0.85rem', fontWeight: 700 }}>
                     ↻ Refreshing…
                   </div>
-                  {planResult.work_orders.length > 0 && (() => {
+                  {woTableTab === 'collapsed' && (
+                    <CollapsedWoView
+                      rows={collapsedFilteredRows}
+                      makeBatchScale={planningConfig.consolidation?.make_batch_scale}
+                      moveBatchScale={planningConfig.consolidation?.move_batch_scale}
+                      purchaseBatchScale={planningConfig.consolidation?.purchase_batch_scale}
+                      pivot={planWoPivot === 'demand' ? 'none' : planWoPivot}
+                    />
+                  )}
+                  {woTableTab !== 'collapsed' && planResult.work_orders.length > 0 && (() => {
                     const workOrdersFiltered = planWorkOrderHideDummyProdArea
                       ? activeWorkOrders.filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'))
                       : activeWorkOrders;
@@ -5669,7 +5726,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       </details>
                     ) : null;
                   })()}
-                  {(() => {
+                  {woTableTab !== 'collapsed' && (() => {
                     let workOrderRows = planWorkOrderHideDummyProdArea
                       ? activeWorkOrders.filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'))
                       : activeWorkOrders;

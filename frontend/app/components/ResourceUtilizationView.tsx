@@ -13,7 +13,16 @@ import {
   type ResourceUtilizationRow,
   type WorkOrder,
 } from '@/lib/api';
-import { ScheduleHorizonRuler, type Horizon, type ScheduleGranularity } from '../cases/[id]/_workOrderSchedule';
+import {
+  ScheduleHorizonRuler,
+  type Horizon,
+  type ScheduleGranularity,
+  parseUtcDate,
+  periodKey,
+  periodStartMs,
+  periodEndMs,
+  periodLabel,
+} from '../cases/[id]/_workOrderSchedule';
 import { ConsolidatedWoAccordion } from './ConsolidatedWoAccordion';
 import { SinglePeggingTreePanel } from './SinglePeggingTreePanel';
 
@@ -515,81 +524,11 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
 
 const DAY_MS = 86_400_000;
 
-function parseUtcDate(s: string): Date | null {
-  if (!s) return null;
-  const d = new Date(`${s.slice(0, 10)}T00:00:00Z`);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-
 function granularityNoun(t: ReturnType<typeof useTranslations>, g: ScheduleGranularity): string {
   if (g === 'day') return t('granularityNounDay');
   if (g === 'week') return t('granularityNounWeek');
   if (g === 'month') return t('granularityNounMonth');
   return t('granularityNounQuarter');
-}
-
-/** Group key for a day. Buckets sharing a key roll into one period. */
-function periodKey(isoDate: string, g: ScheduleGranularity): string {
-  if (g === 'month') return isoDate.slice(0, 7);
-  if (g === 'quarter') {
-    const d = parseUtcDate(isoDate)!;
-    const q = Math.floor(d.getUTCMonth() / 3);
-    return `${d.getUTCFullYear()}-Q${q + 1}`;
-  }
-  if (g === 'week') {
-    const d = parseUtcDate(isoDate)!;
-    const dow = d.getUTCDay();
-    const offset = (dow + 6) % 7; // Mon = 0
-    d.setUTCDate(d.getUTCDate() - offset);
-    return d.toISOString().slice(0, 10);
-  }
-  return isoDate;
-}
-
-/** UTC midnight of the first day in the period containing isoDate. */
-function periodStartMs(isoDate: string, g: ScheduleGranularity): number {
-  const d = parseUtcDate(isoDate)!;
-  if (g === 'month') return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
-  if (g === 'quarter') {
-    const q = Math.floor(d.getUTCMonth() / 3);
-    return Date.UTC(d.getUTCFullYear(), q * 3, 1);
-  }
-  if (g === 'week') {
-    const dow = d.getUTCDay();
-    const offset = (dow + 6) % 7;
-    return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - offset);
-  }
-  return d.getTime();
-}
-
-/** UTC midnight of the first day AFTER the period containing isoDate. */
-function periodEndMs(isoDate: string, g: ScheduleGranularity): number {
-  const d = parseUtcDate(isoDate)!;
-  if (g === 'month') return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1);
-  if (g === 'quarter') {
-    const q = Math.floor(d.getUTCMonth() / 3);
-    return Date.UTC(d.getUTCFullYear(), (q + 1) * 3, 1);
-  }
-  if (g === 'week') {
-    return periodStartMs(isoDate, g) + 7 * DAY_MS;
-  }
-  return d.getTime() + DAY_MS;
-}
-
-function periodLabel(isoDate: string, g: ScheduleGranularity, locale: string): string {
-  if (g === 'month') return isoDate.slice(0, 7);
-  if (g === 'quarter') {
-    const d = parseUtcDate(isoDate)!;
-    return `Q${Math.floor(d.getUTCMonth() / 3) + 1} ${d.getUTCFullYear()}`;
-  }
-  if (g === 'week') {
-    return new Date(periodStartMs(isoDate, g)).toISOString().slice(0, 10);
-  }
-  try {
-    return new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeZone: 'UTC' }).format(parseUtcDate(isoDate)!);
-  } catch {
-    return isoDate;
-  }
 }
 
 /**
