@@ -45,10 +45,16 @@ object OperationLookup {
         val fallback = EffectiveLead(methodMakeLeadDays, "method_make")
         if (qty <= 0.0) return fallback
 
-        val productLocationRow = (data["productlocation"] ?: return fallback)
-            .firstOrNull {
+        // Exact (product, location) row wins; a wildcard-location row (see isWildcardLocation,
+        // PlanningEngine.kt) is only consulted when no exact row exists for this product.
+        val productLocationRows = data["productlocation"] ?: return fallback
+        val productLocationRow = productLocationRows.firstOrNull {
                 (it["product_id"] as? String)?.trim() == productId &&
                 (it["location_id"] as? String)?.trim() == locationId
+            }
+            ?: productLocationRows.firstOrNull {
+                (it["product_id"] as? String)?.trim() == productId &&
+                isWildcardLocation(it["location_id"] as? String)
             }
             ?: return fallback
 
@@ -144,11 +150,17 @@ object OperationLookup {
         locationId: String,
         data: Map<String, List<Map<String, Any?>>>,
     ): Int {
-        val productLocationRow = (data["productlocation"] ?: return 0)
-            .firstOrNull {
+        // Same exact-first, wildcard-fallback rule as effectiveLeadDays above.
+        val productLocationRows = data["productlocation"] ?: return 0
+        val productLocationRow = productLocationRows.firstOrNull {
                 (it["product_id"] as? String)?.trim() == productId &&
                 (it["location_id"] as? String)?.trim() == locationId
-            } ?: return 0
+            }
+            ?: productLocationRows.firstOrNull {
+                (it["product_id"] as? String)?.trim() == productId &&
+                isWildcardLocation(it["location_id"] as? String)
+            }
+            ?: return 0
 
         val prodArea = productLocationRow["prod_area"]?.toString()?.trim()
             ?.takeIf { it.isNotBlank() } ?: return 0

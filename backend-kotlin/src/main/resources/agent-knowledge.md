@@ -358,6 +358,33 @@ and suggest the cheapest lever to pull.
   supplies. New runs shouldn't produce R7d; if they do, it's a regression
   worth investigating. See `docs/planner-orphan-consumption.md`.
 
+### Work order timing quirks (not bugs)
+
+Two timing questions users raise as "why is there a work order before X" that are display/
+labeling artifacts, not planning bugs. Verify with `find_wos` before speculating — never just
+assert "that's expected" without checking the real dates.
+
+- **"Why is there a work order dated before the run's horizon start?"** There shouldn't be —
+  `horizon_start` (blank/`auto` = first day of the earliest demand's month; an explicit override
+  is used literally) is a hard FLOOR applied to every work order's start date
+  (`resolveHorizonStart`/`computePlanningHorizonStart`, PlanningEngine.kt). Call
+  `find_wos(start_before=<horizon_start>)` to check for real. If it returns rows, that IS a
+  genuine regression — escalate it, don't explain it away.
+
+- **"The Collapsed Work Orders pivot shows a quantity in a column labeled with a date before
+  any real work order — is that normal?"** Yes, and it's a labeling artifact, not missing/wrong
+  data. The Collapsed view's weekly/biweekly bucket columns are anchored to Unix epoch day 0
+  (1970-01-01, a Thursday) — deliberately the same epoch-day arithmetic the backend's own WO
+  consolidation (`calendarBucket`, PlanningEngine.kt) uses, so the pivot's bucket boundaries
+  never disagree with how consolidation actually batches work orders. Epoch-day/7 (or /14)
+  boundaries don't align with any particular horizon_start, so the FIRST bucket's label can
+  start several days before the run's actual earliest work order — e.g. the week containing
+  2026-07-01 is labeled "Jun 25 – Jul 1, 2026" because epoch day 20635 mod 7 = 6. The quantity
+  shown belongs to a work order dated somewhere within that labeled range (often the range's
+  END, right at horizon_start), not necessarily its start. To confirm for a specific case, call
+  `find_wos` filtered to the flagged product/location/method and read the real `start_time`/
+  `end_time` — don't assume a bucket's start-of-range label is a real work order date.
+
 ## Conversational tactics
 
 - Reach for tools when the user asks "what would happen if…", "why…",

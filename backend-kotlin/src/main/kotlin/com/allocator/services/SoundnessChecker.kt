@@ -1056,10 +1056,12 @@ private class WalkContext(
         val lid = node["location_id"]?.toString()?.trim() ?: ""
 
         // R2: a method_make must exist for (pid, lid). We look up method_make rows
-        // matching pid, with lid match (or VIRTUAL fallback consistent with getMethods).
+        // matching pid, with lid match (or VIRTUAL fallback, or a wildcard LOCATION_ID row —
+        // "any location" — consistent with getMethods/isWildcardLocation, PlanningEngine.kt).
         val matchingMakes = methodMakes.filter {
             (it["product_id"] as? String)?.trim() == pid &&
-                ((it["location_id"] as? String)?.trim() == lid || lid.isBlank() || lid == "VIRTUAL")
+                ((it["location_id"] as? String)?.trim() == lid || lid.isBlank() || lid == "VIRTUAL" ||
+                    isWildcardLocation(it["location_id"] as? String))
         }
         if (matchingMakes.isEmpty()) {
             violations.add(Violation(
@@ -1267,11 +1269,13 @@ private class WalkContext(
         val toLid = node["location_id"]?.toString()?.trim() ?: ""
         val fromLid = node["location_source"]?.toString()?.trim() ?: ""
 
-        // R3: a method_move must exist for (pid, from_lid, to_lid).
+        // R3: a method_move must exist for (pid, from_lid, to_lid) — either side may instead be
+        // backed by a wildcard FROM_LOCATION_ID/TO_LOCATION_ID row ("any location"), consistent
+        // with getMethods/expandMoveWildcardSource/isWildcardLocation (PlanningEngine.kt).
         val matchingMove = methodMoves.firstOrNull {
             (it["product_id"] as? String)?.trim() == pid &&
-                (it["from_location_id"] as? String)?.trim() == fromLid &&
-                (it["to_location_id"] as? String)?.trim() == toLid
+                ((it["from_location_id"] as? String)?.trim() == fromLid || isWildcardLocation(it["from_location_id"] as? String)) &&
+                ((it["to_location_id"] as? String)?.trim() == toLid || isWildcardLocation(it["to_location_id"] as? String))
         }
         if (matchingMove == null) {
             violations.add(Violation(
@@ -1632,6 +1636,11 @@ internal fun verifyResourceOverload(
         val lid = (it["location_id"] as? String)?.trim() ?: ""
         (pid to lid) to ((it["prod_area"] as? String)?.trim() ?: "")
     }
+    // Fallback when no exact (pid, lid) row exists — a wildcard LOCATION_ID row ("any location"),
+    // consulted the same exact-first way as getProdArea (PlanningEngine.kt).
+    val prodAreaWildcardByPid = productLocations
+        .filter { isWildcardLocation(it["location_id"] as? String) }
+        .associate { (it["product_id"] as? String)?.trim().orEmpty() to ((it["prod_area"] as? String)?.trim() ?: "") }
 
     // Daily load accumulator keyed by (resource_id, location_id).
     val loadMap = mutableMapOf<Pair<String, String>, MutableMap<LocalDate, Double>>()
@@ -1644,7 +1653,7 @@ internal fun verifyResourceOverload(
         val endDt   = parseDateLocal(wo["end_time"]   as? String) ?: continue
         if (!endDt.isAfter(startDt)) continue
 
-        val prodArea = prodAreaByPidLid[pid to lid]?.takeIf { it.isNotBlank() } ?: continue
+        val prodArea = (prodAreaByPidLid[pid to lid] ?: prodAreaWildcardByPid[pid])?.takeIf { it.isNotBlank() } ?: continue
         val op = operationByProdArea[prodArea] ?: continue
         val borId = (op["bor_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: continue
         val borRows = borsById[borId] ?: continue
