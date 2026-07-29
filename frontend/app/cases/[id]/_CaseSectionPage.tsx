@@ -5453,7 +5453,31 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <div style={{ padding: '0.75rem 1rem' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '0.75rem' }}>
                     <h4 style={{ margin: 0 }}>{tP('workOrders.heading')}</h4>
-                    <span style={{ fontSize: '0.72rem', color: '#71717a' }}>{woTabEffectiveCounts.consolidated}</span>
+                    {/* ── Native vs Consolidated segment control ── */}
+                    <div style={{ display: 'flex', border: '1px solid #3f3f46', borderRadius: 6, overflow: 'hidden' }}>
+                      {(['consolidated', 'native'] as const).map((tab) => (
+                        <button
+                          key={tab}
+                          type="button"
+                          onClick={() => { if (woRefreshingRef.current) woRefreshingRef.current.style.display = 'flex'; startTransition(() => setWoTableTab(tab)); }}
+                          style={{
+                            fontSize: '0.82rem',
+                            padding: '4px 14px',
+                            borderRadius: 0,
+                            border: 'none',
+                            background: woTableTab === tab ? '#3f3f46' : 'transparent',
+                            color: woTableTab === tab ? '#f4f4f5' : '#a1a1aa',
+                            fontWeight: woTableTab === tab ? 600 : 400,
+                            cursor: 'pointer',
+                          }}
+                        >
+                          {tP(tab === 'consolidated' ? 'workOrders.tabConsolidated' : 'workOrders.tabNative')}
+                          <span style={{ marginLeft: 6, opacity: 0.65, fontSize: '0.72rem' }}>
+                            {tab === 'consolidated' ? woTabEffectiveCounts.consolidated : woTabEffectiveCounts.native}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
                   </div>
                   <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.25rem' }}>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
