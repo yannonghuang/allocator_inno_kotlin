@@ -196,6 +196,33 @@ function buildSections(groups: GroupRow[], by: 'prod_area' | 'location'): Sectio
  * displayed cell despite having been assigned to different consolidation windows. Only a shared
  * `window_key` means consolidation's own key genuinely collided and it still didn't merge them —
  * flagged visibly; everything else is summed silently, no flag.
+ *
+ * KNOWN REMAINING FALSE-POSITIVE CLASS (investigated on case 173, 2026-07-30; not fixed —
+ * revisit later): a WO that was a *singleton* at every consolidation stage never gets
+ * `wo_window_start` populated at all (it's only written on a merge's output — PlanningEngine.kt
+ * has exactly 3 call sites, all merge-branch-only), so this component falls back to `end_time` for
+ * it, which reintroduces the exact false-positive risk above. Confirmed root cause (debug-log
+ * instrumented rerun of case 173): two independently-and-correctly-consolidated singleton WOs
+ * (different weeks at consolidation time) can each be pushed later by resource-contention
+ * scheduling by a *different* number of days and coincidentally land on the same final day —
+ * observed e.g. product 500-6267 (pushed 8d and 3d respectively, converging on the same date) and
+ * 500-4212 (pushed 20d and 24d). This is NOT a consolidation bug — R5_predecessor_sequencing
+ * (SoundnessChecker.kt) is actively kept sound across pushes via `resequenceFromPegging`'s
+ * `pushUp` DAG cascade (PlanningEngine.kt ~7606), so ordering is fine; it's a display-only
+ * coincidence from consolidation and resource-contention scheduling running as two one-way,
+ * non-communicating phases. Two fixes were considered and rejected:
+ *   1. Re-run consolidation after arbitration: a merge can increase a batch's `lot_count`/duration
+ *      beyond what `ResourceScheduler.arbitrate` already reserved on that shared resource for that
+ *      day — risks a genuine R12 resource-overload violation, and re-arbitrating to fix that isn't
+ *      guaranteed to converge (the existing arbitrate→cascade loop is deliberately capped at two
+ *      passes, not run to a fixed point).
+ *   2. Arbitrate before consolidating: PlanningEngine.kt ~6434 documents that arbitration
+ *      deliberately runs over CONSOLIDATED lots "so capacity is checked against the real
+ *      production-lot count instead of an inflated per-demand count" — arbitrating first would
+ *      systematically overstate resource contention (many small native WOs instead of few batched
+ *      ones) and degrade fill-rate/delivery-performance on every run, not just this edge case.
+ * No frontend or backend fix applied for this class; the banner will still occasionally
+ * over-count on cases with heavy resource contention. See project memory for the full writeup.
  */
 export function CollapsedWoView({
   rows,
