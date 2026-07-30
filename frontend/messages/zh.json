@@ -580,6 +580,7 @@
       "tabNative": "原生（按需求）",
       "tabCollapsed": "折叠",
       "collapsedGranularity": "按周期分组",
+      "collapsedColGroup": "分组",
       "collapsedColProduct": "产品",
       "collapsedColLocation": "地点",
       "collapsedColMethod": "方式",

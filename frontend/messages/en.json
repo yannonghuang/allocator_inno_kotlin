@@ -580,6 +580,7 @@
       "tabNative": "Native (per-demand)",
       "tabCollapsed": "Collapsed",
       "collapsedGranularity": "Bucket by",
+      "collapsedColGroup": "Group",
       "collapsedColProduct": "Product",
       "collapsedColLocation": "Location",
       "collapsedColMethod": "Method",

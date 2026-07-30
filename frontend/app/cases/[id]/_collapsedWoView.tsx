@@ -19,9 +19,22 @@ export type WoPivotMode = 'none' | 'prod_area' | 'location' | 'nested';
 const SCALE_RANK: Record<WoBatchScale, number> = { none: 0, weekly: 1, biweekly: 2, monthly: 3, all: 4 };
 const GRANULARITIES: WoBatchScale[] = ['none', 'weekly', 'biweekly', 'monthly', 'all'];
 const DAY_MS = 86_400_000;
-// Sticky identity columns — Product/Location/Method, split so each is independently sortable via
-// the Sort-by control. Fixed pixel widths so each column's `left` offset (for CSS sticky
-// stacking) can be computed instead of measured.
+const HEADER_ROW_H = 28;
+
+/** One step finer than `scale` in GRANULARITIES ('all'→'monthly'→'biweekly'→'weekly'→'none'),
+ *  or null once already at 'none' (nothing finer to drill into). */
+function nextFinerScale(scale: WoBatchScale): WoBatchScale | null {
+  const idx = GRANULARITIES.indexOf(scale);
+  return idx > 0 ? GRANULARITIES[idx - 1] : null;
+}
+// Sticky identity columns. COL_GROUP_W is a column dedicated ONLY to the pivot path (chevron +
+// section label + count/total on aggregate rows, blank on leaf rows) — kept separate from
+// Product/Location/Method so a given column position always means the same thing regardless of
+// row type, instead of Product's column doubling as a colSpan'd pivot label on aggregate rows.
+// Product/Location/Method are split so each is independently sortable via the Sort-by control.
+// Fixed pixel widths so each column's `left` offset (for CSS sticky stacking) can be computed
+// instead of measured.
+const COL_GROUP_W = 200;
 const COL_PRODUCT_W = 140;
 const COL_LOCATION_W = 90;
 const COL_METHOD_W = 110;
@@ -93,10 +106,12 @@ function formatDateRange(start: Date, end: Date, locale: string): string {
 }
 
 /** Ordered bucket list spanning every day in [minIso, maxIso] at the given scale — same key
- *  scheme as [bucketKeyFor], so a WO's bucketKeyFor(...) always matches one of these entries. */
-function buildBuckets(minIso: string, maxIso: string, scale: WoBatchScale, locale: string, allLabel: string): { key: string; label: string }[] {
-  const buckets: { key: string; label: string }[] = [];
-  if (scale === 'all') return [{ key: 'all', label: allLabel }];
+ *  scheme as [bucketKeyFor], so a WO's bucketKeyFor(...) always matches one of these entries.
+ *  Each entry also carries its own [startIso, endIso] range so a bucket can later be re-queried
+ *  as the [minIso, maxIso] of a finer `buildBuckets` call (local column drill-down). */
+function buildBuckets(minIso: string, maxIso: string, scale: WoBatchScale, locale: string, allLabel: string): Bucket[] {
+  const buckets: Bucket[] = [];
+  if (scale === 'all') return [{ key: 'all', label: allLabel, startIso: minIso, endIso: maxIso }];
   if (scale === 'monthly') {
     let y = +minIso.slice(0, 4);
     let m = +minIso.slice(5, 7);
@@ -104,7 +119,9 @@ function buildBuckets(minIso: string, maxIso: string, scale: WoBatchScale, local
     const maxM = +maxIso.slice(5, 7);
     let guard = 0;
     while ((y < maxY || (y === maxY && m <= maxM)) && guard++ < 600) {
-      buckets.push({ key: `${y}-${pad2(m)}`, label: `${y}-${pad2(m)}` });
+      const startIso = `${y}-${pad2(m)}-01`;
+      const endIso = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10); // last day of month m (1-indexed)
+      buckets.push({ key: `${y}-${pad2(m)}`, label: `${y}-${pad2(m)}`, startIso, endIso });
       m += 1;
       if (m > 12) { m = 1; y += 1; }
     }
@@ -116,11 +133,13 @@ function buildBuckets(minIso: string, maxIso: string, scale: WoBatchScale, local
   let guard = 0;
   for (let b = minBucket; b <= maxBucket && guard < 3000; b++, guard++) {
     const startDay = b * step;
+    const startIso = dateFromEpochDay(startDay).toISOString().slice(0, 10);
+    const endIso = dateFromEpochDay(startDay + step - 1).toISOString().slice(0, 10);
     if (scale === 'none') {
-      buckets.push({ key: dateFromEpochDay(startDay).toISOString().slice(0, 10), label: formatDate(dateFromEpochDay(startDay), locale) });
+      buckets.push({ key: startIso, label: formatDate(dateFromEpochDay(startDay), locale), startIso, endIso: startIso });
     } else {
       const rangeLabel = formatDateRange(dateFromEpochDay(startDay), dateFromEpochDay(startDay + step - 1), locale);
-      buckets.push({ key: `${scale === 'weekly' ? 'w' : 'b'}${b}`, label: rangeLabel });
+      buckets.push({ key: `${scale === 'weekly' ? 'w' : 'b'}${b}`, label: rangeLabel, startIso, endIso });
     }
   }
   return buckets;
@@ -137,8 +156,11 @@ type GroupRow = {
   cells: Map<string, Cell>;
   total: number;
 };
-type Bucket = { key: string; label: string };
+type Bucket = { key: string; label: string; startIso: string; endIso: string };
 type Section = { key: string; groups: GroupRow[]; total: number };
+/** Derived column list rendered by `renderTable`: a collapsed top bucket renders as itself; an
+ *  expanded one is replaced by its finer sub-buckets (mirrors AllocationMatrixView's `ColSpec`). */
+type ColSpec = { type: 'top'; bucket: Bucket } | { type: 'sub'; topKey: string; bucket: Bucket };
 
 function buildSections(groups: GroupRow[], by: 'prod_area' | 'location'): Section[] {
   const map = new Map<string, GroupRow[]>();
@@ -198,6 +220,35 @@ export function CollapsedWoView({
   const sortIndicator = (key: 'product' | 'location' | 'method') =>
     sort?.key === key ? (sort.dir === 'asc' ? ' ↑' : ' ↓') : '';
 
+  // Local drill-down state — kept in this component (not lifted to the caller), mirroring
+  // AllocationMatrixView's expandedCustomers/expandedSupplyGroups: this view owns its own
+  // view-interaction state, the caller only owns the row data.
+  const [expandedBuckets, setExpandedBuckets] = useState<Set<string>>(new Set());
+  // Two pivot row levels, each collapsed by default (aggregate-row-only), mirroring
+  // AllocationMatrixView's expandedSupplyGroups: sectionExpanded reveals the sub-level (the other
+  // dimension, or Location under nested's PROD_AREA); leafExpanded (keyed by the composite
+  // `${topKey}|${subKey}`) reveals that sub-section's actual leaf rows.
+  const [sectionExpanded, setSectionExpanded] = useState<Set<string>>(new Set());
+  const [leafExpanded, setLeafExpanded] = useState<Set<string>>(new Set());
+  const toggleBucket = (key: string) =>
+    setExpandedBuckets((prev) => {
+      const next = new Set(prev);
+      next.has(key) ? next.delete(key) : next.add(key);
+      return next;
+    });
+  const toggleSection = (key: string) =>
+    setSectionExpanded((prev) => {
+      const next = new Set(prev);
+      next.has(key) ? next.delete(key) : next.add(key);
+      return next;
+    });
+  const toggleLeaf = (key: string) =>
+    setLeafExpanded((prev) => {
+      const next = new Set(prev);
+      next.has(key) ? next.delete(key) : next.add(key);
+      return next;
+    });
+
   const scaleForMethod = (method: string): WoBatchScale => {
     if (method === 'make') return makeBatchScale;
     if (method === 'move') return moveBatchScale;
@@ -205,12 +256,12 @@ export function CollapsedWoView({
     return 'weekly';
   };
 
-  const { groups, buckets, excludedCount, flaggedCount } = useMemo(() => {
+  const { groups, buckets, excludedCount } = useMemo(() => {
     const candidateRows = rows.filter((r) => r.method !== 'inventory');
     const validRows = candidateRows.filter((r) => !!r.end_time);
     const excludedCount = candidateRows.length - validRows.length;
     if (validRows.length === 0) {
-      return { groups: [] as GroupRow[], buckets: [] as Bucket[], excludedCount, flaggedCount: 0 };
+      return { groups: [] as GroupRow[], buckets: [] as Bucket[], excludedCount };
     }
     const ends = validRows.map((r) => (r.end_time as string).slice(0, 10));
     const minIso = ends.reduce((a, b) => (a < b ? a : b));
@@ -239,18 +290,78 @@ export function CollapsedWoView({
       grp.total += qty;
     }
     const groups = Array.from(groupMap.values());
-    let flaggedCount = 0;
-    for (const grp of groups) {
-      const consolidationRank = SCALE_RANK[scaleForMethod(grp.method)];
-      const pivotRank = SCALE_RANK[granularity];
-      const alertOnCollision = consolidationRank >= pivotRank;
-      for (const cell of Array.from(grp.cells.values())) {
-        if (cell.contributors.length > 1 && alertOnCollision) flaggedCount++;
-      }
-    }
-    return { groups, buckets, excludedCount, flaggedCount };
+    return { groups, buckets, excludedCount };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rows, granularity, locale, makeBatchScale, moveBatchScale, purchaseBatchScale]);
+
+  // Column plan: each top-level bucket renders as itself, unless locally expanded, in which case
+  // it's replaced by finer sub-buckets computed from that bucket's OWN [startIso, endIso] range —
+  // buildBuckets is reused as-is, just called again with a narrower range and one scale finer.
+  const drillPlan = useMemo(() => {
+    const subBucketsByTop = new Map<string, Bucket[]>();
+    const finerByTop = new Map<string, WoBatchScale>();
+    const finer = nextFinerScale(granularity);
+    if (finer) {
+      for (const b of buckets) {
+        if (!expandedBuckets.has(b.key)) continue;
+        subBucketsByTop.set(b.key, buildBuckets(b.startIso, b.endIso, finer, locale, tP('config.woBatchAll')));
+        finerByTop.set(b.key, finer);
+      }
+    }
+    return { subBucketsByTop, finerByTop, canDrill: !!finer };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [buckets, expandedBuckets, granularity, locale]);
+
+  const colSpecs = useMemo<ColSpec[]>(() => {
+    const specs: ColSpec[] = [];
+    for (const b of buckets) {
+      const subs = drillPlan.subBucketsByTop.get(b.key);
+      if (subs && subs.length > 0) {
+        for (const sb of subs) specs.push({ type: 'sub', topKey: b.key, bucket: sb });
+      } else {
+        specs.push({ type: 'top', bucket: b });
+      }
+    }
+    return specs;
+  }, [buckets, drillPlan]);
+  const anyBucketExpanded = drillPlan.subBucketsByTop.size > 0;
+
+  /** A sub-bucket has no cell of its own — it's derived on demand by re-bucketing its parent top
+   *  cell's raw `contributors` (end_time+quantity) at the finer scale. This is why `Cell` tracks
+   *  contributors in the first place: it's exactly the data a local drill needs, with no need to
+   *  re-touch the original `rows` or re-run the heavy grouping memo. */
+  const getCellForSpec = (grp: GroupRow, spec: ColSpec): Cell | undefined => {
+    if (spec.type === 'top') return grp.cells.get(spec.bucket.key);
+    const parentCell = grp.cells.get(spec.topKey);
+    if (!parentCell) return undefined;
+    const finer = drillPlan.finerByTop.get(spec.topKey)!;
+    let cell: Cell | undefined;
+    for (const c of parentCell.contributors) {
+      if (bucketKeyFor(c.end_time.slice(0, 10), finer) !== spec.bucket.key) continue;
+      if (!cell) cell = { qty: 0, contributors: [] };
+      cell.qty += c.quantity;
+      cell.contributors.push(c);
+    }
+    return cell;
+  };
+  const rankForSpec = (spec: ColSpec): number =>
+    spec.type === 'top' ? SCALE_RANK[granularity] : SCALE_RANK[drillPlan.finerByTop.get(spec.topKey)!];
+
+  // Recomputed from the currently-visible columns (not the raw grouping pass) so drilling into a
+  // flagged bucket can legitimately clear the flag (the collision only existed at the coarser
+  // view) or keep it (a real consolidation problem) — both are informative.
+  const visibleFlaggedCount = useMemo(() => {
+    let count = 0;
+    for (const grp of groups) {
+      const consolidationRank = SCALE_RANK[scaleForMethod(grp.method)];
+      for (const spec of colSpecs) {
+        const cell = getCellForSpec(grp, spec);
+        if (cell && cell.contributors.length > 1 && consolidationRank >= rankForSpec(spec)) count++;
+      }
+    }
+    return count;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groups, colSpecs, drillPlan, granularity]);
 
   // Filter + sort are cheap over the already-grouped rows, so kept out of the heavy
   // grouping/bucketing memo above — typing in the filter box never re-buckets.
@@ -273,78 +384,49 @@ export function CollapsedWoView({
     return <div style={{ padding: '1rem', color: '#a1a1aa', fontSize: '0.875rem' }}>{tP('workOrders.collapsedEmpty')}</div>;
   }
 
-  const renderTable = (rowsForTable: GroupRow[]) => (
-    <div style={{ overflowX: 'auto', border: '1px solid #3f3f46', borderRadius: 6 }}>
-      <table style={{ borderCollapse: 'collapse', fontSize: '0.8rem', minWidth: '100%' }}>
-        <thead>
-          <tr>
-            <th style={{ position: 'sticky', left: 0, zIndex: 1, width: COL_PRODUCT_W, minWidth: COL_PRODUCT_W, background: '#18181b', textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
-              <button type="button" onClick={() => toggleSort('product')} style={sortThBtnStyle(sort?.key === 'product')}>
-                {tP('workOrders.collapsedColProduct')}{sortIndicator('product')}
-              </button>
-            </th>
-            <th style={{ position: 'sticky', left: COL_PRODUCT_W, zIndex: 1, width: COL_LOCATION_W, minWidth: COL_LOCATION_W, background: '#18181b', textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
-              <button type="button" onClick={() => toggleSort('location')} style={sortThBtnStyle(sort?.key === 'location')}>
-                {tP('workOrders.collapsedColLocation')}{sortIndicator('location')}
-              </button>
-            </th>
-            <th style={{ position: 'sticky', left: COL_PRODUCT_W + COL_LOCATION_W, zIndex: 1, width: COL_METHOD_W, minWidth: COL_METHOD_W, background: '#18181b', textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid #3f3f46', borderRight: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
-              <button type="button" onClick={() => toggleSort('method')} style={sortThBtnStyle(sort?.key === 'method')}>
-                {tP('workOrders.collapsedColMethod')}{sortIndicator('method')}
-              </button>
-            </th>
-            {buckets.map((p) => (
-              <th key={p.key} style={{ padding: '6px 10px', borderBottom: '1px solid #3f3f46', color: '#a1a1aa', whiteSpace: 'nowrap', textAlign: 'right' }}>
-                {p.label}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {rowsForTable.map((grp) => {
-            const consolidationRank = SCALE_RANK[scaleForMethod(grp.method)];
-            const pivotRank = SCALE_RANK[granularity];
-            const alertOnCollision = consolidationRank >= pivotRank;
-            return (
-              <tr key={grp.key}>
-                <td style={{ position: 'sticky', left: 0, zIndex: 1, width: COL_PRODUCT_W, minWidth: COL_PRODUCT_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', whiteSpace: 'nowrap' }}>
-                  {grp.product_id}
-                </td>
-                <td style={{ position: 'sticky', left: COL_PRODUCT_W, zIndex: 1, width: COL_LOCATION_W, minWidth: COL_LOCATION_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', whiteSpace: 'nowrap' }}>
-                  {grp.location_id}
-                </td>
-                <td style={{ position: 'sticky', left: COL_PRODUCT_W + COL_LOCATION_W, zIndex: 1, width: COL_METHOD_W, minWidth: COL_METHOD_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', borderRight: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
-                  <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: methodColor(grp.method), marginRight: 6 }} />
-                  {grp.method}
-                </td>
-                {buckets.map((p) => {
-                  const cell = grp.cells.get(p.key);
-                  const flagged = !!cell && cell.contributors.length > 1 && alertOnCollision;
-                  return (
-                    <td
-                      key={p.key}
-                      title={flagged ? cell!.contributors.map((c) => `${c.end_time}: ${qtyFmt(c.quantity)}`).join('\n') : undefined}
-                      style={{
-                        padding: '6px 10px',
-                        borderBottom: '1px solid #27272a',
-                        textAlign: 'right',
-                        color: cell ? '#e4e4e7' : '#3f3f46',
-                        background: flagged ? 'rgba(239,68,68,0.15)' : undefined,
-                        outline: flagged ? '1px solid rgba(239,68,68,0.5)' : undefined,
-                        outlineOffset: flagged ? '-1px' : undefined,
-                      }}
-                    >
-                      {cell ? (flagged ? `⚠ ${qtyFmt(cell.qty)}` : qtyFmt(cell.qty)) : '–'}
-                    </td>
-                  );
-                })}
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
-  );
+  // One row per (product, location, method) group — reused by every pivot mode below, always
+  // under the SAME shared <thead> (see the single <table> in the return below). The temporal
+  // axis lives once, at the outermost level of the whole view; pivot sections are just full-width
+  // divider rows in the same tbody, not separate nested tables each with their own header.
+  const renderRow = (grp: GroupRow) => {
+    const consolidationRank = SCALE_RANK[scaleForMethod(grp.method)];
+    return (
+      <tr key={grp.key}>
+        <td style={{ position: 'sticky', left: 0, zIndex: 1, width: COL_GROUP_W, minWidth: COL_GROUP_W, background: '#18181b', borderBottom: '1px solid #27272a', borderRight: '1px solid #27272a' }} />
+        <td style={{ position: 'sticky', left: COL_GROUP_W, zIndex: 1, width: COL_PRODUCT_W, minWidth: COL_PRODUCT_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', whiteSpace: 'nowrap' }}>
+          {grp.product_id}
+        </td>
+        <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W, zIndex: 1, width: COL_LOCATION_W, minWidth: COL_LOCATION_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', whiteSpace: 'nowrap' }}>
+          {grp.location_id}
+        </td>
+        <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W, zIndex: 1, width: COL_METHOD_W, minWidth: COL_METHOD_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', borderRight: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
+          <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: methodColor(grp.method), marginRight: 6 }} />
+          {grp.method}
+        </td>
+        {colSpecs.map((spec) => {
+          const cell = getCellForSpec(grp, spec);
+          const flagged = !!cell && cell.contributors.length > 1 && consolidationRank >= rankForSpec(spec);
+          return (
+            <td
+              key={spec.type === 'top' ? spec.bucket.key : `${spec.topKey}|${spec.bucket.key}`}
+              title={flagged ? cell!.contributors.map((c) => `${c.end_time}: ${qtyFmt(c.quantity)}`).join('\n') : undefined}
+              style={{
+                padding: '6px 10px',
+                borderBottom: '1px solid #27272a',
+                textAlign: 'right',
+                color: cell ? '#e4e4e7' : '#3f3f46',
+                background: flagged ? 'rgba(239,68,68,0.15)' : undefined,
+                outline: flagged ? '1px solid rgba(239,68,68,0.5)' : undefined,
+                outlineOffset: flagged ? '-1px' : undefined,
+              }}
+            >
+              {cell ? (flagged ? `⚠ ${qtyFmt(cell.qty)}` : qtyFmt(cell.qty)) : '–'}
+            </td>
+          );
+        })}
+      </tr>
+    );
+  };
 
   const renderSectionSummary = (label: string, groupCount: number, total: number) => (
     <span>
@@ -354,6 +436,78 @@ export function CollapsedWoView({
       </span>
     </span>
   );
+
+  // Pivot aggregate row — mirrors AllocationMatrixView's collapsed supply-group row: every time
+  // column gets a REAL sum across the section's member groups (not one grand total crammed into a
+  // single cell), so the aggregate is legible against the same temporal axis the leaf rows use.
+  // The pivot path lives ONLY in the dedicated Group column (col 1) — Product/Location/Method
+  // (cols 2-4) stay blank here, exactly mirroring where they'd be blank/populated on leaf rows, so
+  // a given column always means the same thing regardless of row type. Collapsed by default (only
+  // this row renders); expanding reveals the next level (sub-sections or leaf rows).
+  const renderAggregateRow = (key: string, label: string, groups: GroupRow[], indent: number, expanded: boolean, onToggle: () => void) => {
+    const total = groups.reduce((s, g) => s + g.total, 0);
+    const bg = indent === 0 ? '#1f1f23' : '#19191c';
+    const borderTop = indent === 0 ? '1px solid #3f3f46' : undefined;
+    return (
+      <tr key={`agg-${key}`}>
+        <td
+          onClick={onToggle}
+          style={{
+            position: 'sticky', left: 0, zIndex: 1, width: COL_GROUP_W, minWidth: COL_GROUP_W, background: bg,
+            padding: `6px 10px 6px ${10 + indent * 20}px`,
+            borderBottom: '1px solid #3f3f46', borderRight: '1px solid #27272a', borderTop,
+            cursor: 'pointer', whiteSpace: 'nowrap',
+          }}
+        >
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ color: '#71717a', fontSize: '0.75rem' }}>{expanded ? '▾' : '▸'}</span>
+            {renderSectionSummary(label, groups.length, total)}
+          </span>
+        </td>
+        <td style={{ position: 'sticky', left: COL_GROUP_W, zIndex: 1, width: COL_PRODUCT_W, minWidth: COL_PRODUCT_W, background: bg, borderBottom: '1px solid #3f3f46', borderTop }} />
+        <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W, zIndex: 1, width: COL_LOCATION_W, minWidth: COL_LOCATION_W, background: bg, borderBottom: '1px solid #3f3f46', borderTop }} />
+        <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W, zIndex: 1, width: COL_METHOD_W, minWidth: COL_METHOD_W, background: bg, borderBottom: '1px solid #3f3f46', borderRight: '1px solid #3f3f46', borderTop }} />
+        {colSpecs.map((spec) => {
+          const sum = groups.reduce((s, grp) => s + (getCellForSpec(grp, spec)?.qty ?? 0), 0);
+          return (
+            <td
+              key={spec.type === 'top' ? spec.bucket.key : `${spec.topKey}|${spec.bucket.key}`}
+              style={{
+                padding: '6px 10px', borderBottom: '1px solid #3f3f46', textAlign: 'right',
+                background: bg, color: sum ? '#e4e4e7' : '#3f3f46', fontWeight: 600,
+              }}
+            >
+              {sum ? qtyFmt(sum) : '–'}
+            </td>
+          );
+        })}
+      </tr>
+    );
+  };
+
+  // Both single-dimension pivots (drill reveals the OTHER dimension) and 'nested' (fixed
+  // PROD_AREA -> Location) share the same two-level shape: top section (sectionExpanded) ->
+  // sub-section (leafExpanded, composite-keyed) -> leaf rows. Each level starts collapsed.
+  const bodyRows: React.ReactNode[] = [];
+  if (pivot === 'none') {
+    for (const grp of visibleGroups) bodyRows.push(renderRow(grp));
+  } else {
+    const topDim: 'prod_area' | 'location' = pivot === 'nested' ? 'prod_area' : pivot;
+    const subDim: 'prod_area' | 'location' = pivot === 'location' ? 'prod_area' : 'location';
+    for (const top of buildSections(visibleGroups, topDim)) {
+      const topExpanded = sectionExpanded.has(top.key);
+      bodyRows.push(renderAggregateRow(top.key, top.key, top.groups, 0, topExpanded, () => toggleSection(top.key)));
+      if (!topExpanded) continue;
+      for (const sub of buildSections(top.groups, subDim)) {
+        const subKey = `${top.key}|${sub.key}`;
+        const subExpanded = leafExpanded.has(subKey);
+        bodyRows.push(renderAggregateRow(subKey, sub.key, sub.groups, 1, subExpanded, () => toggleLeaf(subKey)));
+        if (subExpanded) {
+          for (const grp of sub.groups) bodyRows.push(renderRow(grp));
+        }
+      }
+    }
+  }
 
   return (
     <div>
@@ -383,36 +537,99 @@ export function CollapsedWoView({
           <span style={{ fontSize: '0.78rem', color: '#71717a' }}>{tP('workOrders.collapsedNoEndDate', { n: excludedCount })}</span>
         )}
       </div>
-      {flaggedCount > 0 && (
+      {visibleFlaggedCount > 0 && (
         <div style={{ padding: '6px 12px', marginBottom: '0.6rem', background: 'rgba(239,68,68,0.12)', border: '1px solid rgba(239,68,68,0.4)', borderRadius: 5, color: '#f87171', fontSize: '0.82rem' }}>
-          ⚠ {tP('workOrders.collapsedAlertBanner', { n: flaggedCount })}
+          ⚠ {tP('workOrders.collapsedAlertBanner', { n: visibleFlaggedCount })}
         </div>
       )}
       {visibleGroups.length === 0 ? (
         <div style={{ padding: '1rem', color: '#a1a1aa', fontSize: '0.875rem' }}>{tP('workOrders.collapsedEmpty')}</div>
-      ) : pivot === 'none' ? (
-        renderTable(visibleGroups)
-      ) : pivot === 'nested' ? (
-        buildSections(visibleGroups, 'prod_area').map((outer) => (
-          <details key={outer.key} open style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.4rem 0.6rem', marginBottom: '0.5rem' }}>
-            <summary style={{ cursor: 'pointer', padding: '2px 0' }}>{renderSectionSummary(outer.key, outer.groups.length, outer.total)}</summary>
-            <div style={{ marginTop: '0.4rem', paddingLeft: '0.75rem' }}>
-              {buildSections(outer.groups, 'location').map((inner) => (
-                <details key={inner.key} open style={{ border: '1px solid #27272a', borderRadius: 6, padding: '0.35rem 0.55rem', marginBottom: '0.4rem' }}>
-                  <summary style={{ cursor: 'pointer', padding: '2px 0' }}>{renderSectionSummary(inner.key, inner.groups.length, inner.total)}</summary>
-                  <div style={{ marginTop: '0.35rem' }}>{renderTable(inner.groups)}</div>
-                </details>
-              ))}
-            </div>
-          </details>
-        ))
       ) : (
-        buildSections(visibleGroups, pivot).map((section) => (
-          <details key={section.key} open style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.4rem 0.6rem', marginBottom: '0.5rem' }}>
-            <summary style={{ cursor: 'pointer', padding: '2px 0' }}>{renderSectionSummary(section.key, section.groups.length, section.total)}</summary>
-            <div style={{ marginTop: '0.4rem' }}>{renderTable(section.groups)}</div>
-          </details>
-        ))
+        <div style={{ overflowX: 'auto', border: '1px solid #3f3f46', borderRadius: 6 }}>
+          <table style={{ borderCollapse: 'collapse', fontSize: '0.8rem', minWidth: '100%' }}>
+            <thead>
+              <tr>
+                <th
+                  rowSpan={anyBucketExpanded ? 2 : 1}
+                  style={{
+                    position: 'sticky', left: 0, top: 0, zIndex: 3,
+                    width: COL_GROUP_W, minWidth: COL_GROUP_W, background: '#18181b', textAlign: 'left',
+                    padding: '6px 10px', borderBottom: '1px solid #3f3f46', borderRight: '1px solid #27272a',
+                    color: '#a1a1aa', whiteSpace: 'nowrap',
+                  }}
+                >
+                  {tP('workOrders.collapsedColGroup')}
+                </th>
+                <th rowSpan={anyBucketExpanded ? 2 : 1} style={{ position: 'sticky', left: COL_GROUP_W, top: 0, zIndex: 3, width: COL_PRODUCT_W, minWidth: COL_PRODUCT_W, background: '#18181b', textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
+                  <button type="button" onClick={() => toggleSort('product')} style={sortThBtnStyle(sort?.key === 'product')}>
+                    {tP('workOrders.collapsedColProduct')}{sortIndicator('product')}
+                  </button>
+                </th>
+                <th rowSpan={anyBucketExpanded ? 2 : 1} style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W, top: 0, zIndex: 3, width: COL_LOCATION_W, minWidth: COL_LOCATION_W, background: '#18181b', textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
+                  <button type="button" onClick={() => toggleSort('location')} style={sortThBtnStyle(sort?.key === 'location')}>
+                    {tP('workOrders.collapsedColLocation')}{sortIndicator('location')}
+                  </button>
+                </th>
+                <th
+                  rowSpan={anyBucketExpanded ? 2 : 1}
+                  style={{
+                    position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W, top: 0, zIndex: 3,
+                    width: COL_METHOD_W, minWidth: COL_METHOD_W, background: '#18181b', textAlign: 'left',
+                    padding: '6px 10px', borderBottom: '1px solid #3f3f46', borderRight: '1px solid #3f3f46',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  <button type="button" onClick={() => toggleSort('method')} style={sortThBtnStyle(sort?.key === 'method')}>
+                    {tP('workOrders.collapsedColMethod')}{sortIndicator('method')}
+                  </button>
+                </th>
+                {buckets.map((b) => {
+                  const subs = drillPlan.subBucketsByTop.get(b.key);
+                  const expanded = !!subs && subs.length > 0;
+                  return (
+                    <th
+                      key={b.key}
+                      colSpan={expanded ? subs!.length : 1}
+                      rowSpan={!expanded && anyBucketExpanded ? 2 : 1}
+                      onClick={drillPlan.canDrill ? () => toggleBucket(b.key) : undefined}
+                      title={b.label}
+                      style={{
+                        position: 'sticky', top: 0, zIndex: 2, background: '#18181b',
+                        padding: '6px 10px', borderBottom: '1px solid #3f3f46', color: '#a1a1aa',
+                        whiteSpace: 'nowrap', textAlign: 'right', cursor: drillPlan.canDrill ? 'pointer' : 'default',
+                      }}
+                    >
+                      {drillPlan.canDrill && <span style={{ marginRight: 4 }}>{expanded ? '▾' : '▸'}</span>}
+                      {b.label}
+                    </th>
+                  );
+                })}
+              </tr>
+              {anyBucketExpanded && (
+                <tr>
+                  {buckets.flatMap((b) => {
+                    const subs = drillPlan.subBucketsByTop.get(b.key);
+                    if (!subs || subs.length === 0) return [];
+                    return subs.map((sb) => (
+                      <th
+                        key={`${b.key}|${sb.key}`}
+                        title={sb.label}
+                        style={{
+                          position: 'sticky', top: HEADER_ROW_H, zIndex: 2, background: '#18181b',
+                          padding: '4px 10px', borderBottom: '1px solid #3f3f46', borderTop: '1px solid #27272a',
+                          color: '#71717a', fontSize: '0.72rem', fontWeight: 400, whiteSpace: 'nowrap', textAlign: 'right',
+                        }}
+                      >
+                        {sb.label}
+                      </th>
+                    ));
+                  })}
+                </tr>
+              )}
+            </thead>
+            <tbody>{bodyRows}</tbody>
+          </table>
+        </div>
       )}
     </div>
   );
