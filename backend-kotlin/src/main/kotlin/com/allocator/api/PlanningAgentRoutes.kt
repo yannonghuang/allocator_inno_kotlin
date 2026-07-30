@@ -24,6 +24,8 @@ import com.allocator.services.LlmNotConfiguredException
 import com.allocator.services.LlmTool
 import com.allocator.services.LlmToolCall
 import com.allocator.services.llmChatWithTools
+import com.allocator.services.Constraint
+import com.allocator.services.parseConstraints
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.call
 import io.ktor.server.request.receive
@@ -45,6 +47,7 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
+import kotlinx.serialization.json.addJsonObject
 import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
@@ -56,6 +59,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.and
@@ -1294,12 +1298,14 @@ internal val TOOLS: List<LlmTool> = listOf(
             "on product X's existing stock?' in a single call (no run_id/location_id dance needed " +
             "per location). Each row also carries `consumed_qty`/`residual_qty` (from the most recent " +
             "successful run, or `run_id` if given) once a successful plan run exists for the case; " +
-            "response also carries `total_consumed`/`total_residual`. Rows omit those two fields (qty " +
-            "only) when no successful run exists yet. Pair with get_product_methods to diagnose 'why " +
-            "did this demand fail?' — the typical answer is either zero supply at the needed " +
-            "(product, location) AND no make/move/buy method to produce it there. Returns " +
-            "[{supply_id, location, qty, supply_date, consumed_qty?, residual_qty?}], sorted by " +
-            "location then supply_date.",
+            "response also carries `total_consumed`/`total_residual`, PLUS `by_location` — the same " +
+            "totals already rolled up per location, so comparing one product's starting inventory " +
+            "across locations (or against another product via two calls) never requires summing the " +
+            "raw `rows` yourself. Pair with get_product_methods to diagnose 'why did this demand " +
+            "fail?' — the typical answer is either zero supply at the needed (product, location) AND " +
+            "no make/move/buy method to produce it there. Returns [{supply_id, location, qty, " +
+            "supply_date, consumed_qty?, residual_qty?}] plus by_location, sorted by location then " +
+            "supply_date.",
         buildJsonObject {
             put("type", "object")
             putJsonObject("properties") {
@@ -1308,6 +1314,57 @@ internal val TOOLS: List<LlmTool> = listOf(
                     put("type", "integer")
                     put("description", "Which run's consumption to report. Defaults to the case's latest success run.")
                 }
+            }
+            put("required", buildJsonArray { add("product_id") })
+        },
+    ),
+    tool(
+        "compare_alternatives",
+        "Compare 2+ products side by side — supply on hand per location, purchase WO history over " +
+            "time, and any customer-BOM constraint pinning one of them as the FORCED resolution of a " +
+            "shared BOM slot. Purpose-built for 'these are equal-split BOM alternatives, why do their " +
+            "purchase quantities differ' — pass both alternatives' product_ids (find them via " +
+            "find_bom_siblings if you only have one) and this returns everything needed to explain BOTH " +
+            "known causes in one call: (a) different starting on-hand inventory (equal-split guarantees " +
+            "equal DEMAND, not equal PURCHASE — each side draws its own stock first, so purchase " +
+            "quantities only converge once both are depleted), and (b) `pinning_constraints` — a " +
+            "customer constraint routing that customer's ENTIRE demand to one side, bypassing " +
+            "equal-split for it entirely. See agent-knowledge.md's 'Equal-split raw-material sourcing' " +
+            "section for the full mechanism before answering.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("product_ids") {
+                    put("type", "array")
+                    putJsonObject("items") { put("type", "string") }
+                    put("description", "2 or more product ids to compare (e.g. two BOM alt_group siblings).")
+                }
+                putJsonObject("location_id") {
+                    put("type", "string")
+                    put("description", "Optional — restrict supply/purchase comparison to one location.")
+                }
+                putJsonObject("plan_run_id") {
+                    put("type", "integer")
+                    put("description", "Which run's purchase history + config to use. Defaults to the case's latest success run.")
+                }
+            }
+            put("required", buildJsonArray { add("product_ids") })
+        },
+    ),
+    tool(
+        "find_bom_siblings",
+        "Reverse BOM lookup: given ONE product id, find every BOM slot it fills (parent_id + " +
+            "alt_group) and every OTHER product sharing that exact slot — its alternatives. Use this " +
+            "when a user names only one product and you need to discover what it's an alternative " +
+            "to/for, without already knowing the parent (get_bom_tree(parent_id) requires the parent; " +
+            "this doesn't). Each sibling is flagged `purchasable_raw_material`; each slot carries " +
+            "`equal_split_eligible` (2+ siblings, all purchasable raw materials — the same scope " +
+            "PlanningEngine.kt's equal-split logic uses) as a shortcut. Feed the sibling ids straight " +
+            "into compare_alternatives.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("product_id") { put("type", "string") }
             }
             put("required", buildJsonArray { add("product_id") })
         },
@@ -3329,6 +3386,23 @@ private fun toolGetProductSupply(caseId: Int, args: JsonObject, locale: String):
     }
     val totalQty = rows.sumOf { (it["qty"] as? JsonPrimitive)?.contentOrNull?.toDoubleOrNull() ?: 0.0 }
     val totalConsumed = rows.sumOf { (it["consumed_qty"] as? JsonPrimitive)?.contentOrNull?.toDoubleOrNull() ?: 0.0 }
+    // Per-location rollup — callers comparing two products' starting inventory at a specific
+    // location (e.g. two equal-split BOM alternatives) would otherwise have to filter+sum the
+    // raw `rows` themselves; this is the same aggregation, done once, per location.
+    val byLocation = rows.groupBy { (it["location"] as? JsonPrimitive)?.contentOrNull ?: "" }
+        .entries.sortedBy { it.key }
+        .map { (locName, locRows) ->
+            val locQty = locRows.sumOf { (it["qty"] as? JsonPrimitive)?.contentOrNull?.toDoubleOrNull() ?: 0.0 }
+            val locConsumed = locRows.sumOf { (it["consumed_qty"] as? JsonPrimitive)?.contentOrNull?.toDoubleOrNull() ?: 0.0 }
+            buildJsonObject {
+                put("location", JsonPrimitive(locName))
+                put("total_qty", JsonPrimitive(locQty))
+                if (consumedBySupplyId.isNotEmpty()) {
+                    put("total_consumed", JsonPrimitive(locConsumed))
+                    put("total_residual", JsonPrimitive(locQty - locConsumed))
+                }
+            }
+        }
     val payload = buildJsonObject {
         put("product_id", JsonPrimitive(productId))
         put("total_qty", JsonPrimitive(totalQty))
@@ -3336,6 +3410,7 @@ private fun toolGetProductSupply(caseId: Int, args: JsonObject, locale: String):
             put("total_consumed", JsonPrimitive(totalConsumed))
             put("total_residual", JsonPrimitive(totalQty - totalConsumed))
         }
+        put("by_location", JsonArray(byLocation))
         put("rows", JsonArray(rows))
     }
     val summary = if (consumedBySupplyId.isNotEmpty()) {
@@ -3352,6 +3427,210 @@ private fun toolGetProductSupply(caseId: Int, args: JsonObject, locale: String):
         )
     }
     return ToolResult(summary = summary, payload = payload)
+}
+
+/** Resolve a run's config as a native Map the same way loadPlanResultRowFromDb (Allocate.kt)
+ *  resolves the run itself: [planRunId] if given, else the case's latest successful run. Null
+ *  when no matching run/config exists. */
+private fun resolveRunConfig(caseId: Int, planRunId: Int?): Map<String, Any?>? {
+    val configText = transaction {
+        val query = if (planRunId != null) {
+            PlanRuns.selectAll().where { (PlanRuns.id eq planRunId) and (PlanRuns.caseId eq caseId) }
+        } else {
+            PlanRuns.selectAll().where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
+                .orderBy(PlanRuns.id, SortOrder.DESC)
+        }
+        query.firstOrNull()?.get(PlanRuns.config)
+    } ?: return null
+    @Suppress("UNCHECKED_CAST")
+    return runCatching { jsonElementToNative(jsonParser.parseToJsonElement(configText)) as? Map<String, Any?> }
+        .getOrNull()
+}
+
+/**
+ * Compare two or more products side by side — supply on hand per location, purchase WO history
+ * over time, and any customer-BOM constraint that pins one of them as the FORCED resolution of a
+ * shared BOM slot. Built specifically for the "these are supposed to be equal-split BOM
+ * alternatives, why do their purchase quantities differ" class of question: purely comparing
+ * purchase history (find_wos twice) explains WHEN they diverge but not WHY; this tool also
+ * surfaces the two actual root causes in one call — (a) different starting on-hand inventory
+ * (each side draws its own stock first, so equal DEMAND ≠ equal PURCHASE until both are
+ * depleted), and (b) a customer constraint that removes some demand from the equal-split pool
+ * entirely for one side (see agent-knowledge.md's "Equal-split raw-material sourcing" section).
+ * Pure data — the LLM still articulates the mechanism story, this just removes the need to
+ * orchestrate 3+ separate tool calls and manually diff their output by hand.
+ */
+private fun toolCompareAlternatives(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val productIds = (args["product_ids"] as? JsonArray)
+        ?.mapNotNull { it.jsonPrimitive.contentOrNull?.trim() }
+        ?.filter { it.isNotBlank() }
+        ?.distinct()
+        ?: return toolError("`product_ids` (array of 2+ product ids) is required", locale)
+    if (productIds.size < 2) return toolError("`product_ids` needs at least 2 distinct product ids to compare", locale)
+    val locationFilter = args["location_id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+    val planRunId = args["plan_run_id"]?.jsonPrimitive?.intOrNull
+
+    // Supply on hand, per product per location.
+    val supplyRows = transaction {
+        Supplies.selectAll().where { (Supplies.caseId eq caseId) and (Supplies.productId inList productIds) }.toList()
+    }
+    val supplyByProduct = buildJsonObject {
+        for (pid in productIds) {
+            val byLoc = supplyRows
+                .filter { it[Supplies.productId] == pid && (locationFilter == null || it[Supplies.locationId] == locationFilter) }
+                .groupBy { it[Supplies.locationId] ?: "" }
+                .mapValues { (_, lotRows) -> lotRows.sumOf { it[Supplies.qty] } }
+            putJsonObject(pid) {
+                byLoc.entries.sortedBy { it.key }.forEach { (locId, qty) -> put(locId, qty) }
+            }
+        }
+    }
+
+    // Purchase WO history, per product — same wo_group_id aggregation find_wos uses, so results
+    // are directly comparable to a separate find_wos call.
+    val wos = loadBaselineWorkOrders(caseId, planRunId) ?: emptyList()
+    data class Agg(var location: String, var minStart: String?, var maxEnd: String?, var qty: Double)
+    val purchaseByProduct = buildJsonObject {
+        for (pid in productIds) {
+            val matches = wos.asSequence()
+                .filter { it["product_id"] == pid && it["method"] == "purchase" && it["wo_group_id"] != null }
+                .filter { locationFilter == null || it["location_id"] == locationFilter }
+            val byGid = LinkedHashMap<String, Agg>()
+            for (w in matches) {
+                val gid = w["wo_group_id"] as? String ?: continue
+                val start = w["start_time"] as? String
+                val end = w["end_time"] as? String
+                val q = (w["quantity"] as? Number)?.toDouble() ?: 0.0
+                val ex = byGid[gid]
+                if (ex == null) {
+                    byGid[gid] = Agg(w["location_id"] as? String ?: "", start, end, q)
+                } else {
+                    if (start != null && (ex.minStart == null || start < ex.minStart!!)) ex.minStart = start
+                    if (end != null && (ex.maxEnd == null || end > ex.maxEnd!!)) ex.maxEnd = end
+                    ex.qty += q
+                }
+            }
+            putJsonArray(pid) {
+                byGid.values.sortedBy { it.minStart ?: "" }.forEach { a ->
+                    addJsonObject {
+                        put("location_id", a.location)
+                        put("start_time", a.minStart)
+                        put("end_time", a.maxEnd)
+                        put("quantity", a.qty)
+                    }
+                }
+            }
+        }
+    }
+
+    // Customer-BOM constraints pinning ANY of the compared products as the forced child of some
+    // (customer, parent, location) slot — that customer's demand never enters equal-split for
+    // that slot; its entire requirement routes to the pinned product alone.
+    val config = resolveRunConfig(caseId, planRunId)
+    val pinningRules = parseConstraints(config).filter { it.child in productIds }
+    val constraintsJson = buildJsonArray {
+        pinningRules.forEach { rule ->
+            add(buildJsonObject {
+                put("customer_id", rule.customerId)
+                put("parent", rule.parent)
+                put("location", rule.location)
+                put("pinned_child", rule.child)
+            })
+        }
+    }
+
+    val payload = buildJsonObject {
+        put("product_ids", JsonArray(productIds.map { JsonPrimitive(it) }))
+        put("supply_on_hand_by_location", supplyByProduct)
+        put("purchase_history", purchaseByProduct)
+        put("pinning_constraints", constraintsJson)
+    }
+    val summary = if (pinningRules.isEmpty()) {
+        loc(
+            "Compared ${productIds.joinToString(", ")} — supply on hand + purchase history; no pinning constraints found",
+            "已对比 ${productIds.joinToString(", ")} — 现有库存与采购历史；未发现锁定约束",
+            locale,
+        )
+    } else {
+        loc(
+            "Compared ${productIds.joinToString(", ")} — supply on hand + purchase history; " +
+                "${pinningRules.size} customer constraint(s) pin one side exclusively (see pinning_constraints)",
+            "已对比 ${productIds.joinToString(", ")} — 现有库存与采购历史；发现 ${pinningRules.size} 条客户约束单独锁定其中一方（见 pinning_constraints）",
+            locale,
+        )
+    }
+    return ToolResult(summary = summary, payload = payload)
+}
+
+/**
+ * Reverse BOM lookup: given a leaf/child product id, find every BOM slot (parent_id + alt_group)
+ * it fills, and every OTHER product sharing that exact slot (its alternatives). Lets the agent
+ * discover "these two products are alternatives of the same slot" starting from just a product
+ * id, without the user having to name the parent — the gap get_bom_tree(parent_id) alone doesn't
+ * close, since that walks top-down and requires already knowing the parent. Each sibling is
+ * flagged `purchasable_raw_material` (no method_make, has method_buy) and each slot carries
+ * `equal_split_eligible` (2+ siblings, ALL purchasable raw materials — same scope
+ * PlanningEngine.kt's equal-split logic uses, see agent-knowledge.md) as a shortcut so the agent
+ * doesn't have to re-derive that eligibility rule by hand.
+ */
+private fun toolFindBomSiblings(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val productId = args["product_id"]?.jsonPrimitive?.contentOrNull?.trim()
+        ?: return toolError("`product_id` is required", locale)
+    if (productId.isBlank()) return toolError("`product_id` cannot be blank", locale)
+
+    val (slotRows, makeProducts, buyProducts) = transaction {
+        val ownRows = Boms.selectAll().where { (Boms.caseId eq caseId) and (Boms.childId eq productId) }.toList()
+        val parentIds = ownRows.map { it[Boms.parentId] }.distinct()
+        val allRows = if (parentIds.isEmpty()) emptyList() else
+            Boms.selectAll().where { (Boms.caseId eq caseId) and (Boms.parentId inList parentIds) }.toList()
+        val makes = MethodMakes.selectAll().where { MethodMakes.caseId eq caseId }.map { it[MethodMakes.productId] }.toSet()
+        val buys = MethodBuys.selectAll().where { MethodBuys.caseId eq caseId }.map { it[MethodBuys.productId] }.toSet()
+        Triple(allRows, makes, buys)
+    }
+    if (slotRows.isEmpty()) {
+        return ToolResult(
+            summary = loc("$productId is not a BOM child of anything in this case", "$productId 在本案例中不是任何 BOM 的子项", locale),
+            payload = buildJsonObject { put("product_id", productId); put("slots", JsonArray(emptyList())) },
+        )
+    }
+
+    data class SlotKey(val parentId: String, val altGroup: String?)
+    val bySlot = slotRows.groupBy { SlotKey(it[Boms.parentId], it[Boms.altGroup]) }
+        .filterValues { rows -> rows.any { it[Boms.childId] == productId } }
+
+    val slotsJson = buildJsonArray {
+        bySlot.forEach { (slot, rows) ->
+            val siblingIds = rows.map { it[Boms.childId] }.distinct()
+            add(buildJsonObject {
+                put("parent_id", slot.parentId)
+                put("alt_group", slot.altGroup)
+                put("siblings", buildJsonArray {
+                    siblingIds.forEach { sid ->
+                        add(buildJsonObject {
+                            put("product_id", sid)
+                            put("is_self", sid == productId)
+                            put("makeable", sid in makeProducts)
+                            put("buyable", sid in buyProducts)
+                            put("purchasable_raw_material", sid in buyProducts && sid !in makeProducts)
+                        })
+                    }
+                })
+                put("equal_split_eligible", siblingIds.size > 1 && siblingIds.all { it in buyProducts && it !in makeProducts })
+            })
+        }
+    }
+    val totalSiblings = slotRows.map { it[Boms.childId] }.distinct().size - 1
+    return ToolResult(
+        summary = loc(
+            "$productId fills ${bySlot.size} BOM slot(s), $totalSiblings distinct sibling(s) total",
+            "$productId 属于 ${bySlot.size} 个 BOM 槽位，共有 $totalSiblings 个不同的兄弟节点",
+            locale,
+        ),
+        payload = buildJsonObject {
+            put("product_id", productId)
+            put("slots", slotsJson)
+        },
+    )
 }
 
 /** Whether [productId] is referenced ANYWHERE in this case's data — not just the `Products`
@@ -5584,6 +5863,8 @@ private suspend fun dispatchTool(
         "get_demand_pegging" -> Pair(toolGetDemandPegging(caseId, args, locale), workingConfig)
         "get_product_methods" -> Pair(toolGetProductMethods(caseId, args, locale), workingConfig)
         "get_product_supply" -> Pair(toolGetProductSupply(caseId, args, locale), workingConfig)
+        "compare_alternatives" -> Pair(toolCompareAlternatives(caseId, args, locale), workingConfig)
+        "find_bom_siblings" -> Pair(toolFindBomSiblings(caseId, args, locale), workingConfig)
         "get_leaf_competition" -> Pair(toolGetLeafCompetition(caseId, args, locale), workingConfig)
         "get_component_allocation_by_demand" -> Pair(toolGetComponentAllocationByDemand(caseId, args, locale), workingConfig)
         "get_critical_materials" -> Pair(toolGetCriticalMaterials(caseId, args, locale), workingConfig)

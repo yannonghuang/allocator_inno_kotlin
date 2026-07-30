@@ -19,6 +19,27 @@ export type WoPivotMode = 'none' | 'prod_area' | 'location' | 'nested';
 const SCALE_RANK: Record<WoBatchScale, number> = { none: 0, weekly: 1, biweekly: 2, monthly: 3, all: 4 };
 const GRANULARITIES: WoBatchScale[] = ['none', 'weekly', 'biweekly', 'monthly', 'all'];
 const DAY_MS = 86_400_000;
+// Sticky identity columns — Product/Location/Method, split so each is independently sortable via
+// the Sort-by control. Fixed pixel widths so each column's `left` offset (for CSS sticky
+// stacking) can be computed instead of measured.
+const COL_PRODUCT_W = 140;
+const COL_LOCATION_W = 90;
+const COL_METHOD_W = 110;
+
+/** Sortable-column-header button style — same look as the app's other click-to-sort headers
+ *  (e.g. the KB run inspector): plain/muted when inactive, bold/bright when this column is the
+ *  active sort key. */
+function sortThBtnStyle(active: boolean): React.CSSProperties {
+  return {
+    background: 'none',
+    border: 'none',
+    cursor: 'pointer',
+    padding: 0,
+    font: 'inherit',
+    color: active ? '#e4e4e7' : '#a1a1aa',
+    fontWeight: active ? 600 : 400,
+  };
+}
 
 function pad2(n: number): string {
   return n < 10 ? `0${n}` : String(n);
@@ -162,7 +183,20 @@ export function CollapsedWoView({
   const locale = useLocale();
   const [granularity, setGranularity] = useState<WoBatchScale>('weekly');
   const [filterText, setFilterText] = useState('');
-  const [sortBy, setSortBy] = useState<'qty' | 'product' | 'location'>('qty');
+  // null = default sort (total qty, descending). Set by clicking a Product/Location/Method
+  // column header — same {key, dir} toggle pattern used elsewhere in this app (e.g. the KB run
+  // inspector's sortable columns): first click = ascending, second click on the same column =
+  // descending, third click clears back to the default.
+  const [sort, setSort] = useState<{ key: 'product' | 'location' | 'method'; dir: 'asc' | 'desc' } | null>(null);
+  const toggleSort = (key: 'product' | 'location' | 'method') => {
+    setSort((prev) => {
+      if (!prev || prev.key !== key) return { key, dir: 'asc' };
+      if (prev.dir === 'asc') return { key, dir: 'desc' };
+      return null;
+    });
+  };
+  const sortIndicator = (key: 'product' | 'location' | 'method') =>
+    sort?.key === key ? (sort.dir === 'asc' ? ' ↑' : ' ↓') : '';
 
   const scaleForMethod = (method: string): WoBatchScale => {
     if (method === 'make') return makeBatchScale;
@@ -226,12 +260,14 @@ export function CollapsedWoView({
       ? groups.filter((g) => g.product_id.toLowerCase().includes(f) || g.location_id.toLowerCase().includes(f))
       : groups;
     out = [...out].sort((a, b) => {
-      if (sortBy === 'product') return a.product_id.localeCompare(b.product_id) || a.location_id.localeCompare(b.location_id);
-      if (sortBy === 'location') return a.location_id.localeCompare(b.location_id) || a.product_id.localeCompare(b.product_id);
-      return b.total - a.total;
+      if (!sort) return b.total - a.total;
+      const flip = sort.dir === 'asc' ? 1 : -1;
+      if (sort.key === 'product') return flip * (a.product_id.localeCompare(b.product_id) || a.location_id.localeCompare(b.location_id));
+      if (sort.key === 'location') return flip * (a.location_id.localeCompare(b.location_id) || a.product_id.localeCompare(b.product_id));
+      return flip * (a.method.localeCompare(b.method) || a.product_id.localeCompare(b.product_id));
     });
     return out;
-  }, [groups, filterText, sortBy]);
+  }, [groups, filterText, sort]);
 
   if (buckets.length === 0) {
     return <div style={{ padding: '1rem', color: '#a1a1aa', fontSize: '0.875rem' }}>{tP('workOrders.collapsedEmpty')}</div>;
@@ -242,8 +278,20 @@ export function CollapsedWoView({
       <table style={{ borderCollapse: 'collapse', fontSize: '0.8rem', minWidth: '100%' }}>
         <thead>
           <tr>
-            <th style={{ position: 'sticky', left: 0, zIndex: 1, background: '#18181b', textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid #3f3f46', borderRight: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
-              {tP('workOrders.collapsedGroupHeader')}
+            <th style={{ position: 'sticky', left: 0, zIndex: 1, width: COL_PRODUCT_W, minWidth: COL_PRODUCT_W, background: '#18181b', textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
+              <button type="button" onClick={() => toggleSort('product')} style={sortThBtnStyle(sort?.key === 'product')}>
+                {tP('workOrders.collapsedColProduct')}{sortIndicator('product')}
+              </button>
+            </th>
+            <th style={{ position: 'sticky', left: COL_PRODUCT_W, zIndex: 1, width: COL_LOCATION_W, minWidth: COL_LOCATION_W, background: '#18181b', textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
+              <button type="button" onClick={() => toggleSort('location')} style={sortThBtnStyle(sort?.key === 'location')}>
+                {tP('workOrders.collapsedColLocation')}{sortIndicator('location')}
+              </button>
+            </th>
+            <th style={{ position: 'sticky', left: COL_PRODUCT_W + COL_LOCATION_W, zIndex: 1, width: COL_METHOD_W, minWidth: COL_METHOD_W, background: '#18181b', textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid #3f3f46', borderRight: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
+              <button type="button" onClick={() => toggleSort('method')} style={sortThBtnStyle(sort?.key === 'method')}>
+                {tP('workOrders.collapsedColMethod')}{sortIndicator('method')}
+              </button>
             </th>
             {buckets.map((p) => (
               <th key={p.key} style={{ padding: '6px 10px', borderBottom: '1px solid #3f3f46', color: '#a1a1aa', whiteSpace: 'nowrap', textAlign: 'right' }}>
@@ -259,9 +307,15 @@ export function CollapsedWoView({
             const alertOnCollision = consolidationRank >= pivotRank;
             return (
               <tr key={grp.key}>
-                <td style={{ position: 'sticky', left: 0, zIndex: 1, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', borderRight: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
+                <td style={{ position: 'sticky', left: 0, zIndex: 1, width: COL_PRODUCT_W, minWidth: COL_PRODUCT_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', whiteSpace: 'nowrap' }}>
+                  {grp.product_id}
+                </td>
+                <td style={{ position: 'sticky', left: COL_PRODUCT_W, zIndex: 1, width: COL_LOCATION_W, minWidth: COL_LOCATION_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', whiteSpace: 'nowrap' }}>
+                  {grp.location_id}
+                </td>
+                <td style={{ position: 'sticky', left: COL_PRODUCT_W + COL_LOCATION_W, zIndex: 1, width: COL_METHOD_W, minWidth: COL_METHOD_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', borderRight: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
                   <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: methodColor(grp.method), marginRight: 6 }} />
-                  {grp.product_id} · {grp.location_id} · {grp.method}
+                  {grp.method}
                 </td>
                 {buckets.map((p) => {
                   const cell = grp.cells.get(p.key);
@@ -316,18 +370,6 @@ export function CollapsedWoView({
                 {tP(`config.woBatch${g.charAt(0).toUpperCase()}${g.slice(1)}`)}
               </option>
             ))}
-          </select>
-        </label>
-        <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.82rem', color: '#a1a1aa' }}>
-          {tP('workOrders.collapsedSortBy')}
-          <select
-            value={sortBy}
-            onChange={(e) => setSortBy(e.target.value as 'qty' | 'product' | 'location')}
-            style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem' }}
-          >
-            <option value="qty">{tP('workOrders.collapsedSortQty')}</option>
-            <option value="product">{tP('workOrders.collapsedSortProduct')}</option>
-            <option value="location">{tP('workOrders.collapsedSortLocation')}</option>
           </select>
         </label>
         <input
