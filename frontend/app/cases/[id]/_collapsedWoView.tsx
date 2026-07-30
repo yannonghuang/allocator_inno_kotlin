@@ -16,7 +16,6 @@ export type WoBatchScale = 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
  *  in — the caller maps it to 'none' before reaching this component. */
 export type WoPivotMode = 'none' | 'prod_area' | 'location' | 'nested';
 
-const SCALE_RANK: Record<WoBatchScale, number> = { none: 0, weekly: 1, biweekly: 2, monthly: 3, all: 4 };
 const GRANULARITIES: WoBatchScale[] = ['none', 'weekly', 'biweekly', 'monthly', 'all'];
 const DAY_MS = 86_400_000;
 const HEADER_ROW_H = 28;
@@ -145,12 +144,20 @@ function buildBuckets(minIso: string, maxIso: string, scale: WoBatchScale, local
   return buckets;
 }
 
-type Contributor = { end_time: string; quantity: number };
+// window_key is the contributor's OWN backend consolidation batch bucket — calendarBucket(over
+// wo_window_start, that method's batch scale), reproduced here via bucketKeyFor (which mirrors
+// calendarBucket bit-for-bit). This is NOT the same as the cell's display bucket (over end_time):
+// end_time can be shifted later by resource-contention scheduling, which runs AFTER consolidation
+// decisions are already made — two independently-and-correctly-consolidated WOs can coincidentally
+// land on the same displayed end_time despite having been assigned to different windows. Only a
+// shared window_key means consolidation's own key genuinely collided and should have merged them.
+type Contributor = { end_time: string; quantity: number; window_key: string };
 type Cell = { qty: number; contributors: Contributor[] };
 type GroupRow = {
   key: string;
   product_id: string;
   location_id: string;
+  location_source: string;
   method: string;
   prod_area: string;
   cells: Map<string, Cell>;
@@ -180,13 +187,15 @@ function buildSections(groups: GroupRow[], by: 'prod_area' | 'location'): Sectio
  * monthly/all buckets — deliberately the SAME scale vocabulary and bucket boundaries WO
  * consolidation itself uses (see `bucketKeyFor`'s own doc), not a generic calendar grid.
  *
- * A cell backed by more than one original consolidated row is only an anomaly relative to that
- * group's own METHOD batch scale: consolidation already guarantees at most one WO per
- * (product, location, method, its-own-scale-bucket). If the pivot's chosen granularity is the
- * SAME resolution or FINER than that scale, a collision means consolidation failed to merge WOs
- * it should have — flagged visibly. If the pivot is COARSER than the batch scale, seeing several
- * already-correctly-consolidated batches share one wider pivot bucket is normal — summed
- * silently, no flag.
+ * A cell backed by more than one original consolidated row is only a real anomaly if those rows
+ * share the same `window_key` — consolidation's OWN batch key (calendarBucket over
+ * `wo_window_start`, that method's batch scale), reproduced via `bucketKeyFor`/`cellHasWindowCollision`.
+ * `end_time` alone is NOT a reliable "should these have merged" signal: a separate
+ * resource-contention scheduling pass runs AFTER consolidation and can push a WO's `end_time`
+ * later, so two independently-and-correctly-consolidated WOs can coincidentally land in the same
+ * displayed cell despite having been assigned to different consolidation windows. Only a shared
+ * `window_key` means consolidation's own key genuinely collided and it still didn't merge them —
+ * flagged visibly; everything else is summed silently, no flag.
  */
 export function CollapsedWoView({
   rows,
@@ -270,13 +279,24 @@ export function CollapsedWoView({
 
     const groupMap = new Map<string, GroupRow>();
     for (const r of validRows) {
-      const key = `${r.product_id}|${r.location_id}|${r.method}`;
+      // Consolidation's own grouping key (PlanningEngine.kt ~4540) for MOVE work orders is
+      // ("__move__", location_source, location_id, prod_area, bucket) — WITHOUT product_id — so
+      // several already-correctly-consolidated mixed-shipment moves sharing one destination (this
+      // row's location_id) but a different source OR prod_area would otherwise collapse into a
+      // single group here and look like an unmerged collision. Both fields are effectively no-ops
+      // for make/buy: location_source is always null, and a given (product_id, location_id) pair
+      // already implies one prod_area.
+      const locationSource = r.location_source ?? '';
+      const prodArea = r.prod_area ?? '';
+      const key = `${r.product_id}|${r.location_id}|${locationSource}|${prodArea}|${r.method}`;
       let grp = groupMap.get(key);
       if (!grp) {
-        grp = { key, product_id: r.product_id, location_id: r.location_id, method: r.method, prod_area: r.prod_area ?? '', cells: new Map(), total: 0 };
+        // Mixed-shipment MOVE work orders have product_id === null at the API level (not ''), so
+        // it must be coalesced here — every downstream use (filter's .toLowerCase(), sort's
+        // .localeCompare()) assumes a string and would throw on a raw null.
+        grp = { key, product_id: r.product_id ?? '', location_id: r.location_id, location_source: locationSource, method: r.method, prod_area: prodArea, cells: new Map(), total: 0 };
         groupMap.set(key, grp);
       }
-      if (!grp.prod_area && r.prod_area) grp.prod_area = r.prod_area;
       const iso = (r.end_time as string).slice(0, 10);
       const bucketKey = bucketKeyFor(iso, granularity);
       const qty = Number(r.quantity) || 0;
@@ -286,7 +306,9 @@ export function CollapsedWoView({
         grp.cells.set(bucketKey, cell);
       }
       cell.qty += qty;
-      cell.contributors.push({ end_time: r.end_time as string, quantity: qty });
+      const windowIso = ((r.wo_window_start ?? r.end_time) as string).slice(0, 10);
+      const windowKey = bucketKeyFor(windowIso, scaleForMethod(r.method));
+      cell.contributors.push({ end_time: r.end_time as string, quantity: qty, window_key: windowKey });
       grp.total += qty;
     }
     const groups = Array.from(groupMap.values());
@@ -344,8 +366,18 @@ export function CollapsedWoView({
     }
     return cell;
   };
-  const rankForSpec = (spec: ColSpec): number =>
-    spec.type === 'top' ? SCALE_RANK[granularity] : SCALE_RANK[drillPlan.finerByTop.get(spec.topKey)!];
+  // A cell is a genuine consolidation miss only if 2+ of its contributors share the same
+  // window_key — i.e. consolidation's OWN batch key collided and it still didn't merge them.
+  // Contributors that merely display in the same cell (same end_time bucket) but came from
+  // different consolidation windows are NOT a collision — see Contributor's own doc.
+  const cellHasWindowCollision = (cell: Cell): boolean => {
+    const seen = new Set<string>();
+    for (const c of cell.contributors) {
+      if (seen.has(c.window_key)) return true;
+      seen.add(c.window_key);
+    }
+    return false;
+  };
 
   // Recomputed from the currently-visible columns (not the raw grouping pass) so drilling into a
   // flagged bucket can legitimately clear the flag (the collision only existed at the coarser
@@ -353,10 +385,9 @@ export function CollapsedWoView({
   const visibleFlaggedCount = useMemo(() => {
     let count = 0;
     for (const grp of groups) {
-      const consolidationRank = SCALE_RANK[scaleForMethod(grp.method)];
       for (const spec of colSpecs) {
         const cell = getCellForSpec(grp, spec);
-        if (cell && cell.contributors.length > 1 && consolidationRank >= rankForSpec(spec)) count++;
+        if (cell && cellHasWindowCollision(cell)) count++;
       }
     }
     return count;
@@ -389,15 +420,17 @@ export function CollapsedWoView({
   // axis lives once, at the outermost level of the whole view; pivot sections are just full-width
   // divider rows in the same tbody, not separate nested tables each with their own header.
   const renderRow = (grp: GroupRow) => {
-    const consolidationRank = SCALE_RANK[scaleForMethod(grp.method)];
     return (
       <tr key={grp.key}>
         <td style={{ position: 'sticky', left: 0, zIndex: 1, width: COL_GROUP_W, minWidth: COL_GROUP_W, background: '#18181b', borderBottom: '1px solid #27272a', borderRight: '1px solid #27272a' }} />
         <td style={{ position: 'sticky', left: COL_GROUP_W, zIndex: 1, width: COL_PRODUCT_W, minWidth: COL_PRODUCT_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', whiteSpace: 'nowrap' }}>
           {grp.product_id}
         </td>
-        <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W, zIndex: 1, width: COL_LOCATION_W, minWidth: COL_LOCATION_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', whiteSpace: 'nowrap' }}>
-          {grp.location_id}
+        <td
+          title={grp.location_source ? `${grp.location_source} → ${grp.location_id}` : undefined}
+          style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W, zIndex: 1, width: COL_LOCATION_W, minWidth: COL_LOCATION_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}
+        >
+          {grp.location_source ? `${grp.location_source} → ${grp.location_id}` : grp.location_id}
         </td>
         <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W, zIndex: 1, width: COL_METHOD_W, minWidth: COL_METHOD_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', borderRight: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
           <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: methodColor(grp.method), marginRight: 6 }} />
@@ -405,7 +438,7 @@ export function CollapsedWoView({
         </td>
         {colSpecs.map((spec) => {
           const cell = getCellForSpec(grp, spec);
-          const flagged = !!cell && cell.contributors.length > 1 && consolidationRank >= rankForSpec(spec);
+          const flagged = !!cell && cellHasWindowCollision(cell);
           return (
             <td
               key={spec.type === 'top' ? spec.bucket.key : `${spec.topKey}|${spec.bucket.key}`}
