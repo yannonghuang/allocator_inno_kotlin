@@ -580,14 +580,12 @@
       "tabNative": "Native (per-demand)",
       "tabCollapsed": "Collapsed",
       "collapsedGranularity": "Bucket by",
-      "collapsedGroupHeader": "Product · Location · Method",
+      "collapsedColProduct": "Product",
+      "collapsedColLocation": "Location",
+      "collapsedColMethod": "Method",
       "collapsedEmpty": "No consolidated work orders with a parseable end date.",
       "collapsedNoEndDate": "{n} work order(s) have no end date and are excluded from this view.",
       "collapsedAlertBanner": "{n} cell(s) combine more than one consolidated work order for the same product/location/method — this usually means consolidation didn't merge them as it should have. Hover a highlighted cell for details.",
-      "collapsedSortBy": "Sort by",
-      "collapsedSortQty": "Quantity",
-      "collapsedSortProduct": "Product",
-      "collapsedSortLocation": "Location",
       "collapsedFilterPlaceholder": "Filter product / location…"
     },
     "woScheduleImpact": {

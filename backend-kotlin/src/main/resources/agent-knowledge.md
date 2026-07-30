@@ -385,6 +385,61 @@ assert "that's expected" without checking the real dates.
   `find_wos` filtered to the flagged product/location/method and read the real `start_time`/
   `end_time` — don't assume a bucket's start-of-range label is a real work order date.
 
+### Equal-split raw-material sourcing: purchase quantities can diverge, then converge
+
+When `method_selection.raw_material_sourcing = equal_split`, a slot's REQUIREMENT is split
+identically across purely-substitutable raw-material alternatives every cycle
+(`PlanningEngine.kt:3540-3610` — detects alt_group siblings whose recipe resolves to exactly one
+purchasable raw-material child, splits the parent's demand into an equal `target` per sibling).
+**This guarantees equal DEMAND, not equal PURCHASE.** There are TWO independent, legitimate
+reasons the two sides' actual purchase quantities can still differ — check BOTH, they can
+co-occur:
+
+1. **Different starting inventory.** Each alternative still goes through the normal single-item
+   planning path after its (equal) target is set, which draws its OWN existing on-hand inventory
+   first (FIFO) and only purchases the shortfall. If the two alternatives started with different
+   supply on hand, early-cycle purchases differ — smaller/later purchases for whichever has more
+   starting stock — converging only once BOTH sides have fully drawn down their own initial
+   inventory (after which 100% of the still-equal requirement flows to purchase on both sides).
+2. **A customer-BOM constraint pins one side exclusively** (`config.constraints`, applied in
+   `expandWaterfallCandidates`, `PlanningEngine.kt:949-975`, BEFORE equal-split run-detection even
+   sees the candidate list). A rule like `{customer, parent: <shared parent>, child: <one
+   alternative>}` forces EVERY demand from that customer to resolve to the pinned child only —
+   that demand never enters the equal-split pool at all, injecting one-sided purchase volume with
+   no counterpart on the other side. This fades once that customer's constrained demand is fully
+   committed (often in one early batch), after which only ordinary unconstrained (fully-split)
+   demand remains — same convergence pattern as cause 1, different mechanism.
+
+If a user asks "why do these two 'equal-split' alternatives show different purchase amounts in
+early cycles" (often framed as "shouldn't they always match?"):
+
+1. If you only have one product name, call **`find_bom_siblings(product_id)`** first to discover
+   its alt_group siblings and shared parent — no need to wait for the user to name the parent.
+   `equal_split_eligible` on the returned slot confirms it's actually a valid equal-split pair
+   (2+ siblings, all purchasable raw materials, none with their own `method_make`).
+2. Call **`compare_alternatives(product_ids=[A, B])`** — one call returns BOTH diagnostics: supply
+   on hand per location for each (cause 1) and `pinning_constraints` — any customer constraint
+   routing to one side exclusively (cause 2). This replaces the old flow of calling `find_wos`
+   and `get_product_supply` twice each and diffing by hand.
+3. From `compare_alternatives`' `purchase_history`, find the date after which every entry matches
+   exactly — that's the convergence point. Cross-check it against whichever cause(s) fired: does
+   it line up with one side's inventory hitting zero, and/or with a pinned customer's demand being
+   fully committed?
+4. Reply template (adapt to whichever cause(s) actually fired):
+
+   > Equal-split guarantees identical DEMAND, not identical PURCHASE. \<If cause 1:\> \<Product
+   > A\> started with \<qty\> vs \<Product B\>'s \<qty\> at \<location\>, so \<A/B\> covered more
+   > of its early requirement from stock. \<If cause 2:\> Customer \<X\>'s demand is constrained
+   > to \<Product A\> only (`parent=<parent>`), so that demand never entered the equal-split pool
+   > — it added purchase volume to \<A\> with no counterpart on \<B\>. Purchases converge around
+   > \<date\> once \<inventory is exhausted / the constrained demand is fully committed\>, because
+   > from that point on the requirement is genuinely equal on both sides.
+
+Not a bug — expected behavior of "equal-split" being a demand-fairness guarantee, not a
+purchase-quantity guarantee. Don't default to blaming inventory alone; a lopsided divergence that
+doesn't shrink gradually (a step change instead of a fade) is a stronger signal for cause 2 —
+check `pinning_constraints` before concluding.
+
 ## Conversational tactics
 
 - Reach for tools when the user asks "what would happen if…", "why…",
