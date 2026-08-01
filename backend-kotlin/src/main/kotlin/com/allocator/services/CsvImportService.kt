@@ -10,6 +10,7 @@ import org.slf4j.LoggerFactory
 import java.io.ByteArrayInputStream
 import java.io.FileReader
 import java.io.InputStreamReader
+import java.io.PushbackReader
 import java.io.Reader
 import java.nio.file.Path
 
@@ -73,13 +74,27 @@ object CsvImportService {
 
     private fun readCsv(reader: Reader): List<Map<String, String>> {
         val results = mutableListOf<Map<String, String>>()
-        CSVReaderHeaderAware(reader).use { r ->
+        CSVReaderHeaderAware(stripBom(reader)).use { r ->
             var row: Map<String, String>?
             while (r.readMap().also { row = it } != null) {
                 results.add(row!!)
             }
         }
         return results
+    }
+
+    /**
+     * CSVReaderHeaderAware doesn't strip a UTF-8 BOM, so a BOM-prefixed file glues ﻿ onto
+     * the first header cell (e.g. "SUPPLY_ID" becomes "﻿SUPPLY_ID"), silently breaking every
+     * r["SUPPLY_ID"] lookup for that file. Excel-exported CSVs commonly carry this BOM.
+     */
+    private fun stripBom(reader: Reader): Reader {
+        val pushback = PushbackReader(reader, 1)
+        val first = pushback.read()
+        if (first != -1 && first.toChar() != '﻿') {
+            pushback.unread(first)
+        }
+        return pushback
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -187,6 +202,7 @@ object CsvImportService {
             this[MethodMakes.locationId] = r["LOCATION_ID"]?.trim() ?: ""
             this[MethodMakes.preference] = r["PREFERENCE"].toIntOrNullSafe()
             this[MethodMakes.leadTime] = r["LEAD_TIME"].toIntOrNullSafe()
+            this[MethodMakes.yield] = r["YIELD"].toDoubleOrNullSafe()
         }
     }
 
@@ -252,6 +268,7 @@ object CsvImportService {
             this[Supplies.supplyDate] = r["SUPPLY_DATE"]?.takeIf { it.isNotBlank() }
             // Handle scientific notation in qty (e.g. "1e+06")
             this[Supplies.qty] = r["QTY"].toDoubleOrNullSafe() ?: 0.0
+            this[Supplies.targetCustomerId] = r["TARGET"]?.takeIf { it.isNotBlank() }
         }
     }
 

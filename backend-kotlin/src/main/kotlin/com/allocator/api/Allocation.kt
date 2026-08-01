@@ -9,7 +9,7 @@ import com.allocator.services.CaseConfigVersioning
 import com.allocator.services.CaseLoader
 import com.allocator.services.ConfigVersionKind
 import com.allocator.services.KbFingerprint
-import com.allocator.services.buildAllocationBudgetRows
+import com.allocator.services.buildAllocationBudgetRowsFull
 import com.allocator.services.buildSupplyAllocation
 import io.ktor.http.*
 import io.ktor.server.application.*
@@ -151,7 +151,7 @@ internal fun generateAndSeedCaseAllocation(
 ): List<CaseAllocRow> {
     val demands = data["demand"] ?: emptyList()
     val result  = buildSupplyAllocation(demands, data, config)
-    val rows    = buildAllocationBudgetRows(result.perLotBudgets)
+    val rows    = buildAllocationBudgetRowsFull(result.perLotBudgets, result.criticalMatrix, data["supply"] ?: emptyList())
                       .map { (sid, did, qty) -> CaseAllocRow(sid, did, qty) }
     if (rows.isNotEmpty()) {
         transaction {

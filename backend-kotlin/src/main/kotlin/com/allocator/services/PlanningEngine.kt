@@ -607,7 +607,7 @@ internal fun parseDate(s: String?): LocalDate? {
     return null
 }
 
-private fun dateAddDays(d: LocalDate?, days: Double): LocalDate? =
+internal fun dateAddDays(d: LocalDate?, days: Double): LocalDate? =
     if (d == null) null else d.plusDays(days.toLong())
 
 private fun formatDate(d: LocalDate?): String? = d?.format(DATE_FMT)
@@ -673,13 +673,29 @@ private fun consumeFromInventory(
      * Lots whose supplyId is absent from the map are uncapped at the lot level.
      */
     perLotBudget: MutableMap<String, Double>? = null,
+    /**
+     * When true, draw the LATEST-dated lot first instead of FIFO (earliest first) — for critical
+     * materials in cases that actually use TARGET (see this function's call site: gated on
+     * `isRawCriticalPosition && DataIndex.hasTargetedSupply`, NOT merely `perLotBudget != null`
+     * — a case with zero TARGET usage still populates perLotBudget for critical materials via the
+     * original `allocateSuppliesPerLot`, so that alone would silently change draw order for every
+     * case, not just ones opting into this feature. Prioritizes newer/incoming stock over older,
+     * so the earliest-arriving lots stay available longest for whichever demand needs them
+     * soonest. Non-critical materials, and critical materials in non-TARGET cases, keep plain
+     * earliest-first FIFO — main's original behavior, unchanged.
+     */
+    preferLatest: Boolean = false,
 ): List<ConsumedBucket> {
     val pid = productId.trim()
     val lid = locationId.trim()
-    val sorter = compareBy<MutableMap<String, Any?>>(
-        { parseDate(it["supply_date"] as? String) ?: LocalDate.MIN },
-        { it["supply_id"]?.toString() ?: "" }
-    )
+    val sorter = if (preferLatest)
+        compareByDescending<MutableMap<String, Any?>> { parseDate(it["supply_date"] as? String) ?: LocalDate.MIN }
+            .thenBy { it["supply_id"]?.toString() ?: "" }
+    else
+        compareBy<MutableMap<String, Any?>>(
+            { parseDate(it["supply_date"] as? String) ?: LocalDate.MIN },
+            { it["supply_id"]?.toString() ?: "" }
+        )
     fun matches(b: MutableMap<String, Any?>) =
         b["product_id"]?.toString()?.trim() == pid &&
         b["location_id"]?.toString()?.trim() == lid &&
@@ -766,6 +782,7 @@ internal fun copyInventory(inventory: List<Map<String, Any?>>): MutableList<Muta
             "supply_id" to b["supply_id"],
             "qty" to ((b["qty"] as? Number)?.toDouble() ?: 0.0),
             "demand_tag" to b["demand_tag"],
+            "target" to b["target"],
         )
     }.toMutableList()
 
@@ -793,6 +810,11 @@ internal data class DataIndex(
     val bomByBomId: Map<String, List<Map<String, Any?>>>,
     /** BOM rows keyed by parent_id for the fallback (no bom_id match) case. */
     val bomByParentId: Map<String, List<Map<String, Any?>>>,
+    /** True when ANY supply row in this case has a non-blank TARGET — computed once here (rather
+     *  than re-scanning `data["supply"]` at every consumeFromInventory call) so the latest-lot-
+     *  first draw order can be scoped to cases that actually use the feature, matching
+     *  buildSupplyAllocation's own scoping — see consumeFromInventory's own doc. */
+    val hasTargetedSupply: Boolean = false,
 )
 
 /** True when a raw LOCATION_ID cell means "any location" — blank/whitespace-only, or the
@@ -843,6 +865,8 @@ private fun buildDataIndex(data: Map<String, List<Map<String, Any?>>>): DataInde
     bomByParentId = (data["bom"] ?: emptyList()).groupBy {
         it["parent_id"]?.toString()?.trim() ?: ""
     },
+    hasTargetedSupply = (data["supply"] ?: emptyList())
+        .any { (it["target"] as? String)?.trim()?.isNotBlank() == true },
 )
 
 private fun buildInventoryIndex(
@@ -880,6 +904,14 @@ internal fun variantsForMake(
     if (bomId.isBlank()) return emptyList()
     val pid = productId.trim()
     val bomList = data["bom"] ?: emptyList()
+    // Material lost to the make process: to net `quantity` of the parent, you need
+    // quantity*rate/yield of each child, not quantity*rate — a YIELD of 0.97 means ~3% more
+    // input is consumed per finished unit. Absent/non-positive YIELD = no loss (1.0). This is
+    // the single choke point every BOM child-quantity computation calls, so folding yield in
+    // here (rather than at each of the many call sites) propagates it everywhere automatically,
+    // including the achievable-qty inversions in SupplyGuidedPlanning.kt that derive their own
+    // "effective rate" as childQty/parentQty from this function's output.
+    val yield = (method["yield"] as? Number)?.toDouble()?.takeIf { it > 0 } ?: 1.0
 
     fun buildVariants(rows: List<Map<String, Any?>>): List<Pair<String, List<Map<String, Any?>>>> {
         val byAlt = mutableMapOf<String, MutableList<Map<String, Any?>>>()
@@ -888,7 +920,7 @@ internal fun variantsForMake(
             if (rate <= 0) continue
             val ag = b["alt_group"]
             val altKey = if (ag != null && ag.toString().trim().isNotBlank()) ag.toString().trim() else "__null__"
-            val childQty = quantity * rate
+            val childQty = quantity * rate / yield
             byAlt.getOrPut(altKey) { mutableListOf() }.add(
                 mapOf("product_id" to (b["child_id"] ?: ""), "location_id" to locationId, "quantity" to childQty)
             )
@@ -2977,6 +3009,10 @@ fun plan(
 
     // 1) Fulfill from inventory (FIFO)
     val componentKey = "$productId|$locationId"
+    // Computed once, reused below both to decide "critical but no budget entries → banned, not
+    // uncapped" (immediately below) and for the draw order / ownLotRefs' own gate further down
+    // (consumeFromInventory's preferLatest doc).
+    val isCriticalPosition = isRawCriticalPosition(productId, locationId, data, config)
     // Per-lot caps: collect all budget entries whose key starts with "$pid|$lid|".
     // Paired with perLotBudget: each lot's demand-wide-correct remaining BEFORE branch
     // narrowing — the write-back below must use THIS, not perLotBudget's own (possibly
@@ -2984,10 +3020,26 @@ fun plan(
     // into the shared `budget` map and wrongly starve sibling branches that haven't drawn
     // anything yet (see write-back comment below).
     val demandWideRemainingBySid = mutableMapOf<String, Double>()
+    // NOTE: `budget == null` here is deliberately left alone (stays uncapped/FIFO) — legacyCommit
+    // is shared by callers that never populate a critical-material budget at all (isolated plan()
+    // unit tests, Stage-3 v2 consolidation's own per-leaf budgets), so "no budget map for this
+    // demand" is NOT the same signal as "critical but zero entitlement" here. That distinction is
+    // only meaningful for the supply-guided pipeline, which is why it's enforced one layer up, at
+    // the point sgAllocation.perLotBudgets becomes legacyCommit's `budgets` argument (see
+    // buildSupplyGuidedBudgets's own doc) — every demand critical-reachable to something gets a
+    // real, if empty, top-level entry there, so `budget` is non-null by the time it reaches here
+    // whenever the supply-guided system is actually in effect.
     val perLotBudget: MutableMap<String, Double>? = budget?.let { b ->
         val prefix = "$componentKey|"
         val lotEntries = b.entries.filter { it.key.startsWith(prefix) }
-        if (lotEntries.isEmpty()) null
+        // Empty lot entries is ambiguous on its own: either "never under critical allocation"
+        // (FIFO, uncapped) or "critical, but zero eligible lots for THIS demand" (e.g. every
+        // TARGETed lot excluded by the tightened window — a real, expected outcome). Only
+        // isCriticalPosition — not "did the budget happen to have entries" — can tell those
+        // apart; an empty-but-non-null map here makes every lot's own consumeFromInventory
+        // lookup miss and fall to its "else -> 0.0" forbidden branch.
+        if (lotEntries.isEmpty() && !isCriticalPosition) null
+        else if (lotEntries.isEmpty()) mutableMapOf()
         else {
             // Pass 1: each lot's demand-wide-correct remaining BEFORE branch narrowing —
             // v (budget's own live per-lot entry) capped by trueRemaining (initialBudget minus
@@ -3084,8 +3136,15 @@ fun plan(
     val totalLotBudgetBefore = perLotBudget?.values?.sum() ?: 0.0
     val budgetCap = budget?.get(componentKey)
         ?: perLotBudget?.values?.sum()?.takeIf { it > 1e-9 }
+    // Latest-lot-first is scoped to cases that actually use TARGET (matches
+    // buildSupplyAllocation's own scoping) — NOT just "this position is critical", which would
+    // silently change draw order for every case (isCriticalPosition alone doesn't distinguish
+    // "TARGET feature in use" from "always was critical on main too"). Falls back to `false`
+    // (plain FIFO) for callers that didn't wrap `data` in PlanData (e.g. isolated unit tests).
+    val hasTargetedSupply = (data as? PlanData)?.idx?.hasTargetedSupply ?: false
     val consumedBuckets = consumeFromInventory(
         inventory, productId, locationId, quantity, preferDemandId, null, perLotBudget,
+        preferLatest = isCriticalPosition && hasTargetedSupply,
     )
     val taken = consumedBuckets.sumOf { it.qty }
     // Real, physical lots THIS node actually drew from — the informative, "688_M51-style"
@@ -3108,7 +3167,7 @@ fun plan(
     // manufacturable) into a demand's quantity_dominator alongside its genuine critical-material
     // cause. Time has no such gate by design (any real lot's arrival date is fixed regardless of
     // whether the product also has an elastic path) — ownLotLatestTimeRef below stays ungated.
-    val ownLotRefs: List<DominatorRef> = if (isRawCriticalPosition(productId, locationId, data, config))
+    val ownLotRefs: List<DominatorRef> = if (isCriticalPosition)
         consumedBuckets.mapNotNull { bucket ->
             val sid = bucket.supplyId ?: return@mapNotNull null
             DominatorRef(kind = "bom_child", productId = productId, locationId = locationId,
@@ -3955,6 +4014,123 @@ internal fun leadDaysForMethod(
     else -> 0.0
 }
 
+/** [aggregatePathToLeaf]'s result: the cumulative lead time and cumulative rate (yield already
+ *  folded in, since it walks through [variantsForMake]) from one node to another, aggregated
+ *  across every viable route (AND-summed, OR-maxed — see that function's own doc).
+ *  `cumulativeRate` converts a quantity AT `from` into the equivalent quantity actually
+ *  needed/available AT `to` (multiply a `from`-side quantity by it to get the `to`-side quantity;
+ *  divide the other way). */
+internal data class PathInfo(val cumulativeLeadTime: Double, val cumulativeRate: Double)
+
+/**
+ * Walk every make- and move-method route from (fromPid, fromLid) down to a specific (toPid,
+ * toLid) leaf, aggregating cumulative lead time and BOM rate (yield-adjusted via
+ * [variantsForMake]) across however many routes actually reach the target:
+ *  - AND (a make method's own BOM children, all mandatory): rate contributions from every
+ *    child that reaches the target are SUMMED (a diamond — the same raw material reached via
+ *    two-or-more parallel AND-branches of the same parent, e.g. two sibling sub-assemblies that
+ *    both consume it — genuinely needs the combined draw); lead time takes the MAX across those
+ *    children (an AND-group can't finish until its slowest branch does).
+ *  - OR (competing make methods for the same product, BOM alt_group variants within one method,
+ *    AND move-method sources — all genuine mutually-exclusive alternatives): rate and lead time
+ *    each take the MAX independently across every alternative that reaches the target — since
+ *    which alternative actually gets chosen isn't known at this (pre-commit) budgeting stage, the
+ *    worst case (most material consumed, latest-arriving requirement) is the safe assumption for
+ *    both a demand's true material need and its deadline. A move contributes its source's own
+ *    rate unchanged (1:1 — moving stock doesn't change how much of it exists) plus its own
+ *    transit_time.
+ *
+ * Used to compute a demand's true cumulative deadline and rate/yield-adjusted "legitimate
+ * quantity" at a specific critical-raw-material node (see allocateCriticalSuppliesPerLot) — no
+ * existing function walks a path to a SPECIFIC target leaf (the closest existing structures,
+ * nodeSketchInto/leadDaysForMethod, compute related but differently-shaped things). Follows both
+ * "make" and "move" methods — a node reached only via a location transfer, with no make method of
+ * its own, is a dead end without the move branch, which silently breaks every multi-location BOM
+ * (case 173, e.g., routes several critical materials through SUB_PCBA/1000/2000 move steps).
+ * Returns null if unreachable within a bounded depth.
+ */
+internal fun aggregatePathToLeaf(
+    fromPid: String,
+    fromLid: String,
+    toPid: String,
+    toLid: String,
+    data: Map<String, List<Map<String, Any?>>>,
+): PathInfo? {
+    // `visited` guards against genuine CYCLES only — a node revisiting itself as its own
+    // ancestor on the current path — so it must be removed on backtrack (finally block below).
+    // Left permanently marked (the original bug here), it instead blocks any SECOND legitimate
+    // branch from ever reaching a node its first branch already explored — exactly the diamond
+    // pattern (two AND-siblings independently needing the same shared critical material) that's
+    // common in real cases: the second branch's walk() call returns null, its rate contribution
+    // is silently dropped (`?: continue`), and the demand's true cumulative rate at that material
+    // is undercounted or, if every child of a variant hits this, the demand loses its entire
+    // entitlement there. Confirmed live: case 173 (diamond-heavy, zero TARGET/YIELD usage — this
+    // bug alone explains the whole regression) dropped from 69.6% to 30.7% fill rate with this
+    // bug in place.
+    val visited = mutableSetOf<Pair<String, String>>()
+    fun walk(pid: String, lid: String, depth: Int): PathInfo? {
+        if (pid == toPid && lid == toLid) return PathInfo(0.0, 1.0)
+        if (depth > 100 || !visited.add(pid to lid)) return null
+        try {
+            var maxRate = 0.0
+            var maxLead = 0.0
+            var reachedAny = false
+
+            // "make" methods: AND-sum rate across one variant's own mandatory children, OR-max
+            // across variants/methods (see this function's own doc).
+            val makeMethods = getMethods(pid, lid, data).filter { it["type"] == "make" }
+            for (method in makeMethods) {
+                // quantity=1.0 so each child's returned "quantity" IS the yield-adjusted effective
+                // rate (rate/yield) directly, not an absolute qty that would need dividing back out.
+                for ((_, children) in variantsForMake(pid, lid, 1.0, method, data)) {
+                    // AND within this one variant: sum rate, max lead time (see this function's doc).
+                    var totalRate = 0.0
+                    var maxSubLead = 0.0
+                    var reached = false
+                    for (child in children) {
+                        val cPid = (child["product_id"] as? String)?.trim() ?: continue
+                        if (cPid.isBlank()) continue
+                        val cLid = (child["location_id"] as? String)?.trim() ?: lid
+                        val effRate = (child["quantity"] as? Number)?.toDouble() ?: continue
+                        val sub = walk(cPid, cLid, depth + 1) ?: continue
+                        reached = true
+                        totalRate += effRate * sub.cumulativeRate
+                        if (sub.cumulativeLeadTime > maxSubLead) maxSubLead = sub.cumulativeLeadTime
+                    }
+                    if (!reached) continue
+                    reachedAny = true
+                    val leadHere = leadDaysForMethod(method) + maxSubLead
+                    if (totalRate > maxRate) maxRate = totalRate
+                    if (leadHere > maxLead) maxLead = leadHere
+                }
+            }
+
+            // "move" methods: transparent 1:1 rate pass-through from the source location — a
+            // node reached only via a location transfer (no make method of its own here) is
+            // otherwise a dead end, which is exactly wrong for any multi-location BOM (confirmed
+            // live: case 173 routes many critical-material paths through SUB_PCBA/1000/2000 move
+            // steps — without this branch, every one of those demands got NO path at all, hence
+            // no entitlement, hence banned, collapsing fill rate from 69.6% to 30.7%). Another OR
+            // alternative, same as make variants: max rate/lead against everything else found here.
+            val moveMethods = getMethods(pid, lid, data).filter { it["type"] == "move" }
+            for (method in moveMethods) {
+                val fromLid = (method["from_location_id"] as? String)?.trim() ?: continue
+                if (fromLid.isBlank()) continue
+                val sub = walk(pid, fromLid, depth + 1) ?: continue
+                reachedAny = true
+                val leadHere = leadDaysForMethod(method) + sub.cumulativeLeadTime
+                if (sub.cumulativeRate > maxRate) maxRate = sub.cumulativeRate
+                if (leadHere > maxLead) maxLead = leadHere
+            }
+
+            return if (reachedAny) PathInfo(maxLead, maxRate) else null
+        } finally {
+            visited.remove(pid to lid)
+        }
+    }
+    return walk(fromPid, fromLid, 0)
+}
+
 private fun computeStartDt(
     reqDt: LocalDate,
     leadDays: Double,
@@ -4213,16 +4389,26 @@ internal fun reconcile(
             // Mechanism C fixed for the OR aggregate below, but the AND branch's ask still used the
             // naive ratio — propagating, not correcting, upstream drift through nested AND levels;
             // root cause of the R4_qty_propagation/R8_deep_conservation violation class). Falls back
-            // to the ratio only when no real BOM row exists (synthetic/virtual nodes).
+            // to the ratio only when no real BOM row exists (synthetic/virtual nodes) — that
+            // fallback ratio already observes the actual committed quantities, so it implicitly
+            // includes yield loss already (via variantsForMake) and must NOT be divided again.
             val parentPid = (node["product_id"] as? String)?.trim() ?: ""
+            val parentLid = (node["location_id"] as? String)?.trim() ?: ""
             val bomRowsForRate = data["bom"] ?: emptyList()
             val parentBomRowsForRate = bomRowsForRate.filter { (it["parent_id"] as? String)?.trim() == parentPid }
+            val parentYield = getMethods(parentPid, parentLid, data)
+                .firstOrNull { it["type"] == "make" }
+                ?.let { (it["yield"] as? Number)?.toDouble()?.takeIf { y -> y > 0 } } ?: 1.0
+            // rateOf/effectiveRateOf: this is the SAME rate variantsForMake would have used to
+            // size this child (rate / yield) — used by both the AND branch (below) and the OR
+            // aggregate's conservation sum, which independently re-derives rate from the raw BOM
+            // row rather than reusing variantsForMake's own output (see that branch's own doc).
             fun rateOf(cd: Map<String, Any?>): Double {
                 val childPid = (cd["product_id"] as? String)?.trim() ?: ""
                 val actualRate = parentBomRowsForRate
                     .firstOrNull { (it["child_id"] as? String)?.trim() == childPid }
                     ?.let { (it["rate"] as? Number)?.toDouble() }
-                if (actualRate != null && actualRate > 1e-9) return actualRate
+                if (actualRate != null && actualRate > 1e-9) return actualRate / parentYield
                 return if (curQty > 1e-9) ((cd["quantity"] as? Number)?.toDouble() ?: 0.0) / curQty else 0.0
             }
             val rel = node["children_relation"] as? String
@@ -4252,23 +4438,17 @@ internal fun reconcile(
                 method == "move" -> firstAsk.firstOrNull()?.third ?: want   // single source side
                 rel == "or"      -> {
                     // OR-split: each variant independently contributes to the parent.
-                    // The correct parent qty = Σ(c_i / BOM_rate_actual_i) — the same formula R4
-                    // soundness uses. We look up actual BOM rates from the BOM table rather than
-                    // inferring them from cd["quantity"] / curQty, because the latter encodes
+                    // The correct parent qty = Σ(c_i / effective_rate_i) — the same formula R4
+                    // soundness uses. Reuses rateOf (yield-adjusted) rather than re-deriving from
+                    // cd["quantity"] / curQty, because the latter encodes
                     // BOM_rate × variantShare / achievedParentQty and is wrong when the OR WO
                     // achieved less than slotQty (achievedQty < slotQty → rateOf is inflated →
                     // Σ third/n undershoots by slotQty/achievedQty, causing R4 actual>>expected).
-                    val parentPid = (node["product_id"] as? String)?.trim() ?: ""
-                    val bomRows = data["bom"] ?: emptyList()
-                    val parentBomRows = bomRows.filter { (it["parent_id"] as? String)?.trim() == parentPid }
                     val sum = firstAsk.zip(demandChildren).sumOf { (ask, cd) ->
                         val (_, r, third) = ask
                         val c = third * r  // committed_qty for this variant: c = (c/r) × r
-                        val childPid = (cd["product_id"] as? String)?.trim() ?: ""
-                        val actualRate = parentBomRows
-                            .firstOrNull { (it["child_id"] as? String)?.trim() == childPid }
-                            ?.let { (it["rate"] as? Number)?.toDouble() }
-                        if (actualRate != null && actualRate > 1e-9) c / actualRate else third
+                        val effRate = rateOf(cd)
+                        if (effRate > 1e-9) c / effRate else third
                     }
                     sum.coerceAtMost(want)
                 }
@@ -6115,6 +6295,7 @@ private fun runPlanningOnePass(
             "supply_date" to s["supply_date"],
             "supply_id" to s["supply_id"],
             "qty" to ((s["qty"] as? Number)?.toDouble() ?: 0.0),
+            "target" to s["target"],
         )
     }.toMutableList()
 
@@ -6248,6 +6429,18 @@ private fun runPlanningOnePass(
         }
     }
     emitPhase("committing", "Committing demands…", 83)
+    // Every demand critical-reachable to SOMETHING (sgAllocation.criticalMatrix.byRow) gets a
+    // real, non-null top-level budget entry here — even an empty one, for a demand whose
+    // TARGET/lead-time window excluded it from every eligible lot of that material. Without
+    // this, such a demand's `budgets[demandId]` is simply absent, and plan()'s own per-node
+    // budget derivation (deliberately generic — legacyCommit is shared by callers, like
+    // isolated unit tests, that never populate a critical budget at all) has no way to tell
+    // "no budget system in play" apart from "critical, zero entitlement" and falls back to
+    // uncapped FIFO — confirmed live: such a demand grabbed a late, un-entitled lot outright.
+    val budgetsForCommit: Map<Any?, MutableMap<String, Double>> =
+        sgAllocation.perLotBudgets.toMutableMap().apply {
+            for (demandId in sgAllocation.criticalMatrix.byRow.keys) getOrPut(demandId) { mutableMapOf() }
+        }
     var commitResult = legacyCommit(
         demands           = demands,
         inventory         = inventory,
@@ -6255,7 +6448,7 @@ private fun runPlanningOnePass(
         config            = config,
         useTaggedLookup   = false,
         progressCallback  = commitProgressCallback,
-        budgets           = sgAllocation.perLotBudgets,
+        budgets           = budgetsForCommit,
         iter0Allocation   = pristineBudgetCaps,
         achievableQtyMaps = achievableQtyMaps,
         planBlueprint     = planBlueprint,
@@ -6626,21 +6819,72 @@ private fun runPlanningOnePass(
     )
 }
 
+/** Commit-reason values that mean "this row isn't real fulfillment" — a root-level failure row's
+ *  own "quantity" can equal the FULL requested amount (see plan()'s depth_limit/cycle_stopped/
+ *  no_methods early returns), not what was actually delivered. Shared by
+ *  [reallocateCriticalLeftoverBudget]'s own short-demand detection and [totalCommittedQty] (used
+ *  by [runPlanning]'s round-to-round improvement check), so both agree on what "committed" means.
+ *  Matches enrichCommittedDemands's OWN FAILURE_REASONS exactly — NOT isHardPlanningFailure (a
+ *  different function, one file over, that deliberately treats cycle_stopped as benign for a
+ *  DIFFERENT purpose — bottleneck calculation). */
+private val REALLOC_FAILURE_REASONS = setOf("depth_limit", "cycle_stopped", "no_methods", "no_preferred_method")
+private fun isReallocFailureReason(reason: String?) =
+    reason != null && (reason in REALLOC_FAILURE_REASONS || reason.startsWith("child_failed:"))
+
+/** Total genuinely-committed quantity across every demand in [result] — used by [runPlanning] to
+ *  measure a reallocation round's REAL contribution (not the theoretical budget it granted, which
+ *  can go largely unconsumed — see runPlanning's own doc for why that distinction matters). */
+private fun totalCommittedQty(result: RunPlanningResult): Double {
+    @Suppress("UNCHECKED_CAST")
+    val committedDemands = result.output["committed_demands"] as? List<Map<String, Any?>> ?: emptyList()
+    return committedDemands
+        .filterNot { isReallocFailureReason(it["commit_reason"] as? String) }
+        .sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
+}
+
+/** Safety cap on [runPlanning]'s reallocation rounds. Each round is a full extra
+ *  [runPlanningOnePass] invocation, so this only bounds worst-case cost if the real halt
+ *  condition — comparing each round's ACTUAL total-committed gain against a materiality floor —
+ *  doesn't kick in first. In practice a case's dominant critical material is usually exhausted
+ *  within 1-2 rounds, so this cap is a backstop, not the primary stopping mechanism. */
+private const val MAX_REALLOCATION_ROUNDS = 5
+
 /**
  * Public entry point — see [runPlanningOnePass] for the actual single-pass algorithm.
  *
  * EXPERIMENTAL (default off, opt-in via `config["reallocate_critical_leftover"] == true`,
- * unvalidated — see `explore/critical-leftover-reallocation` branch). When enabled, wraps a
- * SECOND pass around the first: demands that came up short (Σcommitted < requested_qty) get an
- * extra share of each critical material's LEFTOVER (unconsumed) supply — sized to close that
- * demand's own remaining gap at the SAME material-per-committed-unit rate it already exhibited,
- * capped by what's actually left when multiple short demands compete for the same material — see
- * [reallocateCriticalLeftoverBudget]'s own doc for the exact formula. The combined
- * (original-entitlement + additional) budget is fed back in as `precomputedBudgets` for a full
- * second run, whose result REPLACES pass 1's entirely, matching the design spec: "re-apply the
- * same planning algorithm with the adjusted allocation." Skips the second pass (returns pass 1
- * unchanged) when there's nothing to add — no short demands, or none of them drew any critical
- * material.
+ * unvalidated — see `explore/critical-leftover-reallocation` branch). When enabled, wraps
+ * additional passes around the first: demands that came up short (Σcommitted < requested_qty)
+ * get an extra share of each critical material's LEFTOVER (unconsumed) supply — sized to close
+ * that demand's own remaining gap at the SAME material-per-committed-unit rate it already
+ * exhibited, capped by what's actually left when multiple short demands compete for the same
+ * material — see [reallocateCriticalLeftoverBudget]'s own doc for the exact formula.
+ *
+ * ITERATES rather than stopping at a fixed second pass: a demand's second-pass entitlement is a
+ * PREDICTION (based on the material-per-unit rate it exhibited in the PRIOR pass), not a
+ * guarantee — the new combined budget can shift what ELSE that demand draws, leaving it satisfied
+ * before it ever touches its newly-granted reallocation share. That share then sits unclaimed
+ * exactly like the original leftover did — confirmed live: a wip lot's redistributed residual
+ * (1,148 units, precisely the prior round's leftover) went 100% unconsumed in a single-pass run,
+ * fully recovered once a second round was allowed to redistribute it again against ACTUAL
+ * (not predicted) draws. Looping catches this.
+ *
+ * The halt condition compares each round's ACTUAL [totalCommittedQty] gain (not the theoretical
+ * budget [reallocateCriticalLeftoverBudget] granted) against a materiality floor — a round can
+ * grant a large "additional" budget that mostly goes unconsumed (the exact wip-lot pattern above,
+ * just at a different scale), so checking the grant's own size isn't a reliable stopping signal;
+ * confirmed live on case 173, where every round's GRANT cleared even a 1%-of-demand threshold
+ * while the real committed-quantity gain from rounds 2-5 combined was only ~0.9% of total demand
+ * for ~20 minutes of extra re-plan cost. [MAX_REALLOCATION_ROUNDS] is only a cost backstop behind
+ * this — the real gain check is expected to fire first on real cases.
+ *
+ * Returns the BEST round seen (by [totalCommittedQty]), not necessarily the last one run: a
+ * round's gain isn't guaranteed non-negative — the underlying commit logic (waterfall
+ * exploration order, consolidation-by-waves, GC) isn't perfectly monotonic across different
+ * budget configurations — confirmed live: case 173's round 3 committed 0.63 units LESS than
+ * round 2 at a 0.1%-of-demand floor. The loop still stops once a round's gain over the best-so-
+ * far falls below the floor (a negative gain trivially qualifies), it just doesn't hand back that
+ * losing round's own result.
  */
 fun runPlanning(
     data: Map<String, List<Map<String, Any?>>>,
@@ -6650,22 +6894,50 @@ fun runPlanning(
     preferenceKb: PreferenceKb? = null,
     demandOrder: Map<String, Int>? = null,
 ): RunPlanningResult {
-    val pass1 = runPlanningOnePass(data, config, progressCallback, precomputedBudgets, preferenceKb, demandOrder)
-    if (config?.get("reallocate_critical_leftover") != true) return pass1
+    var current = runPlanningOnePass(data, config, progressCallback, precomputedBudgets, preferenceKb, demandOrder)
+    if (config?.get("reallocate_critical_leftover") != true) return current
 
     val demands = data["demand"] ?: emptyList()
     // Only used to derive criticalPids (which (pid, lid) pairs are critical) — cheap, pure,
-    // read-only BOM walk, same call buildSupplyAllocation itself made at the top of pass 1.
+    // read-only BOM walk, same call buildSupplyAllocation itself made at the top of each pass.
     val criticalPids = buildSupplyAllocation(demands, data, config).criticalMatrix.byColumn.keys
         .map { it.productId }.toSet()
 
-    val combinedBudgets = reallocateCriticalLeftoverBudget(pass1, data, criticalPids)
-    if (combinedBudgets == null) {
-        log.info("[reallocate-critical-leftover] no short demand drew any critical material with leftover — skipping second pass")
-        return pass1
+    val materialityFloor = maxOf(1.0, demands.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 } * 0.001)
+    // Track the BEST round seen, not just the latest — a round's own gain isn't guaranteed
+    // non-negative (the underlying commit logic — waterfall exploration order, consolidation-by-
+    // waves, GC — isn't perfectly monotonic across different budget configurations; confirmed
+    // live: case 173's round 3 committed 0.63 units LESS than round 2). Blindly returning
+    // whatever the last round produced would silently regress in that case.
+    var best = current
+    var bestCommitted = totalCommittedQty(current)
+    var round = 0
+    while (round < MAX_REALLOCATION_ROUNDS) {
+        val combinedBudgets = reallocateCriticalLeftoverBudget(current, data, criticalPids)
+        if (combinedBudgets == null) {
+            if (round == 0) log.info("[reallocate-critical-leftover] no short demand drew any critical material with leftover — skipping")
+            else log.info("[reallocate-critical-leftover] converged after {} round(s) (no more leftover to redistribute)", round)
+            break
+        }
+        round++
+        log.info("[reallocate-critical-leftover] round {}: re-running with adjusted budget ({} demand entries)", round, combinedBudgets.size)
+        current = runPlanningOnePass(data, config, progressCallback, combinedBudgets, preferenceKb, demandOrder)
+        val newCommitted = totalCommittedQty(current)
+        val gain = newCommitted - bestCommitted
+        log.info("[reallocate-critical-leftover] round {} actual committed gain: {} units (materiality floor {})", round, gain, materialityFloor)
+        if (newCommitted > bestCommitted) {
+            best = current
+            bestCommitted = newCommitted
+        }
+        if (gain < materialityFloor) {
+            log.info("[reallocate-critical-leftover] round {}'s actual gain is below the materiality floor — stopping (returning the best round seen, not necessarily this one)", round)
+            break
+        }
     }
-    log.info("[reallocate-critical-leftover] re-running with adjusted budget ({} demand entries)", combinedBudgets.size)
-    return runPlanningOnePass(data, config, progressCallback, combinedBudgets, preferenceKb, demandOrder)
+    if (round == MAX_REALLOCATION_ROUNDS) {
+        log.warn("[reallocate-critical-leftover] hit the {}-round cost backstop without the materiality floor converging first — some leftover may remain unredistributed", MAX_REALLOCATION_ROUNDS)
+    }
+    return best
 }
 
 /**
@@ -6746,10 +7018,8 @@ private fun reallocateCriticalLeftoverBudget(
     // calculation). A root-level failure row's own "quantity" field can equal the FULL requested
     // amount (see plan()'s depth_limit/cycle_stopped/no_methods early returns), not what was
     // actually delivered — including it here would make a totally-failed demand look fully
-    // committed and never register as short.
-    val reallocFailureReasons = setOf("depth_limit", "cycle_stopped", "no_methods", "no_preferred_method")
-    fun isReallocFailureReason(reason: String?) =
-        reason != null && (reason in reallocFailureReasons || reason.startsWith("child_failed:"))
+    // committed and never register as short. (See top-level isReallocFailureReason — shared with
+    // runPlanning's own round-to-round improvement check, so both agree on what "committed" means.)
     val committedByDemand = mutableMapOf<String, Double>()
     for (row in committedDemands) {
         if (isReallocFailureReason(row["commit_reason"] as? String)) continue
@@ -6871,6 +7141,13 @@ private fun reallocateCriticalLeftoverBudget(
         }
     }
     if (additional.isEmpty()) return null
+    // NOTE: no materiality check on `additional`'s own SIZE here (a prior version tried that
+    // and it didn't work — see runPlanning's own doc: the granted budget is a CEILING, not a
+    // prediction of what gets consumed, so a round can grant a large "additional" that mostly
+    // goes unclaimed, exactly the wip-lot pattern this whole mechanism exists to catch). The
+    // real halt condition lives in runPlanning's loop instead, comparing ACTUAL total-committed
+    // improvement between rounds — the only signal that isn't fooled by over-generous-but-
+    // unconsumed grants.
 
     // original_allocation: each demand's cap starts at what it ACTUALLY consumed in pass 1 (not
     // its unused entitlement ceiling — see this function's own doc for why that over-subscribes).

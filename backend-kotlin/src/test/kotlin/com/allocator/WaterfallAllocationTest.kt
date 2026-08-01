@@ -13,9 +13,13 @@ import io.kotest.matchers.shouldNotBe
  *   FG ─┬─ (make via BOM_A; preference 1)  ← R1 (qty-capped supply)
  *       └─ (make via BOM_B; preference 2)  ← R2 (qty-capped supply)
  *
- * With `max_methods = 2`, the planner runs BOM_A on the full demand first
- * (slot 1), then hands the residual to BOM_B (slot 2). Inventory carries
- * forward — slot 2 sees R1's consumption.
+ * `waterfallConfig` pins `root_waterfall: false` (legacy root-only equal-split — see its own
+ * doc): FG's demand is a ROOT demand, and rootWaterfall now defaults to true, which would
+ * otherwise make the root use the SAME ordinary sequential 100%-then-spillover waterfall as
+ * every non-root node. With the legacy split pinned, `max_methods = 2` divides the root's
+ * quantity evenly across BOM_A/BOM_B up front; genuine spillover (slot 2 picking up a residual
+ * slot 1 couldn't cover, inventory carrying forward) still applies whenever a slot's granted
+ * share exceeds what it can actually deliver.
  */
 class WaterfallAllocationTest : FunSpec({
 
@@ -58,9 +62,13 @@ class WaterfallAllocationTest : FunSpec({
         ),
     )
 
+    // root_waterfall: false pins the legacy root-only equal-split behavior these fixtures were
+    // written around — rootWaterfall now defaults to true (root-alt-waterfall A/B promotion; see
+    // MethodSelectionConfig's own doc), which would otherwise make a root demand use ordinary
+    // sequential waterfall instead of splitting evenly across its top-`max_methods` alternatives.
     val waterfallConfig = mapOf(
         "purchase_allowed" to false,
-        "method_selection" to mapOf("max_methods" to 2, "mode" to "preference", "depth" to 1),
+        "method_selection" to mapOf("max_methods" to 2, "root_waterfall" to false),
     )
 
     test("root demand with both R1 and R2 plentiful: equal split across both slots, not slot-1-only") {
@@ -155,11 +163,16 @@ class WaterfallAllocationTest : FunSpec({
         r2Remaining?.toDouble() shouldBe (800.0 plusOrMinus 1e-6)
     }
 
-    test("max_methods=1 disables waterfall (single-method behavior)") {
-        // R1=50, R2=50. Both methods probe-fail (each can supply at most 50 of 200).
-        // Cascade falls back to lowest preference (BOM_A). Single-method commits 50.
-        // Waterfall (max=2) would have produced 50+50 = 100 with two WOs; max=1 produces
-        // only one WO at 50.
+    test("max_methods no longer bounds ordinary-waterfall candidate count (root_waterfall=true)") {
+        // R1=50, R2=50, demand=200. max_methods=1 does NOT restrict the root to one candidate
+        // when root_waterfall=true (the default): PlanningEngine.kt's rootSplitWeights/loopCap
+        // doc (~3489-3513) is explicit that max_methods only shapes the root's up-front
+        // equal-split when root_waterfall=false AND cap>1 — "the loop previously didn't
+        // actually honor" a max_methods-bounds-candidate-count contract, and that was an
+        // intentional fix, not a regression. Ordinary sequential waterfall (root_waterfall=true,
+        // or any non-root node) tries every available alternative regardless of max_methods:
+        // slot 1 (BOM_A/R1) commits 50, residual 150 spills to slot 2 (BOM_B/R2) which commits
+        // another 50 — total 100, both R1 and R2 drained, both WOs present.
         val inventory = mkInv(
             supply("R1", "L", 50.0, "SUP_R1"),
             supply("R2", "L", 50.0, "SUP_R2"),
@@ -170,20 +183,19 @@ class WaterfallAllocationTest : FunSpec({
         )
         val singleConfig = mapOf(
             "purchase_allowed" to false,
-            "method_selection" to mapOf("max_methods" to 1, "mode" to "preference", "depth" to 1),
+            "method_selection" to mapOf("max_methods" to 1),
         )
 
         val (committed, wos, pegging) = plan(demand, inventory, twoMethodFg, requestTimeDt = null, config = singleConfig)
 
         val totalCommitted = committed.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 }
-        totalCommitted shouldBe (50.0 plusOrMinus 1e-6)
-        (pegging?.get("committed_qty") as? Number)?.toDouble() shouldBe (50.0 plusOrMinus 1e-6)
+        totalCommitted shouldBe (100.0 plusOrMinus 1e-6)
+        (pegging?.get("committed_qty") as? Number)?.toDouble() shouldBe (100.0 plusOrMinus 1e-6)
 
-        // Exactly one make WO (for BOM_A); BOM_B never invoked.
-        wos.count { it["method"] == "make" } shouldBe 1
-        // R2 untouched — slot 2 was never invoked because max=1 disables waterfall.
+        // Both BOM_A and BOM_B fire despite max_methods=1.
+        wos.count { it["method"] == "make" } shouldBe 2
         val r2Remaining = inventory.firstOrNull { it["product_id"] == "R2" }?.get("qty") as? Number
-        r2Remaining?.toDouble() shouldBe (50.0 plusOrMinus 1e-6)
+        r2Remaining?.toDouble() shouldBe (0.0 plusOrMinus 1e-6)
     }
 
     test("inventory carries forward — slot 2 sees slot 1's consumption") {

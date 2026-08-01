@@ -143,7 +143,7 @@ class PreferenceBuilderTest : FunSpec({
         // methods get an even share (5 of 10) rather than B1 taking all of it with B2 unused.
         val data = twoAltFixture("P1", "C1", "C2")
         val (_, wos, _) = plan(demandFor("P1", "D1"), mutableListOf(), data, requestTimeDt = null,
-            config = mapOf("purchase_allowed" to true), preferenceKb = null)
+            config = mapOf("purchase_allowed" to true, "method_selection" to mapOf("root_waterfall" to false)), preferenceKb = null)
         purchasedChildren(wos) shouldBe setOf("C1", "C2")
         purchasedQty(wos, "C1") shouldBe (5.0 plusOrMinus 0.01)
         purchasedQty(wos, "C2") shouldBe (5.0 plusOrMinus 0.01)
@@ -174,7 +174,7 @@ class PreferenceBuilderTest : FunSpec({
         )
 
         val (_, wosP1, _) = plan(demandFor("P1", "D1"), mutableListOf(), combined, requestTimeDt = null,
-            config = mapOf("purchase_allowed" to true), preferenceKb = preferenceKb)
+            config = mapOf("purchase_allowed" to true, "method_selection" to mapOf("root_waterfall" to false)), preferenceKb = preferenceKb)
         // With this lopsided a score gap, B2's reconstructed score is 1.0 and B1's is 0.0 —
         // B1's target share is exactly 0, so it commits nothing at all (no C1 purchase WO).
         purchasedChildren(wosP1) shouldBe setOf("C2")
@@ -182,7 +182,7 @@ class PreferenceBuilderTest : FunSpec({
         purchasedQty(wosP1, "C2") shouldBe (10.0 plusOrMinus 0.01)
 
         val (_, wosP2, _) = plan(demandFor("P2", "D2"), mutableListOf(), combined, requestTimeDt = null,
-            config = mapOf("purchase_allowed" to true), preferenceKb = preferenceKb)
+            config = mapOf("purchase_allowed" to true, "method_selection" to mapOf("root_waterfall" to false)), preferenceKb = preferenceKb)
         purchasedChildren(wosP2) shouldBe setOf("C3", "C4")
         purchasedQty(wosP2, "C3") shouldBe (5.0 plusOrMinus 0.01)
         purchasedQty(wosP2, "C4") shouldBe (5.0 plusOrMinus 0.01)

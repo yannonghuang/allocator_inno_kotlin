@@ -13,12 +13,16 @@ import io.kotest.matchers.shouldBe
  * `customer` resolves `parent` as a make (location blank/"*" = any).
  *
  * Test fixture: parent P (make at L) with two single-child alternatives
- * P→C1 (alt_group A1) and P→C2 (alt_group A2); C1 and C2 are both buyable. At the root
- * (P's demand is the top-level demand here), an unconstrained demand with more than one
- * candidate alternative defaults to an even split across them (C1 and C2, 50/50 of the
- * quantity) — the root-only proportional/equal-split behavior; a matching constraint
- * narrows the candidate list down to the one forced child, which (being the sole
- * remaining candidate) is never split.
+ * P→C1 (alt_group A1) and P→C2 (alt_group A2); C1 and C2 are both buyable. `cfg()` sets
+ * `root_waterfall: false` explicitly — root-only equal-split across alternatives is opt-in
+ * now (rootWaterfall defaults to true since the root-alt-waterfall A/B promotion; see
+ * MethodSelectionConfig's own doc), but equal-split-vs-waterfall is an orthogonal axis to
+ * what this file tests, so these tests pin the legacy split mode rather than silently
+ * start exercising waterfall's 100%-then-spillover semantics. With that pinned, an
+ * unconstrained demand with more than one candidate alternative defaults to an even split
+ * across them (C1 and C2, 50/50 of the quantity); a matching constraint narrows the
+ * candidate list down to the one forced child, which (being the sole remaining candidate)
+ * is never split.
  */
 class ConstraintsTest : FunSpec({
 
@@ -44,6 +48,7 @@ class ConstraintsTest : FunSpec({
     fun cfg(constraints: List<Map<String, Any?>>) = mapOf<String, Any?>(
         "purchase_allowed" to true,
         "constraints" to constraints,
+        "method_selection" to mapOf("root_waterfall" to false),
     )
     fun rule(customer: String, child: String, location: String = "*") =
         mapOf<String, Any?>("customer" to customer, "parent" to "P", "location" to location, "child" to child)
