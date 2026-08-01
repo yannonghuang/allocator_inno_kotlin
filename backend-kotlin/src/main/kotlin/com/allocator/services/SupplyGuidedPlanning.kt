@@ -210,16 +210,35 @@ internal fun buildSupplyAllocation(
                 (if (allocCritical) sortedAllocs else sortedAllocs.take(8)).joinToString { (d, q) -> "$d:${q.toLong()}" })
         }
 
-    // Per-lot budgets — date-filtered so each lot is only consumable by demands
-    // whose need date is on or after the lot's supply_date.
-    val perLotBudgets = allocateSuppliesPerLot(
-        matrix           = criticalMatrix,
-        supplies         = data["supply"] ?: emptyList(),
-        demandPriorities = demandPriorities,
-        mode             = ALLOCATION_MODE,
-        demandDates      = demandDates,
-        demandQuantities = demandQuantities,
-    )
+    // Per-lot budgets. `allocateCriticalSuppliesPerLot` (TARGET/tightened-timing/rate-yield-
+    // adjusted "legitimate quantity") is scoped to cases that actually USE TARGET — a case with
+    // none falls back to the original, unmodified-from-main `allocateSuppliesPerLot`
+    // (demand_qty-proportional). Deliberate: the new path recomputes a rate/yield-adjusted
+    // cumulative need per (demand, critical material) via an uncached recursive BOM+move walk
+    // (aggregatePathToLeaf) — correct, but real cost on a large case, and a materially different
+    // allocation formula from what's shipped on main. Gating it behind actual TARGET usage keeps
+    // every case that doesn't use this feature byte-for-byte identical to main's own behavior —
+    // confirmed necessary live: case 173 (zero TARGET rows) dropped from 69.6% to 30.7% fill rate
+    // when the new path ran unconditionally for every critical material in every case.
+    val hasTargetedSupply = (data["supply"] ?: emptyList())
+        .any { (it["target"] as? String)?.trim()?.isNotBlank() == true }
+    val perLotBudgets = if (hasTargetedSupply) {
+        allocateCriticalSuppliesPerLot(
+            matrix    = criticalMatrix,
+            supplies  = data["supply"] ?: emptyList(),
+            demands   = demands,
+            data      = data,
+        )
+    } else {
+        allocateSuppliesPerLot(
+            matrix           = criticalMatrix,
+            supplies         = data["supply"] ?: emptyList(),
+            demandPriorities = demandPriorities,
+            mode             = ALLOCATION_MODE,
+            demandDates      = demandDates,
+            demandQuantities = demandQuantities,
+        )
+    }
 
     // Build lotKey → demand → qty map for post-planning trace.
     val aggKeySet     = criticalMatrix.byColumn.keys.map { it.toString() }.toSet()
@@ -245,18 +264,6 @@ internal fun buildSupplyAllocation(
         log.info("[supply-guided][allocation-lot] supply={}@{} lot={} allocated={} eligible={} of {} demands  all={}",
             pid, lid, sid, demandAllocs.values.sum().toLong(), demandAllocs.size, allCompeting.size,
             allCompeting.joinToString { (d, _) -> "$d:${(demandAllocs[d] ?: 0.0).toLong()}" })
-    }
-
-    // Diagnostic: per-lot budgets for 160-1153@1000 lots.
-    val diagLots = lotAllocByLot.entries.filter { (k, _) -> k.startsWith("160-1153|1000|") }.sortedBy { it.key }
-    if (diagLots.isEmpty()) {
-        log.info("[supply-guided][diag-160-1153-lots] no lots found in perLotBudgets for 160-1153@1000")
-    } else {
-        for ((lotKey, demandAllocs) in diagLots) {
-            log.info("[supply-guided][diag-160-1153-lots] lot={} demands={} total_alloc={}  allocs={}",
-                lotKey.substringAfterLast('|'), demandAllocs.size, demandAllocs.values.sum().toLong(),
-                demandAllocs.entries.sortedByDescending { it.value }.joinToString { (d, q) -> "$d:${q.toLong()}" })
-        }
     }
 
     return SupplyAllocationResult(
@@ -285,6 +292,47 @@ internal fun buildAllocationBudgetRows(perLotBudgets: Map<Any?, MutableMap<Strin
             val supplyId = key.substringAfterLast('|')
             if (supplyId.isBlank() || qty <= 1e-12) continue
             rows.add(Triple(supplyId, demandId?.toString(), qty))
+        }
+    }
+    return rows
+}
+
+/**
+ * Same output shape as [buildAllocationBudgetRows], but zero-filled: emits a row for EVERY
+ * (physical lot, demand) pair where the demand's BOM can reach that critical material at all
+ * ([criticalMatrix]'s reachability — TARGET/timing-agnostic), not just pairs that actually
+ * received budget.
+ *
+ * Without this, a demand whose deadline (or TARGET mismatch) excludes it from every lot of a
+ * critical material it structurally needs simply has no row anywhere — indistinguishable in the
+ * UI/API from "this demand doesn't need this material," when the true story is "needs it, but no
+ * lot can legally supply it in time." Same reasoning for a lot no demand's deadline reaches: it
+ * silently vanishes from the table rather than showing as a legitimately-unclaimed 0. See
+ * allocateCriticalSuppliesPerLot's own doc for why a (demand, lot) pair can be reachable in
+ * aggregate yet still get 0 budget.
+ */
+internal fun buildAllocationBudgetRowsFull(
+    perLotBudgets: Map<Any?, MutableMap<String, Double>>,
+    criticalMatrix: NeedsMatrix,
+    supplies: List<Map<String, Any?>>,
+): List<Triple<String, String?, Double>> {
+    val lotsByKey: Map<SupplyKey, List<String>> = supplies.mapNotNull { row ->
+        val pid = (row["product_id"] as? String)?.trim() ?: return@mapNotNull null
+        val lid = (row["location_id"] as? String)?.trim() ?: return@mapNotNull null
+        val sid = (row["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        val qty = (row["qty"] as? Number)?.toDouble() ?: return@mapNotNull null
+        if (qty <= 0) null else SupplyKey(pid, lid) to sid
+    }.groupBy({ it.first }, { it.second })
+
+    val rows = mutableListOf<Triple<String, String?, Double>>()
+    for ((sk, demandNeeds) in criticalMatrix.byColumn) {
+        val lots = lotsByKey[sk] ?: continue
+        for (supplyId in lots) {
+            val lotKey = "${sk}|$supplyId"
+            for (demandId in demandNeeds.keys) {
+                val qty = perLotBudgets[demandId]?.get(lotKey) ?: 0.0
+                rows.add(Triple(supplyId, demandId?.toString(), qty))
+            }
         }
     }
     return rows

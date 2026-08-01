@@ -79,6 +79,7 @@ object CaseLoader {
                 "location_id" to it[MethodMakes.locationId],
                 "preference" to (it[MethodMakes.preference] ?: 0),
                 "lead_time" to it[MethodMakes.leadTime],
+                "yield" to (it[MethodMakes.yield] ?: 1.0),
             )
         }
 
@@ -134,6 +135,7 @@ object CaseLoader {
                 "location_id" to (it[Supplies.locationId] ?: ""),
                 "supply_date" to it[Supplies.supplyDate],
                 "qty" to it[Supplies.qty],
+                "target" to it[Supplies.targetCustomerId],
             )
         }
 

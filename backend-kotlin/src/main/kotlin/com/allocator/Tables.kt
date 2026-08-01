@@ -112,6 +112,9 @@ object MethodMakes : Table("method_make") {
     val locationId = varchar("location_id", 255)
     val preference = integer("preference").nullable()
     val leadTime = integer("lead_time").nullable()
+    // Fraction of nominal BOM-rate output actually realized (e.g. 0.97 = 3% material loss).
+    // Null/absent means no yield loss (equivalent to 1.0) — see variantsForMake's own doc.
+    val yield = double("yield").nullable()
     // See Boms.updatedAt's own doc — same "last (re)imported at" audit trail.
     val updatedAt = timestamp("updated_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
@@ -170,6 +173,9 @@ object Supplies : Table("supply") {
     val productId = varchar("product_id", 255)
     val supplyDate = varchar("supply_date", 64).nullable()
     val qty = double("qty")
+    // Customer id this lot is earmarked for (critical-material allocation only — see
+    // allocateCriticalSuppliesPerLot). Null/blank means unrestricted, usable by any demand.
+    val targetCustomerId = varchar("target_customer_id", 255).nullable()
     // See Boms.updatedAt's own doc — same "last (re)imported at" audit trail.
     val updatedAt = timestamp("updated_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)

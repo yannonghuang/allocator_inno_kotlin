@@ -46,35 +46,25 @@ class SupplyGuidedPlanningTest : FunSpec({
 
     val supplyGuidedConfig = mapOf(
         "purchase_allowed" to false,
-        "supply_guided" to mapOf("enabled" to true, "allocation_mode" to "demand_qty"),
     )
 
     // ── A. Config parsing ─────────────────────────────────────────────────────
+    // Step 2's allocation policy is fixed, not configurable (see SupplyGuidedConfig's own doc) —
+    // the only remaining knob is trace_lots (post-planning lot-draw diagnostics, off by default).
 
     test("parseSupplyGuidedConfig: defaults when key absent") {
         val cfg = parseSupplyGuidedConfig(emptyMap<String, Any?>())
-        cfg.enabled shouldBe true
-        cfg.allocationMode shouldBe "demand_qty"
-        cfg.maxCompensationPasses shouldBe 1
+        cfg.traceLots shouldBe false
     }
 
-    test("parseSupplyGuidedConfig: explicit values") {
-        val raw = mapOf(
-            "supply_guided" to mapOf(
-                "enabled" to true,
-                "allocation_mode" to "fair",
-                "max_compensation_passes" to 3,
-            )
-        )
-        val cfg = parseSupplyGuidedConfig(raw)
-        cfg.enabled shouldBe true
-        cfg.allocationMode shouldBe "fair"
-        cfg.maxCompensationPasses shouldBe 3
+    test("parseSupplyGuidedConfig: trace_lots explicit value") {
+        val raw = mapOf("supply_guided" to mapOf("trace_lots" to true))
+        parseSupplyGuidedConfig(raw).traceLots shouldBe true
     }
 
-    test("parseSupplyGuidedConfig: unknown allocation_mode defaults to demand_qty") {
-        val raw = mapOf("supply_guided" to mapOf("enabled" to true, "allocation_mode" to "bogus"))
-        parseSupplyGuidedConfig(raw).allocationMode shouldBe "demand_qty"
+    test("parseSupplyGuidedConfig: wrong-typed trace_lots falls back to default false") {
+        val raw = mapOf("supply_guided" to mapOf("trace_lots" to "yes"))
+        parseSupplyGuidedConfig(raw).traceLots shouldBe false
     }
 
     // ── B. Demand-qty allocation mode ─────────────────────────────────────────
@@ -382,7 +372,14 @@ class SupplyGuidedPlanningTest : FunSpec({
         reqs.map { it.branch }.toSet() shouldBe setOf("C1", "C2", "C3", "C4").map { BranchKey(it, "L") }.toSet()
     }
 
-    test("computeAndSiblingCaps: splits D1's own 40-unit X allowance evenly, 10 per sibling") {
+    test("computeAndSiblingCaps: splits D1's own X allowance evenly, 10 per sibling") {
+        // This fixture's lot carries no TARGET, so buildSupplyAllocation falls back to the
+        // original, unmodified-from-main allocateSuppliesPerLot (demand_qty-proportional) rather
+        // than allocateCriticalSuppliesPerLot's rate/yield-adjusted "legitimate quantity" — that
+        // richer computation is deliberately scoped to cases that actually use TARGET (see
+        // buildSupplyAllocation's own doc; a case with none must stay byte-for-byte identical to
+        // main). So D1's own ceiling on X here is still its raw quantity (40), split evenly
+        // across the 4 siblings: 10 each.
         val data = diamondData()
         val alloc = buildSupplyAllocation(data["demand"]!!, data, diamondConfig)
         val caps = computeAndSiblingCaps(data["demand"]!!, alloc, data, diamondConfig, null).caps
@@ -432,13 +429,14 @@ class SupplyGuidedPlanningTest : FunSpec({
         }
     }
 
-    // A demand's own aggregate ceiling on a critical material is its raw demand quantity (see
-    // diamondData's own comment), NOT scaled down by BOM rate — so an AND-group where every
-    // sibling asks for the FULL demand quantity of the shared material (rate 1.0, as in
-    // diamondData) is ALWAYS constrained once there are >=2 siblings, regardless of the
-    // demand's absolute size. To build a genuinely UNconstrained fixture, each sibling's own
-    // rate down to the shared material must be small enough that even N siblings' combined ask
-    // stays under the demand's own (unscaled) ceiling.
+    // A demand's own aggregate ceiling on a critical material is its rate/yield-adjusted
+    // "legitimate quantity" (allocateCriticalSuppliesPerLot — AND-summed across every branch
+    // reaching the material, so it CAN exceed the demand's own raw quantity in a diamond, e.g.
+    // diamondData's 4-siblings-at-rate-1.0 fixture below: true need 160 vs. raw 40), further
+    // capped by the material's own physical supply. So whether a group is "constrained" depends
+    // on supply vs. that legitimate quantity, not on the demand's raw quantity alone. To build a
+    // genuinely UNconstrained fixture here, supply must exceed the summed rate/yield-adjusted
+    // need across every sibling reaching the material.
     val unconstrainedConfig = mapOf<String, Any?>("purchase_allowed" to false)
     fun unconstrainedData() = mkData(
         supplies = listOf(supply("X", "L", 1000.0)),
@@ -534,14 +532,15 @@ class SupplyGuidedPlanningTest : FunSpec({
     }
 
     test("diamond: AND-required siblings independently reaching one scarce material split fairly, not sequentially") {
-        // Sequential/greedy exploration draws C1=40 (0 left of D1's own 40-unit cap), C2=0,
-        // C3=0, C4=0 — an AND-min of 0, so P commits NOTHING despite that same 40-unit
-        // allowance being enough to give all four siblings a meaningful (10 each) share. This
-        // is the exact shape of the real F35__444 bug this session traced (a make with several
-        // AND-siblings that all route through one non-purchasable raw material). The
-        // gather-then-allocate fix (computeAndSiblingCaps) should instead give each sibling a
-        // fair, pre-computed 40/4=10-unit cap, so all four succeed at 10 and P commits 10
-        // instead of 0.
+        // Sequential/greedy exploration draws C1=up to its full share (0 left for C2/C3/C4) —
+        // an AND-min of 0, so P commits NOTHING despite the same allowance being enough to give
+        // all four siblings a meaningful (10 each — see the computeAndSiblingCaps test just
+        // above; this fixture's lot has no TARGET, so it's a 40/4=10 split of D1's raw quantity,
+        // not the rate-adjusted 12) share. This is the exact shape of the real F35__444 bug this
+        // session traced (a make with several AND-siblings that all route through one
+        // non-purchasable raw material). The gather-then-allocate fix (computeAndSiblingCaps)
+        // should instead give each sibling a fair, pre-computed 10-unit cap, so all four succeed
+        // at 10 and P commits 10 instead of 0.
         val data = diamondData()
         val result = runPlanning(data, config = diamondConfig)
         @Suppress("UNCHECKED_CAST")
@@ -635,8 +634,12 @@ class SupplyGuidedPlanningTest : FunSpec({
         val c2aCap = d1Caps[BranchKey("C2a", "L", "C2@L")]
         c1Cap shouldNotBe null
         c2aCap shouldNotBe null
-        // Fair 2-way split of D1's own 40-unit X ceiling, even though C1 and C2a are cousins
-        // from unrelated cohorts, not siblings under one shared AND-parent.
+        // This fixture's lot carries no TARGET, so buildSupplyAllocation falls back to the
+        // original allocateSuppliesPerLot (demand_qty-proportional), not
+        // allocateCriticalSuppliesPerLot's rate/yield-adjusted "legitimate quantity" (scoped to
+        // TARGET-using cases only — see buildSupplyAllocation's own doc). D1's own ceiling on X
+        // stays its raw quantity (40), split evenly 20/20 across the two cousins, even though
+        // they're from unrelated cohorts rather than siblings under one shared AND-parent.
         c1Cap!!.values.sum() shouldBe (20.0 plusOrMinus 1e-6)
         c2aCap!!.values.sum() shouldBe (20.0 plusOrMinus 1e-6)
     }
@@ -645,9 +648,11 @@ class SupplyGuidedPlanningTest : FunSpec({
         // Without cross-cohort pooling, each cohort sees only one branch touching X and
         // skips the fair split (no contention detected in isolation) — both C1 and C2a go
         // uncapped, and whichever is evaluated first in the live commit's tree walk grabs
-        // the whole 40-unit budget, starving the other to 0. That drags C2's own AND-min to
-        // 0 (since C2a would get nothing), and P's own AND-min to 0 — D1 commits nothing
-        // despite the same 40 units being enough to give both cousins a meaningful 20 each.
+        // the whole budget, starving the other to 0. That drags C2's own AND-min to 0 (since
+        // C2a would get nothing), and P's own AND-min to 0 — D1 commits nothing despite the
+        // same units being enough to give both cousins a meaningful 20 each (see the
+        // computeAndSiblingCaps test just above — no TARGET on this fixture's lot, so it's the
+        // original 40/2=20 split of D1's raw quantity, not the rate-adjusted 24).
         val data = cousinData()
         val result = runPlanning(data, config = cousinConfig)
         @Suppress("UNCHECKED_CAST")
@@ -720,6 +725,10 @@ class SupplyGuidedPlanningTest : FunSpec({
         d1Caps shouldNotBe null
         val xBranches = d1Caps!!.keys.filter { it.productId == "X" && it.locationId == "L" }
         xBranches.size shouldBe 2
+        // This fixture's lot carries no TARGET, so buildSupplyAllocation falls back to the
+        // original allocateSuppliesPerLot — D1's own ceiling on X stays its raw quantity (40),
+        // split evenly 20/20 across the two branches (see the cousin-contention test's own doc
+        // for the equivalent, TARGET-gated derivation).
         for (branch in xBranches) {
             d1Caps[branch]!!.values.sum() shouldBe (20.0 plusOrMinus 1e-6)
         }
@@ -1102,5 +1111,166 @@ class SupplyGuidedPlanningTest : FunSpec({
         )
         val recipients = findOrGroupRecipients(setOf("X"), data)
         recipients["X"] shouldBe setOf("A3")
+    }
+
+    // ── H. Critical-material TARGET / tightened-timing (TARGET-scoped) allocation ──────────────
+    // allocateCriticalSuppliesPerLot (replaces the old demand_qty allocateSuppliesPerLot for
+    // critical materials, called from buildSupplyAllocation). Each lot is processed
+    // independently (no running deduction across lots) — a demand's legitimate quantity is used
+    // as-is for every lot it's eligible for. Tightened timing only gates a lot that also has
+    // TARGET set; an untargeted lot is eligible regardless of deadline.
+
+    // Two customers (CUST_A, CUST_B) each demand a product P made from a critical raw material X
+    // (rate 1.0, no yield loss) at the same location. Two lots of X: an EARLIER, untargeted lot
+    // (usable by anyone) and a LATER lot targeted to CUST_A only.
+    fun targetFixtureData(lots: List<Map<String, Any?>>, demands: List<Map<String, Any?>>) = mkData(
+        supplies = lots,
+        methodMake = listOf(mapOf("bom_id" to "BP", "product_id" to "P", "location_id" to "L", "preference" to 1, "lead_time" to 0.0)),
+        methodBuy = listOf(mapOf("product_id" to "X", "location_id" to "L", "preference" to 1)),
+        bom = listOf(mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "X", "rate" to 1.0, "alt_group" to null)),
+        demands = demands,
+        productlocation = listOf(mapOf("product_id" to "X", "location_id" to "L", "prod_area" to "raw")),
+    )
+    val targetConfig = mapOf<String, Any?>("purchase_allowed" to false)
+
+    test("allocateCriticalSuppliesPerLot: legitimate quantity reflects BOM rate and yield, not raw demand qty") {
+        // P -> X at rate 2.0, method yield 0.8 (20% loss): to net 1 unit of P you need
+        // 1 * 2.0 / 0.8 = 2.5 units of X (variantsForMake's own childQty = quantity*rate/yield
+        // choke point). Demand needs 10 units of P -> legitimate quantity for X is 10 * 2.5 = 25,
+        // not the raw top-level 10. TARGET is set here (matching DA's own customer) specifically
+        // to exercise allocateCriticalSuppliesPerLot at all — buildSupplyAllocation only routes
+        // to it for cases that actually use TARGET; an untargeted case falls back to the
+        // original, unmodified allocateSuppliesPerLot instead (see its own doc).
+        val lots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_X", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 100.0, "target" to "CUST_A"),
+        )
+        val demands = listOf(
+            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P", "location_id" to "L", "quantity" to 10.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_A"),
+        )
+        val data = mkData(
+            supplies = lots,
+            methodMake = listOf(mapOf("bom_id" to "BP", "product_id" to "P", "location_id" to "L", "preference" to 1, "lead_time" to 0.0, "yield" to 0.8)),
+            methodBuy = listOf(mapOf("product_id" to "X", "location_id" to "L", "preference" to 1)),
+            bom = listOf(mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "X", "rate" to 2.0, "alt_group" to null)),
+            demands = demands,
+            productlocation = listOf(mapOf("product_id" to "X", "location_id" to "L", "prod_area" to "raw")),
+        )
+        val alloc = buildSupplyAllocation(demands, data, targetConfig)
+
+        alloc.perLotBudgets["DA"]?.get("X|L|LOT_X") shouldBe (25.0 plusOrMinus 1e-6)
+    }
+
+    test("allocateCriticalSuppliesPerLot: TARGET restricts a lot to the matching customer only") {
+        val lots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_UNTARGETED", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 30.0, "target" to null),
+            mapOf<String, Any?>("supply_id" to "LOT_A_ONLY", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-08", "qty" to 30.0, "target" to "CUST_A"),
+        )
+        val demands = listOf(
+            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P", "location_id" to "L", "quantity" to 20.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_A"),
+            mapOf<String, Any?>("demand_id" to "DB", "product_id" to "P", "location_id" to "L", "quantity" to 20.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_B"),
+        )
+        val data = targetFixtureData(lots, demands)
+        val alloc = buildSupplyAllocation(demands, data, targetConfig)
+
+        // Only CUST_A is eligible for the targeted lot — CUST_B never gets a budget entry for
+        // it at all. DA's full need (20) fits within the lot's 30, so it gets all 20.
+        val daLotAOnly = alloc.perLotBudgets["DA"]?.get("X|L|LOT_A_ONLY")
+        val dbLotAOnly = alloc.perLotBudgets["DB"]?.get("X|L|LOT_A_ONLY")
+        daLotAOnly shouldBe (20.0 plusOrMinus 1e-6)
+        dbLotAOnly shouldBe null
+
+        // The untargeted lot is processed independently — DA's need isn't reduced by what it
+        // already got from LOT_A_ONLY, so both DA and DB compete for it at their full (20 each)
+        // need: 30 available < 40 total need -> proportional split, 15 each.
+        val daUntargeted = alloc.perLotBudgets["DA"]?.get("X|L|LOT_UNTARGETED")
+        val dbUntargeted = alloc.perLotBudgets["DB"]?.get("X|L|LOT_UNTARGETED")
+        daUntargeted shouldBe (15.0 plusOrMinus 1e-6)
+        dbUntargeted shouldBe (15.0 plusOrMinus 1e-6)
+    }
+
+    test("allocateCriticalSuppliesPerLot: tightened timing (on a TARGETed lot) excludes a demand whose deadline precedes the lot's supply_date") {
+        // Both demands match the lot's TARGET (CUST_A), isolating timing as the only reason
+        // either would be excluded. DA's request date is early enough that, even with zero lead
+        // time along its (rate-1.0, lead-time-0) path to X, its deadline still falls BEFORE the
+        // lot's supply_date — DA must not be eligible for it. DB's deadline is late enough to pass.
+        val lots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_LATE", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-06-01", "qty" to 30.0, "target" to "CUST_A"),
+        )
+        val demands = listOf(
+            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P", "location_id" to "L", "quantity" to 20.0, "request_due_time" to "2024-01-01", "customer_id" to "CUST_A"),
+            mapOf<String, Any?>("demand_id" to "DB", "product_id" to "P", "location_id" to "L", "quantity" to 20.0, "request_due_time" to "2024-12-01", "customer_id" to "CUST_A"),
+        )
+        val data = targetFixtureData(lots, demands)
+        val alloc = buildSupplyAllocation(demands, data, targetConfig)
+
+        alloc.perLotBudgets["DA"]?.get("X|L|LOT_LATE") shouldBe null
+        alloc.perLotBudgets["DB"]?.get("X|L|LOT_LATE") shouldBe (20.0 plusOrMinus 1e-6)
+    }
+
+    test("allocateCriticalSuppliesPerLot: an untargeted lot still needs lot date <= demand's request time (simple check), just not the lead-time-tightened one") {
+        // Untargeted lots are NOT fully exempt from timing — only the lead-time SUBTRACTION is
+        // TARGET-scoped; the plain "lot date <= demand's own request time" check still applies
+        // (matches pre-existing, unchanged behavior for the common untargeted case). This fixture
+        // isolates the distinction with a 30-day lead time: the lot (2024-05-15) is BEFORE DA's
+        // due date (2024-06-01) — passes the simple check — but AFTER the lead-time-tightened
+        // deadline (2024-06-01 minus 30 days = 2024-05-02) — would fail the tightened check.
+        // Untargeted here means only the simple check applies, so DA is eligible.
+        val lots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_MID", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-05-15", "qty" to 30.0, "target" to null),
+        )
+        val demands = listOf(
+            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P", "location_id" to "L", "quantity" to 20.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_A"),
+        )
+        val data = mkData(
+            supplies = lots,
+            methodMake = listOf(mapOf("bom_id" to "BP", "product_id" to "P", "location_id" to "L", "preference" to 1, "lead_time" to 30.0)),
+            methodBuy = listOf(mapOf("product_id" to "X", "location_id" to "L", "preference" to 1)),
+            bom = listOf(mapOf("bom_id" to "BP", "parent_id" to "P", "child_id" to "X", "rate" to 1.0, "alt_group" to null)),
+            demands = demands,
+            productlocation = listOf(mapOf("product_id" to "X", "location_id" to "L", "prod_area" to "raw")),
+        )
+        val alloc = buildSupplyAllocation(demands, data, targetConfig)
+
+        alloc.perLotBudgets["DA"]?.get("X|L|LOT_MID") shouldBe (20.0 plusOrMinus 1e-6)
+    }
+
+    test("allocateCriticalSuppliesPerLot: an untargeted lot dated AFTER the demand's request time is still excluded") {
+        // Same simple check, opposite outcome: the lot arrives after DA's own due date, so even
+        // with no TARGET (no lead-time tightening in play at all) it's not eligible.
+        val lots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_LATE", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-06-01", "qty" to 30.0, "target" to null),
+        )
+        val demands = listOf(
+            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P", "location_id" to "L", "quantity" to 20.0, "request_due_time" to "2024-01-01", "customer_id" to "CUST_A"),
+        )
+        val data = targetFixtureData(lots, demands)
+        val alloc = buildSupplyAllocation(demands, data, targetConfig)
+
+        alloc.perLotBudgets["DA"]?.get("X|L|LOT_LATE") shouldBe null
+    }
+
+    test("allocateCriticalSuppliesPerLot: each lot of the same material is processed independently, not deducted") {
+        // Three same-material lots, 15 units each (45 total), one demand needing 40. Each lot is
+        // evaluated on its own using the demand's FULL, undiminished legitimate quantity (40) —
+        // every lot is a shortage case (15 < 40), so the demand gets the lot's entire 15 from
+        // EACH of the three, independently. The resulting aggregate (45) legitimately exceeds the
+        // demand's own top-level need (40): a per-lot ceiling, not a consumption target — actual
+        // draws during commit are still bounded by what the demand really needs.
+        val lots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_1", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 15.0, "target" to null),
+            mapOf<String, Any?>("supply_id" to "LOT_2", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-02-01", "qty" to 15.0, "target" to null),
+            mapOf<String, Any?>("supply_id" to "LOT_3", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-03-01", "qty" to 15.0, "target" to null),
+        )
+        val demands = listOf(
+            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P", "location_id" to "L", "quantity" to 40.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_A"),
+        )
+        val data = targetFixtureData(lots, demands)
+        val alloc = buildSupplyAllocation(demands, data, targetConfig)
+
+        val budget = alloc.perLotBudgets["DA"]
+        budget?.get("X|L|LOT_1") shouldBe (15.0 plusOrMinus 1e-6)
+        budget?.get("X|L|LOT_2") shouldBe (15.0 plusOrMinus 1e-6)
+        budget?.get("X|L|LOT_3") shouldBe (15.0 plusOrMinus 1e-6)
+        budget?.get("X|L") shouldBe (45.0 plusOrMinus 1e-6)
     }
 })

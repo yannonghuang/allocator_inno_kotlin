@@ -336,3 +336,132 @@ fun allocateSuppliesPerLot(
 
     return result
 }
+
+/**
+ * Critical-raw-material variant of [allocateSuppliesPerLot] — replaces it at
+ * [buildSupplyAllocation]'s one call site (already scoped to `criticalMatrix`, the
+ * pre-pruned-to-critical-only reachability matrix, so no separate critical/non-critical
+ * partitioning is needed here). This table exists for users to review and manually edit
+ * (Critical Raw Allocation UI, saved versions) — it expresses per-demand ELIGIBILITY and a
+ * starting proportional split, not a hard sequencing of consumption; actual fair-share
+ * arbitration among competing demands (AND-siblings, diamonds) happens later, during the real
+ * commit, via the existing branchLotCap/intraBudget machinery.
+ *
+ * Two differences from the plain per-lot allocator, each a straightforward per-lot ELIGIBILITY
+ * filter (not order-dependent — every lot is still processed independently, same as
+ * [allocateSuppliesPerLot]):
+ *  - TARGET: a lot whose `target` is set is only eligible for demands from that customer.
+ *  - Tightened timing: only enforced on a lot that ALSO has TARGET set — untargeted lots keep
+ *    today's plain "lot exists" eligibility, no deadline gate. When it does apply, eligibility
+ *    uses the demand's cumulative-lead-time-adjusted deadline (via [aggregatePathToLeaf],
+ *    AND-summed/OR-maxed across however many routes reach this specific material) rather than
+ *    its flat top-level request date.
+ *
+ * Each demand's "legitimate quantity" (top-level qty × cumulative rate/yield at this material,
+ * aggregated the same AND-sum/OR-max way) is computed ONCE and used as-is for every lot it's
+ * eligible for — deliberately NOT reduced/deducted across lots (dropped the earlier
+ * reverse-chronological running-deduction design: sequencing which lot "gets credit" for a
+ * demand's need is exactly the kind of decision the real commit's own fairness system is already
+ * built to make, and duplicating it here as a static pre-pass fought with it — see
+ * consolidated_wo_pegging_redesign-era history for why. A demand can end up with more aggregate
+ * per-lot budget than its own physical need when eligible for several lots of the same material;
+ * that's fine — it's a CEILING per lot, not a consumption target, exactly like the non-critical
+ * allocator already relies on).
+ *
+ * Output shape is identical to [allocateSuppliesPerLot]'s (demandId → `"$pid|$lid|$supplyId"` /
+ * `"$pid|$lid"` → qty), so [consumeFromInventory]/`legacyCommit` need no changes.
+ */
+internal fun allocateCriticalSuppliesPerLot(
+    matrix: NeedsMatrix,
+    supplies: List<Map<String, Any?>>,
+    demands: List<Map<String, Any?>>,
+    data: Map<String, List<Map<String, Any?>>>,
+): MutableMap<Any?, MutableMap<String, Double>> {
+    val result = mutableMapOf<Any?, MutableMap<String, Double>>()
+    val demandsById = demands.associateBy { it["demand_id"] }
+
+    val lotsByKey = mutableMapOf<SupplyKey, MutableList<Map<String, Any?>>>()
+    for (row in supplies) {
+        val pid = (row["product_id"] as? String)?.trim() ?: continue
+        val lid = (row["location_id"] as? String)?.trim() ?: continue
+        val qty = (row["qty"] as? Number)?.toDouble() ?: continue
+        if (pid.isBlank() || lid.isBlank() || qty <= 0) continue
+        (row["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: continue
+        lotsByKey.getOrPut(SupplyKey(pid, lid)) { mutableListOf() }.add(row)
+    }
+
+    data class DemandContext(val customerId: String?, val eligDate: LocalDate?, val deadline: LocalDate?)
+    for ((sk, demandNeeds) in matrix.byColumn) {
+        val lots = lotsByKey[sk] ?: continue
+        val aggKey = sk.toString()
+
+        // Legitimate quantity + tightened deadline, once per demand at this material — same
+        // AND-sum/OR-max aggregation as before, just no longer mutated across lots.
+        val remaining = mutableMapOf<Any?, Double>()
+        val context = mutableMapOf<Any?, DemandContext>()
+        for (demandId in demandNeeds.keys) {
+            val d = demandsById[demandId] ?: continue
+            val dPid = (d["product_id"] as? String)?.trim() ?: continue
+            val dLid = (d["location_id"] as? String)?.trim() ?: continue
+            val dQty = (d["quantity"] as? Number)?.toDouble() ?: 0.0
+            val path = aggregatePathToLeaf(dPid, dLid, sk.productId, sk.locationId, data) ?: continue
+            val reqDate = parseDate(d["request_due_time"] as? String ?: d["request_time"] as? String)
+            // Period-bucket demands (request_due_time = 1st of month) extend to end-of-month —
+            // same convention allocateSuppliesPerLot uses for the untargeted (no lead-time
+            // tightening) case, so an untargeted lot's eligibility here is byte-for-byte
+            // identical to what it would be outside this TARGET-aware allocator.
+            val eligDate = if (reqDate != null && reqDate.dayOfMonth == 1) reqDate.plusMonths(1).minusDays(1) else reqDate
+            val deadline = reqDate?.let { dateAddDays(it, -path.cumulativeLeadTime) }
+            remaining[demandId] = dQty * path.cumulativeRate
+            context[demandId] = DemandContext(
+                customerId = (d["customer_id"] as? String)?.trim(),
+                eligDate = eligDate,
+                deadline = deadline,
+            )
+        }
+        if (remaining.isEmpty()) continue
+
+        for (lot in lots) {
+            val supplyId = (lot["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: continue
+            val lotQty = (lot["qty"] as? Number)?.toDouble() ?: continue
+            if (lotQty <= 1e-12) continue
+            val lotDate = parseDate(lot["supply_date"] as? String)
+            val lotTarget = (lot["target"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+
+            val eligible = context.filter { (demandId, ctx) ->
+                val rem = remaining[demandId] ?: 0.0
+                if (rem <= 1e-12) return@filter false
+                if (lotTarget != null) {
+                    // TARGETed lot: customer match + tightened, lead-time-adjusted deadline —
+                    // deliberately NOT the period-bucket-extended eligDate: a targeted lot's
+                    // timing constraint is about real WO lead time against the demand's actual
+                    // due date, not a monthly-aggregate window.
+                    if (ctx.customerId != lotTarget) return@filter false
+                    val deadline = ctx.deadline
+                    if (lotDate != null && deadline != null && lotDate.isAfter(deadline)) return@filter false
+                } else {
+                    // Untargeted lot (the common case): same period-bucket-aware date check as
+                    // allocateSuppliesPerLot, no lead-time subtraction.
+                    val eligDate = ctx.eligDate
+                    if (lotDate != null && eligDate != null && lotDate.isAfter(eligDate)) return@filter false
+                }
+                true
+            }
+            if (eligible.isEmpty()) continue
+
+            val candidates = eligible.keys.map { demandId ->
+                AllocationCandidate(demandId = demandId, neededQty = remaining.getValue(demandId), priority = 0)
+            }
+            val totalNeed = candidates.sumOf { it.neededQty }
+            for ((demandId, allocated) in allocProportional(candidates, lotQty, totalNeed)) {
+                if (allocated <= 1e-12) continue
+                val budget = result.getOrPut(demandId) { mutableMapOf() }
+                val lotKey = "$aggKey|$supplyId"
+                budget[lotKey] = (budget[lotKey] ?: 0.0) + allocated
+                budget[aggKey]  = (budget[aggKey]  ?: 0.0) + allocated
+            }
+        }
+    }
+
+    return result
+}
