@@ -2397,6 +2397,16 @@ private fun enrichWorkOrders(
     fun cachedChildren(p: String, l: String) =
         childCache.getOrPut("$p|$l") { bomGraphChildren(p, l, data) }
 
+    // demand_id -> customer_id, so a WO (native or consolidated) can report which customer(s)
+    // it serves. A consolidated WO's own "consolidated_demand_ids" list (set in PlanningEngine.kt
+    // wherever ConsolidationEngine merges multiple demands into one WO) can span demands from
+    // DIFFERENT customers — see CollapsedWoView's own doc for how that's surfaced in the pivot UI.
+    val customerIdByDemandId: Map<String, String> = (data["demand"] ?: emptyList()).mapNotNull { d ->
+        val did = (d["demand_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        val cid = (d["customer_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        did to cid
+    }.toMap()
+
     val nodeDemanderSets = mutableMapOf<String, MutableSet<String>>()
     val uniqueDemandRoots = (data["demand"] ?: emptyList()).mapNotNull { d ->
         val dp = (d["product_id"] as? String)?.trim() ?: return@mapNotNull null
@@ -2436,7 +2446,16 @@ private fun enrichWorkOrders(
         }
         val woKey = "$pid|$lid"
         val competingDemands = nodeDemanderSets[woKey]?.toList() ?: emptyList<String>()
+        // Member demand_ids this WO actually serves: itself if native (single demand_id), or its
+        // own "consolidated_demand_ids" list if it's a merge — NOT wo_competing_demands above,
+        // which is every demand that COULD reach this (pid, lid), not just the ones this specific
+        // WO's own quantity was split across.
+        @Suppress("UNCHECKED_CAST")
+        val memberDemandIds: List<String> = if (demandId.isNotBlank()) listOf(demandId)
+            else (wo["consolidated_demand_ids"] as? List<String>) ?: emptyList()
+        val customerIds = memberDemandIds.mapNotNull { customerIdByDemandId[it] }.distinct().sorted()
         wo + mapOf(
+            "customer_ids" to customerIds,
             "pegging_includes_real_make" to (woNode?.let { subtreeContainsRealMake(it, bomPairs) } ?: false),
             "pegging_includes_buy" to (woNode?.let { subtreeContainsBuy(it) } ?: false),
             "pegging_includes_real_move" to (woNode?.let { subtreeContainsRealMove(it, moveTriples) } ?: false),
@@ -2664,10 +2683,23 @@ private fun enrichPlanResultWithData(
     // Inherit pegging enrichment flags from the consolidated WO instead of re-running per-native-WO
     // subtree traversals (49K native WOs × deep BOM search = hundreds of millions of node visits).
     val enrichedByConsolidatedGroupId = enrichedWos.associateBy { it["consolidated_group_id"] as? String ?: "" }
+    // demand_id -> customer_id, same resolution enrichWorkOrders uses internally — rebuilt here
+    // (cheap: one pass over data["demand"]) rather than inheriting from the consolidated parent,
+    // because a native WO belongs to exactly ONE demand/customer, while its consolidated parent
+    // can span several (that's the whole point of the Collapsed WO view's Customer pivot) —
+    // inheriting the parent's customer_ids would wrongly attribute sibling demands' customers to
+    // this specific native WO.
+    val customerIdByDemandId: Map<String, String> = (data["demand"] ?: emptyList()).mapNotNull { d ->
+        val did = (d["demand_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        val cid = (d["customer_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        did to cid
+    }.toMap()
     val enrichedNative = nativeWos.map { n ->
         val cgid = n["consolidated_group_id"] as? String ?: ""
         val consolidated = enrichedByConsolidatedGroupId[cgid]
-        if (consolidated == null) n
+        val ownDemandId = (n["demand_id"] as? String)?.trim()
+        val ownCustomerIds = customerIdByDemandId[ownDemandId]?.let { listOf(it) } ?: emptyList()
+        val base = if (consolidated == null) n
         else n + mapOf(
             "pegging_includes_real_make"  to consolidated["pegging_includes_real_make"],
             "pegging_includes_buy"        to consolidated["pegging_includes_buy"],
@@ -2678,6 +2710,7 @@ private fun enrichPlanResultWithData(
             "wo_explanation_variant"      to consolidated["wo_explanation_variant"],
             "wo_competing_demands"        to consolidated["wo_competing_demands"],
         )
+        base + mapOf("customer_ids" to ownCustomerIds)
     }
     val enrichedCommitted = enrichCommittedDemands(
         result["committed_demands"].let { @Suppress("UNCHECKED_CAST") it as? List<Map<String, Any?>> ?: emptyList() },

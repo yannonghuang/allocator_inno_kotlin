@@ -184,6 +184,10 @@ export type WorkOrder = {
   method: string;
   location_source?: string | null;
   demand_id?: string | null;
+  /** Distinct customer_ids of every demand this WO serves — a single value for a native WO
+   *  (which belongs to exactly one demand), but can hold several on a consolidated WO that
+   *  merges demands from different customers. Sorted, deduplicated. */
+  customer_ids?: string[];
   prod_area?: string | null;
   /** True if this WO's pegging (supplies that fulfill it) includes a real make (non-virtual BOM). */
   pegging_includes_real_make?: boolean;

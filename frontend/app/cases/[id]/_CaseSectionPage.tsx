@@ -1131,7 +1131,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     );
     return keys.size;
   }, [collapsedFilteredRows]);
-  const [planWoPivot, setPlanWoPivot] = useState<'none' | 'prod_area' | 'location' | 'nested' | 'demand'>('none');
+  const [planWoPivot, setPlanWoPivot] = useState<'none' | 'customer' | 'prod_area' | 'location' | 'nested' | 'demand'>('none');
   const [planWoLayoutMode, setPlanWoLayoutMode] = useState<'data' | 'split' | 'timeline'>('split');
   const [woPegHighlightRow, setWoPegHighlightRow] = useState<WoEnrichedRow | null>(null);
   const [planWoPivotExpanded, setPlanWoPivotExpanded] = useState<Set<string>>(new Set());
@@ -5634,7 +5634,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       section headers ── */}
                   <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
                     <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>Pivot:</span>
-                    {(['none', 'prod_area', 'location', 'nested'] as const).map((mode) => (
+                    {/* 'customer' listed first among the actual pivot fields (right after the neutral
+                        'none' state) per the Collapsed WO view's own Customer-pivot requirement —
+                        see CollapsedWoView's WoPivotMode doc for why a section here can represent a
+                        SET of customers (e.g. "CustomerA, CustomerB") rather than always one. */}
+                    {(['none', 'customer', 'prod_area', 'location', 'nested'] as const).map((mode) => (
                       <button
                         key={mode}
                         type="button"
@@ -5642,7 +5646,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         style={{ fontSize: '0.75rem', padding: '2px 10px' }}
                         onClick={() => { setPlanWoPivot(mode); setPlanWoPivotExpanded(new Set()); setPlanWoPivotSubExpanded(new Set()); }}
                       >
-                        {mode === 'none' ? 'None' : mode === 'prod_area' ? 'PROD_AREA' : mode === 'location' ? 'Location' : 'PROD_AREA › Location'}
+                        {mode === 'none' ? 'None' : mode === 'customer' ? 'Customer' : mode === 'prod_area' ? 'PROD_AREA' : mode === 'location' ? 'Location' : 'PROD_AREA › Location'}
                       </button>
                     ))}
                   </div>

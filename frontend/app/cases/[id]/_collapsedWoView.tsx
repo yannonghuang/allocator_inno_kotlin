@@ -13,8 +13,13 @@ export type WoBatchScale = 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
 /** Mirrors the flat table's own Pivot control (`planWoPivot` in _CaseSectionPage.tsx) — here it
  *  rolls this view's own (product, location, method) rows up under collapsible section headers
  *  instead of changing the row grouping itself. 'demand' (a flat-table-only mode) is never passed
- *  in — the caller maps it to 'none' before reaching this component. */
-export type WoPivotMode = 'none' | 'prod_area' | 'location' | 'nested';
+ *  in — the caller maps it to 'none' before reaching this component.
+ *
+ *  'customer' groups by a GroupRow's own customer-SET (see GroupRow.customer_ids's own doc) —
+ *  unlike prod_area/location, a group's customer set isn't guaranteed to be a single value, so a
+ *  section here can represent several customers at once (e.g. "CustomerA, CustomerB") rather than
+ *  splitting into one section per customer — see buildSections' own doc for why. */
+export type WoPivotMode = 'none' | 'customer' | 'prod_area' | 'location' | 'nested';
 
 const GRANULARITIES: WoBatchScale[] = ['none', 'weekly', 'biweekly', 'monthly', 'all'];
 const DAY_MS = 86_400_000;
@@ -37,6 +42,7 @@ const COL_GROUP_W = 200;
 const COL_PRODUCT_W = 140;
 const COL_LOCATION_W = 90;
 const COL_METHOD_W = 110;
+const COL_CUSTOMER_W = 160;
 
 /** Sortable-column-header button style — same look as the app's other click-to-sort headers
  *  (e.g. the KB run inspector): plain/muted when inactive, bold/bright when this column is the
@@ -160,6 +166,14 @@ type GroupRow = {
   location_source: string;
   method: string;
   prod_area: string;
+  /** Union of every constituent WO's own `customer_ids` rolled into this (product, location,
+   *  method) group — sorted, deduplicated. NOT guaranteed to be a single value: unlike prod_area
+   *  (part of the grouping key, so always uniform within a group) or location, a group can span
+   *  time buckets/contributors from different original consolidated WOs whose own customer sets
+   *  differ (e.g. one week's batch served CustomerA, the next week's served CustomerA+CustomerB).
+   *  Customer pivoting/display therefore operates on the group's own aggregate set, not a
+   *  per-cell breakdown — see `customerKeyFor` and `WoPivotMode`'s own doc. */
+  customer_ids: string[];
   cells: Map<string, Cell>;
   total: number;
 };
@@ -169,10 +183,18 @@ type Section = { key: string; groups: GroupRow[]; total: number };
  *  expanded one is replaced by its finer sub-buckets (mirrors AllocationMatrixView's `ColSpec`). */
 type ColSpec = { type: 'top'; bucket: Bucket } | { type: 'sub'; topKey: string; bucket: Bucket };
 
-function buildSections(groups: GroupRow[], by: 'prod_area' | 'location'): Section[] {
+/** Display/grouping key for a group's customer SET (see GroupRow.customer_ids's own doc) — a
+ *  comma-joined label rather than one-section-per-customer, so a group touching several
+ *  customers gets its own distinct section instead of being duplicated under each customer (which
+ *  would double-count its quantity in every section's total). */
+function customerKeyFor(ids: string[]): string {
+  return ids.length > 0 ? ids.join(', ') : '(none)';
+}
+
+function buildSections(groups: GroupRow[], by: 'prod_area' | 'location' | 'customer'): Section[] {
   const map = new Map<string, GroupRow[]>();
   for (const g of groups) {
-    const k = (by === 'prod_area' ? g.prod_area : g.location_id) || '(none)';
+    const k = by === 'customer' ? customerKeyFor(g.customer_ids) : (by === 'prod_area' ? g.prod_area : g.location_id) || '(none)';
     if (!map.has(k)) map.set(k, []);
     map.get(k)!.push(g);
   }
@@ -305,6 +327,9 @@ export function CollapsedWoView({
     const buckets = buildBuckets(minIso, maxIso, granularity, locale, tP('config.woBatchAll'));
 
     const groupMap = new Map<string, GroupRow>();
+    // Accumulated separately from GroupRow itself (a plain Set is cheaper to mutate per-row than
+    // repeatedly rebuilding a sorted array) and finalized into `customer_ids` once, below.
+    const customerIdSets = new Map<string, Set<string>>();
     for (const r of validRows) {
       // Consolidation's own grouping key (PlanningEngine.kt ~4540) for MOVE work orders is
       // ("__move__", location_source, location_id, prod_area, bucket) — WITHOUT product_id — so
@@ -321,7 +346,7 @@ export function CollapsedWoView({
         // Mixed-shipment MOVE work orders have product_id === null at the API level (not ''), so
         // it must be coalesced here — every downstream use (filter's .toLowerCase(), sort's
         // .localeCompare()) assumes a string and would throw on a raw null.
-        grp = { key, product_id: r.product_id ?? '', location_id: r.location_id, location_source: locationSource, method: r.method, prod_area: prodArea, cells: new Map(), total: 0 };
+        grp = { key, product_id: r.product_id ?? '', location_id: r.location_id, location_source: locationSource, method: r.method, prod_area: prodArea, customer_ids: [], cells: new Map(), total: 0 };
         groupMap.set(key, grp);
       }
       const iso = (r.end_time as string).slice(0, 10);
@@ -337,6 +362,17 @@ export function CollapsedWoView({
       const windowKey = bucketKeyFor(windowIso, scaleForMethod(r.method));
       cell.contributors.push({ end_time: r.end_time as string, quantity: qty, window_key: windowKey });
       grp.total += qty;
+      if (r.customer_ids && r.customer_ids.length > 0) {
+        let set = customerIdSets.get(key);
+        if (!set) {
+          set = new Set();
+          customerIdSets.set(key, set);
+        }
+        for (const cid of r.customer_ids) set.add(cid);
+      }
+    }
+    for (const grp of Array.from(groupMap.values())) {
+      grp.customer_ids = Array.from(customerIdSets.get(grp.key) ?? []).sort();
     }
     const groups = Array.from(groupMap.values());
     return { groups, buckets, excludedCount };
@@ -459,9 +495,15 @@ export function CollapsedWoView({
         >
           {grp.location_source ? `${grp.location_source} → ${grp.location_id}` : grp.location_id}
         </td>
-        <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W, zIndex: 1, width: COL_METHOD_W, minWidth: COL_METHOD_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', borderRight: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
+        <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W, zIndex: 1, width: COL_METHOD_W, minWidth: COL_METHOD_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', whiteSpace: 'nowrap' }}>
           <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: methodColor(grp.method), marginRight: 6 }} />
           {grp.method}
+        </td>
+        <td
+          title={grp.customer_ids.length > 0 ? grp.customer_ids.join(', ') : undefined}
+          style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W + COL_METHOD_W, zIndex: 1, width: COL_CUSTOMER_W, minWidth: COL_CUSTOMER_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', borderRight: '1px solid #3f3f46', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', color: grp.customer_ids.length > 0 ? '#e4e4e7' : '#3f3f46' }}
+        >
+          {grp.customer_ids.length > 0 ? grp.customer_ids.join(', ') : '–'}
         </td>
         {colSpecs.map((spec) => {
           const cell = getCellForSpec(grp, spec);
@@ -500,10 +542,10 @@ export function CollapsedWoView({
   // Pivot aggregate row — mirrors AllocationMatrixView's collapsed supply-group row: every time
   // column gets a REAL sum across the section's member groups (not one grand total crammed into a
   // single cell), so the aggregate is legible against the same temporal axis the leaf rows use.
-  // The pivot path lives ONLY in the dedicated Group column (col 1) — Product/Location/Method
-  // (cols 2-4) stay blank here, exactly mirroring where they'd be blank/populated on leaf rows, so
-  // a given column always means the same thing regardless of row type. Collapsed by default (only
-  // this row renders); expanding reveals the next level (sub-sections or leaf rows).
+  // The pivot path lives ONLY in the dedicated Group column (col 1) — Product/Location/Method/
+  // Customer (cols 2-5) stay blank here, exactly mirroring where they'd be blank/populated on leaf
+  // rows, so a given column always means the same thing regardless of row type. Collapsed by
+  // default (only this row renders); expanding reveals the next level (sub-sections or leaf rows).
   const renderAggregateRow = (key: string, label: string, groups: GroupRow[], indent: number, expanded: boolean, onToggle: () => void) => {
     const total = groups.reduce((s, g) => s + g.total, 0);
     const bg = indent === 0 ? '#1f1f23' : '#19191c';
@@ -526,7 +568,8 @@ export function CollapsedWoView({
         </td>
         <td style={{ position: 'sticky', left: COL_GROUP_W, zIndex: 1, width: COL_PRODUCT_W, minWidth: COL_PRODUCT_W, background: bg, borderBottom: '1px solid #3f3f46', borderTop }} />
         <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W, zIndex: 1, width: COL_LOCATION_W, minWidth: COL_LOCATION_W, background: bg, borderBottom: '1px solid #3f3f46', borderTop }} />
-        <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W, zIndex: 1, width: COL_METHOD_W, minWidth: COL_METHOD_W, background: bg, borderBottom: '1px solid #3f3f46', borderRight: '1px solid #3f3f46', borderTop }} />
+        <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W, zIndex: 1, width: COL_METHOD_W, minWidth: COL_METHOD_W, background: bg, borderBottom: '1px solid #3f3f46', borderTop }} />
+        <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W + COL_METHOD_W, zIndex: 1, width: COL_CUSTOMER_W, minWidth: COL_CUSTOMER_W, background: bg, borderBottom: '1px solid #3f3f46', borderRight: '1px solid #3f3f46', borderTop }} />
         {colSpecs.map((spec) => {
           const sum = groups.reduce((s, grp) => s + (getCellForSpec(grp, spec)?.qty ?? 0), 0);
           return (
@@ -552,7 +595,7 @@ export function CollapsedWoView({
   if (pivot === 'none') {
     for (const grp of visibleGroups) bodyRows.push(renderRow(grp));
   } else {
-    const topDim: 'prod_area' | 'location' = pivot === 'nested' ? 'prod_area' : pivot;
+    const topDim: 'prod_area' | 'location' | 'customer' = pivot === 'nested' ? 'prod_area' : pivot;
     const subDim: 'prod_area' | 'location' = pivot === 'location' ? 'prod_area' : 'location';
     for (const top of buildSections(visibleGroups, topDim)) {
       const topExpanded = sectionExpanded.has(top.key);
@@ -635,13 +678,24 @@ export function CollapsedWoView({
                   style={{
                     position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W, top: 0, zIndex: 3,
                     width: COL_METHOD_W, minWidth: COL_METHOD_W, background: '#18181b', textAlign: 'left',
-                    padding: '6px 10px', borderBottom: '1px solid #3f3f46', borderRight: '1px solid #3f3f46',
+                    padding: '6px 10px', borderBottom: '1px solid #3f3f46',
                     whiteSpace: 'nowrap',
                   }}
                 >
                   <button type="button" onClick={() => toggleSort('method')} style={sortThBtnStyle(sort?.key === 'method')}>
                     {tP('workOrders.collapsedColMethod')}{sortIndicator('method')}
                   </button>
+                </th>
+                <th
+                  rowSpan={anyBucketExpanded ? 2 : 1}
+                  style={{
+                    position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W + COL_METHOD_W, top: 0, zIndex: 3,
+                    width: COL_CUSTOMER_W, minWidth: COL_CUSTOMER_W, background: '#18181b', textAlign: 'left',
+                    padding: '6px 10px', borderBottom: '1px solid #3f3f46', borderRight: '1px solid #3f3f46',
+                    whiteSpace: 'nowrap', color: '#a1a1aa',
+                  }}
+                >
+                  {tP('workOrders.collapsedColCustomer')}
                 </th>
                 {buckets.map((b) => {
                   const subs = drillPlan.subBucketsByTop.get(b.key);
