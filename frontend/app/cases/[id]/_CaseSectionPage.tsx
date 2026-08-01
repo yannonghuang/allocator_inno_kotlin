@@ -107,7 +107,8 @@ import {
   getHorizonStartDefault,
 } from '@/lib/api';
 import { computeHorizon, ScheduleBar, ScheduleHorizonRuler, methodColor, BorMiniTimeline, BorTimelineRuler } from './_workOrderSchedule';
-import { CollapsedWoView, type WoPivotField } from './_collapsedWoView';
+import { CollapsedWoView } from './_collapsedWoView';
+import { DemandSummaryView, type WoPivotField } from './_demandSummaryView';
 import { WoScheduleImpactPanel, WoScheduleQuickModal } from './_woScheduleImpact';
 import type { PlanResult, PlanStatusResponse } from '../../../lib/api';
 
@@ -612,7 +613,7 @@ interface WoDemandGroup {
   rows: WoEnrichedRow[]; // WO rows + optional synthetic inventory row
 }
 
-function collapsedPivotFieldLabel(field: WoPivotField): string {
+function demandSummaryPivotFieldLabel(field: WoPivotField): string {
   return field === 'customer' ? 'Customer' : field === 'prod_area' ? 'PROD_AREA' : 'Location';
 }
 
@@ -998,6 +999,25 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planWorkOrderPeggingLoading, setPlanWorkOrderPeggingLoading] = useState<string | null>(null);
   const [planWorkOrderPeggingError, setPlanWorkOrderPeggingError] = useState<string | null>(null);
   const [planResultTab, setPlanResultTab] = useState<'demands' | 'work_orders' | 'supplies' | 'resourceUtilization'>('demands');
+  // The Demands tab hosts two sub-views: "Summary" (a demand-request-date-driven pivot over the
+  // native work orders — see _demandSummaryView.tsx) and "Detail" (the original per-demand table
+  // below, unchanged). Deliberately independent of the Work Orders tab's own state/filters (e.g.
+  // woTableTab, planWorkOrderHideDummyProdArea) — Summary is its own self-contained view, not a
+  // relocation of Work Orders > Collapsed's data pipeline.
+  const [demandsSubTab, setDemandsSubTab] = useState<'summary' | 'detail'>('summary');
+  const [demandSummaryIncludeLocation, setDemandSummaryIncludeLocation] = useState(false);
+  const demandSummaryPivotFields = useMemo<WoPivotField[]>(
+    () => (demandSummaryIncludeLocation ? ['customer', 'prod_area', 'location'] : ['customer', 'prod_area']),
+    [demandSummaryIncludeLocation],
+  );
+  // Native (per-demand) work orders, minus dummy/placeholder VirtualProduct_ rows — the only
+  // filtering applied here (unlike Work Orders > Collapsed's collapsedFilteredRows, this doesn't
+  // reuse the Work Orders tab's own pegging-filter checkboxes, since those live in a different
+  // tab the user isn't looking at while on Demands).
+  const demandSummaryRows = useMemo<WorkOrder[]>(() => {
+    const source = planResult?.work_orders_native ?? planResult?.work_orders ?? [];
+    return source.filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'));
+  }, [planResult]);
   // ID of the plan run currently loaded in planResult; null = freshly-run (not from history)
   const [currentPlanRunId, setCurrentPlanRunId] = useState<number | null>(null);
   // DB run ID for the current fresh (unsaved) plan result; null once saved or when loading from history
@@ -1093,14 +1113,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planWoMoveOnly, setPlanWoMoveOnly] = useState(false);
   const [planWoFilterDemandId, setPlanWoFilterDemandId] = useState('');
   // Rows fed to the Collapsed pivot (_collapsedWoView.tsx) — mirrors the flat table's own filter
-  // predicates (hide-dummy-prod-area, the 8 pegging checkboxes, demand-id) applied to the NATIVE
-  // (per-demand) source — same source as the Native tab's `activeWorkOrders` — WITHOUT the
-  // flat-table-only lot-grouping/requested-qty enrichment that follows it below (the pivot only
-  // needs product_id/location_id/method/quantity/end_time). Native rather than consolidated so the
-  // Collapsed view's own (product, location, method, time-bucket) rollup does the grouping itself,
-  // instead of grouping an already-grouped dataset.
+  // predicates (hide-dummy-prod-area, the 8 pegging checkboxes, demand-id) applied to the
+  // consolidated source, WITHOUT the flat-table-only lot-grouping/requested-qty enrichment that
+  // follows it below (the pivot only needs product_id/location_id/method/quantity/end_time).
   const collapsedFilteredRows = useMemo<WorkOrder[]>(() => {
-    const source = planResult?.work_orders_native ?? planResult?.work_orders ?? [];
+    const source = planResult?.work_orders ?? [];
     let out = planWorkOrderHideDummyProdArea
       ? source.filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'))
       : source;
@@ -1138,14 +1155,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     );
     return keys.size;
   }, [collapsedFilteredRows]);
-  const [planWoPivot, setPlanWoPivot] = useState<'none' | 'customer' | 'prod_area' | 'location' | 'nested' | 'demand'>('none');
-  // Collapsed tab's own pivot control — an ORDERED array of fields (see WoPivotField / buildSections
-  // in _collapsedWoView.tsx), deliberately independent of `planWoPivot` above: the flat table's
-  // fixed presets include 'nested' (a hardcoded PROD_AREA->Location pair) and 'demand' (no
-  // Collapsed-view equivalent at all), which don't map cleanly onto a free-order multi-select.
-  // Always at least one field selected — there is no "None"/flat-table state for the Collapsed
-  // tab's own pivot (unlike the flat table's planWoPivot, which keeps a 'none' preset).
-  const [collapsedPivotFields, setCollapsedPivotFields] = useState<WoPivotField[]>(['customer', 'prod_area']);
+  const [planWoPivot, setPlanWoPivot] = useState<'none' | 'prod_area' | 'location' | 'nested' | 'demand'>('none');
   const [planWoLayoutMode, setPlanWoLayoutMode] = useState<'data' | 'split' | 'timeline'>('split');
   const [woPegHighlightRow, setWoPegHighlightRow] = useState<WoEnrichedRow | null>(null);
   const [planWoPivotExpanded, setPlanWoPivotExpanded] = useState<Set<string>>(new Set());
@@ -5124,6 +5134,62 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               {planResultTab === 'demands' && (
                 <div style={{ padding: '0.75rem 1rem' }}>
                   <h4 style={{ marginTop: 0, marginBottom: '0.5rem' }}>{tP('committedDemands.heading')}</h4>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.75rem' }}>
+                    {(['summary', 'detail'] as const).map((tab) => (
+                      <button
+                        key={tab}
+                        type="button"
+                        className={demandsSubTab === tab ? '' : 'secondary'}
+                        onClick={() => setDemandsSubTab(tab)}
+                      >
+                        {tab === 'summary' ? 'Summary' : 'Detail'}
+                      </button>
+                    ))}
+                  </div>
+                  {demandsSubTab === 'summary' && (
+                    <div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
+                        <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>Pivot:</span>
+                        {(['customer', 'prod_area'] as const).map((field) => (
+                          <span
+                            key={field}
+                            style={{ fontSize: '0.75rem', padding: '2px 8px', background: '#3f3f46', borderRadius: 12, color: '#e4e4e7' }}
+                          >
+                            {demandSummaryPivotFieldLabel(field)}
+                          </span>
+                        ))}
+                        {demandSummaryIncludeLocation ? (
+                          <span
+                            style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.75rem', padding: '2px 8px', background: '#3f3f46', borderRadius: 12, color: '#e4e4e7' }}
+                          >
+                            {demandSummaryPivotFieldLabel('location')}
+                            <button
+                              type="button"
+                              onClick={() => setDemandSummaryIncludeLocation(false)}
+                              title="Remove"
+                              style={{ background: 'none', border: 'none', padding: 0, fontSize: '0.85rem', lineHeight: 1, color: '#a1a1aa', cursor: 'pointer' }}
+                            >×</button>
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            className="secondary"
+                            style={{ fontSize: '0.75rem', padding: '2px 10px' }}
+                            onClick={() => setDemandSummaryIncludeLocation(true)}
+                          >
+                            + {demandSummaryPivotFieldLabel('location')}
+                          </button>
+                        )}
+                      </div>
+                      <DemandSummaryView
+                        rows={demandSummaryRows}
+                        demands={planResult?.committed_demands ?? []}
+                        pivotFields={demandSummaryPivotFields}
+                      />
+                    </div>
+                  )}
+                  {demandsSubTab === 'detail' && (
+                  <>
                   <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
                       <input
@@ -5506,6 +5572,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       </>
                     );
                   })()}
+                  </>
+                  )}
                 </div>
               )}
               {planResultTab === 'work_orders' && (
@@ -5643,73 +5711,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <span>{tP('workOrders.hideDummy')}</span>
                     </label>
                   </div>
-                  {/* ── Pivot selector — flat table keeps its fixed presets; Collapsed tab gets its
-                      own ordered multi-select instead (see collapsedPivotFields' own doc for why
-                      the two aren't shared) ── */}
-                  {woTableTab === 'collapsed' ? (
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
-                      <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>Pivot:</span>
-                      {/* Selected fields render as ordered chips (‹/› reorder, × remove) so the user
-                          can see and change pivot ORDER, not just membership — order changes which
-                          field nests under which (see buildSections/WoPivotField in
-                          _collapsedWoView.tsx). The × is hidden on the last remaining chip — there
-                          is no "None" state to remove down to. */}
-                      {collapsedPivotFields.map((field, idx) => (
-                        <span
-                          key={field}
-                          style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.75rem', padding: '2px 8px', background: '#3f3f46', borderRadius: 12, color: '#e4e4e7' }}
-                        >
-                          <button
-                            type="button"
-                            disabled={idx === 0}
-                            onClick={() => setCollapsedPivotFields((prev) => {
-                              const next = [...prev];
-                              [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
-                              return next;
-                            })}
-                            title="Move earlier"
-                            style={{ background: 'none', border: 'none', padding: 0, fontSize: '0.7rem', color: idx === 0 ? '#52525b' : '#a1a1aa', cursor: idx === 0 ? 'default' : 'pointer' }}
-                          >‹</button>
-                          {collapsedPivotFieldLabel(field)}
-                          <button
-                            type="button"
-                            disabled={idx === collapsedPivotFields.length - 1}
-                            onClick={() => setCollapsedPivotFields((prev) => {
-                              const next = [...prev];
-                              [next[idx], next[idx + 1]] = [next[idx + 1], next[idx]];
-                              return next;
-                            })}
-                            title="Move later"
-                            style={{ background: 'none', border: 'none', padding: 0, fontSize: '0.7rem', color: idx === collapsedPivotFields.length - 1 ? '#52525b' : '#a1a1aa', cursor: idx === collapsedPivotFields.length - 1 ? 'default' : 'pointer' }}
-                          >›</button>
-                          {collapsedPivotFields.length > 1 && (
-                            <button
-                              type="button"
-                              onClick={() => setCollapsedPivotFields((prev) => prev.filter((f) => f !== field))}
-                              title="Remove"
-                              style={{ background: 'none', border: 'none', padding: 0, fontSize: '0.85rem', lineHeight: 1, color: '#a1a1aa', cursor: 'pointer' }}
-                            >×</button>
-                          )}
-                        </span>
-                      ))}
-                      {(['customer', 'prod_area', 'location'] as const)
-                        .filter((f) => !collapsedPivotFields.includes(f))
-                        .map((field) => (
-                          <button
-                            key={field}
-                            type="button"
-                            className="secondary"
-                            style={{ fontSize: '0.75rem', padding: '2px 10px' }}
-                            onClick={() => setCollapsedPivotFields((prev) => [...prev, field])}
-                          >
-                            + {collapsedPivotFieldLabel(field)}
-                          </button>
-                        ))}
-                    </div>
-                  ) : (
+                  {/* ── Pivot selector — flat-table only; the Collapsed tab has no pivot control ── */}
+                  {woTableTab !== 'collapsed' && (
                     <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
                       <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>Pivot:</span>
-                      {(['none', 'customer', 'prod_area', 'location', 'nested'] as const).map((mode) => (
+                      {(['none', 'prod_area', 'location', 'nested'] as const).map((mode) => (
                         <button
                           key={mode}
                           type="button"
@@ -5717,7 +5723,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           style={{ fontSize: '0.75rem', padding: '2px 10px' }}
                           onClick={() => { setPlanWoPivot(mode); setPlanWoPivotExpanded(new Set()); setPlanWoPivotSubExpanded(new Set()); }}
                         >
-                          {mode === 'none' ? 'None' : mode === 'customer' ? 'Customer' : mode === 'prod_area' ? 'PROD_AREA' : mode === 'location' ? 'Location' : 'PROD_AREA › Location'}
+                          {mode === 'none' ? 'None' : mode === 'prod_area' ? 'PROD_AREA' : mode === 'location' ? 'Location' : 'PROD_AREA › Location'}
                         </button>
                       ))}
                     </div>
@@ -5775,7 +5781,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   {woTableTab === 'collapsed' && (
                     <CollapsedWoView
                       rows={collapsedFilteredRows}
-                      pivotFields={collapsedPivotFields}
+                      makeBatchScale={planningConfig.consolidation?.make_batch_scale}
+                      moveBatchScale={planningConfig.consolidation?.move_batch_scale}
+                      purchaseBatchScale={planningConfig.consolidation?.purchase_batch_scale}
                     />
                   )}
                   {woTableTab !== 'collapsed' && planResult.work_orders.length > 0 && (() => {
