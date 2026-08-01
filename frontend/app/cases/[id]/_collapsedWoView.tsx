@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useLocale, useTranslations } from 'next-intl';
 import type { WorkOrder } from '@/lib/api';
 import { qtyFmt } from '@/app/lib/format';
@@ -10,16 +10,17 @@ import { methodColor } from './_workOrderSchedule';
  *  backend's WoBatchConfig/calendarBucket (PlanningEngine.kt) — see this file's own module doc. */
 export type WoBatchScale = 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
 
-/** Mirrors the flat table's own Pivot control (`planWoPivot` in _CaseSectionPage.tsx) — here it
- *  rolls this view's own (product, location, method) rows up under collapsible section headers
- *  instead of changing the row grouping itself. 'demand' (a flat-table-only mode) is never passed
- *  in — the caller maps it to 'none' before reaching this component.
+/** One pivotable dimension for this view's own Pivot control — independent of the flat table's
+ *  `planWoPivot` (_CaseSectionPage.tsx), which stays a fixed-preset single-select including modes
+ *  ('nested', 'demand') that have no equivalent here. This view instead takes an ORDERED array of
+ *  these fields (`pivotFields` below): the caller picks which dimensions to pivot by and in what
+ *  order, and `buildSections` groups recursively, one level per array entry.
  *
  *  'customer' groups by a GroupRow's own customer-SET (see GroupRow.customer_ids's own doc) —
  *  unlike prod_area/location, a group's customer set isn't guaranteed to be a single value, so a
  *  section here can represent several customers at once (e.g. "CustomerA, CustomerB") rather than
  *  splitting into one section per customer — see buildSections' own doc for why. */
-export type WoPivotMode = 'none' | 'customer' | 'prod_area' | 'location' | 'nested';
+export type WoPivotField = 'customer' | 'prod_area' | 'location';
 
 const GRANULARITIES: WoBatchScale[] = ['none', 'weekly', 'biweekly', 'monthly', 'all'];
 const DAY_MS = 86_400_000;
@@ -42,7 +43,6 @@ const COL_GROUP_W = 200;
 const COL_PRODUCT_W = 140;
 const COL_LOCATION_W = 90;
 const COL_METHOD_W = 110;
-const COL_CUSTOMER_W = 160;
 
 /** Sortable-column-header button style — same look as the app's other click-to-sort headers
  *  (e.g. the KB run inspector): plain/muted when inactive, bold/bright when this column is the
@@ -172,7 +172,7 @@ type GroupRow = {
    *  time buckets/contributors from different original consolidated WOs whose own customer sets
    *  differ (e.g. one week's batch served CustomerA, the next week's served CustomerA+CustomerB).
    *  Customer pivoting/display therefore operates on the group's own aggregate set, not a
-   *  per-cell breakdown — see `customerKeyFor` and `WoPivotMode`'s own doc. */
+   *  per-cell breakdown — see `customerKeyFor` and `WoPivotField`'s own doc. */
   customer_ids: string[];
   cells: Map<string, Cell>;
   total: number;
@@ -191,7 +191,7 @@ function customerKeyFor(ids: string[]): string {
   return ids.length > 0 ? ids.join(', ') : '(none)';
 }
 
-function buildSections(groups: GroupRow[], by: 'prod_area' | 'location' | 'customer'): Section[] {
+function buildSections(groups: GroupRow[], by: WoPivotField): Section[] {
   const map = new Map<string, GroupRow[]>();
   for (const g of groups) {
     const k = by === 'customer' ? customerKeyFor(g.customer_ids) : (by === 'prod_area' ? g.prod_area : g.location_id) || '(none)';
@@ -251,13 +251,15 @@ export function CollapsedWoView({
   makeBatchScale = 'weekly',
   moveBatchScale = 'weekly',
   purchaseBatchScale = 'weekly',
-  pivot = 'none',
+  pivotFields = [],
 }: {
   rows: WorkOrder[];
   makeBatchScale?: WoBatchScale;
   moveBatchScale?: WoBatchScale;
   purchaseBatchScale?: WoBatchScale;
-  pivot?: WoPivotMode;
+  /** Ordered pivot dimensions — [] renders the flat (ungrouped) table; each entry adds one more
+   *  nested section level, in the order given (see WoPivotField's own doc). */
+  pivotFields?: WoPivotField[];
 }) {
   const tP = useTranslations('planning');
   const locale = useLocale();
@@ -282,30 +284,30 @@ export function CollapsedWoView({
   // AllocationMatrixView's expandedCustomers/expandedSupplyGroups: this view owns its own
   // view-interaction state, the caller only owns the row data.
   const [expandedBuckets, setExpandedBuckets] = useState<Set<string>>(new Set());
-  // Two pivot row levels, each collapsed by default (aggregate-row-only), mirroring
-  // AllocationMatrixView's expandedSupplyGroups: sectionExpanded reveals the sub-level (the other
-  // dimension, or Location under nested's PROD_AREA); leafExpanded (keyed by the composite
-  // `${topKey}|${subKey}`) reveals that sub-section's actual leaf rows.
-  const [sectionExpanded, setSectionExpanded] = useState<Set<string>>(new Set());
-  const [leafExpanded, setLeafExpanded] = useState<Set<string>>(new Set());
+  // One expansion flag per pivot section, at any depth — keyed by the full path of section keys
+  // joined with '|' (e.g. "CustomerA|East"), so an arbitrary number of nested pivot levels (driven
+  // by `pivotFields`' length) share a single collapsed-by-default toggle set, rather than one
+  // fixed state variable per level as the old two-level (section/leaf) version needed.
+  const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
   const toggleBucket = (key: string) =>
     setExpandedBuckets((prev) => {
       const next = new Set(prev);
       next.has(key) ? next.delete(key) : next.add(key);
       return next;
     });
-  const toggleSection = (key: string) =>
-    setSectionExpanded((prev) => {
+  const togglePath = (path: string) =>
+    setExpandedPaths((prev) => {
       const next = new Set(prev);
-      next.has(key) ? next.delete(key) : next.add(key);
+      next.has(path) ? next.delete(path) : next.add(path);
       return next;
     });
-  const toggleLeaf = (key: string) =>
-    setLeafExpanded((prev) => {
-      const next = new Set(prev);
-      next.has(key) ? next.delete(key) : next.add(key);
-      return next;
-    });
+  // A path from a since-removed pivot level (e.g. the user dropped a field or reordered) would
+  // otherwise linger in the set with no section left to reveal it — reset whenever the field
+  // selection itself changes so expansion state never outlives the levels it was keyed to.
+  useEffect(() => {
+    setExpandedPaths(new Set());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pivotFields.join('|')]);
 
   const scaleForMethod = (method: string): WoBatchScale => {
     if (method === 'make') return makeBatchScale;
@@ -474,6 +476,27 @@ export function CollapsedWoView({
     return out;
   }, [groups, filterText, sort]);
 
+  // Product/Location/Method only mean something once an actual (product, location, method) leaf
+  // row is on screen — while every visible row is still an aggregate section header, those
+  // columns would just be blank width. Always shown in flat (pivotFields.length === 0) mode,
+  // since every row there already IS a leaf; in pivot mode, revealed once expansion reaches the
+  // leaf level anywhere in the tree (same expandedPaths-driven traversal as renderPivotLevel).
+  // Computed before the early empty-buckets return below so hook call order stays stable.
+  const leafRowsVisible = useMemo(() => {
+    if (pivotFields.length === 0) return true;
+    const anyLeafAt = (levelGroups: GroupRow[], depth: number, pathPrefix: string): boolean => {
+      const isLastLevel = depth === pivotFields.length - 1;
+      for (const section of buildSections(levelGroups, pivotFields[depth])) {
+        const path = pathPrefix ? `${pathPrefix}|${section.key}` : section.key;
+        if (!expandedPaths.has(path)) continue;
+        if (isLastLevel) return true;
+        if (anyLeafAt(section.groups, depth + 1, path)) return true;
+      }
+      return false;
+    };
+    return anyLeafAt(visibleGroups, 0, '');
+  }, [pivotFields, visibleGroups, expandedPaths]);
+
   if (buckets.length === 0) {
     return <div style={{ padding: '1rem', color: '#a1a1aa', fontSize: '0.875rem' }}>{tP('workOrders.collapsedEmpty')}</div>;
   }
@@ -485,26 +508,24 @@ export function CollapsedWoView({
   const renderRow = (grp: GroupRow) => {
     return (
       <tr key={grp.key}>
-        <td style={{ position: 'sticky', left: 0, zIndex: 1, width: COL_GROUP_W, minWidth: COL_GROUP_W, background: '#18181b', borderBottom: '1px solid #27272a', borderRight: '1px solid #27272a' }} />
-        <td style={{ position: 'sticky', left: COL_GROUP_W, zIndex: 1, width: COL_PRODUCT_W, minWidth: COL_PRODUCT_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', whiteSpace: 'nowrap' }}>
-          {grp.product_id}
-        </td>
-        <td
-          title={grp.location_source ? `${grp.location_source} → ${grp.location_id}` : undefined}
-          style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W, zIndex: 1, width: COL_LOCATION_W, minWidth: COL_LOCATION_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}
-        >
-          {grp.location_source ? `${grp.location_source} → ${grp.location_id}` : grp.location_id}
-        </td>
-        <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W, zIndex: 1, width: COL_METHOD_W, minWidth: COL_METHOD_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', whiteSpace: 'nowrap' }}>
-          <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: methodColor(grp.method), marginRight: 6 }} />
-          {grp.method}
-        </td>
-        <td
-          title={grp.customer_ids.length > 0 ? grp.customer_ids.join(', ') : undefined}
-          style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W + COL_METHOD_W, zIndex: 1, width: COL_CUSTOMER_W, minWidth: COL_CUSTOMER_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', borderRight: '1px solid #3f3f46', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', color: grp.customer_ids.length > 0 ? '#e4e4e7' : '#3f3f46' }}
-        >
-          {grp.customer_ids.length > 0 ? grp.customer_ids.join(', ') : '–'}
-        </td>
+        <td style={{ position: 'sticky', left: 0, zIndex: 1, width: COL_GROUP_W, minWidth: COL_GROUP_W, background: '#18181b', borderBottom: '1px solid #27272a', borderRight: leafRowsVisible ? '1px solid #27272a' : '1px solid #3f3f46' }} />
+        {leafRowsVisible && (
+          <>
+            <td style={{ position: 'sticky', left: COL_GROUP_W, zIndex: 1, width: COL_PRODUCT_W, minWidth: COL_PRODUCT_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', whiteSpace: 'nowrap' }}>
+              {grp.product_id}
+            </td>
+            <td
+              title={grp.location_source ? `${grp.location_source} → ${grp.location_id}` : undefined}
+              style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W, zIndex: 1, width: COL_LOCATION_W, minWidth: COL_LOCATION_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}
+            >
+              {grp.location_source ? `${grp.location_source} → ${grp.location_id}` : grp.location_id}
+            </td>
+            <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W, zIndex: 1, width: COL_METHOD_W, minWidth: COL_METHOD_W, background: '#18181b', padding: '6px 10px', borderBottom: '1px solid #27272a', borderRight: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
+              <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: methodColor(grp.method), marginRight: 6 }} />
+              {grp.method}
+            </td>
+          </>
+        )}
         {colSpecs.map((spec) => {
           const cell = getCellForSpec(grp, spec);
           const flagged = !!cell && cellHasWindowCollision(cell);
@@ -542,10 +563,11 @@ export function CollapsedWoView({
   // Pivot aggregate row — mirrors AllocationMatrixView's collapsed supply-group row: every time
   // column gets a REAL sum across the section's member groups (not one grand total crammed into a
   // single cell), so the aggregate is legible against the same temporal axis the leaf rows use.
-  // The pivot path lives ONLY in the dedicated Group column (col 1) — Product/Location/Method/
-  // Customer (cols 2-5) stay blank here, exactly mirroring where they'd be blank/populated on leaf
-  // rows, so a given column always means the same thing regardless of row type. Collapsed by
-  // default (only this row renders); expanding reveals the next level (sub-sections or leaf rows).
+  // The pivot path lives ONLY in the dedicated Group column (col 1) — Product/Location/Method
+  // (cols 2-4, hidden entirely until a leaf row is visible — see leafRowsVisible) stay blank here,
+  // exactly mirroring where they'd be blank/populated on leaf rows, so a given column always means
+  // the same thing regardless of row type. Collapsed by default (only this row renders); expanding
+  // reveals the next level (sub-sections or leaf rows).
   const renderAggregateRow = (key: string, label: string, groups: GroupRow[], indent: number, expanded: boolean, onToggle: () => void) => {
     const total = groups.reduce((s, g) => s + g.total, 0);
     const bg = indent === 0 ? '#1f1f23' : '#19191c';
@@ -557,7 +579,7 @@ export function CollapsedWoView({
           style={{
             position: 'sticky', left: 0, zIndex: 1, width: COL_GROUP_W, minWidth: COL_GROUP_W, background: bg,
             padding: `6px 10px 6px ${10 + indent * 20}px`,
-            borderBottom: '1px solid #3f3f46', borderRight: '1px solid #27272a', borderTop,
+            borderBottom: '1px solid #3f3f46', borderRight: leafRowsVisible ? '1px solid #27272a' : '1px solid #3f3f46', borderTop,
             cursor: 'pointer', whiteSpace: 'nowrap',
           }}
         >
@@ -566,10 +588,13 @@ export function CollapsedWoView({
             {renderSectionSummary(label, groups.length, total)}
           </span>
         </td>
-        <td style={{ position: 'sticky', left: COL_GROUP_W, zIndex: 1, width: COL_PRODUCT_W, minWidth: COL_PRODUCT_W, background: bg, borderBottom: '1px solid #3f3f46', borderTop }} />
-        <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W, zIndex: 1, width: COL_LOCATION_W, minWidth: COL_LOCATION_W, background: bg, borderBottom: '1px solid #3f3f46', borderTop }} />
-        <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W, zIndex: 1, width: COL_METHOD_W, minWidth: COL_METHOD_W, background: bg, borderBottom: '1px solid #3f3f46', borderTop }} />
-        <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W + COL_METHOD_W, zIndex: 1, width: COL_CUSTOMER_W, minWidth: COL_CUSTOMER_W, background: bg, borderBottom: '1px solid #3f3f46', borderRight: '1px solid #3f3f46', borderTop }} />
+        {leafRowsVisible && (
+          <>
+            <td style={{ position: 'sticky', left: COL_GROUP_W, zIndex: 1, width: COL_PRODUCT_W, minWidth: COL_PRODUCT_W, background: bg, borderBottom: '1px solid #3f3f46', borderTop }} />
+            <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W, zIndex: 1, width: COL_LOCATION_W, minWidth: COL_LOCATION_W, background: bg, borderBottom: '1px solid #3f3f46', borderTop }} />
+            <td style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W, zIndex: 1, width: COL_METHOD_W, minWidth: COL_METHOD_W, background: bg, borderBottom: '1px solid #3f3f46', borderRight: '1px solid #3f3f46', borderTop }} />
+          </>
+        )}
         {colSpecs.map((spec) => {
           const sum = groups.reduce((s, grp) => s + (getCellForSpec(grp, spec)?.qty ?? 0), 0);
           return (
@@ -588,29 +613,30 @@ export function CollapsedWoView({
     );
   };
 
-  // Both single-dimension pivots (drill reveals the OTHER dimension) and 'nested' (fixed
-  // PROD_AREA -> Location) share the same two-level shape: top section (sectionExpanded) ->
-  // sub-section (leafExpanded, composite-keyed) -> leaf rows. Each level starts collapsed.
-  const bodyRows: React.ReactNode[] = [];
-  if (pivot === 'none') {
-    for (const grp of visibleGroups) bodyRows.push(renderRow(grp));
-  } else {
-    const topDim: 'prod_area' | 'location' | 'customer' = pivot === 'nested' ? 'prod_area' : pivot;
-    const subDim: 'prod_area' | 'location' = pivot === 'location' ? 'prod_area' : 'location';
-    for (const top of buildSections(visibleGroups, topDim)) {
-      const topExpanded = sectionExpanded.has(top.key);
-      bodyRows.push(renderAggregateRow(top.key, top.key, top.groups, 0, topExpanded, () => toggleSection(top.key)));
-      if (!topExpanded) continue;
-      for (const sub of buildSections(top.groups, subDim)) {
-        const subKey = `${top.key}|${sub.key}`;
-        const subExpanded = leafExpanded.has(subKey);
-        bodyRows.push(renderAggregateRow(subKey, sub.key, sub.groups, 1, subExpanded, () => toggleLeaf(subKey)));
-        if (subExpanded) {
-          for (const grp of sub.groups) bodyRows.push(renderRow(grp));
-        }
+  // Recursive pivot: one nested section level per entry in `pivotFields`, in the order given.
+  // Each level starts collapsed; expanding the LAST level reveals leaf rows, expanding any earlier
+  // level recurses into the next field. Mirrors the old fixed two-level shape but generalizes to
+  // any number of levels (including zero, i.e. the flat table).
+  const renderPivotLevel = (groups: GroupRow[], depth: number, pathPrefix: string): React.ReactNode[] => {
+    const field = pivotFields[depth];
+    const isLastLevel = depth === pivotFields.length - 1;
+    const nodes: React.ReactNode[] = [];
+    for (const section of buildSections(groups, field)) {
+      const path = pathPrefix ? `${pathPrefix}|${section.key}` : section.key;
+      const expanded = expandedPaths.has(path);
+      nodes.push(renderAggregateRow(path, section.key, section.groups, depth, expanded, () => togglePath(path)));
+      if (!expanded) continue;
+      if (isLastLevel) {
+        for (const grp of section.groups) nodes.push(renderRow(grp));
+      } else {
+        nodes.push(...renderPivotLevel(section.groups, depth + 1, path));
       }
     }
-  }
+    return nodes;
+  };
+  const bodyRows: React.ReactNode[] = pivotFields.length === 0
+    ? visibleGroups.map((grp) => renderRow(grp))
+    : renderPivotLevel(visibleGroups, 0, '');
 
   return (
     <div>
@@ -657,46 +683,39 @@ export function CollapsedWoView({
                   style={{
                     position: 'sticky', left: 0, top: 0, zIndex: 3,
                     width: COL_GROUP_W, minWidth: COL_GROUP_W, background: '#18181b', textAlign: 'left',
-                    padding: '6px 10px', borderBottom: '1px solid #3f3f46', borderRight: '1px solid #27272a',
+                    padding: '6px 10px', borderBottom: '1px solid #3f3f46', borderRight: leafRowsVisible ? '1px solid #27272a' : '1px solid #3f3f46',
                     color: '#a1a1aa', whiteSpace: 'nowrap',
                   }}
                 >
                   {tP('workOrders.collapsedColGroup')}
                 </th>
-                <th rowSpan={anyBucketExpanded ? 2 : 1} style={{ position: 'sticky', left: COL_GROUP_W, top: 0, zIndex: 3, width: COL_PRODUCT_W, minWidth: COL_PRODUCT_W, background: '#18181b', textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
-                  <button type="button" onClick={() => toggleSort('product')} style={sortThBtnStyle(sort?.key === 'product')}>
-                    {tP('workOrders.collapsedColProduct')}{sortIndicator('product')}
-                  </button>
-                </th>
-                <th rowSpan={anyBucketExpanded ? 2 : 1} style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W, top: 0, zIndex: 3, width: COL_LOCATION_W, minWidth: COL_LOCATION_W, background: '#18181b', textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
-                  <button type="button" onClick={() => toggleSort('location')} style={sortThBtnStyle(sort?.key === 'location')}>
-                    {tP('workOrders.collapsedColLocation')}{sortIndicator('location')}
-                  </button>
-                </th>
-                <th
-                  rowSpan={anyBucketExpanded ? 2 : 1}
-                  style={{
-                    position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W, top: 0, zIndex: 3,
-                    width: COL_METHOD_W, minWidth: COL_METHOD_W, background: '#18181b', textAlign: 'left',
-                    padding: '6px 10px', borderBottom: '1px solid #3f3f46',
-                    whiteSpace: 'nowrap',
-                  }}
-                >
-                  <button type="button" onClick={() => toggleSort('method')} style={sortThBtnStyle(sort?.key === 'method')}>
-                    {tP('workOrders.collapsedColMethod')}{sortIndicator('method')}
-                  </button>
-                </th>
-                <th
-                  rowSpan={anyBucketExpanded ? 2 : 1}
-                  style={{
-                    position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W + COL_METHOD_W, top: 0, zIndex: 3,
-                    width: COL_CUSTOMER_W, minWidth: COL_CUSTOMER_W, background: '#18181b', textAlign: 'left',
-                    padding: '6px 10px', borderBottom: '1px solid #3f3f46', borderRight: '1px solid #3f3f46',
-                    whiteSpace: 'nowrap', color: '#a1a1aa',
-                  }}
-                >
-                  {tP('workOrders.collapsedColCustomer')}
-                </th>
+                {leafRowsVisible && (
+                  <>
+                    <th rowSpan={anyBucketExpanded ? 2 : 1} style={{ position: 'sticky', left: COL_GROUP_W, top: 0, zIndex: 3, width: COL_PRODUCT_W, minWidth: COL_PRODUCT_W, background: '#18181b', textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
+                      <button type="button" onClick={() => toggleSort('product')} style={sortThBtnStyle(sort?.key === 'product')}>
+                        {tP('workOrders.collapsedColProduct')}{sortIndicator('product')}
+                      </button>
+                    </th>
+                    <th rowSpan={anyBucketExpanded ? 2 : 1} style={{ position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W, top: 0, zIndex: 3, width: COL_LOCATION_W, minWidth: COL_LOCATION_W, background: '#18181b', textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid #3f3f46', whiteSpace: 'nowrap' }}>
+                      <button type="button" onClick={() => toggleSort('location')} style={sortThBtnStyle(sort?.key === 'location')}>
+                        {tP('workOrders.collapsedColLocation')}{sortIndicator('location')}
+                      </button>
+                    </th>
+                    <th
+                      rowSpan={anyBucketExpanded ? 2 : 1}
+                      style={{
+                        position: 'sticky', left: COL_GROUP_W + COL_PRODUCT_W + COL_LOCATION_W, top: 0, zIndex: 3,
+                        width: COL_METHOD_W, minWidth: COL_METHOD_W, background: '#18181b', textAlign: 'left',
+                        padding: '6px 10px', borderBottom: '1px solid #3f3f46', borderRight: '1px solid #3f3f46',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      <button type="button" onClick={() => toggleSort('method')} style={sortThBtnStyle(sort?.key === 'method')}>
+                        {tP('workOrders.collapsedColMethod')}{sortIndicator('method')}
+                      </button>
+                    </th>
+                  </>
+                )}
                 {buckets.map((b) => {
                   const subs = drillPlan.subBucketsByTop.get(b.key);
                   const expanded = !!subs && subs.length > 0;

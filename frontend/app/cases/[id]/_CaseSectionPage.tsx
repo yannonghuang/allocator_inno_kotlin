@@ -107,7 +107,7 @@ import {
   getHorizonStartDefault,
 } from '@/lib/api';
 import { computeHorizon, ScheduleBar, ScheduleHorizonRuler, methodColor, BorMiniTimeline, BorTimelineRuler } from './_workOrderSchedule';
-import { CollapsedWoView } from './_collapsedWoView';
+import { CollapsedWoView, type WoPivotField } from './_collapsedWoView';
 import { WoScheduleImpactPanel, WoScheduleQuickModal } from './_woScheduleImpact';
 import type { PlanResult, PlanStatusResponse } from '../../../lib/api';
 
@@ -610,6 +610,10 @@ interface WoDemandGroup {
   requested_qty: number; // demand_qty - inventory_fulfilled
   shortage: number;
   rows: WoEnrichedRow[]; // WO rows + optional synthetic inventory row
+}
+
+function collapsedPivotFieldLabel(field: WoPivotField): string {
+  return field === 'customer' ? 'Customer' : field === 'prod_area' ? 'PROD_AREA' : 'Location';
 }
 
 function buildWoNestedPivotGroups(rows: WoEnrichedRow[]): WoNestedGroup[] {
@@ -1132,6 +1136,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return keys.size;
   }, [collapsedFilteredRows]);
   const [planWoPivot, setPlanWoPivot] = useState<'none' | 'customer' | 'prod_area' | 'location' | 'nested' | 'demand'>('none');
+  // Collapsed tab's own pivot control — an ORDERED array of fields (see WoPivotField / buildSections
+  // in _collapsedWoView.tsx), deliberately independent of `planWoPivot` above: the flat table's
+  // fixed presets include 'nested' (a hardcoded PROD_AREA->Location pair) and 'demand' (no
+  // Collapsed-view equivalent at all), which don't map cleanly onto a free-order multi-select.
+  const [collapsedPivotFields, setCollapsedPivotFields] = useState<WoPivotField[]>([]);
   const [planWoLayoutMode, setPlanWoLayoutMode] = useState<'data' | 'split' | 'timeline'>('split');
   const [woPegHighlightRow, setWoPegHighlightRow] = useState<WoEnrichedRow | null>(null);
   const [planWoPivotExpanded, setPlanWoPivotExpanded] = useState<Set<string>>(new Set());
@@ -5629,27 +5638,85 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       <span>{tP('workOrders.hideDummy')}</span>
                     </label>
                   </div>
-                  {/* ── Pivot selector — applies to the flat table's own rows, or (Collapsed tab)
-                      rolls the pivot table's groups up under collapsible PROD_AREA/Location
-                      section headers ── */}
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
-                    <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>Pivot:</span>
-                    {/* 'customer' listed first among the actual pivot fields (right after the neutral
-                        'none' state) per the Collapsed WO view's own Customer-pivot requirement —
-                        see CollapsedWoView's WoPivotMode doc for why a section here can represent a
-                        SET of customers (e.g. "CustomerA, CustomerB") rather than always one. */}
-                    {(['none', 'customer', 'prod_area', 'location', 'nested'] as const).map((mode) => (
-                      <button
-                        key={mode}
-                        type="button"
-                        className={planWoPivot === mode ? '' : 'secondary'}
-                        style={{ fontSize: '0.75rem', padding: '2px 10px' }}
-                        onClick={() => { setPlanWoPivot(mode); setPlanWoPivotExpanded(new Set()); setPlanWoPivotSubExpanded(new Set()); }}
-                      >
-                        {mode === 'none' ? 'None' : mode === 'customer' ? 'Customer' : mode === 'prod_area' ? 'PROD_AREA' : mode === 'location' ? 'Location' : 'PROD_AREA › Location'}
-                      </button>
-                    ))}
-                  </div>
+                  {/* ── Pivot selector — flat table keeps its fixed presets; Collapsed tab gets its
+                      own ordered multi-select instead (see collapsedPivotFields' own doc for why
+                      the two aren't shared) ── */}
+                  {woTableTab === 'collapsed' ? (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>Pivot:</span>
+                      {collapsedPivotFields.length === 0 && (
+                        <span style={{ fontSize: '0.75rem', color: '#71717a' }}>None</span>
+                      )}
+                      {/* Selected fields render as ordered chips (‹/› reorder, × remove) so the user
+                          can see and change pivot ORDER, not just membership — order changes which
+                          field nests under which (see buildSections/WoPivotField in
+                          _collapsedWoView.tsx). */}
+                      {collapsedPivotFields.map((field, idx) => (
+                        <span
+                          key={field}
+                          style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.75rem', padding: '2px 8px', background: '#3f3f46', borderRadius: 12, color: '#e4e4e7' }}
+                        >
+                          <button
+                            type="button"
+                            disabled={idx === 0}
+                            onClick={() => setCollapsedPivotFields((prev) => {
+                              const next = [...prev];
+                              [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
+                              return next;
+                            })}
+                            title="Move earlier"
+                            style={{ background: 'none', border: 'none', padding: 0, fontSize: '0.7rem', color: idx === 0 ? '#52525b' : '#a1a1aa', cursor: idx === 0 ? 'default' : 'pointer' }}
+                          >‹</button>
+                          {collapsedPivotFieldLabel(field)}
+                          <button
+                            type="button"
+                            disabled={idx === collapsedPivotFields.length - 1}
+                            onClick={() => setCollapsedPivotFields((prev) => {
+                              const next = [...prev];
+                              [next[idx], next[idx + 1]] = [next[idx + 1], next[idx]];
+                              return next;
+                            })}
+                            title="Move later"
+                            style={{ background: 'none', border: 'none', padding: 0, fontSize: '0.7rem', color: idx === collapsedPivotFields.length - 1 ? '#52525b' : '#a1a1aa', cursor: idx === collapsedPivotFields.length - 1 ? 'default' : 'pointer' }}
+                          >›</button>
+                          <button
+                            type="button"
+                            onClick={() => setCollapsedPivotFields((prev) => prev.filter((f) => f !== field))}
+                            title="Remove"
+                            style={{ background: 'none', border: 'none', padding: 0, fontSize: '0.85rem', lineHeight: 1, color: '#a1a1aa', cursor: 'pointer' }}
+                          >×</button>
+                        </span>
+                      ))}
+                      {(['customer', 'prod_area', 'location'] as const)
+                        .filter((f) => !collapsedPivotFields.includes(f))
+                        .map((field) => (
+                          <button
+                            key={field}
+                            type="button"
+                            className="secondary"
+                            style={{ fontSize: '0.75rem', padding: '2px 10px' }}
+                            onClick={() => setCollapsedPivotFields((prev) => [...prev, field])}
+                          >
+                            + {collapsedPivotFieldLabel(field)}
+                          </button>
+                        ))}
+                    </div>
+                  ) : (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
+                      <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>Pivot:</span>
+                      {(['none', 'customer', 'prod_area', 'location', 'nested'] as const).map((mode) => (
+                        <button
+                          key={mode}
+                          type="button"
+                          className={planWoPivot === mode ? '' : 'secondary'}
+                          style={{ fontSize: '0.75rem', padding: '2px 10px' }}
+                          onClick={() => { setPlanWoPivot(mode); setPlanWoPivotExpanded(new Set()); setPlanWoPivotSubExpanded(new Set()); }}
+                        >
+                          {mode === 'none' ? 'None' : mode === 'customer' ? 'Customer' : mode === 'prod_area' ? 'PROD_AREA' : mode === 'location' ? 'Location' : 'PROD_AREA › Location'}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                   {/* ── Layout selector (Data / Split / Timeline) — flat-table only ── */}
                   {woTableTab !== 'collapsed' && (
                     <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
@@ -5706,7 +5773,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       makeBatchScale={planningConfig.consolidation?.make_batch_scale}
                       moveBatchScale={planningConfig.consolidation?.move_batch_scale}
                       purchaseBatchScale={planningConfig.consolidation?.purchase_batch_scale}
-                      pivot={planWoPivot === 'demand' ? 'none' : planWoPivot}
+                      pivotFields={collapsedPivotFields}
                     />
                   )}
                   {woTableTab !== 'collapsed' && planResult.work_orders.length > 0 && (() => {
