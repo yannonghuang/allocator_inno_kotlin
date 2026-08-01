@@ -150,14 +150,10 @@ function buildBuckets(minIso: string, maxIso: string, scale: WoBatchScale, local
   return buckets;
 }
 
-// window_key is the contributor's OWN backend consolidation batch bucket — calendarBucket(over
-// wo_window_start, that method's batch scale), reproduced here via bucketKeyFor (which mirrors
-// calendarBucket bit-for-bit). This is NOT the same as the cell's display bucket (over end_time):
-// end_time can be shifted later by resource-contention scheduling, which runs AFTER consolidation
-// decisions are already made — two independently-and-correctly-consolidated WOs can coincidentally
-// land on the same displayed end_time despite having been assigned to different windows. Only a
-// shared window_key means consolidation's own key genuinely collided and should have merged them.
-type Contributor = { end_time: string; quantity: number; window_key: string };
+// One raw (native, per-demand) work order rolled into a cell — kept individually (not just
+// summed) so a cell backed by several native WOs can still list them out on hover, even though
+// the cell itself only ever shows their combined qty.
+type Contributor = { end_time: string; quantity: number };
 type Cell = { qty: number; contributors: Contributor[] };
 type GroupRow = {
   key: string;
@@ -204,59 +200,22 @@ function buildSections(groups: GroupRow[], by: WoPivotField): Section[] {
 }
 
 /**
- * Pivot/cross-tab built on top of the Consolidated Work Orders view: one row per
- * (product, location, method) group, time running horizontally as none(day)/weekly/biweekly/
- * monthly/all buckets — deliberately the SAME scale vocabulary and bucket boundaries WO
- * consolidation itself uses (see `bucketKeyFor`'s own doc), not a generic calendar grid.
+ * Pivot/cross-tab built on top of the NATIVE (per-demand) Work Orders — the same source as the
+ * flat table's Native tab, NOT the Consolidated view — rolled up into one row per (product,
+ * location, method) group, time running horizontally as none(day)/weekly/biweekly/monthly/all
+ * buckets (see `bucketKeyFor`'s own doc), not a generic calendar grid.
  *
- * A cell backed by more than one original consolidated row is only a real anomaly if those rows
- * share the same `window_key` — consolidation's OWN batch key (calendarBucket over
- * `wo_window_start`, that method's batch scale), reproduced via `bucketKeyFor`/`cellHasWindowCollision`.
- * `end_time` alone is NOT a reliable "should these have merged" signal: a separate
- * resource-contention scheduling pass runs AFTER consolidation and can push a WO's `end_time`
- * later, so two independently-and-correctly-consolidated WOs can coincidentally land in the same
- * displayed cell despite having been assigned to different consolidation windows. Only a shared
- * `window_key` means consolidation's own key genuinely collided and it still didn't merge them —
- * flagged visibly; everything else is summed silently, no flag.
- *
- * KNOWN REMAINING FALSE-POSITIVE CLASS (investigated on case 173, 2026-07-30; not fixed —
- * revisit later): a WO that was a *singleton* at every consolidation stage never gets
- * `wo_window_start` populated at all (it's only written on a merge's output — PlanningEngine.kt
- * has exactly 3 call sites, all merge-branch-only), so this component falls back to `end_time` for
- * it, which reintroduces the exact false-positive risk above. Confirmed root cause (debug-log
- * instrumented rerun of case 173): two independently-and-correctly-consolidated singleton WOs
- * (different weeks at consolidation time) can each be pushed later by resource-contention
- * scheduling by a *different* number of days and coincidentally land on the same final day —
- * observed e.g. product 500-6267 (pushed 8d and 3d respectively, converging on the same date) and
- * 500-4212 (pushed 20d and 24d). This is NOT a consolidation bug — R5_predecessor_sequencing
- * (SoundnessChecker.kt) is actively kept sound across pushes via `resequenceFromPegging`'s
- * `pushUp` DAG cascade (PlanningEngine.kt ~7606), so ordering is fine; it's a display-only
- * coincidence from consolidation and resource-contention scheduling running as two one-way,
- * non-communicating phases. Two fixes were considered and rejected:
- *   1. Re-run consolidation after arbitration: a merge can increase a batch's `lot_count`/duration
- *      beyond what `ResourceScheduler.arbitrate` already reserved on that shared resource for that
- *      day — risks a genuine R12 resource-overload violation, and re-arbitrating to fix that isn't
- *      guaranteed to converge (the existing arbitrate→cascade loop is deliberately capped at two
- *      passes, not run to a fixed point).
- *   2. Arbitrate before consolidating: PlanningEngine.kt ~6434 documents that arbitration
- *      deliberately runs over CONSOLIDATED lots "so capacity is checked against the real
- *      production-lot count instead of an inflated per-demand count" — arbitrating first would
- *      systematically overstate resource contention (many small native WOs instead of few batched
- *      ones) and degrade fill-rate/delivery-performance on every run, not just this edge case.
- * No frontend or backend fix applied for this class; the banner will still occasionally
- * over-count on cases with heavy resource contention. See project memory for the full writeup.
+ * Because the source is native rather than consolidated, a cell backed by several rows is the
+ * NORMAL case (a group's own time bucket naturally collects one entry per native WO — e.g. one
+ * per demand — that landed in it), not an anomaly to flag. Each cell's `contributors` list is
+ * kept only so a multi-entry cell can be broken down on hover (see `Contributor`'s own doc);
+ * there is no highlighting or alerting on cell composition.
  */
 export function CollapsedWoView({
   rows,
-  makeBatchScale = 'weekly',
-  moveBatchScale = 'weekly',
-  purchaseBatchScale = 'weekly',
   pivotFields = [],
 }: {
   rows: WorkOrder[];
-  makeBatchScale?: WoBatchScale;
-  moveBatchScale?: WoBatchScale;
-  purchaseBatchScale?: WoBatchScale;
   /** Ordered pivot dimensions — [] renders the flat (ungrouped) table; each entry adds one more
    *  nested section level, in the order given (see WoPivotField's own doc). */
   pivotFields?: WoPivotField[];
@@ -309,13 +268,6 @@ export function CollapsedWoView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pivotFields.join('|')]);
 
-  const scaleForMethod = (method: string): WoBatchScale => {
-    if (method === 'make') return makeBatchScale;
-    if (method === 'move') return moveBatchScale;
-    if (method === 'purchase' || method === 'buy') return purchaseBatchScale;
-    return 'weekly';
-  };
-
   const { groups, buckets, excludedCount } = useMemo(() => {
     const candidateRows = rows.filter((r) => r.method !== 'inventory');
     const validRows = candidateRows.filter((r) => !!r.end_time);
@@ -333,13 +285,12 @@ export function CollapsedWoView({
     // repeatedly rebuilding a sorted array) and finalized into `customer_ids` once, below.
     const customerIdSets = new Map<string, Set<string>>();
     for (const r of validRows) {
-      // Consolidation's own grouping key (PlanningEngine.kt ~4540) for MOVE work orders is
-      // ("__move__", location_source, location_id, prod_area, bucket) — WITHOUT product_id — so
-      // several already-correctly-consolidated mixed-shipment moves sharing one destination (this
-      // row's location_id) but a different source OR prod_area would otherwise collapse into a
-      // single group here and look like an unmerged collision. Both fields are effectively no-ops
-      // for make/buy: location_source is always null, and a given (product_id, location_id) pair
-      // already implies one prod_area.
+      // Mirrors consolidation's own grouping key (PlanningEngine.kt ~4540) for MOVE work orders —
+      // ("__move__", location_source, location_id, prod_area, bucket), WITHOUT product_id — so
+      // mixed-shipment moves sharing one destination (this row's location_id) but a different
+      // source OR prod_area still land in distinct display groups here, matching how consolidation
+      // itself would treat them. Both fields are effectively no-ops for make/buy: location_source
+      // is always null, and a given (product_id, location_id) pair already implies one prod_area.
       const locationSource = r.location_source ?? '';
       const prodArea = r.prod_area ?? '';
       const key = `${r.product_id}|${r.location_id}|${locationSource}|${prodArea}|${r.method}`;
@@ -360,9 +311,7 @@ export function CollapsedWoView({
         grp.cells.set(bucketKey, cell);
       }
       cell.qty += qty;
-      const windowIso = ((r.wo_window_start ?? r.end_time) as string).slice(0, 10);
-      const windowKey = bucketKeyFor(windowIso, scaleForMethod(r.method));
-      cell.contributors.push({ end_time: r.end_time as string, quantity: qty, window_key: windowKey });
+      cell.contributors.push({ end_time: r.end_time as string, quantity: qty });
       grp.total += qty;
       if (r.customer_ids && r.customer_ids.length > 0) {
         let set = customerIdSets.get(key);
@@ -379,7 +328,7 @@ export function CollapsedWoView({
     const groups = Array.from(groupMap.values());
     return { groups, buckets, excludedCount };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rows, granularity, locale, makeBatchScale, moveBatchScale, purchaseBatchScale]);
+  }, [rows, granularity, locale]);
 
   // Column plan: each top-level bucket renders as itself, unless locally expanded, in which case
   // it's replaced by finer sub-buckets computed from that bucket's OWN [startIso, endIso] range —
@@ -431,33 +380,6 @@ export function CollapsedWoView({
     }
     return cell;
   };
-  // A cell is a genuine consolidation miss only if 2+ of its contributors share the same
-  // window_key — i.e. consolidation's OWN batch key collided and it still didn't merge them.
-  // Contributors that merely display in the same cell (same end_time bucket) but came from
-  // different consolidation windows are NOT a collision — see Contributor's own doc.
-  const cellHasWindowCollision = (cell: Cell): boolean => {
-    const seen = new Set<string>();
-    for (const c of cell.contributors) {
-      if (seen.has(c.window_key)) return true;
-      seen.add(c.window_key);
-    }
-    return false;
-  };
-
-  // Recomputed from the currently-visible columns (not the raw grouping pass) so drilling into a
-  // flagged bucket can legitimately clear the flag (the collision only existed at the coarser
-  // view) or keep it (a real consolidation problem) — both are informative.
-  const visibleFlaggedCount = useMemo(() => {
-    let count = 0;
-    for (const grp of groups) {
-      for (const spec of colSpecs) {
-        const cell = getCellForSpec(grp, spec);
-        if (cell && cellHasWindowCollision(cell)) count++;
-      }
-    }
-    return count;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [groups, colSpecs, drillPlan, granularity]);
 
   // Filter + sort are cheap over the already-grouped rows, so kept out of the heavy
   // grouping/bucketing memo above — typing in the filter box never re-buckets.
@@ -528,22 +450,19 @@ export function CollapsedWoView({
         )}
         {colSpecs.map((spec) => {
           const cell = getCellForSpec(grp, spec);
-          const flagged = !!cell && cellHasWindowCollision(cell);
+          const multiEntry = !!cell && cell.contributors.length > 1;
           return (
             <td
               key={spec.type === 'top' ? spec.bucket.key : `${spec.topKey}|${spec.bucket.key}`}
-              title={flagged ? cell!.contributors.map((c) => `${c.end_time}: ${qtyFmt(c.quantity)}`).join('\n') : undefined}
+              title={multiEntry ? cell!.contributors.map((c) => `${c.end_time}: ${qtyFmt(c.quantity)}`).join('\n') : undefined}
               style={{
                 padding: '6px 10px',
                 borderBottom: '1px solid #27272a',
                 textAlign: 'right',
                 color: cell ? '#e4e4e7' : '#3f3f46',
-                background: flagged ? 'rgba(239,68,68,0.15)' : undefined,
-                outline: flagged ? '1px solid rgba(239,68,68,0.5)' : undefined,
-                outlineOffset: flagged ? '-1px' : undefined,
               }}
             >
-              {cell ? (flagged ? `⚠ ${qtyFmt(cell.qty)}` : qtyFmt(cell.qty)) : '–'}
+              {cell ? qtyFmt(cell.qty) : '–'}
             </td>
           );
         })}
@@ -666,11 +585,6 @@ export function CollapsedWoView({
           <span style={{ fontSize: '0.78rem', color: '#71717a' }}>{tP('workOrders.collapsedNoEndDate', { n: excludedCount })}</span>
         )}
       </div>
-      {visibleFlaggedCount > 0 && (
-        <div style={{ padding: '6px 12px', marginBottom: '0.6rem', background: 'rgba(239,68,68,0.12)', border: '1px solid rgba(239,68,68,0.4)', borderRadius: 5, color: '#f87171', fontSize: '0.82rem' }}>
-          ⚠ {tP('workOrders.collapsedAlertBanner', { n: visibleFlaggedCount })}
-        </div>
-      )}
       {visibleGroups.length === 0 ? (
         <div style={{ padding: '1rem', color: '#a1a1aa', fontSize: '0.875rem' }}>{tP('workOrders.collapsedEmpty')}</div>
       ) : (

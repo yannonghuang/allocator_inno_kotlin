@@ -1093,11 +1093,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planWoMoveOnly, setPlanWoMoveOnly] = useState(false);
   const [planWoFilterDemandId, setPlanWoFilterDemandId] = useState('');
   // Rows fed to the Collapsed pivot (_collapsedWoView.tsx) — mirrors the flat table's own filter
-  // predicates (hide-dummy-prod-area, the 8 pegging checkboxes, demand-id) applied to the
-  // consolidated source, WITHOUT the flat-table-only lot-grouping/requested-qty enrichment that
-  // follows it below (the pivot only needs product_id/location_id/method/quantity/end_time).
+  // predicates (hide-dummy-prod-area, the 8 pegging checkboxes, demand-id) applied to the NATIVE
+  // (per-demand) source — same source as the Native tab's `activeWorkOrders` — WITHOUT the
+  // flat-table-only lot-grouping/requested-qty enrichment that follows it below (the pivot only
+  // needs product_id/location_id/method/quantity/end_time). Native rather than consolidated so the
+  // Collapsed view's own (product, location, method, time-bucket) rollup does the grouping itself,
+  // instead of grouping an already-grouped dataset.
   const collapsedFilteredRows = useMemo<WorkOrder[]>(() => {
-    const source = planResult?.work_orders ?? [];
+    const source = planResult?.work_orders_native ?? planResult?.work_orders ?? [];
     let out = planWorkOrderHideDummyProdArea
       ? source.filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'))
       : source;
@@ -1140,7 +1143,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // in _collapsedWoView.tsx), deliberately independent of `planWoPivot` above: the flat table's
   // fixed presets include 'nested' (a hardcoded PROD_AREA->Location pair) and 'demand' (no
   // Collapsed-view equivalent at all), which don't map cleanly onto a free-order multi-select.
-  const [collapsedPivotFields, setCollapsedPivotFields] = useState<WoPivotField[]>([]);
+  // Always at least one field selected — there is no "None"/flat-table state for the Collapsed
+  // tab's own pivot (unlike the flat table's planWoPivot, which keeps a 'none' preset).
+  const [collapsedPivotFields, setCollapsedPivotFields] = useState<WoPivotField[]>(['customer', 'prod_area']);
   const [planWoLayoutMode, setPlanWoLayoutMode] = useState<'data' | 'split' | 'timeline'>('split');
   const [woPegHighlightRow, setWoPegHighlightRow] = useState<WoEnrichedRow | null>(null);
   const [planWoPivotExpanded, setPlanWoPivotExpanded] = useState<Set<string>>(new Set());
@@ -5644,13 +5649,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   {woTableTab === 'collapsed' ? (
                     <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
                       <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>Pivot:</span>
-                      {collapsedPivotFields.length === 0 && (
-                        <span style={{ fontSize: '0.75rem', color: '#71717a' }}>None</span>
-                      )}
                       {/* Selected fields render as ordered chips (‹/› reorder, × remove) so the user
                           can see and change pivot ORDER, not just membership — order changes which
                           field nests under which (see buildSections/WoPivotField in
-                          _collapsedWoView.tsx). */}
+                          _collapsedWoView.tsx). The × is hidden on the last remaining chip — there
+                          is no "None" state to remove down to. */}
                       {collapsedPivotFields.map((field, idx) => (
                         <span
                           key={field}
@@ -5679,12 +5682,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             title="Move later"
                             style={{ background: 'none', border: 'none', padding: 0, fontSize: '0.7rem', color: idx === collapsedPivotFields.length - 1 ? '#52525b' : '#a1a1aa', cursor: idx === collapsedPivotFields.length - 1 ? 'default' : 'pointer' }}
                           >›</button>
-                          <button
-                            type="button"
-                            onClick={() => setCollapsedPivotFields((prev) => prev.filter((f) => f !== field))}
-                            title="Remove"
-                            style={{ background: 'none', border: 'none', padding: 0, fontSize: '0.85rem', lineHeight: 1, color: '#a1a1aa', cursor: 'pointer' }}
-                          >×</button>
+                          {collapsedPivotFields.length > 1 && (
+                            <button
+                              type="button"
+                              onClick={() => setCollapsedPivotFields((prev) => prev.filter((f) => f !== field))}
+                              title="Remove"
+                              style={{ background: 'none', border: 'none', padding: 0, fontSize: '0.85rem', lineHeight: 1, color: '#a1a1aa', cursor: 'pointer' }}
+                            >×</button>
+                          )}
                         </span>
                       ))}
                       {(['customer', 'prod_area', 'location'] as const)
@@ -5770,9 +5775,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   {woTableTab === 'collapsed' && (
                     <CollapsedWoView
                       rows={collapsedFilteredRows}
-                      makeBatchScale={planningConfig.consolidation?.make_batch_scale}
-                      moveBatchScale={planningConfig.consolidation?.move_batch_scale}
-                      purchaseBatchScale={planningConfig.consolidation?.purchase_batch_scale}
                       pivotFields={collapsedPivotFields}
                     />
                   )}
