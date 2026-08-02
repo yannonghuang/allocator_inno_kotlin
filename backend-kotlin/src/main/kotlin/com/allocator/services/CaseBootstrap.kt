@@ -150,6 +150,10 @@ private fun seedCfg(
     rootWaterfall: Boolean = true,
     equalSplitRawMaterials: Boolean = false,
     horizonStart: String? = null,
+    /** Per-lot ASC override: supply_id -> date. Each "wip"-dated lot has its own independent
+     *  readiness schedule (see PlanningEngine.kt's ASC section doc) — applied uniformly to every
+     *  preset in this seeding batch, same as [horizonStart]. */
+    wipSupplyDates: Map<String, String> = emptyMap(),
 ): JsonObject = buildJsonObject {
     putJsonObject("method_selection") {
         put("mode", "preference")
@@ -165,6 +169,13 @@ private fun seedCfg(
             put("commit_time", 0.4)
             put("inventory_consumed", 0.35)
             put("purchase", 0.25)
+        }
+    }
+    if (wipSupplyDates.isNotEmpty()) {
+        putJsonObject("app_specific_config") {
+            putJsonObject("wip_supply_dates") {
+                wipSupplyDates.forEach { (sid, date) -> put(sid, date) }
+            }
         }
     }
     putJsonObject("consolidation") {
@@ -804,6 +815,12 @@ object CaseBootstrap {
         val rootWaterfall: Boolean = true,
         val equalSplitRawMaterials: Boolean = false,
         val horizonStart: String? = null,
+        /** Per-lot ASC override for the whole seeding batch: supply_id -> date — see
+         *  [resolveWipSupplyDates]' own doc for the per-lot "auto" -> horizon-start default (each
+         *  "wip" lot is its own independent readiness schedule). Lots absent from this map leave
+         *  that lot unresolved (falls back to horizon start at run time, same as a manual
+         *  submission that never touched the ASC section). */
+        val wipSupplyDates: Map<String, String> = emptyMap(),
         /** [ConfigVersionKind.key] strings the user explicitly detached for this batch — see
          *  `parseDetachedKinds`'s own doc (CaseConfigVersioning.kt). Empty = nothing detached. */
         val detachedExternalConfigs: List<String> = emptyList(),
@@ -868,6 +885,7 @@ object CaseBootstrap {
                         rootWaterfall = form.rootWaterfall,
                         equalSplitRawMaterials = form.equalSplitRawMaterials,
                         horizonStart = form.horizonStart,
+                        wipSupplyDates = form.wipSupplyDates,
                     ),
                     form,
                 ),

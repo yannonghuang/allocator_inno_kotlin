@@ -105,6 +105,8 @@ import {
   type ResourceUtilization,
   type DominatorRef,
   getHorizonStartDefault,
+  getAscOptions,
+  type WipLot,
 } from '@/lib/api';
 import { computeHorizon, ScheduleBar, ScheduleHorizonRuler, methodColor, BorMiniTimeline, BorTimelineRuler } from './_workOrderSchedule';
 import { CollapsedWoView } from './_collapsedWoView';
@@ -1203,6 +1205,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // value whenever no explicit override is set; submission itself still sends nothing for "auto"
   // (server resolves the authoritative value fresh again at plan-submit time).
   const [defaultHorizonStart, setDefaultHorizonStart] = useState<string | null>(null);
+  // ASC (app-specific config): every SUPPLY_DATE="wip" lot this case has to configure, each with
+  // its own independent readiness schedule (not one case-wide date), plus a shared default
+  // (horizon start) each unconfigured lot falls back to. Fetched alongside defaultHorizonStart
+  // below — see getAscOptions's own doc. An empty wipLots list hides the ASC section entirely on
+  // both the Planning form and the KB-seeding form (there's nothing to configure).
+  const [wipLots, setWipLots] = useState<WipLot[]>([]);
+  const [defaultWipSupplyDate, setDefaultWipSupplyDate] = useState<string | null>(null);
   // Read-only preview popup for the currently-selected version of one external config object —
   // opened via the "Preview" link next to each picker's dropdown. Rendered as a movable/resizable
   // floating window (not anchored to an edge like the other slide-in panels) so it can sit
@@ -1275,6 +1284,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [bootstrapRootWaterfall, setBootstrapRootWaterfall] = useState(true);
   const [bootstrapEqualSplitRawMaterials, setBootstrapEqualSplitRawMaterials] = useState(true);
   const [bootstrapHorizonStart, setBootstrapHorizonStart] = useState('');
+  const [bootstrapWipSupplyDates, setBootstrapWipSupplyDates] = useState<Record<string, string>>({});
   const [bootstrapPurchaseAllowed, setBootstrapPurchaseAllowed] = useState(true);
   const [bootstrapMakeBatchScale, setBootstrapMakeBatchScale] = useState<'none' | 'weekly' | 'biweekly' | 'monthly' | 'all'>('weekly');
   const [bootstrapMoveBatchScale, setBootstrapMoveBatchScale] = useState<'none' | 'weekly' | 'biweekly' | 'monthly' | 'all'>('weekly');
@@ -1292,6 +1302,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     root_waterfall: bootstrapRootWaterfall,
     raw_material_sourcing: bootstrapEqualSplitRawMaterials ? 'equal_split' : 'waterfall',
     horizon_start: bootstrapHorizonStart || undefined,
+    wip_supply_dates: Object.keys(bootstrapWipSupplyDates).length ? bootstrapWipSupplyDates : undefined,
     purchase_allowed: bootstrapPurchaseAllowed,
     make_batch_scale: bootstrapMakeBatchScale,
     move_batch_scale: bootstrapMoveBatchScale,
@@ -1833,6 +1844,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     getHorizonStartDefault(id)
       .then((v) => { if (!cancelled) setDefaultHorizonStart(v); })
       .catch(() => { if (!cancelled) setDefaultHorizonStart(null); });
+    return () => { cancelled = true; };
+  }, [id]);
+
+  // Fetch every ASC lot (SUPPLY_DATE="wip" supply rows) this case has to configure, and what
+  // they default to — see wipLots' own doc above. Drives both the Planning page's and the
+  // KB-seeding dialog's ASC section visibility.
+  useEffect(() => {
+    if (!id) { setWipLots([]); setDefaultWipSupplyDate(null); return; }
+    let cancelled = false;
+    getAscOptions(id)
+      .then(({ wipLots: lots, wipSupplyDateDefault }) => {
+        if (cancelled) return;
+        setWipLots(lots);
+        setDefaultWipSupplyDate(wipSupplyDateDefault);
+      })
+      .catch(() => { if (!cancelled) { setWipLots([]); setDefaultWipSupplyDate(null); } });
     return () => { cancelled = true; };
   }, [id]);
 
@@ -4663,6 +4690,57 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 <span style={{ fontSize: '0.875rem' }}>{tP('config.reallocateCriticalLeftover')}</span>
               </label>
             </div>
+
+            {/* ── App-specific config (ASC) — only shown when the case actually has SUPPLY_DATE=
+                "wip" lots to configure; see wipLots' own doc. One row per lot — each is its own
+                independent readiness schedule, not one case-wide date. ── */}
+            {wipLots.length > 0 && (
+              <div style={{ marginTop: '0.65rem', borderTop: '1px solid #27272a', paddingTop: '0.4rem' }}>
+                <div style={{ fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.3rem' }} title={tP('config.wipSupplyDateTooltip')}>
+                  {tP('config.subheadAsc')}
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+                  {wipLots.map((lot) => {
+                    const override = planningConfig.app_specific_config?.wip_supply_dates?.[lot.supply_id];
+                    return (
+                      <label key={lot.supply_id} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }}>
+                        <span style={{ color: '#a1a1aa', minWidth: 220 }}>
+                          {tP('config.wipSupplyDate')}: {lot.product_id}{lot.location_id ? `@${lot.location_id}` : ''}
+                          <span style={{ color: '#52525b' }}> ({lot.supply_id})</span>
+                        </span>
+                        <input
+                          type="date"
+                          value={(override && override.toLowerCase() !== 'auto') ? override : (defaultWipSupplyDate ?? '')}
+                          onChange={(e) => setPlanningConfig((c) => {
+                            const dates = { ...c.app_specific_config?.wip_supply_dates };
+                            if (e.target.value) dates[lot.supply_id] = e.target.value;
+                            else delete dates[lot.supply_id];
+                            return { ...c, app_specific_config: { ...c.app_specific_config, wip_supply_dates: dates } };
+                          })}
+                          placeholder={tP('config.wipSupplyDateAuto')}
+                          style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+                        />
+                        {override && (
+                          <button
+                            type="button"
+                            className="secondary"
+                            title={tP('config.wipSupplyDateClearTooltip')}
+                            onClick={() => setPlanningConfig((c) => {
+                              const rest = { ...c.app_specific_config?.wip_supply_dates };
+                              delete rest[lot.supply_id];
+                              return { ...c, app_specific_config: { ...c.app_specific_config, wip_supply_dates: rest } };
+                            })}
+                            style={{ fontSize: '0.72rem', padding: '2px 6px' }}
+                          >
+                            {tP('config.wipSupplyDateClear')}
+                          </button>
+                        )}
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </fieldset>
 
           {/* ── External config object version pickers — explicit pick, else the case's default
@@ -7786,6 +7864,57 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       )}
                     </label>
                   </div>
+
+                  {/* ── App-specific config (ASC) — only shown when the case actually has
+                      SUPPLY_DATE="wip" lots; one row per lot, applied to every preset in the
+                      seeding batch. Each lot is its own independent readiness schedule. ── */}
+                  {wipLots.length > 0 && (
+                    <div style={{ marginTop: '0.65rem', borderTop: '1px solid #27272a', paddingTop: '0.4rem' }}>
+                      <div style={{ fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.3rem' }} title={tP('config.wipSupplyDateTooltip')}>
+                        {tP('config.subheadAsc')}
+                      </div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+                        {wipLots.map((lot) => {
+                          const override = bootstrapWipSupplyDates[lot.supply_id];
+                          return (
+                            <label key={lot.supply_id} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }}>
+                              <span style={{ color: '#a1a1aa', minWidth: 220 }}>
+                                {tP('config.wipSupplyDate')}: {lot.product_id}{lot.location_id ? `@${lot.location_id}` : ''}
+                                <span style={{ color: '#52525b' }}> ({lot.supply_id})</span>
+                              </span>
+                              <input
+                                type="date"
+                                value={override || (defaultWipSupplyDate ?? '')}
+                                onChange={(e) => setBootstrapWipSupplyDates((m) => {
+                                  const next = { ...m };
+                                  if (e.target.value) next[lot.supply_id] = e.target.value;
+                                  else delete next[lot.supply_id];
+                                  return next;
+                                })}
+                                placeholder={tP('config.wipSupplyDateAuto')}
+                                style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+                              />
+                              {override && (
+                                <button
+                                  type="button"
+                                  className="secondary"
+                                  title={tP('config.wipSupplyDateClearTooltip')}
+                                  onClick={() => setBootstrapWipSupplyDates((m) => {
+                                    const next = { ...m };
+                                    delete next[lot.supply_id];
+                                    return next;
+                                  })}
+                                  style={{ fontSize: '0.72rem', padding: '2px 6px' }}
+                                >
+                                  {tP('config.wipSupplyDateClear')}
+                                </button>
+                              )}
+                            </label>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
 
                   {/* ── Purchase ── */}
                   <div style={{ marginTop: '0.65rem', borderTop: '1px solid #27272a', paddingTop: '0.4rem' }}>

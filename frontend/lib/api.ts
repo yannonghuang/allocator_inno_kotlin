@@ -517,6 +517,19 @@ export type PlanningConfig = {
    *  this run — suppresses version resolution for that object regardless of the picks above or
    *  the case's default. See `parseDetachedKinds`'s own doc (CaseConfigVersioning.kt). */
   detached_external_configs?: string[];
+  /**
+   * App-specific config (ASC): optional runtime parameters a case's own CSVs can't hardcode.
+   * Only meaningful when the case has at least one supply row with SUPPLY_DATE="wip" — see
+   * `getAscOptions`. The UI should only render this section when that's true.
+   */
+  app_specific_config?: {
+    /** Per-lot override: supply_id -> the concrete date that "wip"-dated lot resolves to for this
+     *  run. Each lot is its own independent readiness schedule — one finishing WIP soon doesn't
+     *  imply another on a different line does — so this is keyed by supply_id, not one case-wide
+     *  date. A lot absent from this map, or mapped to undefined/blank/"auto", defaults to horizon
+     *  start (see `method_selection.horizon_start`'s own doc). */
+    wip_supply_dates?: Record<string, string>;
+  };
 };
 
 export type PlanSupplyAllocation = {
@@ -1986,6 +1999,9 @@ export type SeedForm = {
   /** Blank/undefined or "auto": computed from the case's own demands. See PlanningConfig's
    *  identical field for the full semantics. */
   horizon_start?: string;
+  /** Per-lot ASC override applied to every preset in this seeding batch. See PlanningConfig's
+   *  `app_specific_config.wip_supply_dates`'s identical field for the full semantics. */
+  wip_supply_dates?: Record<string, string>;
   /** See PlanningConfig's identical field — kind keys detached for this whole batch. */
   detached_external_configs?: string[];
 };
@@ -2070,6 +2086,26 @@ export async function getHorizonStartDefault(caseId: number): Promise<string | n
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
   return (data.horizon_start_default as string | null) ?? null;
+}
+
+/** One SUPPLY_DATE="wip" lot this case has to configure — its own independent readiness
+ *  schedule, not part of one case-wide date (see getAscOptions's own doc). */
+export type WipLot = { supply_id: string; product_id: string; location_id: string | null; qty: number };
+
+/** Whether this case has ASC parameters to configure (SUPPLY_DATE="wip" supply rows), the list of
+ *  those lots, and what they default to (horizon start) when unconfigured. Read-only preview for
+ *  the Planning/KB-seeding config forms — an empty wipLots list means there's nothing to show;
+ *  the ASC section stays hidden. Actual plan submission resolves this fresh, server-side, same as
+ *  horizon start. */
+export async function getAscOptions(caseId: number): Promise<{ hasWipSupply: boolean; wipSupplyDateDefault: string | null; wipLots: WipLot[] }> {
+  const r = await fetch(`${API}/cases/${caseId}/plan/asc-options`);
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return {
+    hasWipSupply: !!data.has_wip_supply,
+    wipSupplyDateDefault: (data.wip_supply_date_default as string | null) ?? null,
+    wipLots: (data.wip_lots as WipLot[] | undefined) ?? [],
+  };
 }
 
 // ── Config versioning (shared across the 5 "external config objects") ──────────
