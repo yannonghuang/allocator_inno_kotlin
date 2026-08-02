@@ -319,6 +319,24 @@ internal fun isRawCriticalPosition(
     return !buyAdmitted(pid, purchaseAllowed, purchasable)  // criterion 2: no make, buy exists but excluded
 }
 
+/**
+ * True if [pid]@[lid] has zero supply defined anywhere in the case's static [data] — a
+ * genuine, permanent data gap. Used to distinguish that from a raw+critical position whose
+ * "no_methods" commit_reason fired only because ITS OWN eligible lots were filtered out by
+ * [allocateCriticalSuppliesPerLot]'s target/deadline gate for one specific demand's request
+ * date — real supply exists, just not reachable in time for THIS caller. That distinction
+ * matters for [planMethodSlot]'s structuralFailedMakes memo: see its own call site's doc.
+ */
+private fun hasAnySupplyEverDefined(
+    pid: String,
+    lid: String,
+    data: Map<String, List<Map<String, Any?>>>,
+): Boolean = (data["supply"] ?: emptyList()).any { row ->
+    (row["product_id"] as? String)?.trim() == pid &&
+        (row["location_id"] as? String)?.trim() == lid &&
+        ((row["qty"] as? Number)?.toDouble() ?: 0.0) > 0
+}
+
 internal fun rawDominatorRefs(
     node: Map<String, Any?>?,
     key: String,
@@ -2367,11 +2385,33 @@ internal fun planMethodSlot(
             // AND had no inventory — true topological dead-end, safe to memo.
             // Cascade-only cases (the child has a method but it failed deeper)
             // are runtime-dependent and excluded.
+            //
+            // ADDITIONALLY excluded: a raw+critical deepest leaf (deepPid/deepLoc) that DOES
+            // have real supply somewhere in the case (hasAnySupplyEverDefined) but returned 0
+            // for THIS call only. For a raw+critical position "no_methods" fires unconditionally
+            // whenever its residual > 0 (PlanningEngine's own no_methods branch), which conflates
+            // two very different situations: (a) truly zero supply ever defined anywhere — a
+            // permanent data gap, safe to memo — vs (b) supply exists but was filtered out by
+            // allocateCriticalSuppliesPerLot's per-demand TARGET/deadline eligibility gate (a
+            // demand due early in the horizon can have a lead-time-tightened deadline that
+            // predates every dated lot). (b) is state/timing-dependent, not structural: a LATER
+            // demand (later request date → later, satisfiable deadline) can succeed via the exact
+            // same make method. Memoizing (b) as permanent wrongly blocks every subsequent demand
+            // that shares this (pid, lid) node — including demands for a DIFFERENT customer/target
+            // than the one that triggered the miss, whenever that node (like a shared, untargeted
+            // intermediate consumed by two unrelated top-level demands) has no target of its own
+            // to keep those demands' entitlements separate. Confirmed live on case 214: 280-1001
+            // (elastic — has its own make method, so never critical itself) is shared, untargeted
+            // WIP consumed by two different FG chains; its own make bottoms out at a raw+critical,
+            // per-customer-TARGETed material. One customer's demand missing the deadline at that
+            // raw leaf permanently blocked BOTH customers' subsequent demands from ever retrying
+            // 280-1001's make, even though later demands' own deadlines were perfectly reachable.
             val immediateTrulyStructural = bottleneck.effectiveQty <= 1e-9 &&
                 bottleneck.solvedList.any { row ->
                     val r = row["commit_reason"] as? String
                     r == "no_methods" || r == "no_preferred_method"
-                }
+                } &&
+                !hasAnySupplyEverDefined(deepPid, deepLoc, data)
             return MethodSlotResult(
                 achievableQty = 0.0,
                 wos = emptyList(),
@@ -3261,11 +3301,31 @@ fun plan(
         }
     }
     val fulfillCommitTime = consumedBuckets.firstOrNull()?.commitTime
+    // Clamp to this node's own required-by date (reqTimeStr — already lead-time-reduced
+    // top-down from the ultimate demand's request date for any nested BOM call, same value
+    // computeStartDt uses as its backward-scheduling baseline for work orders) — never
+    // EARLIER, only later if the real lot's own date demands it. Mirrors computeStartDt's
+    // identical clamp (start at reqDt - leadDays, only pushed later by a child's actual
+    // commit time, never earlier) so a direct-inventory draw is scheduled the same
+    // "as-late-as-actually-needed" way a make/move WO already is. Without this, a lot that
+    // physically arrived weeks before it was ever needed reports ITS OWN arrival date as the
+    // demand's delivery date — technically not late, but not a realistic commit either, and
+    // inconsistent with how the WO path already treats the identical situation. A lot dated
+    // AFTER reqTimeStr (genuinely late) is left untouched — the clamp only ever moves the date
+    // later than the raw lot date, never earlier, so true lateness still shows through. Used for
+    // this node's own displayed commit_time (both the committedRow and the demandNode below);
+    // the per-bucket "supply" pegging children keep their own true, unclamped lot dates (line
+    // below) since those represent physical fact, not the demand's own delivery commitment.
+    val fulfillDt = parseDate(fulfillCommitTime)
+    val reqDtForClamp = parseDate(reqTimeStr)
+    val commitForFulfilled = when {
+        fulfillDt != null && reqDtForClamp != null && fulfillDt.isBefore(reqDtForClamp) -> reqTimeStr
+        else -> fulfillCommitTime ?: reqTimeStr
+    }
     val demandFulfilledList = mutableListOf<Map<String, Any?>>()
     val peggingChildren = mutableListOf<Map<String, Any?>>()
 
     if (taken > 0) {
-        val commitForFulfilled = fulfillCommitTime ?: reqTimeStr
         demandFulfilledList.add(committedRow(taken, commitForFulfilled, "inventory"))
         // One supply node per consumed bucket so each node carries its exact supply_id.
         // Keep `quantity` UNROUNDED — fair-split allocators distribute supply.qty across
@@ -3298,14 +3358,14 @@ fun plan(
     if (demandNetQty <= 1e-9) {
         // Treat sub-epsilon residuals as fully satisfied (prevents floating-point drift from
         // cascading into child_failed when a consolidation proportional share rounds down by ε)
-        return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, fulfillCommitTime, committedQty = taken, timeDominator = ownLotTimeDominator))
+        return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, commitForFulfilled, committedQty = taken, timeDominator = ownLotTimeDominator))
     }
     // Sub-half residuals after partial inventory consumption are numerical noise from
     // proportional pda splits and partial-replan scaling (e.g. demand=2119 vs synthetic
     // bucket=2118.95 leaves a 0.05 residual). Recursing on those produces a roundQty(0.x)=0
     // WO in the ledger and a phantom pegging entry — absorb them as fulfilled instead.
     if (taken > 0 && demandNetQty < 0.5) {
-        return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, fulfillCommitTime, committedQty = quantity, timeDominator = ownLotTimeDominator))
+        return Triple(demandFulfilledList, emptyList(), demandNode(peggingChildren, commitForFulfilled, committedQty = quantity, timeDominator = ownLotTimeDominator))
     }
 
     // 2) Get methods
@@ -5544,7 +5604,16 @@ internal fun rewritePeggingTimings(
             }
             val newCommit = commitCandidates.maxOfOrNull { it.first }
             val current = parseDate(node["commit_time"] as? String)
-            val commitChanged = newCommit != null && newCommit != current
+            // Only ever roll the parent's commit_time LATER, never earlier — same "bottom-up
+            // rollup can only push out, never pull in" invariant already enforced by the sibling
+            // rewrite pass (rewriteTreeFromWorkOrders's "demand"/"supply"/"purchase" branches,
+            // `current == null || newCommit > current`). Before this fix the comparison was a
+            // blind `newCommit != current`, so a "supply" child correctly keeping its own true,
+            // unclamped physical lot date (a deliberate choice — see plan()'s consumeFromInventory
+            // clamp doc) got rolled straight up into the parent here, silently undoing that
+            // clamp: the demand's own commit_time reverted to the lot's raw arrival date instead
+            // of staying "as-late-as-actually-needed."
+            val commitChanged = newCommit != null && (current == null || newCommit > current)
             return if (commitChanged || childrenChanged) {
                 node.toMutableMap().also { m ->
                     if (childrenChanged) m["children"] = newChildren

@@ -5185,6 +5185,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         rows={demandSummaryRows}
                         demands={planResult?.committed_demands ?? []}
                         pivotFields={demandSummaryPivotFields}
+                        horizonStart={planningConfig.method_selection?.horizon_start}
                       />
                     </div>
                   )}
@@ -5784,6 +5785,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       makeBatchScale={planningConfig.consolidation?.make_batch_scale}
                       moveBatchScale={planningConfig.consolidation?.move_batch_scale}
                       purchaseBatchScale={planningConfig.consolidation?.purchase_batch_scale}
+                      horizonStart={planningConfig.method_selection?.horizon_start}
                     />
                   )}
                   {woTableTab !== 'collapsed' && planResult.work_orders.length > 0 && (() => {
@@ -10104,6 +10106,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 }
               }
 
+              // Only needed when the tree's root is a work_order (single-WO pegging view) — that
+              // node type carries no request_time of its own, so the "is this actually late"
+              // check in SinglePeggingTreePanel needs the serving demand's own request_time
+              // resolved here instead (see that component's servingDemandRequestTime prop doc).
+              const servingDemandRequestTime = contextDemandId
+                ? (planResult?.committed_demands ?? []).find((d) => d.demand_id === contextDemandId)?.request_time ?? null
+                : null;
               return tree ? (
                 <SinglePeggingTreePanel
                   key={woPeggingRowKey ?? ''}
@@ -10116,6 +10125,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                   onNavigateToSupply={handleDominatorSupplyClick}
                   caseId={id}
                   runId={currentPlanRunId ?? freshPlanRunId ?? null}
+                  servingDemandRequestTime={servingDemandRequestTime}
                 />
               ) : null;
             })()}
