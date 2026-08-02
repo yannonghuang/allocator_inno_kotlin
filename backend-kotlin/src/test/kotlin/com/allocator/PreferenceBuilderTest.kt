@@ -149,12 +149,13 @@ class PreferenceBuilderTest : FunSpec({
         purchasedQty(wos, "C2") shouldBe (5.0 plusOrMinus 0.01)
     }
 
-    test("a full-coverage Preferences KB skews the root split toward the higher-scored candidate; a sibling node with no KB coverage still gets the equal-split default") {
+    test("a full-coverage Preferences KB no longer skews the root split — it stays a flat equal split even with a lopsided score gap") {
         // P1 gets KB entries for BOTH of its alternatives with a lopsided score (B2 far ahead of
-        // B1) -> the root split should heavily favor C2 over C1, not a flat 50/50. P2 has NO KB
-        // entries at all -> falls back to the plain equal-split default (not a 100% flip either),
-        // proving the "per-node" fallback granularity: a KB existing for one case doesn't imply
-        // coverage for every node in it.
+        // B1). The root split used to skew heavily toward C2 in this case; it's now a flat 50/50
+        // regardless of the KB score gap — a continuous KB-weighted ratio is a hard-to-explain
+        // artifact for users, so root split ignores it entirely and always divides evenly across
+        // the top `cap` candidates. P2 has NO KB entries at all -> same flat equal-split result,
+        // proving the KB's presence/absence no longer changes root-split behavior at all.
         val dataP1 = twoAltFixture("P1", "C1", "C2")
         val dataP2 = twoAltFixture("P2", "C3", "C4")
         val combined = mapOf(
@@ -175,11 +176,9 @@ class PreferenceBuilderTest : FunSpec({
 
         val (_, wosP1, _) = plan(demandFor("P1", "D1"), mutableListOf(), combined, requestTimeDt = null,
             config = mapOf("purchase_allowed" to true, "method_selection" to mapOf("root_waterfall" to false)), preferenceKb = preferenceKb)
-        // With this lopsided a score gap, B2's reconstructed score is 1.0 and B1's is 0.0 —
-        // B1's target share is exactly 0, so it commits nothing at all (no C1 purchase WO).
-        purchasedChildren(wosP1) shouldBe setOf("C2")
-        purchasedQty(wosP1, "C1") shouldBe (0.0 plusOrMinus 0.01)
-        purchasedQty(wosP1, "C2") shouldBe (10.0 plusOrMinus 0.01)
+        purchasedChildren(wosP1) shouldBe setOf("C1", "C2")
+        purchasedQty(wosP1, "C1") shouldBe (5.0 plusOrMinus 0.01)
+        purchasedQty(wosP1, "C2") shouldBe (5.0 plusOrMinus 0.01)
 
         val (_, wosP2, _) = plan(demandFor("P2", "D2"), mutableListOf(), combined, requestTimeDt = null,
             config = mapOf("purchase_allowed" to true, "method_selection" to mapOf("root_waterfall" to false)), preferenceKb = preferenceKb)

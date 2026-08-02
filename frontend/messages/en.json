@@ -306,7 +306,7 @@
       "constraintNoAlternatives": "This case has no parent products with BOM alternatives",
       "constraintNoMatch": "No match",
       "rootWaterfall": "Root waterfall",
-      "rootWaterfallTooltip": "When on (default), the root demand uses the same ordinary waterfall every deeper node uses: 100% to the best-ranked method, spillover to the next only if it falls short. When off, the root instead splits its quantity up-front, proportionally, across its top-ranked alternatives (legacy behavior) — Max methods only controls that split shape while this is off.",
+      "rootWaterfallTooltip": "When on (default), the root demand uses the same ordinary waterfall every deeper node uses: 100% to the best-ranked method, spillover to the next only if it falls short. When off, the root instead splits its quantity up-front, evenly, across its top-ranked alternatives (legacy behavior) — Max methods only controls that split shape while this is off.",
       "methodMaxCount": "Max methods",
       "methodMaxCountTooltip": "Waterfall cap: how many ranked alternatives (across method type and BOM variant) may be tried per demand. 1 = single best; N>1 = exhaust the best, resort to the next only if demand isn't met, up to N candidates. Default 2. Only affects the root's own split shape when Root waterfall is off.",
       "rawMaterialSourcing": "Equal-split raw materials",
