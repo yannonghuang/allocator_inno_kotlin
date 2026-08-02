@@ -7,6 +7,7 @@ import {
   getPlanRun,
   getResourceUtilization,
   getWorkOrderPegging,
+  type CommittedDemand,
   type PlanningPeggingEntry,
   type PlanningPeggingNode,
   type ResourceUtilization,
@@ -115,9 +116,12 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
   const [breakdownRow, setBreakdownRow] = useState<ResourceUtilizationRow | null>(null);
   const [breakdownMode, setBreakdownMode] = useState<BreakdownMode>('list');
   const [peggingWo, setPeggingWo] = useState<WoContext | null>(null);
-  // work_orders_native + planning_pegging from a plan-run fetch, needed by
-  // ConsolidatedWoAccordion for a cross-demand batch WO (see the wo_pegging fetch effect below).
-  const [accordionData, setAccordionData] = useState<{ workOrdersNative: WorkOrder[]; planningPegging: PlanningPeggingEntry[] } | null>(null);
+  // work_orders_native + planning_pegging + committed_demands from a plan-run fetch. The first
+  // two feed ConsolidatedWoAccordion for a cross-demand batch WO; committedDemands resolves the
+  // serving demand's own request_time for the single-WO pegging panel's "is this actually late"
+  // check (see the wo_pegging fetch effect below and SinglePeggingTreePanel's
+  // servingDemandRequestTime prop doc).
+  const [accordionData, setAccordionData] = useState<{ workOrdersNative: WorkOrder[]; planningPegging: PlanningPeggingEntry[]; committedDemands: CommittedDemand[] } | null>(null);
   const [woTrees, setWoTrees] = useState<Map<string, PlanningPeggingNode>>(new Map());
   const [woTreesLoading, setWoTreesLoading] = useState(false);
   const [woTreesError, setWoTreesError] = useState<string | null>(null);
@@ -215,7 +219,10 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
     // effect would otherwise re-trigger it, cleanup would flip `cancelled`
     // before the fetch lands. Cache hits are handled by the closure-captured
     // accordionData (refreshed every time peggingWo or planRunId changes).
-    const needsAccordionData = breakdownMode === 'wo_pegging' && peggingWo?.demandId === '';
+    // Fetched for EVERY wo_pegging entry now (not just cross-demand consolidated batches) —
+    // the single-WO tree branch below also needs committedDemands to resolve its serving
+    // demand's request_time.
+    const needsAccordionData = breakdownMode === 'wo_pegging' && peggingWo != null;
     if (!needsAccordionData || planRunId == null) return;
     if (accordionData != null) return;
     let cancelled = false;
@@ -225,6 +232,7 @@ export function ResourceUtilizationView({ caseId, planRunId }: Props): JSX.Eleme
         setAccordionData({
           workOrdersNative: pr.result?.work_orders_native ?? [],
           planningPegging: pr.result?.planning_pegging ?? [],
+          committedDemands: pr.result?.committed_demands ?? [],
         });
       })
       .catch((e: unknown) => {
@@ -617,7 +625,7 @@ function BreakdownSlideIn({
 }: {
   caseId: number;
   planRunId: number | null;
-  accordionData: { workOrdersNative: WorkOrder[]; planningPegging: PlanningPeggingEntry[] } | null;
+  accordionData: { workOrdersNative: WorkOrder[]; planningPegging: PlanningPeggingEntry[]; committedDemands: CommittedDemand[] } | null;
   row: ResourceUtilizationRow;
   mode: BreakdownMode;
   peggingWo: WoContext | null;
@@ -732,6 +740,9 @@ function BreakdownSlideIn({
                       planningPegging={accordionData?.planningPegging ?? []}
                       caseId={caseId}
                       runId={planRunId}
+                      servingDemandRequestTime={
+                        accordionData?.committedDemands.find((d) => d.demand_id === peggingWo.demandId)?.request_time ?? null
+                      }
                     />
                   )}
                 </>

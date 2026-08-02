@@ -28,7 +28,26 @@ export type SinglePeggingTreePanelProps = {
    *  to a single demand), the table still renders but its two amount columns show "–". */
   caseId?: number | null;
   runId?: number | null;
+  /** Serving demand's own request_time — used only to gate the root "Delayed by" time-dominator
+   *  label (see the rootIsLate computation below). Needed when `tree`'s root is a `work_order`
+   *  (single-WO pegging view): that node type has no `request_time` of its own (only
+   *  `start_time`/`end_time`), so the caller resolves it from the serving demand (via
+   *  `contextDemandId`/the WO row's `demand_id`) and passes it through. When `tree`'s root is a
+   *  `demand`, its own `request_time` is used instead and this prop is ignored. */
+  servingDemandRequestTime?: string | null;
 };
+
+/** Same lenient ISO/M-d-yyyy parsing as the Demand Summary view's normalizeIso — kept local
+ *  since no shared date util exists yet. Returns a zero-padded "yyyy-MM-dd" string comparable
+ *  with plain `<`/`>`, or null if unparseable. */
+function normalizeIso(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(raw);
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  const slash = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(raw.trim());
+  if (slash) return `${slash[3]}-${slash[1].padStart(2, '0')}-${slash[2].padStart(2, '0')}`;
+  return null;
+}
 
 /** A single demand's or single work order's pegging tree, with search,
  *  quantity/time-dominator links, and a "why method" explanation toggle — the
@@ -46,6 +65,7 @@ export function SinglePeggingTreePanel({
   onNavigateToSupply,
   caseId,
   runId,
+  servingDemandRequestTime,
 }: SinglePeggingTreePanelProps): JSX.Element {
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [explanationExpanded, setExplanationExpanded] = useState<Set<string>>(() => new Set());
@@ -230,6 +250,18 @@ export function SinglePeggingTreePanel({
   const rootQtyDominators = dedupBySupply(tree.quantity_dominator ?? []);
   const rootTimeDominators = dedupBySupply(tree.time_dominator ?? []);
 
+  // The backend populates time_dominator unconditionally, as a trace of "which lot/child
+  // determined this timing" — NOT specifically "what delayed this" (see computeStartDt's own
+  // doc: resolved even when nothing pushed the schedule past its own backward-computed
+  // deadline). The UI's "Delayed by" label is only accurate when the root actually IS late —
+  // otherwise it reads as a contradiction next to an on-time commit/end date. Suppress it only
+  // when both dates are resolvable and prove the root is on time or early; if either is missing
+  // or unparseable, fall back to showing it (the previous, always-on behavior) rather than
+  // guessing.
+  const rootRequestIso = normalizeIso(tree.type === 'demand' ? tree.request_time : servingDemandRequestTime);
+  const rootCommitIso = normalizeIso(tree.type === 'work_order' ? tree.end_time : tree.commit_time);
+  const rootKnownOnTime = rootRequestIso != null && rootCommitIso != null && rootCommitIso <= rootRequestIso;
+
   // Group qty-dominator rows by the material they name (product_id@location_id) rather than
   // one flat list with one combined footer. Two DIFFERENT materials showing up as dominators
   // at once are two INDEPENDENT causes/budgets, not one shared pool — e.g. one method
@@ -255,10 +287,11 @@ export function SinglePeggingTreePanel({
     }
   }
   const showAllocCols = caseId != null && runId != null;
+  const showTimeDominators = rootTimeDominators.length > 0 && !rootKnownOnTime;
 
   return (
     <>
-      {(rootQtyDominators.length > 0 || rootTimeDominators.length > 0) && (
+      {(rootQtyDominators.length > 0 || showTimeDominators) && (
         <div style={{
           marginBottom: '0.5rem', padding: '6px 8px', background: '#1c1c1e',
           border: '1px solid #3d3d40', borderRadius: 4,
@@ -336,7 +369,7 @@ export function SinglePeggingTreePanel({
               })}
             </div>
           )}
-          {rootTimeDominators.map((d, i) => (
+          {showTimeDominators && rootTimeDominators.map((d, i) => (
             <DominatorLink key={`rt-${i}`} kind="time" dominator={d} onClick={handleDominatorClick} contextDemandId={contextDemandId ?? tree.demand_id} />
           ))}
         </div>
