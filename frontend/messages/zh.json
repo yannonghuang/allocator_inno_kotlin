@@ -591,7 +591,6 @@
       "collapsedColMethod": "方式",
       "collapsedEmpty": "没有可解析结束日期的合并工单。",
       "collapsedNoEndDate": "{n} 个工单没有结束日期，已从此视图中排除。",
-      "collapsedAlertBanner": "{n} 个单元格合并了同一产品/地点/方式的多个合并工单——这通常意味着合并未能按预期归并它们。将鼠标悬停在高亮单元格上查看详情。",
       "collapsedFilterPlaceholder": "筛选产品／地点…",
       "demandSummaryGranularity": "按周期分组",
       "demandSummaryColGroup": "分组",

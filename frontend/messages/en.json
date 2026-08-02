@@ -591,7 +591,6 @@
       "collapsedColMethod": "Method",
       "collapsedEmpty": "No consolidated work orders with a parseable end date.",
       "collapsedNoEndDate": "{n} work order(s) have no end date and are excluded from this view.",
-      "collapsedAlertBanner": "{n} cell(s) combine more than one consolidated work order for the same product/location/method — this usually means consolidation didn't merge them as it should have. Hover a highlighted cell for details.",
       "collapsedFilterPlaceholder": "Filter product / location…",
       "demandSummaryGranularity": "Bucket by",
       "demandSummaryColGroup": "Group",
