@@ -140,6 +140,10 @@ const METHOD_COLOR: Record<string, string> = {
   move: '#f59e0b',
   buy: '#22c55e',
   purchase: '#22c55e',
+  // Same green the flat Work Orders table's own inventory-fulfilled rows already use
+  // (_CaseSectionPage.tsx's _is_inventory styling) — darker than buy/purchase so the two stay
+  // visually distinct despite the shared "on-hand, not a new order" association.
+  inventory: '#16a34a',
 };
 
 // A consolidated (cross-demand batched) WO is shown in a lighter shade of its method's base color.
@@ -148,6 +152,7 @@ const METHOD_COLOR_CONSOLIDATED: Record<string, string> = {
   move: '#fcd34d',
   buy: '#86efac',
   purchase: '#86efac',
+  inventory: '#86efac',
 };
 
 export function methodColor(method: string | null | undefined, consolidated = false): string {

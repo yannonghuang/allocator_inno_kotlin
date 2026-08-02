@@ -1,6 +1,7 @@
 package com.allocator.api
 
 import com.allocator.Cases
+import com.allocator.ProductLocations
 import com.allocator.Supplies
 import io.ktor.http.*
 import io.ktor.server.application.*
@@ -31,6 +32,11 @@ data class CaseSupplyRow(
     val supplyDate:  String?,
     val qty:         Double,
     val description: String?,
+    /** From productlocation.prod_area — null when this (product, location) has no productlocation
+     *  row (or the row's own prod_area is unset). Lets callers group/label supply by PROD_AREA
+     *  without a separate lookup — e.g. the Planning page's Demand Summary attributes a synthetic
+     *  inventory-consumption row to this same prod_area (see demandSummaryRows' own doc). */
+    val prodArea:    String? = null,
 )
 
 /**
@@ -86,19 +92,33 @@ fun Routing.supplyRoutes() {
             val caseId = call.parameters["case_id"]?.toIntOrNull()
                 ?: return@get call.respond(HttpStatusCode.BadRequest, "Invalid case_id")
             val rows = transaction {
+                val productLocationRows = ProductLocations.selectAll().where { ProductLocations.caseId eq caseId }.toList()
+                // Exact (product, location) match when productlocation actually carries a location —
+                // falls back to a product-only match for case data (like this app's own CSV fixtures)
+                // where productlocation.csv's LOCATION_ID column is blank, meaning prod_area is
+                // defined per-product only, not per (product, location) pair.
+                val prodAreaByProductLocation = productLocationRows
+                    .filter { it[ProductLocations.locationId].isNotBlank() }
+                    .associate { "${it[ProductLocations.productId]}|${it[ProductLocations.locationId]}" to it[ProductLocations.prodArea] }
+                val prodAreaByProduct = productLocationRows
+                    .filter { it[ProductLocations.locationId].isBlank() }
+                    .associate { it[ProductLocations.productId] to it[ProductLocations.prodArea] }
                 Supplies.selectAll()
                     .where { Supplies.caseId eq caseId }
                     .orderBy(Supplies.supplyId, SortOrder.ASC)
                     .map { row ->
+                        val productId = row[Supplies.productId]
+                        val locationId = row[Supplies.locationId] ?: ""
                         CaseSupplyRow(
                             id          = row[Supplies.id],
                             supplyId    = row[Supplies.supplyId],
-                            productId   = row[Supplies.productId],
+                            productId   = productId,
                             locationId  = row[Supplies.locationId],
                             vendorId    = row[Supplies.vendorId],
                             supplyDate  = row[Supplies.supplyDate],
                             qty         = row[Supplies.qty],
                             description = row[Supplies.description],
+                            prodArea    = prodAreaByProductLocation["$productId|$locationId"] ?: prodAreaByProduct[productId],
                         )
                     }
             }

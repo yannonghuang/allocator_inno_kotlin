@@ -631,17 +631,18 @@ internal fun dateAddDays(d: LocalDate?, days: Double): LocalDate? =
 private fun formatDate(d: LocalDate?): String? = d?.format(DATE_FMT)
 
 /**
- * The planning horizon's start: the first day of the earliest month among all demands'
- * request_due_time/request_time. No work order should ever be scheduled to start before this —
- * it's the floor of last resort against a node's own backward lead-time math (or an unparseable/
- * missing due date) landing before the plan's own frame of reference. Returns null only when NOT
- * A SINGLE demand has a parseable due date (nothing to anchor against; the floor is skipped).
+ * The planning horizon's start: the last day of the month PRIOR to the earliest month among all
+ * demands' request_due_time/request_time — one day short of that month's first day. No work
+ * order should ever be scheduled to start before this — it's the floor of last resort against a
+ * node's own backward lead-time math (or an unparseable/missing due date) landing before the
+ * plan's own frame of reference. Returns null only when NOT A SINGLE demand has a parseable due
+ * date (nothing to anchor against; the floor is skipped).
  */
 internal fun computePlanningHorizonStart(demands: List<Map<String, Any?>>): LocalDate? {
     val earliest = demands.asSequence()
         .mapNotNull { d -> parseDate(d["request_due_time"] as? String ?: d["request_time"] as? String) }
         .minOrNull() ?: return null
-    return earliest.withDayOfMonth(1)
+    return earliest.withDayOfMonth(1).minusDays(1)
 }
 
 /**
@@ -2944,11 +2945,11 @@ fun plan(
      *  this makes for itself (nodeCap re-entry) — the AND-loop in [planMethodSlot] is the
      *  only place that ever flips it from false to true. */
     insideDiamondRecipient: Boolean = false,
-    /** The planning horizon's start (first day of the earliest month among all of this case's
-     *  demand due dates) — see [computePlanningHorizonStart]. No work order should ever be
-     *  scheduled to start before it; enforced as a floor in [computeStartDt]. Computed once by
-     *  [legacyCommit] and threaded through unchanged to every recursive [plan] /
-     *  [planMethodSlot] call. */
+    /** The planning horizon's start (last day of the month prior to the earliest month among
+     *  all of this case's demand due dates) — see [computePlanningHorizonStart]. No work order
+     *  should ever be scheduled to start before it; enforced as a floor in [computeStartDt].
+     *  Computed once by [legacyCommit] and threaded through unchanged to every recursive
+     *  [plan] / [planMethodSlot] call. */
     horizonStart: LocalDate? = null,
 ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
 
