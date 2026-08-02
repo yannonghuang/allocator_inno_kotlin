@@ -310,8 +310,9 @@ fun Routing.allocateRoutes() {
     }
 
     // ── GET /cases/{case_id}/plan/horizon-start-default ───────────────────────
-    // The date "Horizon start: auto" currently resolves to — first day of the earliest month
-    // among this case's demand due dates (see computePlanningHorizonStart, PlanningEngine.kt).
+    // The date "Horizon start: auto" currently resolves to — the last day of the month PRIOR to
+    // the earliest month among this case's demand due dates (see computePlanningHorizonStart,
+    // PlanningEngine.kt).
     // Read-only preview so the Planning/KB-seeding config forms can SHOW the real date instead
     // of sitting blank; actual plan submission is unaffected — it still resolves this fresh,
     // server-side, via resolveHorizonStart at submit time. Deliberately reuses the canonical

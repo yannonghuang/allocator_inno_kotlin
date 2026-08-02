@@ -1012,14 +1012,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     () => (demandSummaryIncludeLocation ? ['customer', 'prod_area', 'location'] : ['customer', 'prod_area']),
     [demandSummaryIncludeLocation],
   );
-  // Native (per-demand) work orders, minus dummy/placeholder VirtualProduct_ rows — the only
-  // filtering applied here (unlike Work Orders > Collapsed's collapsedFilteredRows, this doesn't
-  // reuse the Work Orders tab's own pegging-filter checkboxes, since those live in a different
-  // tab the user isn't looking at while on Demands).
-  const demandSummaryRows = useMemo<WorkOrder[]>(() => {
-    const source = planResult?.work_orders_native ?? planResult?.work_orders ?? [];
-    return source.filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'));
-  }, [planResult]);
   // ID of the plan run currently loaded in planResult; null = freshly-run (not from history)
   const [currentPlanRunId, setCurrentPlanRunId] = useState<number | null>(null);
   // DB run ID for the current fresh (unsaved) plan result; null once saved or when loading from history
@@ -1038,6 +1030,71 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [caseSupplies, setCaseSupplies] = useState<CaseSupplyRow[]>([]);
   const [caseSuppliesLoading, setCaseSuppliesLoading] = useState(false);
   const [caseSuppliesError, setCaseSuppliesError] = useState<string | null>(null);
+  // Native (per-demand) work orders, minus dummy/placeholder VirtualProduct_ rows — the only
+  // filtering applied here (unlike Work Orders > Collapsed's collapsedFilteredRows, this doesn't
+  // reuse the Work Orders tab's own pegging-filter checkboxes, since those live in a different tab
+  // the user isn't looking at while on Demands). Plus one synthetic method:'inventory' row per
+  // supply_allocations entry — inventory consumption happens at EVERY level, not just a top-level
+  // demand fulfilled straight from stock: a component several BOM levels down (e.g. a WIP lot for
+  // a sub-assembly) gets drawn on by a "make" WO the same way, and that WO's own product never
+  // gets its own committed_demands row (only end-customer demands do) — so without this, a
+  // component's inventory contribution would be invisible everywhere, even though the KPI panel's
+  // "Fulfilled by inventories"/"Consumption rate" already account for it. supply_allocations is the
+  // one source that's granular enough for both cases uniformly: {supply_id, demand_id, qty_consumed}
+  // per lot draw, at whatever BOM level that lot sits, attributed to the ROOT demand whose build
+  // consumed it (for cell positioning — see _demandSummaryView.tsx's own doc on why a row's cell
+  // position always comes from its demand_id's request_time). Mirrors the flat Work Orders table's
+  // native-tab synthesis in spirit (~woRowsAll below), but that one only covers the top-level case.
+  const demandSummaryRows = useMemo<WorkOrder[]>(() => {
+    const source = planResult?.work_orders_native ?? planResult?.work_orders ?? [];
+    const woRows = source.filter((r) => !(r.product_id ?? '').trim().startsWith('VirtualProduct_'));
+    // A supply_allocations row only carries `supply_id` — resolve its OWN product/location (which
+    // may be several BOM levels below the demand_id it's attributed to) via the case's supply
+    // master data, not the demand's. caseSupplies also carries the supply's own PROD_AREA (from
+    // productlocation, joined server-side — see CaseSupplyRow.prodArea's own doc) so a pure raw
+    // material with no make/move WO anywhere still lands in its real PROD_AREA group, not "(none)".
+    const supplyMeta = new Map<string, { productId: string; locationId: string | null; prodArea: string | null }>();
+    for (const s of caseSupplies) supplyMeta.set(s.supplyId, { productId: s.productId, locationId: s.locationId, prodArea: s.prodArea });
+    // demand_id -> customer_id, for the synthetic rows' own customer_ids (group display label
+    // only — see prod_area's identical rationale below; Customer-pivot totals come from `demands`
+    // directly, not from row.customer_ids, so this is cosmetic-only, not load-bearing).
+    const customerByDemandId = new Map<string, string>();
+    for (const d of planResult?.committed_demands ?? []) {
+      if (d.demand_id && d.customer_id && !customerByDemandId.has(d.demand_id)) customerByDemandId.set(d.demand_id, d.customer_id);
+    }
+    // Fallback only for the rare product/location caseSupplies doesn't know about (no supply row
+    // at all for it — e.g. purely purchased/manufactured with no on-hand lot in this case's own
+    // supply.csv): backfill from any real WO for the SAME (product, location) elsewhere in this
+    // plan result. Built from the unfiltered `source` (not `woRows`) so a VirtualProduct_-only
+    // product/location pair still resolves correctly.
+    const prodAreaByProductLocation = new Map<string, string>();
+    for (const r of source) {
+      if (!r.prod_area) continue;
+      const k = `${r.product_id}|${r.location_id}`;
+      if (!prodAreaByProductLocation.has(k)) prodAreaByProductLocation.set(k, r.prod_area);
+    }
+    const invRows: WorkOrder[] = (planResult?.supply_allocations ?? [])
+      .filter((a) => (a.qty_consumed ?? 0) > 0 && a.demand_id)
+      .map((a): WorkOrder | null => {
+        const meta = supplyMeta.get(a.supply_id);
+        if (!meta) return null;
+        const key = `${meta.productId}|${meta.locationId}`;
+        const customerId = a.demand_id ? customerByDemandId.get(a.demand_id) : undefined;
+        return {
+          product_id: meta.productId,
+          location_id: meta.locationId ?? '',
+          quantity: a.qty_consumed,
+          start_time: null,
+          end_time: null,
+          method: 'inventory',
+          demand_id: a.demand_id,
+          customer_ids: customerId ? [customerId] : [],
+          prod_area: meta.prodArea ?? prodAreaByProductLocation.get(key) ?? null,
+        };
+      })
+      .filter((r): r is WorkOrder => r !== null);
+    return [...woRows, ...invRows];
+  }, [planResult, caseSupplies]);
   const [planSupplyTextFilter, setPlanSupplyTextFilter] = useState('');
   const [planSupplyUnusedOnly, setPlanSupplyUnusedOnly] = useState(false);
   const [planSupplyPartialOnly, setPlanSupplyPartialOnly] = useState(false);
@@ -5427,6 +5484,18 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       if (e.demand_id) acc[e.demand_id] = e;
                       return acc;
                     }, {});
+                    // Distinct demand_id count (rows without one each count as their own "demand")
+                    // — matches the post-filter merge below, so "showing X of Y demands" counts
+                    // demands, not raw committed_demands slot rows (a demand can carry several).
+                    const totalDemandCount = (() => {
+                      const seen = new Set<string>();
+                      let count = 0;
+                      for (const r of planResult.committed_demands) {
+                        if (r.demand_id) { if (!seen.has(r.demand_id)) { seen.add(r.demand_id); count++; } }
+                        else count++;
+                      }
+                      return count;
+                    })();
                     let list = planResult.committed_demands;
                     if (planDemandRealMakeOnly && bomRealPairs !== null) {
                       const keys = new Set(bomRealPairs.map(([p, c]) => `${(p ?? '').trim()}|${(c ?? '').trim()}`));
@@ -5481,6 +5550,43 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       const demandSet = new Set((pegging?.demands ?? []).map((d) => d.demandId));
                       list = list.filter((r) => demandSet.has(r.demand_id ?? ''));
                     }
+                    // Merge waterfall-fallback slots that share one demand_id (e.g. part filled from
+                    // on-hand inventory, part from a new WO — see PlanningEngine.kt's
+                    // reallocateCriticalLeftoverBudget doc and demandSummaryRows' own doc,
+                    // _CaseSectionPage.tsx) into ONE display row — internally these are legitimate
+                    // separate committed_demands entries, but showing them as separate table rows
+                    // for the same demand reads as a duplicate/bug. Applied AFTER every filter above
+                    // so filter semantics (checked per slot) are unchanged; this only collapses
+                    // whatever slots survive filtering. Pegging's own "Show" button is unaffected —
+                    // it's already keyed by demand_id, not by which slot row it was clicked from, so
+                    // it resolves to the same single tree regardless.
+                    const mergedList: CommittedDemand[] = [];
+                    const mergedIndexByDemandId = new Map<string, number>();
+                    for (const r of list) {
+                      const did = r.demand_id;
+                      const idx = did ? mergedIndexByDemandId.get(did) : undefined;
+                      if (did && idx !== undefined) {
+                        const m = mergedList[idx];
+                        m.quantity = (Number(m.quantity) || 0) + (Number(r.quantity) || 0);
+                        // Latest slot commit_time = when the demand is actually fully satisfied.
+                        // Both ISO ("yyyy-MM-dd") and "M/d/yyyy" occur in this field — same loose
+                        // Date parsing computeLatenessDays already relies on, not a new convention.
+                        if (r.commit_time && (!m.commit_time || new Date(r.commit_time.slice(0, 10)).getTime() > new Date(m.commit_time.slice(0, 10)).getTime())) {
+                          m.commit_time = r.commit_time;
+                        }
+                        if (r.commit_reason && r.commit_reason !== m.commit_reason) {
+                          m.commit_reason = m.commit_reason ? `${m.commit_reason} + ${r.commit_reason}` : r.commit_reason;
+                        }
+                        // A merged row is only "failed" if EVERY one of its slots failed — any slot
+                        // that actually committed something means the demand isn't a hard failure.
+                        m.is_failed = (m.is_failed ?? false) && (r.is_failed ?? false);
+                      } else {
+                        const copy: CommittedDemand = { ...r };
+                        mergedList.push(copy);
+                        if (did) mergedIndexByDemandId.set(did, mergedList.length - 1);
+                      }
+                    }
+                    list = mergedList;
                     const byCustomer = list.reduce<Record<string, number>>((acc, r) => {
                       const cName = (r.customer ?? r.customer_id ?? '–') as string;
                       acc[cName] = (acc[cName] ?? 0) + (Number(r.quantity) || 0);
@@ -5490,7 +5596,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     return (
                       <>
                         <p style={{ fontSize: '0.8rem', color: '#a1a1aa', marginBottom: hasMultipleCustomers ? '0.5rem' : '0.25rem' }}>
-                          {tP('committedDemands.showing')} {list.length} {tP('committedDemands.of')} {planResult.committed_demands.length} {tP('committedDemands.demandsLabel')}
+                          {tP('committedDemands.showing')} {list.length} {tP('committedDemands.of')} {totalDemandCount} {tP('committedDemands.demandsLabel')}
                           {planDemandRealMakeOnly && !planDemandBuyOnly && !planDemandRealMoveOnly && ' ' + tP('committedDemands.filterDescMake')}
                           {!planDemandRealMakeOnly && planDemandBuyOnly && !planDemandRealMoveOnly && ' ' + tP('committedDemands.filterDescBuy')}
                           {!planDemandRealMakeOnly && !planDemandBuyOnly && planDemandRealMoveOnly && ' ' + tP('committedDemands.filterDescMove')}

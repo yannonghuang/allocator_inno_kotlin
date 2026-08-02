@@ -312,7 +312,7 @@
       "rawMaterialSourcing": "Equal-split raw materials",
       "rawMaterialSourcingTooltip": "Sourcing strategy for purchasable raw-material alternatives at the same BOM slot (e.g. two substitutable raw materials both filling one component position). Off (default): waterfall — 100% to the best-ranked alternative, spillover to the next only if short. On: divide the slot's quantity equally across all such alternatives up front. Scoped to raw materials only — alternatives that are themselves manufacturable (real sub-assemblies with their own capacity/lead-time limits) are never affected.",
       "horizonStart": "Horizon start",
-      "horizonStartTooltip": "No work order is ever scheduled to start before this date. Blank (default): computed automatically as the first day of the earliest month among all of this case's demand due dates. Set an explicit date to override it.",
+      "horizonStartTooltip": "No work order is ever scheduled to start before this date. Blank (default): computed automatically as the last day of the month prior to the earliest month among all of this case's demand due dates. Set an explicit date to override it.",
       "horizonStartAuto": "Auto",
       "horizonStartClear": "Auto",
       "horizonStartClearTooltip": "Clear the override and go back to computing the horizon start automatically from this case's demands.",

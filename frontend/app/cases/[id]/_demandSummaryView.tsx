@@ -253,11 +253,11 @@ export function DemandSummaryView({
    *  request date (cell position) and to drive Customer-level totals directly (see module doc). */
   demands: CommittedDemand[];
   /** Plan's own resolved horizon_start (method_selection.horizon_start), ISO or M/d/yyyy. Floors
-   *  the bucket range's start — see the buckets useMemo's own doc for why this is needed: `rows`
-   *  only contains demands with at least one real work order, so a run whose earliest demands are
-   *  fully covered by on-hand inventory (no WO at all) would otherwise start its buckets at
-   *  whenever the first real make/move/buy WO appears, silently dropping the leading inventory-only
-   *  weeks from the view. */
+   *  the bucket range's start — see the buckets useMemo's own doc for why this is needed: a caller
+   *  that (unlike this app's own) doesn't synthesize a method:'inventory' row for every
+   *  inventory-fulfilled demand would otherwise have its earliest buckets start wherever the first
+   *  real make/move/buy WO appears, silently dropping the leading inventory-only weeks — this
+   *  floor is the safety net for that, independent of whatever `rows` happens to contain. */
   horizonStart?: string | null;
   /** Ordered pivot dimensions — [] renders the flat (ungrouped) table; each entry adds one more
    *  nested section level, in the order given (see WoPivotField's own doc). */
@@ -363,7 +363,11 @@ export function DemandSummaryView({
   };
 
   const { groups, buckets, excludedCount } = useMemo(() => {
-    const candidateRows = rows.filter((r) => r.method !== 'inventory');
+    // method:'inventory' rows (synthesized by the caller for inventory-fulfilled demands — see
+    // `demandSummaryRows`' own doc, _CaseSectionPage.tsx) flow through the SAME grouping/bucketing
+    // below as any real WO — the pivot/grouping logic is method-agnostic, so an 'inventory' group
+    // just becomes its own row, colored via methodColor('inventory').
+    const candidateRows = rows;
     // A row's cell POSITION is its pegged demand's own request date (module doc) — resolved here,
     // once, via demand_id → demandById, rather than at the point of use. A row whose demand_id is
     // missing, doesn't match any entry in `demands`, or whose demand has no `request_time` can't
@@ -382,12 +386,13 @@ export function DemandSummaryView({
     }
     const isos = resolvedRows.map((x) => x.requestIso);
     // Floor at horizon_start and extend through the LATEST commit_time across every committed
-    // demand (not just isos, which only covers demands with at least one real work order) — a
-    // demand fully covered by on-hand inventory never produces a native WO row, so `rows` alone
-    // silently drops any leading inventory-only weeks and any trailing commit slippage past the
-    // last request date. `demands` is the full list regardless of whether a WO exists, so it's the
-    // right source for both ends of the range; buckets before/after any resolved row's own request
-    // date just render empty, same as any other zero-activity bucket.
+    // demand (not just isos, which only covers rows that resolved to a section) — a demand whose
+    // synthetic inventory row got excluded upstream (e.g. missing commit_time or demand_id — see
+    // `demandSummaryRows`' own doc) would otherwise silently drop its week from the range, same
+    // for any trailing commit slippage past the last request date. `demands` is the full list
+    // regardless of whether a row exists for it, so it's the right source for both ends of the
+    // range; buckets before/after any resolved row's own request date just render empty, same as
+    // any other zero-activity bucket.
     const demandIsos = demands
       .flatMap((d) => [d.request_time, d.commit_time])
       .map((v) => (v ? normalizeIso(v) : null))

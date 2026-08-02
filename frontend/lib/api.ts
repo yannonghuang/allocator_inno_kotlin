@@ -448,10 +448,10 @@ export type PlanningConfig = {
     /**
      * Planning horizon start — no work order is ever scheduled to start before this date.
      * Undefined/blank or `"auto"` (the default): computed from the case's own demands, as the
-     * first day of the earliest month among all their due dates. An explicit `"yyyy-MM-dd"`
-     * override is used literally (not re-floored to a month start). Guards against a node's own
-     * backward lead-time math — or an unparseable/missing due date — landing a work order before
-     * the plan's own frame of reference.
+     * last day of the month PRIOR to the earliest month among all their due dates. An explicit
+     * `"yyyy-MM-dd"` override is used literally (not re-floored to a month start). Guards against
+     * a node's own backward lead-time math — or an unparseable/missing due date — landing a work
+     * order before the plan's own frame of reference.
      */
     horizon_start?: string;
   };
@@ -1320,6 +1320,10 @@ export type CaseSupplyRow = {
   supplyDate: string | null;
   qty: number;
   description: string | null;
+  /** From productlocation.prod_area — null when this (product, location) has no productlocation
+   *  row, or the row's own prod_area is unset (e.g. a pure raw material with no make/move WO
+   *  anywhere to otherwise infer it from). */
+  prodArea: string | null;
 };
 
 /** A demand pegged to a supply, computed client-side from planning_pegging inversion. */
@@ -2076,11 +2080,12 @@ export async function getCaseDemands(caseId: number): Promise<CaseDemandRow[]> {
   return data.demands as CaseDemandRow[];
 }
 
-/** What "Horizon start: auto" currently resolves to — first day of the earliest month among
- *  this case's demand due dates, computed server-side (reuses the same canonical date-parsing
- *  routine `resolveHorizonStart` uses at plan-submit time — demand due dates are known to arrive
- *  in inconsistent formats, so this deliberately isn't reimplemented client-side). Null when the
- *  case has no demands with a parseable due date. Read-only preview for the config forms. */
+/** What "Horizon start: auto" currently resolves to — the last day of the month PRIOR to the
+ *  earliest month among this case's demand due dates, computed server-side (reuses the same
+ *  canonical date-parsing routine `resolveHorizonStart` uses at plan-submit time — demand due
+ *  dates are known to arrive in inconsistent formats, so this deliberately isn't reimplemented
+ *  client-side). Null when the case has no demands with a parseable due date. Read-only preview
+ *  for the config forms. */
 export async function getHorizonStartDefault(caseId: number): Promise<string | null> {
   const r = await fetch(`${API}/cases/${caseId}/plan/horizon-start-default`);
   if (!r.ok) throw new Error(await r.text());

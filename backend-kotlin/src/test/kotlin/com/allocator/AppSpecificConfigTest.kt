@@ -45,8 +45,8 @@ class AppSpecificConfigTest : FunSpec({
 
     test("resolveWipSupplyDates defaults every lot to horizon start when absent") {
         val resolved = resolveWipSupplyDates(null, demandsWithDueDate, listOf(wipRow1, wipRow2))
-        resolved["wip_1"].toString() shouldBe "2026-03-01"
-        resolved["wip_2"].toString() shouldBe "2026-03-01"
+        resolved["wip_1"].toString() shouldBe "2026-02-28"
+        resolved["wip_2"].toString() shouldBe "2026-02-28"
     }
 
     test("resolveWipSupplyDates returns an empty map when the case has no wip lots") {
@@ -55,23 +55,23 @@ class AppSpecificConfigTest : FunSpec({
 
     test("resolveWipSupplyDates treats blank/auto override as absent for that lot") {
         val cfg = mapOf("app_specific_config" to mapOf("wip_supply_dates" to mapOf("wip_1" to "")))
-        resolveWipSupplyDates(cfg, demandsWithDueDate, listOf(wipRow1))["wip_1"].toString() shouldBe "2026-03-01"
+        resolveWipSupplyDates(cfg, demandsWithDueDate, listOf(wipRow1))["wip_1"].toString() shouldBe "2026-02-28"
         val cfgAuto = mapOf("app_specific_config" to mapOf("wip_supply_dates" to mapOf("wip_1" to "auto")))
-        resolveWipSupplyDates(cfgAuto, demandsWithDueDate, listOf(wipRow1))["wip_1"].toString() shouldBe "2026-03-01"
+        resolveWipSupplyDates(cfgAuto, demandsWithDueDate, listOf(wipRow1))["wip_1"].toString() shouldBe "2026-02-28"
     }
 
     test("resolveWipSupplyDates resolves each lot independently — one override doesn't affect the other") {
         val cfg = mapOf("app_specific_config" to mapOf("wip_supply_dates" to mapOf("wip_1" to "2026-07-04")))
         val resolved = resolveWipSupplyDates(cfg, demandsWithDueDate, listOf(wipRow1, wipRow2))
         resolved["wip_1"].toString() shouldBe "2026-07-04"
-        resolved["wip_2"].toString() shouldBe "2026-03-01"  // untouched lot still falls back to horizon start
+        resolved["wip_2"].toString() shouldBe "2026-02-28"  // untouched lot still falls back to horizon start
     }
 
     test("resolveWipSupplyDates falls back to horizon start on an unparseable override for that lot only") {
         val cfg = mapOf("app_specific_config" to mapOf("wip_supply_dates" to mapOf("wip_1" to "not-a-date")))
         val resolved = resolveWipSupplyDates(cfg, demandsWithDueDate, listOf(wipRow1, wipRow2))
-        resolved["wip_1"].toString() shouldBe "2026-03-01"
-        resolved["wip_2"].toString() shouldBe "2026-03-01"
+        resolved["wip_1"].toString() shouldBe "2026-02-28"
+        resolved["wip_2"].toString() shouldBe "2026-02-28"
     }
 
     test("resolveWipSupplyDates' auto default cascades through an explicit horizon_start override") {
