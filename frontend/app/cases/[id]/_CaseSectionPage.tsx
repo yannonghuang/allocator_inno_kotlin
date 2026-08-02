@@ -5185,6 +5185,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         rows={demandSummaryRows}
                         demands={planResult?.committed_demands ?? []}
                         pivotFields={demandSummaryPivotFields}
+                        horizonStart={planningConfig.method_selection?.horizon_start}
                       />
                     </div>
                   )}
@@ -5784,6 +5785,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       makeBatchScale={planningConfig.consolidation?.make_batch_scale}
                       moveBatchScale={planningConfig.consolidation?.move_batch_scale}
                       purchaseBatchScale={planningConfig.consolidation?.purchase_batch_scale}
+                      horizonStart={planningConfig.method_selection?.horizon_start}
                     />
                   )}
                   {woTableTab !== 'collapsed' && planResult.work_orders.length > 0 && (() => {

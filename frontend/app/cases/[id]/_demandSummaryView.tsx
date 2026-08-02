@@ -246,11 +246,19 @@ export function DemandSummaryView({
   rows,
   demands,
   pivotFields = [],
+  horizonStart,
 }: {
   rows: WorkOrder[];
   /** Committed demands for this plan run — joined to `rows` by `demand_id` to resolve each WO's
    *  request date (cell position) and to drive Customer-level totals directly (see module doc). */
   demands: CommittedDemand[];
+  /** Plan's own resolved horizon_start (method_selection.horizon_start), ISO or M/d/yyyy. Floors
+   *  the bucket range's start — see the buckets useMemo's own doc for why this is needed: `rows`
+   *  only contains demands with at least one real work order, so a run whose earliest demands are
+   *  fully covered by on-hand inventory (no WO at all) would otherwise start its buckets at
+   *  whenever the first real make/move/buy WO appears, silently dropping the leading inventory-only
+   *  weeks from the view. */
+  horizonStart?: string | null;
   /** Ordered pivot dimensions — [] renders the flat (ungrouped) table; each entry adds one more
    *  nested section level, in the order given (see WoPivotField's own doc). */
   pivotFields?: WoPivotField[];
@@ -373,8 +381,21 @@ export function DemandSummaryView({
       return { groups: [] as GroupRow[], buckets: [] as Bucket[], excludedCount };
     }
     const isos = resolvedRows.map((x) => x.requestIso);
-    const minIso = isos.reduce((a, b) => (a < b ? a : b));
-    const maxIso = isos.reduce((a, b) => (a > b ? a : b));
+    // Floor at horizon_start and extend through the LATEST commit_time across every committed
+    // demand (not just isos, which only covers demands with at least one real work order) — a
+    // demand fully covered by on-hand inventory never produces a native WO row, so `rows` alone
+    // silently drops any leading inventory-only weeks and any trailing commit slippage past the
+    // last request date. `demands` is the full list regardless of whether a WO exists, so it's the
+    // right source for both ends of the range; buckets before/after any resolved row's own request
+    // date just render empty, same as any other zero-activity bucket.
+    const demandIsos = demands
+      .flatMap((d) => [d.request_time, d.commit_time])
+      .map((v) => (v ? normalizeIso(v) : null))
+      .filter((v): v is string => v !== null);
+    const horizonIso = horizonStart ? normalizeIso(horizonStart) : null;
+    const allIsos = [...isos, ...demandIsos, ...(horizonIso ? [horizonIso] : [])];
+    const minIso = allIsos.reduce((a, b) => (a < b ? a : b));
+    const maxIso = allIsos.reduce((a, b) => (a > b ? a : b));
     const buckets = buildBuckets(minIso, maxIso, granularity, locale, tP('config.woBatchAll'));
 
     const groupMap = new Map<string, GroupRow>();

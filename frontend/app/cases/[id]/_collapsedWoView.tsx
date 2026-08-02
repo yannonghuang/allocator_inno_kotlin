@@ -205,11 +205,17 @@ export function CollapsedWoView({
   makeBatchScale = 'weekly',
   moveBatchScale = 'weekly',
   purchaseBatchScale = 'weekly',
+  horizonStart,
 }: {
   rows: WorkOrder[];
   makeBatchScale?: WoBatchScale;
   moveBatchScale?: WoBatchScale;
   purchaseBatchScale?: WoBatchScale;
+  /** Plan's own resolved horizon_start (method_selection.horizon_start), ISO or M/d/yyyy. Floors
+   *  the bucket range's start so a run whose earliest weeks have no work orders at all (fully
+   *  covered by on-hand inventory) still shows those leading weeks instead of starting the view at
+   *  whenever the first real WO happens to land. */
+  horizonStart?: string | null;
 }) {
   const tP = useTranslations('planning');
   const locale = useLocale();
@@ -256,8 +262,14 @@ export function CollapsedWoView({
       return { groups: [] as GroupRow[], buckets: [] as Bucket[], excludedCount };
     }
     const ends = validRows.map((r) => (r.end_time as string).slice(0, 10));
-    const minIso = ends.reduce((a, b) => (a < b ? a : b));
-    const maxIso = ends.reduce((a, b) => (a > b ? a : b));
+    // Floor at horizon_start — a run whose earliest weeks are fully covered by on-hand inventory
+    // has no work order at all for that period (this view only ever shows real WOs), so `ends`
+    // alone would start the range at whenever the first real WO lands, silently dropping the
+    // leading inventory-only weeks from the view.
+    const horizonIso = horizonStart ? horizonStart.slice(0, 10) : null;
+    const allEnds = horizonIso ? [...ends, horizonIso] : ends;
+    const minIso = allEnds.reduce((a, b) => (a < b ? a : b));
+    const maxIso = allEnds.reduce((a, b) => (a > b ? a : b));
     const buckets = buildBuckets(minIso, maxIso, granularity, locale, tP('config.woBatchAll'));
 
     const groupMap = new Map<string, GroupRow>();
