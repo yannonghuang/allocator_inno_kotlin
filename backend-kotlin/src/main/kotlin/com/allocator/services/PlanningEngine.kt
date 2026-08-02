@@ -663,6 +663,87 @@ internal fun resolveHorizonStart(config: Map<String, Any?>?, demands: List<Map<S
     }
 }
 
+// ── App-specific config (ASC) ───────────────────────────────────────────────
+//
+// ASC is an optional, persisted slice of PlanningConfig for runtime parameters a case's own
+// CSVs can't hardcode. Its first (and so far only) parameter: a supply row can carry the
+// literal SUPPLY_DATE="wip" instead of a real date, meaning "this lot's availability date is
+// decided at plan time, not case-authoring time." Each "wip" lot is its own independent
+// readiness schedule — one lot finishing WIP two weeks from now doesn't imply another lot on a
+// different line does — so the override is keyed by supply_id, not one case-wide date.
+// [resolveWipSupplyDates] resolves one concrete date PER wip supply_id (per-lot config override,
+// else horizon start — same "auto" convention as [resolveHorizonStart]); [applyAppSpecificConfig]
+// then substitutes each into its own "wip" row BEFORE planning ever sees the data, so every
+// downstream consumer of `supply_date` (consumeFromInventory's FIFO sort, TimeUtils.supplyPeriod,
+// the R10 soundness check, ...) operates on a normal literal date and needs no ASC-awareness of
+// its own.
+
+/** True if this case has at least one supply row whose SUPPLY_DATE is the literal "wip" —
+ *  i.e. this case actually has an ASC parameter to resolve/display. Case data display (Views.kt,
+ *  Pegging.kt, ...) reads supply_date straight from the DB and is untouched by ASC — this is
+ *  planning-side only. */
+internal fun caseHasWipSupply(supplies: List<Map<String, Any?>>): Boolean =
+    supplies.any { (it["supply_date"] as? String)?.trim() == "wip" }
+
+/** Every supply_id in [supplies] whose SUPPLY_DATE is the literal "wip" — the set of ASC lots
+ *  this case actually has to configure. */
+internal fun wipSupplyIds(supplies: List<Map<String, Any?>>): List<String> =
+    supplies.mapNotNull { s ->
+        val sid = (s["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        sid.takeIf { (s["supply_date"] as? String)?.trim() == "wip" }
+    }.distinct()
+
+/** Resolves `app_specific_config.wip_supply_dates` — one concrete date PER "wip"-dated supply_id
+ *  in [supplies], since each lot's own readiness is independent (see this section's own doc).
+ *  For a given lot: absent, blank, or "auto" in [config]'s per-supply_id override map means "the
+ *  same horizon-start floor [resolveHorizonStart] computes" — deliberately reused rather than
+ *  re-derived, so an unconfigured lot still gets a sane default. An unparseable override falls
+ *  back to horizon start the same way. Lots that resolve to null (no demand ever anchored a
+ *  horizon, and no override was given) are simply absent from the returned map — nothing to
+ *  substitute for them. */
+internal fun resolveWipSupplyDates(
+    config: Map<String, Any?>?,
+    demands: List<Map<String, Any?>>,
+    supplies: List<Map<String, Any?>>,
+): Map<String, LocalDate> {
+    val ids = wipSupplyIds(supplies)
+    if (ids.isEmpty()) return emptyMap()
+    val horizonStart = resolveHorizonStart(config, demands)
+    val overrides = (config?.get("app_specific_config") as? Map<*, *>)?.get("wip_supply_dates") as? Map<*, *>
+    return ids.mapNotNull { sid ->
+        val raw = overrides?.get(sid) as? String
+        val resolved = if (raw.isNullOrBlank() || raw.trim().lowercase() == "auto") {
+            horizonStart
+        } else {
+            parseDate(raw) ?: run {
+                log.warn("Invalid app_specific_config.wip_supply_dates[{}]={}; falling back to horizon start", sid, raw)
+                horizonStart
+            }
+        }
+        resolved?.let { sid to it }
+    }.toMap()
+}
+
+/** Substitutes each lot's own resolved date (from [wipSupplyDates]) into its "wip"-dated supply
+ *  row, so planning proceeds exactly as if that date had been in the case file all along (see
+ *  this section's own doc). No-op (returns [data] unchanged) when there's nothing to substitute —
+ *  [wipSupplyDates] is empty (no "wip" rows, or none of them resolved to a date). A "wip" row
+ *  whose supply_id isn't in [wipSupplyDates] (only possible if horizon start was itself
+ *  unresolvable) is left as literal "wip" rather than guessed at. */
+internal fun applyAppSpecificConfig(
+    data: Map<String, List<Map<String, Any?>>>,
+    wipSupplyDates: Map<String, LocalDate>,
+): Map<String, List<Map<String, Any?>>> {
+    if (wipSupplyDates.isEmpty()) return data
+    val supplies = data["supply"] ?: return data
+    val substituted = supplies.map { s ->
+        val sid = (s["supply_id"] as? String)?.trim()
+        val resolved = if (sid != null && (s["supply_date"] as? String)?.trim() == "wip") wipSupplyDates[sid] else null
+        if (resolved != null) s + mapOf("supply_date" to resolved.toString()) else s
+    }
+    return data + mapOf("supply" to substituted)
+}
+
 // ── Inventory helpers ──────────────────────────────────────────────────────────
 
 /** FIFO consumption from mutable inventory. Returns (taken, commitTime).
@@ -6963,6 +7044,11 @@ fun runPlanning(
     preferenceKb: PreferenceKb? = null,
     demandOrder: Map<String, Int>? = null,
 ): RunPlanningResult {
+    // ASC substitution happens once, here, for every submission path that reaches runPlanning
+    // (manual Plan Run, async, KB seeding, agent/copilot) — see applyAppSpecificConfig's own doc.
+    val wipSupplyDates = resolveWipSupplyDates(config, data["demand"] ?: emptyList(), data["supply"] ?: emptyList())
+    val data = applyAppSpecificConfig(data, wipSupplyDates)
+
     var current = runPlanningOnePass(data, config, progressCallback, precomputedBudgets, preferenceKb, demandOrder)
     if (config?.get("reallocate_critical_leftover") != true) return current
 

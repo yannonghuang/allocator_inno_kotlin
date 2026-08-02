@@ -60,9 +60,10 @@ internal val bootstrapJobs = ConcurrentHashMap<String, MutableMap<String, Any?>>
 /** Parse a KB-seeding form payload (see `CaseBootstrap.SeedForm`'s own doc) from the
  *  `/bootstrap/preview` POST body. Mirrors the exact knobs the Planning page's own manual-run
  *  form exposes (purchase allowed, per-type WO batch scale, analyze criticality, check
- *  soundness, root waterfall, raw-material sourcing, horizon start) plus the 5 external-config
- *  version picks — everything else about a submitted config (mode/depth/max_bom_depth/weights)
- *  is fixed at Planning's own defaults, same as a manual submission that never touched those. */
+ *  soundness, root waterfall, raw-material sourcing, horizon start, ASC wip supply date) plus
+ *  the 5 external-config version picks — everything else about a submitted config
+ *  (mode/depth/max_bom_depth/weights) is fixed at Planning's own defaults, same as a manual
+ *  submission that never touched those. */
 private fun parseSeedForm(payload: JsonObject): com.allocator.services.CaseBootstrap.SeedForm {
     fun str(key: String, default: String): String =
         payload[key]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: default
@@ -88,6 +89,9 @@ private fun parseSeedForm(payload: JsonObject): com.allocator.services.CaseBoots
         rootWaterfall = bool("root_waterfall", true),
         equalSplitRawMaterials = str("raw_material_sourcing", "waterfall") == "equal_split",
         horizonStart = payload["horizon_start"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() },
+        wipSupplyDates = (payload["wip_supply_dates"] as? JsonObject)
+            ?.mapNotNull { (sid, v) -> v.jsonPrimitive.contentOrNull?.takeIf { it.isNotBlank() }?.let { sid to it } }
+            ?.toMap() ?: emptyMap(),
         detachedExternalConfigs = (payload["detached_external_configs"] as? JsonArray)
             ?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList(),
     )
@@ -324,6 +328,44 @@ fun Routing.allocateRoutes() {
         }
         val horizonStart = com.allocator.services.computePlanningHorizonStart(demands)
         call.respond(buildJsonObject { put("horizon_start_default", horizonStart?.toString()) })
+    }
+
+    // A single SUPPLY_DATE="wip" lot, for the /plan/asc-options listing below.
+    data class WipLot(val supplyId: String, val productId: String, val locationId: String?, val qty: Double)
+
+    // ── GET /cases/{case_id}/plan/asc-options ──────────────────────────────────
+    // App-specific config (ASC): every SUPPLY_DATE="wip" lot this case has, each with its OWN
+    // default (horizon start) — a lot's readiness is independent of every other lot's, so there's
+    // one row per supply_id, not one case-wide default. Drives whether the Planning/KB-seeding
+    // config forms show the ASC section at all — an empty list means the case has no ASC
+    // parameter, so there's nothing to configure.
+    get("/cases/{case_id}/plan/asc-options") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val (wipLots, demands) = transaction {
+            Cases.selectAll().where { Cases.id eq caseId }.singleOrNull()
+                ?: throw NoSuchElementException("Case not found")
+            val lots = Supplies.selectAll().where { (Supplies.caseId eq caseId) and (Supplies.supplyDate eq "wip") }
+                .map { WipLot(it[Supplies.supplyId], it[Supplies.productId], it[Supplies.locationId], it[Supplies.qty]) }
+            val demandRows = Demands.selectAll().where { Demands.caseId eq caseId }
+                .map { mapOf("request_due_time" to it[Demands.requestDueTime]) }
+            lots to demandRows
+        }
+        val default = if (wipLots.isNotEmpty()) com.allocator.services.computePlanningHorizonStart(demands) else null
+        call.respond(buildJsonObject {
+            put("has_wip_supply", wipLots.isNotEmpty())
+            put("wip_supply_date_default", default?.toString())
+            putJsonArray("wip_lots") {
+                wipLots.forEach { lot ->
+                    addJsonObject {
+                        put("supply_id", lot.supplyId)
+                        put("product_id", lot.productId)
+                        put("location_id", lot.locationId)
+                        put("qty", lot.qty)
+                    }
+                }
+            }
+        })
     }
 
     // ── GET /cases/{case_id}/plan/constraint-options ──────────────────────────
@@ -3346,6 +3388,13 @@ internal fun resolveEffectiveConfig(
     val consolidation = (c["consolidation"]     as? Map<*, *>)?.let { it as Map<String, Any?> } ?: emptyMap()
     val methodCfg = resolveMethodSelection(c)
     val horizonStart = com.allocator.services.resolveHorizonStart(c, data["demand"] ?: emptyList())
+    // ASC: only meaningful (and only ever shown/persisted) when the case actually has SUPPLY_DATE
+    // ="wip" rows — see resolveWipSupplyDates' own doc for the per-lot "auto" -> horizon-start
+    // default (each lot is its own independent readiness schedule, not one case-wide date).
+    // Resolved here (not left to runPlanning's own internal resolution) so a reloaded/viewed run's
+    // persisted config shows what was actually used, same rationale as horizonStart above.
+    val hasWipSupply = com.allocator.services.caseHasWipSupply(data["supply"] ?: emptyList())
+    val wipSupplyDates = if (hasWipSupply) com.allocator.services.resolveWipSupplyDates(c, data["demand"] ?: emptyList(), data["supply"] ?: emptyList()) else emptyMap()
 
     fun explicitVersionId(key: String): Int? = (c[key] as? Number)?.toInt()
     val detachedKinds = com.allocator.services.parseDetachedKinds(c)
@@ -3394,6 +3443,16 @@ internal fun resolveEffectiveConfig(
             put("root_waterfall", methodCfg.rootWaterfall)
             put("raw_material_sourcing", if (methodCfg.equalSplitRawMaterials) "equal_split" else "waterfall")
             put("horizon_start", horizonStart?.toString())
+        }
+        // Only present when this case actually has SUPPLY_DATE="wip" rows — absence is how the
+        // UI/ConfigDetailView know not to show the ASC section at all (see caseHasWipSupply).
+        // One entry per wip lot (supply_id) that resolved to a date — see resolveWipSupplyDates.
+        if (hasWipSupply) {
+            putJsonObject("app_specific_config") {
+                putJsonObject("wip_supply_dates") {
+                    wipSupplyDates.forEach { (sid, d) -> put(sid, d.toString()) }
+                }
+            }
         }
         putJsonObject("consolidation") {
             // 0 = single-bucket sentinel (collapses every demand into LocalDate.EPOCH); legal value, do NOT clamp up to 1.

@@ -95,6 +95,7 @@ export function ConfigDetailView({ config, caseId, versionRefs }: { config: Reco
 
   const ms = (config.method_selection ?? {}) as Record<string, unknown>;
   const cs = (config.consolidation ?? {}) as Record<string, unknown>;
+  const asc = config.app_specific_config as Record<string, unknown> | undefined;
   const globalBatchFb = (cs.wo_batch_scale as string) ?? 'weekly';
 
   const row = (label: string, value: React.ReactNode) => (
@@ -118,6 +119,9 @@ export function ConfigDetailView({ config, caseId, versionRefs }: { config: Reco
         {row('Max methods', String(ms.max_methods ?? 1))}
         {row('Raw material sourcing', (ms.raw_material_sourcing as string) === 'equal_split' ? 'Equal-split' : 'Waterfall')}
         {row('Horizon start', (ms.horizon_start as string) ?? 'None (no parseable demand due dates)')}
+        {asc && Object.entries((asc.wip_supply_dates ?? {}) as Record<string, string>).map(([sid, date]) =>
+          row(`WIP: ${sid}`, date)
+        )}
         {row('Purchase allowed', String(config.purchase_allowed === true))}
         {row('Reallocate critical leftover', String(config.reallocate_critical_leftover === true))}
         {row('WO batch (make/move/buy)', `${(cs.make_batch_scale as string) ?? globalBatchFb} / ${(cs.move_batch_scale as string) ?? globalBatchFb} / ${(cs.purchase_batch_scale as string) ?? globalBatchFb}`)}
