@@ -3686,23 +3686,28 @@ fun plan(
     // type after a partial success — matching the historical root-only waterfall's behavior,
     // which had no such restriction.
     val isRoot = depth == MAX_PLAN_DEPTH
-    // Legacy root-only proportional/equal split among the top `cap` candidates (opt-in via
+    // Legacy root-only equal split among the top `cap` candidates (opt-in via
     // method_selection.root_waterfall=false): rather than the ordinary sequential
     // 100%-then-spillover waterfall, a root demand with cap > 1 gets its quantity divided
-    // up-front across its top-ranked alternatives — weighted by each candidate's reconstructed
-    // Preferences-KB score when one is fully available for every candidate in play, otherwise
-    // an even split. Never applied below the root (that's exactly the 2^N fan-out risk the
-    // historical proactive waterfall was root-only to avoid). methodCfg.rootWaterfall defaults
-    // true, forcing this to null — every downstream reference already has a null-safe fallback
-    // to the ordinary sequential `residual` target, so this single condition cleanly degrades
-    // the root to the SAME waterfall every non-root node uses, across-the-board.
+    // up-front, evenly, across its top-ranked alternatives. Never applied below the root
+    // (that's exactly the 2^N fan-out risk the historical proactive waterfall was root-only
+    // to avoid). methodCfg.rootWaterfall defaults true, forcing this to null — every
+    // downstream reference already has a null-safe fallback to the ordinary sequential
+    // `residual` target, so this single condition cleanly degrades the root to the SAME
+    // waterfall every non-root node uses, across-the-board.
+    //
+    // Deliberately flat, not weighted by the Preferences-KB reconstructed score (see
+    // reconstructNodeScores): a KB-proportional split used to skew this toward the
+    // higher-scored candidate, but that ratio is a continuous, hard-to-explain artifact of
+    // the KB's own scoring weights — "why did C2 get 73% and C1 27%?" has no answer a user
+    // can act on. A flat 1/cap split is naive but transparent, and covers the practical case
+    // (spread risk/lead-time across a small number of top alternatives) just as well. Keep
+    // this in sync with SupplyGuidedPlanning.kt's discover() root-split weights — that
+    // function mirrors this formula exactly for its own (separate) AND-sibling-cap discovery
+    // pass, and the two diverging would desync caps computed during discovery from what
+    // commit actually splits.
     val rootSplitWeights: List<Double>? = if (isRoot && cap > 1 && !methodCfg.rootWaterfall) {
-        val scored = preferenceKb?.let { reconstructNodeScores(productId, locationId, candidates, it) }
-            ?.take(cap)?.let { topScores ->
-                val sum = topScores.sum()
-                if (sum > 1e-9) topScores.map { it / sum } else null
-            }
-        scored ?: List(cap) { 1.0 / cap }
+        List(cap) { 1.0 / cap }
     } else null
     // Loop bound: root-split mode (rootSplitWeights != null) bounds candidate-trying at `cap` —
     // rootSplitWeights is sized to exactly `cap` entries, so trying more candidates than that

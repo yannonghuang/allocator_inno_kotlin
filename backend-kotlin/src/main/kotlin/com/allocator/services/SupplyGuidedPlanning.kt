@@ -926,7 +926,7 @@ internal fun gatherAndSiblingRequests(
 
     // Walks the same topology looking for fanout points (AND-parent with >1 child, or the
     // root's own rootSplitWeights split). At each one found: computes each branch's own
-    // target qty (rate-based for AND, KB-weighted for root-split — mirroring
+    // target qty (rate-based for AND, flat 1/cap for root-split — mirroring
     // PlanningEngine.kt's rootSplitWeights formula exactly), fires one fresh [accumulate]
     // per branch, and keeps discovering deeper, independent fanouts nested within each
     // branch's own subtree — each nested fanout gets its own, separate cohort. Two
@@ -964,9 +964,9 @@ internal fun gatherAndSiblingRequests(
             if (isRoot && cap > 1) {
                 val cohort = key
                 val top = candidates.take(cap)
-                val scored = preferenceKb?.let { reconstructNodeScores(pid, lid, top, it) }
-                    ?.let { s -> val sum = s.sum(); if (sum > 1e-9) s.map { it / sum } else null }
-                val weights = scored ?: List(top.size) { 1.0 / top.size }
+                // Flat split — see PlanningEngine.kt's rootSplitWeights for why this is no
+                // longer KB-proportional.
+                val weights = List(top.size) { 1.0 / top.size }
                 for ((idx, cand) in top.withIndex()) {
                     val target = weights[idx] * needed
                     if (target <= 1e-9) continue

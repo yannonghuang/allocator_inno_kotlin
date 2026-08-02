@@ -310,6 +310,41 @@ elaborate only when delivery time matters more than fairness (e.g.,
 expedited orders), and consider `max_methods >= methods.size` if you
 do — the elab-ON Gini hit fades when the cap is broad.
 
+## Legacy root-only split: proportional → equal (2026-08-02)
+
+A separate, smaller vestige of proportional split survives outside the
+exponential-cost problem this doc otherwise covers: `method_selection.
+root_waterfall=false` opts a **root demand only** (never deeper — see
+`isRoot` gating in `rootSplitWeights`, `PlanningEngine.kt`) into dividing its
+quantity up-front across its top `max_methods` candidates, instead of the
+ordinary 100%-then-spillover waterfall. Being root-only, this was never the
+`max_methods^depth` blow-up that killed general proportional split — it's a
+single fan-out with no deeper recursion to multiply across.
+
+Until 2026-08-02, that up-front division was **weighted by each candidate's
+reconstructed Preferences-KB score** (`reconstructNodeScores`) when a KB
+covered every candidate in play, falling back to a flat split only when it
+didn't. That KB-proportional ratio is a continuous, opaque artifact of the
+KB's own delivery/inventory/critical-material scoring weights — "why did
+candidate B get 73% and candidate A 27%?" has no answer a user can act on.
+
+**Changed to a flat `1/cap` split unconditionally**, regardless of KB
+coverage. Naive, but transparent, and empirically close to fill-rate-neutral:
+isolating the split formula alone on case 173 (208 demands, `root_waterfall=
+false` both ways) moved fill rate by under 1 point (61.36% proportional →
+60.43% equal) while on-time count improved slightly (56→59); soundness was
+clean (208/208) either way. Note `root_waterfall=false` itself costs far more
+than that relative to the `root_waterfall=true` default (69.99% fill on the
+same case) — that's the mode switch, not this formula change.
+
+Changed in `PlanningEngine.kt`'s `rootSplitWeights` and the mirrored formula
+in `SupplyGuidedPlanning.kt`'s `discover()` (AND-sibling-cap discovery pass —
+the two must stay identical or discovery-computed caps desync from what
+commit actually splits). `reconstructNodeScores` itself is untouched and
+still KB-score-reconstruction-tested directly in `PreferenceBuilderTest.kt`
+— it's just no longer called from either root-split site. Branch:
+`explore/root-alt-equal-split`.
+
 ## Migration
 
 Saved plan_run configs containing `split_mechanism` are not migrated. They
