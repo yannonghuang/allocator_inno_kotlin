@@ -534,6 +534,8 @@
       "filterPeggedOnlyTooltip": "仅显示选中的生产订单及其上下游相关订单",
       "filterPlaceholder": "按产品、地点、方法筛选…",
       "shared": "共享",
+      "negativeInventoryTooltip": "吸收负库存缺口：{qty}",
+      "negativeInventoryTooltipSupply": "吸收负库存缺口：{qty}（供应 {supplyIds}）",
       "columns": {
         "product": "产品",
         "location": "地点",
@@ -1068,6 +1070,7 @@
       "scarcityBomTooltip": "BOM 派生消耗 {demand} / 总供应 {supply}：此为中间物料，{demand} 为上游用户需求经 BOM 展开消耗的数量。基于已承诺数据，受供应上限约束，真实请求压力可能更高。",
       "scarcityShortageTooltip": "需求 {demand} / 无可用供应 — 完全缺货。",
       "scarcityNoneTooltip": "该产品无用户需求，亦无 BOM 派生消耗 — 物料未被使用。",
+      "negativeInventoryTooltip": "负库存缺口 — 由该产品/地点的首个采购订单吸收",
       "columns": {
         "supplyId": "供应 ID",
         "product": "产品",
@@ -1224,7 +1227,9 @@
     "consumerBreakdown": "以下需求共同需要此单一合并订单（在各需求间分摊）。",
     "consumerNote": "从上方的单一合并订单中分得其份额",
     "noWorkOrders": "无生产订单 — 规划无法满足该需求（无可用方法或子项失败）。",
-    "noComponentBreakdown": "无组件明细（叶子生产订单或受深度限制）。"
+    "noComponentBreakdown": "无组件明细（叶子生产订单或受深度限制）。",
+    "negativeInventoryLeaf": "负库存缺口 — 与相邻的采购/生产订单相抵",
+    "negativeInventoryWo": "吸收负库存缺口：{qty}"
   },
   "runDetail": {
     "backToCase": "← 方案",

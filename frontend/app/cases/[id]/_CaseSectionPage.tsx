@@ -2905,7 +2905,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     }
 
     function addPegging(sid: string, qty: number, demandId: string) {
-      if (qty <= 1e-9) return;
+      // Math.abs(): a negative_inventory=true supply leaf (pre-existing deficit netted
+      // against its enlarged purchase sibling) legitimately carries a negative qty — see
+      // PlanningEngine.kt's NegativeInventoryLot doc. A plain `qty <= 1e-9` check treats it
+      // as "nothing to record" and drops it from the Supply View's Pegged Demands.
+      if (Math.abs(qty) <= 1e-9) return;
       const existing = map.get(sid);
       if (existing) {
         const existingForDemand = existing.demands.find((d) => d.demandId === demandId);
@@ -2970,7 +2974,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       if (node.type === 'supply' && node.supply_id) {
         const sid = node.supply_id;
         const qty = Number(node.quantity ?? 0);
-        if (qty > 1e-9) {
+        if (Math.abs(qty) > 1e-9) {
           if (effectiveDemandId) {
             // Normal (non-consolidated): peg to the specific demand.
             // Skip synthetic tagged buckets — the physical supplies underlying them are
@@ -3108,7 +3112,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const supplyDemandConsumedMap = useMemo(() => {
     const m = new Map<string, Map<string, number>>();
     for (const a of planResult?.supply_allocations ?? []) {
-      if (!a.demand_id || a.qty_consumed <= 1e-9) continue;
+      // Math.abs(): a negative_inventory leaf's qty_consumed is legitimately negative — see
+      // addPegging's identical fix above.
+      if (!a.demand_id || Math.abs(a.qty_consumed) <= 1e-9) continue;
       let dm = m.get(a.supply_id);
       if (!dm) { dm = new Map(); m.set(a.supply_id, dm); }
       dm.set(a.demand_id, (dm.get(a.demand_id) ?? 0) + a.qty_consumed);
@@ -6228,6 +6234,36 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       });
                     }
                     const horizon = computeHorizon(woRows);
+                    // Negative-inventory absorption: a pre-existing deficit at (product_id,
+                    // location_id) shows up as a negative-qty_consumed row in supply_allocations
+                    // (extracted from the pegging tree's negative_inventory=true supply leaf —
+                    // see PlanningEngine.kt's extractSupplyAllocations/planMethodSlot). No extra
+                    // backend linkage needed on the WO record itself (a flat-field stamp there
+                    // doesn't survive timing resequencing, which regenerates native WO rows from
+                    // the pegging tree). supply_allocations only carries supply_id/demand_id, not
+                    // product/location, so resolve the deficit's (product_id, location_id) via
+                    // caseSupplies and match WO rows on BOTH that node AND demand membership —
+                    // matching on demand_id alone would flag every unrelated WO in that demand's
+                    // whole BOM tree, not just the one purchase that actually absorbed it.
+                    const supplyMetaById = new Map(caseSupplies.map((s) => [s.supplyId, s]));
+                    const negativeInventoryByDemand = new Map<string, { offset: number; supplyId: string; productId: string; locationId: string | null }[]>();
+                    for (const a of (planResult?.supply_allocations ?? [])) {
+                      if (!(a.qty_consumed < 0) || !a.demand_id) continue;
+                      const meta = supplyMetaById.get(a.supply_id);
+                      if (!meta) continue;
+                      const list = negativeInventoryByDemand.get(a.demand_id) ?? [];
+                      list.push({ offset: -a.qty_consumed, supplyId: a.supply_id, productId: meta.productId, locationId: meta.locationId });
+                      negativeInventoryByDemand.set(a.demand_id, list);
+                    }
+                    const negativeInventoryFor = (r: WoEnrichedRow): { offset: number; supplyIds: string[] } | null => {
+                      if (r.method !== 'purchase') return null;
+                      const demandIds = r._demand_ids ?? (r.demand_id ? [r.demand_id] : []);
+                      const hits = demandIds
+                        .flatMap((did) => negativeInventoryByDemand.get(did) ?? [])
+                        .filter((h) => h.productId === r.product_id && h.locationId === r.location_id);
+                      if (!hits.length) return null;
+                      return { offset: hits.reduce((s, h) => s + h.offset, 0), supplyIds: hits.map((h) => h.supplyId) };
+                    };
                     const woColumns: {
                       key: string;
                       label: string;
@@ -6377,9 +6413,22 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         const isConsolidatedView = woTableTab === 'consolidated' || r.consolidated;
                         const c = methodColor(r.method, isConsolidatedView);
                         const label = r.method ?? '–';
-                        return isConsolidatedView
-                          ? <span style={{ color: c, background: `${c}22`, border: `1px solid ${c}66`, borderRadius: 4, padding: '0 6px', fontWeight: 600 }}>{label}</span>
-                          : <span style={{ color: c }}>{label}</span>;
+                        const negInv = negativeInventoryFor(r);
+                        return (
+                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                            {isConsolidatedView
+                              ? <span style={{ color: c, background: `${c}22`, border: `1px solid ${c}66`, borderRadius: 4, padding: '0 6px', fontWeight: 600 }}>{label}</span>
+                              : <span style={{ color: c }}>{label}</span>}
+                            {negInv && (
+                              <span
+                                title={negInv.supplyIds.length
+                                  ? tP('workOrders.negativeInventoryTooltipSupply', { qty: negInv.offset.toFixed(1), supplyIds: negInv.supplyIds.join(', ') })
+                                  : tP('workOrders.negativeInventoryTooltip', { qty: negInv.offset.toFixed(1) })}
+                                style={{ color: '#f87171', cursor: 'help' }}
+                              >⚠</span>
+                            )}
+                          </span>
+                        );
                       } },
                       { key: '_demand_label', label: tP('workOrders.columns.demand'), sortable: true, width: '9%', render: (r) => {
                         const ids = r._demand_ids ?? [];
@@ -7222,9 +7271,24 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                             { key: 'productId', label: tP('supplyView.columns.product'), sortable: true },
                             { key: 'locationId', label: tP('supplyView.columns.location'), sortable: true, render: (r) => r.locationId ?? '–' },
                             { key: 'supplyDate', label: tP('supplyView.columns.supplyDate'), sortable: true, render: (r) => (r.supplyDate && r.supplyDate !== 'NULL') ? r.supplyDate : '–' },
-                            { key: 'qty', label: tP('supplyView.columns.initialQty'), sortable: true, render: (r) => qtyFmt(Number(r.qty)) },
+                            { key: 'qty', label: tP('supplyView.columns.initialQty'), sortable: true, render: (r) => {
+                              const qty = Number(r.qty);
+                              if (qty >= 0) return qtyFmt(qty);
+                              // Negative starting inventory — same ⚠ treatment as the Work
+                              // orders table's absorbing-purchase badge (see negativeInventoryFor
+                              // there): this row IS the deficit; that row shows what absorbed it.
+                              return (
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                  {qtyFmt(qty)}
+                                  <span
+                                    title={tP('supplyView.negativeInventoryTooltip')}
+                                    style={{ color: '#f87171', cursor: 'help' }}
+                                  >⚠</span>
+                                </span>
+                              );
+                            } },
                             { key: 'productTotal', label: tP('supplyView.columns.productTotal'), sortable: true, render: (r) => r.productTotal > 0 ? qtyFmt(Number(r.productTotal)) : '–' },
-                            { key: 'consumedQty', label: tP('supplyView.columns.consumed'), sortable: true, render: (r) => r.consumedQty > 0 ? <span style={{ color: '#a78bfa' }}>{qtyFmt(Number(r.consumedQty))}</span> : <span style={{ color: '#52525b' }}>0</span> },
+                            { key: 'consumedQty', label: tP('supplyView.columns.consumed'), sortable: true, render: (r) => Math.abs(r.consumedQty) > 1e-9 ? <span style={{ color: r.consumedQty < 0 ? '#f87171' : '#a78bfa' }}>{qtyFmt(Math.abs(Number(r.consumedQty)))}</span> : <span style={{ color: '#52525b' }}>0</span> },
                             { key: 'residualQty', label: tP('supplyView.columns.residual'), sortable: true, render: (r) => r.residualQty > 0 ? <span style={{ color: '#34d399' }}>{qtyFmt(Number(r.residualQty))}</span> : <span style={{ color: '#52525b' }}>0</span> },
                             { key: 'utilizationRate', label: tP('supplyView.columns.utilPct'), sortable: true, render: (r) => {
                               if (r.utilizationRate == null) return <span style={{ color: '#52525b' }}>–</span>;
@@ -7234,7 +7298,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                               return <span style={{ color }} title={overAllocated ? 'Over-allocated: consumed exceeds initial qty' : undefined}>{pct}%{overAllocated ? ' ⚠' : ''}</span>;
                             }},
                             { key: 'peggedDemandCount', label: tP('supplyView.columns.peggedDemands'), sortable: true, render: (r) => r.peggedDemandCount > 0 ? <span style={{ color: '#60a5fa' }}>{r.peggedDemandCount}</span> : <span style={{ color: '#52525b' }}>0</span> },
-                            { key: 'totalPeggedQty', label: tP('supplyView.columns.totalPeggedQty'), sortable: true, render: (r) => r.totalPeggedQty > 0 ? qtyFmt(Number(r.totalPeggedQty)) : <span style={{ color: '#52525b' }}>0</span> },
+                            { key: 'totalPeggedQty', label: tP('supplyView.columns.totalPeggedQty'), sortable: true, render: (r) => Math.abs(r.totalPeggedQty) > 1e-9 ? <span style={{ color: r.totalPeggedQty < 0 ? '#f87171' : undefined }}>{qtyFmt(Math.abs(Number(r.totalPeggedQty)))}</span> : <span style={{ color: '#52525b' }}>0</span> },
                             { key: '_sup_explain' as keyof (PlanSupplyViewRow & { _key: string }), label: tP('supplyView.columns.breakdown'), sortable: false, render: (r) => {
                               const cs = supplyCriticalityMap[r.supplyId];
                               const hasCriticality = cs === 'critical' || cs === 'not_critical';

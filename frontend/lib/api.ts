@@ -306,6 +306,10 @@ export type PlanningPeggingNode = {
   max_lot_size?: number | null;
   /** For supply nodes: the specific supply record that was consumed. */
   supply_id?: string | null;
+  /** Marker on a supply node representing a pre-existing negative-inventory deficit netted
+   *  against a sibling purchase/WO — `quantity` is legitimately negative (a fixed historical
+   *  fact, not a target-driven allocation). See NegativeInventoryLot's doc in PlanningEngine.kt. */
+  negative_inventory?: boolean;
   /** For purchase leaves: the vendor the supply is procured from (no source supply record exists). */
   vendor_id?: string | null;
   /** Marker on work_order nodes from the AND-bottleneck blocked branch.

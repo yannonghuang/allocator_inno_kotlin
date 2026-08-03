@@ -190,9 +190,11 @@ export function SinglePeggingTreePanel({
         && raw.length > 0;
       if (isLegacyBlockedWo) return [];
       if (n.children_relation === 'or' && raw.length > 1) {
-        const contribCount = raw.filter((c) => childContrib(c) > 1e-9).length;
+        // Math.abs() — see PlanningPeggingTreeView's identical fix: a negative_inventory=true
+        // leaf legitimately contributes a negative amount and must not be treated as absent.
+        const contribCount = raw.filter((c) => Math.abs(childContrib(c)) > 1e-9).length;
         if (contribCount > 0 && contribCount < raw.length)
-          return raw.filter((c) => childContrib(c) > 1e-9);
+          return raw.filter((c) => Math.abs(childContrib(c)) > 1e-9);
       }
       return raw;
     };
