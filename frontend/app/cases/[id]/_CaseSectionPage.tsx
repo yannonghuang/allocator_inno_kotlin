@@ -876,6 +876,47 @@ function normalizePlanningConfig(cfg: PlanningConfig): PlanningConfig {
   };
 }
 
+const EXTERNAL_CONFIG_REF_KEYS = [
+  { configKey: 'case_alloc_version_id',            kind: 'casealloc' },
+  { configKey: 'pref_version_id',                  kind: 'pref' },
+  { configKey: 'demand_order_version_id',          kind: 'ord' },
+  { configKey: 'purchasable_material_version_id',  kind: 'purchmat' },
+  { configKey: 'constraint_version_id',            kind: 'constr' },
+] as const;
+
+/**
+ * Restores a loaded run's own external-config attachments onto its config, so re-opening a past
+ * run shows exactly what THAT run used — not the case's CURRENT default. The 5 version-id fields
+ * live on the plan_run row itself (PlanRunFull), never inside the `config` JSON blob (see
+ * Allocate.kt's resolveEffectiveConfig, which persists only `_kb_fingerprint` hashes there, not
+ * the literal ids) — normalizePlanningConfig alone can't restore them. Without this, re-opening
+ * any past run left these 5 fields unset on `planningConfig`, and the version picker's own "no
+ * explicit pick ⇒ case's current default" fallback silently attributed whatever is CURRENTLY
+ * default to every restored run, however old — confirmed live: restoring run 1691 (submitted
+ * before any Demand Ordering config existed for the case) showed run 1692's brand-new config the
+ * moment 1692's Generate call created it as the case's first-ever (and thus default) version.
+ *
+ * A run whose own ref is null didn't just "not pick a version" — it explicitly used NONE, so that
+ * kind must be marked detached too, not merely left blank, or the same silent-default fallback
+ * kicks in immediately on render.
+ */
+function restoreExternalConfigRefs(cfg: PlanningConfig, full: PlanRunFull): PlanningConfig {
+  const detached = new Set(cfg.detached_external_configs ?? []);
+  const next: PlanningConfig = { ...cfg };
+  for (const { configKey, kind } of EXTERNAL_CONFIG_REF_KEYS) {
+    const v = full[configKey];
+    if (v != null) {
+      next[configKey] = v;
+      detached.delete(kind);
+    } else {
+      delete next[configKey];
+      detached.add(kind);
+    }
+  }
+  next.detached_external_configs = Array.from(detached);
+  return next;
+}
+
 export function CaseDetail({ section: sectionProp = 'planning', subsection }: { section?: string; subsection?: string }) {
   const tNav = useTranslations('nav');
   const tSec = useTranslations('sections');
@@ -1612,7 +1653,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 setPlanRunSaveError(null);
                 setPlanWorkOrderPeggingCache({});
                 if (full.config) {
-                  setPlanningConfig(normalizePlanningConfig(full.config as PlanningConfig));
+                  setPlanningConfig(restoreExternalConfigRefs(normalizePlanningConfig(full.config as PlanningConfig), full));
                 }
                 listPlanRuns(id).then(setPlanRunHistory).catch(() => { /* ignore */ });
               } catch {
@@ -2293,7 +2334,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         setCurrentPlanRunId(chosen.id);
         setPlanWorkOrderPeggingCache({});
         if (full.config) {
-          setPlanningConfig(normalizePlanningConfig(full.config as PlanningConfig));
+          setPlanningConfig(restoreExternalConfigRefs(normalizePlanningConfig(full.config as PlanningConfig), full));
         }
         restoreCriticality(chosen.id);
       }
@@ -3871,7 +3912,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         setPlanRunSaveError(null);
         setPlanWorkOrderPeggingCache({});
         if (full.config) {
-          setPlanningConfig(normalizePlanningConfig(full.config as PlanningConfig));
+          setPlanningConfig(restoreExternalConfigRefs(normalizePlanningConfig(full.config as PlanningConfig), full));
         }
         setPlanRunHistoryOpen(false);
       }
