@@ -6438,10 +6438,12 @@ private fun runPlanningOnePass(
     preferenceKb: PreferenceKb? = null,
     /** Optional Demand Ordering KB override: demand_id -> canonical processing order (10, 20,
      *  30, ...). When present, demands covered by it sort first (by that order); demands NOT
-     *  covered (e.g. added after the KB was last generated) fall back to today's raw
-     *  `(priority, demand_id)` sort and sort after all covered demands — the same
-     *  per-alternative-not-all-or-nothing fallback principle as [preferenceKb]. `null` (no KB
-     *  for this case) preserves today's exact `(priority, demand_id)` sort. */
+     *  covered (e.g. added after the KB was last generated) fall back to the default
+     *  `(request_due_time, priority, demand_id)` chronological sort and sort after all covered
+     *  demands — the same per-alternative-not-all-or-nothing fallback principle as
+     *  [preferenceKb]. `null` (no KB for this case) means EVERY demand takes that fallback path,
+     *  so the whole run processes in chronological order — see [buildDemandOrder]
+     *  (DemandOrderBuilder.kt), which computes this exact rule as its own KB-seeding formula. */
     demandOrder: Map<String, Int>? = null,
 ): RunPlanningResult {
     val inventory: MutableList<MutableMap<String, Any?>> = (data["supply"] ?: emptyList()).map { s ->
@@ -6469,13 +6471,15 @@ private fun runPlanningOnePass(
     emitPhase("allocating", "Allocating supply across demands…", 0)
 
     // Demand processing order: covered by the Demand Ordering KB (see `demandOrder` doc) sorts
-    // first by its canonical order; anything not covered falls back to the raw (priority,
-    // demand_id) rule and sorts after all covered demands. demandOrder == null (no KB) reduces
-    // the first two comparator keys to no-ops, preserving today's exact sort unchanged.
+    // first by its canonical order; anything not covered falls back to the default chronological
+    // (request_due_time, priority, demand_id) rule and sorts after all covered demands.
+    // demandOrder == null (no KB for this case) reduces the first two comparator keys to
+    // no-ops for every demand, so the whole run processes in that chronological default order.
     val demands = (data["demand"] ?: emptyList()).sortedWith(
         compareBy(
             { d: Map<String, Any?> -> if (demandOrder?.containsKey(d["demand_id"]?.toString()) == true) 0 else 1 },
             { d: Map<String, Any?> -> demandOrder?.get(d["demand_id"]?.toString()) ?: Int.MAX_VALUE },
+            { d: Map<String, Any?> -> (d["request_due_time"] as? String)?.let { parseDate(it) } ?: LocalDate.MAX },
             { d: Map<String, Any?> -> (d["priority"] as? Number)?.toInt() ?: 0 },
             { d: Map<String, Any?> -> d["demand_id"]?.toString() ?: "" },
         )
