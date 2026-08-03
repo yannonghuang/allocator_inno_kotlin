@@ -7098,7 +7098,58 @@ fun runPlanning(
     if (round == MAX_REALLOCATION_ROUNDS) {
         log.warn("[reallocate-critical-leftover] hit the {}-round cost backstop without the materiality floor converging first — some leftover may remain unredistributed", MAX_REALLOCATION_ROUNDS)
     }
-    return best
+    return reconcileReallocatedSupplyAllocations(best)
+}
+
+/**
+ * Reconciles `qty_allocated` in the returned round's own `supply_allocations` down to
+ * `qty_consumed` wherever the grant exceeds it. Reporting-only — never touches
+ * `committed_demands`, `work_orders`, or pegging, so this cannot change fill rate, WOs, or any
+ * planning decision; it only corrects what gets PERSISTED/DISPLAYED as a demand's entitlement.
+ *
+ * Why this is needed: [reallocateCriticalLeftoverBudget] computes each round's grant
+ * PROSPECTIVELY from the PRECEDING round's own consumption pattern (`pass1` there is literally
+ * the prior round's result) — by design a ceiling, not a prediction (see that function's own
+ * "NOTE: no materiality check on additional's own SIZE" — a round CAN grant more than gets
+ * claimed, and that's meant to be harmless for planning). But [runPlanning]'s own loop can
+ * return a round that ISN'T the fully-converged final one (best-by-total-committed, not
+ * best-by-self-consistency) — confirmed live on case 173: round 4 was chosen as "best" over
+ * round 5 despite round 5 alone reconciling material 283-0226's shared lot to an exact,
+ * fully-consumed state (round 5 scored lower on TOTAL committed elsewhere in the case, the
+ * same already-documented non-monotonicity). Round 4's own grant to demand
+ * 888_F37_2024_10_VIRTUAL (1476.79, extrapolated from round 3) overstated what round 4's own
+ * actual cross-demand competition for that lot let it realize (507.05) — round 5's grant,
+ * computed from round 4's REAL pattern, correctly re-targeted it to exactly 507.05. So whenever
+ * the returned round isn't the converged one, its OWN qty_allocated numbers are structurally
+ * guaranteed to be stale relative to its OWN qty_consumed — exactly what
+ * R13_dominator_budget_exhausted (SoundnessChecker.kt) exists to catch, and was catching
+ * correctly, just for a cause this function now closes rather than the genuine planner bugs
+ * (e.g. GCEngine.kt not restoring demandConsumed — see r13_dominator_budget_followup project
+ * memory) R13 was originally built for.
+ *
+ * Deliberately does NOT distinguish "original" (pass-1-equivalent) entitlement from
+ * "additional" (reallocation top-up) — flooring at consumed is safe either way: an ORIGINAL
+ * entitlement genuinely left unconsumed for a non-reallocation reason (the class of bug R13
+ * was originally built to catch) still gets caught by R13 on any run with
+ * reallocate_critical_leftover=false, which is the vast majority of runs and where this
+ * function is never called at all (see the early return above). See
+ * reallocation_r13_dominator_mismatch project memory for the full live trace this fix is based
+ * on.
+ */
+internal fun reconcileReallocatedSupplyAllocations(result: RunPlanningResult): RunPlanningResult {
+    @Suppress("UNCHECKED_CAST")
+    val supplyAllocations = result.output["supply_allocations"] as? List<Map<String, Any?>> ?: return result
+    var changed = false
+    val reconciled = supplyAllocations.map { row ->
+        val allocated = (row["qty_allocated"] as? Number)?.toDouble() ?: return@map row
+        val consumed = (row["qty_consumed"] as? Number)?.toDouble() ?: 0.0
+        if (allocated > consumed + 1e-9) {
+            changed = true
+            row + ("qty_allocated" to consumed)
+        } else row
+    }
+    if (!changed) return result
+    return result.copy(output = result.output + ("supply_allocations" to reconciled))
 }
 
 /**
