@@ -616,7 +616,7 @@ interface WoDemandGroup {
 }
 
 function demandSummaryPivotFieldLabel(field: WoPivotField): string {
-  return field === 'customer' ? 'Customer' : field === 'prod_area' ? 'PROD_AREA' : 'Location';
+  return field === 'customer' ? 'Customer' : field === 'prod_area' ? 'PROD_AREA' : field === 'method' ? 'Method' : 'Location';
 }
 
 function buildWoNestedPivotGroups(rows: WoEnrichedRow[]): WoNestedGroup[] {
@@ -1009,7 +1009,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [demandsSubTab, setDemandsSubTab] = useState<'summary' | 'detail'>('summary');
   const [demandSummaryIncludeLocation, setDemandSummaryIncludeLocation] = useState(false);
   const demandSummaryPivotFields = useMemo<WoPivotField[]>(
-    () => (demandSummaryIncludeLocation ? ['customer', 'prod_area', 'location'] : ['customer', 'prod_area']),
+    () => (demandSummaryIncludeLocation ? ['customer', 'prod_area', 'method', 'location'] : ['customer', 'prod_area', 'method']),
     [demandSummaryIncludeLocation],
   );
   // ID of the plan run currently loaded in planResult; null = freshly-run (not from history)
@@ -5285,7 +5285,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     <div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
                         <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>Pivot:</span>
-                        {(['customer', 'prod_area'] as const).map((field) => (
+                        {(['customer', 'prod_area', 'method'] as const).map((field) => (
                           <span
                             key={field}
                             style={{ fontSize: '0.75rem', padding: '2px 8px', background: '#3f3f46', borderRadius: 12, color: '#e4e4e7' }}
@@ -5321,6 +5321,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         demands={planResult?.committed_demands ?? []}
                         pivotFields={demandSummaryPivotFields}
                         horizonStart={planningConfig.method_selection?.horizon_start}
+                        onOpenDemandPegging={(demandId) => {
+                          const demandRow = (planResult?.committed_demands ?? []).find((d) => d.demand_id === demandId) ?? null;
+                          if (!demandRow) return;
+                          setPreviousPeggingContext(null);
+                          setPreviousSupExplainRow(null);
+                          setPreviousWoExplainRow(null);
+                          setPreviousManifestWoRow(null);
+                          setPlanPeggingContext({ type: 'demand', row: demandRow });
+                          setPlanPeggingOpen(true);
+                        }}
                       />
                     </div>
                   )}
