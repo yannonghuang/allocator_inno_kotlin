@@ -116,6 +116,38 @@ object CaseConfigVersioning {
         resolveVersionId(caseId, kind, requested)
             ?: createVersion(caseId, kind, name = null, comments = null, markDefault = true)
 
+    /** Same [requested]-first resolution as [resolveVersionId], but for a SILENT system auto-seed
+     *  (currently only the interactive plan path's Critical Raw Allocation snapshot — see
+     *  Allocate.kt's runPlanBackground doc) rather than an explicit user Save/Generate/Import.
+     *  Never touches [CaseConfigVersions.isDefault] — reuses the case+kind's most recently
+     *  created version (regardless of default status) if [requested] doesn't resolve, or creates
+     *  a fresh NON-default one if none exists at all.
+     *
+     *  Deliberately does NOT fall back to [defaultVersionId]/resolveOrCreateVersionId's
+     *  markDefault=true: a plan run that had no explicit override for this kind genuinely used
+     *  none, and silently promoting its auto-computed snapshot to the case's new default would
+     *  retroactively change what every future no-override run resolves to — confirmed live: a
+     *  Critical Raw Allocation version auto-seeded this way became case default the instant it
+     *  was created (old createVersion "first version always becomes default" rule), even though
+     *  the triggering run's own case_alloc_version_id stayed null throughout, then silently
+     *  attached itself to every subsequent run/picker that resolved "current default". Still
+     *  reuses (rather than re-creates) the latest existing version so repeated no-override plan
+     *  runs refresh the same cache slot instead of accumulating a fresh version every time. */
+    fun resolveOrCreateSystemVersionId(caseId: Int, kind: ConfigVersionKind, requested: Int?): Int = transaction {
+        if (requested != null) {
+            val ok = CaseConfigVersions.selectAll()
+                .where { (CaseConfigVersions.id eq requested) and (CaseConfigVersions.caseId eq caseId) and (CaseConfigVersions.kind eq kind.key) }
+                .any()
+            if (ok) return@transaction requested
+        }
+        CaseConfigVersions.selectAll()
+            .where { (CaseConfigVersions.caseId eq caseId) and (CaseConfigVersions.kind eq kind.key) }
+            .orderBy(CaseConfigVersions.id, org.jetbrains.exposed.sql.SortOrder.DESC)
+            .limit(1)
+            .singleOrNull()?.get(CaseConfigVersions.id)
+            ?: createVersion(caseId, kind, name = null, comments = null, markDefault = false, forceDefaultIfFirst = false)
+    }
+
     /** Whether [versionId] is used by any COMPLETED plan_run or kb_record for [kind] — the gate
      *  for Save/Generate/Import/Clear/Delete having to become "Save As" instead.
      *
@@ -171,12 +203,16 @@ object CaseConfigVersioning {
      *  found nothing) and plan submission itself (an untouched picker resolves via the same
      *  `is_default` lookup server-side, so the run used NO override even though the UI showed a
      *  version). A second-or-later "Save As" still stays non-default as before — only the very
-     *  first version for a case+kind is special-cased. */
-    fun createVersion(caseId: Int, kind: ConfigVersionKind, name: String?, comments: String?, markDefault: Boolean = false): Int = transaction {
+     *  first version for a case+kind is special-cased.
+     *
+     *  [forceDefaultIfFirst] (default true) is that special case's own switch — set false only by
+     *  [resolveOrCreateSystemVersionId]'s silent background auto-seed, where being the first
+     *  version must NOT imply becoming the case's default (see its own doc for why). */
+    fun createVersion(caseId: Int, kind: ConfigVersionKind, name: String?, comments: String?, markDefault: Boolean = false, forceDefaultIfFirst: Boolean = true): Int = transaction {
         val isFirstVersion = !CaseConfigVersions.selectAll()
             .where { (CaseConfigVersions.caseId eq caseId) and (CaseConfigVersions.kind eq kind.key) }
             .any()
-        val effectiveDefault = markDefault || isFirstVersion
+        val effectiveDefault = markDefault || (isFirstVersion && forceDefaultIfFirst)
         val id = CaseConfigVersions.insert {
             it[CaseConfigVersions.caseId] = caseId
             it[CaseConfigVersions.kind] = kind.key

@@ -2895,8 +2895,13 @@ internal suspend fun runPlanBackground(
             // reuse) — the one legitimate place to materialize a version on demand if the case
             // never had one, same as an explicit Generate. Doesn't retroactively touch this
             // plan_run's own (already-persisted) caseAllocVersionId — the run itself genuinely
-            // ran with no explicit allocation override; this just seeds a fresh snapshot.
-            val seedVersionId = CaseConfigVersioning.resolveOrCreateVersionId(caseId, ConfigVersionKind.CASEALLOC, effectiveConfig.caseAllocVersionId)
+            // ran with no explicit allocation override; this just seeds a fresh snapshot. Uses
+            // resolveOrCreateSystemVersionId (not resolveOrCreateVersionId) so this silent seed
+            // never becomes the case's default the way an explicit Save/Generate does — confirmed
+            // live: it used to become default immediately (createVersion's "first version always
+            // becomes default" rule), silently attaching itself to every later run/picker that
+            // resolves "current default", even though this run's own column stayed null.
+            val seedVersionId = CaseConfigVersioning.resolveOrCreateSystemVersionId(caseId, ConfigVersionKind.CASEALLOC, effectiveConfig.caseAllocVersionId)
             val allocRows = generateAndSeedCaseAllocation(caseId, seedVersionId, data, config)
             log.info("[plan] seeded case_allocation with {} rows for case {}", allocRows.size, caseId)
         }
