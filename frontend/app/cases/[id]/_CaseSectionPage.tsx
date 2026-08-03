@@ -1693,6 +1693,23 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           const freshId = st.plan_run_id ?? null;
           // Stop polling immediately — prevents a concurrent interval tick while we await below.
           if (planPollRef.current) { clearInterval(planPollRef.current); planPollRef.current = null; }
+          // Sync the version pickers to what THIS run actually resolved to, same as
+          // handleRestorePlanRun — otherwise planningConfig keeps whatever was live in the form
+          // before submission (usually all-unset/"use default"), and the picker's own "no
+          // explicit pick -> case's CURRENT default" fallback re-evaluates on every render. That
+          // silently reattaches this already-completed run to any version created afterward
+          // (e.g. a Demand Ordering Generate a moment later) while its own banner still reads
+          // "Viewing run #<id>" — confirmed live, the exact "no good" repro after the previous
+          // fixes: submitting all-default, then creating a Demand Ordering config, made the
+          // still-displayed just-submitted run's picker show the brand-new version.
+          if (freshId != null) {
+            try {
+              const full = await getPlanRun(id, freshId);
+              if (full.config) {
+                setPlanningConfig(restoreExternalConfigRefs(normalizePlanningConfig(full.config as PlanningConfig), full));
+              }
+            } catch { /* non-fatal — config panel just won't reflect this run's own refs */ }
+          }
           try { sessionStorage.removeItem(`criticality-case-${id}`); } catch { /* ignore */ }
           // Soundness needs a persisted run_id; criticality also requires save. If either
           // toggle is on, save first, then trigger their respective async work.
