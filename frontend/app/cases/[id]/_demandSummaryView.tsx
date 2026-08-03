@@ -17,10 +17,15 @@ export type WoBatchScale = 'none' | 'weekly' | 'biweekly' | 'monthly' | 'all';
  *  order, and `buildSections` groups recursively, one level per array entry.
  *
  *  'customer' groups by a GroupRow's own customer-SET (see GroupRow.customer_ids's own doc) —
- *  unlike prod_area/location, a group's customer set isn't guaranteed to be a single value, so a
- *  section here can represent several customers at once (e.g. "CustomerA, CustomerB") rather than
- *  splitting into one section per customer — see buildSections' own doc for why. */
-export type WoPivotField = 'customer' | 'prod_area' | 'location';
+ *  unlike prod_area/method/location, a group's customer set isn't guaranteed to be a single value,
+ *  so a section here can represent several customers at once (e.g. "CustomerA, CustomerB") rather
+ *  than splitting into one section per customer — see buildSections' own doc for why.
+ *
+ *  'method', like prod_area/location, is already part of a GroupRow's own leaf-level grouping key
+ *  (see the groupMap key in this file's own grouping pass) — one uniform value per group, so it
+ *  pivots the same straightforward way. Default order (see _CaseSectionPage.tsx's
+ *  demandSummaryPivotFields): Customer, PROD_AREA, Method, then optional Location. */
+export type WoPivotField = 'customer' | 'prod_area' | 'method' | 'location';
 
 const GRANULARITIES: WoBatchScale[] = ['none', 'weekly', 'biweekly', 'monthly', 'all'];
 const DAY_MS = 86_400_000;
@@ -58,6 +63,19 @@ function sortThBtnStyle(active: boolean): React.CSSProperties {
     fontWeight: active ? 600 : 400,
   };
 }
+
+// Cell-value-as-hyperlink style — opens the sole contributing demand's pegging tree (see
+// `soleDemandIdForSpec`'s own doc for why only single-demand Customer-level cells get this).
+// Matches the app's other inline text-button links (e.g. the Work Orders table's demand column).
+const DEMAND_LINK_STYLE: React.CSSProperties = {
+  background: 'none',
+  border: 'none',
+  padding: 0,
+  color: '#60a5fa',
+  cursor: 'pointer',
+  textDecoration: 'underline',
+  font: 'inherit',
+};
 
 function pad2(n: number): string {
   return n < 10 ? `0${n}` : String(n);
@@ -206,7 +224,8 @@ function customerKeyFor(ids: string[]): string {
 function buildSections(groups: GroupRow[], by: WoPivotField): Section[] {
   const map = new Map<string, GroupRow[]>();
   for (const g of groups) {
-    const k = by === 'customer' ? customerKeyFor(g.customer_ids) : (by === 'prod_area' ? g.prod_area : g.location_id) || '(none)';
+    const k = by === 'customer' ? customerKeyFor(g.customer_ids)
+      : (by === 'prod_area' ? g.prod_area : by === 'method' ? g.method : g.location_id) || '(none)';
     if (!map.has(k)) map.set(k, []);
     map.get(k)!.push(g);
   }
@@ -247,6 +266,7 @@ export function DemandSummaryView({
   demands,
   pivotFields = [],
   horizonStart,
+  onOpenDemandPegging,
 }: {
   rows: WorkOrder[];
   /** Committed demands for this plan run — joined to `rows` by `demand_id` to resolve each WO's
@@ -262,6 +282,11 @@ export function DemandSummaryView({
   /** Ordered pivot dimensions — [] renders the flat (ungrouped) table; each entry adds one more
    *  nested section level, in the order given (see WoPivotField's own doc). */
   pivotFields?: WoPivotField[];
+  /** Opens the caller's own demand-pegging popup (the same one the Work Orders/Detail tables use)
+   *  for the given demand_id. When omitted, cell values render as plain text — no hyperlinks. Only
+   *  ever called for a Customer-level cell that traces to exactly one demand — see
+   *  `soleDemandIdForSpec`'s own doc. */
+  onOpenDemandPegging?: (demandId: string) => void;
 }) {
   const tP = useTranslations('planning');
   const locale = useLocale();
@@ -334,15 +359,15 @@ export function DemandSummaryView({
   // by the joined label directly would silently miss every multi-customer section. Callers must
   // instead resolve a section's OWN customer_ids (via `sectionCustomerIds`) and look up each one.
   const demandsByCustomerId = useMemo(() => {
-    const map = new Map<string, Array<{ requestIso: string; qty: number }>>();
+    const map = new Map<string, Array<{ requestIso: string; qty: number; demandId: string }>>();
     for (const d of Array.from(demandById.values())) {
-      if (!d.request_time) continue;
+      if (!d.request_time || !d.demand_id) continue;
       const requestIso = normalizeIso(d.request_time);
       if (!requestIso) continue;
       const key = d.customer_id ?? '(none)';
       const qty = Number(d.requested_qty ?? d.quantity) || 0;
       if (!map.has(key)) map.set(key, []);
-      map.get(key)!.push({ requestIso, qty });
+      map.get(key)!.push({ requestIso, qty, demandId: d.demand_id });
     }
     return map;
   }, [demandById]);
@@ -357,7 +382,7 @@ export function DemandSummaryView({
     return Array.from(set).sort();
   };
 
-  const demandsForSection = (customerIds: string[]): Array<{ requestIso: string; qty: number }> => {
+  const demandsForSection = (customerIds: string[]): Array<{ requestIso: string; qty: number; demandId: string }> => {
     if (customerIds.length === 0) return demandsByCustomerId.get('(none)') ?? [];
     return customerIds.flatMap((cid) => demandsByCustomerId.get(cid) ?? []);
   };
@@ -606,6 +631,24 @@ export function DemandSummaryView({
     return sum;
   };
 
+  /** A Customer section's cell hyperlink target: the ONE demand_id every demand landing in this
+   *  bucket traces back to, or null once a second, different one shows up (a cell shared across
+   *  several demands has no single pegging tree to jump to — stays plain, unclickable text).
+   *  Mirrors `demandQtyForSpec`'s own bucket matching, just collecting demand_ids instead of
+   *  summing qty. Only ever consulted for Customer-level rows (`demandCustomerIds !== undefined`
+   *  in `renderAggregateRow`) — PROD_AREA/Method/Location aggregate rows stay unlinked. */
+  const soleDemandIdForSpec = (customerIds: string[], spec: ColSpec): string | null => {
+    const list = demandsForSection(customerIds);
+    const scale = spec.type === 'top' ? granularity : drillPlan.finerByTop.get(spec.topKey)!;
+    let found: string | null = null;
+    for (const d of list) {
+      if (bucketKeyFor(d.requestIso, scale) !== spec.bucket.key) continue;
+      if (found !== null && found !== d.demandId) return null;
+      found = d.demandId;
+    }
+    return found;
+  };
+
   const renderSectionSummary = (label: string, groupCount: number, total: number) => (
     <span>
       <strong style={{ color: '#f4f4f5' }}>{label}</strong>
@@ -659,6 +702,9 @@ export function DemandSummaryView({
           const sum = demandCustomerIds !== undefined
             ? demandQtyForSpec(demandCustomerIds, spec)
             : groups.reduce((s, grp) => s + (getCellForSpec(grp, spec)?.qty ?? 0), 0);
+          const demandId = onOpenDemandPegging && sum && demandCustomerIds !== undefined
+            ? soleDemandIdForSpec(demandCustomerIds, spec)
+            : null;
           return (
             <td
               key={spec.type === 'top' ? spec.bucket.key : `${spec.topKey}|${spec.bucket.key}`}
@@ -667,7 +713,16 @@ export function DemandSummaryView({
                 background: bg, color: sum ? '#e4e4e7' : '#3f3f46', fontWeight: 600,
               }}
             >
-              {sum ? qtyFmt(sum) : '–'}
+              {!sum ? '–' : demandId ? (
+                <button
+                  type="button"
+                  title={tP('supExplain.openDemandPegging')}
+                  onClick={() => onOpenDemandPegging!(demandId)}
+                  style={{ ...DEMAND_LINK_STYLE, fontWeight: 600 }}
+                >
+                  {qtyFmt(sum)}
+                </button>
+              ) : qtyFmt(sum)}
             </td>
           );
         })}
