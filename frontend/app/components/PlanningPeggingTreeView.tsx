@@ -74,6 +74,11 @@ type NodeProps = Omit<PlanningPeggingTreeProps, 'tree'> & {
   path: string;
   depth: number;
   xlink: boolean;
+  /** Sum of any sibling negative_inventory=true leaves' quantity (already negative) in the
+   *  same children list — flags the purchase/WO netted against them (mirroring the Work
+   *  orders table's ⚠ badge) and lets its label show contributed/total instead of just the
+   *  enlarged total. Undefined when no such sibling exists. */
+  siblingNegativeInventoryQty?: number;
 };
 
 /** "Quantity limited by" / "Delayed by" link — the mechanical, local replacement for the old
@@ -143,6 +148,7 @@ function NodeView({
   explanationExpanded, onToggleExplanation,
   workOrderRootQty, contextDemandId,
   consolidatedSourceResolver, hideLotCount,
+  siblingNegativeInventoryQty,
 }: NodeProps): JSX.Element {
   const t = useTranslations('pegging');
   const rawChildren = node.children ?? [];
@@ -160,11 +166,25 @@ function NodeView({
   if (isLegacyBlockedWo) childrenList = [];
 
   // OR-relation: hide failed alternatives when at least one path contributed.
+  // Math.abs(): a negative_inventory=true supply leaf (a pre-existing deficit netted
+  // against a sibling purchase/WO) legitimately contributes a NEGATIVE amount — a plain
+  // `> 1e-9` check treats it as "didn't contribute" and silently drops it from the tree.
   if (!isLegacyBlockedWo && node.children_relation === 'or' && childrenList.length > 1) {
-    const contribCount = childrenList.reduce((n, c) => n + (childContrib(c) > 1e-9 ? 1 : 0), 0);
+    const contribCount = childrenList.reduce((n, c) => n + (Math.abs(childContrib(c)) > 1e-9 ? 1 : 0), 0);
     if (contribCount > 0 && contribCount < childrenList.length) {
-      childrenList = childrenList.filter((c) => childContrib(c) > 1e-9);
+      childrenList = childrenList.filter((c) => Math.abs(childContrib(c)) > 1e-9);
     }
+  }
+  // Display-only reorder: a negative_inventory=true leaf must stay FIRST in the underlying
+  // data (reconcile()'s bottom-up pass relies on that order — see PlanningEngine.kt's
+  // NegativeInventoryLot doc), but reads more naturally shown AFTER the purchase it offsets,
+  // as a "netted against" annotation rather than the lead entry. Reordering only the rendered
+  // list, never the data itself.
+  if (childrenList.some((c) => c.negative_inventory)) {
+    childrenList = [
+      ...childrenList.filter((c) => !c.negative_inventory),
+      ...childrenList.filter((c) => c.negative_inventory),
+    ];
   }
 
   // Consolidated supply source trees (only resolvable if the parent provides
@@ -238,7 +258,14 @@ function NodeView({
           const wavePart = !hideLotCount && waveCount && lotCount && cap && cap > 1 && waveCount < lotCount
             ? ` · ${waveCount} wave${waveCount > 1 ? 's' : ''} of up to ${cap} parallel`
             : '';
-          return `${node.method} ${node.product_id} @ ${node.location_id ?? '–'} · ${qtyFmt(qty)}${node.end_time ? ` · end ${node.end_time}` : ''}${lotPart}${wavePart}`;
+          // Netted against a sibling negative-inventory leaf: this WO's own quantity is the
+          // REAL total purchase (includes covering that deficit), but only part of it counts
+          // toward the parent's own need — show both, same "contributed / total" shape as the
+          // demand-node label above.
+          const qtyPart = siblingNegativeInventoryQty
+            ? `${qtyFmt(qty + siblingNegativeInventoryQty)} / ${qtyFmt(qty)}`
+            : qtyFmt(qty);
+          return `${node.method} ${node.product_id} @ ${node.location_id ?? '–'} · ${qtyPart}${node.end_time ? ` · end ${node.end_time}` : ''}${lotPart}${wavePart}`;
         })()
       : isOperation
         ? (() => {
@@ -274,7 +301,10 @@ function NodeView({
               return parts.join(' · ');
             })()
           : node.type === 'supply'
-            ? `${node.product_id} @ ${node.location_id ?? '–'} · ${qtyFmt(Number(node.quantity ?? 0))}${node.supply_id ? ` · ${node.supply_id}` : ''}`
+            // negative_inventory: show the magnitude — the ⚠ badge already carries the "this is
+            // a deficit" meaning, so a signed "-16" next to it reads as a confusing double
+            // negative. The underlying signed quantity is untouched (reconcile() needs it).
+            ? `${node.product_id} @ ${node.location_id ?? '–'} · ${qtyFmt(Math.abs(Number(node.quantity ?? 0)))}${node.supply_id ? ` · ${node.supply_id}` : ''}`
             : `${node.product_id} @ ${node.location_id ?? '–'} · ${qtyFmt(Number(node.quantity ?? 0))}`;
 
   const indentPx = 12;
@@ -353,6 +383,18 @@ function NodeView({
         <span style={{ width: 14, flexShrink: 0 }}>{expandable ? (isExpanded ? '▼' : '▶') : '·'}</span>
         <span style={{ width: 18, flexShrink: 0, fontSize: '0.9em', color: typeColor }} title={typeLabel}>{icon}</span>
         <span style={{ flex: 1, color: typeColor }}>{label}</span>
+        {node.negative_inventory && (
+          <span
+            title={t('negativeInventoryLeaf')}
+            style={{ color: '#f87171', cursor: 'help', flexShrink: 0 }}
+          >⚠</span>
+        )}
+        {siblingNegativeInventoryQty != null && (
+          <span
+            title={t('negativeInventoryWo', { qty: qtyFmt(-siblingNegativeInventoryQty) })}
+            style={{ color: '#f87171', cursor: 'help', flexShrink: 0 }}
+          >⚠</span>
+        )}
       </button>
       {node.type === 'work_order' && node.method_choice_explanation && onToggleExplanation && (
         <div style={{ marginTop: 4, marginLeft: 4, fontSize: '0.75rem', color: '#a1a1aa' }}>
@@ -392,25 +434,33 @@ function NodeView({
             </div>
           )}
           {childrenList.length > 0
-            ? childrenList.map((child, i) => (
-                <NodeView
-                  key={i}
-                  node={child}
-                  path={`${path}-${i}`}
-                  depth={depth + 1}
-                  xlink={xlink}
-                  expanded={expanded}
-                  onToggle={onToggle}
-                  matchPath={matchPath}
-                  matchPaths={matchPaths}
-                  explanationExpanded={explanationExpanded}
-                  onToggleExplanation={onToggleExplanation}
-                  workOrderRootQty={null}
-                  contextDemandId={contextDemandId}
-                  consolidatedSourceResolver={consolidatedSourceResolver}
-                  hideLotCount={hideLotCount}
-                />
-              ))
+            ? (() => {
+                const negativeInventorySiblingQty = childrenList
+                  .filter((c) => c.negative_inventory)
+                  .reduce((sum, c) => sum + Number(c.quantity ?? 0), 0);
+                return childrenList.map((child, i) => (
+                  <NodeView
+                    key={i}
+                    node={child}
+                    path={`${path}-${i}`}
+                    depth={depth + 1}
+                    xlink={xlink}
+                    expanded={expanded}
+                    onToggle={onToggle}
+                    matchPath={matchPath}
+                    matchPaths={matchPaths}
+                    explanationExpanded={explanationExpanded}
+                    onToggleExplanation={onToggleExplanation}
+                    workOrderRootQty={null}
+                    contextDemandId={contextDemandId}
+                    consolidatedSourceResolver={consolidatedSourceResolver}
+                    hideLotCount={hideLotCount}
+                    siblingNegativeInventoryQty={
+                      negativeInventorySiblingQty && !child.negative_inventory ? negativeInventorySiblingQty : undefined
+                    }
+                  />
+                ));
+              })()
             : consolidatedSourceTrees.length > 0
               ? null
               : node.type === 'demand'

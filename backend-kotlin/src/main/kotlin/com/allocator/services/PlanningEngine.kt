@@ -754,6 +754,17 @@ internal fun applyAppSpecificConfig(
  */
 private data class ConsumedBucket(val supplyId: String?, val qty: Double, val commitTime: String?)
 
+/**
+ * One negative-QTY row in `supply.csv` at (product_id, location_id) — a pre-existing deficit
+ * (already-negative starting inventory). `qty` is stored negative (the raw row value).
+ * Deliberately kept OUT of [IndexedInventory]'s FIFO pool (see negativeInventoryPending's own
+ * doc on [plan]) so it never reaches [consumeFromInventory]'s critical-material budget
+ * machinery (perLotBudget/demandConsumed/branchConsumed), which assumes non-negative
+ * remaining caps throughout. Instead it's absorbed once, by the first demand that triggers a
+ * PURCHASE work order at this exact node — see planMethodSlot's purchase branch.
+ */
+data class NegativeInventoryLot(val supplyId: String?, val qty: Double, val supplyDate: String?)
+
 private fun consumeFromInventory(
     inventory: MutableList<MutableMap<String, Any?>>,
     productId: String,
@@ -1902,6 +1913,14 @@ internal data class MethodSlotResult(
      * dependent, must NOT be cached). Default false.
      */
     val immediateBottleneckTrulyStructural: Boolean = false,
+    /**
+     * Set only in the "purchase" branch when this call absorbed one or more pending
+     * [NegativeInventoryLot]s for (productId, locationId) — the deficit already baked into
+     * this WO's own (enlarged) quantity. Caller ([plan]) uses this to emit a matching sibling
+     * `type="supply", negative_inventory=true` pegging leaf — see plan()'s doc on why it must
+     * be placed BEFORE the WO node in the demand's children list (reconcile() ordering).
+     */
+    val negativeInventoryAbsorbed: List<NegativeInventoryLot>? = null,
 )
 
 /**
@@ -1936,6 +1955,8 @@ internal fun planMethodSlot(
     methodChoiceExplanation: String,
     feasibilityCache: MutableMap<Pair<String, String>, Int>? = null,
     structuralFailedMakes: MutableMap<Pair<String, String>, String>? = null,
+    /** See [plan]'s doc. Consulted (and drained) only in the "purchase" branch below. */
+    negativeInventoryPending: MutableMap<Pair<String, String>, List<NegativeInventoryLot>>? = null,
     initialBudget: Map<String, Double>? = null,
     /** See [plan]'s doc — same cumulative, never-restored, demand-wide consumption tracker. */
     demandConsumed: MutableMap<String, Double>? = null,
@@ -2194,7 +2215,7 @@ internal fun planMethodSlot(
         // nested fanout further down was actually tagged with.
         val isAndGroupChild = activeChildren.size > 1
         val cBranchLineage = if (isAndGroupChild) extendLineage(branchLineage, cPid, cLid) else branchLineage
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, andSiblingCaps = andSiblingCaps, branchLotCap = cBranchLotCap, branchConsumed = cBranchConsumed, branchLineage = cBranchLineage, andSiblingDominators = andSiblingDominators, branchDominator = cBranchDominator, diamondRecipientCaps = diamondRecipientCaps, diamondRecipients = diamondRecipients, diamondCriticalEntitlement = diamondCriticalEntitlement, diamondReserveFraction = diamondReserveFraction, intraBudget = intraBudget, intraBudgetBaseline = intraBudgetBaseline, insideDiamondRecipient = cInsideDiamondRecipient, horizonStart = horizonStart)
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, negativeInventoryPending = negativeInventoryPending, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, andSiblingCaps = andSiblingCaps, branchLotCap = cBranchLotCap, branchConsumed = cBranchConsumed, branchLineage = cBranchLineage, andSiblingDominators = andSiblingDominators, branchDominator = cBranchDominator, diamondRecipientCaps = diamondRecipientCaps, diamondRecipients = diamondRecipients, diamondCriticalEntitlement = diamondCriticalEntitlement, diamondReserveFraction = diamondReserveFraction, intraBudget = intraBudget, intraBudgetBaseline = intraBudgetBaseline, insideDiamondRecipient = cInsideDiamondRecipient, horizonStart = horizonStart)
         // Prefer the unrounded "quantity_precise" (see committedRow's doc) over the rounded
         // "quantity" — this feeds the AND-min ratio (computeRawAchievable) below, and reading
         // the rounded value here would let a genuinely-achieved fractional child (e.g. 0.4999
@@ -2664,17 +2685,36 @@ internal fun planMethodSlot(
 
     // 5) Timing + work orders
     val (startDt, startDtDominator) = computeStartDt(reqDt, leadDays, commitTimesWithSource, data, config, horizonStart)
-    val woResult = buildWorkOrders(productId, productionLocation, achievableParentQty, leadDays, startDt, m, demandId, data)
+    val methodType = m["type"] as? String ?: ""
+    // Negative starting-inventory absorption — PURCHASE only (raw materials; see
+    // NegativeInventoryLot's doc). A purchase WO is elastic (buildWoNode/reconcile() both
+    // already treat its quantity as "whatever's actually bought," never a hard ceiling from a
+    // prior pass), so enlarging it here to also cover a pre-existing deficit is a real,
+    // additional purchase — not bookkeeping. Only commit (remove from the pending map) once
+    // this candidate is actually about to produce a real WO (achievableParentQty > 0) —
+    // purchase has no AND-bottleneck block path, so reaching here means it will succeed.
+    val absorbedNegativeLots: List<NegativeInventoryLot>? =
+        if (methodType == "purchase" && achievableParentQty > 1e-9 && negativeInventoryPending != null) {
+            negativeInventoryPending.remove(Pair(productId, productionLocation))
+        } else null
+    val negativeInventoryDeficit = absorbedNegativeLots?.sumOf { -it.qty } ?: 0.0
+    val purchaseWoQty = achievableParentQty + negativeInventoryDeficit
+    // Note: NOT stamped onto the flat wos/work_orders_native records — timing resequencing
+    // (fixTimingFromPegging/resequenceFromPegging) regenerates native WO rows FROM the
+    // pegging tree rather than passing this list through, so a custom field here would be
+    // silently lost before reaching the API response (confirmed live). The UI instead
+    // cross-references `supply_allocations` (qty_consumed < 0 for this supply_id), which is
+    // extracted straight from the same pegging tree and reliably survives.
+    val woResult = buildWorkOrders(productId, productionLocation, purchaseWoQty, leadDays, startDt, m, demandId, data)
     val wos = woResult.wos
     val lotCount = woResult.lotCount
     val lastEnd = woResult.lastEnd
     val lotSizeVal = woResult.lotSizeVal
-    val methodType = m["type"] as? String ?: ""
     // Purchase leaves have no source supply record (they are new procurement),
     // so surface the vendor as their identifier in the supply-leaf table.
-    val woChildren = if (methodType == "purchase") listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to roundQty(achievableParentQty), "quantity_precise" to achievableParentQty, "vendor_id" to m["vendor_id"], "start_time" to formatDate(startDt), "end_time" to formatDate(lastEnd), "children" to emptyList<Any>()))
+    val woChildren = if (methodType == "purchase") listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to roundQty(purchaseWoQty), "quantity_precise" to purchaseWoQty, "vendor_id" to m["vendor_id"], "start_time" to formatDate(startDt), "end_time" to formatDate(lastEnd), "children" to emptyList<Any>()))
                      else childPeggingNodes
-    val methodPeggingNode = buildWoNode(productId, productionLocation, achievableParentQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodChoiceExplanation, variantExplanation, woChildrenRelation, woChildren, woGroupId = woResult.woGroupId, data = data, quantityDominator = qtyDominatorForWoNode, timeDominator = startDtDominator)
+    val methodPeggingNode = buildWoNode(productId, productionLocation, purchaseWoQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodChoiceExplanation, variantExplanation, woChildrenRelation, woChildren, woGroupId = woResult.woGroupId, data = data, quantityDominator = qtyDominatorForWoNode, timeDominator = startDtDominator)
 
     return MethodSlotResult(
         achievableQty = achievableParentQty,
@@ -2683,6 +2723,7 @@ internal fun planMethodSlot(
         latestCommit = lastEnd,
         anyChildShort = anyChildShort,
         blockedReason = null,
+        negativeInventoryAbsorbed = absorbedNegativeLots,
     )
 }
 
@@ -2759,6 +2800,15 @@ fun plan(
      * Cuts the per-demand recursion cost on shared structurally-doomed subtrees.
      */
     structuralFailedMakes: MutableMap<Pair<String, String>, String>? = null,
+    /**
+     * Negative starting-inventory deficits pending absorption, by (product_id, location_id),
+     * scoped to one commit pass (see [NegativeInventoryLot]'s doc and legacyCommit's
+     * `sharedNegativeInventoryPending`). Threaded through unchanged to every recursive call —
+     * a deficit can sit at any level of a BOM tree, not just a top-level demand's own node.
+     * Absorbed (entry removed) the first time a PURCHASE work order is built for that
+     * (pid, lid), in planMethodSlot's purchase branch — never for make/move.
+     */
+    negativeInventoryPending: MutableMap<Pair<String, String>, List<NegativeInventoryLot>>? = null,
     /**
      * Optional iter-0 snapshot of consolidation-engine per-leaf budget caps
      * for THIS demand. Used by planMethodSlot to identify the *origin* leaf
@@ -2976,6 +3026,7 @@ fun plan(
             budget           = budget,
             feasibilityCache = feasibilityCache,
             structuralFailedMakes = structuralFailedMakes,
+            negativeInventoryPending = negativeInventoryPending,
             initialBudget    = initialBudget,
             demandConsumed   = demandConsumed,
             nodeQtyCaps      = nodeQtyCaps,
@@ -3656,6 +3707,10 @@ fun plan(
     val cap = methodCfg.maxMethods.coerceAtMost(candidates.size)
     val combinedWos = mutableListOf<Map<String, Any?>>()
     val combinedPegging = mutableListOf<Map<String, Any?>>()
+    // Set at most once per node (negativeInventoryPending is drained on first absorption) —
+    // see planMethodSlot's purchase branch and this function's use of it below, right before
+    // `peggingChildren.addAll(combinedPegging)`.
+    var absorbedNegativeInventory: List<NegativeInventoryLot>? = null
     var residual = demandNetQty
     var totalAchievable = 0.0
     var latestCommit: LocalDate? = null
@@ -3942,6 +3997,7 @@ fun plan(
             methodChoiceExplanation = label,
             feasibilityCache = feasibilityCache,
             structuralFailedMakes = structuralFailedMakes,
+            negativeInventoryPending = negativeInventoryPending,
             initialBudget = initialBudget,
             demandConsumed = demandConsumed,
             nodeQtyCaps = nodeQtyCaps,
@@ -3990,6 +4046,9 @@ fun plan(
         // (including blocked ones with zero qty) — informative for the user even when a
         // candidate committed nothing.
         combinedPegging.add(slotPeggingNode)
+        if (attempt.negativeInventoryAbsorbed != null) {
+            absorbedNegativeInventory = attempt.negativeInventoryAbsorbed
+        }
         if (attempt.blockedReason != null) {
             priorAttemptWasBlocked = true
             lastBlockedReason = attempt.blockedReason
@@ -4098,6 +4157,26 @@ fun plan(
             quantityDominator = (ownLotRefs + qtyDominatorForDemand).dedupBySupply()))
     }
 
+    // Negative-inventory sibling leaf(s) — MUST be added before combinedPegging so they
+    // precede the enlarged purchase WO in the demand node's children. reconcile()'s "demand"
+    // case walks children in order, feeding each one `remaining` and subtracting whatever it
+    // reports back; a `type="supply", negative_inventory=true` leaf (see reconcile()'s "supply"
+    // case) reports its own literal (negative) quantity unclamped, so processing it FIRST
+    // inflates `remaining` by the deficit BEFORE the elastic purchase WO is asked for its
+    // share — which is what lets the WO's real, enlarged size survive reconcile() correctly
+    // instead of being clipped back down to this demand's own (smaller) net need.
+    absorbedNegativeInventory?.forEach { lot ->
+        peggingChildren.add(mapOf(
+            "type" to "supply",
+            "product_id" to productId,
+            "location_id" to locationId,
+            "supply_id" to lot.supplyId,
+            "quantity" to lot.qty,
+            "commit_time" to (lot.supplyDate ?: reqTimeStr),
+            "negative_inventory" to true,
+            "children" to emptyList<Any>(),
+        ))
+    }
     // Some commit. Combine all attempted WOs (success + blocked) in pegging. Siblings
     // under the demand are additive supply paths (candidate 1 + candidate 2 each cover
     // part of the demand) — mark "or" so the UI labels them as alternatives.
@@ -4431,6 +4510,17 @@ internal fun reconcile(
             return (node + ("quantity" to supplied)) to supplied
         }
         "supply" -> {
+            if (node["negative_inventory"] == true) {
+                // A pre-existing deficit, not a target-driven allocation — a fixed historical
+                // fact (see NegativeInventoryLot's doc), not fungible stock. Pass its literal
+                // (negative) quantity through UNCLAMPED regardless of `target`: the sibling
+                // "demand" case's `remaining -= g` loop (below) relies on this negative `g` to
+                // inflate what it hands the enlarged purchase WO that absorbed it — the
+                // `.coerceAtLeast(0.0)` a genuine supply lot needs (below) would floor this to
+                // 0 and silently erase the deficit here instead.
+                val q = (node["quantity"] as? Number)?.toDouble() ?: 0.0
+                return node to q
+            }
             // Prefer the unrounded "quantity_precise" when present (see committedRow's doc) —
             // a supply lot is genuinely fixed (raw, existing inventory), so it stays capped.
             val q = ((node["quantity_precise"] as? Number) ?: (node["quantity"] as? Number))?.toDouble() ?: 0.0
@@ -6043,7 +6133,14 @@ internal fun extractSupplyAllocations(
             } else {
                 rawQty  // synthetic/non-physical bucket — no cap
             }
-            if (effectiveQty > 1e-9) {
+            // abs(), not effectiveQty > 1e-9: a negative_inventory=true leaf (see
+            // NegativeInventoryLot's doc) legitimately carries a negative qty_consumed — it's
+            // netting a pre-existing deficit against the sibling purchase that absorbed it, not
+            // a positive draw. A plain positivity gate here silently drops it from
+            // supply_allocations, which is what the UI's Supplies tab reads — leaving that
+            // supply row showing 0 consumed / 0 pegged demands despite the pegging tree
+            // correctly recording it (confirmed live: case inno_neg_inv, supply_id=10).
+            if (kotlin.math.abs(effectiveQty) > 1e-9) {
                 result.add(mutableMapOf(
                     "supply_id"    to supplyId,
                     "demand_id"    to (demandId ?: ""),
@@ -6075,12 +6172,14 @@ internal fun extractSupplyAllocations(
             } else {
                 rawQty  // synthetic/non-physical bucket — no cap
             }
-            if (effectiveQty > 1e-9) {
+            // abs() — see walk()'s identical fix for why a negative_inventory leaf's negative
+            // qty_consumed must not be dropped by a plain positivity gate.
+            if (kotlin.math.abs(effectiveQty) > 1e-9) {
                 val totalWeight = weights.values.sum()
                 if (totalWeight > 1e-12) {
                     for ((did, w) in weights) {
                         val share = effectiveQty * (w / totalWeight)
-                        if (share > 1e-9) {
+                        if (kotlin.math.abs(share) > 1e-9) {
                             result.add(mutableMapOf(
                                 "supply_id"    to supplyId,
                                 "demand_id"    to did,
@@ -6238,6 +6337,14 @@ internal fun legacyCommit(
     /** Optional shared structural-failure memo, see plan()'s docs. */
     sharedStructuralFailedMakes: MutableMap<Pair<String, String>, String>? = null,
     /**
+     * Negative starting-inventory deficits by (product_id, location_id), scoped to this one
+     * commit pass. Consumed (entry removed) by whichever demand is the FIRST, in processing
+     * order, to trigger a PURCHASE work order at that node — see planMethodSlot's purchase
+     * branch and [NegativeInventoryLot]'s doc. `null`/absent (pre-existing default) means no
+     * negative-inventory rows exist for this run — identical to today's behavior.
+     */
+    sharedNegativeInventoryPending: MutableMap<Pair<String, String>, List<NegativeInventoryLot>>? = null,
+    /**
      * Optional iter-0 snapshot of the consolidation engine's per-(demand, leaf)
      * allocation, captured BEFORE the cap-refinement loop in runV2Iterated
      * smears them. Used by plan()/planMethodSlot() to identify the *origin*
@@ -6293,6 +6400,8 @@ internal fun legacyCommit(
     // `data` and `purchase_allowed` don't change mid-commit.
     val feasibilityCache: MutableMap<Pair<String, String>, Int> = sharedFeasibilityCache ?: mutableMapOf()
     val structuralFailedMakes: MutableMap<Pair<String, String>, String> = sharedStructuralFailedMakes ?: mutableMapOf()
+    val negativeInventoryPending: MutableMap<Pair<String, String>, List<NegativeInventoryLot>> =
+        sharedNegativeInventoryPending ?: mutableMapOf()
 
     // Build hot-path indexes once for all demands. These eliminate the O(N) linear
     // scans in getMethods (11K rows), variantsForMake (14K rows), and
@@ -6342,6 +6451,7 @@ internal fun legacyCommit(
             budget = demandBudget,
             feasibilityCache = feasibilityCache,
             structuralFailedMakes = structuralFailedMakes,
+            negativeInventoryPending = negativeInventoryPending,
             initialBudget = iter0Allocation?.get(demandId),
             demandConsumed = demandConsumed,
             nodeQtyCaps = achievableQtyMaps?.get(demandId),
@@ -6444,7 +6554,28 @@ private fun runPlanningOnePass(
      *  for this case) preserves today's exact `(priority, demand_id)` sort. */
     demandOrder: Map<String, Int>? = null,
 ): RunPlanningResult {
-    val inventory: MutableList<MutableMap<String, Any?>> = (data["supply"] ?: emptyList()).map { s ->
+    // Negative-QTY supply rows represent pre-existing deficits, not fungible FIFO stock — split
+    // them off here so they never enter the FIFO pool below (see NegativeInventoryLot's doc).
+    // The rows stay in `data["supply"]` unchanged (untouched map), so SoundnessChecker's
+    // supply_id lookups (R7a/R7b) still resolve them normally.
+    val negativeInventoryLots: Map<Pair<String, String>, List<NegativeInventoryLot>> =
+        (data["supply"] ?: emptyList())
+            .filter { ((it["qty"] as? Number)?.toDouble() ?: 0.0) < 0.0 }
+            .groupBy {
+                Pair((it["product_id"] as? String)?.trim() ?: "", (it["location_id"] as? String)?.trim() ?: "")
+            }
+            .mapValues { (_, rows) ->
+                rows.map {
+                    NegativeInventoryLot(
+                        supplyId = it["supply_id"] as? String,
+                        qty = (it["qty"] as? Number)?.toDouble() ?: 0.0,
+                        supplyDate = it["supply_date"] as? String,
+                    )
+                }
+            }
+    val inventory: MutableList<MutableMap<String, Any?>> = (data["supply"] ?: emptyList())
+        .filter { ((it["qty"] as? Number)?.toDouble() ?: 0.0) >= 0.0 }
+        .map { s ->
         mutableMapOf(
             "product_id" to (s["product_id"] ?: ""),
             "location_id" to (s["location_id"] ?: ""),
@@ -6604,6 +6735,7 @@ private fun runPlanningOnePass(
         config            = config,
         useTaggedLookup   = false,
         progressCallback  = commitProgressCallback,
+        sharedNegativeInventoryPending = negativeInventoryLots.toMutableMap(),
         budgets           = budgetsForCommit,
         iter0Allocation   = pristineBudgetCaps,
         achievableQtyMaps = achievableQtyMaps,

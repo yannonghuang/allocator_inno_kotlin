@@ -534,6 +534,8 @@
       "filterPeggedOnlyTooltip": "Show only the selected work order and its upstream/downstream pegged work orders",
       "filterPlaceholder": "Filter by product, location, method…",
       "shared": "shared",
+      "negativeInventoryTooltip": "Absorbs negative starting inventory: {qty}",
+      "negativeInventoryTooltipSupply": "Absorbs negative starting inventory: {qty} (supply {supplyIds})",
       "columns": {
         "product": "Product",
         "location": "Location",
@@ -1068,6 +1070,7 @@
       "scarcityBomTooltip": "BOM-derived consumption {demand} / total supply {supply}: this is an intermediate material; {demand} is what upstream user demands consumed via BOM explosion. Committed-based — capped at supply availability, so true requested pressure could be higher.",
       "scarcityShortageTooltip": "Demand {demand} / no supply available — total shortage.",
       "scarcityNoneTooltip": "No user demand for this product, and no BOM-derived consumption — material is unused.",
+      "negativeInventoryTooltip": "Negative starting inventory — absorbed by the first purchase at this product/location",
       "columns": {
         "supplyId": "Supply ID",
         "product": "Product",
@@ -1224,7 +1227,9 @@
     "consumerBreakdown": "required in the following demands — one consolidated order, shared across them.",
     "consumerNote": "draws its share from the single consolidated order above",
     "noWorkOrders": "No work orders — planning could not fulfill this demand (no method or child failed).",
-    "noComponentBreakdown": "No component breakdown (leaf work order or depth-limited)."
+    "noComponentBreakdown": "No component breakdown (leaf work order or depth-limited).",
+    "negativeInventoryLeaf": "Negative starting inventory — netted against the sibling purchase/WO",
+    "negativeInventoryWo": "Absorbs negative starting inventory: {qty}"
   },
   "runDetail": {
     "backToCase": "← Case",

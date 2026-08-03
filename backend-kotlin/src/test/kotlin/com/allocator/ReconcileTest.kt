@@ -90,4 +90,53 @@ class ReconcileTest : FunSpec({
         // purchase sibling expands to its true need (0.36) and no longer dominates the group.
         supplied shouldBe (36.0 plusOrMinus 1e-6)
     }
+
+    // ── Negative starting inventory: demand-level netting ────────────────────
+
+    fun negativeInventoryLeaf(qty: Double, supplyId: String? = "NEG1"): Map<String, Any?> =
+        mapOf("type" to "supply", "quantity" to qty, "supply_id" to supplyId,
+              "negative_inventory" to true, "children" to emptyList<Any>())
+
+    test("demand node: a negative_inventory leaf placed BEFORE the purchase WO inflates what the WO is asked for") {
+        // Mirrors plan()'s own children ordering (negative leaf, then the enlarged WO) —
+        // see plan()'s doc on why order matters here: this "demand" case's greedy
+        // remaining-=g loop must see the (negative) deficit before it reconciles the WO,
+        // or the WO's real enlarged size gets clipped back down to the raw demand target.
+        val negLeaf = negativeInventoryLeaf(-1424.0)
+        val wo = purchaseWo(1924.0, purchaseLeaf(1924.0))
+        val demandNode = mapOf(
+            "type" to "demand", "quantity" to 500.0, "committed_qty" to 500.0,
+            "children" to listOf(negLeaf, wo),
+        )
+
+        val (reconciled, supplied) = reconcile(demandNode, 500.0, emptyMap(), null)
+
+        // The demand's own commitment nets back to its real ask, not the enlarged purchase.
+        supplied shouldBe (500.0 plusOrMinus 1e-9)
+        @Suppress("UNCHECKED_CAST")
+        val children = reconciled["children"] as List<Map<String, Any?>>
+        // The negative leaf survives verbatim (a fixed historical fact, not re-derived).
+        (children[0]["quantity"] as Number).toDouble() shouldBe (-1424.0 plusOrMinus 1e-9)
+        // The purchase WO keeps its real, enlarged size — NOT clipped to the 500 target.
+        (children[1]["quantity"] as Number).toDouble() shouldBe (1924.0 plusOrMinus 1e-9)
+    }
+
+    test("control: a negative_inventory leaf placed AFTER the WO does not inflate the WO (ordering matters)") {
+        // Documents the ordering requirement itself: reconcile()'s greedy loop only inflates
+        // `remaining` for children processed AFTER the negative leaf. plan() always places it
+        // first; this test pins down what happens if a future caller got that backwards.
+        val negLeaf = negativeInventoryLeaf(-1424.0)
+        val wo = purchaseWo(1924.0, purchaseLeaf(1924.0))
+        val demandNode = mapOf(
+            "type" to "demand", "quantity" to 500.0, "committed_qty" to 500.0,
+            "children" to listOf(wo, negLeaf),
+        )
+
+        val (reconciled, _) = reconcile(demandNode, 500.0, emptyMap(), null)
+        @Suppress("UNCHECKED_CAST")
+        val children = reconciled["children"] as List<Map<String, Any?>>
+        // WO was asked for the raw 500 target (negative leaf hadn't been seen yet) — purchase
+        // is elastic, so it simply grants exactly what it was asked, losing the enlargement.
+        (children[0]["quantity"] as Number).toDouble() shouldBe (500.0 plusOrMinus 1e-9)
+    }
 })
