@@ -83,8 +83,13 @@ const listVersionsFor: Record<ExternalKind, (caseId: number) => Promise<ConfigVe
  * Clicking a link drills into a read-only preview within this same slide-in (not a page
  * navigation) — a "← Back" link returns to this view. When [versionRefs] carries this run's
  * resolved version id for that object (see CaseConfigVersions' own doc), the preview fetches that
- * EXACT historical version — no longer "whatever is live now." Falls back to the case's current
- * default version for legacy (pre-versioning) runs, where no version id was ever recorded.
+ * EXACT historical version — no longer "whatever is live now." When no version id was recorded
+ * (this run genuinely used no config for that kind, or predates version tracking), shows "this
+ * run did not use a version of this config" instead of ever falling back to the case's CURRENT
+ * default — that fallback used to make an old run look retroactively reattached the moment a
+ * later run created/promoted a new default version for that kind (confirmed live: reloading an
+ * older run after a newer run's first-ever Generate call showed the older run "using" the new
+ * config, even though its stored version ref was still null in the DB).
  */
 export function ConfigDetailView({ config, caseId, versionRefs }: { config: Record<string, unknown>; caseId: number; versionRefs?: VersionRefs }) {
   const [drill, setDrill] = useState<ExternalKind | null>(null);
@@ -181,7 +186,23 @@ export function ExternalConfigDrilldown({ kind, caseId, versionId, onBack, conte
   const [aux, setAux] = useState<unknown>(null);
   const [versionMeta, setVersionMeta] = useState<ConfigVersion | null>(null);
 
+  // 'run' + no version ref means this run genuinely used no config for this kind (or predates
+  // version tracking) — never resolve that to whatever is CURRENTLY the case's default, or a run
+  // appears to retroactively change what it used the moment a later run creates/promotes a new
+  // default version (confirmed live: reloading an older run after a newer run's first-ever
+  // Generate call showed the older run "using" the newer run's config). Only 'live' callers (the
+  // Planning page's own picker, not tied to any past run) still want the current-default fallback.
+  const showsNoConfig = context === 'run' && versionId == null;
+
   useEffect(() => {
+    if (showsNoConfig) {
+      setLoading(false);
+      setError(null);
+      setRows([]);
+      setAux(null);
+      setVersionMeta(null);
+      return;
+    }
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -283,12 +304,12 @@ export function ExternalConfigDrilldown({ kind, caseId, versionId, onBack, conte
               ? `Historical version this run actually used${versionMeta?.comments ? ` — ${versionMeta.comments}` : ''}.`
               : `Selected version${versionMeta?.comments ? ` — ${versionMeta.comments}` : ''}.`)
           : (context === 'run'
-              ? 'Live current default version — this run predates version tracking, so its exact historical state was never captured (see ExternalConfigVersioningMigration.kt).'
+              ? 'This run did not use a version of this config.'
               : "Case's current default version.")}
       </div>
       {loading && <div style={{ color: '#71717a' }}>Loading…</div>}
       {error && <div style={{ color: '#f87171' }}>{error}</div>}
-      {!loading && !error && (
+      {!loading && !error && !showsNoConfig && (
         <div style={{ color: '#e4e4e7' }}>
           {renderView()}
         </div>
