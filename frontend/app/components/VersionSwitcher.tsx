@@ -140,14 +140,27 @@ export function VersionSwitcher({
                     >
                       {t('rename')}
                     </button>
-                    <button
-                      type="button"
-                      disabled={v.is_default || v.referenced}
-                      onClick={() => { if (confirm(t('confirmDelete'))) onDelete(v.id); }}
-                      style={{ ...btnStyle, padding: '2px 8px', color: '#f87171', opacity: (v.is_default || v.referenced) ? 0.4 : 1 }}
-                    >
-                      {t('delete')}
-                    </button>
+                    {(() => {
+                      // Deleting the default is only blocked when ANOTHER version exists to
+                      // promote first (setDefaultVersion can only promote an EXISTING version) —
+                      // matches CaseConfigVersioning.deleteVersion's own guard. The sole version
+                      // for a case+kind is always default (createVersion's first-version rule),
+                      // so unconditionally disabling on is_default made a fully-detached, never-
+                      // referenced solo version permanently undeletable through this button, even
+                      // after the backend was fixed to allow it.
+                      const blockedByDefault = v.is_default && versions.length > 1;
+                      const disabled = v.referenced || blockedByDefault;
+                      return (
+                        <button
+                          type="button"
+                          disabled={disabled}
+                          onClick={() => { if (confirm(t('confirmDelete'))) onDelete(v.id); }}
+                          style={{ ...btnStyle, padding: '2px 8px', color: '#f87171', opacity: disabled ? 0.4 : 1 }}
+                        >
+                          {t('delete')}
+                        </button>
+                      );
+                    })()}
                   </td>
                 </tr>
               ))}
