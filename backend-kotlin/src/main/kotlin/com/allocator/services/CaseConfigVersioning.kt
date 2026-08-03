@@ -260,13 +260,28 @@ object CaseConfigVersioning {
 
     /** Deletes a version's registry row (its data rows cascade-delete with it — see
      *  CaseAllocations.versionId et al.'s own doc). Throws if referenced by any run, or if it's
-     *  the case's current default (must set another version as default first). */
+     *  the case's default AND another version for this case+kind still exists (must set that
+     *  other one as default first — the invariant [resolveVersionId] assumes, "a version exists
+     *  ⇒ a default exists for that kind", would otherwise break).
+     *
+     *  Deleting the SOLE version for a case+kind is allowed even though it's necessarily the
+     *  default (every first version is, per [createVersion]) — [setDefaultVersion] can only
+     *  promote an EXISTING other version, so "set another as default first" is impossible when
+     *  there is no other version, making this a dead end otherwise (confirmed live: a case's only,
+     *  fully-detached-from-every-run Critical Raw Allocation version could never be removed).
+     *  Afterward the case simply has zero versions for that kind again — already a normal,
+     *  fully-supported state (a case never has to touch any of the 5 external config objects). */
     fun deleteVersion(caseId: Int, kind: ConfigVersionKind, versionId: Int) = transaction {
         val row = CaseConfigVersions.selectAll()
             .where { (CaseConfigVersions.id eq versionId) and (CaseConfigVersions.caseId eq caseId) and (CaseConfigVersions.kind eq kind.key) }
             .singleOrNull() ?: throw NoSuchElementException("Version not found")
         if (row[CaseConfigVersions.isDefault]) {
-            throw VersionIsDefaultException("Cannot delete the default version — set another version as default first")
+            val otherVersionExists = CaseConfigVersions.selectAll()
+                .where { (CaseConfigVersions.caseId eq caseId) and (CaseConfigVersions.kind eq kind.key) and (CaseConfigVersions.id neq versionId) }
+                .any()
+            if (otherVersionExists) {
+                throw VersionIsDefaultException("Cannot delete the default version — set another version as default first")
+            }
         }
         if (isVersionReferenced(versionId, kind)) {
             throw VersionInUseException("Version is referenced by an existing plan run or KB record — use Save As instead")
