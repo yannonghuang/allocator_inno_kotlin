@@ -103,10 +103,31 @@ class DemandOrderBuilderTest : FunSpec({
         ).map { it + ("quantity" to 30.0) },
     )
 
-    test("no Demand Ordering KB: default (priority, demand_id) order — D1 wins the scarce supply") {
+    test("no Demand Ordering KB: default chronological order — D1 wins the scarce supply (same due_time, tie-broken to D1)") {
         val result = runPlanning(scarceSupplyData(), config = nonCriticalConfig, demandOrder = null)
         committedQty(result.output, "D1") shouldBe (30.0 plusOrMinus 1e-6)
         committedQty(result.output, "D2") shouldBe (20.0 plusOrMinus 1e-6)
+    }
+
+    test("no Demand Ordering KB: default order is chronological by request_due_time, not demand_id") {
+        // D2 has the earlier due_time despite sorting after D1 alphabetically — proves runPlanning's
+        // own demandOrder==null default is (request_due_time, priority, demand_id), not a raw
+        // (priority, demand_id)/insertion-order fallback that would let D1 win here.
+        val data = mapOf(
+            "method_make" to emptyList<Map<String, Any?>>(),
+            "method_buy" to emptyList<Map<String, Any?>>(),
+            "method_move" to emptyList<Map<String, Any?>>(),
+            "bom" to emptyList<Map<String, Any?>>(),
+            "productlocation" to emptyList<Map<String, Any?>>(),
+            "supply" to listOf(supply("FG", "L", 50.0)),
+            "demand" to listOf(
+                demand("D1", dueTime = "2024-06-15") + ("quantity" to 30.0),
+                demand("D2", dueTime = "2024-06-01") + ("quantity" to 30.0),
+            ),
+        )
+        val result = runPlanning(data, config = nonCriticalConfig, demandOrder = null)
+        committedQty(result.output, "D2") shouldBe (30.0 plusOrMinus 1e-6)
+        committedQty(result.output, "D1") shouldBe (20.0 plusOrMinus 1e-6)
     }
 
     test("Demand Ordering KB flips the winner: D2 first now wins the scarce supply") {
@@ -116,9 +137,10 @@ class DemandOrderBuilderTest : FunSpec({
         committedQty(result.output, "D1") shouldBe (20.0 plusOrMinus 1e-6)
     }
 
-    test("partial KB coverage: covered demand always wins; uncovered demands fall back to (priority, demand_id) and sort after") {
+    test("partial KB coverage: covered demand always wins; uncovered demands fall back to chronological order and sort after") {
         // D1, D2, D3 all compete for 50 units, each needing 30. Only D3 has a KB entry (forced
-        // first). D1/D2 are uncovered -> fall back to (priority, demand_id): D1 before D2.
+        // first). D1/D2 are uncovered -> fall back to (request_due_time, priority, demand_id);
+        // same due_time and no priority here, so it reduces to D1 before D2.
         val data = mapOf(
             "method_make" to emptyList<Map<String, Any?>>(),
             "method_buy" to emptyList<Map<String, Any?>>(),
