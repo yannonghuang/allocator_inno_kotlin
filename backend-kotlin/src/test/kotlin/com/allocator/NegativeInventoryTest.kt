@@ -60,14 +60,20 @@ class NegativeInventoryTest : FunSpec({
         // The flat work-order list (what actually gets purchased) is enlarged to 500 + 1424.
         wos.sumOf { (it["quantity"] as? Number)?.toDouble() ?: 0.0 } shouldBe (1924.0 plusOrMinus 1e-6)
 
-        // Pegging tree: a negative_inventory=true supply leaf sits alongside the enlarged WO.
+        // Pegging tree: the negative_inventory=true leaf is a genuine CHILD of the enlarged WO
+        // (nested alongside the WO's own purchase leaf) — "this purchase's total splits into
+        // what the demand needed and what it paid down" — not a demand-level sibling of the WO.
         @Suppress("UNCHECKED_CAST")
         val children = pegging?.get("children") as List<Map<String, Any?>>
-        val negLeaf = children.first { it["negative_inventory"] == true }
-        (negLeaf["quantity"] as Number).toDouble() shouldBe (-1424.0 plusOrMinus 1e-6)
-        negLeaf["supply_id"] shouldBe "NEG1"
         val woNode = children.first { it["type"] == "work_order" }
         (woNode["quantity"] as Number).toDouble() shouldBe (1924.0 plusOrMinus 1e-6)
+        @Suppress("UNCHECKED_CAST")
+        val woChildren = woNode["children"] as List<Map<String, Any?>>
+        val negLeaf = woChildren.first { it["negative_inventory"] == true }
+        (negLeaf["quantity"] as Number).toDouble() shouldBe (-1424.0 plusOrMinus 1e-6)
+        negLeaf["supply_id"] shouldBe "NEG1"
+        val purchaseLeaf = woChildren.first { it["type"] == "purchase" }
+        (purchaseLeaf["quantity"] as Number).toDouble() shouldBe (500.0 plusOrMinus 1e-6)
 
         // First-touch-wins: the pending entry is drained after absorption.
         pending.containsKey(key) shouldBe false

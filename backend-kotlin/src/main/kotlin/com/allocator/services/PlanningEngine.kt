@@ -1913,14 +1913,6 @@ internal data class MethodSlotResult(
      * dependent, must NOT be cached). Default false.
      */
     val immediateBottleneckTrulyStructural: Boolean = false,
-    /**
-     * Set only in the "purchase" branch when this call absorbed one or more pending
-     * [NegativeInventoryLot]s for (productId, locationId) — the deficit already baked into
-     * this WO's own (enlarged) quantity. Caller ([plan]) uses this to emit a matching sibling
-     * `type="supply", negative_inventory=true` pegging leaf — see plan()'s doc on why it must
-     * be placed BEFORE the WO node in the demand's children list (reconcile() ordering).
-     */
-    val negativeInventoryAbsorbed: List<NegativeInventoryLot>? = null,
 )
 
 /**
@@ -2711,9 +2703,28 @@ internal fun planMethodSlot(
     val lastEnd = woResult.lastEnd
     val lotSizeVal = woResult.lotSizeVal
     // Purchase leaves have no source supply record (they are new procurement),
-    // so surface the vendor as their identifier in the supply-leaf table.
-    val woChildren = if (methodType == "purchase") listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to roundQty(purchaseWoQty), "quantity_precise" to purchaseWoQty, "vendor_id" to m["vendor_id"], "start_time" to formatDate(startDt), "end_time" to formatDate(lastEnd), "children" to emptyList<Any>()))
-                     else childPeggingNodes
+    // so surface the vendor as their identifier in the supply-leaf table. When this purchase
+    // also absorbed a negative-inventory deficit, the leaf shows only its REAL contribution
+    // (achievableParentQty) and gets a sibling leaf for the deficit — both as genuine children
+    // of this WO (not a demand-level sibling of the WO), so the tree reads as "this purchase's
+    // total splits into: what this demand needed, and what it paid down." reconcile()'s
+    // work_order/purchase case reads this same shape back to re-derive the enlarged total
+    // after trimming (see its own doc).
+    val woChildren = if (methodType == "purchase") {
+        listOf(mapOf("type" to "purchase", "product_id" to productId, "location_id" to productionLocation, "quantity" to roundQty(achievableParentQty), "quantity_precise" to achievableParentQty, "vendor_id" to m["vendor_id"], "start_time" to formatDate(startDt), "end_time" to formatDate(lastEnd), "children" to emptyList<Any>())) +
+            (absorbedNegativeLots?.map { lot ->
+                mapOf(
+                    "type" to "supply",
+                    "product_id" to productId,
+                    "location_id" to productionLocation,
+                    "supply_id" to lot.supplyId,
+                    "quantity" to lot.qty,
+                    "commit_time" to (lot.supplyDate ?: formatDate(startDt)),
+                    "negative_inventory" to true,
+                    "children" to emptyList<Any>(),
+                )
+            } ?: emptyList())
+    } else childPeggingNodes
     val methodPeggingNode = buildWoNode(productId, productionLocation, purchaseWoQty, methodType, m, startDt, lastEnd, lotCount, lotSizeVal, methodChoiceExplanation, variantExplanation, woChildrenRelation, woChildren, woGroupId = woResult.woGroupId, data = data, quantityDominator = qtyDominatorForWoNode, timeDominator = startDtDominator)
 
     return MethodSlotResult(
@@ -2723,7 +2734,6 @@ internal fun planMethodSlot(
         latestCommit = lastEnd,
         anyChildShort = anyChildShort,
         blockedReason = null,
-        negativeInventoryAbsorbed = absorbedNegativeLots,
     )
 }
 
@@ -3707,10 +3717,6 @@ fun plan(
     val cap = methodCfg.maxMethods.coerceAtMost(candidates.size)
     val combinedWos = mutableListOf<Map<String, Any?>>()
     val combinedPegging = mutableListOf<Map<String, Any?>>()
-    // Set at most once per node (negativeInventoryPending is drained on first absorption) —
-    // see planMethodSlot's purchase branch and this function's use of it below, right before
-    // `peggingChildren.addAll(combinedPegging)`.
-    var absorbedNegativeInventory: List<NegativeInventoryLot>? = null
     var residual = demandNetQty
     var totalAchievable = 0.0
     var latestCommit: LocalDate? = null
@@ -4046,9 +4052,6 @@ fun plan(
         // (including blocked ones with zero qty) — informative for the user even when a
         // candidate committed nothing.
         combinedPegging.add(slotPeggingNode)
-        if (attempt.negativeInventoryAbsorbed != null) {
-            absorbedNegativeInventory = attempt.negativeInventoryAbsorbed
-        }
         if (attempt.blockedReason != null) {
             priorAttemptWasBlocked = true
             lastBlockedReason = attempt.blockedReason
@@ -4157,26 +4160,6 @@ fun plan(
             quantityDominator = (ownLotRefs + qtyDominatorForDemand).dedupBySupply()))
     }
 
-    // Negative-inventory sibling leaf(s) — MUST be added before combinedPegging so they
-    // precede the enlarged purchase WO in the demand node's children. reconcile()'s "demand"
-    // case walks children in order, feeding each one `remaining` and subtracting whatever it
-    // reports back; a `type="supply", negative_inventory=true` leaf (see reconcile()'s "supply"
-    // case) reports its own literal (negative) quantity unclamped, so processing it FIRST
-    // inflates `remaining` by the deficit BEFORE the elastic purchase WO is asked for its
-    // share — which is what lets the WO's real, enlarged size survive reconcile() correctly
-    // instead of being clipped back down to this demand's own (smaller) net need.
-    absorbedNegativeInventory?.forEach { lot ->
-        peggingChildren.add(mapOf(
-            "type" to "supply",
-            "product_id" to productId,
-            "location_id" to locationId,
-            "supply_id" to lot.supplyId,
-            "quantity" to lot.qty,
-            "commit_time" to (lot.supplyDate ?: reqTimeStr),
-            "negative_inventory" to true,
-            "children" to emptyList<Any>(),
-        ))
-    }
     // Some commit. Combine all attempted WOs (success + blocked) in pegging. Siblings
     // under the demand are additive supply paths (candidate 1 + candidate 2 each cover
     // part of the demand) — mark "or" so the UI labels them as alternatives.
@@ -4609,13 +4592,35 @@ internal fun reconcile(
             // bug fixed in planMethodSlot's effectiveQty.
             val curQty = ((node["quantity_precise"] as? Number) ?: (node["quantity"] as? Number))?.toDouble() ?: 0.0
             val method = node["method"]
-            // Purchase WOs are elastic — see the "purchase" leaf case's own doc for why. This
-            // wrapper's own curQty cap must be bypassed too, or a purchase WO would still be
-            // frozen at its stale first-pass buy before `want` ever reaches the leaf below.
-            val want = if (method == "purchase") target.coerceAtLeast(0.0)
-                       else minOf(target, curQty).coerceAtLeast(0.0)
             val demandChildren = allChildren.mapNotNull { it as? Map<String, Any?> }.filter { it["type"] == "demand" }
-            if (method == "purchase" || demandChildren.isEmpty()) {
+            if (method == "purchase") {
+                // Purchase WOs are elastic — see the "purchase" leaf case's own doc for why
+                // `target` isn't capped at curQty. When one of THIS WO's own children is a
+                // negative_inventory=true leaf (a pre-existing deficit this purchase also
+                // absorbed — see NegativeInventoryLot's doc), the WO's real total is `target`
+                // (what the parent asked for) PLUS that deficit, read directly off the child
+                // rather than a separate marker — the pre-reconcile tree already carries it
+                // there (planMethodSlot's purchase branch). The deficit leaf reconciles
+                // unconditionally (the "supply" case below ignores target for it and returns
+                // its own fixed value); the purchase leaf gets exactly `target`. So this WO's
+                // own upward-reported contribution stays `target`, unaffected by the
+                // enlargement — the parent's own committed/remaining bookkeeping never sees
+                // the deficit, only this WO's own (larger) displayed quantity does.
+                val negChild = allChildren.filterIsInstance<Map<String, Any?>>()
+                    .firstOrNull { it["negative_inventory"] == true }
+                val absorbsDeficit = negChild?.let { c ->
+                    -(((c["quantity_precise"] as? Number) ?: (c["quantity"] as? Number))?.toDouble() ?: 0.0)
+                } ?: 0.0
+                val contribution = target.coerceAtLeast(0.0)
+                val displayQty = contribution + absorbsDeficit
+                val newChildren = allChildren.map { ch ->
+                    val cm = ch as? Map<String, Any?> ?: return@map ch
+                    reconcile(cm, if (cm["negative_inventory"] == true) 0.0 else contribution, data, config).first
+                }
+                return (node + mapOf("quantity" to displayQty, "children" to newChildren)) to contribution
+            }
+            val want = minOf(target, curQty).coerceAtLeast(0.0)
+            if (demandChildren.isEmpty()) {
                 // Procurement / leaf-backed WO delivers `want`; trim leaf children to it.
                 val newChildren = allChildren.map { ch -> (ch as? Map<String, Any?>)?.let { reconcile(it, want, data, config).first } ?: ch }
                 return (node + mapOf("quantity" to want, "children" to newChildren)) to want
