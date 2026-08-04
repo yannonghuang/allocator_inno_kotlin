@@ -91,52 +91,46 @@ class ReconcileTest : FunSpec({
         supplied shouldBe (36.0 plusOrMinus 1e-6)
     }
 
-    // ── Negative starting inventory: demand-level netting ────────────────────
+    // ── Negative starting inventory: nested under the absorbing purchase WO ──
 
     fun negativeInventoryLeaf(qty: Double, supplyId: String? = "NEG1"): Map<String, Any?> =
         mapOf("type" to "supply", "quantity" to qty, "supply_id" to supplyId,
               "negative_inventory" to true, "children" to emptyList<Any>())
 
-    test("demand node: a negative_inventory leaf placed BEFORE the purchase WO inflates what the WO is asked for") {
-        // Mirrors plan()'s own children ordering (negative leaf, then the enlarged WO) —
-        // see plan()'s doc on why order matters here: this "demand" case's greedy
-        // remaining-=g loop must see the (negative) deficit before it reconciles the WO,
-        // or the WO's real enlarged size gets clipped back down to the raw demand target.
+    test("purchase WO with a negative_inventory child: displays target+deficit, but reports only target upward") {
+        // Mirrors planMethodSlot's purchase branch: the WO's own children are the real
+        // purchase leaf (500, what this demand needs) plus the deficit leaf (-1424, a fixed
+        // historical fact) — reconcile() must read the deficit straight off this child, grant
+        // the WO's own displayed quantity = target + deficit, but still report only `target`
+        // upward so the PARENT demand's own committed/remaining bookkeeping is untouched.
         val negLeaf = negativeInventoryLeaf(-1424.0)
-        val wo = purchaseWo(1924.0, purchaseLeaf(1924.0))
-        val demandNode = mapOf(
-            "type" to "demand", "quantity" to 500.0, "committed_qty" to 500.0,
-            "children" to listOf(negLeaf, wo),
+        val wo = mapOf(
+            "type" to "work_order", "method" to "purchase", "quantity" to 1924.0, "quantity_precise" to 1924.0,
+            "children" to listOf(purchaseLeaf(1924.0), negLeaf),
         )
 
-        val (reconciled, supplied) = reconcile(demandNode, 500.0, emptyMap(), null)
+        val (reconciled, supplied) = reconcile(wo, 500.0, emptyMap(), null)
 
-        // The demand's own commitment nets back to its real ask, not the enlarged purchase.
+        // Upward-reported contribution is exactly the target — the deficit is invisible to
+        // whatever asked for this WO.
         supplied shouldBe (500.0 plusOrMinus 1e-9)
+        // The WO's own displayed quantity is the real, enlarged total.
+        (reconciled["quantity"] as Number).toDouble() shouldBe (1924.0 plusOrMinus 1e-9)
         @Suppress("UNCHECKED_CAST")
         val children = reconciled["children"] as List<Map<String, Any?>>
-        // The negative leaf survives verbatim (a fixed historical fact, not re-derived).
-        (children[0]["quantity"] as Number).toDouble() shouldBe (-1424.0 plusOrMinus 1e-9)
-        // The purchase WO keeps its real, enlarged size — NOT clipped to the 500 target.
-        (children[1]["quantity"] as Number).toDouble() shouldBe (1924.0 plusOrMinus 1e-9)
+        val purchaseChild = children.first { it["type"] == "purchase" }
+        val negChild = children.first { it["negative_inventory"] == true }
+        // The purchase leaf gets only the real contribution (target)...
+        (purchaseChild["quantity"] as Number).toDouble() shouldBe (500.0 plusOrMinus 1e-9)
+        // ...and the deficit leaf survives verbatim (a fixed fact, not re-derived from target).
+        (negChild["quantity"] as Number).toDouble() shouldBe (-1424.0 plusOrMinus 1e-9)
     }
 
-    test("control: a negative_inventory leaf placed AFTER the WO does not inflate the WO (ordering matters)") {
-        // Documents the ordering requirement itself: reconcile()'s greedy loop only inflates
-        // `remaining` for children processed AFTER the negative leaf. plan() always places it
-        // first; this test pins down what happens if a future caller got that backwards.
-        val negLeaf = negativeInventoryLeaf(-1424.0)
-        val wo = purchaseWo(1924.0, purchaseLeaf(1924.0))
-        val demandNode = mapOf(
-            "type" to "demand", "quantity" to 500.0, "committed_qty" to 500.0,
-            "children" to listOf(wo, negLeaf),
-        )
+    test("control: purchase WO without a negative_inventory child behaves exactly as before") {
+        val wo = purchaseWo(0.0267, purchaseLeaf(0.0267))
+        val (reconciled, supplied) = reconcile(wo, 0.36, emptyMap(), null)
 
-        val (reconciled, _) = reconcile(demandNode, 500.0, emptyMap(), null)
-        @Suppress("UNCHECKED_CAST")
-        val children = reconciled["children"] as List<Map<String, Any?>>
-        // WO was asked for the raw 500 target (negative leaf hadn't been seen yet) — purchase
-        // is elastic, so it simply grants exactly what it was asked, losing the enlargement.
-        (children[0]["quantity"] as Number).toDouble() shouldBe (500.0 plusOrMinus 1e-9)
+        supplied shouldBe (0.36 plusOrMinus 1e-9)
+        (reconciled["quantity"] as Number).toDouble() shouldBe (0.36 plusOrMinus 1e-9)
     }
 })
