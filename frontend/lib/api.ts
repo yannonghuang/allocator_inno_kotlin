@@ -509,18 +509,15 @@ export type PlanningConfig = {
   check_soundness?: boolean;
   /**
    * Explicit version picks for the 5 "external config objects" (see CaseConfigVersions' own doc
-   * in Tables.kt) — omit any to use the case's current default version for that object. Resolved
-   * server-side by `resolveEffectiveConfig`/`CaseConfigVersioning.resolveVersionId`.
+   * in Tables.kt) — omit any (or "-" in the UI) for no override on that object. No implicit
+   * fallback of any kind. Resolved server-side by
+   * `resolveEffectiveConfig`/`CaseConfigVersioning.resolveVersionId`.
    */
   case_alloc_version_id?: number;
   pref_version_id?: number;
   demand_order_version_id?: number;
   purchasable_material_version_id?: number;
   constraint_version_id?: number;
-  /** Kind keys ('casealloc' | 'pref' | 'ord' | 'purchmat' | 'constr') explicitly detached for
-   *  this run — suppresses version resolution for that object regardless of the picks above or
-   *  the case's default. See `parseDetachedKinds`'s own doc (CaseConfigVersioning.kt). */
-  detached_external_configs?: string[];
   /**
    * App-specific config (ASC): optional runtime parameters a case's own CSVs can't hardcode.
    * Only meaningful when the case has at least one supply row with SUPPLY_DATE="wip" — see
@@ -2010,8 +2007,6 @@ export type SeedForm = {
   /** Per-lot ASC override applied to every preset in this seeding batch. See PlanningConfig's
    *  `app_specific_config.wip_supply_dates`'s identical field for the full semantics. */
   wip_supply_dates?: Record<string, string>;
-  /** See PlanningConfig's identical field — kind keys detached for this whole batch. */
-  detached_external_configs?: string[];
 };
 
 /** Fetch the net-new max_methods sweep for the KB dialog — read-only, does not run anything.
@@ -2124,14 +2119,13 @@ export async function getAscOptions(caseId: number): Promise<{ hasWipSupply: boo
 // exactly one marked default; a version can only be edited-in-place or deleted
 // while unreferenced by any plan run (in KB or history) — otherwise "Save As" a
 // new one. `versionId` is accepted as an optional trailing arg by the existing
-// get/update/delete/import/generate functions below (omit to use the case's
-// current default).
+// get/update/delete/import/generate functions below (omit for no override — there
+// is no "default version" concept; "-" in the UI).
 
 export type ConfigVersion = {
   id: number;
   name: string | null;
   comments: string | null;
-  is_default: boolean;
   referenced: boolean;
   created_at: string;
   updated_at: string;
@@ -2160,7 +2154,7 @@ async function createConfigVersion(kindPath: string, caseId: number, body: Recor
 
 async function updateConfigVersion(
   kindPath: string, caseId: number, versionId: number,
-  body: { name?: string | null; comments?: string | null; is_default?: boolean },
+  body: { name?: string | null; comments?: string | null },
 ): Promise<ConfigVersion> {
   const r = await fetch(`${API}/cases/${caseId}/${kindPath}/versions/${versionId}`, {
     method: 'PUT',
@@ -2241,7 +2235,7 @@ export async function exportAllocationCsv(caseId: number, versionId?: number): P
 export const listAllocationVersions = (caseId: number) => listConfigVersions('allocation', caseId);
 export const createAllocationVersion = (caseId: number, body: { name?: string; comments?: string; rows: AllocationRow[] }) =>
   createConfigVersion('allocation', caseId, body);
-export const updateAllocationVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null; is_default?: boolean }) =>
+export const updateAllocationVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null }) =>
   updateConfigVersion('allocation', caseId, versionId, body);
 export const deleteAllocationVersion = (caseId: number, versionId: number) => deleteConfigVersion('allocation', caseId, versionId);
 
@@ -2297,7 +2291,7 @@ export async function exportPurchasableMaterialsCsv(caseId: number, versionId?: 
 export const listPurchasableMaterialsVersions = (caseId: number) => listConfigVersions('purchasable-materials', caseId);
 export const createPurchasableMaterialsVersion = (caseId: number, body: { name?: string; comments?: string; product_ids: string[] }) =>
   createConfigVersion('purchasable-materials', caseId, body);
-export const updatePurchasableMaterialsVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null; is_default?: boolean }) =>
+export const updatePurchasableMaterialsVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null }) =>
   updateConfigVersion('purchasable-materials', caseId, versionId, body);
 export const deletePurchasableMaterialsVersion = (caseId: number, versionId: number) => deleteConfigVersion('purchasable-materials', caseId, versionId);
 
@@ -2356,7 +2350,7 @@ export async function exportCaseConstraintsCsv(caseId: number, versionId?: numbe
 export const listCaseConstraintsVersions = (caseId: number) => listConfigVersions('constraints', caseId);
 export const createCaseConstraintsVersion = (caseId: number, body: { name?: string; comments?: string; rows: ConstraintRuleRow[] }) =>
   createConfigVersion('constraints', caseId, body);
-export const updateCaseConstraintsVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null; is_default?: boolean }) =>
+export const updateCaseConstraintsVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null }) =>
   updateConfigVersion('constraints', caseId, versionId, body);
 export const deleteCaseConstraintsVersion = (caseId: number, versionId: number) => deleteConfigVersion('constraints', caseId, versionId);
 
@@ -2451,7 +2445,7 @@ export async function exportPreferencesCsv(caseId: number, versionId?: number): 
 export const listPreferencesVersions = (caseId: number) => listConfigVersions('preferences', caseId);
 export const createPreferencesVersion = (caseId: number, body: { name?: string; comments?: string; rows: PreferenceRow[] }) =>
   createConfigVersion('preferences', caseId, body);
-export const updatePreferencesVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null; is_default?: boolean }) =>
+export const updatePreferencesVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null }) =>
   updateConfigVersion('preferences', caseId, versionId, body);
 export const deletePreferencesVersion = (caseId: number, versionId: number) => deleteConfigVersion('preferences', caseId, versionId);
 
@@ -2528,6 +2522,6 @@ export async function exportDemandOrderingCsv(caseId: number, versionId?: number
 export const listDemandOrderingVersions = (caseId: number) => listConfigVersions('demand-ordering', caseId);
 export const createDemandOrderingVersion = (caseId: number, body: { name?: string; comments?: string; rows: { demand_id: string; order: number }[] }) =>
   createConfigVersion('demand-ordering', caseId, body);
-export const updateDemandOrderingVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null; is_default?: boolean }) =>
+export const updateDemandOrderingVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null }) =>
   updateConfigVersion('demand-ordering', caseId, versionId, body);
 export const deleteDemandOrderingVersion = (caseId: number, versionId: number) => deleteConfigVersion('demand-ordering', caseId, versionId);

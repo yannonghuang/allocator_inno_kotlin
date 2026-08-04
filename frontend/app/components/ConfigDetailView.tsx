@@ -83,8 +83,13 @@ const listVersionsFor: Record<ExternalKind, (caseId: number) => Promise<ConfigVe
  * Clicking a link drills into a read-only preview within this same slide-in (not a page
  * navigation) — a "← Back" link returns to this view. When [versionRefs] carries this run's
  * resolved version id for that object (see CaseConfigVersions' own doc), the preview fetches that
- * EXACT historical version — no longer "whatever is live now." Falls back to the case's current
- * default version for legacy (pre-versioning) runs, where no version id was ever recorded.
+ * EXACT historical version — no longer "whatever is live now." When no version id was recorded
+ * (this run genuinely used no config for that kind, or predates version tracking), shows "this
+ * run did not use a version of this config" instead of ever falling back to the case's CURRENT
+ * default — that fallback used to make an old run look retroactively reattached the moment a
+ * later run created/promoted a new default version for that kind (confirmed live: reloading an
+ * older run after a newer run's first-ever Generate call showed the older run "using" the new
+ * config, even though its stored version ref was still null in the DB).
  */
 export function ConfigDetailView({ config, caseId, versionRefs }: { config: Record<string, unknown>; caseId: number; versionRefs?: VersionRefs }) {
   const [drill, setDrill] = useState<ExternalKind | null>(null);
@@ -141,7 +146,7 @@ export function ConfigDetailView({ config, caseId, versionRefs }: { config: Reco
               onClick={() => setDrill(k)}
               style={{ textAlign: 'left', background: 'none', border: 'none', color: '#93c5fd', cursor: 'pointer', fontSize: '0.76rem', padding: '2px 0' }}
             >
-              {EXTERNAL_LABELS[k]}{vId != null && <span style={{ color: '#71717a', fontFamily: 'monospace' }}> (v{vId})</span>} →
+              {EXTERNAL_LABELS[k]}<span style={{ color: '#71717a', fontFamily: 'monospace' }}> ({vId != null ? `v${vId}` : '-'})</span> →
             </button>
           );
         })}
@@ -152,20 +157,19 @@ export function ConfigDetailView({ config, caseId, versionRefs }: { config: Reco
 
 type AllocationAux = { supplies: CaseSupplyRow[]; demands: CaseDemandRow[] };
 
-/** Read-only preview of one external config object's content, for [versionId] if given, else the
- *  case's current default. Reused directly (not just from within ConfigDetailView's own drill-in
- *  flow) by the Planning page's per-object version picker — its "← Back" doubles as a plain close
- *  action there.
+/** Read-only preview of one external config object's content, for [versionId] — or "no version
+ *  selected" if none, never a fallback to anything (no "default" concept exists — see
+ *  CaseConfigVersions' own doc). Reused directly (not just from within ConfigDetailView's own
+ *  drill-in flow) by the Planning page's per-object version picker preview — its "← Back" doubles
+ *  as a plain close action there. Since there's no default fallback to differ on, this behaves
+ *  identically whether reached from a completed run's history, the KB panel, or a live picker
+ *  preview — no separate "context" needed.
  *
  *  Renders the EXACT same view component as the object's own dedicated (editable) page — just in
  *  read-only mode — rather than a separate simplified viewer, so filters/search/sort (critical
  *  for the long lists like Preferences and Purchasable Materials) work identically here. */
-export function ExternalConfigDrilldown({ kind, caseId, versionId, onBack, context = 'run', showBackLink = true }: {
+export function ExternalConfigDrilldown({ kind, caseId, versionId, onBack, showBackLink = true }: {
   kind: ExternalKind; caseId: number; versionId?: number; onBack: () => void;
-  /** 'run' (default): the caption frames [versionId] as "what this run used" — for ConfigDetailView's
-   *  own drill-in from a KB/history entry. 'live': frames it as just the currently-selected
-   *  version — for the Planning page's own picker preview, which isn't tied to any past run. */
-  context?: 'run' | 'live';
   /** Hide the "← Back" link — for callers (the Planning page's standalone preview window) that
    *  already have their own close affordance and aren't drilling in from a list. */
   showBackLink?: boolean;
@@ -181,7 +185,18 @@ export function ExternalConfigDrilldown({ kind, caseId, versionId, onBack, conte
   const [aux, setAux] = useState<unknown>(null);
   const [versionMeta, setVersionMeta] = useState<ConfigVersion | null>(null);
 
+  // No version ref means no override for this kind, full stop — never resolved to anything else.
+  const showsNoConfig = versionId == null;
+
   useEffect(() => {
+    if (showsNoConfig) {
+      setLoading(false);
+      setError(null);
+      setRows([]);
+      setAux(null);
+      setVersionMeta(null);
+      return;
+    }
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -279,16 +294,12 @@ export function ExternalConfigDrilldown({ kind, caseId, versionId, onBack, conte
       </div>
       <div style={{ color: '#71717a', fontSize: '0.68rem', marginBottom: 6 }}>
         {versionId != null
-          ? (context === 'run'
-              ? `Historical version this run actually used${versionMeta?.comments ? ` — ${versionMeta.comments}` : ''}.`
-              : `Selected version${versionMeta?.comments ? ` — ${versionMeta.comments}` : ''}.`)
-          : (context === 'run'
-              ? 'Live current default version — this run predates version tracking, so its exact historical state was never captured (see ExternalConfigVersioningMigration.kt).'
-              : "Case's current default version.")}
+          ? `Version used${versionMeta?.comments ? ` — ${versionMeta.comments}` : ''}.`
+          : 'No version selected for this config ("-").'}
       </div>
       {loading && <div style={{ color: '#71717a' }}>Loading…</div>}
       {error && <div style={{ color: '#f87171' }}>{error}</div>}
-      {!loading && !error && (
+      {!loading && !error && !showsNoConfig && (
         <div style={{ color: '#e4e4e7' }}>
           {renderView()}
         </div>

@@ -277,21 +277,17 @@
       "subheadPurchase": "Purchase",
       "groupPostPlan": "Post-plan handling",
       "groupExternalVersions": "External config",
+      "doneReadOnly": "Done — read-only",
+      "readOnlyActionTooltip": "This run is read-only — click \"New Run\" to start a new draft.",
       "externalAllocation": "Critical Raw Allocation",
       "externalPreferences": "Supply Preferences",
       "externalDemandOrdering": "Demand Ordering",
       "externalPurchasableMaterials": "Purchasable Materials",
       "externalConstraints": "Constraints",
       "externalVersionLabel": "Version {id}",
-      "externalDefault": "Default",
+      "externalNone": "-",
       "externalPreview": "Preview",
       "externalPreviewTooltip": "Read-only preview of this version's content",
-      "externalDetach": "Detach",
-      "externalDetachTooltip": "Bypass this object's version for this run only, without changing the case's default",
-      "externalReattach": "Reattach",
-      "externalReattachTooltip": "Resume using the picked (or default) version for this object",
-      "externalDetachAll": "Detach all",
-      "externalReattachAll": "Reattach all",
       "constraintShow": "Show constraints",
       "constraintHide": "Hide constraints",
       "constraintHint": "Pin which BOM alternative a customer's demand resolves to: for a customer + parent product (location * = any), force a specific child. Add one rule per pin.",
@@ -936,9 +932,11 @@
     "runHistory": {
       "title": "Run history",
       "panelTitle": "Plan run history",
+      "panelTitlePickMode": "Select a run to start a new draft from",
       "close": "Close",
       "sortBy": "Sort by:",
       "load": "Load",
+      "useAsNew": "Use as new",
       "loading": "Loading…",
       "delete": "Delete",
       "edit": "Edit",
@@ -965,6 +963,7 @@
         "loading": "Loading…",
         "setActive": "Set active",
         "setActiveTitle": "Pin this run as the case's active plan run",
+        "useAsNewTitle": "Load this run's config as a starting point for a new draft (doesn't mark it loaded/read-only)",
         "unpin": "Unpin",
         "unpinTitle": "Clear the pin — active will fall back to the latest successful run",
         "working": "…"
@@ -1178,6 +1177,11 @@
       "errorSend": "Failed to send reply.",
       "confirmAbandon": "Abandon negotiation? The latest contingent remains promotable manually.",
       "noActive": "No active negotiation."
+    },
+    "newRun": {
+      "button": "New Run",
+      "blank": "Start empty",
+      "fromExisting": "Start from an existing run…"
     }
   },
   "bomGraph": {
@@ -1407,7 +1411,7 @@
   },
   "versioning": {
     "version": "Version",
-    "default": "default",
+    "none": "-",
     "inUseReadOnly": "in use — read only",
     "inUseTooltip": "This version is used by an existing plan run — Save/Generate/Import/Clear are disabled. Use Save As to create an editable copy.",
     "saveAs": "Save As…",
@@ -1416,7 +1420,6 @@
     "commentsPlaceholder": "Comments (optional)",
     "create": "Create",
     "cancel": "Cancel",
-    "setDefault": "Set default",
     "rename": "Rename",
     "delete": "Delete",
     "renamePrompt": "Rename version (name):",

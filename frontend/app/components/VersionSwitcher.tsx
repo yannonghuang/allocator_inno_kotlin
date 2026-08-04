@@ -9,7 +9,10 @@ import type { ConfigVersion } from '@/lib/api';
  * Supply Preferences, Demand Ordering, Purchasable Materials, Constraints) — see
  * CaseConfigVersions' own doc in Tables.kt. Each object's dedicated page renders one of these
  * above its editor: switch which version you're viewing/editing, "Save As" the current draft
- * into a new named version, and manage existing versions (rename, set default, delete).
+ * into a new named version, and manage existing versions (rename, delete).
+ *
+ * No "default version" concept — a version is just a name (or `versionLabel {id}` if unnamed);
+ * there's nothing to mark "current" case-wide, only "which one is this page showing right now."
  *
  * Doesn't know anything about the object's own row shape — callers own Save/Generate/Import/
  * Clear and must disable them (or route through Save As) when `referenced` is true for the
@@ -20,7 +23,6 @@ export function VersionSwitcher({
   currentVersionId,
   onSwitch,
   onSaveAs,
-  onSetDefault,
   onRename,
   onDelete,
 }: {
@@ -28,7 +30,6 @@ export function VersionSwitcher({
   currentVersionId: number | null;
   onSwitch: (versionId: number) => void;
   onSaveAs: (name: string | undefined, comments: string | undefined) => void;
-  onSetDefault: (versionId: number) => void;
   onRename: (versionId: number, name: string | undefined, comments: string | undefined) => void;
   onDelete: (versionId: number) => void;
 }) {
@@ -64,12 +65,12 @@ export function VersionSwitcher({
           >
             {versions.map((v) => (
               <option key={v.id} value={v.id}>
-                {label(v)}{v.is_default ? ` (${t('default')})` : ''}
+                {label(v)}
               </option>
             ))}
           </select>
         ) : (
-          <span style={{ fontSize: '0.82rem', color: '#e4e4e7' }}>{current ? label(current) : t('default')}</span>
+          <span style={{ fontSize: '0.82rem', color: '#e4e4e7' }}>{current ? label(current) : t('none')}</span>
         )}
         {referenced && (
           <span
@@ -120,14 +121,9 @@ export function VersionSwitcher({
                   <td style={{ padding: '3px 6px', color: '#e4e4e7' }}>{label(v)}</td>
                   <td style={{ padding: '3px 6px', color: '#a1a1aa' }}>{v.comments ?? ''}</td>
                   <td style={{ padding: '3px 6px' }}>
-                    {v.is_default && <span style={{ color: '#93c5fd', marginRight: 6 }}>{t('default')}</span>}
                     {v.referenced && <span style={{ color: '#fbbf24' }}>{t('inUseReadOnly')}</span>}
                   </td>
                   <td style={{ padding: '3px 6px', textAlign: 'right', whiteSpace: 'nowrap' }}>
-                    <button type="button" disabled={v.is_default} onClick={() => onSetDefault(v.id)}
-                      style={{ ...btnStyle, padding: '2px 8px', opacity: v.is_default ? 0.4 : 1, marginRight: 4 }}>
-                      {t('setDefault')}
-                    </button>
                     <button
                       type="button"
                       onClick={() => {
@@ -142,9 +138,9 @@ export function VersionSwitcher({
                     </button>
                     <button
                       type="button"
-                      disabled={v.is_default || v.referenced}
+                      disabled={v.referenced}
                       onClick={() => { if (confirm(t('confirmDelete'))) onDelete(v.id); }}
-                      style={{ ...btnStyle, padding: '2px 8px', color: '#f87171', opacity: (v.is_default || v.referenced) ? 0.4 : 1 }}
+                      style={{ ...btnStyle, padding: '2px 8px', color: '#f87171', opacity: v.referenced ? 0.4 : 1 }}
                     >
                       {t('delete')}
                     </button>

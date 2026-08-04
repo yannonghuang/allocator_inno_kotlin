@@ -58,7 +58,7 @@ export function DemandOrderingPage() {
         setRows(res?.rows ?? []);
         setConfig(res?.config ?? null);
         setVersions(vs);
-        setVersionId(vId ?? vs.find((v) => v.is_default)?.id ?? vs[0]?.id ?? null);
+        setVersionId(vId ?? vs[vs.length - 1]?.id ?? null);
       })
       .catch((e) => setError(String(e)));
   }, [caseId]);
@@ -194,12 +194,6 @@ export function DemandOrderingPage() {
     finally { setSaving(false); }
   };
 
-  const handleSetDefault = async (vId: number) => {
-    try {
-      await updateDemandOrderingVersion(caseId, vId, { is_default: true });
-      setVersions(await listDemandOrderingVersions(caseId));
-    } catch (e) { setError(String(e)); }
-  };
 
   const handleRename = async (vId: number, name: string | undefined, comments: string | undefined) => {
     try {
@@ -249,7 +243,6 @@ export function DemandOrderingPage() {
         currentVersionId={versionId}
         onSwitch={handleSwitchVersion}
         onSaveAs={handleSaveAs}
-        onSetDefault={handleSetDefault}
         onRename={handleRename}
         onDelete={handleDeleteVersion}
       />

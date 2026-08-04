@@ -796,8 +796,8 @@ object CaseBootstrap {
      *  runs from — `max_methods` sweeps every integer in [maxMethodsMin, maxMethodsMax] (one run
      *  per value; running the same max_methods twice would just collide on the same signature,
      *  so there is no separate "how many runs" knob), everything else held fixed across the
-     *  whole batch. The 5 version ids are nullable — null means "use the case's current default"
-     *  for that external config object, same convention as [CaseConfigVersioning.resolveVersionId]. */
+     *  whole batch. The 5 version ids are nullable — null means "no override" for that external
+     *  config object, same convention as [CaseConfigVersioning.resolveVersionId]. */
     data class SeedForm(
         val maxMethodsMin: Int,
         val maxMethodsMax: Int,
@@ -821,13 +821,10 @@ object CaseBootstrap {
          *  that lot unresolved (falls back to horizon start at run time, same as a manual
          *  submission that never touched the ASC section). */
         val wipSupplyDates: Map<String, String> = emptyMap(),
-        /** [ConfigVersionKind.key] strings the user explicitly detached for this batch — see
-         *  `parseDetachedKinds`'s own doc (CaseConfigVersioning.kt). Empty = nothing detached. */
-        val detachedExternalConfigs: List<String> = emptyList(),
     )
 
     /** Overlay [form]'s external-config version picks onto [config] — only non-null picks are
-     *  written, so an unset pick leaves that object to resolve to the case's default (see
+     *  written, so an unset pick leaves that object with no override (see
      *  [CaseConfigVersioning.resolveVersionId]'s own doc), exactly like a manual Plan Run
      *  submission that never touched that picker would. */
     private fun withVersionPicks(config: JsonObject, form: SeedForm): JsonObject = buildJsonObject {
@@ -837,9 +834,6 @@ object CaseBootstrap {
         form.ordVersionId?.let { put("demand_order_version_id", it) }
         form.purchMatVersionId?.let { put("purchasable_material_version_id", it) }
         form.constrVersionId?.let { put("constraint_version_id", it) }
-        if (form.detachedExternalConfigs.isNotEmpty()) {
-            putJsonArray("detached_external_configs") { form.detachedExternalConfigs.forEach { add(it) } }
-        }
     }
 
     /** One entry per integer in [SeedForm.maxMethodsMin, SeedForm.maxMethodsMax] whose resulting

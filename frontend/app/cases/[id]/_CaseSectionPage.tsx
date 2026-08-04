@@ -876,6 +876,37 @@ function normalizePlanningConfig(cfg: PlanningConfig): PlanningConfig {
   };
 }
 
+const EXTERNAL_CONFIG_REF_KEYS = [
+  { configKey: 'case_alloc_version_id',            kind: 'casealloc' },
+  { configKey: 'pref_version_id',                  kind: 'pref' },
+  { configKey: 'demand_order_version_id',          kind: 'ord' },
+  { configKey: 'purchasable_material_version_id',  kind: 'purchmat' },
+  { configKey: 'constraint_version_id',            kind: 'constr' },
+] as const;
+
+/**
+ * Copies a loaded run's own external-config refs onto its config, so re-opening a past run (or
+ * seeding a rerun from it) starts from exactly what THAT run used. The 5 version-id fields live
+ * on the plan_run row itself (PlanRunFull), never inside the `config` JSON blob (see Allocate.kt's
+ * resolveEffectiveConfig, which persists only `_kb_fingerprint` hashes there, not the literal
+ * ids) — normalizePlanningConfig alone can't restore them.
+ *
+ * No fallback concerns anymore (no "default version" concept — see CaseConfigVersions' own doc):
+ * a null ref just stays unset, meaning no override, full stop. The Done-mode display itself reads
+ * straight off each run's own PlanRunFull rather than planningConfig (see isDoneRun), so this
+ * function only matters for seeding the NEXT draft's starting point, not for what's displayed
+ * while a run is loaded.
+ */
+function restoreExternalConfigRefs(cfg: PlanningConfig, full: PlanRunFull): PlanningConfig {
+  const next: PlanningConfig = { ...cfg };
+  for (const { configKey } of EXTERNAL_CONFIG_REF_KEYS) {
+    const v = full[configKey];
+    if (v != null) next[configKey] = v;
+    else delete next[configKey];
+  }
+  return next;
+}
+
 export function CaseDetail({ section: sectionProp = 'planning', subsection }: { section?: string; subsection?: string }) {
   const tNav = useTranslations('nav');
   const tSec = useTranslations('sections');
@@ -1328,6 +1359,24 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planRunHistorySoundOnly, setPlanRunHistorySoundOnly] = useState(false);
   const currentRunIsContingent = currentPlanRunId != null &&
     planRunHistory.find(r => r.id === currentPlanRunId)?.status === 'contingent';
+  // Two states, per the versioning rework: New (still composing a draft for the NEXT
+  // submission — planningConfig is live/editable) vs Done (a specific already-executed run is
+  // loaded, whether formally saved yet or not — its external-config section renders read-only,
+  // straight off that run's own persisted refs, never planningConfig's current live value).
+  const isDoneRun = (currentPlanRunId ?? freshPlanRunId) != null;
+  // Guards the New-draft persist effect below from firing before the mount effect's own
+  // restore-draft-or-load-latest-run decision has resolved — without this, the persist effect
+  // (declared, and therefore run, before the mount effect on initial mount) would synchronously
+  // overwrite the saved sessionStorage draft with the blank initial planningConfig the instant
+  // this component (re)mounts, before the mount effect even gets a chance to read it back out.
+  const [planningDraftHydrated, setPlanningDraftHydrated] = useState(false);
+  const [newRunMenuOpen, setNewRunMenuOpen] = useState(false);
+  // When the Plan Run History panel is opened via "New Run" -> "Start from an existing run…",
+  // it's unambiguously in "pick a seed for a new draft" mode: rows only offer "Use as new"
+  // (handleNewRunFromExisting, New mode), not "Load" (handleRestorePlanRun, Done/readonly mode) —
+  // having both side by side let a user click the wrong one and land in readonly mode when they
+  // explicitly asked to start something new. False = the panel's normal "browse history" mode.
+  const [planRunHistoryPickMode, setPlanRunHistoryPickMode] = useState(false);
   const [planRunHistoryOpen, setPlanRunHistoryOpen] = useState(false);
   // ── Bootstrap (KB seeding) state ────────────────────────────────────────
   const [bootstrapDialogOpen, setBootstrapDialogOpen] = useState(false);
@@ -1351,7 +1400,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [bootstrapVersionPicks, setBootstrapVersionPicks] = useState<{
     case_alloc_version_id?: number; pref_version_id?: number; demand_order_version_id?: number;
     purchasable_material_version_id?: number; constraint_version_id?: number;
-    detached_external_configs?: string[];
   }>({});
   const buildSeedForm = (): SeedForm => ({
     max_methods_min: bootstrapMaxMethodsMin,
@@ -1612,7 +1660,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 setPlanRunSaveError(null);
                 setPlanWorkOrderPeggingCache({});
                 if (full.config) {
-                  setPlanningConfig(normalizePlanningConfig(full.config as PlanningConfig));
+                  setPlanningConfig(restoreExternalConfigRefs(normalizePlanningConfig(full.config as PlanningConfig), full));
                 }
                 listPlanRuns(id).then(setPlanRunHistory).catch(() => { /* ignore */ });
               } catch {
@@ -1652,6 +1700,23 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           const freshId = st.plan_run_id ?? null;
           // Stop polling immediately — prevents a concurrent interval tick while we await below.
           if (planPollRef.current) { clearInterval(planPollRef.current); planPollRef.current = null; }
+          // Sync the version pickers to what THIS run actually resolved to, same as
+          // handleRestorePlanRun — otherwise planningConfig keeps whatever was live in the form
+          // before submission (usually all-unset/"use default"), and the picker's own "no
+          // explicit pick -> case's CURRENT default" fallback re-evaluates on every render. That
+          // silently reattaches this already-completed run to any version created afterward
+          // (e.g. a Demand Ordering Generate a moment later) while its own banner still reads
+          // "Viewing run #<id>" — confirmed live, the exact "no good" repro after the previous
+          // fixes: submitting all-default, then creating a Demand Ordering config, made the
+          // still-displayed just-submitted run's picker show the brand-new version.
+          if (freshId != null) {
+            try {
+              const full = await getPlanRun(id, freshId);
+              if (full.config) {
+                setPlanningConfig(restoreExternalConfigRefs(normalizePlanningConfig(full.config as PlanningConfig), full));
+              }
+            } catch { /* non-fatal — config panel just won't reflect this run's own refs */ }
+          }
           try { sessionStorage.removeItem(`criticality-case-${id}`); } catch { /* ignore */ }
           // Soundness needs a persisted run_id; criticality also requires save. If either
           // toggle is on, save first, then trigger their respective async work.
@@ -1814,6 +1879,21 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     } catch { /* ignore */ }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [supplyCriticalityMap]);
+
+  // Persist an in-progress New-mode draft (planningConfig) to sessionStorage so it survives
+  // navigating to another section and back — each case section is its own Next.js route, which
+  // unmounts/remounts this whole component, so without this the mount effect below would re-run
+  // loadLatestPlanRun and silently snap a "New Run" draft back into Done/readonly mode the moment
+  // the user left Planning to (say) generate a Demand Ordering config and came back. Cleared the
+  // instant a run actually completes (isDoneRun true) — Done mode is trivially re-derivable from
+  // the run itself, nothing to preserve.
+  useEffect(() => {
+    if (!id || !planningDraftHydrated) return;
+    try {
+      if (isDoneRun) sessionStorage.removeItem(`planning-new-draft-case-${id}`);
+      else sessionStorage.setItem(`planning-new-draft-case-${id}`, JSON.stringify(planningConfig));
+    } catch { /* ignore */ }
+  }, [id, isDoneRun, planningConfig, planningDraftHydrated]);
 
   // Load real BOM pairs and real move triples once we have a plan result.
   useEffect(() => {
@@ -2293,7 +2373,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         setCurrentPlanRunId(chosen.id);
         setPlanWorkOrderPeggingCache({});
         if (full.config) {
-          setPlanningConfig(normalizePlanningConfig(full.config as PlanningConfig));
+          setPlanningConfig(restoreExternalConfigRefs(normalizePlanningConfig(full.config as PlanningConfig), full));
         }
         restoreCriticality(chosen.id);
       }
@@ -2324,14 +2404,27 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       });
       if (signal.cancelled) return;
       if (caseDetail) setC(caseDetail);
+      // A saved New-mode draft (see the persist effect above) means the user was mid-draft when
+      // this component last unmounted (e.g. navigated to another section) — restore it and skip
+      // loadLatestPlanRun's own Done-mode load entirely, or returning to Planning would silently
+      // snap the page back to readonly, discarding the in-progress "New Run" draft.
+      let restoredDraft = false;
+      try {
+        const saved = sessionStorage.getItem(`planning-new-draft-case-${id}`);
+        if (saved) {
+          setPlanningConfig(JSON.parse(saved) as PlanningConfig);
+          restoredDraft = true;
+        }
+      } catch { /* ignore — fall through to loadLatestPlanRun */ }
       await Promise.all([
         loadRuns(),
-        loadLatestPlanRun(caseDetail, signal),
+        restoredDraft ? Promise.resolve() : loadLatestPlanRun(caseDetail, signal),
       ]);
     })().finally(() => {
       if (signal.cancelled) return;
       clearTimeout(timeoutId);
       setLoading(false);
+      setPlanningDraftHydrated(true);
     });
     return () => { signal.cancelled = true; };
   }, [id]);
@@ -3871,15 +3964,62 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         setPlanRunSaveError(null);
         setPlanWorkOrderPeggingCache({});
         if (full.config) {
-          setPlanningConfig(normalizePlanningConfig(full.config as PlanningConfig));
+          setPlanningConfig(restoreExternalConfigRefs(normalizePlanningConfig(full.config as PlanningConfig), full));
         }
         setPlanRunHistoryOpen(false);
+        setPlanRunHistoryPickMode(false);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load plan run');
     } finally {
       setPlanRunLoadingId(null);
     }
+  };
+
+  /** Seeds a NEW draft (isDoneRun stays/becomes false) by COPYING an existing run's config —
+   *  both embedded (method_selection/purchase_allowed/consolidation/WIP dates/etc., via
+   *  normalizePlanningConfig(full.config)) and external (the 5 version refs, via
+   *  restoreExternalConfigRefs) — onto planningConfig. Deliberately does NOT touch planResult or
+   *  any other "what's currently loaded/displayed" state: this is a config copy for composing the
+   *  NEXT submission, not a load of that run's own results — currentPlanRunId/freshPlanRunId are
+   *  explicitly cleared (not set to runId) so the external-config section stays the live, editable
+   *  New-mode picker instead of freezing into a read-only display of that run. */
+  const handleNewRunFromExisting = async (runId: number) => {
+    setPlanRunLoadingId(runId);
+    try {
+      const full = await getPlanRun(id, runId);
+      setCurrentPlanRunId(null);
+      setFreshPlanRunId(null);
+      setReplaceTargetRunId(null);
+      setPlanRunSaveError(null);
+      if (full.config) {
+        setPlanningConfig(restoreExternalConfigRefs(normalizePlanningConfig(full.config as PlanningConfig), full));
+      }
+      setPlanRunHistoryOpen(false);
+      setPlanRunHistoryPickMode(false);
+      setNewRunMenuOpen(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load plan run');
+    } finally {
+      setPlanRunLoadingId(null);
+    }
+  };
+
+  /** Resets to a blank draft (same defaults as "Reset config") and explicitly clears any loaded
+   *  run, so the page enters New mode even if it was previously showing a Done run's read-only
+   *  external-config display. */
+  const handleNewRunEmpty = () => {
+    setPlanningConfig({
+      method_selection: {
+        max_methods: 1,
+        raw_material_sourcing: 'equal_split',
+      },
+      purchase_allowed: true,
+      consolidation: { period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' },
+    });
+    setCurrentPlanRunId(null);
+    setFreshPlanRunId(null);
+    setNewRunMenuOpen(false);
   };
 
   const handleDeletePlanRun = async (runId: number) => {
@@ -4624,12 +4764,55 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       )}
       {caseSection === 'planning' && (
       <section>
-        <h2>{tSec('planning')}</h2>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <h2>{tSec('planning')}</h2>
+          {/* New Run — configure the next submission either blank or seeded from an existing
+              run's own config (handleNewRunEmpty/handleNewRunFromExisting). Distinct from
+              "Load" in Plan Run History, which enters read-only Done mode instead (see
+              isDoneRun's own comment). */}
+          <div style={{ position: 'relative' }}>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => setNewRunMenuOpen((o) => !o)}
+              style={{ padding: '6px 14px' }}
+            >
+              {tP('newRun.button')}
+            </button>
+            {newRunMenuOpen && (
+              <div style={{ position: 'absolute', right: 0, top: '100%', marginTop: 4, background: '#18181b', border: '1px solid #3d3d40', borderRadius: 6, boxShadow: '0 4px 12px rgba(0,0,0,0.4)', zIndex: 20, minWidth: 210, overflow: 'hidden' }}>
+                <button
+                  type="button"
+                  onClick={handleNewRunEmpty}
+                  style={{ display: 'block', width: '100%', textAlign: 'left', padding: '8px 12px', background: 'none', border: 'none', color: '#e4e4e7', cursor: 'pointer', fontSize: '0.82rem' }}
+                >
+                  {tP('newRun.blank')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setNewRunMenuOpen(false); loadPlanRunHistory(); setPlanRunHistoryPickMode(true); setPlanRunHistoryOpen(true); }}
+                  style={{ display: 'block', width: '100%', textAlign: 'left', padding: '8px 12px', background: 'none', border: 'none', borderTop: '1px solid #27272a', color: '#e4e4e7', cursor: 'pointer', fontSize: '0.82rem' }}
+                >
+                  {tP('newRun.fromExisting')}
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
         <div style={{ marginBottom: '0.75rem' }}>
           {/* ── Group 1: Configurations (how methods are ranked + tried per demand) ── */}
-          <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.65rem', margin: '0 0 0.55rem' }}>
+          {/* disabled on the <fieldset> itself natively cascades to every input/select/button
+              descendant (including the WIP-date "Clear" buttons) — the readonly enforcement for
+              directive #3 ("readonly applies to ALL configuration parameters, not just external
+              configs") without having to thread isDoneRun into each individual control. */}
+          <fieldset disabled={isDoneRun} style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.65rem', margin: '0 0 0.55rem', opacity: isDoneRun ? 0.7 : 1 }}>
             <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
               {tP('config.groupMethodSelection')}
+              {isDoneRun && (
+                <span style={{ marginLeft: 8, fontSize: '0.62rem', color: '#71717a', background: '#27272a', borderRadius: 8, padding: '1px 7px', textTransform: 'none', letterSpacing: 0 }}>
+                  {tP('config.doneReadOnly')}
+                </span>
+              )}
             </legend>
             {/* ── Method ── */}
             <div style={{ fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.3rem' }}>
@@ -4806,38 +4989,24 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
             )}
           </fieldset>
 
-          {/* ── External config object version pickers — explicit pick, else the case's default
-              (see resolveEffectiveConfig's own doc). Each object's own data lives on its
-              dedicated page; this is just "which version does THIS run use." ── */}
+          {/* ── External config object version pickers — explicit pick, or "-" for no override
+              (no "default version" concept — see CaseConfigVersions' own doc). Each object's own
+              data lives on its dedicated page; this is just "which version does THIS run use."
+              Two distinct modes: New (isDoneRun false) is the editable draft for the NEXT
+              submission; Done (a specific already-executed run is loaded, whether formally saved
+              or not) is a frozen, read-only display of exactly what THAT run used — no select, no
+              edit affordance, never derived from anything but that run's own persisted refs. This
+              is what makes "config states of a done run are immutable" hold structurally: Done
+              mode simply never reads or writes `planningConfig`. ── */}
           <details open style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
             <summary style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em', cursor: 'pointer' }}>
               {tP('config.groupExternalVersions')}
+              {isDoneRun && (
+                <span style={{ marginLeft: 8, fontSize: '0.62rem', color: '#71717a', background: '#27272a', borderRadius: 8, padding: '1px 7px', textTransform: 'none', letterSpacing: 0 }}>
+                  {tP('config.doneReadOnly')}
+                </span>
+              )}
             </summary>
-            {(() => {
-              const allKinds = ['casealloc', 'pref', 'ord', 'purchmat', 'constr'] as const;
-              const detachedSet = new Set(planningConfig.detached_external_configs ?? []);
-              const allDetached = allKinds.every((k) => detachedSet.has(k));
-              return (
-                // Mirrors each row's own flex layout (label / select / preview / detach columns,
-                // same widths + gap) with invisible spacers so "detach all" lines up exactly
-                // above the per-row Detach buttons below, instead of merely being right-aligned.
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.3rem' }}>
-                  <span style={{ minWidth: 170 }} />
-                  <span style={{ width: 200 }} />
-                  <span style={{ width: 52 }} />
-                  <button
-                    type="button"
-                    onClick={() => setPlanningConfig((c) => ({
-                      ...c,
-                      detached_external_configs: allDetached ? [] : [...allKinds],
-                    }))}
-                    style={{ background: 'none', border: '1px solid #3f3f46', borderRadius: 4, color: allDetached ? '#fbbf24' : '#a1a1aa', cursor: 'pointer', fontSize: '0.72rem', padding: '2px 8px' }}
-                  >
-                    {tP(allDetached ? 'config.externalReattachAll' : 'config.externalDetachAll')}
-                  </button>
-                </div>
-              );
-            })()}
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', marginTop: '0.4rem' }}>
               {([
                 { kind: 'casealloc', externalKind: 'allocation', label: tP('config.externalAllocation'), configKey: 'case_alloc_version_id' },
@@ -4847,47 +5016,56 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 { kind: 'constr', externalKind: 'constraints', label: tP('config.externalConstraints'), configKey: 'constraint_version_id' },
               ] as const).map(({ kind, externalKind, label, configKey }) => {
                 const versions = externalConfigVersions[kind];
-                const detached = (planningConfig.detached_external_configs ?? []).includes(kind);
-                const selectedId: number | undefined = planningConfig[configKey] ?? versions.find((v) => v.is_default)?.id;
+                const selectedId: number | undefined = planningConfig[configKey];
+                if (isDoneRun) {
+                  // Read-only: exactly what this run's own record says, nothing else. No select,
+                  // no fallback, no edit affordance.
+                  const versionName = selectedId != null
+                    ? (versions.find((v) => v.id === selectedId)?.name || tP('config.externalVersionLabel', { id: selectedId }))
+                    : tP('config.externalNone');
+                  return (
+                    <div key={kind} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.82rem' }}>
+                      <span style={{ color: '#a1a1aa', minWidth: 170 }}>{label}</span>
+                      <span style={{ width: 200, color: '#e4e4e7', fontFamily: selectedId != null ? undefined : 'monospace' }}>{versionName}</span>
+                      <button
+                        type="button"
+                        disabled={selectedId == null}
+                        onClick={() => setExternalConfigPreview({ kind: externalKind, versionId: selectedId })}
+                        title={tP('config.externalPreviewTooltip')}
+                        style={{ width: 52, textAlign: 'left', background: 'none', border: 'none', color: '#93c5fd', cursor: selectedId == null ? 'default' : 'pointer', fontSize: '0.76rem', padding: 0, opacity: selectedId == null ? 0.4 : 1 }}
+                      >
+                        {tP('config.externalPreview')}
+                      </button>
+                    </div>
+                  );
+                }
                 return (
                   <div key={kind} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.82rem' }}>
                     <span style={{ color: '#a1a1aa', minWidth: 170 }}>{label}</span>
                     <select
                       value={selectedId ?? ''}
-                      disabled={versions.length === 0 || detached}
+                      disabled={versions.length === 0}
                       onChange={(e) => {
                         const v = e.target.value ? Number(e.target.value) : undefined;
                         setPlanningConfig((c) => ({ ...c, [configKey]: v }));
                       }}
-                      style={{ width: 200, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem', opacity: detached ? 0.4 : 1 }}
+                      style={{ width: 200, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem' }}
                     >
-                      {versions.length === 0 && <option value="">{tP('config.externalDefault')}</option>}
+                      <option value="">{tP('config.externalNone')}</option>
                       {versions.map((v) => (
                         <option key={v.id} value={v.id}>
-                          {v.name || tP('config.externalVersionLabel', { id: v.id })}{v.is_default ? ` (${tP('config.externalDefault')})` : ''}
+                          {v.name || tP('config.externalVersionLabel', { id: v.id })}
                         </option>
                       ))}
                     </select>
                     <button
                       type="button"
-                      disabled={selectedId == null || detached}
+                      disabled={selectedId == null}
                       onClick={() => setExternalConfigPreview({ kind: externalKind, versionId: selectedId })}
                       title={tP('config.externalPreviewTooltip')}
-                      style={{ width: 52, textAlign: 'left', background: 'none', border: 'none', color: '#93c5fd', cursor: (selectedId == null || detached) ? 'default' : 'pointer', fontSize: '0.76rem', padding: 0, opacity: (selectedId == null || detached) ? 0.4 : 1 }}
+                      style={{ width: 52, textAlign: 'left', background: 'none', border: 'none', color: '#93c5fd', cursor: selectedId == null ? 'default' : 'pointer', fontSize: '0.76rem', padding: 0, opacity: selectedId == null ? 0.4 : 1 }}
                     >
                       {tP('config.externalPreview')}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setPlanningConfig((c) => {
-                        const cur = new Set(c.detached_external_configs ?? []);
-                        if (detached) cur.delete(kind); else cur.add(kind);
-                        return { ...c, detached_external_configs: Array.from(cur) };
-                      })}
-                      title={tP(detached ? 'config.externalReattachTooltip' : 'config.externalDetachTooltip')}
-                      style={{ background: 'none', border: 'none', color: detached ? '#fbbf24' : '#71717a', cursor: 'pointer', fontSize: '0.76rem', padding: 0 }}
-                    >
-                      {tP(detached ? 'config.externalReattach' : 'config.externalDetach')}
                     </button>
                   </div>
                 );
@@ -4896,9 +5074,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           </details>
 
           {/* ── Group 2: Post-plan handling (run AFTER planning, do not affect planner) ── */}
-          <fieldset style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
+          <fieldset disabled={isDoneRun} style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem', opacity: isDoneRun ? 0.7 : 1 }}>
             <legend style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
               {tP('config.groupPostPlan')}
+              {isDoneRun && (
+                <span style={{ marginLeft: 8, fontSize: '0.62rem', color: '#71717a', background: '#27272a', borderRadius: 8, padding: '1px 7px', textTransform: 'none', letterSpacing: 0 }}>
+                  {tP('config.doneReadOnly')}
+                </span>
+              )}
             </legend>
             <div style={{ display: 'flex', alignItems: 'center', gap: '1.25rem', flexWrap: 'wrap' }}>
               {/* WO batch scales — grouped visually */}
@@ -4960,8 +5143,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           <br style={{ marginTop: '0.25rem' }} />
           <button
             type="button"
-            disabled={planLoading || currentRunIsContingent}
-            title={currentRunIsContingent ? 'Viewing a contingent (what-if) run — load a baseline run first to re-plan' : undefined}
+            disabled={planLoading || currentRunIsContingent || isDoneRun}
+            title={isDoneRun ? tP('config.readOnlyActionTooltip') : (currentRunIsContingent ? 'Viewing a contingent (what-if) run — load a baseline run first to re-plan' : undefined)}
             onClick={async () => {
               setPlanError(null);
               setPlanLoading(true);
@@ -4996,7 +5179,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           <button
             type="button"
             className="secondary"
-            disabled={planLoading}
+            disabled={planLoading || isDoneRun}
             onClick={() => setPlanningConfig({
               method_selection: {
                 max_methods: 1,
@@ -5005,7 +5188,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               purchase_allowed: true,
               consolidation: { period_days: 7, make_batch_scale: 'weekly', move_batch_scale: 'weekly', purchase_batch_scale: 'weekly' },
             })}
-            title={tP('config.resetDefaultsTitle')}
+            title={isDoneRun ? tP('config.readOnlyActionTooltip') : tP('config.resetDefaultsTitle')}
             style={{ padding: '6px 12px' }}
           >
             {tP('config.resetDefaults')}
@@ -5014,7 +5197,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
           <button
             type="button"
             className="secondary"
-            onClick={() => { loadPlanRunHistory(); setPlanRunHistoryOpen(true); }}
+            onClick={() => { loadPlanRunHistory(); setPlanRunHistoryPickMode(false); setPlanRunHistoryOpen(true); }}
             style={{ padding: '6px 12px' }}
           >
             {tP('planRunHistory')}
@@ -8113,36 +8296,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 </fieldset>
 
                 {/* External config object version pickers — same pattern as the Planning page's
-                    own fieldset (see its own comment). One fixed pick for the whole batch. */}
+                    own fieldset (see its own comment). One fixed pick for the whole batch —
+                    always a fresh draft (this dialog never displays a past run), so no Done-mode
+                    read-only split needed here. */}
                 <details open style={{ border: '1px solid #3f3f46', borderRadius: 6, padding: '0.45rem 0.75rem 0.55rem', margin: '0 0 0.55rem' }}>
                   <summary style={{ padding: '0 0.4rem', fontSize: '0.72rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em', cursor: 'pointer' }}>
                     {tP('config.groupExternalVersions')}
                   </summary>
-                  {(() => {
-                    const allKinds = ['casealloc', 'pref', 'ord', 'purchmat', 'constr'] as const;
-                    const detachedSet = new Set(bootstrapVersionPicks.detached_external_configs ?? []);
-                    const allDetached = allKinds.every((k) => detachedSet.has(k));
-                    return (
-                      // Mirrors each row's own flex layout (label / select / preview / detach
-                      // columns, same widths + gap) with invisible spacers so "detach all" lines
-                      // up exactly above the per-row Detach buttons below.
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.3rem' }}>
-                        <span style={{ minWidth: 170 }} />
-                        <span style={{ width: 200 }} />
-                        <span style={{ width: 52 }} />
-                        <button
-                          type="button"
-                          onClick={() => setBootstrapVersionPicks((c) => ({
-                            ...c,
-                            detached_external_configs: allDetached ? [] : [...allKinds],
-                          }))}
-                          style={{ background: 'none', border: '1px solid #3f3f46', borderRadius: 4, color: allDetached ? '#fbbf24' : '#a1a1aa', cursor: 'pointer', fontSize: '0.72rem', padding: '2px 8px' }}
-                        >
-                          {tP(allDetached ? 'config.externalReattachAll' : 'config.externalDetachAll')}
-                        </button>
-                      </div>
-                    );
-                  })()}
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', marginTop: '0.4rem' }}>
                     {([
                       { kind: 'casealloc', externalKind: 'allocation', label: tP('config.externalAllocation'), configKey: 'case_alloc_version_id' },
@@ -8152,47 +8312,34 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       { kind: 'constr', externalKind: 'constraints', label: tP('config.externalConstraints'), configKey: 'constraint_version_id' },
                     ] as const).map(({ kind, externalKind, label, configKey }) => {
                       const versions = externalConfigVersions[kind];
-                      const detached = (bootstrapVersionPicks.detached_external_configs ?? []).includes(kind);
-                      const selectedId: number | undefined = bootstrapVersionPicks[configKey] ?? versions.find((v) => v.is_default)?.id;
+                      const selectedId: number | undefined = bootstrapVersionPicks[configKey];
                       return (
                         <div key={kind} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.82rem' }}>
                           <span style={{ color: '#a1a1aa', minWidth: 170 }}>{label}</span>
                           <select
                             value={selectedId ?? ''}
-                            disabled={versions.length === 0 || detached}
+                            disabled={versions.length === 0}
                             onChange={(e) => {
                               const v = e.target.value ? Number(e.target.value) : undefined;
                               setBootstrapVersionPicks((c) => ({ ...c, [configKey]: v }));
                             }}
-                            style={{ width: 200, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem', opacity: detached ? 0.4 : 1 }}
+                            style={{ width: 200, padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.8rem' }}
                           >
-                            {versions.length === 0 && <option value="">{tP('config.externalDefault')}</option>}
+                            <option value="">{tP('config.externalNone')}</option>
                             {versions.map((v) => (
                               <option key={v.id} value={v.id}>
-                                {v.name || tP('config.externalVersionLabel', { id: v.id })}{v.is_default ? ` (${tP('config.externalDefault')})` : ''}
+                                {v.name || tP('config.externalVersionLabel', { id: v.id })}
                               </option>
                             ))}
                           </select>
                           <button
                             type="button"
-                            disabled={selectedId == null || detached}
+                            disabled={selectedId == null}
                             onClick={() => setExternalConfigPreview({ kind: externalKind, versionId: selectedId })}
                             title={tP('config.externalPreviewTooltip')}
-                            style={{ width: 52, textAlign: 'left', background: 'none', border: 'none', color: '#93c5fd', cursor: (selectedId == null || detached) ? 'default' : 'pointer', fontSize: '0.76rem', padding: 0, opacity: (selectedId == null || detached) ? 0.4 : 1 }}
+                            style={{ width: 52, textAlign: 'left', background: 'none', border: 'none', color: '#93c5fd', cursor: selectedId == null ? 'default' : 'pointer', fontSize: '0.76rem', padding: 0, opacity: selectedId == null ? 0.4 : 1 }}
                           >
                             {tP('config.externalPreview')}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setBootstrapVersionPicks((c) => {
-                              const cur = new Set(c.detached_external_configs ?? []);
-                              if (detached) cur.delete(kind); else cur.add(kind);
-                              return { ...c, detached_external_configs: Array.from(cur) };
-                            })}
-                            title={tP(detached ? 'config.externalReattachTooltip' : 'config.externalDetachTooltip')}
-                            style={{ background: 'none', border: 'none', color: detached ? '#fbbf24' : '#71717a', cursor: 'pointer', fontSize: '0.76rem', padding: 0 }}
-                          >
-                            {tP(detached ? 'config.externalReattach' : 'config.externalDetach')}
                           </button>
                         </div>
                       );
@@ -8564,7 +8711,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       )}
       {planRunHistoryOpen && typeof document !== 'undefined' && createPortal(
         <div style={{ position: 'fixed', inset: 0, zIndex: 9996, display: 'flex', justifyContent: 'flex-end' }} role="dialog" aria-label="Plan run history">
-          <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)' }} onClick={() => setPlanRunHistoryOpen(false)} aria-hidden />
+          <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)' }} onClick={() => { setPlanRunHistoryOpen(false); setPlanRunHistoryPickMode(false); }} aria-hidden />
           <div style={{ position: 'relative', zIndex: 10, width: planRunHistoryPanelWidth, maxWidth: '90vw', height: '100vh', display: 'flex', flexDirection: 'column', background: '#1c1c1e', color: '#e4e4e7', boxShadow: '-4px 0 24px rgba(0,0,0,0.4)' }}>
             {/* Resize handle */}
             <div
@@ -8574,8 +8721,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: 6, cursor: 'col-resize', zIndex: 11 }}
             />
             <div style={{ padding: '1rem 1.25rem', borderBottom: '1px solid #3d3d40', flexShrink: 0, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <h3 style={{ margin: 0, fontSize: '1rem' }}>{tP('runHistory.panelTitle')}</h3>
-              <button type="button" onClick={() => setPlanRunHistoryOpen(false)} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tP('runHistory.close')}</button>
+              <h3 style={{ margin: 0, fontSize: '1rem' }}>{planRunHistoryPickMode ? tP('runHistory.panelTitlePickMode') : tP('runHistory.panelTitle')}</h3>
+              <button type="button" onClick={() => { setPlanRunHistoryOpen(false); setPlanRunHistoryPickMode(false); }} style={{ padding: '4px 10px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>{tP('runHistory.close')}</button>
             </div>
             <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
               {planRunHistoryLoading && <p style={{ color: '#71717a' }}>{tP('runHistory.loading')}</p>}
@@ -8744,7 +8891,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       })()}
                     </div>
                     <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                      {(run.status === 'success' || run.status === 'contingent') && (
+                      {/* Pick mode ("New Run" -> "Start from an existing run…"): the ONLY action
+                          offered is "Use as new" (New mode) — "Load" (Done/readonly mode) is
+                          hidden entirely so there's no ambiguous choice to click the wrong one of. */}
+                      {!planRunHistoryPickMode && (run.status === 'success' || run.status === 'contingent') && (
                         <button
                           type="button"
                           className="secondary"
@@ -8756,6 +8906,18 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         </button>
                       )}
                       {(run.status === 'success' || run.status === 'contingent') && (
+                        <button
+                          type="button"
+                          className={planRunHistoryPickMode ? undefined : 'secondary'}
+                          style={{ fontSize: '0.8rem', padding: '3px 10px' }}
+                          disabled={planRunLoadingId === run.id}
+                          title={tP('runHistory.actions.useAsNewTitle')}
+                          onClick={() => handleNewRunFromExisting(run.id)}
+                        >
+                          {planRunLoadingId === run.id ? tP('runHistory.actions.loading') : tP('runHistory.useAsNew')}
+                        </button>
+                      )}
+                      {!planRunHistoryPickMode && (run.status === 'success' || run.status === 'contingent') && (
                         <button
                           type="button"
                           className="secondary"
@@ -8782,7 +8944,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         </button>
                       )}
                       {/* Set active: only for successful runs that aren't already active */}
-                      {run.status === 'success' && !isActive && (
+                      {!planRunHistoryPickMode && run.status === 'success' && !isActive && (
                         <button
                           type="button"
                           className="secondary"
@@ -8795,7 +8957,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         </button>
                       )}
                       {/* Unpin: only when this run is the pinned (designated) active */}
-                      {isDesignated && (
+                      {!planRunHistoryPickMode && isDesignated && (
                         <button
                           type="button"
                           className="secondary"
@@ -8807,7 +8969,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           {isDesignating ? tP('runHistory.actions.working') : tP('runHistory.actions.unpin')}
                         </button>
                       )}
-                      {!editing && (
+                      {!planRunHistoryPickMode && !editing && (
                         <button
                           type="button"
                           className="secondary"
@@ -8817,14 +8979,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           {tP('runHistory.edit')}
                         </button>
                       )}
-                      <button
-                        type="button"
-                        className="secondary"
-                        style={{ fontSize: '0.8rem', padding: '3px 10px', color: '#f87171', borderColor: '#f87171' }}
-                        onClick={() => handleDeletePlanRun(run.id)}
-                      >
-                        {tP('runHistory.delete')}
-                      </button>
+                      {!planRunHistoryPickMode && (
+                        <button
+                          type="button"
+                          className="secondary"
+                          style={{ fontSize: '0.8rem', padding: '3px 10px', color: '#f87171', borderColor: '#f87171' }}
+                          onClick={() => handleDeletePlanRun(run.id)}
+                        >
+                          {tP('runHistory.delete')}
+                        </button>
+                      )}
                     </div>
                   </div>
                   {/* KPI strip — compact summary of the headline metrics from the run's
@@ -10770,7 +10934,6 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 caseId={id}
                 versionId={externalConfigPreview.versionId}
                 onBack={() => setExternalConfigPreview(null)}
-                context="live"
                 showBackLink={false}
               />
             </div>

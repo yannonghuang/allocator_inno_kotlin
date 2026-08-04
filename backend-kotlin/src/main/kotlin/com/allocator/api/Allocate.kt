@@ -92,8 +92,6 @@ private fun parseSeedForm(payload: JsonObject): com.allocator.services.CaseBoots
         wipSupplyDates = (payload["wip_supply_dates"] as? JsonObject)
             ?.mapNotNull { (sid, v) -> v.jsonPrimitive.contentOrNull?.takeIf { it.isNotBlank() }?.let { sid to it } }
             ?.toMap() ?: emptyMap(),
-        detachedExternalConfigs = (payload["detached_external_configs"] as? JsonArray)
-            ?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList(),
     )
 }
 
@@ -1206,6 +1204,8 @@ fun Routing.allocateRoutes() {
             val finishedAt: kotlinx.datetime.Instant?,
             val chosenDepth: Int?,
             val attempts: String?,
+            val caseAllocVersionId: Int?, val prefVersionId: Int?, val ordVersionId: Int?,
+            val purchMatVersionId: Int?, val constrVersionId: Int?,
         )
         val raw = transaction {
             val row = PlanRuns.selectAll().where {
@@ -1221,6 +1221,11 @@ fun Routing.allocateRoutes() {
                 finishedAt = row[PlanRuns.finishedAt],
                 chosenDepth = row[PlanRuns.chosenDepth],
                 attempts = row[PlanRuns.attempts],
+                caseAllocVersionId = row[PlanRuns.caseAllocVersionId],
+                prefVersionId = row[PlanRuns.prefVersionId],
+                ordVersionId = row[PlanRuns.ordVersionId],
+                purchMatVersionId = row[PlanRuns.purchMatVersionId],
+                constrVersionId = row[PlanRuns.constrVersionId],
             )
         }
 
@@ -1303,6 +1308,11 @@ fun Routing.allocateRoutes() {
             durationMs = displayedDurationMs(raw.createdAt, raw.finishedAt, raw.chosenDepth, rawAttempts),
             chosenDepth = raw.chosenDepth,
             attempts = rawAttempts,
+            caseAllocVersionId = raw.caseAllocVersionId,
+            prefVersionId = raw.prefVersionId,
+            demandOrderVersionId = raw.ordVersionId,
+            purchasableMaterialVersionId = raw.purchMatVersionId,
+            constraintVersionId = raw.constrVersionId,
         )
         call.respond(response)
     }
@@ -2895,7 +2905,10 @@ internal suspend fun runPlanBackground(
             // reuse) — the one legitimate place to materialize a version on demand if the case
             // never had one, same as an explicit Generate. Doesn't retroactively touch this
             // plan_run's own (already-persisted) caseAllocVersionId — the run itself genuinely
-            // ran with no explicit allocation override; this just seeds a fresh snapshot.
+            // ran with no explicit allocation override; this just seeds a fresh snapshot. Now that
+            // there's no "default" concept at all, resolveOrCreateVersionId can't accidentally
+            // promote this silent seed to anything — it's just a cache slot, no different from any
+            // other unnamed version until a user explicitly picks it.
             val seedVersionId = CaseConfigVersioning.resolveOrCreateVersionId(caseId, ConfigVersionKind.CASEALLOC, effectiveConfig.caseAllocVersionId)
             val allocRows = generateAndSeedCaseAllocation(caseId, seedVersionId, data, config)
             log.info("[plan] seeded case_allocation with {} rows for case {}", allocRows.size, caseId)
@@ -3397,17 +3410,18 @@ internal fun resolveEffectiveConfig(
     val hasWipSupply = com.allocator.services.caseHasWipSupply(data["supply"] ?: emptyList())
     val wipSupplyDates = if (hasWipSupply) com.allocator.services.resolveWipSupplyDates(c, data["demand"] ?: emptyList(), data["supply"] ?: emptyList()) else emptyMap()
 
+    // "No explicit id" already means "no override" — resolveVersionId never falls back to
+    // anything (see CaseConfigVersions' own doc), so there's no separate "detached" state to
+    // track here anymore; a caller that wants no override for a kind simply omits/nulls its key.
     fun explicitVersionId(key: String): Int? = (c[key] as? Number)?.toInt()
-    val detachedKinds = com.allocator.services.parseDetachedKinds(c)
-    fun resolveOrDetach(kind: ConfigVersionKind, explicitKey: String): Int? =
-        if (kind in detachedKinds) null
-        else CaseConfigVersioning.resolveVersionId(caseId, kind, explicitVersionId(explicitKey))
+    fun resolved(kind: ConfigVersionKind, explicitKey: String): Int? =
+        CaseConfigVersioning.resolveVersionId(caseId, kind, explicitVersionId(explicitKey))
 
-    val caseAllocVersionId = resolveOrDetach(ConfigVersionKind.CASEALLOC, "case_alloc_version_id")
-    val prefVersionId = resolveOrDetach(ConfigVersionKind.PREF, "pref_version_id")
-    val ordVersionId = resolveOrDetach(ConfigVersionKind.ORD, "demand_order_version_id")
-    val purchMatVersionId = resolveOrDetach(ConfigVersionKind.PURCHMAT, "purchasable_material_version_id")
-    val constrVersionId = resolveOrDetach(ConfigVersionKind.CONSTR, "constraint_version_id")
+    val caseAllocVersionId = resolved(ConfigVersionKind.CASEALLOC, "case_alloc_version_id")
+    val prefVersionId = resolved(ConfigVersionKind.PREF, "pref_version_id")
+    val ordVersionId = resolved(ConfigVersionKind.ORD, "demand_order_version_id")
+    val purchMatVersionId = resolved(ConfigVersionKind.PURCHMAT, "purchasable_material_version_id")
+    val constrVersionId = resolved(ConfigVersionKind.CONSTR, "constraint_version_id")
 
     val json = buildJsonObject {
         put("purchase_allowed", c["purchase_allowed"] as? Boolean ?: true)

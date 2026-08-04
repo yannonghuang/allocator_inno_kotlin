@@ -337,11 +337,19 @@ object PlanSupplyAllocations : Table("plan_supply_allocation") {
 /**
  * Version registry for the 5 "external config objects" (Critical Raw Allocation, Supply
  * Preferences, Demand Ordering, Purchasable Materials, Constraints). Each object can have
- * multiple named/commented versions per case, exactly one marked `isDefault` at a time
- * (enforced in application code — see `CaseConfigVersioning.kt` — not a DB constraint, matching
- * this file's existing style of no partial unique indexes). `kind` reuses the exact segment
- * names [com.allocator.services.KbFingerprint.Segments] already uses ("casealloc"/"pref"/"ord"/
+ * multiple named/commented versions per case. `kind` reuses the exact segment names
+ * [com.allocator.services.KbFingerprint.Segments] already uses ("casealloc"/"pref"/"ord"/
  * "purchmat"/"constr") so the two vocabularies stay in sync.
+ *
+ * No "default version" concept — every plan_run carries an EXPLICIT version id per kind, or none
+ * at all (meaning no override for that kind; a version with zero data rows behaves identically to
+ * having none — see `CaseConfigVersioning.resolveVersionId`'s own doc). This used to have an
+ * `isDefault` flag with "no explicit pick ⇒ case's current default" fallback resolution — removed
+ * after that single mechanism produced a run of retroactive-looking-attachment bugs: a later run
+ * creating a case's first version silently became what every earlier no-pick run appeared to use,
+ * a silently auto-seeded snapshot became the case default with zero user action, and a case's
+ * sole default version could never be deleted. "No pick" now always means "no override," full
+ * stop, never "go look up something implicit."
  *
  * The actual data tables (CaseAllocations et al.) and their companion "config" tables each carry
  * a `versionId` pointing back at a row here; `PlanRuns`/`KbRecords` each carry 5 nullable
@@ -354,7 +362,6 @@ object CaseConfigVersions : Table("case_config_version") {
     val kind      = varchar("kind", 16)
     val name      = varchar("name", 255).nullable()
     val comments  = text("comments").nullable()
-    val isDefault = bool("is_default").default(false)
     val createdAt = timestamp("created_at").defaultExpression(CurrentTimestamp)
     val updatedAt = timestamp("updated_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)

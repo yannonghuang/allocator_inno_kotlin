@@ -27,8 +27,8 @@ import org.slf4j.LoggerFactory
  * own doc in Tables.kt for the overall shape.
  *
  * For each case that has data-table rows or a companion "config" row for a given kind, but no
- * `version_id` on them yet, creates exactly one (unnamed, `isDefault=true`) version and points
- * those rows at it. Every historical `plan_run`/`kb_record` row for that case is ALSO backfilled
+ * `version_id` on them yet, creates exactly one (unnamed) version and points those rows at it.
+ * Every historical `plan_run`/`kb_record` row for that case is ALSO backfilled
  * to reference this same version for that kind — accurate, because before this feature there
  * was only ever one state per case, now captured as that version. This also correctly makes the
  * version immediately "referenced," protecting it from being silently overwritten right after
@@ -109,7 +109,7 @@ object ExternalConfigVersioningMigration {
     ): Int {
         val caseIds = dataCaseIds() + configCaseIds()
         for (caseId in caseIds) {
-            val versionId = CaseConfigVersioning.createVersion(caseId, kind, name = null, comments = null, markDefault = true)
+            val versionId = CaseConfigVersioning.createVersion(caseId, kind, name = null, comments = null)
             backfillData(caseId, versionId)
             backfillConfig(caseId, versionId)
             PlanRuns.update({ (PlanRuns.caseId eq caseId) and (planRunCol.isNull()) }) { it[planRunCol] = versionId }
