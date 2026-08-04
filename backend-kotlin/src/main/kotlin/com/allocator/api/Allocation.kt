@@ -125,7 +125,6 @@ private fun versionJson(caseId: Int, versionId: Int?): JsonObject {
         put("id", versionId)
         put("name", summary?.name)
         put("comments", summary?.comments)
-        put("is_default", summary?.isDefault ?: false)
         put("referenced", summary?.referenced ?: false)
     }
 }
@@ -411,7 +410,7 @@ fun Routing.allocationRoutes() {
             put("versions", JsonArray(versions.map { v ->
                 buildJsonObject {
                     put("id", v.id); put("name", v.name); put("comments", v.comments)
-                    put("is_default", v.isDefault); put("referenced", v.referenced)
+                    put("referenced", v.referenced)
                     put("created_at", v.createdAt); put("updated_at", v.updatedAt)
                 }
             }))
@@ -452,7 +451,7 @@ fun Routing.allocationRoutes() {
     }
 
     // ── PUT /cases/{case_id}/allocation/versions/{version_id} ─────────────────
-    // Body: { name?, comments?, is_default? } — rename/comment/set-default, always allowed.
+    // Body: { name?, comments? } — rename, always allowed.
     put("/cases/{case_id}/allocation/versions/{version_id}") {
         val caseId = requireCaseId(call)
         val versionId = call.parameters["version_id"]?.toIntOrNull() ?: throw IllegalArgumentException("Invalid version_id")
@@ -460,9 +459,6 @@ fun Routing.allocationRoutes() {
         val payload = Json.parseToJsonElement(body).jsonObject
         if (payload.containsKey("name") || payload.containsKey("comments")) {
             CaseConfigVersioning.renameVersion(versionId, payload["name"]?.jsonPrimitive?.contentOrNull, payload["comments"]?.jsonPrimitive?.contentOrNull)
-        }
-        if (payload["is_default"]?.jsonPrimitive?.booleanOrNull == true) {
-            CaseConfigVersioning.setDefaultVersion(caseId, KIND, versionId)
         }
         call.respond(versionJson(caseId, versionId))
     }
@@ -476,8 +472,6 @@ fun Routing.allocationRoutes() {
             call.respond(HttpStatusCode.OK, buildJsonObject { put("deleted", true) })
         } catch (e: CaseConfigVersioning.VersionInUseException) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
-        } catch (e: CaseConfigVersioning.VersionIsDefaultException) {
-            call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_is_default") })
         }
     }
 }

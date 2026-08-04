@@ -279,6 +279,9 @@ private fun migrateSchema() {
         // Phase-out: drop manual override table and its snapshot column on plan_run
         "ALTER TABLE plan_run DROP COLUMN IF EXISTS override_snapshot",
         "DROP TABLE IF EXISTS manual_override",
+        // Phase-out: "default version" concept removed from external-config versioning — every
+        // plan_run now carries an explicit version id per kind, or none (meaning no override).
+        "ALTER TABLE case_config_version DROP COLUMN IF EXISTS is_default",
     )
     val conn = org.jetbrains.exposed.sql.transactions.TransactionManager.current().connection
     stmts.forEach { sql ->
