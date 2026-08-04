@@ -67,7 +67,7 @@ export function AllocationPage() {
       .then(([a, s, d, vs]) => {
         setRows(a ?? []); setSupplies(s); setDemands(d);
         setVersions(vs);
-        setVersionId(vId ?? vs.find(v => v.is_default)?.id ?? vs[0]?.id ?? null);
+        setVersionId(vId ?? vs[vs.length - 1]?.id ?? null);
       })
       .catch(e => setError(String(e)));
   }, [caseId]);
@@ -279,12 +279,6 @@ export function AllocationPage() {
     finally { setSaving(false); }
   };
 
-  const handleSetDefault = async (vId: number) => {
-    try {
-      await updateAllocationVersion(caseId, vId, { is_default: true });
-      setVersions(await listAllocationVersions(caseId));
-    } catch (e) { setError(String(e)); }
-  };
 
   const handleRename = async (vId: number, name: string | undefined, comments: string | undefined) => {
     try {
@@ -328,7 +322,6 @@ export function AllocationPage() {
         currentVersionId={versionId}
         onSwitch={handleSwitchVersion}
         onSaveAs={handleSaveAs}
-        onSetDefault={handleSetDefault}
         onRename={handleRename}
         onDelete={handleDeleteVersion}
       />

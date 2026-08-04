@@ -146,7 +146,7 @@ export function ConfigDetailView({ config, caseId, versionRefs }: { config: Reco
               onClick={() => setDrill(k)}
               style={{ textAlign: 'left', background: 'none', border: 'none', color: '#93c5fd', cursor: 'pointer', fontSize: '0.76rem', padding: '2px 0' }}
             >
-              {EXTERNAL_LABELS[k]}{vId != null && <span style={{ color: '#71717a', fontFamily: 'monospace' }}> (v{vId})</span>} →
+              {EXTERNAL_LABELS[k]}<span style={{ color: '#71717a', fontFamily: 'monospace' }}> ({vId != null ? `v${vId}` : '-'})</span> →
             </button>
           );
         })}
@@ -157,20 +157,19 @@ export function ConfigDetailView({ config, caseId, versionRefs }: { config: Reco
 
 type AllocationAux = { supplies: CaseSupplyRow[]; demands: CaseDemandRow[] };
 
-/** Read-only preview of one external config object's content, for [versionId] if given, else the
- *  case's current default. Reused directly (not just from within ConfigDetailView's own drill-in
- *  flow) by the Planning page's per-object version picker — its "← Back" doubles as a plain close
- *  action there.
+/** Read-only preview of one external config object's content, for [versionId] — or "no version
+ *  selected" if none, never a fallback to anything (no "default" concept exists — see
+ *  CaseConfigVersions' own doc). Reused directly (not just from within ConfigDetailView's own
+ *  drill-in flow) by the Planning page's per-object version picker preview — its "← Back" doubles
+ *  as a plain close action there. Since there's no default fallback to differ on, this behaves
+ *  identically whether reached from a completed run's history, the KB panel, or a live picker
+ *  preview — no separate "context" needed.
  *
  *  Renders the EXACT same view component as the object's own dedicated (editable) page — just in
  *  read-only mode — rather than a separate simplified viewer, so filters/search/sort (critical
  *  for the long lists like Preferences and Purchasable Materials) work identically here. */
-export function ExternalConfigDrilldown({ kind, caseId, versionId, onBack, context = 'run', showBackLink = true }: {
+export function ExternalConfigDrilldown({ kind, caseId, versionId, onBack, showBackLink = true }: {
   kind: ExternalKind; caseId: number; versionId?: number; onBack: () => void;
-  /** 'run' (default): the caption frames [versionId] as "what this run used" — for ConfigDetailView's
-   *  own drill-in from a KB/history entry. 'live': frames it as just the currently-selected
-   *  version — for the Planning page's own picker preview, which isn't tied to any past run. */
-  context?: 'run' | 'live';
   /** Hide the "← Back" link — for callers (the Planning page's standalone preview window) that
    *  already have their own close affordance and aren't drilling in from a list. */
   showBackLink?: boolean;
@@ -186,13 +185,8 @@ export function ExternalConfigDrilldown({ kind, caseId, versionId, onBack, conte
   const [aux, setAux] = useState<unknown>(null);
   const [versionMeta, setVersionMeta] = useState<ConfigVersion | null>(null);
 
-  // 'run' + no version ref means this run genuinely used no config for this kind (or predates
-  // version tracking) — never resolve that to whatever is CURRENTLY the case's default, or a run
-  // appears to retroactively change what it used the moment a later run creates/promotes a new
-  // default version (confirmed live: reloading an older run after a newer run's first-ever
-  // Generate call showed the older run "using" the newer run's config). Only 'live' callers (the
-  // Planning page's own picker, not tied to any past run) still want the current-default fallback.
-  const showsNoConfig = context === 'run' && versionId == null;
+  // No version ref means no override for this kind, full stop — never resolved to anything else.
+  const showsNoConfig = versionId == null;
 
   useEffect(() => {
     if (showsNoConfig) {
@@ -300,12 +294,8 @@ export function ExternalConfigDrilldown({ kind, caseId, versionId, onBack, conte
       </div>
       <div style={{ color: '#71717a', fontSize: '0.68rem', marginBottom: 6 }}>
         {versionId != null
-          ? (context === 'run'
-              ? `Historical version this run actually used${versionMeta?.comments ? ` — ${versionMeta.comments}` : ''}.`
-              : `Selected version${versionMeta?.comments ? ` — ${versionMeta.comments}` : ''}.`)
-          : (context === 'run'
-              ? 'This run did not use a version of this config.'
-              : "Case's current default version.")}
+          ? `Version used${versionMeta?.comments ? ` — ${versionMeta.comments}` : ''}.`
+          : 'No version selected for this config ("-").'}
       </div>
       {loading && <div style={{ color: '#71717a' }}>Loading…</div>}
       {error && <div style={{ color: '#f87171' }}>{error}</div>}

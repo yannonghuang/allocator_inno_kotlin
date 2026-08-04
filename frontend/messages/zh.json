@@ -277,21 +277,17 @@
       "subheadPurchase": "采购",
       "groupPostPlan": "计划后处理",
       "groupExternalVersions": "外部配置",
+      "doneReadOnly": "已完成 — 只读",
+      "readOnlyActionTooltip": "此运行为只读 — 请点击\"新建运行\"以开始新的草稿。",
       "externalAllocation": "关键原材料分配",
       "externalPreferences": "供应偏好",
       "externalDemandOrdering": "需求排序",
       "externalPurchasableMaterials": "可采购物料",
       "externalConstraints": "约束条件",
       "externalVersionLabel": "版本 {id}",
-      "externalDefault": "默认",
+      "externalNone": "-",
       "externalPreview": "预览",
       "externalPreviewTooltip": "只读预览此版本的内容",
-      "externalDetach": "分离",
-      "externalDetachTooltip": "仅本次运行绕过该对象的版本，不改变案例的默认设置",
-      "externalReattach": "重新关联",
-      "externalReattachTooltip": "恢复使用所选（或默认）版本",
-      "externalDetachAll": "全部分离",
-      "externalReattachAll": "全部重新关联",
       "constraintShow": "展开约束",
       "constraintHide": "收起约束",
       "constraintHint": "为指定客户的需求固定 BOM 替代料的选择：对某客户 + 父产品（地点 * = 任意），强制使用指定的子件。每条规则固定一项。",
@@ -936,9 +932,11 @@
     "runHistory": {
       "title": "运行历史",
       "panelTitle": "计划运行历史",
+      "panelTitlePickMode": "选择一个运行作为新草稿的起点",
       "close": "关闭",
       "sortBy": "排序：",
       "load": "加载",
+      "useAsNew": "用作新运行",
       "loading": "加载中…",
       "delete": "删除",
       "edit": "编辑",
@@ -965,6 +963,7 @@
         "loading": "加载中…",
         "setActive": "设为当前",
         "setActiveTitle": "将此运行固定为案例的当前计划运行",
+        "useAsNewTitle": "将此运行的配置加载为新草稿的起点（不会将其标记为已加载/只读）",
         "unpin": "取消固定",
         "unpinTitle": "清除固定 — 当前将回退到最新的成功运行",
         "working": "…"
@@ -1178,6 +1177,11 @@
       "errorSend": "发送回复失败。",
       "confirmAbandon": "放弃协商?最新的备用方案仍可手动升级。",
       "noActive": "无活跃协商。"
+    },
+    "newRun": {
+      "button": "新建运行",
+      "blank": "从空白开始",
+      "fromExisting": "从现有运行开始…"
     }
   },
   "bomGraph": {
@@ -1407,7 +1411,7 @@
   },
   "versioning": {
     "version": "版本",
-    "default": "默认",
+    "none": "-",
     "inUseReadOnly": "使用中 — 只读",
     "inUseTooltip": "此版本已被某个计划运行使用 — 保存/生成/导入/清除已禁用。请使用「另存为」创建可编辑的副本。",
     "saveAs": "另存为…",
@@ -1416,7 +1420,6 @@
     "commentsPlaceholder": "备注(可选)",
     "create": "创建",
     "cancel": "取消",
-    "setDefault": "设为默认",
     "rename": "重命名",
     "delete": "删除",
     "renamePrompt": "重命名版本(名称):",

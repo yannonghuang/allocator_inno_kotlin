@@ -70,7 +70,7 @@ export function ConstraintsPage() {
         setDirty(false);
         setOptions(opts);
         setVersions(vs);
-        setVersionId(vId ?? vs.find((v) => v.is_default)?.id ?? vs[0]?.id ?? null);
+        setVersionId(vId ?? vs[vs.length - 1]?.id ?? null);
       })
       .catch((e) => setError(String(e)));
   }, [caseId]);
@@ -185,12 +185,6 @@ export function ConstraintsPage() {
     finally { setSaving(false); }
   };
 
-  const handleSetDefault = async (vId: number) => {
-    try {
-      await updateCaseConstraintsVersion(caseId, vId, { is_default: true });
-      setVersions(await listCaseConstraintsVersions(caseId));
-    } catch (e) { setError(String(e)); }
-  };
 
   const handleRename = async (vId: number, name: string | undefined, comments: string | undefined) => {
     try {
@@ -232,7 +226,6 @@ export function ConstraintsPage() {
         currentVersionId={versionId}
         onSwitch={handleSwitchVersion}
         onSaveAs={handleSaveAs}
-        onSetDefault={handleSetDefault}
         onRename={handleRename}
         onDelete={handleDeleteVersion}
       />

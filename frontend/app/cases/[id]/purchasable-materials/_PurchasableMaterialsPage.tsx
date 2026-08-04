@@ -62,7 +62,7 @@ export function PurchasableMaterialsPage() {
         setDirty(false);
         setOptions(catalog.materials);
         setVersions(vs);
-        setVersionId(vId ?? vs.find((v) => v.is_default)?.id ?? vs[0]?.id ?? null);
+        setVersionId(vId ?? vs[vs.length - 1]?.id ?? null);
       })
       .catch((e) => setError(String(e)));
   }, [caseId]);
@@ -178,14 +178,6 @@ export function PurchasableMaterialsPage() {
     finally { setSaving(false); }
   };
 
-  const handleSetDefault = async (vId: number) => {
-    try {
-      await updatePurchasableMaterialsVersion(caseId, vId, { is_default: true });
-      const vs = await listPurchasableMaterialsVersions(caseId);
-      setVersions(vs);
-    } catch (e) { setError(String(e)); }
-  };
-
   const handleRename = async (vId: number, name: string | undefined, comments: string | undefined) => {
     try {
       await updatePurchasableMaterialsVersion(caseId, vId, { name: name ?? null, comments: comments ?? null });
@@ -228,7 +220,6 @@ export function PurchasableMaterialsPage() {
         currentVersionId={versionId}
         onSwitch={handleSwitchVersion}
         onSaveAs={handleSaveAs}
-        onSetDefault={handleSetDefault}
         onRename={handleRename}
         onDelete={handleDeleteVersion}
       />

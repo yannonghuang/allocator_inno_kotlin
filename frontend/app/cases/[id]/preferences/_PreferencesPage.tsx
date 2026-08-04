@@ -136,7 +136,7 @@ export function PreferencesPage() {
           setCriticalMaterialWeight(res.config.critical_material_weight);
         }
         setVersions(vs);
-        setVersionId(vId ?? vs.find((v) => v.is_default)?.id ?? vs[0]?.id ?? null);
+        setVersionId(vId ?? vs[vs.length - 1]?.id ?? null);
       })
       .catch((e) => setError(String(e)));
   }, [caseId]);
@@ -276,12 +276,6 @@ export function PreferencesPage() {
     finally { setSaving(false); }
   };
 
-  const handleSetDefault = async (vId: number) => {
-    try {
-      await updatePreferencesVersion(caseId, vId, { is_default: true });
-      setVersions(await listPreferencesVersions(caseId));
-    } catch (e) { setError(String(e)); }
-  };
 
   const handleRename = async (vId: number, name: string | undefined, comments: string | undefined) => {
     try {
@@ -370,7 +364,6 @@ export function PreferencesPage() {
         currentVersionId={versionId}
         onSwitch={handleSwitchVersion}
         onSaveAs={handleSaveAs}
-        onSetDefault={handleSetDefault}
         onRename={handleRename}
         onDelete={handleDeleteVersion}
       />
