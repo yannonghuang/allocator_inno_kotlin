@@ -337,6 +337,39 @@ You do NOT modify planning config (consolidation, method_selection, score_weight
 etc.). Config changes go through the plan-form UI, not through you. If the user
 asks to change those, redirect them to the form rather than attempting the change.
 
+**HONESTY HARD STOP — the single most-violated rule in this system, read before
+answering ANY "why" question:** Every fact you state about this case's data — a
+BOM alt_group, a constraint row, a config version number, a tool's returned
+fields — MUST come from a tool result you actually received THIS turn. This is
+not a style preference; it has caused repeated, confirmed incidents where the
+agent invented a plausible-sounding schema/constraint/product-variant that does
+not exist anywhere in the case's data, and a user caught it against the raw
+CSVs. Concretely:
+  - **An empty / zero-match tool result (`match_count: 0`, `[]`, "no WO found",
+    `0 unique gids`) is a complete, valid answer.** It means exactly what it
+    says — nothing more. Report it as-is. Do NOT follow an empty result with an
+    invented mechanism, mock payload, or narrative that fills the gap with
+    something plausible-sounding.
+  - **Never invent an identifier.** Product/BOM-variant ids, alt_group names,
+    constraint version numbers, demand ids — if it isn't a literal string or
+    number copied from a tool payload this turn, don't write it. "This looks
+    like it would be named X" is not grounding.
+  - **Don't conflate two different id spaces.** location_id and prod_area are
+    different dimensions (see explain_method_choice's doc); customer_id and
+    product_id can collide as the SAME string across different cases (see
+    list_customers' doc). A tool call using the wrong dimension will look
+    "empty" or "wrong" — that's a signal to re-check which dimension you meant,
+    not to guess past it.
+  - **Don't contradict yourself across turns without saying so.** If a claim
+    you're about to make conflicts with something you displayed earlier THIS
+    conversation (e.g. a number in an earlier table), that's a red flag —
+    re-run the grounding tool call and quote the fresh result explicitly,
+    noting the discrepancy, rather than silently overwriting the earlier claim.
+  - If you genuinely don't know the mechanism after calling the relevant
+    tools, say so plainly ("the available tools don't show a reason for this")
+    instead of constructing one. A correct "I don't know" is always better than
+    a fabricated explanation.
+
 **INTENT-ROUTING HARD STOP — read BEFORE doing anything else:**
 If the user's message contains ANY of these phrases (or their close paraphrases),
 the intent is **WO shutdown/maintenance scheduling**. Skip the three-bucket
@@ -379,6 +412,30 @@ Planner knowledge (from docs/waterfall-allocation.md):
     under shortage) | "proportional" | "priority_first". Split policy applies at
     supply-bearing nodes (raw inventory, leftover stock, carry-over WOs).
   - On case-171 the empirical sweet spot is mode=preference + max_methods=2.
+  - method_selection.root_waterfall (bool, default true) — true = the demand's ROOT node uses
+    the same ordinary sequential 100%-then-spillover waterfall as every other node. false =
+    the root instead divides its quantity UP-FRONT across its alternatives (root-only
+    proportional/equal split), before waterfall applies below. Only the root is affected;
+    every non-root BOM node always waterfalls regardless of this flag. Distinct from
+    raw_material_sourcing="equal_split" (below) — that one applies at ANY depth to
+    purchasable-raw-material siblings specifically, this one applies only at the demand root
+    and to any alternatives there.
+  - method_selection.raw_material_sourcing = "equal_split" (vs default "waterfall") — when
+    "equal_split", PURCHASABLE-RAW-MATERIAL alternatives filling the same BOM slot (no
+    method_make, admitted as buy) get an equal fixed share of that slot's quantity instead of
+    sequential waterfall. Manufacturable alternatives (have a method_make) are never grouped
+    this way even if structurally identical. See agent-knowledge.md's "Equal-split raw-material
+    sourcing" section and compare_alternatives' tool doc for the "equal DEMAND ≠ equal
+    PURCHASE" consequence this has on purchase-quantity questions.
+  - reallocate_critical_leftover (bool, default false, EXPERIMENTAL, top-level config key — NOT
+    under method_selection) — when true, after the normal critical-material allocation pass,
+    any leftover budget on a (critical-material, supply-lot) that its originally-allocated
+    demand didn't fully use gets reallocated to OTHER demands that are still short of that same
+    material, instead of sitting unused. When explaining a demand that unexpectedly DID or did
+    NOT receive extra critical material beyond its own Critical Raw Allocation rows, check this
+    flag via get_run_config before concluding the allocation is wrong — with it on, a short
+    demand legitimately drawing beyond its own pre-allocated rows is expected behavior, not a
+    bug.
 
 **Critical materials** (canonical test: `isRawCriticalPosition` in PlanningEngine.kt — the
 SAME function used for live dominator labeling and for building Critical Raw Allocation's
@@ -1002,6 +1059,121 @@ your tool-result trace):
     expired or was already accepted — ask the user.
   If promote fails: report the error to the user; do not recover by
     re-running analysis.
+
+──────────────────────────────────────────────────────────────────────
+WORKFLOW — Scenario Q&A playbooks (purchase/WO comparison, customer schedules)
+──────────────────────────────────────────────────────────────────────
+
+These three question shapes recur constantly across cases — recognize them and
+go straight to the recipe instead of orchestrating tools from scratch.
+
+  **Playbook 1 — weekly/daily purchase (or WO) comparison across products.**
+  Trigger phrases (English): "weekly purchase plan for X and Y", "compare
+  purchases of X vs Y", "side by side", "pull out weekly/daily purchase plans".
+  中文: "X 和 Y 的每周采购计划", "对比 X 和 Y 的采购", "并排比较", "逐周/逐日采购计划".
+    → call compare_alternatives(product_ids=[X, Y], group_by="week" (or "day")).
+      Render `purchase_history[pid]` (already bucketed by period+location) as
+      one table with a row per period, one column per product. Do NOT hand-bucket
+      raw per-WO rows yourself when group_by is available — that's what it's for.
+
+  **Playbook 2 — "why does X have more purchases/WOs than Y".**
+  Trigger phrases (English): "why does X have more purchases than Y", "why is
+  X's total higher", "explain the discrepancy between X and Y".
+  中文: "为什么 X 的采购比 Y 多", "X 和 Y 的差异是什么原因", "解释一下差距".
+    → call compare_alternatives(product_ids=[X, Y]) (group_by optional). Check,
+      in order: (a) `opening_stock_total` — equal-split (raw_material_sourcing=
+      "equal_split") guarantees equal DEMAND, not equal PURCHASE; the side with
+      less starting stock buys sooner (see `first_purchase_date`) and more,
+      even under an identical split; (b) `pinning_constraints` — a Constraints
+      row can route one customer's ENTIRE demand to only one side, bypassing
+      equal-split for it; (c) if root_waterfall=false (get_run_config), the
+      root-level split itself may be uneven — check the config value rather
+      than assuming a 50/50 split. Cite whichever of (a)/(b)/(c) the data
+      actually shows; never narrate a mechanism the tool result doesn't support.
+
+  **Playbook 3 — daily work orders for a customer, optionally across 2+ prod_areas.**
+  Trigger phrases (English): "daily work orders for customer X", "WOs for
+  customer X in CB and COC", "X and Y's respective CB, and shared COC".
+  中文: "客户 X 的每日工单", "客户 X 在 CB 和 COC 的工单", "X 和 Y 各自的 CB，以及共用的 COC".
+    → ground BOTH free-form terms first: list_customers for X (same grounding
+      rule list_prod_areas/list_locations already use), list_prod_areas for
+      the area names. If X isn't in list_customers' result, STOP before
+      calling find_wos — see the "zero-match diagnosis" rule below, do not
+      just retry find_wos with the same id. Once grounded, ONE call to
+      find_wos(customer_id=X, prod_areas=[…], start_after=…, limit=500). Each
+      returned row already carries its own `prod_area`, so a single call
+      covers multiple areas — do not call find_wos once per area. Render as a
+      daily table (one row per wo_group_id, sorted by start_time). Note in
+      your reply that customer_id attribution assumes WO consolidation is off
+      for this case (each native WO maps to exactly one demand_id → customer);
+      say so explicitly if the run's config has any *_batch_scale other than
+      "none".
+
+    **"Shared" prod_area/product across two customers — query it directly, don't
+    infer it.** When a user says one prod_area is "shared" between two
+    customers (e.g. each has their own CB, sharing a common COC), that means a
+    specific COMPONENT product is a BOM child of both customers' top-level
+    products — confirm with get_bom_tree(each customer's own product_id) and
+    look for the SAME child product_id under both. Once confirmed, get the
+    shared rows with ONE call to find_wos(product_id=<shared child>,
+    prod_area=…) — WITHOUT a customer_id filter, since the whole point is the
+    combined production regardless of which demand triggered which lot. Do NOT
+    approximate "shared" by calling find_wos separately per customer and then
+    manually intersecting dates / summing quantities — that's an invented
+    proxy for something find_wos can answer directly and exactly.
+
+  **Zero-match diagnosis — a term not found in THIS case is not the same as
+  "doesn't exist".** Every case is an independent dataset; the SAME id string
+  can mean different things in different cases (a real, observed case: "Q4R"
+  is a product_id in one case's data and a customer_id in an entirely
+  different case). Never guess at spelling variants or retry the identical
+  failing call. Instead, the moment ANY grounding/lookup tool (list_customers,
+  list_prod_areas, list_locations, find_wos, get_product_methods, …) comes
+  back empty for a user-supplied id:
+    1. State which case you're currently scoped to — `<case_id>`/`<case_name>`
+       from the system prompt context — plainly in your reply. This is the
+       single most common actual cause and the one thing you can't infer from
+       the tool result alone.
+    2. Check whether the SAME string resolves under a DIFFERENT role in this
+       same case (e.g. list_customers had no match → try
+       find_wos(product_id=X) or get_product_methods(X); or vice versa).
+    3. If neither resolves, say plainly that the id isn't in this case's data
+       and ask the user to confirm the case/scenario they mean — do NOT
+       silently keep retrying the same failing filter across multiple turns,
+       and do NOT invent alternate id spellings ("maybe it's X__666?") without
+       evidence from an actual tool result.
+
+  **Playbook 3b — "why is there no WO for customer X on date Y" (absence, not lookup).**
+  Trigger phrases (English): "why does X have no CB workorder on Aug 14",
+  "why is there nothing scheduled for X that day".
+  中文: "为什么 X 在 8 月 14 日没有 CB 工单", "为什么那天没有安排".
+    This is a multi-tool synthesis, not a single lookup — no tool answers
+    "why not" directly:
+      1. find_wos(customer_id=X, prod_area=…, start_after=<day-3>,
+         start_before=<day+3>) to confirm the gap and see what IS scheduled
+         immediately around it. If a table earlier in THIS conversation
+         already showed a value for that exact (customer, prod_area, date),
+         a fresh call returning empty is a direct contradiction — say so
+         explicitly and re-verify rather than silently going with whichever
+         answer you produce last.
+      2. get_critical_raw_allocation(product_id=…, demand_id=…) /
+         get_critical_materials(run_id) to check whether a critical-material
+         lead-time or targeting constraint (see the "Critical Raw Allocation"
+         primer above) is binding on that date — a demand can't get a WO
+         before its critical inputs are available.
+      3. Cross-check the demand's own request_due_time (get_demand_pegging or
+         find_demands_for_product) — a WO legitimately absent on day Y but
+         present on day Y±k is normal waterfall/lead-time scheduling, not a
+         bug.
+      4. Only if you need method-selection detail, call
+         explain_method_choice/get_bom_tree — with a REAL location_id (ground
+         via list_locations first; a real, observed failure was passing a
+         prod_area string like "COC" as location_id, which matches nothing).
+         If either returns empty/no alt_group, that is the complete answer —
+         report "no alternate method/variant found," do not invent one.
+    Cite whichever cause the data actually shows (lead-time constraint vs.
+    inventory/critical-material exhaustion vs. simply no demand due that day)
+    — never assert a mechanism you haven't confirmed against a tool result.
 """
 
 // ── Tool registry ────────────────────────────────────────────────────────────
@@ -1327,10 +1499,14 @@ internal val TOOLS: List<LlmTool> = listOf(
             "find_bom_siblings if you only have one) and this returns everything needed to explain BOTH " +
             "known causes in one call: (a) different starting on-hand inventory (equal-split guarantees " +
             "equal DEMAND, not equal PURCHASE — each side draws its own stock first, so purchase " +
-            "quantities only converge once both are depleted), and (b) `pinning_constraints` — a " +
-            "customer constraint routing that customer's ENTIRE demand to one side, bypassing " +
-            "equal-split for it entirely. See agent-knowledge.md's 'Equal-split raw-material sourcing' " +
-            "section for the full mechanism before answering.",
+            "quantities only converge once both are depleted — see per-product `opening_stock_total` " +
+            "and `first_purchase_date`, the date each side's stock ran out and buying started), and " +
+            "(b) `pinning_constraints` — a customer constraint routing that customer's ENTIRE demand " +
+            "to one side, bypassing equal-split for it entirely. See agent-knowledge.md's 'Equal-split " +
+            "raw-material sourcing' section for the full mechanism before answering. Also THE tool for " +
+            "'weekly/daily purchase plan for product X and Y side by side' — pass `group_by` to get " +
+            "`purchase_history` pre-bucketed into periods instead of one row per WO, so you don't have " +
+            "to bucket dozens of individual purchase lots by hand.",
         buildJsonObject {
             put("type", "object")
             putJsonObject("properties") {
@@ -1346,6 +1522,12 @@ internal val TOOLS: List<LlmTool> = listOf(
                 putJsonObject("plan_run_id") {
                     put("type", "integer")
                     put("description", "Which run's purchase history + config to use. Defaults to the case's latest success run.")
+                }
+                putJsonObject("group_by") {
+                    put("type", "string")
+                    put("description", "Optional — \"day\" or \"week\" to pre-bucket `purchase_history` by period " +
+                        "(summed quantity per period per location) instead of one row per native WO. Omit for the " +
+                        "raw per-WO rows (unchanged default behavior).")
                 }
             }
             put("required", buildJsonArray { add("product_ids") })
@@ -1624,7 +1806,14 @@ internal val TOOLS: List<LlmTool> = listOf(
             putJsonObject("properties") {
                 putJsonObject("run_id") { put("type", "integer") }
                 putJsonObject("product_id") { put("type", "string") }
-                putJsonObject("location_id") { put("type", "string") }
+                putJsonObject("location_id") {
+                    put("type", "string")
+                    put("description", "A real location_id (ground via list_locations, or reuse one already seen in a find_wos/ " +
+                        "get_bom_tree result this turn) — NOT a prod_area value. location_id and prod_area are different " +
+                        "dimensions (e.g. one real case has a single location_id \"1000\" but multiple prod_area values like " +
+                        "\"CB\"/\"COC\"); passing a prod_area string here will simply match zero WOs and return an honest empty " +
+                        "result — that empty result means no match was found, NOT that you should guess what it would show.")
+                }
                 putJsonObject("demand_id") {
                     put("type", "string")
                     put("description", "Optional — restrict matches to one demand's pegging tree.")
@@ -1784,22 +1973,53 @@ internal val TOOLS: List<LlmTool> = listOf(
         },
     ),
     tool(
+        "list_customers",
+        "Return distinct customer_id values present in the case's demand data (with demand counts and " +
+            "sample products), straight from the demand table — no plan run required. Use BEFORE " +
+            "find_wos(customer_id=…) whenever the term is free-form / unconfirmed, the SAME grounding " +
+            "rule as list_prod_areas/list_locations. Critically useful when a lookup by a given id " +
+            "comes back empty: the SAME string can be a customer_id in one case and a product_id in " +
+            "another (cases are independent datasets) — call this first (and check the id against " +
+            "find_wos(product_id=…) too) rather than guessing at spelling variants, and always state " +
+            "which case (<case_id>/<case_name>) you're scoped to when reporting a not-found result, since " +
+            "that's the most common actual cause.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {}
+            put("required", buildJsonArray { })
+        },
+    ),
+    tool(
         "find_wos",
         "THE general lookup for actual, planner-generated work orders (make, move, AND purchase) " +
             "— use this for questions like 'what purchase requests/orders exist for product X', 'list " +
-            "buy work orders at location Y', 'what move orders are scheduled next month', etc. Pass " +
-            "method=\"purchase\" for purchase requests specifically (\"buy\" is also accepted as an " +
-            "alias — CSV/table name is method_buy, but WOs are stamped method=\"purchase\" at runtime). " +
-            "Also the entry point before calling analyze_wo_availability / analyze_wo_schedule_impact " +
-            "for a maintenance/downtime scenario. One row per wo_group_id (product_id, location_id, " +
-            "method, start_time, end_time, quantity). Filters AND together; omit any to match all. " +
-            "Returns up to `limit` rows (default 50, max 500).",
+            "buy work orders at location Y', 'what move orders are scheduled next month', 'daily work " +
+            "orders for customer Q4R in CB and COC', etc. Pass method=\"purchase\" for purchase requests " +
+            "specifically (\"buy\" is also accepted as an alias — CSV/table name is method_buy, but WOs " +
+            "are stamped method=\"purchase\" at runtime). Also the entry point before calling " +
+            "analyze_wo_availability / analyze_wo_schedule_impact for a maintenance/downtime scenario. " +
+            "One row per wo_group_id (product_id, location_id, prod_area, method, start_time, end_time, " +
+            "quantity, demand_id). Filters AND together (prod_areas is OR'd against itself, then AND'd " +
+            "with the rest); omit any to match all. Returns up to `limit` rows (default 50, max 500).",
         buildJsonObject {
             put("type", "object")
             putJsonObject("properties") {
-                putJsonObject("prod_area")  { put("type", "string"); put("description", "Exact prod_area match.") }
+                putJsonObject("prod_area")  { put("type", "string"); put("description", "Exact prod_area match. For 2+ areas in one call, use prod_areas instead.") }
+                putJsonObject("prod_areas") {
+                    put("type", "array")
+                    putJsonObject("items") { put("type", "string") }
+                    put("description", "Match ANY of these prod_area values (e.g. [\"CB\", \"COC\"] for \"in CB and COC\"). Combine with prod_area for a single extra value.")
+                }
                 putJsonObject("location_id"){ put("type", "string"); put("description", "Exact location_id match.") }
                 putJsonObject("product_id") { put("type", "string"); put("description", "Exact product_id match.") }
+                putJsonObject("customer_id") {
+                    put("type", "string")
+                    put("description", "Exact customer_id match — resolved via each WO's demand_id (Demand.customer_id). Ground free-form " +
+                        "customer terms via list_customers FIRST, same rule as prod_area/list_prod_areas — the same id string can mean a " +
+                        "different real-world entity in a different case (e.g. a product_id in one case, a customer_id in another). Only " +
+                        "meaningful when WO consolidation is off (one native WO per demand); with consolidation on, a consolidated WO can " +
+                        "serve multiple customers and won't be attributable to just one.")
+                }
                 putJsonObject("method")     { put("type", "string"); put("description", "make / move / purchase (\"buy\" also accepted as an alias for purchase).") }
                 putJsonObject("start_after") {
                     put("type", "string")
@@ -3447,6 +3667,15 @@ private fun resolveRunConfig(caseId: Int, planRunId: Int?): Map<String, Any?>? {
         .getOrNull()
 }
 
+/** Bucket a WO start date into a "day" (the date itself) or "week" (Monday of that ISO
+ *  calendar week) label — used by `compare_alternatives`'s optional `group_by`. Deliberately
+ *  Monday-aligned rather than reusing PlanningEngine's epoch-day/7 consolidation buckets
+ *  (calendarBucket): those are anchored to the Unix epoch (a Thursday) purely for internal
+ *  WO-merge grouping and were never meant for display; a calendar week start is what a human
+ *  reads as "the week of". */
+internal fun periodLabel(date: java.time.LocalDate, scale: String): String =
+    if (scale == "week") date.minusDays((date.dayOfWeek.value - 1).toLong()).toString() else date.toString()
+
 /**
  * Compare two or more products side by side — supply on hand per location, purchase WO history
  * over time, and any customer-BOM constraint that pins one of them as the FORCED resolution of a
@@ -3469,27 +3698,36 @@ private fun toolCompareAlternatives(caseId: Int, args: JsonObject, locale: Strin
     if (productIds.size < 2) return toolError("`product_ids` needs at least 2 distinct product ids to compare", locale)
     val locationFilter = args["location_id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
     val planRunId = args["plan_run_id"]?.jsonPrimitive?.intOrNull
+    val groupBy = args["group_by"]?.jsonPrimitive?.contentOrNull?.trim()?.lowercase()
+        ?.takeIf { it == "day" || it == "week" }
 
-    // Supply on hand, per product per location.
+    // Supply on hand, per product per location — also rolled up to a per-product total below
+    // (opening_stock_total), the "how much was already on hand before any purchase" figure.
     val supplyRows = transaction {
         Supplies.selectAll().where { (Supplies.caseId eq caseId) and (Supplies.productId inList productIds) }.toList()
     }
+    val stockByProductLoc = productIds.associateWith { pid ->
+        supplyRows
+            .filter { it[Supplies.productId] == pid && (locationFilter == null || it[Supplies.locationId] == locationFilter) }
+            .groupBy { it[Supplies.locationId] ?: "" }
+            .mapValues { (_, lotRows) -> lotRows.sumOf { it[Supplies.qty] } }
+    }
     val supplyByProduct = buildJsonObject {
         for (pid in productIds) {
-            val byLoc = supplyRows
-                .filter { it[Supplies.productId] == pid && (locationFilter == null || it[Supplies.locationId] == locationFilter) }
-                .groupBy { it[Supplies.locationId] ?: "" }
-                .mapValues { (_, lotRows) -> lotRows.sumOf { it[Supplies.qty] } }
             putJsonObject(pid) {
-                byLoc.entries.sortedBy { it.key }.forEach { (locId, qty) -> put(locId, qty) }
+                stockByProductLoc.getValue(pid).entries.sortedBy { it.key }.forEach { (locId, qty) -> put(locId, qty) }
             }
         }
     }
 
     // Purchase WO history, per product — same wo_group_id aggregation find_wos uses, so results
-    // are directly comparable to a separate find_wos call.
+    // are directly comparable to a separate find_wos call. When `group_by` is set, further
+    // bucket into day/week periods (summed per location) instead of one row per native WO —
+    // built for "weekly purchase plan" comparisons where dozens/hundreds of individual purchase
+    // lots would otherwise have to be bucketed by hand.
     val wos = loadBaselineWorkOrders(caseId, planRunId) ?: emptyList()
     data class Agg(var location: String, var minStart: String?, var maxEnd: String?, var qty: Double)
+    val firstPurchaseDateByProduct = mutableMapOf<String, String?>()
     val purchaseByProduct = buildJsonObject {
         for (pid in productIds) {
             val matches = wos.asSequence()
@@ -3510,13 +3748,39 @@ private fun toolCompareAlternatives(caseId: Int, args: JsonObject, locale: Strin
                     ex.qty += q
                 }
             }
-            putJsonArray(pid) {
-                byGid.values.sortedBy { it.minStart ?: "" }.forEach { a ->
-                    addJsonObject {
-                        put("location_id", a.location)
-                        put("start_time", a.minStart)
-                        put("end_time", a.maxEnd)
-                        put("quantity", a.qty)
+            val sortedAggs = byGid.values.sortedBy { it.minStart ?: "" }
+            firstPurchaseDateByProduct[pid] = sortedAggs.firstOrNull { it.minStart != null }?.minStart
+
+            if (groupBy == null) {
+                putJsonArray(pid) {
+                    sortedAggs.forEach { a ->
+                        addJsonObject {
+                            put("location_id", a.location)
+                            put("start_time", a.minStart)
+                            put("end_time", a.maxEnd)
+                            put("quantity", a.qty)
+                        }
+                    }
+                }
+            } else {
+                data class PeriodAgg(var qty: Double = 0.0, var lotCount: Int = 0)
+                val byPeriod = LinkedHashMap<Pair<String, String>, PeriodAgg>() // (period, location) -> agg
+                for (a in sortedAggs) {
+                    val start = a.minStart?.let { runCatching { java.time.LocalDate.parse(it.take(10)) }.getOrNull() }
+                        ?: continue
+                    val key = periodLabel(start, groupBy) to a.location
+                    val bucket = byPeriod.getOrPut(key) { PeriodAgg() }
+                    bucket.qty += a.qty
+                    bucket.lotCount += 1
+                }
+                putJsonArray(pid) {
+                    byPeriod.entries.sortedBy { it.key.first }.forEach { (key, agg) ->
+                        addJsonObject {
+                            put("period", key.first)
+                            put("location_id", key.second)
+                            put("quantity", agg.qty)
+                            put("lot_count", agg.lotCount)
+                        }
                     }
                 }
             }
@@ -3542,6 +3806,13 @@ private fun toolCompareAlternatives(caseId: Int, args: JsonObject, locale: Strin
     val payload = buildJsonObject {
         put("product_ids", JsonArray(productIds.map { JsonPrimitive(it) }))
         put("supply_on_hand_by_location", supplyByProduct)
+        put("opening_stock_total", buildJsonObject {
+            for (pid in productIds) put(pid, stockByProductLoc.getValue(pid).values.sum())
+        })
+        put("first_purchase_date", buildJsonObject {
+            for (pid in productIds) firstPurchaseDateByProduct[pid]?.let { put(pid, it) }
+        })
+        groupBy?.let { put("group_by", it) }
         put("purchase_history", purchaseByProduct)
         put("pinning_constraints", constraintsJson)
     }
@@ -5595,9 +5866,16 @@ private suspend fun runAgentLoop(
     // Resolve the case's active run id with the same logic the rest of the
     // app uses (designated → falls back to latest success). When the case has
     // no successful runs yet this is null and the agent must ask the user.
+    // caseName is surfaced as <case_name> below — the chat has no other way to tell the agent
+    // (or, via its replies, the user) which case/scenario it's currently scoped to. Distinct
+    // cases can reuse the same free-form id for different real-world entities (e.g. "Q4R" is a
+    // product in one case's data and a customer in another's) — without this, a zero-match
+    // lookup looks like "not found" instead of "wrong case", and the agent has no way to say so.
+    var caseName: String? = null
     val activeRunId: Int? = transaction {
-        val designatedId = Cases.selectAll().where { Cases.id eq caseId }
-            .firstOrNull()?.get(Cases.designatedActivePlanRunId)
+        val caseRow = Cases.selectAll().where { Cases.id eq caseId }.firstOrNull()
+        caseName = caseRow?.get(Cases.name)
+        val designatedId = caseRow?.get(Cases.designatedActivePlanRunId)
         val successIds = PlanRuns.selectAll()
             .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
             .map { it[PlanRuns.id] }
@@ -5615,6 +5893,8 @@ private suspend fun runAgentLoop(
         append("\n\n<current_config>\n")
         append(workingConfig.toString())
         append("\n</current_config>")
+        append("\n\n<case_id>").append(caseId.toString()).append("</case_id>")
+        append("\n<case_name>").append(caseName ?: "(unknown)").append("</case_name>")
         append("\n\n<viewing_run_id>")
         append(viewingRunId?.toString() ?: "(none)")
         append("</viewing_run_id>")
@@ -5882,6 +6162,7 @@ private suspend fun dispatchTool(
         "write_memory" -> Pair(toolWriteMemory(caseId, args, locale), workingConfig)
         "list_prod_areas" -> Pair(toolListProdAreas(caseId, args, locale), workingConfig)
         "list_locations" -> Pair(toolListLocations(caseId, args, locale), workingConfig)
+        "list_customers" -> Pair(toolListCustomers(caseId, locale), workingConfig)
         "find_wos" -> Pair(toolFindWos(caseId, args, locale), workingConfig)
         "analyze_wo_availability" -> Pair(toolAnalyzeWoAvailability(caseId, args, locale), workingConfig)
         "analyze_wo_schedule_impact" -> Pair(toolAnalyzeWoScheduleImpact(caseId, args, locale), workingConfig)
@@ -5984,11 +6265,61 @@ internal fun toolListLocations(caseId: Int, args: JsonObject, locale: String): T
     )
 }
 
+/** Ground free-form customer_id terms against the case's actual demand data, straight from
+ *  Demands (no plan run needed) — mirrors list_prod_areas/list_locations' grounding role for
+ *  find_wos(customer_id=…). Cases are independent datasets that can reuse the same id string for
+ *  different real-world entities (e.g. a product code in one case, a customer id in another);
+ *  this lets the agent confirm which one it's looking at instead of guessing after a 0-match. */
+internal fun toolListCustomers(caseId: Int, locale: String): ToolResult {
+    val rows = transaction { Demands.selectAll().where { Demands.caseId eq caseId }.toList() }
+    val entries = rows.groupBy { it[Demands.customerId] }
+        .filter { it.key.isNotBlank() }
+        .map { (cid, list) ->
+            val sampleProducts = list.map { it[Demands.productId] }.toSet().sorted().take(5)
+            Triple(cid, list.size, sampleProducts)
+        }
+        .sortedByDescending { it.second }
+    return ToolResult(
+        summary = loc("${entries.size} customer(s)", "${entries.size} 个客户", locale),
+        payload = buildJsonObject {
+            put("count", entries.size)
+            put("customers", buildJsonArray {
+                entries.forEach { (cid, demandCount, samples) ->
+                    add(buildJsonObject {
+                        put("customer_id", cid)
+                        put("demand_count", demandCount)
+                        put("sample_products", buildJsonArray { samples.forEach { add(it) } })
+                    })
+                }
+            })
+        },
+    )
+}
+
 internal fun toolFindWos(caseId: Int, args: JsonObject, locale: String): ToolResult {
     val planRunId = args["plan_run_id"]?.jsonPrimitive?.intOrNull
-    val prodArea = args["prod_area"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+    // prod_area (single) and prod_areas (array) are OR'd together into one match set — lets
+    // "daily WOs for customer Q4R in CB and COC" resolve in one call instead of two.
+    val prodAreas: Set<String>? = buildSet {
+        args["prod_area"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }?.let { add(it) }
+        (args["prod_areas"] as? JsonArray)
+            ?.mapNotNull { it.jsonPrimitive.contentOrNull?.trim() }
+            ?.filter { it.isNotBlank() }
+            ?.let { addAll(it) }
+    }.takeIf { it.isNotEmpty() }
     val locationId = args["location_id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
     val productId = args["product_id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+    // customer_id resolves via each WO's demand_id (Demand.customer_id) — WOs have no direct
+    // customer column. Reliable 1:1 only when WO consolidation is off (see tool doc string).
+    val customerId = args["customer_id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+    val customerDemandIds: Set<String>? = customerId?.let { cid ->
+        transaction {
+            Demands.selectAll()
+                .where { (Demands.caseId eq caseId) and (Demands.customerId eq cid) }
+                .map { it[Demands.demandId] }
+                .toSet()
+        }
+    }
     // WOs are stamped with method type "make"/"move"/"purchase" at runtime — never "buy" (that's
     // only the CSV/table name, method_buy.csv/MethodBuys). Normalize so an LLM call using the
     // CSV-derived term still matches real data instead of silently returning zero rows.
@@ -6015,9 +6346,10 @@ internal fun toolFindWos(caseId: Int, args: JsonObject, locale: String): ToolRes
 
     val filtered = wos.asSequence()
         .filter { !isVirtualProductWo(it) && it["wo_group_id"] != null }
-        .filter { prodArea == null || it["prod_area"] == prodArea }
+        .filter { prodAreas == null || it["prod_area"] in prodAreas }
         .filter { locationId == null || it["location_id"] == locationId }
         .filter { productId == null || it["product_id"] == productId }
+        .filter { customerDemandIds == null || it["demand_id"] in customerDemandIds }
         .filter { method == null || it["method"] == method }
         .filter {
             val s = parseStart(it) ?: return@filter false
