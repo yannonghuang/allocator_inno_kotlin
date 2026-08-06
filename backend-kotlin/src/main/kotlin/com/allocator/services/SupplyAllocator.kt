@@ -342,7 +342,7 @@ fun allocateSuppliesPerLot(
  * [buildSupplyAllocation]'s one call site (already scoped to `criticalMatrix`, the
  * pre-pruned-to-critical-only reachability matrix, so no separate critical/non-critical
  * partitioning is needed here). This table exists for users to review and manually edit
- * (Critical Raw Allocation UI, saved versions) — it expresses per-demand ELIGIBILITY and a
+ * (Critical Material Allocation UI, saved versions) — it expresses per-demand ELIGIBILITY and a
  * starting proportional split, not a hard sequencing of consumption; actual fair-share
  * arbitration among competing demands (AND-siblings, diamonds) happens later, during the real
  * commit, via the existing branchLotCap/intraBudget machinery.

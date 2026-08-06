@@ -2114,7 +2114,7 @@ export async function getAscOptions(caseId: number): Promise<{ hasWipSupply: boo
 
 // ── Config versioning (shared across the 5 "external config objects") ──────────
 // See CaseConfigVersions' own doc in Tables.kt. Every one of the 5 objects below
-// (Critical Raw Allocation / Supply Preferences / Demand Ordering / Purchasable
+// (Critical Material Allocation / Supply Preferences / Demand Ordering / Purchasable
 // Materials / Constraints) can have multiple named/commented versions per case,
 // exactly one marked default; a version can only be edited-in-place or deleted
 // while unreferenced by any plan run (in KB or history) — otherwise "Save As" a

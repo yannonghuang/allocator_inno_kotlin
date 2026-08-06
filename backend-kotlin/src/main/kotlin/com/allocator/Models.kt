@@ -182,7 +182,7 @@ data class PlanRunFullResponse(
     // "using as new" a run (frontend's restoreExternalConfigRefs) reads these off THIS single-run
     // detail response, not the list one — omitting them here silently dropped every run's
     // external-config attachment on Load/"Use as new", confirmed live (run 1700 showed "-" for
-    // Critical Raw Allocation and Demand Ordering despite both being set in the DB).
+    // Critical Material Allocation and Demand Ordering despite both being set in the DB).
     @SerialName("case_alloc_version_id") val caseAllocVersionId: Int? = null,
     @SerialName("pref_version_id") val prefVersionId: Int? = null,
     @SerialName("demand_order_version_id") val demandOrderVersionId: Int? = null,

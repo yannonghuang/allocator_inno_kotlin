@@ -3092,7 +3092,7 @@ internal suspend fun runBootstrapBatchBackground(
 }
 
 /** Run one preset end-to-end: insert plan_run, run planner, persist, soundness. Reads the
- *  preset's resolved Critical Raw Allocation / Supply Preferences / Demand Ordering version the
+ *  preset's resolved Critical Material Allocation / Supply Preferences / Demand Ordering version the
  *  same way a manual Plan Run does (`loadCaseAllocRows`/`loadPreferenceKb`/`loadDemandOrderMap`,
  *  see `runPlanBackground`'s identical wiring) — every KB-seeding run genuinely consults the
  *  case's actual (picked-or-default) business data, not a fixed "na" placeholder. Deliberately
@@ -3483,6 +3483,21 @@ internal fun resolveEffectiveConfig(
                 if (v != null && v in validScales) put(key, v)
             }
         }
+        // The 5 resolved version ids themselves — embedded directly (not just their resolved
+        // CONTENT, e.g. purchasable_materials above) so this `json` is a genuine round-trip
+        // descriptor: POSTing an unmodified `GET /plan-runs/{id}` response's own `config` back to
+        // `/plan` reproduces the same run, rather than silently re-resolving every "*_version_id"
+        // to null (no override -> fresh compute/latest-default) because the id lived only in this
+        // response's separate sibling fields (`case_alloc_version_id` etc. on the plan-run object,
+        // not inside `config`) and never made it into what a caller would naturally resubmit.
+        // Null is a legitimate, valid value here (no version for that kind) and round-trips
+        // correctly too — explicitVersionId's null-check treats an explicit null exactly like an
+        // absent key, both meaning "no override."
+        put("case_alloc_version_id", caseAllocVersionId)
+        put("pref_version_id", prefVersionId)
+        put("demand_order_version_id", ordVersionId)
+        put("purchasable_material_version_id", purchMatVersionId)
+        put("constraint_version_id", constrVersionId)
         val fp = com.allocator.services.KbFingerprint.buildFingerprint(
             caseAllocVersionId, prefVersionId, ordVersionId, purchMatVersionId, constrVersionId,
         )

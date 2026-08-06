@@ -383,18 +383,22 @@ export function AllocationMatrixView({
                 })
             ) : (
               supplyGroups.map((group) => {
-                const exp = expandedSupplyGroups.has(group.groupKey);
+                // A group with a single lot has nothing to drill into — the nested row would
+                // just repeat the group row's own numbers. Only show the expand affordance (and
+                // ever render the nested row) when there's actually more than one lot to compare.
+                const expandable = group.lotIds.length > 1;
+                const exp = expandable && expandedSupplyGroups.has(group.groupKey);
                 const gTotal = getGroupRowTotal(group.groupKey);
                 return (
                   <React.Fragment key={group.groupKey}>
                     <tr style={rowSt(true)}>
-                      <td style={labelTd()} title={group.label}
-                        onClick={() => setExpandedSupplyGroups((prev) => {
+                      <td style={{ ...labelTd(), cursor: expandable ? 'pointer' : 'default' }} title={group.label}
+                        onClick={() => expandable && setExpandedSupplyGroups((prev) => {
                           const n = new Set(prev); exp ? n.delete(group.groupKey) : n.add(group.groupKey); return n;
                         })}>
-                        <span style={{ marginRight: 4, color: '#52525b', fontSize: '0.7rem' }}>{exp ? '▾' : '▸'}</span>
+                        {expandable && <span style={{ marginRight: 4, color: '#52525b', fontSize: '0.7rem' }}>{exp ? '▾' : '▸'}</span>}
                         {group.label.length > 30 ? group.label.slice(0, 28) + '…' : group.label}
-                        <span style={{ marginLeft: 6, color: '#52525b', fontSize: '0.7rem' }}>({group.lotIds.length})</span>
+                        {expandable && <span style={{ marginLeft: 6, color: '#52525b', fontSize: '0.7rem' }}>({group.lotIds.length})</span>}
                       </td>
                       {colSpecs.map((spec) => {
                         const qty = getGroupCellQty(group.groupKey, spec);

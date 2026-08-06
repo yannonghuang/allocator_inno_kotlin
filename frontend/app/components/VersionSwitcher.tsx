@@ -5,7 +5,7 @@ import { useTranslations } from 'next-intl';
 import type { ConfigVersion } from '@/lib/api';
 
 /**
- * Shared version switcher/manager for the 5 "external config objects" (Critical Raw Allocation,
+ * Shared version switcher/manager for the 5 "external config objects" (Critical Material Allocation,
  * Supply Preferences, Demand Ordering, Purchasable Materials, Constraints) — see
  * CaseConfigVersions' own doc in Tables.kt. Each object's dedicated page renders one of these
  * above its editor: switch which version you're viewing/editing, "Save As" the current draft

@@ -335,7 +335,7 @@ object PlanSupplyAllocations : Table("plan_supply_allocation") {
 }
 
 /**
- * Version registry for the 5 "external config objects" (Critical Raw Allocation, Supply
+ * Version registry for the 5 "external config objects" (Critical Material Allocation, Supply
  * Preferences, Demand Ordering, Purchasable Materials, Constraints). Each object can have
  * multiple named/commented versions per case. `kind` reuses the exact segment names
  * [com.allocator.services.KbFingerprint.Segments] already uses ("casealloc"/"pref"/"ord"/
@@ -533,7 +533,7 @@ object CaseDemandOrderConfigs : Table("case_demand_order_config") {
 }
 
 /**
- * Content-fingerprint tracker for [CaseAllocations] ("Critical Raw Allocation") — mirrors
+ * Content-fingerprint tracker for [CaseAllocations] ("Critical Material Allocation") — mirrors
  * [CaseDemandOrderConfigs]' shape. Allocation has no separate generation PARAMETERS of its own
  * (unlike Preferences' max_bom_depth/weights) — this table exists purely to hold a cheap,
  * incrementally-maintained hash of the current case_allocation row set, read by the KB

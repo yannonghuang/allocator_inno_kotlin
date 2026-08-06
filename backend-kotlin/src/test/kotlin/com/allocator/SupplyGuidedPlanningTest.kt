@@ -1273,4 +1273,287 @@ class SupplyGuidedPlanningTest : FunSpec({
         budget?.get("X|L|LOT_3") shouldBe (15.0 plusOrMinus 1e-6)
         budget?.get("X|L") shouldBe (45.0 plusOrMinus 1e-6)
     }
+
+    // ── I. Critical stocks ────────────────────────────────────────────────────
+    // On-hand stock of an otherwise-elastic product (has a make method) whose every fulfillment
+    // alternative is structurally guaranteed to consume the same single critical, TARGETed raw
+    // material — inherits that material's targeting even though its own supply row has no TARGET
+    // of its own. Mirrors cases/inno2026_2's real wip_280-1001 scenario (shared node, blank own
+    // TARGET, split derived entirely from its raw material's own per-lot targeting).
+
+    val noPurchaseConfig = mapOf<String, Any?>("purchase_allowed" to false)
+
+    test("computeMandatoryCriticalRawMaterials: single-path product returns the one raw SupplyKey") {
+        val data = mkData(
+            methodMake = listOf(mapOf("bom_id" to "BM", "product_id" to "M", "location_id" to "L", "preference" to 1)),
+            methodBuy  = listOf(mapOf("product_id" to "X", "location_id" to "L", "preference" to 1)),
+            bom        = listOf(mapOf("bom_id" to "BM", "parent_id" to "M", "child_id" to "X", "rate" to 1.0, "alt_group" to null)),
+        )
+        computeMandatoryCriticalRawMaterials("M", "L", data, noPurchaseConfig) shouldBe setOf(SupplyKey("X", "L"))
+    }
+
+    test("computeMandatoryCriticalRawMaterials: an admitted purchase alternative collapses the result to empty") {
+        // M2 can ALSO just be bought outright — buying bypasses the BOM entirely, so no raw
+        // material is unavoidable, even though the make alternative alone would require X.
+        val data = mkData(
+            methodMake = listOf(mapOf("bom_id" to "BM2", "product_id" to "M2", "location_id" to "L", "preference" to 1)),
+            methodBuy  = listOf(
+                mapOf("product_id" to "X", "location_id" to "L", "preference" to 1),
+                mapOf("product_id" to "M2", "location_id" to "L", "preference" to 1),
+            ),
+            bom        = listOf(mapOf("bom_id" to "BM2", "parent_id" to "M2", "child_id" to "X", "rate" to 1.0, "alt_group" to null)),
+        )
+        // purchase_allowed defaults true (unset) here, unlike noPurchaseConfig — M2's own buy is
+        // admitted; X's is irrelevant to X's OWN raw-critical status (no make anywhere for X).
+        computeMandatoryCriticalRawMaterials("M2", "L", data, emptyMap()) shouldBe emptySet()
+    }
+
+    test("computeMandatoryCriticalRawMaterials: two ALT_GROUP alternatives requiring different raw materials -> empty") {
+        val data = mkData(
+            methodMake = listOf(mapOf("bom_id" to "BM3", "product_id" to "M3", "location_id" to "L", "preference" to 1)),
+            methodBuy  = listOf(
+                mapOf("product_id" to "X", "location_id" to "L", "preference" to 1),
+                mapOf("product_id" to "Y", "location_id" to "L", "preference" to 1),
+            ),
+            bom        = listOf(
+                mapOf("bom_id" to "BM3", "parent_id" to "M3", "child_id" to "X", "rate" to 1.0, "alt_group" to "G1"),
+                mapOf("bom_id" to "BM3", "parent_id" to "M3", "child_id" to "Y", "rate" to 1.0, "alt_group" to "G2"),
+            ),
+        )
+        computeMandatoryCriticalRawMaterials("M3", "L", data, noPurchaseConfig) shouldBe emptySet()
+    }
+
+    test("computeMandatoryCriticalRawMaterials: a BOM cycle terminates and yields empty for the cyclic node") {
+        val data = mkData(
+            methodMake = listOf(
+                mapOf("bom_id" to "BC1", "product_id" to "C1", "location_id" to "L", "preference" to 1),
+                mapOf("bom_id" to "BC2", "product_id" to "C2", "location_id" to "L", "preference" to 1),
+            ),
+            bom = listOf(
+                mapOf("bom_id" to "BC1", "parent_id" to "C1", "child_id" to "C2", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BC2", "parent_id" to "C2", "child_id" to "C1", "rate" to 1.0, "alt_group" to null),
+            ),
+        )
+        computeMandatoryCriticalRawMaterials("C1", "L", data, noPurchaseConfig) shouldBe emptySet()
+    }
+
+    // Shared-node fixture mirroring cases/inno2026_2: two top-level products (P1, P2) both route
+    // through the SAME intermediate M, which in turn consumes the SAME critical raw material X.
+    // X has two TARGETed lots (CUST_A 90, CUST_B 10); M's own on-hand stock row has NO target.
+    fun sharedStockData(mStockQty: Double, xLots: List<Map<String, Any?>>, demands: List<Map<String, Any?>> = emptyList()) = mkData(
+        supplies = xLots + listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_M", "product_id" to "M", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to mStockQty, "target" to null),
+        ),
+        methodMake = listOf(
+            mapOf("bom_id" to "BM", "product_id" to "M", "location_id" to "L", "preference" to 1),
+            mapOf("bom_id" to "BP1", "product_id" to "P1", "location_id" to "L", "preference" to 1),
+            mapOf("bom_id" to "BP2", "product_id" to "P2", "location_id" to "L", "preference" to 1),
+        ),
+        methodBuy = listOf(mapOf("product_id" to "X", "location_id" to "L", "preference" to 1)),
+        bom = listOf(
+            mapOf("bom_id" to "BM", "parent_id" to "M", "child_id" to "X", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BP1", "parent_id" to "P1", "child_id" to "M", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BP2", "parent_id" to "P2", "child_id" to "M", "rate" to 1.0, "alt_group" to null),
+        ),
+        demands = demands,
+    )
+
+    test("computeCriticalStockPositions: shared intermediate qualifies; raw leaf and top virtual products don't") {
+        val xLots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 90.0, "target" to "CUST_A"),
+            mapOf<String, Any?>("supply_id" to "LOT_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 10.0, "target" to "CUST_B"),
+        )
+        val data = sharedStockData(50.0, xLots)
+        val stocks = computeCriticalStockPositions(data, noPurchaseConfig)
+
+        stocks.keys shouldBe setOf(SupplyKey("M", "L"))
+        stocks[SupplyKey("M", "L")] shouldBe SupplyKey("X", "L")
+        // X itself is raw-critical, not critical STOCK (excluded by construction); P1/P2 have no
+        // on-hand supply row at all, so they're never even candidates.
+        (SupplyKey("X", "L") in stocks) shouldBe false
+        (SupplyKey("P1", "L") in stocks) shouldBe false
+    }
+
+    test("computeCriticalStockPositions: raw material with zero targeted lots -> intermediate not classified") {
+        val xLots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 100.0, "target" to null),
+        )
+        val data = sharedStockData(50.0, xLots)
+        computeCriticalStockPositions(data, noPurchaseConfig) shouldBe emptyMap()
+    }
+
+    test("computeCriticalStockPositions: case with no TARGET usage anywhere takes the hard early-exit (case-173-shaped)") {
+        // A cyclic, method-less-raw-material case that would either hang or throw if the real
+        // detection walk ran at all — the only way this returns quickly and correctly is the
+        // hasAnyTargetedSupply guard firing FIRST, before any BOM walk happens.
+        val data = mkData(
+            supplies = listOf(
+                mapOf<String, Any?>("supply_id" to "LOT_M", "product_id" to "M", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 50.0, "target" to null),
+            ),
+            methodMake = listOf(
+                mapOf("bom_id" to "BM", "product_id" to "M", "location_id" to "L", "preference" to 1),
+                mapOf("bom_id" to "BM2", "product_id" to "M2", "location_id" to "L", "preference" to 1),
+            ),
+            bom = listOf(
+                mapOf("bom_id" to "BM", "parent_id" to "M", "child_id" to "M2", "rate" to 1.0, "alt_group" to null),
+                mapOf("bom_id" to "BM2", "parent_id" to "M2", "child_id" to "M", "rate" to 1.0, "alt_group" to null),
+            ),
+        )
+        computeCriticalStockPositions(data, noPurchaseConfig) shouldBe emptyMap()
+    }
+
+    test("expandCriticalStockSupplies: falls back to physical lot qty when nothing is allocated yet (fresh generate)") {
+        val xLots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 377349.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "LOT_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 28500.0, "target" to "Q6K"),
+        )
+        val data = sharedStockData(87013.0, xLots)
+        val criticalStocks = mapOf(SupplyKey("M", "L") to SupplyKey("X", "L"))
+        val (expanded, virtualToReal) = expandCriticalStockSupplies(
+            data["supply"]!!, criticalStocks, rawLotAllocatedTotals = emptyMap(), data = data, config = noPurchaseConfig,
+        )
+
+        val virtualRows = expanded.filter { (it["supply_id"] as String).startsWith("LOT_M#") }
+        virtualRows.size shouldBe 2
+        virtualToReal.values.toSet() shouldBe setOf("LOT_M")
+        val byTarget = virtualRows.associate { it["target"] to (it["qty"] as Double) }
+        byTarget["Q6J"] shouldBe (80902.67202087476 plusOrMinus 1e-4)
+        byTarget["Q6K"] shouldBe (6110.327979125241 plusOrMinus 1e-4)
+        // The real physical row is gone, replaced by its virtual sub-lots.
+        expanded.none { it["supply_id"] == "LOT_M" } shouldBe true
+    }
+
+    // Fixture for selectHistoricalWeightLots: M is one make-step from raw material X, lead_time=7,
+    // fed by demand D1 due 2024-08-01 -> resolveHorizonStart's computePlanningHorizonStart floors
+    // to the LAST day of the PRIOR month = 2024-07-31, so M's own lookback date is 2024-07-24
+    // (horizon_start minus its 7-day lead time to X).
+    fun leadTimeFixtureData(demandDue: String = "2024-08-01") = mkData(
+        methodMake = listOf(mapOf("bom_id" to "BM", "product_id" to "M", "location_id" to "L", "preference" to 1, "lead_time" to 7.0)),
+        methodBuy  = listOf(mapOf("product_id" to "X", "location_id" to "L", "preference" to 1)),
+        bom        = listOf(mapOf("bom_id" to "BM", "parent_id" to "M", "child_id" to "X", "rate" to 1.0, "alt_group" to null)),
+        demands    = listOf(mapOf<String, Any?>("demand_id" to "D1", "product_id" to "M", "location_id" to "L", "quantity" to 1.0, "request_due_time" to demandDue)),
+    )
+
+    test("selectHistoricalWeightLots: uses genuine historical lots (dated at/before the lookback date), ignoring current-period lots") {
+        val data = leadTimeFixtureData()
+        val historicalLots = listOf(
+            mapOf<String, Any?>("supply_id" to "HIST_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-07-20", "qty" to 70.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "HIST_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-07-22", "qty" to 30.0, "target" to "Q6K"),
+        )
+        val currentLots = listOf(
+            mapOf<String, Any?>("supply_id" to "CUR_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-08-01", "qty" to 10.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "CUR_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-08-08", "qty" to 90.0, "target" to "Q6K"),
+        )
+        val selected = selectHistoricalWeightLots(
+            stockPid = "M", stockLid = "L", rawPid = "X", rawLid = "L",
+            rawLots = historicalLots + currentLots, data = data, config = emptyMap(),
+        )
+        selected.map { it["supply_id"] }.toSet() shouldBe setOf("HIST_A", "HIST_B")
+    }
+
+    test("selectHistoricalWeightLots: falls back to the two earliest available dates when no lot is old enough (no historical data uploaded)") {
+        val data = leadTimeFixtureData()
+        val currentLots = listOf(
+            mapOf<String, Any?>("supply_id" to "CUR_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-08-01", "qty" to 10.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "CUR_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-08-08", "qty" to 90.0, "target" to "Q6K"),
+            mapOf<String, Any?>("supply_id" to "CUR_C", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-08-15", "qty" to 20.0, "target" to "Q6J"),
+        )
+        val selected = selectHistoricalWeightLots(
+            stockPid = "M", stockLid = "L", rawPid = "X", rawLid = "L",
+            rawLots = currentLots, data = data, config = emptyMap(),
+        )
+        selected.map { it["supply_id"] }.toSet() shouldBe setOf("CUR_A", "CUR_B")
+    }
+
+    test("expandCriticalStockSupplies: a stock row with its OWN explicit target is never fractured against the raw material's split") {
+        // Reproduces cases/inno2026_2's wip_280-0001 bug live: a critical-stock row that already
+        // has its own target must pass through unchanged — splitting it by the raw material's OWN
+        // (different) distribution would fabricate a phantom sub-lot for a target that can never
+        // reach this node (a separate BOM branch entirely), permanently stranding that quantity —
+        // confirmed live as an exact-to-the-decimal R10 "inventory not consumed" violation.
+        val xLots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 377349.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "LOT_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 28500.0, "target" to "Q6K"),
+        )
+        val data = mkData(
+            supplies = xLots + listOf(
+                mapOf<String, Any?>("supply_id" to "LOT_M", "product_id" to "M", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 37961.0, "target" to "Q6J"),
+            ),
+            methodMake = listOf(mapOf("bom_id" to "BM", "product_id" to "M", "location_id" to "L", "preference" to 1)),
+            methodBuy  = listOf(mapOf("product_id" to "X", "location_id" to "L", "preference" to 1)),
+            bom        = listOf(mapOf("bom_id" to "BM", "parent_id" to "M", "child_id" to "X", "rate" to 1.0, "alt_group" to null)),
+        )
+        val criticalStocks = mapOf(SupplyKey("M", "L") to SupplyKey("X", "L"))
+        val (expanded, virtualToReal) = expandCriticalStockSupplies(
+            data["supply"]!!, criticalStocks, rawLotAllocatedTotals = emptyMap(), data = data, config = noPurchaseConfig,
+        )
+
+        virtualToReal.isEmpty() shouldBe true
+        val mRow = expanded.single { it["supply_id"] == "LOT_M" }
+        mRow["qty"] shouldBe (37961.0 plusOrMinus 1e-9)
+        mRow["target"] shouldBe "Q6J"
+    }
+
+    test("expandCriticalStockSupplies: follows rawLotAllocatedTotals (current allocation), not physical qty, when given") {
+        val xLots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 90.0, "target" to "CUST_A"),
+            mapOf<String, Any?>("supply_id" to "LOT_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 10.0, "target" to "CUST_B"),
+        )
+        val data = sharedStockData(100.0, xLots)
+        val criticalStocks = mapOf(SupplyKey("M", "L") to SupplyKey("X", "L"))
+        // Simulates a user having manually rebalanced LOT_A/LOT_B's own allocation to 50/50,
+        // diverging from their 90/10 physical split.
+        val (expanded, _) = expandCriticalStockSupplies(
+            data["supply"]!!, criticalStocks,
+            rawLotAllocatedTotals = mapOf("LOT_A" to 50.0, "LOT_B" to 50.0),
+            data = data, config = noPurchaseConfig,
+        )
+        val byTarget = expanded.filter { (it["supply_id"] as String).startsWith("LOT_M#") }
+            .associate { it["target"] to (it["qty"] as Double) }
+        byTarget["CUST_A"] shouldBe (50.0 plusOrMinus 1e-6)
+        byTarget["CUST_B"] shouldBe (50.0 plusOrMinus 1e-6)
+    }
+
+    test("buildSupplyAllocation: critical stock budgets collapse to the real supply_id and respect the inherited target split") {
+        val xLots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 90.0, "target" to "CUST_A"),
+            mapOf<String, Any?>("supply_id" to "LOT_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 10.0, "target" to "CUST_B"),
+        )
+        // Demand well beyond either raw lot's share, so both sides are scarce/fully-subscribed —
+        // matches cases/inno2026_2's own regime (see the worked example in the plan).
+        val demands = listOf(
+            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P1", "location_id" to "L", "quantity" to 1000.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_A"),
+            mapOf<String, Any?>("demand_id" to "DB", "product_id" to "P2", "location_id" to "L", "quantity" to 1000.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_B"),
+        )
+        val data = sharedStockData(100.0, xLots, demands)
+        val alloc = buildSupplyAllocation(demands, data, noPurchaseConfig)
+
+        // No virtual "#i" key ever leaks into the final budgets — proves the collapse step ran.
+        val allKeys = alloc.perLotBudgets.values.flatMap { it.keys }
+        allKeys.none { it.contains("#") } shouldBe true
+
+        // DA (CUST_A) gets (up to) its fair share of M's Q6J-side split; DB (CUST_B) is capped out
+        // of it entirely — the actual regression this feature exists to fix (today, ignoring
+        // target, either demand could exhaust the shared stock FIFO regardless of target).
+        val daM = alloc.perLotBudgets["DA"]?.get("M|L|LOT_M")
+        val dbM = alloc.perLotBudgets["DB"]?.get("M|L|LOT_M")
+        daM shouldBe (90.0 plusOrMinus 1e-6)
+        dbM shouldBe (10.0 plusOrMinus 1e-6)
+    }
+
+    test("buildSupplyAllocation: a case with no TARGET usage anywhere is unaffected by critical-stock detection") {
+        // Same shared-M shape, but X has no TARGET at all — computeCriticalStockPositions must
+        // take its hard early-exit, so M stays a plain elastic (uncapped-in-criticalMatrix)
+        // position exactly like on main.
+        val xLots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 100.0, "target" to null),
+        )
+        val demands = listOf(
+            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P1", "location_id" to "L", "quantity" to 10.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_A"),
+        )
+        val data = sharedStockData(50.0, xLots, demands)
+        val alloc = buildSupplyAllocation(demands, data, noPurchaseConfig)
+
+        alloc.criticalMatrix.byColumn.keys.contains(SupplyKey("M", "L")) shouldBe false
+    }
 })
