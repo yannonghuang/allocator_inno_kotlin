@@ -239,8 +239,15 @@ internal fun buildReachabilityMatrix(
     graph: BomGraph,
     /** When non-null, only supply nodes whose product_id is in this set are recorded.
      *  Non-critical supply leaves are skipped, avoiding allocation work for purchasable
-     *  materials whose lots are uncapped in planning anyway. */
+     *  materials whose lots are uncapped in planning anyway. Product-scoped (matches
+     *  computeCriticalPids's own all-locations-must-qualify semantics) — see
+     *  [criticalStockKeys] for the location-aware counterpart. */
     criticalPids: Set<String>? = null,
+    /** When non-null, ALSO record supply nodes whose exact (productId, locationId) is in this
+     *  set — deliberately location-aware, unlike [criticalPids]: a product that's critical stock
+     *  at one location but not another must not pull the OTHER location's ordinary lots into the
+     *  TARGET-aware allocator too. See `computeCriticalStockPositions`'s own doc. */
+    criticalStockKeys: Set<SupplyKey>? = null,
 ): NeedsMatrix {
     val byRow = mutableMapOf<Any?, MutableMap<SupplyKey, Double>>()
 
@@ -261,7 +268,9 @@ internal fun buildReachabilityMatrix(
         while (queue.isNotEmpty()) {
             val node = queue.removeFirst()
             val sk   = SupplyKey(node.first, node.second)
-            if (sk in graph.supplyIndex && (criticalPids == null || sk.productId in criticalPids))
+            if (sk in graph.supplyIndex &&
+                ((criticalPids == null || sk.productId in criticalPids) ||
+                    (criticalStockKeys != null && sk in criticalStockKeys)))
                 needs[sk] = qty
             for ((child, _) in graph.edges[node] ?: emptyList()) {
                 if (visited.add(child)) queue.addLast(child)

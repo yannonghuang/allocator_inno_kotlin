@@ -5,12 +5,21 @@ import com.allocator.CaseAllocations
 import com.allocator.Cases
 import com.allocator.Demands
 import com.allocator.PlanRuns
+import com.allocator.Supplies
 import com.allocator.services.CaseConfigVersioning
 import com.allocator.services.CaseLoader
 import com.allocator.services.ConfigVersionKind
 import com.allocator.services.KbFingerprint
+import com.allocator.services.SupplyKey
+import com.allocator.services.allocateCriticalSuppliesPerLot
 import com.allocator.services.buildAllocationBudgetRowsFull
+import com.allocator.services.buildBomGraph
+import com.allocator.services.buildReachabilityMatrix
 import com.allocator.services.buildSupplyAllocation
+import com.allocator.services.collapseCriticalStockBudgets
+import com.allocator.services.computeCriticalStockPositions
+import com.allocator.services.expandCriticalStockSupplies
+import com.allocator.services.hasAnyTargetedSupply
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.request.*
@@ -19,6 +28,7 @@ import io.ktor.server.routing.*
 import kotlinx.serialization.json.*
 import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.inList
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.slf4j.LoggerFactory
 
@@ -117,7 +127,7 @@ private fun recomputeCaseAllocationHash(caseId: Int, versionId: Int) {
     }
 }
 
-/** [versionId] null means this case has never had a Critical Raw Allocation version at all — a
+/** [versionId] null means this case has never had a Critical Material Allocation version at all — a
  *  legitimate "nothing yet" state (see CaseConfigVersioning's own doc), not an error. */
 private fun versionJson(caseId: Int, versionId: Int?): JsonObject {
     val summary = versionId?.let { vid -> CaseConfigVersioning.listVersions(caseId, KIND).firstOrNull { it.id == vid } }
@@ -141,6 +151,15 @@ private fun versionJson(caseId: Int, versionId: Int?): JsonObject {
  *
  * This is the single shared implementation used by both the Generate endpoint and the
  * plan-run seeding path in runPlanBackground.
+ *
+ * Already includes critical-stock rows with no extra work: [buildSupplyAllocation]'s own
+ * `criticalMatrix`/`perLotBudgets` are critical-stock-aware (see `computeCriticalStockPositions`),
+ * so `buildAllocationBudgetRowsFull` below picks them up for free, split against each mandatory raw
+ * material's own physical lot quantities (no persisted allocation exists yet on a fresh generate —
+ * see `expandCriticalStockSupplies`'s fallback). Only the manual-edit routes (`PUT`/`import`/
+ * `versions`) need [recomputeCriticalStockAllocationRows] — they can leave a case's raw-material
+ * rows in a state this function never produced (e.g. rebalanced away from physical-lot
+ * proportions), which the derived stock split must then follow.
  */
 internal fun generateAndSeedCaseAllocation(
     caseId: Int,
@@ -163,6 +182,142 @@ internal fun generateAndSeedCaseAllocation(
                 this[CaseAllocations.qtyAllocated] = row.qtyAllocated
             }
             recomputeCaseAllocationHash(caseId, versionId)
+        }
+    }
+    return rows
+}
+
+// ── Critical stock: derived, read-only rows ─────────────────────────────────────
+
+/** Cheap, direct DB check for "does this case have any TARGETed supply row at all" — used as the
+ *  route-layer early-exit BEFORE paying for a full `CaseLoader.load(caseId)` + critical-stock
+ *  detection walk on every `PUT`/`import`/`versions` write, so a non-TARGET case (e.g. case 173)
+ *  stays exactly as cheap as it was before this feature existed. Mirrors
+ *  [hasAnyTargetedSupply][com.allocator.services.hasAnyTargetedSupply]'s in-memory check exactly,
+ *  just queried directly (one column, one case) instead of against an already-loaded case map. */
+private fun caseHasTargetedSupply(caseId: Int): Boolean = transaction {
+    Supplies.select(Supplies.targetCustomerId)
+        .where { Supplies.caseId eq caseId }
+        .any { (it[Supplies.targetCustomerId])?.trim()?.isNotBlank() == true }
+}
+
+/** Best-effort config for a route with no caller-supplied override in its own body schema (`PUT`/
+ *  `import`/`versions` all take rows/CSV, not a config blob) — the latest successful plan run's
+ *  config, same fallback the Generate route already uses when its own optional `config` field is
+ *  absent, so `purchasable_materials`/`purchase_allowed` (which affect both critical-material and
+ *  critical-stock classification) match what the case was actually last planned with. Returns null
+ *  if the case has never had a successful plan run — detection still runs, just without any
+ *  purchasable-whitelist narrowing. */
+private fun latestPlanRunConfig(caseId: Int): Map<String, Any?>? {
+    val latestConfigJson = transaction {
+        PlanRuns.select(PlanRuns.config)
+            .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
+            .orderBy(PlanRuns.id to SortOrder.DESC)
+            .limit(1)
+            .singleOrNull()
+            ?.get(PlanRuns.config)
+    }
+    return latestConfigJson?.let {
+        @Suppress("UNCHECKED_CAST")
+        runCatching { jsonElementToNative(Json.parseToJsonElement(it)) as? Map<String, Any?> }.getOrNull()
+    }
+}
+
+/**
+ * Partitions submitted `case_allocation` rows into ones a caller may actually write ([Pair.first])
+ * and ones that belong to a derived, read-only critical-stock position ([Pair.second] — the
+ * stripped `supply_id`s). Critical-stock rows can never be directly edited: they're a deterministic
+ * function of their mandatory raw material's OWN current allocation (see
+ * [recomputeCriticalStockAllocationRows]), so a direct edit would just be silently overwritten (or
+ * worse, drift out of sync) the next time anything touches that raw material's rows. Returns
+ * `(rows, emptyList())` unchanged whenever the case has no critical stock at all — the common case.
+ */
+internal fun partitionEditableAllocationRows(
+    rows: List<CaseAllocRow>,
+    data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
+): Pair<List<CaseAllocRow>, List<String>> {
+    val criticalStocks = computeCriticalStockPositions(data, config)
+    if (criticalStocks.isEmpty()) return rows to emptyList()
+    val supplyToKey: Map<String, SupplyKey> = (data["supply"] ?: emptyList()).mapNotNull { row ->
+        val sid = (row["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        val pid = (row["product_id"] as? String)?.trim() ?: return@mapNotNull null
+        val lid = (row["location_id"] as? String)?.trim() ?: return@mapNotNull null
+        sid to SupplyKey(pid, lid)
+    }.toMap()
+    val (rejected, editable) = rows.partition { row -> supplyToKey[row.supplyId]?.let { it in criticalStocks } == true }
+    return editable to rejected.map { it.supplyId }.distinct()
+}
+
+/**
+ * Computes and overwrites [versionId]'s critical-stock `case_allocation` rows, reading that
+ * version's JUST-PERSISTED raw-material rows (whatever the caller wrote immediately before calling
+ * this, in the SAME transaction) as the Ramification-1 split weight — see
+ * `expandCriticalStockSupplies`'s own doc for why this (a lot's CURRENT effective allocation, not
+ * its static physical qty) is the correct weight once any manual edit could have happened. Must be
+ * called inside a transaction that already wrote whatever raw-material change triggered this — does
+ * NOT open its own.
+ *
+ * Always clears this version's existing critical-stock rows first, even when there's nothing to
+ * re-derive (e.g. the triggering edit zeroed out the raw material's own allocation entirely) — a
+ * stale split must never linger. Reuses the exact same demand-competition machinery
+ * [buildSupplyAllocation] uses ([allocateCriticalSuppliesPerLot] over a
+ * [buildReachabilityMatrix]/[expandCriticalStockSupplies] pair restricted to critical-stock
+ * `SupplyKey`s only) plus the same [collapseCriticalStockBudgets] step, so a version's derived rows
+ * are always byte-identical to what a live plan run would enforce for the same raw-material state.
+ */
+internal fun recomputeCriticalStockAllocationRows(
+    caseId: Int,
+    versionId: Int,
+    data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
+): List<CaseAllocRow> {
+    val criticalStocks = computeCriticalStockPositions(data, config)
+
+    val stockSupplyIds: Set<String> = (data["supply"] ?: emptyList()).mapNotNull { row ->
+        val pid = (row["product_id"] as? String)?.trim()
+        val lid = (row["location_id"] as? String)?.trim()
+        val sid = (row["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+        if (pid != null && lid != null && sid != null && SupplyKey(pid, lid) in criticalStocks) sid else null
+    }.toSet()
+    if (stockSupplyIds.isNotEmpty()) {
+        CaseAllocations.deleteWhere {
+            (CaseAllocations.versionId eq versionId) and (CaseAllocations.supplyId inList stockSupplyIds)
+        }
+    }
+    if (criticalStocks.isEmpty()) return emptyList()
+
+    val rawLotAllocatedTotals: Map<String, Double> = CaseAllocations.selectAll()
+        .where { CaseAllocations.versionId eq versionId }
+        .groupBy({ it[CaseAllocations.supplyId] }, { it[CaseAllocations.qtyAllocated] })
+        .mapValues { (_, qtys) -> qtys.sum() }
+
+    val demands = data["demand"] ?: emptyList()
+    val graph = buildBomGraph(demands, data)
+    val criticalStockMatrix = buildReachabilityMatrix(
+        demands, graph, criticalPids = emptySet(), criticalStockKeys = criticalStocks.keys,
+    )
+    val (expandedSupplies, virtualToReal) = expandCriticalStockSupplies(
+        supplies              = data["supply"] ?: emptyList(),
+        criticalStocks        = criticalStocks,
+        rawLotAllocatedTotals = rawLotAllocatedTotals,
+        data                  = data,
+        config                = config,
+    )
+    val rawBudgets = allocateCriticalSuppliesPerLot(
+        matrix = criticalStockMatrix, supplies = expandedSupplies, demands = demands, data = data,
+    )
+    val collapsedBudgets = collapseCriticalStockBudgets(rawBudgets, virtualToReal)
+    val rows = buildAllocationBudgetRowsFull(collapsedBudgets, criticalStockMatrix, data["supply"] ?: emptyList())
+        .map { (sid, did, qty) -> CaseAllocRow(sid, did, qty) }
+
+    if (rows.isNotEmpty()) {
+        CaseAllocations.batchInsert(rows) { row ->
+            this[CaseAllocations.caseId]       = caseId
+            this[CaseAllocations.versionId]    = versionId
+            this[CaseAllocations.supplyId]     = row.supplyId
+            this[CaseAllocations.demandId]     = row.demandId
+            this[CaseAllocations.qtyAllocated] = row.qtyAllocated
         }
     }
     return rows
@@ -281,7 +436,9 @@ fun Routing.allocationRoutes() {
 
     // ── PUT /cases/{case_id}/allocation ───────────────────────────────────────
     // Body: { "rows": [{ "supply_id", "demand_id", "qty_allocated" }] }
-    // Upserts (insert-or-replace) the given rows; leaves other rows unchanged.
+    // Upserts (insert-or-replace) the given rows; leaves other rows unchanged. A row whose
+    // supply_id is a derived critical-stock position is rejected — see
+    // recomputeCriticalStockAllocationRows's own doc — and reported back in "rejected".
     put("/cases/{case_id}/allocation") {
         val caseId = requireCaseId(call)
         val versionId = resolvedOrCreatedVersionId(call, caseId)
@@ -292,7 +449,7 @@ fun Routing.allocationRoutes() {
         val body = call.receiveText()
         val payload = Json.parseToJsonElement(body).jsonObject
         val rowsJson = payload["rows"]?.jsonArray ?: throw IllegalArgumentException("Missing 'rows'")
-        val rows = rowsJson.map { el ->
+        val submittedRows = rowsJson.map { el ->
             val obj = el.jsonObject
             CaseAllocRow(
                 supplyId     = obj["supply_id"]?.jsonPrimitive?.content ?: throw IllegalArgumentException("Missing supply_id"),
@@ -300,6 +457,21 @@ fun Routing.allocationRoutes() {
                 qtyAllocated = obj["qty_allocated"]?.jsonPrimitive?.double ?: throw IllegalArgumentException("Missing qty_allocated"),
             )
         }
+
+        // Cheap DB-only check first: a non-TARGET case (e.g. case 173) never loads case data or
+        // runs critical-stock detection at all, staying exactly as cheap as before this feature.
+        var rows = submittedRows
+        var rejected: List<String> = emptyList()
+        var caseData: Map<String, List<Map<String, Any?>>>? = null
+        var caseConfig: Map<String, Any?>? = null
+        if (caseHasTargetedSupply(caseId)) {
+            caseData = transaction { CaseLoader.load(caseId) }
+            caseConfig = latestPlanRunConfig(caseId)
+            val (editable, rej) = partitionEditableAllocationRows(submittedRows, caseData, caseConfig)
+            rows = editable
+            rejected = rej
+        }
+
         transaction {
             for (row in rows) {
                 val existing = CaseAllocations.selectAll().where {
@@ -323,9 +495,14 @@ fun Routing.allocationRoutes() {
                     }
                 }
             }
+            val cd = caseData
+            if (cd != null) recomputeCriticalStockAllocationRows(caseId, versionId, cd, caseConfig)
             recomputeCaseAllocationHash(caseId, versionId)
         }
-        call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", rows.size) })
+        call.respond(HttpStatusCode.OK, buildJsonObject {
+            put("updated", rows.size)
+            put("rejected", JsonArray(rejected.map { JsonPrimitive(it) }))
+        })
     }
 
     // ── DELETE /cases/{case_id}/allocation ────────────────────────────────────
@@ -352,6 +529,8 @@ fun Routing.allocationRoutes() {
 
     // ── POST /cases/{case_id}/allocation/import ───────────────────────────────
     // Body: CSV text with header row: supply_id,demand_id,qty_allocated
+    // Any row whose supply_id is a derived critical-stock position is dropped from the import —
+    // see recomputeCriticalStockAllocationRows's own doc — and reported in "rejected".
     post("/cases/{case_id}/allocation/import") {
         val caseId = requireCaseId(call)
         val versionId = resolvedOrCreatedVersionId(call, caseId)
@@ -360,8 +539,22 @@ fun Routing.allocationRoutes() {
             return@post
         }
         val csvText = call.receiveText()
-        val rows = parseCsvAllocation(csvText)
-        log.info("[allocation] importing {} rows for case {} version {}", rows.size, caseId, versionId)
+        val parsedRows = parseCsvAllocation(csvText)
+
+        var rows = parsedRows
+        var rejected: List<String> = emptyList()
+        var caseData: Map<String, List<Map<String, Any?>>>? = null
+        var caseConfig: Map<String, Any?>? = null
+        if (caseHasTargetedSupply(caseId)) {
+            caseData = transaction { CaseLoader.load(caseId) }
+            caseConfig = latestPlanRunConfig(caseId)
+            val (editable, rej) = partitionEditableAllocationRows(parsedRows, caseData, caseConfig)
+            rows = editable
+            rejected = rej
+        }
+        log.info("[allocation] importing {} rows for case {} version {} ({} rejected as critical-stock)",
+            rows.size, caseId, versionId, rejected.size)
+
         transaction {
             CaseAllocations.deleteWhere { CaseAllocations.versionId eq versionId }
             CaseAllocations.batchInsert(rows) { row ->
@@ -371,6 +564,8 @@ fun Routing.allocationRoutes() {
                 this[CaseAllocations.demandId]     = row.demandId
                 this[CaseAllocations.qtyAllocated] = row.qtyAllocated
             }
+            val cd = caseData
+            if (cd != null) recomputeCriticalStockAllocationRows(caseId, versionId, cd, caseConfig)
             recomputeCaseAllocationHash(caseId, versionId)
         }
         val responseRows = rows.map { row ->
@@ -380,7 +575,10 @@ fun Routing.allocationRoutes() {
                 put("qty_allocated", row.qtyAllocated)
             }
         }
-        call.respond(buildJsonObject { put("rows", JsonArray(responseRows)) })
+        call.respond(buildJsonObject {
+            put("rows", JsonArray(responseRows))
+            put("rejected", JsonArray(rejected.map { JsonPrimitive(it) }))
+        })
     }
 
     // ── GET /cases/{case_id}/allocation/export ────────────────────────────────
@@ -419,13 +617,16 @@ fun Routing.allocationRoutes() {
 
     // ── POST /cases/{case_id}/allocation/versions ("Save As") ─────────────────
     // Body: { name?, comments?, rows: [{ supply_id, demand_id, qty_allocated }] }
+    // Any submitted row whose supply_id is a derived critical-stock position is dropped — see
+    // recomputeCriticalStockAllocationRows's own doc — and the new version's own derived rows are
+    // computed fresh instead.
     post("/cases/{case_id}/allocation/versions") {
         val caseId = requireCaseId(call)
         val body = call.receiveText()
         val payload = Json.parseToJsonElement(body).jsonObject
         val name = payload["name"]?.jsonPrimitive?.contentOrNull
         val comments = payload["comments"]?.jsonPrimitive?.contentOrNull
-        val rows = (payload["rows"]?.jsonArray ?: JsonArray(emptyList())).map { el ->
+        val submittedRows = (payload["rows"]?.jsonArray ?: JsonArray(emptyList())).map { el ->
             val obj = el.jsonObject
             CaseAllocRow(
                 supplyId     = obj["supply_id"]?.jsonPrimitive?.content ?: throw IllegalArgumentException("Missing supply_id"),
@@ -433,6 +634,16 @@ fun Routing.allocationRoutes() {
                 qtyAllocated = obj["qty_allocated"]?.jsonPrimitive?.double ?: throw IllegalArgumentException("Missing qty_allocated"),
             )
         }
+
+        var rows = submittedRows
+        var caseData: Map<String, List<Map<String, Any?>>>? = null
+        var caseConfig: Map<String, Any?>? = null
+        if (caseHasTargetedSupply(caseId)) {
+            caseData = transaction { CaseLoader.load(caseId) }
+            caseConfig = latestPlanRunConfig(caseId)
+            rows = partitionEditableAllocationRows(submittedRows, caseData, caseConfig).first
+        }
+
         val versionId = transaction {
             val newId = CaseConfigVersioning.createVersion(caseId, KIND, name, comments)
             if (rows.isNotEmpty()) {
@@ -444,6 +655,8 @@ fun Routing.allocationRoutes() {
                     this[CaseAllocations.qtyAllocated] = row.qtyAllocated
                 }
             }
+            val cd = caseData
+            if (cd != null) recomputeCriticalStockAllocationRows(caseId, newId, cd, caseConfig)
             recomputeCaseAllocationHash(caseId, newId)
             newId
         }

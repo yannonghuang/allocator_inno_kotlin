@@ -89,7 +89,7 @@ fun initDatabase() {
     // recomputes signatures so dedup survives.
     com.allocator.services.ScopeRenameMigration.run()
     com.allocator.services.ConfigRetirementMigration.run()
-    // Backfills version_id for the 5 external config objects (Critical Raw Allocation/Supply
+    // Backfills version_id for the 5 external config objects (Critical Material Allocation/Supply
     // Preferences/Demand Ordering/Purchasable Materials/Constraints) — see its own doc.
     // Independent of the two migrations above; order relative to them doesn't matter.
     com.allocator.services.ExternalConfigVersioningMigration.run()

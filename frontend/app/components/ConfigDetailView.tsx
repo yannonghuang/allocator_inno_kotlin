@@ -48,7 +48,7 @@ type VersionRefs = {
 };
 
 const EXTERNAL_LABELS: Record<ExternalKind, string> = {
-  allocation: 'Critical Raw Allocation',
+  allocation: 'Critical Material Allocation',
   preferences: 'Supply Preferences',
   demandOrdering: 'Demand Ordering',
   purchasableMaterials: 'Purchasable Materials',

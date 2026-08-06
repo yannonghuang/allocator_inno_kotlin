@@ -320,6 +320,100 @@ internal fun isRawCriticalPosition(
 }
 
 /**
+ * For [productId]@[locationId]: the set of critical raw-material [SupplyKey]s that EVERY
+ * alternative way of fulfilling this position is structurally guaranteed to consume — the
+ * "mandatory" set, as opposed to [buildBomGraph]'s union-all/OR reachability (which can only tell
+ * you a material is *reachable*, never that it's *unavoidable*). Used by
+ * [computeCriticalStockPositions] to find "critical stock": on-hand inventory of an otherwise-
+ * elastic product that nonetheless can only ever have come from — and can only ever be replenished
+ * from — one single critical, targeted raw material.
+ *
+ * Base case: a position that's already raw-critical ([isRawCriticalPosition]) mandatorily requires
+ * only itself. Otherwise, the result is the INTERSECTION across every alternative (each `make` BOM
+ * `ALT_GROUP` variant, each `move` source, and — if admitted — `purchase`, exactly the same
+ * alternative set [buildBomGraph] enumerates) of that alternative's own mandatory set (the UNION of
+ * its children's mandatory sets, since an alternative's children are all required simultaneously,
+ * AND-wise). An admitted `purchase` alternative contributes an empty set (buying bypasses the BOM
+ * entirely), which collapses the intersection to empty — correctly excluding any product that could
+ * ever be sourced without touching the material. No alternatives at all -> empty (nothing is
+ * guaranteed, because nothing is possible).
+ *
+ * Cycle guard: a node already on the current call stack ([visiting]) returns empty rather than
+ * recursing forever — conservative (excludes from critical-stock classification instead of
+ * hanging), matching [planMethodSlot]'s own `cycle_stopped` treatment of BOM cycles elsewhere.
+ * Never memoized (the truncated answer depends on which ancestor triggered it, not just on the
+ * node itself) — but safe: any OTHER caller reaching this same node via a non-cyclic path always
+ * enters fresh (empty `visiting`) and gets — and caches — the real, fully-resolved answer. [memo]
+ * is shared across the whole [buildSupplyAllocation] call so repeated reference to the same node
+ * (e.g. a widely-shared sub-assembly) costs O(1) after the first visit.
+ */
+internal fun computeMandatoryCriticalRawMaterials(
+    productId: String,
+    locationId: String,
+    data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
+    memo: MutableMap<Pair<String, String>, Set<SupplyKey>> = mutableMapOf(),
+    visiting: MutableSet<Pair<String, String>> = mutableSetOf(),
+): Set<SupplyKey> {
+    val pid = productId.trim()
+    val lid = locationId.trim()
+    val key = pid to lid
+    memo[key]?.let { return it }
+    if (isRawCriticalPosition(pid, lid, data, config)) {
+        return setOf(SupplyKey(pid, lid)).also { memo[key] = it }
+    }
+    if (!visiting.add(key)) return emptySet()   // cycle: conservative, never cached
+
+    fun mandatoryForChildren(children: List<Map<String, Any?>>): Set<SupplyKey> {
+        var union = emptySet<SupplyKey>()
+        for (child in children) {
+            val cPid = (child["product_id"] as? String)?.trim() ?: continue
+            val cLid = (child["location_id"] as? String)?.trim() ?: continue
+            val cRate = (child["quantity"] as? Number)?.toDouble() ?: continue
+            if (cRate <= 0) continue
+            union = union + computeMandatoryCriticalRawMaterials(cPid, cLid, data, config, memo, visiting)
+        }
+        return union
+    }
+
+    try {
+        val methods = getMethods(pid, lid, data)
+        var mandatory: Set<SupplyKey>? = null   // null = no alternative examined yet
+        for (method in methods) {
+            when (method["type"]) {
+                "make" -> {
+                    val pLid = (method["location_id"] as? String)?.trim() ?: lid
+                    val variants = variantsForMake(pid, pLid, 1.0, method, data)
+                    if (variants.isEmpty()) continue   // no usable BOM children: not a real alternative
+                    var acrossVariants: Set<SupplyKey>? = null
+                    for ((_, childList) in variants) {
+                        val v = mandatoryForChildren(childList)
+                        acrossVariants = if (acrossVariants == null) v else acrossVariants!!.intersect(v)
+                    }
+                    val altSet = acrossVariants ?: emptySet()
+                    mandatory = if (mandatory == null) altSet else mandatory!!.intersect(altSet)
+                }
+                "move" -> {
+                    val altSet = mandatoryForChildren(childMaterialsForMove(method, 1.0))
+                    mandatory = if (mandatory == null) altSet else mandatory!!.intersect(altSet)
+                }
+                "purchase" -> {
+                    val purchaseAllowed = config?.get("purchase_allowed") != false
+                    val purchasable = effectivePurchasableSet(config, data)
+                    if (!buyAdmitted(pid, purchaseAllowed, purchasable)) continue   // not admitted: not a real alternative
+                    mandatory = emptySet()   // admitted buy bypasses the BOM entirely
+                }
+            }
+        }
+        val result = mandatory ?: emptySet()
+        memo[key] = result
+        return result
+    } finally {
+        visiting.remove(key)
+    }
+}
+
+/**
  * True if [pid]@[lid] has zero supply defined anywhere in the case's static [data] — a
  * genuine, permanent data gap. Used to distinguish that from a raw+critical position whose
  * "no_methods" commit_reason fired only because ITS OWN eligible lots were filtered out by
@@ -351,10 +445,19 @@ internal fun rawDominatorRefs(
     // elastic sourcing path. So for time_dominator this is the simple rule (any "supply" leaf is
     // raw); quantity_dominator additionally requires raw+critical.
     val isQty = key == "quantity_dominator"
+    // Critical stock joins critical raw material here too — a demand shortfall caused by
+    // exhausting a critical stock's own on-hand lot is a real, citable quantity dominator, not a
+    // silent fall-through to a generic/misleading placeholder. See
+    // computeCriticalStockPositions's own doc.
+    fun isCriticalOrCriticalStock(pid: String?, lid: String?): Boolean {
+        if (isRawCriticalPosition(pid, lid, data, config)) return true
+        if (pid == null || lid == null) return false
+        return (data as? PlanData)?.idx?.criticalStockPositions?.contains(pid to lid) == true
+    }
     fun isRawLeaf(n: Map<String, Any?>): Boolean {
         if (n["type"] != "supply") return false
         if (!isQty) return true
-        return isRawCriticalPosition(n["product_id"] as? String, n["location_id"] as? String, data, config)
+        return isCriticalOrCriticalStock(n["product_id"] as? String, n["location_id"] as? String)
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -392,7 +495,7 @@ internal fun rawDominatorRefs(
     if (isQty && node["type"] == "demand" && (node["children"] as? List<*>).isNullOrEmpty()) {
         val pid = node["product_id"] as? String
         val lid = node["location_id"] as? String
-        if (isRawCriticalPosition(pid, lid, data, config)) {
+        if (isCriticalOrCriticalStock(pid, lid)) {
             return listOf(DominatorRef(
                 kind = fallbackKind, productId = pid, locationId = lid,
                 label = "$pid@$lid (no supply method)",
@@ -609,6 +712,12 @@ private val FALLBACK_DATE_FMTS = listOf(
 internal fun parseDate(s: String?): LocalDate? {
     if (s.isNullOrBlank()) return null
     val raw = s.trim().let { if (it.length > 10) it.take(10) else it }
+    // The literal text "NULL" (case-insensitive) is a common null-marker convention from
+    // database/ETL exports (as opposed to a genuinely blank cell) — treat it exactly like blank
+    // (silently missing), not like a malformed date. Distinct from the warn-and-fall-through path
+    // below, which is for values that look like an attempted-but-unparseable date (a real data
+    // quality signal worth surfacing) — "NULL" was never an attempted date to begin with.
+    if (raw.equals("NULL", ignoreCase = true)) return null
     try {
         return LocalDate.parse(raw, DATE_FMT)
     } catch (e: DateTimeParseException) {
@@ -926,6 +1035,13 @@ internal data class DataIndex(
      *  first draw order can be scoped to cases that actually use the feature, matching
      *  buildSupplyAllocation's own scoping — see consumeFromInventory's own doc. */
     val hasTargetedSupply: Boolean = false,
+    /** `(productId, locationId)` pairs classified as critical stock by
+     *  [computeCriticalStockPositions] — computed once here, same "compute once, read via
+     *  PlanData" pattern as [hasTargetedSupply]. Read by `planMethodSlot`'s consumption gate and
+     *  by `rawDominatorRefs`'s citation logic to treat critical stock exactly like a raw critical
+     *  material at those two call sites. Empty whenever [hasTargetedSupply] is false — see
+     *  [computeCriticalStockPositions]'s own hard early-exit. */
+    val criticalStockPositions: Set<Pair<String, String>> = emptySet(),
 )
 
 /** True when a raw LOCATION_ID cell means "any location" — blank/whitespace-only, or the
@@ -951,7 +1067,7 @@ internal class IndexedInventory(
     val idx: Map<Pair<String, String>, List<MutableMap<String, Any?>>>,
 ) : MutableList<MutableMap<String, Any?>> by list
 
-private fun buildDataIndex(data: Map<String, List<Map<String, Any?>>>): DataIndex = DataIndex(
+private fun buildDataIndex(data: Map<String, List<Map<String, Any?>>>, config: Map<String, Any?>?): DataIndex = DataIndex(
     makeByPidLid = (data["method_make"] ?: emptyList())
         .filterNot { isWildcardLocation(it["location_id"] as? String) }
         .groupBy { Pair(it["product_id"]?.toString()?.trim() ?: "", it["location_id"]?.toString()?.trim() ?: "") },
@@ -976,8 +1092,9 @@ private fun buildDataIndex(data: Map<String, List<Map<String, Any?>>>): DataInde
     bomByParentId = (data["bom"] ?: emptyList()).groupBy {
         it["parent_id"]?.toString()?.trim() ?: ""
     },
-    hasTargetedSupply = (data["supply"] ?: emptyList())
-        .any { (it["target"] as? String)?.trim()?.isNotBlank() == true },
+    hasTargetedSupply = hasAnyTargetedSupply(data),
+    criticalStockPositions = computeCriticalStockPositions(data, config).keys
+        .map { it.productId to it.locationId }.toSet(),
 )
 
 private fun buildInventoryIndex(
@@ -3194,8 +3311,14 @@ fun plan(
     val componentKey = "$productId|$locationId"
     // Computed once, reused below both to decide "critical but no budget entries → banned, not
     // uncapped" (immediately below) and for the draw order / ownLotRefs' own gate further down
-    // (consumeFromInventory's preferLatest doc).
-    val isCriticalPosition = isRawCriticalPosition(productId, locationId, data, config)
+    // (consumeFromInventory's preferLatest doc). Critical STOCK joins critical raw material here —
+    // this is Ramification 2's consumption side in full: existing on-hand stock of an otherwise-
+    // elastic product follows the pre-planning allocation table exactly like a raw critical
+    // material, while a WO issued to REPLENISH it (a different (productId, locationId) — its own
+    // make method's other components) is evaluated fresh on its own merits below, staying FIFO
+    // unless independently critical. See computeCriticalStockPositions's own doc.
+    val isCriticalPosition = isRawCriticalPosition(productId, locationId, data, config) ||
+        ((data as? PlanData)?.idx?.criticalStockPositions?.contains(productId to locationId) == true)
     // Per-lot caps: collect all budget entries whose key starts with "$pid|$lid|".
     // Paired with perLotBudget: each lot's demand-wide-correct remaining BEFORE branch
     // narrowing — the write-back below must use THIS, not perLotBudget's own (possibly
@@ -6413,7 +6536,7 @@ internal fun legacyCommit(
     // consumeFromInventory (4K+ rows) that dominate runtime on large plans.
     // Passed via JVM subtyping — no signature changes to plan() or helpers.
     val planData: Map<String, List<Map<String, Any?>>> =
-        if (data !is PlanData) PlanData(data, buildDataIndex(data)) else data
+        if (data !is PlanData) PlanData(data, buildDataIndex(data, config)) else data
     val indexedInventory: MutableList<MutableMap<String, Any?>> =
         if (inventory !is IndexedInventory) IndexedInventory(inventory, buildInventoryIndex(inventory)) else inventory
     log.info("legacyCommit: built indexes (supply={} make={} move={} bom={})",
@@ -7308,7 +7431,7 @@ internal fun reconcileReallocatedSupplyAllocations(result: RunPlanningResult): R
  * it already exhibited, to close its own remaining gap entirely.
  *
  * TWO fixes, both learned from live regressions on case 173, both resolved by treating this as a
- * REVISED, self-consistent Critical Raw Allocation table computed up front — the SAME way a real
+ * REVISED, self-consistent Critical Material Allocation table computed up front — the SAME way a real
  * one is computed — rather than pass-1 output patched after the fact:
  *
  * 1. `original_allocation` is built from every demand's ACTUAL pass-1 CONSUMPTION
