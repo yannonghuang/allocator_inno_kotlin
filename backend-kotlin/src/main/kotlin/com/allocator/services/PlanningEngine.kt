@@ -6703,8 +6703,23 @@ private fun runPlanningOnePass(
                     )
                 }
             }
+    // Horizon floor for the FIFO pool itself (distinct from computeStartDt's WO-scheduling
+    // floor): a lot dated before the horizon is stock whose consumption is presumed already
+    // folded into the case's WIP snapshot for that product — pegging a new WO to it too would
+    // double-count that material. Applies uniformly, including "wip"-dated rows: under the
+    // default/"auto" resolution a wip row's date IS horizon start (see resolveWipSupplyDates),
+    // so it naturally clears this floor with no special-casing; an explicit per-lot override
+    // that resolves a wip row to an earlier date gets excluded exactly like any other stale lot
+    // — no exemption. Blank/unparseable dates are left alone (existing convention treats them as
+    // always-available, same as consumeFromInventory's sort).
+    val horizonStart = resolveHorizonStart(config, data["demand"] ?: emptyList())
     val inventory: MutableList<MutableMap<String, Any?>> = (data["supply"] ?: emptyList())
         .filter { ((it["qty"] as? Number)?.toDouble() ?: 0.0) >= 0.0 }
+        .filter { s ->
+            if (horizonStart == null) return@filter true
+            val d = parseDate(s["supply_date"] as? String) ?: return@filter true
+            !d.isBefore(horizonStart)
+        }
         .map { s ->
         mutableMapOf(
             "product_id" to (s["product_id"] ?: ""),
