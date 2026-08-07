@@ -754,6 +754,16 @@ internal fun computePlanningHorizonStart(demands: List<Map<String, Any?>>): Loca
     return earliest.withDayOfMonth(1).minusDays(1)
 }
 
+/** Default planning horizon end: the last day of the month containing the LATEST demand due
+ *  date — the mirror-image of [computePlanningHorizonStart] (last day of the month BEFORE the
+ *  earliest). Null when no demand has a parseable date, same convention. */
+internal fun computePlanningHorizonEnd(demands: List<Map<String, Any?>>): LocalDate? {
+    val latest = demands.asSequence()
+        .mapNotNull { d -> parseDate(d["request_due_time"] as? String ?: d["request_time"] as? String) }
+        .maxOrNull() ?: return null
+    return latest.withDayOfMonth(1).plusMonths(1).minusDays(1)
+}
+
 /**
  * Resolves `method_selection.horizon_start` — the config-facing entry point layered on top of
  * [computePlanningHorizonStart]. Absent, blank, or the literal string "auto" (the default) means
@@ -770,6 +780,19 @@ internal fun resolveHorizonStart(config: Map<String, Any?>?, demands: List<Map<S
     return parseDate(raw) ?: run {
         log.warn("Invalid method_selection.horizon_start={}; falling back to auto (earliest demand month)", raw)
         computePlanningHorizonStart(demands)
+    }
+}
+
+/** Resolves `method_selection.horizon_end` — same "auto"/explicit-override convention as
+ *  [resolveHorizonStart], mirrored onto [computePlanningHorizonEnd]. Used by [planMethodSlot]
+ *  (to actually enforce the ceiling) and `resolveEffectiveConfig` (to persist the resolved value
+ *  for KB / Run History / Planning UI display) — both must resolve identically. */
+internal fun resolveHorizonEnd(config: Map<String, Any?>?, demands: List<Map<String, Any?>>): LocalDate? {
+    val raw = (config?.get("method_selection") as? Map<*, *>)?.get("horizon_end") as? String
+    if (raw.isNullOrBlank() || raw.trim().lowercase() == "auto") return computePlanningHorizonEnd(demands)
+    return parseDate(raw) ?: run {
+        log.warn("Invalid method_selection.horizon_end={}; falling back to auto (latest demand month)", raw)
+        computePlanningHorizonEnd(demands)
     }
 }
 
@@ -2119,10 +2142,41 @@ internal fun planMethodSlot(
      *  Threaded through unchanged to every recursive [plan] call this slot makes for its own
      *  BOM children. */
     horizonStart: LocalDate? = null,
+    /** See [plan]'s doc — the planning horizon's end, enforced as a ceiling right below (before
+     *  any child recursion — there's no "clamp" for a late start the way [computeStartDt] clamps
+     *  an early one, so a slot that can't possibly start in time is rejected outright, at qty 0,
+     *  before it ever touches inventory). Threaded through unchanged to every recursive [plan]
+     *  call this slot makes for its own BOM children. */
+    horizonEnd: LocalDate? = null,
 ): MethodSlotResult {
     val productionLocation = (if (m["type"] == "move") m["to_location_id"] else m["location_id"])?.toString() ?: locationId
     val reqDt = parseDate(reqTimeStr) ?: requestTimeDt ?: LocalDate.now()
     val leadDays = leadDaysForMethod(m, productId, productionLocation, slotQty, data)
+
+    // Horizon-end ceiling: reject this slot OUTRIGHT (qty 0, no children touched) if its own
+    // lead time alone already pushes the earliest possible start past the horizon's end — before
+    // any BOM-child recursion, so no inventory is ever consumed for an attempt that structurally
+    // can't be scheduled at all. Unlike horizon_start (a floor computeStartDt can clamp UP to),
+    // there's no way to "clamp" a late start earlier without missing the demand's own need, so
+    // this has to be an early rejection, not a date adjustment.
+    if (horizonEnd != null) {
+        val prospectiveStart = if (leadDays > 0) dateAddDays(reqDt, -leadDays) ?: reqDt else reqDt
+        if (prospectiveStart.isAfter(horizonEnd)) {
+            return MethodSlotResult(
+                achievableQty = 0.0,
+                wos = emptyList(),
+                methodPeggingNode = buildWoNode(
+                    productId, productionLocation, 0.0, (m["type"] as? String) ?: "", m,
+                    reqDt, null, 0, 0.0,
+                    "$methodChoiceExplanation — blocked: earliest possible start ($prospectiveStart) is after the planning horizon end ($horizonEnd)",
+                    "", null, emptyList(), failed = true, data = data,
+                ),
+                latestCommit = null,
+                anyChildShort = true,
+                blockedReason = "horizon_end",
+            )
+        }
+    }
 
     // 3) Child materials
     var woChildrenRelation: String? = null
@@ -2324,7 +2378,7 @@ internal fun planMethodSlot(
         // nested fanout further down was actually tagged with.
         val isAndGroupChild = activeChildren.size > 1
         val cBranchLineage = if (isAndGroupChild) extendLineage(branchLineage, cPid, cLid) else branchLineage
-        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, negativeInventoryPending = negativeInventoryPending, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, andSiblingCaps = andSiblingCaps, branchLotCap = cBranchLotCap, branchConsumed = cBranchConsumed, branchLineage = cBranchLineage, andSiblingDominators = andSiblingDominators, branchDominator = cBranchDominator, diamondRecipientCaps = diamondRecipientCaps, diamondRecipients = diamondRecipients, diamondCriticalEntitlement = diamondCriticalEntitlement, diamondReserveFraction = diamondReserveFraction, intraBudget = intraBudget, intraBudgetBaseline = intraBudgetBaseline, insideDiamondRecipient = cInsideDiamondRecipient, horizonStart = horizonStart)
+        val (solvedList, cWos, cPegging) = plan(cDemand, inventory, data, cReqDt, depth = depth - 1, planningPath = path, config = config, preferDemandId = preferDemandId, budget = budget, feasibilityCache = feasibilityCache, structuralFailedMakes = structuralFailedMakes, negativeInventoryPending = negativeInventoryPending, initialBudget = initialBudget, demandConsumed = demandConsumed, nodeQtyCaps = nodeQtyCaps, demandBlueprint = demandBlueprint, preferenceKb = preferenceKb, andSiblingCaps = andSiblingCaps, branchLotCap = cBranchLotCap, branchConsumed = cBranchConsumed, branchLineage = cBranchLineage, andSiblingDominators = andSiblingDominators, branchDominator = cBranchDominator, diamondRecipientCaps = diamondRecipientCaps, diamondRecipients = diamondRecipients, diamondCriticalEntitlement = diamondCriticalEntitlement, diamondReserveFraction = diamondReserveFraction, intraBudget = intraBudget, intraBudgetBaseline = intraBudgetBaseline, insideDiamondRecipient = cInsideDiamondRecipient, horizonStart = horizonStart, horizonEnd = horizonEnd)
         // Prefer the unrounded "quantity_precise" (see committedRow's doc) over the rounded
         // "quantity" — this feeds the AND-min ratio (computeRawAchievable) below, and reading
         // the rounded value here would let a genuinely-achieved fractional child (e.g. 0.4999
@@ -3128,6 +3182,12 @@ fun plan(
      *  Computed once by [legacyCommit] and threaded through unchanged to every recursive
      *  [plan] / [planMethodSlot] call. */
     horizonStart: LocalDate? = null,
+    /** The planning horizon's end (last day of the month of the LATEST demand due date) — see
+     *  [computePlanningHorizonEnd]. No work order may start after it; enforced as an outright
+     *  rejection in [planMethodSlot] (there's no floor-style clamp for a late start). Computed
+     *  once by [legacyCommit] and threaded through unchanged to every recursive [plan] /
+     *  [planMethodSlot] call. */
+    horizonEnd: LocalDate? = null,
 ): Triple<List<Map<String, Any?>>, List<Map<String, Any?>>, Map<String, Any?>?> {
 
     val productId = (demand["product_id"] as? String)?.trim() ?: ""
@@ -3172,6 +3232,7 @@ fun plan(
             intraBudgetBaseline = intraBudgetBaseline,
             insideDiamondRecipient = insideDiamondRecipient,
             horizonStart = horizonStart,
+            horizonEnd = horizonEnd,
         )
         // No cross-demand contention tag for quantity: critical materials are fully resolved by
         // the supply-guided pre-processor (buildSupplyAllocation's perLotBudgets) before this
@@ -4146,6 +4207,7 @@ fun plan(
             intraBudgetBaseline = slotIntraBudgetBaseline,
             insideDiamondRecipient = insideDiamondRecipient,
             horizonStart = horizonStart,
+            horizonEnd = horizonEnd,
         )
         // Intra-demand sibling contention (step c), applied directly here rather than relying
         // solely on plan()'s nodeCap-gated tagging site — same rationale as the AND-loop's
@@ -6550,7 +6612,8 @@ internal fun legacyCommit(
     // orders against the SAME horizon (the case's own earliest due month, or an explicit
     // method_selection.horizon_start override), not a per-demand one.
     val horizonStart = resolveHorizonStart(config, demands)
-    log.info("legacyCommit: planning horizon start={}", horizonStart ?: "none (no parseable demand due dates)")
+    val horizonEnd = resolveHorizonEnd(config, demands)
+    log.info("legacyCommit: planning horizon start={} end={}", horizonStart ?: "none (no parseable demand due dates)", horizonEnd ?: "none")
 
     demands.forEachIndexed { i, d ->
         val reqStr = d["request_due_time"] as? String ?: d["request_time"] as? String
@@ -6590,6 +6653,7 @@ internal fun legacyCommit(
             diamondRecipients = diamondRecipients,
             diamondCriticalEntitlement = diamondCriticalEntitlement?.get(demandId),
             horizonStart = horizonStart,
+            horizonEnd = horizonEnd,
         )
         // plan()'s `quantity <= 0` early return produces a COMPLETELY empty result (no
         // committed_demands row, no work order, no pegging tree) — correct when a demand

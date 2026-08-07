@@ -150,6 +150,7 @@ private fun seedCfg(
     rootWaterfall: Boolean = true,
     equalSplitRawMaterials: Boolean = false,
     horizonStart: String? = null,
+    horizonEnd: String? = null,
     /** Per-lot ASC override: supply_id -> date. Each "wip"-dated lot has its own independent
      *  readiness schedule (see PlanningEngine.kt's ASC section doc) — applied uniformly to every
      *  preset in this seeding batch, same as [horizonStart]. */
@@ -165,6 +166,7 @@ private fun seedCfg(
         put("root_waterfall", rootWaterfall)
         put("raw_material_sourcing", if (equalSplitRawMaterials) "equal_split" else "waterfall")
         if (horizonStart != null) put("horizon_start", horizonStart)
+        if (horizonEnd != null) put("horizon_end", horizonEnd)
         putJsonObject("score_weights") {
             put("commit_time", 0.4)
             put("inventory_consumed", 0.35)
@@ -815,6 +817,7 @@ object CaseBootstrap {
         val rootWaterfall: Boolean = true,
         val equalSplitRawMaterials: Boolean = false,
         val horizonStart: String? = null,
+        val horizonEnd: String? = null,
         /** Per-lot ASC override for the whole seeding batch: supply_id -> date — see
          *  [resolveWipSupplyDates]' own doc for the per-lot "auto" -> horizon-start default (each
          *  "wip" lot is its own independent readiness schedule). Lots absent from this map leave
@@ -879,6 +882,7 @@ object CaseBootstrap {
                         rootWaterfall = form.rootWaterfall,
                         equalSplitRawMaterials = form.equalSplitRawMaterials,
                         horizonStart = form.horizonStart,
+                        horizonEnd = form.horizonEnd,
                         wipSupplyDates = form.wipSupplyDates,
                     ),
                     form,

@@ -125,6 +125,7 @@ export function ConfigDetailView({ config, caseId, versionRefs }: { config: Reco
         {row('Max methods', String(ms.max_methods ?? 1))}
         {row('Raw material sourcing', (ms.raw_material_sourcing as string) === 'equal_split' ? 'Equal-split' : 'Waterfall')}
         {row('Horizon start', (ms.horizon_start as string) ?? 'None (no parseable demand due dates)')}
+        {row('Horizon end', (ms.horizon_end as string) ?? 'None (no parseable demand due dates)')}
         {asc && Object.entries((asc.wip_supply_dates ?? {}) as Record<string, string>).map(([sid, date]) =>
           row(`WIP: ${sid}`, date)
         )}

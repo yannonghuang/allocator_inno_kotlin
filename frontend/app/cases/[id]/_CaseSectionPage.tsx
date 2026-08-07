@@ -105,6 +105,7 @@ import {
   type ResourceUtilization,
   type DominatorRef,
   getHorizonStartDefault,
+  getHorizonEndDefault,
   getAscOptions,
   type WipLot,
 } from '@/lib/api';
@@ -1293,6 +1294,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // value whenever no explicit override is set; submission itself still sends nothing for "auto"
   // (server resolves the authoritative value fresh again at plan-submit time).
   const [defaultHorizonStart, setDefaultHorizonStart] = useState<string | null>(null);
+  // Mirror of defaultHorizonStart for "Horizon end: auto" (computePlanningHorizonEnd — last day
+  // of the month of the LATEST demand due date).
+  const [defaultHorizonEnd, setDefaultHorizonEnd] = useState<string | null>(null);
   // ASC (app-specific config): every SUPPLY_DATE="wip" lot this case has to configure, each with
   // its own independent readiness schedule (not one case-wide date), plus a shared default
   // (horizon start) each unconfigured lot falls back to. Fetched alongside defaultHorizonStart
@@ -1390,6 +1394,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [bootstrapRootWaterfall, setBootstrapRootWaterfall] = useState(true);
   const [bootstrapEqualSplitRawMaterials, setBootstrapEqualSplitRawMaterials] = useState(true);
   const [bootstrapHorizonStart, setBootstrapHorizonStart] = useState('');
+  const [bootstrapHorizonEnd, setBootstrapHorizonEnd] = useState('');
   const [bootstrapWipSupplyDates, setBootstrapWipSupplyDates] = useState<Record<string, string>>({});
   const [bootstrapPurchaseAllowed, setBootstrapPurchaseAllowed] = useState(true);
   const [bootstrapMakeBatchScale, setBootstrapMakeBatchScale] = useState<'none' | 'weekly' | 'biweekly' | 'monthly' | 'all'>('weekly');
@@ -1407,6 +1412,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     root_waterfall: bootstrapRootWaterfall,
     raw_material_sourcing: bootstrapEqualSplitRawMaterials ? 'equal_split' : 'waterfall',
     horizon_start: bootstrapHorizonStart || undefined,
+    horizon_end: bootstrapHorizonEnd || undefined,
     wip_supply_dates: Object.keys(bootstrapWipSupplyDates).length ? bootstrapWipSupplyDates : undefined,
     purchase_allowed: bootstrapPurchaseAllowed,
     make_batch_scale: bootstrapMakeBatchScale,
@@ -1981,6 +1987,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     getHorizonStartDefault(id)
       .then((v) => { if (!cancelled) setDefaultHorizonStart(v); })
       .catch(() => { if (!cancelled) setDefaultHorizonStart(null); });
+    return () => { cancelled = true; };
+  }, [id]);
+
+  // Mirror of the above for "Horizon end: auto".
+  useEffect(() => {
+    if (!id) { setDefaultHorizonEnd(null); return; }
+    let cancelled = false;
+    getHorizonEndDefault(id)
+      .then((v) => { if (!cancelled) setDefaultHorizonEnd(v); })
+      .catch(() => { if (!cancelled) setDefaultHorizonEnd(null); });
     return () => { cancelled = true; };
   }, [id]);
 
@@ -4899,6 +4915,37 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                     style={{ fontSize: '0.72rem', padding: '2px 6px' }}
                   >
                     {tP('config.horizonStartClear')}
+                  </button>
+                )}
+              </label>
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }} title={tP('config.horizonEndTooltip')}>
+                <span style={{ color: '#a1a1aa' }}>{tP('config.horizonEnd')}</span>
+                <input
+                  type="date"
+                  value={(() => {
+                    const v = planningConfig.method_selection?.horizon_end;
+                    return (v && v.toLowerCase() !== 'auto') ? v : (defaultHorizonEnd ?? '');
+                  })()}
+                  onChange={(e) => setPlanningConfig((c) => ({
+                    ...c,
+                    method_selection: { ...c.method_selection, horizon_end: e.target.value || undefined },
+                  }))}
+                  placeholder={tP('config.horizonEndAuto')}
+                  style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+                />
+                {planningConfig.method_selection?.horizon_end && (
+                  <button
+                    type="button"
+                    className="secondary"
+                    title={tP('config.horizonEndClearTooltip')}
+                    onClick={() => setPlanningConfig((c) => {
+                      const rest = { ...c.method_selection };
+                      delete rest.horizon_end;
+                      return { ...c, method_selection: rest };
+                    })}
+                    style={{ fontSize: '0.72rem', padding: '2px 6px' }}
+                  >
+                    {tP('config.horizonEndClear')}
                   </button>
                 )}
               </label>
@@ -8223,6 +8270,27 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                           style={{ fontSize: '0.72rem', padding: '2px 6px' }}
                         >
                           {tP('config.horizonStartClear')}
+                        </button>
+                      )}
+                    </label>
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.875rem' }} title={tP('config.horizonEndTooltip')}>
+                      <span style={{ color: '#a1a1aa' }}>{tP('config.horizonEnd')}</span>
+                      <input
+                        type="date"
+                        value={bootstrapHorizonEnd || (defaultHorizonEnd ?? '')}
+                        onChange={(e) => setBootstrapHorizonEnd(e.target.value)}
+                        placeholder={tP('config.horizonEndAuto')}
+                        style={{ padding: '3px 6px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 4, color: '#fafafa', fontSize: '0.875rem' }}
+                      />
+                      {bootstrapHorizonEnd && (
+                        <button
+                          type="button"
+                          className="secondary"
+                          title={tP('config.horizonEndClearTooltip')}
+                          onClick={() => setBootstrapHorizonEnd('')}
+                          style={{ fontSize: '0.72rem', padding: '2px 6px' }}
+                        >
+                          {tP('config.horizonEndClear')}
                         </button>
                       )}
                     </label>
