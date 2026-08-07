@@ -458,6 +458,15 @@ export type PlanningConfig = {
      * order before the plan's own frame of reference.
      */
     horizon_start?: string;
+    /**
+     * Planning horizon end — no work order may be scheduled to START after this date; a demand
+     * whose required start (due date minus lead time) falls after it is rejected outright rather
+     * than clamped (unlike horizon_start, there's no way to "clamp" a late start earlier without
+     * missing the demand's own need). Undefined/blank or `"auto"` (the default): computed from
+     * the case's own demands, as the last day of the month of the LATEST due date. An explicit
+     * `"yyyy-MM-dd"` override is used literally (not re-floored to a month end).
+     */
+    horizon_end?: string;
   };
   /** When false, the buy/purchase method is excluded from planning. Default: true. */
   purchase_allowed?: boolean;
@@ -2004,6 +2013,9 @@ export type SeedForm = {
   /** Blank/undefined or "auto": computed from the case's own demands. See PlanningConfig's
    *  identical field for the full semantics. */
   horizon_start?: string;
+  /** Blank/undefined or "auto": computed from the case's own demands. See PlanningConfig's
+   *  identical field for the full semantics. */
+  horizon_end?: string;
   /** Per-lot ASC override applied to every preset in this seeding batch. See PlanningConfig's
    *  `app_specific_config.wip_supply_dates`'s identical field for the full semantics. */
   wip_supply_dates?: Record<string, string>;
@@ -2090,6 +2102,16 @@ export async function getHorizonStartDefault(caseId: number): Promise<string | n
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
   return (data.horizon_start_default as string | null) ?? null;
+}
+
+/** What "Horizon end: auto" currently resolves to — the last day of the month of the LATEST
+ *  demand due date, computed server-side (mirrors getHorizonStartDefault). Null when the case has
+ *  no demands with a parseable due date. Read-only preview for the config forms. */
+export async function getHorizonEndDefault(caseId: number): Promise<string | null> {
+  const r = await fetch(`${API}/cases/${caseId}/plan/horizon-end-default`);
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return (data.horizon_end_default as string | null) ?? null;
 }
 
 /** One SUPPLY_DATE="wip" lot this case has to configure — its own independent readiness

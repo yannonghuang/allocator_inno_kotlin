@@ -89,6 +89,7 @@ private fun parseSeedForm(payload: JsonObject): com.allocator.services.CaseBoots
         rootWaterfall = bool("root_waterfall", true),
         equalSplitRawMaterials = str("raw_material_sourcing", "waterfall") == "equal_split",
         horizonStart = payload["horizon_start"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() },
+        horizonEnd = payload["horizon_end"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() },
         wipSupplyDates = (payload["wip_supply_dates"] as? JsonObject)
             ?.mapNotNull { (sid, v) -> v.jsonPrimitive.contentOrNull?.takeIf { it.isNotBlank() }?.let { sid to it } }
             ?.toMap() ?: emptyMap(),
@@ -327,6 +328,20 @@ fun Routing.allocateRoutes() {
         }
         val horizonStart = com.allocator.services.computePlanningHorizonStart(demands)
         call.respond(buildJsonObject { put("horizon_start_default", horizonStart?.toString()) })
+    }
+
+    // ── GET /cases/{case_id}/plan/horizon-end-default ─────────────────────────
+    // Mirror of horizon-start-default: the date "Horizon end: auto" currently resolves to — the
+    // last day of the month of the LATEST demand due date (see computePlanningHorizonEnd).
+    get("/cases/{case_id}/plan/horizon-end-default") {
+        val caseId = call.parameters["case_id"]?.toIntOrNull()
+            ?: throw IllegalArgumentException("Invalid case_id")
+        val demands = transaction {
+            Demands.selectAll().where { Demands.caseId eq caseId }
+                .map { mapOf("request_due_time" to it[Demands.requestDueTime]) }
+        }
+        val horizonEnd = com.allocator.services.computePlanningHorizonEnd(demands)
+        call.respond(buildJsonObject { put("horizon_end_default", horizonEnd?.toString()) })
     }
 
     // A single SUPPLY_DATE="wip" lot, for the /plan/asc-options listing below.
@@ -3402,6 +3417,7 @@ internal fun resolveEffectiveConfig(
     val consolidation = (c["consolidation"]     as? Map<*, *>)?.let { it as Map<String, Any?> } ?: emptyMap()
     val methodCfg = resolveMethodSelection(c)
     val horizonStart = com.allocator.services.resolveHorizonStart(c, data["demand"] ?: emptyList())
+    val horizonEnd = com.allocator.services.resolveHorizonEnd(c, data["demand"] ?: emptyList())
     // ASC: only meaningful (and only ever shown/persisted) when the case actually has SUPPLY_DATE
     // ="wip" rows — see resolveWipSupplyDates' own doc for the per-lot "auto" -> horizon-start
     // default (each lot is its own independent readiness schedule, not one case-wide date).
@@ -3458,6 +3474,7 @@ internal fun resolveEffectiveConfig(
             put("root_waterfall", methodCfg.rootWaterfall)
             put("raw_material_sourcing", if (methodCfg.equalSplitRawMaterials) "equal_split" else "waterfall")
             put("horizon_start", horizonStart?.toString())
+            put("horizon_end", horizonEnd?.toString())
         }
         // Only present when this case actually has SUPPLY_DATE="wip" rows — absence is how the
         // UI/ConfigDetailView know not to show the ASC section at all (see caseHasWipSupply).
