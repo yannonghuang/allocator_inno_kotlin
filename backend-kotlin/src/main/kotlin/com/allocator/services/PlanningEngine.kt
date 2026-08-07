@@ -4525,6 +4525,45 @@ internal fun aggregatePathToLeaf(
     return walk(fromPid, fromLid, 0)
 }
 
+/**
+ * Cumulative make lead time from (pid, lid) UP to its finished-good root(s) — the mirror image of
+ * [aggregatePathToLeaf]'s downward walk, used to reconstruct a critical stock's coverage window
+ * (see [com.allocator.services.computeCriticalStockCells]'s own doc for the mental model). Sums each
+ * ANCESTOR's own make lead time via bom.csv child_id -> parent_id edges, NOT [pid]'s own lead time —
+ * [pid] is assumed already-built (on-hand WIP), so only the time remaining above it counts.
+ *
+ * A component reachable from more than one finished good (e.g. cases/inno2026_2's 280-1001, which
+ * feeds both the Q6J and Q6K trees) takes the MAX across every reachable parent — conservative: never
+ * assume WIP is available for consumption before the slowest reachable path could actually use it.
+ * Returns 0.0 when [pid] has no BOM parent at all (it IS a finished good).
+ */
+internal fun daysToFinishedGood(
+    pid: String,
+    lid: String,
+    data: Map<String, List<Map<String, Any?>>>,
+): Double {
+    val visited = mutableSetOf<String>()
+    fun walk(p: String, depth: Int): Double {
+        if (depth > 100 || !visited.add(p)) return 0.0
+        try {
+            val parents = (data["bom"] ?: emptyList())
+                .filter { (it["child_id"] as? String)?.trim() == p }
+                .mapNotNull { (it["parent_id"] as? String)?.trim()?.takeIf { x -> x.isNotBlank() } }
+                .distinct()
+            if (parents.isEmpty()) return 0.0
+            return parents.maxOf { parentPid ->
+                val parentLead = getMethods(parentPid, lid, data)
+                    .filter { it["type"] == "make" }
+                    .maxOfOrNull { leadDaysForMethod(it) } ?: 0.0
+                parentLead + walk(parentPid, depth + 1)
+            }
+        } finally {
+            visited.remove(p)
+        }
+    }
+    return walk(pid, 0)
+}
+
 private fun computeStartDt(
     reqDt: LocalDate,
     leadDays: Double,

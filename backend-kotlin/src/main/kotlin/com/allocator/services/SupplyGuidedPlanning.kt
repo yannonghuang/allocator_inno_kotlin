@@ -305,10 +305,10 @@ internal fun expandCriticalStockSupplies(
             continue
         }
 
-        val rawLots = selectHistoricalWeightLots(
+        val rawLots = latestDatedSupplyLots(selectHistoricalWeightLots(
             stockPid = pid, stockLid = lid, rawPid = rawKey.productId, rawLid = rawKey.locationId,
             rawLots = rawLotsByKey[rawKey] ?: emptyList(), data = data, config = config,
-        )
+        )).map { it.second }
         val weightedLots: List<Pair<Map<String, Any?>, Double>> = rawLots.mapNotNull { lot ->
             val lotSid = (lot["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val lotPhysicalQty = (lot["qty"] as? Number)?.toDouble() ?: 0.0
@@ -383,6 +383,24 @@ internal fun selectHistoricalWeightLots(
 }
 
 /**
+ * Narrows [selectHistoricalWeightLots]'s candidate set down to only its LATEST dated lot(s) —
+ * a stock's pegging tree is only ever presumed to draw against the most recent raw allocation
+ * cycle it could have reached; any earlier lot [selectHistoricalWeightLots] also surfaces (its own
+ * two-earliest-dates fallback, or a lookback window wide enough to span more than one real dated
+ * lot) should already have been absorbed by downstream WIP or by demands themselves, so it
+ * contributes no weight. A no-op when every candidate lot already shares one date (the common
+ * case — see every existing [expandCriticalStockSupplies] fixture). Shared by both
+ * [expandCriticalStockSupplies] (the real proportional allocation split) and
+ * [com.allocator.services.computeCriticalStockCells] (the advisory scope reconstruction), so the
+ * two can never disagree about which lots a stock's split is weighted against.
+ */
+internal fun latestDatedSupplyLots(lots: List<Map<String, Any?>>): List<Pair<LocalDate, Map<String, Any?>>> {
+    val dated = lots.mapNotNull { lot -> parseDate(lot["supply_date"] as? String)?.let { it to lot } }
+    val latest = dated.maxOfOrNull { it.first } ?: return emptyList()
+    return dated.filter { it.first == latest }
+}
+
+/**
  * Rewrites per-lot budget keys ("$pid|$lid|$virtualSid") produced against
  * [expandCriticalStockSupplies]'s virtual sub-lots back to the one real, physical supply_id
  * ("$pid|$lid|$realSid"), summing when multiple virtual sub-lots collapse onto the same real lot —
@@ -410,6 +428,119 @@ internal fun collapseCriticalStockBudgets(
         }
     }
     return budgets
+}
+
+/**
+ * One "qualified cell" of a critical stock: a (product, location, target, quantity) slice tied to
+ * one specific raw-material supply lot, with the reconstructed [scopeStart]..[scopeEnd] window that
+ * lot's WIP is presumed to cover:
+ * ```
+ * start    = horizon_start + daysToFinishedGood(stock.product, stock.location)
+ * coverage = date(nextSupply)   -   date(rawSupply)
+ * end      = start + coverage
+ * ```
+ * "rawSupply" is the specific mandatory-raw-material lot this stock's quantity is tied to — its
+ * "dependent raw alloc" — and "nextSupply" is the next dated lot of that same raw material/target
+ * after it, i.e. the point the following planning cycle's own allocation would have taken over.
+ *
+ * An already-targeted stock row (e.g. wip_280-0001, target=Q6J) is never split — it stays one cell
+ * at its full quantity, tied to the latest same-target raw lot on/before its own lookback date (see
+ * [selectHistoricalWeightLots]), or the earliest available lot if none qualifies.
+ *
+ * An untargeted stock (e.g. wip_280-1001) yields one cell per lot [selectHistoricalWeightLots]
+ * selects — the exact same Ramification-1 proportional split [expandCriticalStockSupplies] already
+ * performs for allocation purposes — since each split fraction inherits a different target (and
+ * therefore a different raw lot / scope) from the raw material lot it's weighted against.
+ *
+ * [nextSupplyDate] (and therefore [scopeEnd]) is null when a cell's raw lot is the last dated lot of
+ * its target — an open-ended scope, not a bug: there's no "next cycle" yet to bound it.
+ */
+internal data class CriticalStockCell(
+    val stockSupplyId: String,
+    val productId: String,
+    val locationId: String,
+    val target: String?,
+    val quantity: Double,
+    val rawSupplyId: String,
+    val rawSupplyDate: LocalDate,
+    val nextSupplyDate: LocalDate?,
+    val scopeStart: LocalDate,
+    val scopeEnd: LocalDate?,
+)
+
+/** Computes every [CriticalStockCell] for the case — see that type's own doc for the model. Empty
+ *  whenever [computeCriticalStockPositions] finds no critical stock (its own hard early-exit), same
+ *  as every other TARGET-aware behavior in this file. */
+internal fun computeCriticalStockCells(
+    data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
+): List<CriticalStockCell> {
+    val criticalStocks = computeCriticalStockPositions(data, config)
+    if (criticalStocks.isEmpty()) return emptyList()
+
+    val horizonStart = resolveHorizonStart(config, data["demand"] ?: emptyList()) ?: return emptyList()
+    val supplies = data["supply"] ?: emptyList()
+
+    fun nextDateAfter(pid: String, lid: String, target: String?, after: LocalDate): LocalDate? =
+        supplies.mapNotNull { row ->
+            if ((row["product_id"] as? String)?.trim() != pid) return@mapNotNull null
+            if ((row["location_id"] as? String)?.trim() != lid) return@mapNotNull null
+            if ((row["target"] as? String)?.trim()?.takeIf { it.isNotBlank() } != target) return@mapNotNull null
+            parseDate(row["supply_date"] as? String)
+        }.filter { it.isAfter(after) }.minOrNull()
+
+    val cells = mutableListOf<CriticalStockCell>()
+    for (row in supplies) {
+        val pid = (row["product_id"] as? String)?.trim() ?: continue
+        val lid = (row["location_id"] as? String)?.trim() ?: continue
+        val qty = (row["qty"] as? Number)?.toDouble() ?: continue
+        val sid = (row["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: continue
+        if (qty <= 0) continue
+        val rawKey = criticalStocks[SupplyKey(pid, lid)] ?: continue
+        val ownTarget = (row["target"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+
+        val rawLotsAll = supplies.filter { r ->
+            (r["product_id"] as? String)?.trim() == rawKey.productId &&
+                (r["location_id"] as? String)?.trim() == rawKey.locationId
+        }
+        val startDate = horizonStart.plusDays(daysToFinishedGood(pid, lid, data).toLong())
+
+        if (ownTarget != null) {
+            val candidates = rawLotsAll.filter { (it["target"] as? String)?.trim() == ownTarget }
+            val selected = selectHistoricalWeightLots(pid, lid, rawKey.productId, rawKey.locationId, candidates, data, config)
+            val (lotDate, lot) = latestDatedSupplyLots(selected).firstOrNull() ?: continue
+            val lotSid = (lot["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: continue
+            val next = nextDateAfter(rawKey.productId, rawKey.locationId, ownTarget, lotDate)
+            cells.add(CriticalStockCell(
+                stockSupplyId = sid, productId = pid, locationId = lid, target = ownTarget, quantity = qty,
+                rawSupplyId = lotSid, rawSupplyDate = lotDate, nextSupplyDate = next,
+                scopeStart = startDate,
+                scopeEnd = next?.let { startDate.plusDays(it.toEpochDay() - lotDate.toEpochDay()) },
+            ))
+        } else {
+            val selected = selectHistoricalWeightLots(pid, lid, rawKey.productId, rawKey.locationId, rawLotsAll, data, config)
+            val weighted = latestDatedSupplyLots(selected).mapNotNull { (lotDate, lot) ->
+                val lotSid = (lot["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                val lotQty = (lot["qty"] as? Number)?.toDouble() ?: 0.0
+                if (lotQty <= 0) null else Triple(lotDate to lot, lotSid, lotQty)
+            }
+            val totalWeight = weighted.sumOf { it.third }
+            if (totalWeight <= 0) continue
+            for ((dateAndLot, lotSid, lotQty) in weighted) {
+                val (lotDate, lot) = dateAndLot
+                val lotTarget = (lot["target"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+                val next = nextDateAfter(rawKey.productId, rawKey.locationId, lotTarget, lotDate)
+                cells.add(CriticalStockCell(
+                    stockSupplyId = sid, productId = pid, locationId = lid, target = lotTarget,
+                    quantity = qty * (lotQty / totalWeight),
+                    rawSupplyId = lotSid, rawSupplyDate = lotDate, nextSupplyDate = next,
+                    scopeStart = startDate,
+                    scopeEnd = next?.let { startDate.plusDays(it.toEpochDay() - lotDate.toEpochDay()) },
+                ))
+            }
+        }
+    }
+    return cells
 }
 
 /**
@@ -556,11 +687,19 @@ internal fun buildSupplyAllocation(
             data                  = data,
             config                = config,
         )
+        // Reconstructed coverage ceiling per critical-stock (product, location, target) cell —
+        // see computeCriticalStockCells's own doc. Keyed by the stock's own real supply_id (never
+        // a virtual "#i" sub-lot) so allocateCriticalSuppliesPerLot can match it directly off
+        // expandedSupplies' lot ids.
+        val criticalStockScopeEnds: Map<Pair<String, String?>, LocalDate> = computeCriticalStockCells(data, config)
+            .mapNotNull { cell -> cell.scopeEnd?.let { (cell.stockSupplyId to cell.target) to it } }
+            .toMap()
         val rawBudgets = allocateCriticalSuppliesPerLot(
             matrix    = criticalMatrix,
             supplies  = expandedSupplies,
             demands   = demands,
             data      = data,
+            criticalStockScopeEnds = criticalStockScopeEnds,
         )
         // Collapse: every downstream consumer (case_allocation persistence, consumeFromInventory)
         // must only ever see the real, physical supply_id — never a virtual "#i" sub-lot, which

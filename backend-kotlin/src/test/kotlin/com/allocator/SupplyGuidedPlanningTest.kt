@@ -1618,4 +1618,191 @@ class SupplyGuidedPlanningTest : FunSpec({
 
         alloc.criticalMatrix.byColumn.keys.contains(SupplyKey("M", "L")) shouldBe false
     }
+
+    // ── J. Critical stock qualified cells ───────────────────────────────────────
+    // Reconstructs each critical-stock WIP row's coverage window from the previous planning
+    // cycle: start = horizon_start + daysToFinishedGood(stock.product); coverage = date(next raw
+    // lot) - date(the raw lot the stock's own pegging tree draws against); end = start + coverage.
+    // Fixture below is cases/inno2026_2 itself, transcribed verbatim (same products, BOM, lead
+    // times/yields, raw-lot dates/qtys, WIP rows) so this test doubles as a regression check
+    // against the real case's own numbers.
+
+    fun inno2026_2Data(): Map<String, List<Map<String, Any?>>> = mkData(
+        bom = listOf(
+            mapOf("bom_id" to "BOM_Q6J", "parent_id" to "Q6J", "child_id" to "500-0001", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_Q6K", "parent_id" to "Q6K", "child_id" to "500-0002", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_Q4R", "parent_id" to "Q4R", "child_id" to "500-0003", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_500-0001", "parent_id" to "500-0001", "child_id" to "280-0001", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_500-0002", "parent_id" to "500-0002", "child_id" to "280-0002", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_500-0003", "parent_id" to "500-0003", "child_id" to "280-0003", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_280-0001", "parent_id" to "280-0001", "child_id" to "280-1001", "rate" to 2.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_280-0002", "parent_id" to "280-0002", "child_id" to "280-1001", "rate" to 4.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_280-0003", "parent_id" to "280-0003", "child_id" to "280-1003", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_280-1001", "parent_id" to "280-1001", "child_id" to "283-0504-31", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_280-1003", "parent_id" to "280-1003", "child_id" to "263-0071-31", "rate" to 1.0, "alt_group" to null),
+        ),
+        methodMake = listOf("Q6J", "Q6K", "Q4R", "500-0001", "500-0002", "500-0003").map { pid ->
+            mapOf("bom_id" to "BOM_$pid", "product_id" to pid, "location_id" to "1000", "preference" to 1, "lead_time" to 0.0, "yield" to 1.0)
+        } + listOf(
+            mapOf("bom_id" to "BOM_280-0001", "product_id" to "280-0001", "location_id" to "1000", "preference" to 1, "lead_time" to 7.0, "yield" to 0.97),
+            mapOf("bom_id" to "BOM_280-0002", "product_id" to "280-0002", "location_id" to "1000", "preference" to 1, "lead_time" to 7.0, "yield" to 0.97),
+            mapOf("bom_id" to "BOM_280-0003", "product_id" to "280-0003", "location_id" to "1000", "preference" to 1, "lead_time" to 6.0, "yield" to 0.98),
+            mapOf("bom_id" to "BOM_280-1001", "product_id" to "280-1001", "location_id" to "1000", "preference" to 1, "lead_time" to 7.0, "yield" to 0.925),
+            mapOf("bom_id" to "BOM_280-1003", "product_id" to "280-1003", "location_id" to "1000", "preference" to 1, "lead_time" to 7.0, "yield" to 0.93),
+        ),
+        methodBuy = listOf(
+            mapOf("product_id" to "283-0504-31", "location_id" to "1000", "preference" to 1),
+            mapOf("product_id" to "263-0071-31", "location_id" to "1000", "preference" to 1),
+        ),
+        demands = listOf(
+            mapOf<String, Any?>("demand_id" to "Q6J_CB_08/01/2026", "product_id" to "280-0001", "location_id" to "1000", "quantity" to 5513.0, "priority" to 10, "request_due_time" to "2026-08-01", "customer_id" to "Q6J"),
+        ),
+        supplies = listOf(
+            // 283-0504-31: Q6J-targeted lots
+            mapOf<String, Any?>("supply_id" to "RAW_QJ_0715", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-07-15", "qty" to 81667.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "RAW_QJ_0722", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-07-22", "qty" to 7500.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "RAW_QJ_0801", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-08-01", "qty" to 81667.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "RAW_QJ_0808", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-08-08", "qty" to 7500.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "RAW_QJ_0815", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-08-15", "qty" to 73757.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "RAW_QJ_0822", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-08-22", "qty" to 214425.0, "target" to "Q6J"),
+            // 283-0504-31: Q6K-targeted lots
+            mapOf<String, Any?>("supply_id" to "RAW_QK_0715", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-07-15", "qty" to 17500.0, "target" to "Q6K"),
+            mapOf<String, Any?>("supply_id" to "RAW_QK_0722", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-07-22", "qty" to 11000.0, "target" to "Q6K"),
+            mapOf<String, Any?>("supply_id" to "RAW_QK_0801", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-08-01", "qty" to 17500.0, "target" to "Q6K"),
+            mapOf<String, Any?>("supply_id" to "RAW_QK_0808", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-08-08", "qty" to 11000.0, "target" to "Q6K"),
+            mapOf<String, Any?>("supply_id" to "RAW_QK_0815", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-08-15", "qty" to 0.0, "target" to "Q6K"),
+            mapOf<String, Any?>("supply_id" to "RAW_QK_0822", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-08-22", "qty" to 0.0, "target" to "Q6K"),
+            // 263-0071-31: Q4R-targeted lots (no pre-horizon history uploaded, unlike 283-0504-31)
+            mapOf<String, Any?>("supply_id" to "RAW_4R_0801", "product_id" to "263-0071-31", "location_id" to "1000", "supply_date" to "2026-08-01", "qty" to 62667.0, "target" to "Q4R"),
+            mapOf<String, Any?>("supply_id" to "RAW_4R_0808", "product_id" to "263-0071-31", "location_id" to "1000", "supply_date" to "2026-08-08", "qty" to 62667.0, "target" to "Q4R"),
+            mapOf<String, Any?>("supply_id" to "RAW_4R_0815", "product_id" to "263-0071-31", "location_id" to "1000", "supply_date" to "2026-08-15", "qty" to 62667.0, "target" to "Q4R"),
+            mapOf<String, Any?>("supply_id" to "RAW_4R_0822", "product_id" to "263-0071-31", "location_id" to "1000", "supply_date" to "2026-08-22", "qty" to 62667.0, "target" to "Q4R"),
+            // the 5 WIP rows under test
+            mapOf<String, Any?>("supply_id" to "wip_280-0001", "product_id" to "280-0001", "location_id" to "1000", "supply_date" to "wip", "qty" to 37961.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "wip_280-0002", "product_id" to "280-0002", "location_id" to "1000", "supply_date" to "wip", "qty" to 4438.0, "target" to "Q6K"),
+            mapOf<String, Any?>("supply_id" to "wip_280-0003", "product_id" to "280-0003", "location_id" to "1000", "supply_date" to "wip", "qty" to 54987.0, "target" to "Q4R"),
+            mapOf<String, Any?>("supply_id" to "wip_280-1001", "product_id" to "280-1001", "location_id" to "1000", "supply_date" to "wip", "qty" to 87013.0, "target" to null),
+            mapOf<String, Any?>("supply_id" to "wip_280-1003", "product_id" to "280-1003", "location_id" to "1000", "supply_date" to "wip", "qty" to 66730.0, "target" to "Q4R"),
+        ),
+    )
+
+    test("computeCriticalStockCells: horizon_start resolves to the last day of the prior month (auto)") {
+        // Earliest demand is 2026-08-01 -> horizon_start = 2026-07-31, same "auto" convention
+        // resolveHorizonStart already uses everywhere else.
+        val cells = computeCriticalStockCells(inno2026_2Data(), noPurchaseConfig)
+        cells.map { it.scopeStart }.distinct().toSet() shouldBe setOf(
+            java.time.LocalDate.of(2026, 7, 31),
+            java.time.LocalDate.of(2026, 8, 6),
+            java.time.LocalDate.of(2026, 8, 7),
+        )
+    }
+
+    test("computeCriticalStockCells: an already-targeted stock (wip_280-0001, Q6J) stays a single cell") {
+        val cells = computeCriticalStockCells(inno2026_2Data(), noPurchaseConfig)
+        val stock = cells.single { it.stockSupplyId == "wip_280-0001" }
+        stock.target shouldBe "Q6J"
+        stock.quantity shouldBe (37961.0 plusOrMinus 1e-6)
+        stock.rawSupplyId shouldBe "RAW_QJ_0715"
+        stock.rawSupplyDate shouldBe java.time.LocalDate.of(2026, 7, 15)
+        stock.nextSupplyDate shouldBe java.time.LocalDate.of(2026, 7, 22)
+        // days_to_FG(280-0001) = 0 (everything above it — 500-0001, Q6J — has 0 lead time)
+        stock.scopeStart shouldBe java.time.LocalDate.of(2026, 7, 31)
+        stock.scopeEnd shouldBe java.time.LocalDate.of(2026, 8, 7)
+    }
+
+    test("computeCriticalStockCells: wip_280-0002 (Q6K) and wip_280-1003 (Q4R) match the reconstructed scope") {
+        val cells = computeCriticalStockCells(inno2026_2Data(), noPurchaseConfig)
+
+        val s2 = cells.single { it.stockSupplyId == "wip_280-0002" }
+        s2.quantity shouldBe (4438.0 plusOrMinus 1e-6)
+        s2.rawSupplyDate shouldBe java.time.LocalDate.of(2026, 7, 15)
+        s2.nextSupplyDate shouldBe java.time.LocalDate.of(2026, 7, 22)
+        s2.scopeStart shouldBe java.time.LocalDate.of(2026, 7, 31)
+        s2.scopeEnd shouldBe java.time.LocalDate.of(2026, 8, 7)
+
+        // 280-0003/263-0071-31 has no lot dated before its lookback window (no pre-horizon history
+        // uploaded for this raw material) -> selectHistoricalWeightLots falls back to the two
+        // earliest available lots (8/1, 8/8); latestDatedOnly then takes just the later of those
+        // two (8/8) as "the" reference lot, same "only the latest matters" rule as everywhere else.
+        // Coverage (7d, to the next lot at 8/15) is unaffected either way.
+        val s3 = cells.single { it.stockSupplyId == "wip_280-0003" }
+        s3.rawSupplyDate shouldBe java.time.LocalDate.of(2026, 8, 8)
+        s3.nextSupplyDate shouldBe java.time.LocalDate.of(2026, 8, 15)
+        s3.scopeStart shouldBe java.time.LocalDate.of(2026, 7, 31)
+        s3.scopeEnd shouldBe java.time.LocalDate.of(2026, 8, 7)
+
+        // days_to_FG(280-1003) = 6 (its own parent 280-0003's make lead time)
+        val s5 = cells.single { it.stockSupplyId == "wip_280-1003" }
+        s5.quantity shouldBe (66730.0 plusOrMinus 1e-6)
+        s5.rawSupplyDate shouldBe java.time.LocalDate.of(2026, 8, 8)
+        s5.nextSupplyDate shouldBe java.time.LocalDate.of(2026, 8, 15)
+        s5.scopeStart shouldBe java.time.LocalDate.of(2026, 8, 6)
+        s5.scopeEnd shouldBe java.time.LocalDate.of(2026, 8, 13)
+    }
+
+    test("computeCriticalStockCells: untargeted wip_280-1001 splits into 2 cells at the LATEST qualifying raw-lot date only") {
+        // 280-1001's lookback window (2026-07-24) would nominally admit FOUR historical lots
+        // (7/15 x2 + 7/22 x2 across both targets) — but only the latest date's lots (7/22) are
+        // used: earlier lots should already have been absorbed by downstream WIP or by demands
+        // themselves, so they carry no weight in reconstructing what THIS stock covers.
+        val cells = computeCriticalStockCells(inno2026_2Data(), noPurchaseConfig)
+        val stock1001 = cells.filter { it.stockSupplyId == "wip_280-1001" }
+        stock1001.size shouldBe 2
+
+        val q6j = stock1001.single { it.target == "Q6J" }
+        val q6k = stock1001.single { it.target == "Q6K" }
+
+        // weighted 7500/(7500+11000) and 11000/(7500+11000) of the 87013 total
+        q6j.quantity shouldBe (87013.0 * 7500.0 / 18500.0 plusOrMinus 1e-6)
+        q6k.quantity shouldBe (87013.0 * 11000.0 / 18500.0 plusOrMinus 1e-6)
+        (q6j.quantity + q6k.quantity) shouldBe (87013.0 plusOrMinus 1e-6)
+
+        for (cell in stock1001) {
+            cell.rawSupplyDate shouldBe java.time.LocalDate.of(2026, 7, 22)
+            cell.nextSupplyDate shouldBe java.time.LocalDate.of(2026, 8, 1)
+            // days_to_FG(280-1001) = 7, same via either the Q6J or Q6K path (280-0001/280-0002
+            // both have their own 7-day lead, 500-000x/Q6J/Q6K all 0)
+            cell.scopeStart shouldBe java.time.LocalDate.of(2026, 8, 7)
+            cell.scopeEnd shouldBe java.time.LocalDate.of(2026, 8, 17)
+        }
+    }
+
+    test("buildSupplyAllocation: wip_280-1001 stops feeding demand once its reconstructed scope (8/17) is behind it") {
+        // Regression for the live bug: a WIP row's supply_date is never a real date ("wip"), so
+        // parseDate returns null and the plain lotDate-vs-deadline eligibility check was silently
+        // skipped entirely for critical-stock lots — wip_280-1001 was feeding demand arbitrarily
+        // far into the future (confirmed live on cases/inno2026_2, run #1740: it was still
+        // allocating to 08/24/2026 demand). criticalStockScopeEnds now caps it at its own
+        // reconstructed scope end (8/17, per the test above), compared against the demand's own
+        // RAW due date — NOT a further lead-time-backed-off deadline (a second live regression:
+        // comparing against `deadline` = reqDate - 7 double-counted the SAME 7-day lead time
+        // daysToFinishedGood already folds forward into scopeEnd, quietly extending the ceiling to
+        // 8/24 instead of 8/17 — exactly the leak the live screenshot showed).
+        val early = mapOf<String, Any?>("demand_id" to "D_EARLY", "product_id" to "280-0001", "location_id" to "1000", "quantity" to 100.0, "priority" to 10, "request_due_time" to "2026-08-17", "customer_id" to "Q6J")
+        val late  = mapOf<String, Any?>("demand_id" to "D_LATE",  "product_id" to "280-0001", "location_id" to "1000", "quantity" to 100.0, "priority" to 10, "request_due_time" to "2026-08-18", "customer_id" to "Q6J")
+        val data = inno2026_2Data() + ("demand" to listOf(early, late))
+
+        val alloc = buildSupplyAllocation(data["demand"]!!, data, noPurchaseConfig)
+
+        val earlyFromWip1001 = alloc.perLotBudgets["D_EARLY"]?.get("280-1001|1000|wip_280-1001") ?: 0.0
+        val lateFromWip1001  = alloc.perLotBudgets["D_LATE"]?.get("280-1001|1000|wip_280-1001") ?: 0.0
+        (earlyFromWip1001 > 0.0) shouldBe true
+        lateFromWip1001 shouldBe (0.0 plusOrMinus 1e-9)
+    }
+
+    test("buildSupplyAllocation: a demand due on the 1st of the month isn't wrongly pushed past its own critical stock's scope") {
+        // Regression: Q6J_CB_08/01/2026 (cases/inno2026_2's own real demand row) is due 2026-08-01,
+        // squarely inside wip_280-0001's own scope [7/31, 8/07] — but request_due_time falling on
+        // the 1st of a month triggers this allocator's separate "period-bucket demand" convention
+        // (eligDate extended to end-of-month, 8/31), which the scopeEnd check must NOT use, or a
+        // demand due on the 1st looks like it needs the material as late as month-end and gets
+        // wrongly excluded even though its real due date is nowhere near the scope boundary.
+        val demand = mapOf<String, Any?>("demand_id" to "Q6J_CB_08/01/2026", "product_id" to "280-0001", "location_id" to "1000", "quantity" to 5513.0, "priority" to 10, "request_due_time" to "2026-08-01", "customer_id" to "Q6J")
+        val data = inno2026_2Data() + ("demand" to listOf(demand))
+
+        val alloc = buildSupplyAllocation(data["demand"]!!, data, noPurchaseConfig)
+
+        val fromWip0001 = alloc.perLotBudgets["Q6J_CB_08/01/2026"]?.get("280-0001|1000|wip_280-0001") ?: 0.0
+        (fromWip0001 > 0.0) shouldBe true
+    }
 })
