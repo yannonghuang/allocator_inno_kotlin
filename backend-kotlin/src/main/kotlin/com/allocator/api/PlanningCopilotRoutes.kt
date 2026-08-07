@@ -53,7 +53,7 @@ private data class PlanningCopilotResponse(
 
 private const val SYSTEM_PROMPT = """You are a friendly planning configuration assistant. Users express their requirements in many different ways, in English or Chinese. Your job is to infer their intent from whatever wording they use—do not expect or require specific phrases. Be conversational and natural. Mirror the user's language (reply in Chinese if they wrote in Chinese).
 
-The plan config has three groups plus two post-plan UI toggles: **method_selection** (how make/move/buy methods are chosen), **purchase_allowed** (top-level boolean — purchasing on/off as a whole), **consolidation** (WO batch window — groups same-component work orders that start within N days into fewer larger orders), **analyze_criticality** (top-level boolean, post-plan auto-analysis), and **check_soundness** (top-level boolean, post-plan auto-validation). Any of these can appear in `config_update`. (BOM variants are modeled as distinct make methods, so there is no separate variant config.) Beyond these, a case also has 5 versioned external config objects (Critical Material Allocation, Supply Preferences, Demand Ordering, Purchasable Materials, Constraints) — see (18)-(20) below for how the copilot deals with those: version-picking for all five, plus regeneration for the two that are computed (Supply Preferences via parameter tuning, Critical Material Allocation on request). **Purchasable Materials CONTENT is never edited from this chat** — see (6s).
+The plan config has three groups plus two post-plan UI toggles: **method_selection** (how make/move/buy methods are chosen), **purchase_allowed** (top-level boolean — purchasing on/off as a whole), **consolidation** (WO batch window — groups same-component work orders that start within N days into fewer larger orders), **analyze_criticality** (top-level boolean, post-plan auto-analysis), and **check_soundness** (top-level boolean, post-plan auto-validation). Any of these can appear in `config_update`. (BOM variants are modeled as distinct make methods, so there is no separate variant config.) Beyond these, a case also has 5 versioned external config objects (Targeted Supply Allocation, Supply Preferences, Demand Ordering, Purchasable Materials, Constraints) — see (18)-(20) below for how the copilot deals with those: version-picking for all five, plus regeneration for the two that are computed (Supply Preferences via parameter tuning, Targeted Supply Allocation on request). **Purchasable Materials CONTENT is never edited from this chat** — see (6s).
 
 Intent → config mapping (interpret any phrasing that conveys the same intent):
 
@@ -116,7 +116,7 @@ these keys.
     → check_soundness: false.
 
 18) **Pick a version of an external config object.** Each case has 5 versioned external config
-    objects — Critical Material Allocation, Supply Preferences, Demand Ordering, Purchasable
+    objects — Targeted Supply Allocation, Supply Preferences, Demand Ordering, Purchasable
     Materials, Constraints — and a run can pin a specific version of each (e.g. "use allocation
     version 2", "plan with constraints version 6", "用偏好版本 3", "切换到需求排序版本 5"):
     → the matching key with the integer id the user named:
@@ -143,7 +143,7 @@ these keys.
     run. For qualitative asks ("favor X", "care more about Y") set that weight to a clearly
     dominant value (e.g. 0.6) and let renormalization handle the rest.
 
-20) **Regenerate Critical Material Allocation** (e.g. "regenerate allocation", "refresh the critical raw allocation", "重新生成分配", "刷新关键原材料分配") — also the right move whenever the user just changed which materials are purchasable, since which supply positions are "critical" (and so get an allocation budget) depends on that. Acknowledge in `reply`; emit NO config_update key for this yourself — the backend detects the request from your wording directly and regenerates. (Do not confuse with (18)'s case_alloc_version_id, which only PICKS an existing version.)
+20) **Regenerate Targeted Supply Allocation** (e.g. "regenerate allocation", "refresh the critical raw allocation", "重新生成分配", "刷新关键原材料分配") — also the right move whenever the user just changed which materials are purchasable, since which supply positions are "critical" (and so get an allocation budget) depends on that. Acknowledge in `reply`; emit NO config_update key for this yourself — the backend detects the request from your wording directly and regenerates. (Do not confuse with (18)'s case_alloc_version_id, which only PICKS an existing version.)
 
 Valid config_update keys:
 - method_selection: object with optional "multiple" (bool, legacy), "mode" ("preference" — the only supported mode), "max_methods" (int ≥ 1; default 2; waterfall cap — how many ranked alternatives, across method type and BOM variant, to try before giving up).
@@ -594,7 +594,7 @@ private fun ruleBasedParse(
         Regex("重新生成.*分配|刷新.*分配").containsMatchIn(raw)
     ) {
         return bi(
-            "On it — regenerating Critical Material Allocation.",
+            "On it — regenerating Targeted Supply Allocation.",
             "好的 — 正在重新生成关键原材料分配。",
             raw,
         ) to null
@@ -766,7 +766,7 @@ private fun resolvePreferenceTuning(
 
 // ── Allocation ↔ Purchasable coupling ────────────────────────────────────────
 //
-// Critical Material Allocation and Purchasable Materials are NOT independent: a supply
+// Targeted Supply Allocation and Purchasable Materials are NOT independent: a supply
 // position is "critical" (gets an allocation budget row at all) only when it has
 // no make method AND is not an admitted buy — see isRawCriticalPosition in
 // PlanningEngine.kt, criterion 2. So switching purchasable_material_version_id
@@ -794,16 +794,16 @@ private fun invitePurchasableCoupledAllocationRefresh(
     if (configUpdate?.get("purchasable_material_version_id") == null) return reply
     if (justRegenerated) return reply
     return "$reply\n" + bi(
-        "Heads up: Critical Material Allocation depends on which materials are purchasable — a " +
+        "Heads up: Targeted Supply Allocation depends on which materials are purchasable — a " +
             "budget built under the old selection may no longer be accurate. Regenerate it on " +
-            "the Critical Material Allocation page, or tell me \"regenerate allocation\".",
+            "the Targeted Supply Allocation page, or tell me \"regenerate allocation\".",
         "提示：关键原材料分配取决于哪些材料可采购 — 基于旧选择生成的分配可能已不准确。" +
             "请在「关键原材料分配」页面重新生成，或告诉我「重新生成分配」。",
         userMessage,
     )
 }
 
-/** Explicit "regenerate allocation" request — regenerates into a NEW Critical Material Allocation
+/** Explicit "regenerate allocation" request — regenerates into a NEW Targeted Supply Allocation
  *  version using the currently-effective purchasable/constraints selection (never mutates a
  *  referenced version, matching the Generate route's own discipline) and selects it. Third
  *  return value is true only when THIS call actually minted a new version — the signal
@@ -845,14 +845,14 @@ private fun maybeRegenerateAllocation(
             "Created by planning copilot from: \"${userMessage.take(200)}\"",
         )
     }
-    val rows = generateAndSeedCaseAllocation(caseId, newVersionId, data, cfgMap)
+    val rows = generateDefaultTsaRows(caseId, newVersionId, data, cfgMap)
 
     val outCu = JsonObject((configUpdate ?: JsonObject(emptyMap())).toMutableMap().apply {
         put("case_alloc_version_id", JsonPrimitive(newVersionId))
     })
     return Triple(
         "$reply\n" + bi(
-            "Regenerated Critical Material Allocation (${rows.size} rows) against the currently selected purchasable materials — saved as version $newVersionId and selected it for the next run.",
+            "Regenerated Targeted Supply Allocation (${rows.size} rows) against the currently selected purchasable materials — saved as version $newVersionId and selected it for the next run.",
             "已根据当前选定的可采购材料重新生成关键原材料分配（${rows.size} 行）— 已保存为版本 $newVersionId 并选作下次运行。",
             userMessage,
         ),

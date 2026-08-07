@@ -33,14 +33,14 @@ package com.allocator.services
  * exception: [isRawCriticalPosition] itself depends on `config` (criterion 2, "bought
  * but excluded from purchasable_materials"), so a case's `config` is now threaded
  * through the whole build — the exact same tradeoff `Allocation.kt`'s
- * `generateAndSeedCaseAllocation` already makes for the identical reason. As with
+ * `generateDefaultTsaRows` already makes for the identical reason. As with
  * that precedent, this means critical-material scores can go stale if
  * `purchase_allowed`/`purchasable_materials` changes after a KB is generated, until
  * the KB is regenerated — the first two axes remain a pure function of case data.
  *
  * This file is intentionally DB-free (pure functions over `data`); persistence lives
  * in `api/Preferences.kt`, mirroring how [buildSupplyAllocation] (pure) is split from
- * `Allocation.kt`'s `generateAndSeedCaseAllocation` (DB read/write).
+ * `Allocation.kt`'s `generateDefaultTsaRows` (DB read/write).
  */
 
 /**

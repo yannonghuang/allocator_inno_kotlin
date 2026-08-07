@@ -1325,6 +1325,10 @@ export type CaseSupplyRow = {
    *  row, or the row's own prod_area is unset (e.g. a pure raw material with no make/move WO
    *  anywhere to otherwise infer it from). */
   prodArea: string | null;
+  /** The lot's own physical TARGET (customer id) from supply.csv — null for most lots. Distinct
+   *  from a Targeted Supply Allocation override (TsaRow.target), which is what a user has since
+   *  edited on top of this starting value. */
+  target: string | null;
 };
 
 /** A demand pegged to a supply, computed client-side from planning_pegging inversion. */
@@ -2170,7 +2174,19 @@ async function deleteConfigVersion(kindPath: string, caseId: number, versionId: 
   if (!r.ok) throw new Error(await r.text());
 }
 
-// ── Allocation map ─────────────────────────────────────────────────────────────
+// ── Targeted Supply Allocation (TSA) ────────────────────────────────────────────
+// `case_allocation` was repurposed from a DERIVED (supply_lot, demand) -> qty_allocated grid
+// (directly hand-edited — limited real usage, disconnected from real inputs) into TSA INPUT rows:
+// one row per critical-material lot, carrying only `qty_cap` (cap override) and `target`
+// (customer earmark) — see backend `CaseAllocations`' own doc. `AllocationRow` is now the
+// READ-ONLY, recomputed (supply_lot, demand) -> qty_allocated preview grid — never persisted,
+// always derived from the current TSA rows via `previewAllocation`.
+
+export type TsaRow = {
+  supply_id: string;
+  qty_cap: number | null;
+  target: string | null;
+};
 
 export type AllocationRow = {
   supply_id: string;
@@ -2178,27 +2194,28 @@ export type AllocationRow = {
   qty_allocated: number;
 };
 
-/** GET /cases/{id}/allocation — null when no allocation exists yet (204). */
-export async function getAllocation(caseId: number, versionId?: number): Promise<AllocationRow[] | null> {
+/** GET /cases/{id}/allocation — the version's TSA input rows. Null when no version resolved. */
+export async function getAllocation(caseId: number, versionId?: number): Promise<TsaRow[] | null> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/allocation`, versionId));
   if (r.status === 204) return null;
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
-  return data.rows as AllocationRow[];
+  return data.rows as TsaRow[];
 }
 
-/** POST /cases/{id}/allocation/generate — runs SupplyAllocator and saves result. 409 if the
- *  target version is referenced by an existing plan run. */
-export async function generateAllocation(caseId: number, versionId?: number): Promise<AllocationRow[]> {
+/** POST /cases/{id}/allocation/generate — seeds TSA rows for the case's current critical-material
+ *  lots (qty_cap/target copied from their physical values — a no-op starting point to edit from).
+ *  409 if the target version is referenced by an existing plan run. */
+export async function generateAllocation(caseId: number, versionId?: number): Promise<TsaRow[]> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/allocation/generate`, versionId), { method: 'POST' });
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
-  return data.rows as AllocationRow[];
+  return data.rows as TsaRow[];
 }
 
-/** PUT /cases/{id}/allocation — upsert (partial or full) rows. 409 if the target version is
+/** PUT /cases/{id}/allocation — upsert (partial or full) TSA rows. 409 if the target version is
  *  referenced by an existing plan run — use createAllocationVersion ("Save As") instead. */
-export async function updateAllocationRows(caseId: number, rows: AllocationRow[], versionId?: number): Promise<void> {
+export async function updateAllocationRows(caseId: number, rows: TsaRow[], versionId?: number): Promise<void> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/allocation`, versionId), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
@@ -2207,14 +2224,14 @@ export async function updateAllocationRows(caseId: number, rows: AllocationRow[]
   if (!r.ok) throw new Error(await r.text());
 }
 
-/** DELETE /cases/{id}/allocation — clear the target version's rows. */
+/** DELETE /cases/{id}/allocation — clear the target version's TSA rows. */
 export async function deleteAllocation(caseId: number, versionId?: number): Promise<void> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/allocation`, versionId), { method: 'DELETE' });
   if (!r.ok) throw new Error(await r.text());
 }
 
-/** POST /cases/{id}/allocation/import — upload CSV, replace all rows. */
-export async function importAllocationCsv(caseId: number, csvText: string, versionId?: number): Promise<AllocationRow[]> {
+/** POST /cases/{id}/allocation/import — upload CSV (supply_id,qty_cap,target), replace all rows. */
+export async function importAllocationCsv(caseId: number, csvText: string, versionId?: number): Promise<TsaRow[]> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/allocation/import`, versionId), {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain' },
@@ -2222,18 +2239,43 @@ export async function importAllocationCsv(caseId: number, csvText: string, versi
   });
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
-  return data.rows as AllocationRow[];
+  return data.rows as TsaRow[];
 }
 
-/** GET /cases/{id}/allocation/export — download CSV text. */
+/** GET /cases/{id}/allocation/export — download CSV text (supply_id,qty_cap,target). */
 export async function exportAllocationCsv(caseId: number, versionId?: number): Promise<string> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/allocation/export`, versionId));
   if (!r.ok) throw new Error(await r.text());
   return r.text();
 }
 
+export type AllocationPreview = {
+  rows: AllocationRow[];
+  /** supply_ids that are genuinely raw critical-material lots — directly editable in the TSA
+   *  table. Everything else (critical stock, non-critical supply) is read-only/derived. */
+  rawCriticalSupplyIds: string[];
+};
+
+/** POST /cases/{id}/allocation/preview — recomputes the read-only (supply_lot, demand) ->
+ *  qty_allocated grid via buildSupplyAllocation. Pass `rows` to preview UNSAVED pending edits
+ *  ("try out different options on-the-fly" without committing); omit it to preview the resolved
+ *  version's own saved rows. Never persists anything. */
+export async function previewAllocation(caseId: number, versionId?: number, rows?: TsaRow[]): Promise<AllocationPreview> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/allocation/preview`, versionId), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(rows ? { rows } : {}),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return {
+    rows: data.rows as AllocationRow[],
+    rawCriticalSupplyIds: (data.raw_critical_supply_ids ?? []) as string[],
+  };
+}
+
 export const listAllocationVersions = (caseId: number) => listConfigVersions('allocation', caseId);
-export const createAllocationVersion = (caseId: number, body: { name?: string; comments?: string; rows: AllocationRow[] }) =>
+export const createAllocationVersion = (caseId: number, body: { name?: string; comments?: string; rows: TsaRow[] }) =>
   createConfigVersion('allocation', caseId, body);
 export const updateAllocationVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null }) =>
   updateConfigVersion('allocation', caseId, versionId, body);

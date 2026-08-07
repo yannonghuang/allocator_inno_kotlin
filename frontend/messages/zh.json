@@ -66,7 +66,7 @@
     "materialImpact": "影响分析",
     "events": "事件",
     "criteria": "评估标准",
-    "allocation": "关键原材料分配",
+    "allocation": "定向供应分配",
     "preferences": "供应偏好设置",
     "woScheduleImpact": "工单排程影响",
     "demandOrdering": "需求排序",
@@ -279,7 +279,7 @@
       "groupExternalVersions": "外部配置",
       "doneReadOnly": "已完成 — 只读",
       "readOnlyActionTooltip": "此运行为只读 — 请点击\"新建运行\"以开始新的草稿。",
-      "externalAllocation": "关键原材料分配",
+      "externalAllocation": "定向供应分配",
       "externalPreferences": "供应偏好",
       "externalDemandOrdering": "需求排序",
       "externalPurchasableMaterials": "可采购物料",
@@ -1290,7 +1290,14 @@
     "confirmLeave": "您有未保存的更改，确定要离开吗？",
     "undoTitle": "撤销  Ctrl+Z",
     "redoTitle": "重做  Ctrl+Shift+Z",
-    "saveTitle": "保存  Ctrl+S"
+    "saveTitle": "保存  Ctrl+S",
+    "tsaHeader": "定向供应分配",
+    "tsaHint": "高亮的可编辑单元格 = 原材料批次 × 客户 — 编辑单元格可设置额度上限并/或将批次的目标客户移到此列。其余单元格均为只读：聚合汇总、某客户下按需求拆分的更细粒度结果，或由其依赖的原材料分配传导而来的关键库存批次数值。",
+    "untargetedHeader": "未指定客户",
+    "editableLegend": "可编辑（原材料批次 × 客户）",
+    "noTsaRows": "该案例没有关键材料 — 点击",
+    "noTsaRowsMiddle": "生成当前关键材料批次，或",
+    "noTsaRowsAfter": "加载已有数据。"
   },
   "preferencesPage": {
     "loading": "加载偏好设置中…",

@@ -11,14 +11,10 @@ import com.allocator.services.CaseLoader
 import com.allocator.services.ConfigVersionKind
 import com.allocator.services.KbFingerprint
 import com.allocator.services.SupplyKey
-import com.allocator.services.allocateCriticalSuppliesPerLot
+import com.allocator.services.TsaOverride
 import com.allocator.services.buildAllocationBudgetRowsFull
-import com.allocator.services.buildBomGraph
-import com.allocator.services.buildReachabilityMatrix
 import com.allocator.services.buildSupplyAllocation
-import com.allocator.services.collapseCriticalStockBudgets
 import com.allocator.services.computeCriticalStockPositions
-import com.allocator.services.expandCriticalStockSupplies
 import com.allocator.services.hasAnyTargetedSupply
 import io.ktor.http.*
 import io.ktor.server.application.*
@@ -28,63 +24,58 @@ import io.ktor.server.routing.*
 import kotlinx.serialization.json.*
 import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
-import org.jetbrains.exposed.sql.SqlExpressionBuilder.inList
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.slf4j.LoggerFactory
 
 private val log = LoggerFactory.getLogger("com.allocator.AllocationRoute")
 private val KIND = ConfigVersionKind.CASEALLOC
 
-// ── Helper: load case_allocation rows as perLotBudgets ───────────────────────
+// ── Targeted Supply Allocation (TSA) — repurposed `case_allocation` ─────────────
+//
+// `case_allocation` used to store the DERIVED (supply_lot, demand) -> qty_allocated budget grid,
+// a snapshot of buildSupplyAllocation's own output that a user could hand-edit. That table had
+// limited real usage: it's an intermediate step (post-BOM-walk), not something a user naturally
+// reasons about editing directly, and any edit to it was disconnected from the actual inputs
+// (qty/target per critical-material lot) that drive the real computation.
+//
+// This table is repurposed to instead store the INPUT side: one row per critical-material lot,
+// carrying only the two fields a user actually wants to try out — [CaseAllocRow.qtyCap] (a cap
+// override) and [CaseAllocRow.target] (customer earmark). Lead time is never stored here — it's
+// always derived live from BOM structure (see [TsaOverride]'s own doc).
+//
+// The old derived grid still exists — it's just never persisted anymore. It's recomputed
+// on-demand ([computeAllocationPreview]) from whatever TSA rows currently exist for a version,
+// via the exact same [buildSupplyAllocation] pipeline a real plan run uses, so the preview always
+// matches what planning would actually do with those inputs.
 
-data class CaseAllocRow(val supplyId: String, val demandId: String?, val qtyAllocated: Double)
+data class CaseAllocRow(val supplyId: String, val qtyCap: Double?, val target: String?)
 
-/** Loads case_allocation rows for [versionId]. Returns null when none exist (planning falls back
- *  to SupplyAllocator). */
+/** One row of the read-only, recomputed (supply_lot, demand) -> qty_allocated preview grid — the
+ *  same shape `case_allocation` used to persist, now produced on-demand by
+ *  [computeAllocationPreview] instead. */
+data class AllocPreviewRow(val supplyId: String, val demandId: String?, val qtyAllocated: Double)
+
+/** Loads a version's TSA input rows. Returns null when none exist (an unedited version —
+ *  planning proceeds with zero overrides, i.e. exactly pre-TSA behavior). */
 internal fun loadCaseAllocRows(versionId: Int?): List<CaseAllocRow>? {
     if (versionId == null) return null
     return transaction {
         val rows = CaseAllocations.selectAll()
             .where { CaseAllocations.versionId eq versionId }
-            .map { CaseAllocRow(it[CaseAllocations.supplyId], it[CaseAllocations.demandId], it[CaseAllocations.qtyAllocated]) }
+            .map { CaseAllocRow(it[CaseAllocations.supplyId], it[CaseAllocations.qtyCap], it[CaseAllocations.target]) }
         if (rows.isEmpty()) null else rows
     }
 }
 
-/**
- * Converts case_allocation rows into the perLotBudgets format used by planning:
- * demandId → { "$pid|$lid|$supplyId" → qty, "$pid|$lid" → qty (aggregate) }.
- *
- * Requires [supplies] from case data to look up product+location for each supply_id.
- */
-internal fun buildBudgetsFromCaseAlloc(
-    rows: List<CaseAllocRow>,
-    supplies: List<Map<String, Any?>>,
-): Map<Any?, MutableMap<String, Double>> {
-    val supplyMeta = supplies.associate { s ->
-        val sid = (s["supply_id"] as? String)?.trim() ?: ""
-        val pid = (s["product_id"] as? String)?.trim() ?: ""
-        val lid = (s["location_id"] as? String)?.trim() ?: ""
-        sid to (pid to lid)
-    }
-    val result = mutableMapOf<Any?, MutableMap<String, Double>>()
-    for (row in rows) {
-        val (pid, lid) = supplyMeta[row.supplyId] ?: continue
-        if (pid.isBlank() || lid.isBlank()) continue
-        val aggKey = "$pid|$lid"
-        val lotKey = "$aggKey|${row.supplyId}"
-        val budget = result.getOrPut(row.demandId) { mutableMapOf() }
-        budget[lotKey] = (budget[lotKey] ?: 0.0) + row.qtyAllocated
-        budget[aggKey] = (budget[aggKey] ?: 0.0) + row.qtyAllocated
-    }
-    return result
-}
+/** Converts a version's TSA rows into the override map [buildSupplyAllocation] takes directly. */
+internal fun buildTsaOverridesFromCaseAlloc(rows: List<CaseAllocRow>): Map<String, TsaOverride> =
+    rows.associate { it.supplyId to TsaOverride(qtyCap = it.qtyCap, target = it.target) }
 
-/** The set of product ids covered by [rows] (an allocation version's stored rows) — i.e. the
- *  critical-material set that version was generated for, based on the actual supply lots it
- *  budgeted. Compared against [computeCriticalPids][com.allocator.services.computeCriticalPids]'s
- *  live result at plan-submit time to detect a version that's gone stale (see call sites in
- *  Allocate.kt's `runPlanBackground`/`runOneBootstrapPreset`). */
+/** The set of product ids covered by [rows] (a TSA version's stored input rows) — i.e. the
+ *  critical-material set that version's rows were generated against. Compared against
+ *  [computeCriticalPids][com.allocator.services.computeCriticalPids]'s live result at plan-submit
+ *  time to detect a version that's gone stale (see call sites in Allocate.kt's
+ *  `runPlanBackground`/`runOneBootstrapPreset`). */
 internal fun caseAllocMaterialSet(
     rows: List<CaseAllocRow>,
     supplies: List<Map<String, Any?>>,
@@ -95,13 +86,27 @@ internal fun caseAllocMaterialSet(
     return rows.mapNotNull { supplyToPid[it.supplyId]?.takeIf { pid -> pid.isNotBlank() } }.toSet()
 }
 
-/**
- * Recompute and persist case_allocation's content-hash fingerprint for [versionId] — call after
- * any write to [CaseAllocations], inside the SAME transaction as the row mutation so hash and
- * rows commit atomically. Re-reads the FULL current row set (not a delta) so PUT's partial
- * row-by-row edits still produce a hash reflecting the true final table state. Read later by
- * the KB signature's plan-submission fingerprint injection (CaseBootstrap.signatureFor /
- * Allocate.kt's resolveEffectiveConfig), not by anything in the live planning path itself.
+/** Runs [buildSupplyAllocation] with [tsaOverrides] applied and flattens the result into the same
+ *  (supply_lot, demand) -> qty_allocated shape `case_allocation` used to persist — the read-only
+ *  preview grid shown by the Allocation page's matrix view, and read by the two
+ *  `PlanningAgentRoutes` tools that used to read stored rows directly. */
+internal fun computeAllocationPreview(
+    data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
+    tsaOverrides: Map<String, TsaOverride>,
+): List<AllocPreviewRow> {
+    val demands = data["demand"] ?: emptyList()
+    val result = buildSupplyAllocation(demands, data, config, tsaOverrides)
+    return buildAllocationBudgetRowsFull(result.perLotBudgets, result.criticalMatrix, data["supply"] ?: emptyList())
+        .map { (sid, did, qty) -> AllocPreviewRow(sid, did, qty) }
+}
+
+/** Recompute and persist case_allocation's content-hash fingerprint for [versionId] — call after
+ *  any write to [CaseAllocations], inside the SAME transaction as the row mutation so hash and
+ *  rows commit atomically. Re-reads the FULL current row set (not a delta) so PUT's partial
+ *  row-by-row edits still produce a hash reflecting the true final table state. Read later by
+ *  the KB signature's plan-submission fingerprint injection (CaseBootstrap.signatureFor /
+ *  Allocate.kt's resolveEffectiveConfig), not by anything in the live planning path itself.
  *
  * Known accepted limitation: does not take a row lock before recomputing, so two genuinely
  * concurrent writers on the same version (double-click Save, two tabs) could each compute a hash
@@ -111,7 +116,7 @@ internal fun caseAllocMaterialSet(
  */
 private fun recomputeCaseAllocationHash(caseId: Int, versionId: Int) {
     val rows = CaseAllocations.selectAll().where { CaseAllocations.versionId eq versionId }
-        .map { "${it[CaseAllocations.supplyId]}|${it[CaseAllocations.demandId] ?: ""}|${it[CaseAllocations.qtyAllocated]}" }
+        .map { "${it[CaseAllocations.supplyId]}|${it[CaseAllocations.qtyCap] ?: ""}|${it[CaseAllocations.target] ?: ""}" }
     val hash = KbFingerprint.hashRows(rows)
     val existing = CaseAllocationConfigs.selectAll().where { CaseAllocationConfigs.versionId eq versionId }.firstOrNull()
     if (existing != null) {
@@ -127,7 +132,7 @@ private fun recomputeCaseAllocationHash(caseId: Int, versionId: Int) {
     }
 }
 
-/** [versionId] null means this case has never had a Critical Material Allocation version at all — a
+/** [versionId] null means this case has never had a Targeted Supply Allocation version at all — a
  *  legitimate "nothing yet" state (see CaseConfigVersioning's own doc), not an error. */
 private fun versionJson(caseId: Int, versionId: Int?): JsonObject {
     val summary = versionId?.let { vid -> CaseConfigVersioning.listVersions(caseId, KIND).firstOrNull { it.id == vid } }
@@ -140,46 +145,83 @@ private fun versionJson(caseId: Int, versionId: Int?): JsonObject {
 }
 
 /**
- * Run the supply allocation for [caseId]/[versionId] using [data] and [config], persist the
- * result into that version's rows, and return the saved rows. Config is required for
- * purchasable_materials filtering — pass null only when no plan run has been run yet for the
- * case. Deliberately does NOT check "is this version referenced" — see call sites: the Generate
- * route checks before calling this; `runPlanBackground`'s auto-seed-on-first-run path is an
- * internal write performed by the very run that just referenced this version, not a user-
- * initiated edit of pre-existing data, so it must stay unconditional (matches this function's
- * pre-versioning behavior exactly).
+ * The set of `supply_id`s that are genuinely RAW critical-material lots for the case's CURRENT
+ * data/config — i.e. eligible for a direct TSA (qty_cap/target) override. Excludes critical-STOCK
+ * positions (on-hand inventory of an otherwise-elastic, non-raw product that only INHERITS
+ * targeting from its mandatory raw material — see
+ * [com.allocator.services.computeCriticalStockPositions]'s own doc): their effective targeting
+ * must stay entirely DERIVED, never set directly (see [generateDefaultTsaRows]'s own doc for why).
+ * Shared by [generateDefaultTsaRows] (which supply_ids to seed) and the `/preview` route (which
+ * cells the TSA table renders as editable vs read-only-derived).
  *
- * This is the single shared implementation used by both the Generate endpoint and the
- * plan-run seeding path in runPlanBackground.
- *
- * Already includes critical-stock rows with no extra work: [buildSupplyAllocation]'s own
- * `criticalMatrix`/`perLotBudgets` are critical-stock-aware (see `computeCriticalStockPositions`),
- * so `buildAllocationBudgetRowsFull` below picks them up for free, split against each mandatory raw
- * material's own physical lot quantities (no persisted allocation exists yet on a fresh generate —
- * see `expandCriticalStockSupplies`'s fallback). Only the manual-edit routes (`PUT`/`import`/
- * `versions`) need [recomputeCriticalStockAllocationRows] — they can leave a case's raw-material
- * rows in a state this function never produced (e.g. rebalanced away from physical-lot
- * proportions), which the derived stock split must then follow.
+ * Empty for a case that has never used TARGET at all ([hasAnyTargetedSupply] false) — a case that
+ * hasn't opted into targeting (e.g. case 173) keeps its raw critical materials fully read-only,
+ * the same "intermediate allocation, not an input surface" treatment as critical stock, rather
+ * than retroactively exposing every such case's raw lots as newly editable. Mirrors the exact
+ * same case-level gate [buildSupplyAllocation] already uses to choose which per-lot allocator
+ * runs (`allocateCriticalSuppliesPerLot` vs `allocateSuppliesPerLot`), so a case's TSA
+ * editability can never disagree with which algorithm actually produced its numbers.
  */
-internal fun generateAndSeedCaseAllocation(
+internal fun rawCriticalSupplyIds(
+    data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
+): Set<String> {
+    if (!hasAnyTargetedSupply(data)) return emptySet()
+    val demands = data["demand"] ?: emptyList()
+    val result = buildSupplyAllocation(demands, data, config)
+    val criticalStockKeys = computeCriticalStockPositions(data, config).keys
+    val rawCriticalKeys = result.criticalMatrix.byColumn.keys - criticalStockKeys
+    return (data["supply"] ?: emptyList()).mapNotNull { s ->
+        val pid = (s["product_id"] as? String)?.trim() ?: return@mapNotNull null
+        val lid = (s["location_id"] as? String)?.trim() ?: return@mapNotNull null
+        if (SupplyKey(pid, lid) !in rawCriticalKeys) return@mapNotNull null
+        (s["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+    }.toSet()
+}
+
+/**
+ * Seeds [versionId]'s TSA rows with the case's CURRENT critical-material lots — one row per lot,
+ * `qty_cap`/`target` copied verbatim from the lot's own physical qty/target (a no-op override,
+ * identical to having none, but gives the UI real starting numbers to edit from instead of blank
+ * inputs). Config is required for purchasable_materials filtering (which materials are critical
+ * depends on it) — pass null only when no plan run has been run yet for the case.
+ *
+ * Only genuinely RAW critical-material lots qualify — `criticalMatrix.byColumn.keys` also
+ * contains critical-STOCK positions (on-hand inventory of an otherwise-elastic, non-raw product
+ * that merely INHERITS targeting from its mandatory raw material — see
+ * [com.allocator.services.computeCriticalStockPositions]'s own doc), which are excluded here via
+ * a set difference. A critical-stock lot's effective targeting must stay entirely DERIVED,
+ * computed automatically inside `buildSupplyAllocation` — an explicit TSA override on one would
+ * short-circuit `expandCriticalStockSupplies`'s inherited-target split (see its own doc: an
+ * explicit target on a stock row is treated as the row's OWN, skipping the derived split
+ * entirely — exactly the corruption this exclusion prevents).
+ *
+ * Deliberately does NOT check "is this version referenced" — see call sites: the Generate route
+ * checks before calling this.
+ */
+internal fun generateDefaultTsaRows(
     caseId: Int,
     versionId: Int,
     data: Map<String, List<Map<String, Any?>>>,
     config: Map<String, Any?>?,
 ): List<CaseAllocRow> {
-    val demands = data["demand"] ?: emptyList()
-    val result  = buildSupplyAllocation(demands, data, config)
-    val rows    = buildAllocationBudgetRowsFull(result.perLotBudgets, result.criticalMatrix, data["supply"] ?: emptyList())
-                      .map { (sid, did, qty) -> CaseAllocRow(sid, did, qty) }
+    val rawCriticalIds = rawCriticalSupplyIds(data, config)
+    val rows = (data["supply"] ?: emptyList()).mapNotNull { s ->
+        val sid = (s["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        if (sid !in rawCriticalIds) return@mapNotNull null
+        val qty = (s["qty"] as? Number)?.toDouble() ?: return@mapNotNull null
+        val target = (s["target"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+        CaseAllocRow(sid, qty, target)
+    }
     if (rows.isNotEmpty()) {
         transaction {
             CaseAllocations.deleteWhere { CaseAllocations.versionId eq versionId }
             CaseAllocations.batchInsert(rows) { row ->
-                this[CaseAllocations.caseId]       = caseId
-                this[CaseAllocations.versionId]    = versionId
-                this[CaseAllocations.supplyId]     = row.supplyId
-                this[CaseAllocations.demandId]     = row.demandId
-                this[CaseAllocations.qtyAllocated] = row.qtyAllocated
+                this[CaseAllocations.caseId]    = caseId
+                this[CaseAllocations.versionId] = versionId
+                this[CaseAllocations.supplyId]  = row.supplyId
+                this[CaseAllocations.qtyCap]    = row.qtyCap
+                this[CaseAllocations.target]    = row.target
             }
             recomputeCaseAllocationHash(caseId, versionId)
         }
@@ -187,27 +229,10 @@ internal fun generateAndSeedCaseAllocation(
     return rows
 }
 
-// ── Critical stock: derived, read-only rows ─────────────────────────────────────
-
-/** Cheap, direct DB check for "does this case have any TARGETed supply row at all" — used as the
- *  route-layer early-exit BEFORE paying for a full `CaseLoader.load(caseId)` + critical-stock
- *  detection walk on every `PUT`/`import`/`versions` write, so a non-TARGET case (e.g. case 173)
- *  stays exactly as cheap as it was before this feature existed. Mirrors
- *  [hasAnyTargetedSupply][com.allocator.services.hasAnyTargetedSupply]'s in-memory check exactly,
- *  just queried directly (one column, one case) instead of against an already-loaded case map. */
-private fun caseHasTargetedSupply(caseId: Int): Boolean = transaction {
-    Supplies.select(Supplies.targetCustomerId)
-        .where { Supplies.caseId eq caseId }
-        .any { (it[Supplies.targetCustomerId])?.trim()?.isNotBlank() == true }
-}
-
-/** Best-effort config for a route with no caller-supplied override in its own body schema (`PUT`/
- *  `import`/`versions` all take rows/CSV, not a config blob) — the latest successful plan run's
- *  config, same fallback the Generate route already uses when its own optional `config` field is
- *  absent, so `purchasable_materials`/`purchase_allowed` (which affect both critical-material and
- *  critical-stock classification) match what the case was actually last planned with. Returns null
- *  if the case has never had a successful plan run — detection still runs, just without any
- *  purchasable-whitelist narrowing. */
+/** Best-effort config for a route with no caller-supplied override in its own body schema —
+ *  the latest successful plan run's config, so `purchasable_materials`/`purchase_allowed` (which
+ *  affect critical-material classification) match what the case was actually last planned with.
+ *  Returns null if the case has never had a successful plan run. */
 private fun latestPlanRunConfig(caseId: Int): Map<String, Any?>? {
     val latestConfigJson = transaction {
         PlanRuns.select(PlanRuns.config)
@@ -223,16 +248,25 @@ private fun latestPlanRunConfig(caseId: Int): Map<String, Any?>? {
     }
 }
 
+/** Cheap, direct DB check for "does this case have any TARGETed supply row at all" — used as a
+ *  route-layer early-exit BEFORE paying for a full `CaseLoader.load(caseId)` +
+ *  [computeCriticalStockPositions] walk on every write, so a non-TARGET case (the common case)
+ *  stays exactly as cheap as it was before this feature existed. */
+private fun caseHasTargetedSupply(caseId: Int): Boolean = transaction {
+    Supplies.select(Supplies.targetCustomerId)
+        .where { Supplies.caseId eq caseId }
+        .any { (it[Supplies.targetCustomerId])?.trim()?.isNotBlank() == true }
+}
+
 /**
- * Partitions submitted `case_allocation` rows into ones a caller may actually write ([Pair.first])
- * and ones that belong to a derived, read-only critical-stock position ([Pair.second] — the
- * stripped `supply_id`s). Critical-stock rows can never be directly edited: they're a deterministic
- * function of their mandatory raw material's OWN current allocation (see
- * [recomputeCriticalStockAllocationRows]), so a direct edit would just be silently overwritten (or
- * worse, drift out of sync) the next time anything touches that raw material's rows. Returns
- * `(rows, emptyList())` unchanged whenever the case has no critical stock at all — the common case.
+ * Rejects any submitted TSA row whose `supply_id` is a critical-STOCK position — see
+ * [generateDefaultTsaRows]'s own doc for why: a critical-stock lot's effective targeting must
+ * stay entirely DERIVED from its mandatory raw material, never set directly. Returns
+ * `(rows, emptyList())` unchanged whenever the case has no critical stock at all (the common
+ * case, cheaply short-circuited by [computeCriticalStockPositions]'s own `hasAnyTargetedSupply`
+ * gate before this is ever called from a route).
  */
-internal fun partitionEditableAllocationRows(
+internal fun filterOutCriticalStockRows(
     rows: List<CaseAllocRow>,
     data: Map<String, List<Map<String, Any?>>>,
     config: Map<String, Any?>?,
@@ -247,80 +281,6 @@ internal fun partitionEditableAllocationRows(
     }.toMap()
     val (rejected, editable) = rows.partition { row -> supplyToKey[row.supplyId]?.let { it in criticalStocks } == true }
     return editable to rejected.map { it.supplyId }.distinct()
-}
-
-/**
- * Computes and overwrites [versionId]'s critical-stock `case_allocation` rows, reading that
- * version's JUST-PERSISTED raw-material rows (whatever the caller wrote immediately before calling
- * this, in the SAME transaction) as the Ramification-1 split weight — see
- * `expandCriticalStockSupplies`'s own doc for why this (a lot's CURRENT effective allocation, not
- * its static physical qty) is the correct weight once any manual edit could have happened. Must be
- * called inside a transaction that already wrote whatever raw-material change triggered this — does
- * NOT open its own.
- *
- * Always clears this version's existing critical-stock rows first, even when there's nothing to
- * re-derive (e.g. the triggering edit zeroed out the raw material's own allocation entirely) — a
- * stale split must never linger. Reuses the exact same demand-competition machinery
- * [buildSupplyAllocation] uses ([allocateCriticalSuppliesPerLot] over a
- * [buildReachabilityMatrix]/[expandCriticalStockSupplies] pair restricted to critical-stock
- * `SupplyKey`s only) plus the same [collapseCriticalStockBudgets] step, so a version's derived rows
- * are always byte-identical to what a live plan run would enforce for the same raw-material state.
- */
-internal fun recomputeCriticalStockAllocationRows(
-    caseId: Int,
-    versionId: Int,
-    data: Map<String, List<Map<String, Any?>>>,
-    config: Map<String, Any?>?,
-): List<CaseAllocRow> {
-    val criticalStocks = computeCriticalStockPositions(data, config)
-
-    val stockSupplyIds: Set<String> = (data["supply"] ?: emptyList()).mapNotNull { row ->
-        val pid = (row["product_id"] as? String)?.trim()
-        val lid = (row["location_id"] as? String)?.trim()
-        val sid = (row["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() }
-        if (pid != null && lid != null && sid != null && SupplyKey(pid, lid) in criticalStocks) sid else null
-    }.toSet()
-    if (stockSupplyIds.isNotEmpty()) {
-        CaseAllocations.deleteWhere {
-            (CaseAllocations.versionId eq versionId) and (CaseAllocations.supplyId inList stockSupplyIds)
-        }
-    }
-    if (criticalStocks.isEmpty()) return emptyList()
-
-    val rawLotAllocatedTotals: Map<String, Double> = CaseAllocations.selectAll()
-        .where { CaseAllocations.versionId eq versionId }
-        .groupBy({ it[CaseAllocations.supplyId] }, { it[CaseAllocations.qtyAllocated] })
-        .mapValues { (_, qtys) -> qtys.sum() }
-
-    val demands = data["demand"] ?: emptyList()
-    val graph = buildBomGraph(demands, data)
-    val criticalStockMatrix = buildReachabilityMatrix(
-        demands, graph, criticalPids = emptySet(), criticalStockKeys = criticalStocks.keys,
-    )
-    val (expandedSupplies, virtualToReal) = expandCriticalStockSupplies(
-        supplies              = data["supply"] ?: emptyList(),
-        criticalStocks        = criticalStocks,
-        rawLotAllocatedTotals = rawLotAllocatedTotals,
-        data                  = data,
-        config                = config,
-    )
-    val rawBudgets = allocateCriticalSuppliesPerLot(
-        matrix = criticalStockMatrix, supplies = expandedSupplies, demands = demands, data = data,
-    )
-    val collapsedBudgets = collapseCriticalStockBudgets(rawBudgets, virtualToReal)
-    val rows = buildAllocationBudgetRowsFull(collapsedBudgets, criticalStockMatrix, data["supply"] ?: emptyList())
-        .map { (sid, did, qty) -> CaseAllocRow(sid, did, qty) }
-
-    if (rows.isNotEmpty()) {
-        CaseAllocations.batchInsert(rows) { row ->
-            this[CaseAllocations.caseId]       = caseId
-            this[CaseAllocations.versionId]    = versionId
-            this[CaseAllocations.supplyId]     = row.supplyId
-            this[CaseAllocations.demandId]     = row.demandId
-            this[CaseAllocations.qtyAllocated] = row.qtyAllocated
-        }
-    }
-    return rows
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -346,6 +306,33 @@ fun Routing.allocationRoutes() {
     fun resolvedOrCreatedVersionId(call: ApplicationCall, caseId: Int): Int =
         CaseConfigVersioning.resolveOrCreateVersionId(caseId, KIND, call.request.queryParameters["version_id"]?.toIntOrNull())
 
+    fun rowJson(row: CaseAllocRow): JsonObject = buildJsonObject {
+        put("supply_id", row.supplyId)
+        put("qty_cap", row.qtyCap)
+        put("target", row.target)
+    }
+
+    fun previewRowJson(row: AllocPreviewRow): JsonObject = buildJsonObject {
+        put("supply_id", row.supplyId)
+        if (row.demandId != null) put("demand_id", row.demandId) else put("demand_id", JsonNull)
+        put("qty_allocated", row.qtyAllocated)
+    }
+
+    /** Config: prefer caller-supplied `config`; fall back to latest plan run config so
+     *  purchasable_materials filtering is always applied correctly. Shared by generate/preview. */
+    suspend fun resolveConfigFromBody(call: ApplicationCall, caseId: Int): Map<String, Any?>? {
+        val body = runCatching { call.receiveText() }.getOrElse { "" }
+        val payload = if (body.isBlank()) null
+                      else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrNull()
+        val configJson = payload?.get("config")
+        return if (configJson != null && configJson !is JsonNull) {
+            @Suppress("UNCHECKED_CAST")
+            runCatching { jsonElementToNative(configJson) as? Map<String, Any?> }.getOrNull()
+        } else {
+            latestPlanRunConfig(caseId).also { if (it != null) log.info("[allocation] using config from latest plan run for case {}", caseId) }
+        }
+    }
+
     // ── GET /cases/{case_id}/demands ─────────────────────────────────────────
     get("/cases/{case_id}/demands") {
         val caseId = requireCaseId(call)
@@ -367,22 +354,17 @@ fun Routing.allocationRoutes() {
     }
 
     // ── GET /cases/{case_id}/allocation ──────────────────────────────────────
+    // Returns the version's TSA input rows (qty_cap/target per critical-material lot) —
+    // NOT the derived grid; see POST .../allocation/preview for that.
     get("/cases/{case_id}/allocation") {
         val caseId = requireCaseId(call)
         val versionId = resolvedVersionId(call, caseId)
-        val rows = (loadCaseAllocRows(versionId) ?: emptyList())
-            .sortedWith(compareBy({ it.supplyId }, { it.demandId ?: "" }))
-            .map { row ->
-                buildJsonObject {
-                    put("supply_id", row.supplyId)
-                    if (row.demandId != null) put("demand_id", row.demandId) else put("demand_id", JsonNull)
-                    put("qty_allocated", row.qtyAllocated)
-                }
-            }
-        call.respond(buildJsonObject { put("rows", JsonArray(rows)); put("version", versionJson(caseId, versionId)) })
+        val rows = (loadCaseAllocRows(versionId) ?: emptyList()).sortedBy { it.supplyId }
+        call.respond(buildJsonObject { put("rows", JsonArray(rows.map(::rowJson))); put("version", versionJson(caseId, versionId)) })
     }
 
     // ── POST /cases/{case_id}/allocation/generate ─────────────────────────────
+    // Body: { config? } — seeds TSA rows for the case's current critical-material lots.
     post("/cases/{case_id}/allocation/generate") {
         val caseId = requireCaseId(call)
         val versionId = resolvedOrCreatedVersionId(call, caseId)
@@ -394,51 +376,20 @@ fun Routing.allocationRoutes() {
         if ((data["demand"] ?: emptyList()).isEmpty()) throw IllegalArgumentException("No demand data for case $caseId")
         if ((data["supply"] ?: emptyList()).isEmpty()) throw IllegalArgumentException("No supply data for case $caseId")
 
-        // Config: prefer caller-supplied; fall back to latest plan run config so
-        // purchasable_materials filtering is always applied correctly.
-        val config: Map<String, Any?>? = run {
-            val body = runCatching { call.receiveText() }.getOrElse { "" }
-            val payload = if (body.isBlank()) null
-                          else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrNull()
-            val configJson = payload?.get("config")
-            if (configJson != null && configJson !is JsonNull) {
-                @Suppress("UNCHECKED_CAST")
-                runCatching { jsonElementToNative(configJson) as? Map<String, Any?> }.getOrNull()
-            } else {
-                val latestConfigJson = transaction {
-                    PlanRuns.select(PlanRuns.config)
-                        .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
-                        .orderBy(PlanRuns.id to SortOrder.DESC)
-                        .limit(1)
-                        .singleOrNull()
-                        ?.get(PlanRuns.config)
-                }
-                latestConfigJson?.let {
-                    @Suppress("UNCHECKED_CAST")
-                    runCatching { jsonElementToNative(Json.parseToJsonElement(it)) as? Map<String, Any?> }.getOrNull()
-                }.also { if (it != null) log.info("[allocation] using config from latest plan run for case {}", caseId) }
-            }
-        }
+        val config = resolveConfigFromBody(call, caseId)
 
-        log.info("[allocation] generating allocation for case {} version {}", caseId, versionId)
-        val newRows = generateAndSeedCaseAllocation(caseId, versionId, data, config)
-        log.info("[allocation] generated {} rows for case {} ({} critical supply lots)", newRows.size, caseId, newRows.map { it.supplyId }.distinct().size)
+        log.info("[allocation] generating TSA rows for case {} version {}", caseId, versionId)
+        val newRows = generateDefaultTsaRows(caseId, versionId, data, config)
+        log.info("[allocation] generated {} TSA rows for case {} (critical supply lots)", newRows.size, caseId)
 
-        val responseRows = newRows.map { row ->
-            buildJsonObject {
-                put("supply_id", row.supplyId)
-                if (row.demandId != null) put("demand_id", row.demandId) else put("demand_id", JsonNull)
-                put("qty_allocated", row.qtyAllocated)
-            }
-        }
-        call.respond(buildJsonObject { put("rows", JsonArray(responseRows)) })
+        call.respond(buildJsonObject { put("rows", JsonArray(newRows.map(::rowJson))) })
     }
 
     // ── PUT /cases/{case_id}/allocation ───────────────────────────────────────
-    // Body: { "rows": [{ "supply_id", "demand_id", "qty_allocated" }] }
+    // Body: { "rows": [{ "supply_id", "qty_cap"?, "target"? }] }
     // Upserts (insert-or-replace) the given rows; leaves other rows unchanged. A row whose
-    // supply_id is a derived critical-stock position is rejected — see
-    // recomputeCriticalStockAllocationRows's own doc — and reported back in "rejected".
+    // supply_id is a critical-stock position is rejected — see filterOutCriticalStockRows' own
+    // doc — and reported back in "rejected".
     put("/cases/{case_id}/allocation") {
         val caseId = requireCaseId(call)
         val versionId = resolvedOrCreatedVersionId(call, caseId)
@@ -452,22 +403,18 @@ fun Routing.allocationRoutes() {
         val submittedRows = rowsJson.map { el ->
             val obj = el.jsonObject
             CaseAllocRow(
-                supplyId     = obj["supply_id"]?.jsonPrimitive?.content ?: throw IllegalArgumentException("Missing supply_id"),
-                demandId     = obj["demand_id"]?.takeIf { it !is JsonNull }?.jsonPrimitive?.content,
-                qtyAllocated = obj["qty_allocated"]?.jsonPrimitive?.double ?: throw IllegalArgumentException("Missing qty_allocated"),
+                supplyId = obj["supply_id"]?.jsonPrimitive?.content ?: throw IllegalArgumentException("Missing supply_id"),
+                qtyCap   = obj["qty_cap"]?.takeIf { it !is JsonNull }?.jsonPrimitive?.double,
+                target   = obj["target"]?.takeIf { it !is JsonNull }?.jsonPrimitive?.content,
             )
         }
 
-        // Cheap DB-only check first: a non-TARGET case (e.g. case 173) never loads case data or
-        // runs critical-stock detection at all, staying exactly as cheap as before this feature.
         var rows = submittedRows
         var rejected: List<String> = emptyList()
-        var caseData: Map<String, List<Map<String, Any?>>>? = null
-        var caseConfig: Map<String, Any?>? = null
         if (caseHasTargetedSupply(caseId)) {
-            caseData = transaction { CaseLoader.load(caseId) }
-            caseConfig = latestPlanRunConfig(caseId)
-            val (editable, rej) = partitionEditableAllocationRows(submittedRows, caseData, caseConfig)
+            val data = transaction { CaseLoader.load(caseId) }
+            val config = latestPlanRunConfig(caseId)
+            val (editable, rej) = filterOutCriticalStockRows(submittedRows, data, config)
             rows = editable
             rejected = rej
         }
@@ -475,28 +422,25 @@ fun Routing.allocationRoutes() {
         transaction {
             for (row in rows) {
                 val existing = CaseAllocations.selectAll().where {
-                    (CaseAllocations.versionId eq versionId) and
-                    (CaseAllocations.supplyId eq row.supplyId) and
-                    (if (row.demandId != null) CaseAllocations.demandId eq row.demandId else CaseAllocations.demandId.isNull())
+                    (CaseAllocations.versionId eq versionId) and (CaseAllocations.supplyId eq row.supplyId)
                 }.singleOrNull()
                 if (existing != null) {
                     CaseAllocations.update({
-                        (CaseAllocations.versionId eq versionId) and
-                        (CaseAllocations.supplyId eq row.supplyId) and
-                        (if (row.demandId != null) CaseAllocations.demandId eq row.demandId else CaseAllocations.demandId.isNull())
-                    }) { it[CaseAllocations.qtyAllocated] = row.qtyAllocated }
+                        (CaseAllocations.versionId eq versionId) and (CaseAllocations.supplyId eq row.supplyId)
+                    }) {
+                        it[CaseAllocations.qtyCap] = row.qtyCap
+                        it[CaseAllocations.target] = row.target
+                    }
                 } else {
                     CaseAllocations.insert {
-                        it[CaseAllocations.caseId]       = caseId
-                        it[CaseAllocations.versionId]    = versionId
-                        it[CaseAllocations.supplyId]     = row.supplyId
-                        it[CaseAllocations.demandId]     = row.demandId
-                        it[CaseAllocations.qtyAllocated] = row.qtyAllocated
+                        it[CaseAllocations.caseId]    = caseId
+                        it[CaseAllocations.versionId] = versionId
+                        it[CaseAllocations.supplyId]  = row.supplyId
+                        it[CaseAllocations.qtyCap]    = row.qtyCap
+                        it[CaseAllocations.target]    = row.target
                     }
                 }
             }
-            val cd = caseData
-            if (cd != null) recomputeCriticalStockAllocationRows(caseId, versionId, cd, caseConfig)
             recomputeCaseAllocationHash(caseId, versionId)
         }
         call.respond(HttpStatusCode.OK, buildJsonObject {
@@ -528,9 +472,9 @@ fun Routing.allocationRoutes() {
     }
 
     // ── POST /cases/{case_id}/allocation/import ───────────────────────────────
-    // Body: CSV text with header row: supply_id,demand_id,qty_allocated
-    // Any row whose supply_id is a derived critical-stock position is dropped from the import —
-    // see recomputeCriticalStockAllocationRows's own doc — and reported in "rejected".
+    // Body: CSV text with header row: supply_id,qty_cap,target
+    // A row whose supply_id is a critical-stock position is dropped from the import — see
+    // filterOutCriticalStockRows' own doc — and reported in "rejected".
     post("/cases/{case_id}/allocation/import") {
         val caseId = requireCaseId(call)
         val versionId = resolvedOrCreatedVersionId(call, caseId)
@@ -539,44 +483,33 @@ fun Routing.allocationRoutes() {
             return@post
         }
         val csvText = call.receiveText()
-        val parsedRows = parseCsvAllocation(csvText)
+        val parsedRows = parseCsvTsa(csvText)
 
         var rows = parsedRows
         var rejected: List<String> = emptyList()
-        var caseData: Map<String, List<Map<String, Any?>>>? = null
-        var caseConfig: Map<String, Any?>? = null
         if (caseHasTargetedSupply(caseId)) {
-            caseData = transaction { CaseLoader.load(caseId) }
-            caseConfig = latestPlanRunConfig(caseId)
-            val (editable, rej) = partitionEditableAllocationRows(parsedRows, caseData, caseConfig)
+            val data = transaction { CaseLoader.load(caseId) }
+            val config = latestPlanRunConfig(caseId)
+            val (editable, rej) = filterOutCriticalStockRows(parsedRows, data, config)
             rows = editable
             rejected = rej
         }
-        log.info("[allocation] importing {} rows for case {} version {} ({} rejected as critical-stock)",
+        log.info("[allocation] importing {} TSA rows for case {} version {} ({} rejected as critical-stock)",
             rows.size, caseId, versionId, rejected.size)
 
         transaction {
             CaseAllocations.deleteWhere { CaseAllocations.versionId eq versionId }
             CaseAllocations.batchInsert(rows) { row ->
-                this[CaseAllocations.caseId]       = caseId
-                this[CaseAllocations.versionId]    = versionId
-                this[CaseAllocations.supplyId]     = row.supplyId
-                this[CaseAllocations.demandId]     = row.demandId
-                this[CaseAllocations.qtyAllocated] = row.qtyAllocated
+                this[CaseAllocations.caseId]    = caseId
+                this[CaseAllocations.versionId] = versionId
+                this[CaseAllocations.supplyId]  = row.supplyId
+                this[CaseAllocations.qtyCap]    = row.qtyCap
+                this[CaseAllocations.target]    = row.target
             }
-            val cd = caseData
-            if (cd != null) recomputeCriticalStockAllocationRows(caseId, versionId, cd, caseConfig)
             recomputeCaseAllocationHash(caseId, versionId)
         }
-        val responseRows = rows.map { row ->
-            buildJsonObject {
-                put("supply_id", row.supplyId)
-                if (row.demandId != null) put("demand_id", row.demandId) else put("demand_id", JsonNull)
-                put("qty_allocated", row.qtyAllocated)
-            }
-        }
         call.respond(buildJsonObject {
-            put("rows", JsonArray(responseRows))
+            put("rows", JsonArray(rows.map(::rowJson)))
             put("rejected", JsonArray(rejected.map { JsonPrimitive(it) }))
         })
     }
@@ -585,19 +518,69 @@ fun Routing.allocationRoutes() {
     get("/cases/{case_id}/allocation/export") {
         val caseId = requireCaseId(call)
         val versionId = resolvedVersionId(call, caseId)
-        val rows = (loadCaseAllocRows(versionId) ?: emptyList())
-            .sortedWith(compareBy({ it.supplyId }, { it.demandId ?: "" }))
-        val sb = StringBuilder("supply_id,demand_id,qty_allocated\n")
+        val rows = (loadCaseAllocRows(versionId) ?: emptyList()).sortedBy { it.supplyId }
+        val sb = StringBuilder("supply_id,qty_cap,target\n")
         for (row in rows) {
             sb.append(csvEscape(row.supplyId))
             sb.append(',')
-            sb.append(if (row.demandId != null) csvEscape(row.demandId) else "")
+            sb.append(row.qtyCap?.toString() ?: "")
             sb.append(',')
-            sb.append(row.qtyAllocated)
+            sb.append(row.target?.let { csvEscape(it) } ?: "")
             sb.append('\n')
         }
-        call.response.headers.append(HttpHeaders.ContentDisposition, "attachment; filename=\"allocation_case_$caseId.csv\"")
+        call.response.headers.append(HttpHeaders.ContentDisposition, "attachment; filename=\"targeted_supply_allocation_case_$caseId.csv\"")
         call.respondText(sb.toString(), ContentType.Text.CSV)
+    }
+
+    // ── POST /cases/{case_id}/allocation/preview ──────────────────────────────
+    // Body: { config?, rows?: [{ supply_id, qty_cap?, target? }] }
+    // Recomputes the read-only (supply_lot, demand) -> qty_allocated grid via buildSupplyAllocation
+    // using the given `rows` as TSA overrides — pending, unsaved UI edits by default, falling back
+    // to the resolved version's own saved rows when `rows` is omitted. Never persists anything.
+    post("/cases/{case_id}/allocation/preview") {
+        val caseId = requireCaseId(call)
+        val versionId = resolvedVersionId(call, caseId)
+        val body = runCatching { call.receiveText() }.getOrElse { "" }
+        val payload = if (body.isBlank()) null else runCatching { Json.parseToJsonElement(body).jsonObject }.getOrNull()
+
+        val pendingRowsJson = payload?.get("rows")?.takeIf { it !is JsonNull }?.jsonArray
+        val tsaRows = if (pendingRowsJson != null) {
+            pendingRowsJson.map { el ->
+                val obj = el.jsonObject
+                CaseAllocRow(
+                    supplyId = obj["supply_id"]?.jsonPrimitive?.content ?: throw IllegalArgumentException("Missing supply_id"),
+                    qtyCap   = obj["qty_cap"]?.takeIf { it !is JsonNull }?.jsonPrimitive?.double,
+                    target   = obj["target"]?.takeIf { it !is JsonNull }?.jsonPrimitive?.content,
+                )
+            }
+        } else {
+            loadCaseAllocRows(versionId) ?: emptyList()
+        }
+
+        val data = transaction { CaseLoader.load(caseId) }
+        if ((data["demand"] ?: emptyList()).isEmpty()) throw IllegalArgumentException("No demand data for case $caseId")
+
+        val configJson = payload?.get("config")
+        val config = if (configJson != null && configJson !is JsonNull) {
+            @Suppress("UNCHECKED_CAST")
+            runCatching { jsonElementToNative(configJson) as? Map<String, Any?> }.getOrNull()
+        } else {
+            latestPlanRunConfig(caseId)
+        }
+
+        // Same critical-stock exclusion as PUT/import/versions — a stray override on a
+        // stock-derived lot would corrupt its inherited split (see filterOutCriticalStockRows).
+        val (editableTsaRows, _) = filterOutCriticalStockRows(tsaRows, data, config)
+        val previewRows = computeAllocationPreview(data, config, buildTsaOverridesFromCaseAlloc(editableTsaRows))
+        // Tells the frontend TSA table which supply_ids to render as directly editable (raw
+        // critical lots) vs read-only/derived (critical stock, plus anything not critical at
+        // all) — see rawCriticalSupplyIds' own doc.
+        val rawCriticalIds = rawCriticalSupplyIds(data, config)
+        call.respond(buildJsonObject {
+            put("rows", JsonArray(previewRows.sortedWith(compareBy({ it.supplyId }, { it.demandId ?: "" })).map(::previewRowJson)))
+            put("version", versionJson(caseId, versionId))
+            putJsonArray("raw_critical_supply_ids") { rawCriticalIds.sorted().forEach { add(it) } }
+        })
     }
 
     // ── GET /cases/{case_id}/allocation/versions ──────────────────────────────
@@ -616,10 +599,9 @@ fun Routing.allocationRoutes() {
     }
 
     // ── POST /cases/{case_id}/allocation/versions ("Save As") ─────────────────
-    // Body: { name?, comments?, rows: [{ supply_id, demand_id, qty_allocated }] }
-    // Any submitted row whose supply_id is a derived critical-stock position is dropped — see
-    // recomputeCriticalStockAllocationRows's own doc — and the new version's own derived rows are
-    // computed fresh instead.
+    // Body: { name?, comments?, rows: [{ supply_id, qty_cap?, target? }] }
+    // Any submitted row whose supply_id is a critical-stock position is dropped — see
+    // filterOutCriticalStockRows' own doc.
     post("/cases/{case_id}/allocation/versions") {
         val caseId = requireCaseId(call)
         val body = call.receiveText()
@@ -629,34 +611,30 @@ fun Routing.allocationRoutes() {
         val submittedRows = (payload["rows"]?.jsonArray ?: JsonArray(emptyList())).map { el ->
             val obj = el.jsonObject
             CaseAllocRow(
-                supplyId     = obj["supply_id"]?.jsonPrimitive?.content ?: throw IllegalArgumentException("Missing supply_id"),
-                demandId     = obj["demand_id"]?.takeIf { it !is JsonNull }?.jsonPrimitive?.content,
-                qtyAllocated = obj["qty_allocated"]?.jsonPrimitive?.double ?: throw IllegalArgumentException("Missing qty_allocated"),
+                supplyId = obj["supply_id"]?.jsonPrimitive?.content ?: throw IllegalArgumentException("Missing supply_id"),
+                qtyCap   = obj["qty_cap"]?.takeIf { it !is JsonNull }?.jsonPrimitive?.double,
+                target   = obj["target"]?.takeIf { it !is JsonNull }?.jsonPrimitive?.content,
             )
         }
 
         var rows = submittedRows
-        var caseData: Map<String, List<Map<String, Any?>>>? = null
-        var caseConfig: Map<String, Any?>? = null
         if (caseHasTargetedSupply(caseId)) {
-            caseData = transaction { CaseLoader.load(caseId) }
-            caseConfig = latestPlanRunConfig(caseId)
-            rows = partitionEditableAllocationRows(submittedRows, caseData, caseConfig).first
+            val data = transaction { CaseLoader.load(caseId) }
+            val config = latestPlanRunConfig(caseId)
+            rows = filterOutCriticalStockRows(submittedRows, data, config).first
         }
 
         val versionId = transaction {
             val newId = CaseConfigVersioning.createVersion(caseId, KIND, name, comments)
             if (rows.isNotEmpty()) {
                 CaseAllocations.batchInsert(rows) { row ->
-                    this[CaseAllocations.caseId]       = caseId
-                    this[CaseAllocations.versionId]    = newId
-                    this[CaseAllocations.supplyId]     = row.supplyId
-                    this[CaseAllocations.demandId]     = row.demandId
-                    this[CaseAllocations.qtyAllocated] = row.qtyAllocated
+                    this[CaseAllocations.caseId]    = caseId
+                    this[CaseAllocations.versionId] = newId
+                    this[CaseAllocations.supplyId]  = row.supplyId
+                    this[CaseAllocations.qtyCap]    = row.qtyCap
+                    this[CaseAllocations.target]    = row.target
                 }
             }
-            val cd = caseData
-            if (cd != null) recomputeCriticalStockAllocationRows(caseId, newId, cd, caseConfig)
             recomputeCaseAllocationHash(caseId, newId)
             newId
         }
@@ -691,21 +669,21 @@ fun Routing.allocationRoutes() {
 
 // ── CSV helpers ───────────────────────────────────────────────────────────────
 
-private fun parseCsvAllocation(csv: String): List<CaseAllocRow> {
+private fun parseCsvTsa(csv: String): List<CaseAllocRow> {
     val lines = csv.trim().split('\n').map { it.trimEnd('\r') }
     if (lines.isEmpty()) return emptyList()
     val header = lines[0].split(',').map { it.trim().lowercase() }
     val supplyIdx = header.indexOf("supply_id")
-    val demandIdx = header.indexOf("demand_id")
-    val qtyIdx    = header.indexOfFirst { it == "qty_allocated" || it == "qty" }
-    if (supplyIdx < 0 || qtyIdx < 0) throw IllegalArgumentException("CSV must have supply_id and qty_allocated columns")
+    val qtyIdx    = header.indexOfFirst { it == "qty_cap" || it == "qty" }
+    val targetIdx = header.indexOf("target")
+    if (supplyIdx < 0) throw IllegalArgumentException("CSV must have a supply_id column")
     return lines.drop(1).mapNotNull { line ->
         if (line.isBlank()) return@mapNotNull null
         val cols = line.split(',')
         val supplyId = cols.getOrNull(supplyIdx)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-        val demandId = if (demandIdx >= 0) cols.getOrNull(demandIdx)?.trim()?.takeIf { it.isNotBlank() } else null
-        val qty = cols.getOrNull(qtyIdx)?.trim()?.toDoubleOrNull() ?: return@mapNotNull null
-        CaseAllocRow(supplyId, demandId, qty)
+        val qty = if (qtyIdx >= 0) cols.getOrNull(qtyIdx)?.trim()?.toDoubleOrNull() else null
+        val target = if (targetIdx >= 0) cols.getOrNull(targetIdx)?.trim()?.takeIf { it.isNotBlank() } else null
+        CaseAllocRow(supplyId, qty, target)
     }
 }
 

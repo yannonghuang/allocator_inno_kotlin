@@ -335,7 +335,7 @@ object PlanSupplyAllocations : Table("plan_supply_allocation") {
 }
 
 /**
- * Version registry for the 5 "external config objects" (Critical Material Allocation, Supply
+ * Version registry for the 5 "external config objects" (Targeted Supply Allocation, Supply
  * Preferences, Demand Ordering, Purchasable Materials, Constraints). Each object can have
  * multiple named/commented versions per case. `kind` reuses the exact segment names
  * [com.allocator.services.KbFingerprint.Segments] already uses ("casealloc"/"pref"/"ord"/
@@ -368,18 +368,32 @@ object CaseConfigVersions : Table("case_config_version") {
     init { index("ix_case_config_version_case_kind", false, caseId, kind) }
 }
 
-/** Standalone allocation map for a case — independent of any plan run lifecycle. */
+/**
+ * Targeted Supply Allocation (TSA) input rows — one row per critical-material lot a user has
+ * chosen to override, carrying only [qtyCap] (cap override) and [target] (customer earmark).
+ *
+ * Repurposed from an earlier "Critical Material Allocation" table that stored the DERIVED
+ * (supply_lot, demand) -> qty_allocated budget grid (a snapshot of buildSupplyAllocation's own
+ * output). That grid is still computable on demand (see `Allocation.kt`'s
+ * `computeAllocationPreview`) but is never persisted anymore — this table now stores the INPUT
+ * side instead, feeding straight into `buildSupplyAllocation`'s `tsaOverrides` parameter. Lead
+ * time is never stored here — it's always derived live from BOM structure.
+ */
 object CaseAllocations : Table("case_allocation") {
-    val id           = integer("id").autoIncrement()
-    val caseId       = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val id        = integer("id").autoIncrement()
+    val caseId    = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
     // Nullable only until ExternalConfigVersioningMigration backfills pre-existing rows — see
     // CaseConfigVersions' own doc. Always populated for rows created after this feature shipped.
-    val versionId    = integer("version_id").references(CaseConfigVersions.id, onDelete = ReferenceOption.CASCADE).nullable()
-    val supplyId     = varchar("supply_id", 255)
-    val demandId     = varchar("demand_id", 255).nullable()
-    val qtyAllocated = double("qty_allocated")
+    val versionId = integer("version_id").references(CaseConfigVersions.id, onDelete = ReferenceOption.CASCADE).nullable()
+    val supplyId  = varchar("supply_id", 255)
+    // Null means "no cap override — use the lot's own physical qty" / "no target override".
+    val qtyCap    = double("qty_cap").nullable()
+    val target    = varchar("target", 255).nullable()
     override val primaryKey = PrimaryKey(id)
-    init { index("ix_case_allocation_case", false, caseId) }
+    init {
+        index("ix_case_allocation_case", false, caseId)
+        uniqueIndex("ux_case_allocation_version_supply", versionId, supplyId)
+    }
 }
 
 /**
@@ -533,7 +547,7 @@ object CaseDemandOrderConfigs : Table("case_demand_order_config") {
 }
 
 /**
- * Content-fingerprint tracker for [CaseAllocations] ("Critical Material Allocation") — mirrors
+ * Content-fingerprint tracker for [CaseAllocations] ("Targeted Supply Allocation") — mirrors
  * [CaseDemandOrderConfigs]' shape. Allocation has no separate generation PARAMETERS of its own
  * (unlike Preferences' max_bom_depth/weights) — this table exists purely to hold a cheap,
  * incrementally-maintained hash of the current case_allocation row set, read by the KB

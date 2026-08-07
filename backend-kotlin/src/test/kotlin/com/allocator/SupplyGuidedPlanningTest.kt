@@ -1274,6 +1274,68 @@ class SupplyGuidedPlanningTest : FunSpec({
         budget?.get("X|L") shouldBe (45.0 plusOrMinus 1e-6)
     }
 
+    // ── H2. Targeted Supply Allocation (TSA) overrides ─────────────────────────
+    // applyTsaOverrides / buildSupplyAllocation's tsaOverrides param — the UI-editable qty
+    // cap / target per lot, applied before critical-material classification so it can flip an
+    // otherwise-untargeted case onto the TARGET-aware allocation path.
+
+    test("buildSupplyAllocation: no tsaOverrides reproduces baseline behavior exactly") {
+        val lots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_UNTARGETED", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 30.0, "target" to null),
+            mapOf<String, Any?>("supply_id" to "LOT_A_ONLY", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-08", "qty" to 30.0, "target" to "CUST_A"),
+        )
+        val demands = listOf(
+            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P", "location_id" to "L", "quantity" to 20.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_A"),
+            mapOf<String, Any?>("demand_id" to "DB", "product_id" to "P", "location_id" to "L", "quantity" to 20.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_B"),
+        )
+        val data = targetFixtureData(lots, demands)
+        val baseline = buildSupplyAllocation(demands, data, targetConfig)
+        val withEmptyOverrides = buildSupplyAllocation(demands, data, targetConfig, tsaOverrides = emptyMap())
+
+        withEmptyOverrides.perLotBudgets shouldBe baseline.perLotBudgets
+    }
+
+    test("buildSupplyAllocation: tsaOverrides qtyCap replaces the lot's physical qty") {
+        val lots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A_ONLY", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-08", "qty" to 30.0, "target" to "CUST_A"),
+        )
+        val demands = listOf(
+            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P", "location_id" to "L", "quantity" to 20.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_A"),
+        )
+        val data = targetFixtureData(lots, demands)
+
+        // Cap the lot down to 5 (below DA's 20 need) — DA's budget for this lot must reflect
+        // the OVERRIDDEN cap, not the raw 30 in the supply row.
+        val alloc = buildSupplyAllocation(
+            demands, data, targetConfig,
+            tsaOverrides = mapOf("LOT_A_ONLY" to TsaOverride(qtyCap = 5.0)),
+        )
+        alloc.perLotBudgets["DA"]?.get("X|L|LOT_A_ONLY") shouldBe (5.0 plusOrMinus 1e-6)
+    }
+
+    test("buildSupplyAllocation: tsaOverrides target turns a previously untargeted, single-customer case onto the TARGET-aware path") {
+        // Baseline case has NO target anywhere (hasAnyTargetedSupply is false), so it would
+        // normally route through the plain demand_qty allocateSuppliesPerLot. Setting target via
+        // TSA override alone (nothing in the raw supply row) must flip hasAnyTargetedSupply and
+        // exclude the non-matching customer the same way an uploaded TARGET column would.
+        val lots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_X", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 30.0, "target" to null),
+        )
+        val demands = listOf(
+            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P", "location_id" to "L", "quantity" to 20.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_A"),
+            mapOf<String, Any?>("demand_id" to "DB", "product_id" to "P", "location_id" to "L", "quantity" to 20.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_B"),
+        )
+        val data = targetFixtureData(lots, demands)
+        hasAnyTargetedSupply(data) shouldBe false
+
+        val alloc = buildSupplyAllocation(
+            demands, data, targetConfig,
+            tsaOverrides = mapOf("LOT_X" to TsaOverride(target = "CUST_A")),
+        )
+        alloc.perLotBudgets["DA"]?.get("X|L|LOT_X") shouldBe (20.0 plusOrMinus 1e-6)
+        alloc.perLotBudgets["DB"]?.get("X|L|LOT_X") shouldBe null
+    }
+
     // ── I. Critical stocks ────────────────────────────────────────────────────
     // On-hand stock of an otherwise-elastic product (has a make method) whose every fulfillment
     // alternative is structurally guaranteed to consume the same single critical, TARGETed raw

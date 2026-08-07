@@ -691,7 +691,7 @@ object CaseBootstrap {
      * the same 5 `*_version_id` keys `Allocate.kt`'s `resolveEffectiveConfig` reads directly off
      * [config] (falling back to the case's current default when a key is absent) so this preview
      * signature always matches what submission will actually produce — every run now genuinely
-     * consults the case's Critical Material Allocation / Supply Preferences / Demand Ordering /
+     * consults the case's Targeted Supply Allocation / Supply Preferences / Demand Ordering /
      * Purchasable Materials / Constraints state (see `runOneBootstrapPreset`'s own doc), so
      * there is no "na"-sentinel/non-consulting path left to special-case here.
      */

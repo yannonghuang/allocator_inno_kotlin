@@ -153,7 +153,7 @@ private fun versionJson(caseId: Int, versionId: Int?): JsonObject {
  * the Preferences KB is optional-by-design (planning falls back to raw CSV preference when
  * absent; auto-seeding would silently change that fallback behavior without user action).
  * Deliberately does NOT check "is this version referenced" — see Allocation.kt's
- * generateAndSeedCaseAllocation's own doc for why that guard belongs in the route layer, not here.
+ * generateDefaultTsaRows's own doc for why that guard belongs in the route layer, not here.
  */
 internal fun generateAndSeedCasePreferences(
     caseId: Int,
