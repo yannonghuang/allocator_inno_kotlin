@@ -37,6 +37,10 @@ data class CaseSupplyRow(
      *  without a separate lookup — e.g. the Planning page's Demand Summary attributes a synthetic
      *  inventory-consumption row to this same prod_area (see demandSummaryRows' own doc). */
     val prodArea:    String? = null,
+    /** The lot's own physical TARGET (customer id), from supply.csv — null/unrestricted for most
+     *  lots. Shown by the Targeted Supply Allocation editor as each row's starting/default value,
+     *  distinct from any TSA `target` override (`case_allocation.target`) a user has since set. */
+    val target:      String? = null,
 )
 
 /**
@@ -119,6 +123,7 @@ fun Routing.supplyRoutes() {
                             qty         = row[Supplies.qty],
                             description = row[Supplies.description],
                             prodArea    = prodAreaByProductLocation["$productId|$locationId"] ?: prodAreaByProduct[productId],
+                            target      = row[Supplies.targetCustomerId],
                         )
                     }
             }

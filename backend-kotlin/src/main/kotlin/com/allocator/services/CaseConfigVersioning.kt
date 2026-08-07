@@ -75,12 +75,10 @@ object CaseConfigVersioning {
 
     /** [requested] if valid, else reuses the case+kind's most recently created version if one
      *  exists, else creates a fresh unnamed one. The ONE place a version gets materialized on
-     *  demand: any caller about to WRITE data against it (Save / Generate / Import / a silent
-     *  system auto-seed like the interactive plan path's Critical Material Allocation snapshot — see
-     *  Allocate.kt's runPlanBackground doc) — never call this from a GET/read/planning path.
-     *  Reusing the latest existing version (rather than always creating new) means repeated
-     *  no-pick auto-seeds refresh the same cache slot instead of accumulating a version every
-     *  plan run. */
+     *  demand: any caller about to WRITE data against it (Save / Generate / Import) — never call
+     *  this from a GET/read/planning path. Reusing the latest existing version (rather than
+     *  always creating new) means repeated no-pick writes refresh the same cache slot instead of
+     *  accumulating a version every call. */
     fun resolveOrCreateVersionId(caseId: Int, kind: ConfigVersionKind, requested: Int?): Int = transaction {
         resolveVersionId(caseId, kind, requested)?.let { return@transaction it }
         CaseConfigVersions.selectAll()

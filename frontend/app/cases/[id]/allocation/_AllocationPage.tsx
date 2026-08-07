@@ -8,6 +8,7 @@ import {
   CaseDemandRow,
   CaseSupplyRow,
   ConfigVersion,
+  TsaRow,
   createAllocationVersion,
   deleteAllocation,
   deleteAllocationVersion,
@@ -18,54 +19,71 @@ import {
   getCaseSupplies,
   importAllocationCsv,
   listAllocationVersions,
+  previewAllocation,
   updateAllocationRows,
   updateAllocationVersion,
 } from '../../../../lib/api';
 import { VersionSwitcher } from '@/app/components/VersionSwitcher';
-import { AllocationMatrixView, parsePKey, type UndoBatch } from '@/app/components/AllocationMatrixView';
+import { TsaTable } from '@/app/components/TsaTable';
+
+// ── Types ────────────────────────────────────────────────────────────────────
+
+/** One committed cell edit, for undo/redo — a lot has at most one target, so moving it to a
+ *  different customer column changes qty_cap and target together, atomically. */
+type CellEdit = {
+  supplyId: string;
+  oldQtyCap: number | null; oldTarget: string | null;
+  newQtyCap: number | null; newTarget: string | null;
+};
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export function AllocationPage() {
   const params = useParams();
   const caseId = Number(params.id);
-  // Optional ?version_id= — set when arriving from ConfigDetailView's "Open full page" link for
-  // a specific historical version (see CaseConfigVersions' own doc).
   const initialVersionId = Number(useSearchParams().get('version_id')) || undefined;
   const t = useTranslations('allocationPage');
 
   // Committed state
-  const [rows, setRows]         = useState<AllocationRow[] | null>(null);
+  const [tsaRows, setTsaRows]   = useState<TsaRow[] | null>(null);
   const [supplies, setSupplies] = useState<CaseSupplyRow[]>([]);
   const [demands, setDemands]   = useState<CaseDemandRow[]>([]);
 
-  // Pending edit buffer
-  const [pendingChanges, setPendingChanges] = useState<Map<string, number>>(new Map());
-  const [undoStack, setUndoStack] = useState<UndoBatch[]>([]);
-  const [redoStack, setRedoStack] = useState<UndoBatch[]>([]);
+  // Pending edit buffer — keyed by supply_id (one TSA row per lot).
+  const [pendingQtyCap, setPendingQtyCap] = useState<Map<string, number | null>>(new Map());
+  const [pendingTarget, setPendingTarget] = useState<Map<string, string | null>>(new Map());
+  const [undoStack, setUndoStack] = useState<CellEdit[]>([]);
+  const [redoStack, setRedoStack] = useState<CellEdit[]>([]);
+
+  // The table IS the preview — recomputed (supply_lot, demand) -> qty_allocated, refreshed after
+  // every commit (including unsaved pending edits) so it's always the single source of truth for
+  // both input and output, never a second stale view.
+  const [previewRows, setPreviewRows] = useState<AllocationRow[]>([]);
+  const [rawCriticalIds, setRawCriticalIds] = useState<string[]>([]);
+  const [previewLoading, setPreviewLoading] = useState(false);
 
   // UI flags
-  const [generating, setGenerating]     = useState(false);
+  const [generating, setGenerating]       = useState(false);
   const [importLoading, setImportLoading] = useState(false);
-  const [clearing, setClearing]         = useState(false);
-  const [saving, setSaving]             = useState(false);
-  const [error, setError]               = useState<string | null>(null);
+  const [clearing, setClearing]           = useState(false);
+  const [saving, setSaving]               = useState(false);
+  const [error, setError]                 = useState<string | null>(null);
   const importRef = useRef<HTMLInputElement>(null);
 
   const [versions, setVersions] = useState<ConfigVersion[]>([]);
   const [versionId, setVersionId] = useState<number | null>(null);
   const referenced = versions.find(v => v.id === versionId)?.referenced ?? false;
 
-  const hasPending = pendingChanges.size > 0;
+  const hasPending = pendingQtyCap.size > 0 || pendingTarget.size > 0;
 
   // ── Load ──────────────────────────────────────────────────────────────────
 
   const loadVersion = useCallback((vId: number | undefined) => {
     if (!caseId || isNaN(caseId)) return;
-    setRows(null);
+    setTsaRows(null);
     Promise.all([getAllocation(caseId, vId), getCaseSupplies(caseId), getCaseDemands(caseId), listAllocationVersions(caseId)])
-      .then(([a, s, d, vs]) => {
-        setRows(a ?? []); setSupplies(s); setDemands(d);
+      .then(([rows, s, d, vs]) => {
+        setTsaRows(rows ?? []); setSupplies(s); setDemands(d);
         setVersions(vs);
         setVersionId(vId ?? vs[vs.length - 1]?.id ?? null);
       })
@@ -73,6 +91,45 @@ export function AllocationPage() {
   }, [caseId]);
 
   useEffect(() => { loadVersion(initialVersionId); }, [loadVersion, initialVersionId]);
+
+  // ── Committed lookup + effective (pending-aware) overrides ────────────────
+
+  const committed = React.useMemo(() => new Map((tsaRows ?? []).map(r => [r.supply_id, r])), [tsaRows]);
+
+  const effectiveQtyCap = useCallback((supplyId: string): number | null =>
+    pendingQtyCap.has(supplyId) ? pendingQtyCap.get(supplyId)! : (committed.get(supplyId)?.qty_cap ?? null),
+    [pendingQtyCap, committed]);
+  const effectiveTarget = useCallback((supplyId: string): string | null =>
+    pendingTarget.has(supplyId) ? pendingTarget.get(supplyId)! : (committed.get(supplyId)?.target ?? null),
+    [pendingTarget, committed]);
+
+  const effectiveRows = useCallback((): TsaRow[] => {
+    const ids = new Set<string>();
+    (tsaRows ?? []).forEach(r => ids.add(r.supply_id));
+    pendingQtyCap.forEach((_, sid) => ids.add(sid));
+    pendingTarget.forEach((_, sid) => ids.add(sid));
+    return Array.from(ids).map(sid => ({ supply_id: sid, qty_cap: effectiveQtyCap(sid), target: effectiveTarget(sid) }));
+  }, [tsaRows, pendingQtyCap, pendingTarget, effectiveQtyCap, effectiveTarget]);
+
+  // ── Live preview — the table's only data source, refreshed after every commit ─────────────
+
+  useEffect(() => {
+    if (tsaRows === null) return;
+    let cancelled = false;
+    setPreviewLoading(true);
+    previewAllocation(caseId, versionId ?? undefined, effectiveRows())
+      .then((p) => { if (!cancelled) { setPreviewRows(p.rows); setRawCriticalIds(p.rawCriticalSupplyIds); } })
+      .catch((e) => { if (!cancelled) setError(String(e)); })
+      .finally(() => { if (!cancelled) setPreviewLoading(false); });
+    return () => { cancelled = true; };
+    // effectiveRows already depends on tsaRows/pendingQtyCap/pendingTarget — including it alone
+    // as a dep would refresh on every render, so its own inputs are listed instead.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [caseId, versionId, tsaRows, pendingQtyCap, pendingTarget]);
+
+  const allSupplyIds = React.useMemo(() =>
+    Array.from(new Set([...rawCriticalIds, ...previewRows.map(r => r.supply_id)])).sort(),
+    [rawCriticalIds, previewRows]);
 
   // ── Navigation guards ─────────────────────────────────────────────────────
 
@@ -98,11 +155,61 @@ export function AllocationPage() {
     return () => document.removeEventListener('click', h, true);
   }, [hasPending]);
 
-  // ── Keyboard shortcuts (stable listener via fn refs) ──────────────────────
+  // ── Edit history ──────────────────────────────────────────────────────────
 
-  const undoRef   = useRef<() => void>(() => {});
-  const redoRef   = useRef<() => void>(() => {});
-  const saveRef   = useRef<() => void>(() => {});
+  const applyCellEdit = useCallback((edit: CellEdit, direction: 'do' | 'undo') => {
+    const qtyCap = direction === 'do' ? edit.newQtyCap : edit.oldQtyCap;
+    const target = direction === 'do' ? edit.newTarget : edit.oldTarget;
+    const committedQtyCap = committed.get(edit.supplyId)?.qty_cap ?? null;
+    const committedTarget = committed.get(edit.supplyId)?.target ?? null;
+    setPendingQtyCap(prev => {
+      const n = new Map(prev);
+      if (qtyCap === committedQtyCap) n.delete(edit.supplyId); else n.set(edit.supplyId, qtyCap);
+      return n;
+    });
+    setPendingTarget(prev => {
+      const n = new Map(prev);
+      if (target === committedTarget) n.delete(edit.supplyId); else n.set(edit.supplyId, target);
+      return n;
+    });
+  }, [committed]);
+
+  const handleEditCell = useCallback((supplyId: string, customerId: string | null, newQtyCap: number | null) => {
+    const oldQtyCap = effectiveQtyCap(supplyId);
+    const oldTarget = effectiveTarget(supplyId);
+    if (newQtyCap === oldQtyCap && customerId === oldTarget) return;
+    const edit: CellEdit = { supplyId, oldQtyCap, oldTarget, newQtyCap, newTarget: customerId };
+    applyCellEdit(edit, 'do');
+    setUndoStack(prev => [...prev, edit]);
+    setRedoStack([]);
+  }, [effectiveQtyCap, effectiveTarget, applyCellEdit]);
+
+  const undo = useCallback(() => {
+    setUndoStack(prev => {
+      if (!prev.length) return prev;
+      const edit = prev[prev.length - 1];
+      applyCellEdit(edit, 'undo');
+      setRedoStack(r => [...r, edit]);
+      return prev.slice(0, -1);
+    });
+  }, [applyCellEdit]);
+
+  const redo = useCallback(() => {
+    setRedoStack(prev => {
+      if (!prev.length) return prev;
+      const edit = prev[prev.length - 1];
+      applyCellEdit(edit, 'do');
+      setUndoStack(u => [...u, edit]);
+      return prev.slice(0, -1);
+    });
+  }, [applyCellEdit]);
+
+  const undoRef = useRef<() => void>(() => {});
+  const redoRef = useRef<() => void>(() => {});
+  const saveRef = useRef<() => void>(() => {});
+
+  useEffect(() => { undoRef.current = undo; }, [undo]);
+  useEffect(() => { redoRef.current = redo; }, [redo]);
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
@@ -115,102 +222,28 @@ export function AllocationPage() {
     return () => window.removeEventListener('keydown', h);
   }, []);
 
-  // ── Committed cell map ────────────────────────────────────────────────────
-  // Kept here (independent of AllocationMatrixView's own internal copy) purely so
-  // pushEdit/undo/redo can look up each key's true SAVED value — the "did this net back to the
-  // committed state" check needs the pre-any-pending-edit value, not the batch's own oldQty
-  // (which may itself already reflect an earlier uncommitted edit).
-  const cellMap = React.useMemo(() => {
-    const m = new Map<string, Map<string, number>>();
-    for (const r of rows ?? []) {
-      if (!m.has(r.supply_id)) m.set(r.supply_id, new Map());
-      m.get(r.supply_id)!.set(r.demand_id ?? '', r.qty_allocated);
-    }
-    return m;
-  }, [rows]);
-
-  // ── Edit history ──────────────────────────────────────────────────────────
-
-  const pushEdit = useCallback((batch: UndoBatch) => {
-    setPendingChanges(prev => {
-      const next = new Map(prev);
-      for (const { key, newQty } of batch) {
-        const { supplyId, demandId } = parsePKey(key);
-        const committed = cellMap.get(supplyId)?.get(demandId) ?? 0;
-        if (Math.abs(newQty - committed) < 1e-12) next.delete(key);
-        else next.set(key, newQty);
-      }
-      return next;
-    });
-    setUndoStack(prev => [...prev, batch]);
-    setRedoStack([]);
-  }, [cellMap]);
-
-  const undo = useCallback(() => {
-    setUndoStack(prev => {
-      if (!prev.length) return prev;
-      const batch = prev[prev.length - 1];
-      setRedoStack(r => [...r, batch]);
-      setPendingChanges(cur => {
-        const next = new Map(cur);
-        for (const { key, oldQty } of batch) {
-          const { supplyId, demandId } = parsePKey(key);
-          const committed = cellMap.get(supplyId)?.get(demandId) ?? 0;
-          if (Math.abs(oldQty - committed) < 1e-12) next.delete(key);
-          else next.set(key, oldQty);
-        }
-        return next;
-      });
-      return prev.slice(0, -1);
-    });
-  }, [cellMap]);
-
-  const redo = useCallback(() => {
-    setRedoStack(prev => {
-      if (!prev.length) return prev;
-      const batch = prev[prev.length - 1];
-      setUndoStack(u => [...u, batch]);
-      setPendingChanges(cur => {
-        const next = new Map(cur);
-        for (const { key, newQty } of batch) {
-          const { supplyId, demandId } = parsePKey(key);
-          const committed = cellMap.get(supplyId)?.get(demandId) ?? 0;
-          if (Math.abs(newQty - committed) < 1e-12) next.delete(key);
-          else next.set(key, newQty);
-        }
-        return next;
-      });
-      return prev.slice(0, -1);
-    });
-  }, [cellMap]);
-
-  // Wire fn refs (keeps keyboard listener stable while always calling latest)
-  useEffect(() => { undoRef.current = undo; }, [undo]);
-  useEffect(() => { redoRef.current = redo; }, [redo]);
-
   // ── Save ──────────────────────────────────────────────────────────────────
 
   const handleSave = useCallback(async () => {
-    if (!pendingChanges.size || referenced) return;
+    if (!hasPending || referenced) return;
     setSaving(true);
     setError(null);
     try {
-      const updated: AllocationRow[] = Array.from(pendingChanges.entries()).map(([key, qty]) => {
-        const { supplyId, demandId } = parsePKey(key);
-        return { supply_id: supplyId, demand_id: demandId || null, qty_allocated: qty };
-      });
+      const changedIds = new Set<string>([...Array.from(pendingQtyCap.keys()), ...Array.from(pendingTarget.keys())]);
+      const updated: TsaRow[] = Array.from(changedIds).map(sid => ({
+        supply_id: sid, qty_cap: effectiveQtyCap(sid), target: effectiveTarget(sid),
+      }));
       await updateAllocationRows(caseId, updated, versionId ?? undefined);
-      setRows(prev => {
-        if (!prev) return prev;
-        const next = [...prev];
+      setTsaRows(prev => {
+        const next = [...(prev ?? [])];
         for (const ur of updated) {
-          const idx = next.findIndex(r =>
-            r.supply_id === ur.supply_id && (r.demand_id ?? '') === (ur.demand_id ?? ''));
+          const idx = next.findIndex(r => r.supply_id === ur.supply_id);
           if (idx >= 0) next[idx] = ur; else next.push(ur);
         }
         return next;
       });
-      setPendingChanges(new Map());
+      setPendingQtyCap(new Map());
+      setPendingTarget(new Map());
       setUndoStack([]);
       setRedoStack([]);
     } catch (e) {
@@ -218,19 +251,19 @@ export function AllocationPage() {
     } finally {
       setSaving(false);
     }
-  }, [pendingChanges, caseId, versionId, referenced]);
+  }, [hasPending, caseId, versionId, referenced, pendingQtyCap, pendingTarget, effectiveQtyCap, effectiveTarget]);
 
   useEffect(() => { saveRef.current = handleSave; }, [handleSave]);
 
   // ── Actions ───────────────────────────────────────────────────────────────
 
-  const clearPending = () => { setPendingChanges(new Map()); setUndoStack([]); setRedoStack([]); };
+  const clearPending = () => { setPendingQtyCap(new Map()); setPendingTarget(new Map()); setUndoStack([]); setRedoStack([]); };
 
   const handleGenerate = async () => {
     if (referenced) return;
     if (hasPending && !confirm(t('confirmDiscard'))) return;
     setGenerating(true); setError(null);
-    try { setRows(await generateAllocation(caseId, versionId ?? undefined)); clearPending(); }
+    try { setTsaRows(await generateAllocation(caseId, versionId ?? undefined)); clearPending(); }
     catch (e) { setError(String(e)); }
     finally { setGenerating(false); }
   };
@@ -243,7 +276,7 @@ export function AllocationPage() {
       return;
     }
     setImportLoading(true); setError(null);
-    try { setRows(await importAllocationCsv(caseId, await file.text(), versionId ?? undefined)); clearPending(); }
+    try { setTsaRows(await importAllocationCsv(caseId, await file.text(), versionId ?? undefined)); clearPending(); }
     catch (e) { setError(String(e)); }
     finally { setImportLoading(false); if (importRef.current) importRef.current.value = ''; }
   };
@@ -252,7 +285,7 @@ export function AllocationPage() {
     try {
       const csv = await exportAllocationCsv(caseId, versionId ?? undefined);
       const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
-      const a   = Object.assign(document.createElement('a'), { href: url, download: `allocation_case_${caseId}.csv` });
+      const a   = Object.assign(document.createElement('a'), { href: url, download: `targeted_supply_allocation_case_${caseId}.csv` });
       a.click(); URL.revokeObjectURL(url);
     } catch (e) { setError(String(e)); }
   };
@@ -260,7 +293,7 @@ export function AllocationPage() {
   const handleClear = async () => {
     if (referenced || !confirm(t('confirmClear'))) return;
     setClearing(true);
-    try { await deleteAllocation(caseId, versionId ?? undefined); setRows([]); clearPending(); }
+    try { await deleteAllocation(caseId, versionId ?? undefined); setTsaRows([]); clearPending(); }
     catch (e) { setError(String(e)); }
     finally { setClearing(false); }
   };
@@ -272,13 +305,12 @@ export function AllocationPage() {
   const handleSaveAs = async (name: string | undefined, comments: string | undefined) => {
     setSaving(true); setError(null);
     try {
-      const v = await createAllocationVersion(caseId, { name, comments, rows: rows ?? [] });
+      const v = await createAllocationVersion(caseId, { name, comments, rows: effectiveRows() });
       clearPending();
       loadVersion(v.id);
     } catch (e) { setError(String(e)); }
     finally { setSaving(false); }
   };
-
 
   const handleRename = async (vId: number, name: string | undefined, comments: string | undefined) => {
     try {
@@ -309,7 +341,7 @@ export function AllocationPage() {
 
   // ── Render ────────────────────────────────────────────────────────────────
 
-  if (rows === null)
+  if (tsaRows === null)
     return <div style={{ padding: '2rem', color: '#71717a', fontSize: '0.875rem' }}>{t('loading')}</div>;
 
   const sep = <span style={{ color: '#3f3f46', padding: '0 0.15rem' }}>|</span>;
@@ -326,6 +358,12 @@ export function AllocationPage() {
         onDelete={handleDeleteVersion}
       />
 
+      <div style={{ fontSize: '1rem', fontWeight: 600, marginBottom: '0.25rem' }}>
+        {t('tsaHeader')}
+        {previewLoading && <span style={{ marginLeft: 8, fontSize: '0.72rem', color: '#71717a', fontWeight: 400 }}>⟳</span>}
+      </div>
+      <div style={{ fontSize: '0.76rem', color: '#71717a', marginBottom: '0.75rem', maxWidth: 760 }}>{t('tsaHint')}</div>
+
       {/* Action bar */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '0.75rem' }}>
         <button style={btn('primary')} onClick={handleGenerate} disabled={generating || referenced}>
@@ -335,29 +373,26 @@ export function AllocationPage() {
           {importLoading ? t('uploading') : t('uploadCsv')}
         </button>
         <input ref={importRef} type="file" accept=".csv,text/csv" style={{ display: 'none' }} onChange={handleImport} />
-        <button style={btn()} onClick={handleExport} disabled={!rows.length}>{t('downloadCsv')}</button>
-        <button style={btn('danger')} onClick={handleClear} disabled={clearing || !rows.length || referenced}>
+        <button style={btn()} onClick={handleExport} disabled={!tsaRows.length}>{t('downloadCsv')}</button>
+        <button style={btn('danger')} onClick={handleClear} disabled={clearing || !tsaRows.length || referenced}>
           {clearing ? t('clearing') : t('clear')}
         </button>
-        {!!rows.length && (<>
-          {sep}
-          <button style={{ ...btn(), opacity: undoStack.length ? 1 : 0.35 }}
-            onClick={undo} disabled={!undoStack.length} title={t('undoTitle')}>{t('undo')}</button>
-          <button style={{ ...btn(), opacity: redoStack.length ? 1 : 0.35 }}
-            onClick={redo} disabled={!redoStack.length} title={t('redoTitle')}>{t('redo')}</button>
-          {sep}
-          <button
-            style={{ ...btn(hasPending ? 'save' : 'ghost'), opacity: hasPending ? 1 : 0.35 }}
-            onClick={handleSave} disabled={!hasPending || saving || referenced} title={t('saveTitle')}>
-            {saving ? t('saving') : hasPending ? t('saveWithCount', { count: pendingChanges.size }) : t('save')}
-          </button>
-        </>)}
+        {sep}
+        <button style={{ ...btn(), opacity: undoStack.length ? 1 : 0.35 }}
+          onClick={undo} disabled={!undoStack.length} title={t('undoTitle')}>{t('undo')}</button>
+        <button style={{ ...btn(), opacity: redoStack.length ? 1 : 0.35 }}
+          onClick={redo} disabled={!redoStack.length} title={t('redoTitle')}>{t('redo')}</button>
+        {sep}
+        <button
+          style={{ ...btn(hasPending ? 'save' : 'ghost'), opacity: hasPending ? 1 : 0.35 }}
+          onClick={handleSave} disabled={!hasPending || saving || referenced} title={t('saveTitle')}>
+          {saving ? t('saving') : hasPending ? t('saveWithCount', { count: pendingQtyCap.size + pendingTarget.size }) : t('save')}
+        </button>
       </div>
 
-      {/* Unsaved-changes banner */}
       {hasPending && (
         <div style={{ background: '#1c1008', border: '1px solid #78350f', borderRadius: 4, padding: '0.4rem 0.75rem', fontSize: '0.78rem', color: '#fdba74', marginBottom: '0.75rem' }}>
-          {t('unsavedBanner', { count: pendingChanges.size })}
+          {t('unsavedBanner', { count: pendingQtyCap.size + pendingTarget.size })}
         </div>
       )}
 
@@ -367,17 +402,21 @@ export function AllocationPage() {
         </div>
       )}
 
-      {!rows.length ? (
+      {!allSupplyIds.length ? (
         <div style={{ padding: '3rem 1rem', textAlign: 'center', color: '#52525b', fontSize: '0.875rem' }}>
-          {t('emptyHint')} <strong style={{ color: '#93c5fd' }}>{t('generate')}</strong> {t('emptyHintMiddle')} <strong style={{ color: '#93c5fd' }}>{t('uploadCsv')}</strong> {t('emptyHintAfter')}
+          {t('noTsaRows')} <strong style={{ color: '#93c5fd' }}>{t('generate')}</strong> {t('noTsaRowsMiddle')} <strong style={{ color: '#93c5fd' }}>{t('uploadCsv')}</strong> {t('noTsaRowsAfter')}
         </div>
       ) : (
-        <AllocationMatrixView
-          rows={rows}
+        <TsaTable
+          rows={previewRows}
           supplies={supplies}
           demands={demands}
-          pendingChanges={pendingChanges}
-          onCommitBatch={pushEdit}
+          supplyIds={allSupplyIds}
+          editableSupplyIds={new Set(rawCriticalIds)}
+          getQtyCap={effectiveQtyCap}
+          getTarget={effectiveTarget}
+          isPending={(sid) => pendingQtyCap.has(sid) || pendingTarget.has(sid)}
+          onEditCell={referenced ? undefined : handleEditCell}
           t={t}
         />
       )}

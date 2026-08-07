@@ -48,6 +48,75 @@ fun parseSupplyGuidedConfig(config: Map<String, Any?>?): SupplyGuidedConfig {
     return SupplyGuidedConfig(traceLots)
 }
 
+// ── Targeted Supply Allocation (TSA) overrides ──────────────────────────────────
+
+/**
+ * One critical-material lot's user-editable input, keyed by `supply_id` — the "Targeted Supply
+ * Allocation" UI's entire editable surface. Only quantity and target are overridable: lead time
+ * is always derived live from BOM structure ([aggregatePathToLeaf] inside
+ * [allocateCriticalSuppliesPerLot]), never stored or overridden here.
+ *
+ * [qtyCap] replaces the lot's physical `qty` for allocation purposes (defaults to the lot's own
+ * `qty` when a TSA row is first generated — see the route layer's "generate default" action, not
+ * this file). [target] replaces the lot's `target` (customer id); pass `""` (not null) to
+ * explicitly clear a lot's own TARGET via the UI — a null [target] here means "leave the row's
+ * existing target as-is", matching [qtyCap]'s null-means-unset convention.
+ */
+data class TsaOverride(
+    val qtyCap: Double? = null,
+    val target: String? = null,
+)
+
+/**
+ * Applies [tsaOverrides] to [data]'s `supply` rows, replacing `qty`/`target` per matching
+ * `supply_id`. Returns [data] unchanged (same reference) when there's nothing to apply, so every
+ * case with no TSA edits — i.e. everything before this feature existed — stays byte-for-byte
+ * identical. Applied once, at the very top of [buildSupplyAllocation], BEFORE critical-material
+ * classification, critical-stock detection, and the [hasAnyTargetedSupply] gate — so a target
+ * added purely via a TSA override correctly flips a case into the TARGET-aware allocation path,
+ * exactly as if it had been in the uploaded supply.csv all along.
+ */
+internal fun applyTsaOverrides(
+    data: Map<String, List<Map<String, Any?>>>,
+    tsaOverrides: Map<String, TsaOverride>?,
+): Map<String, List<Map<String, Any?>>> {
+    if (tsaOverrides.isNullOrEmpty()) return data
+    val supplies = data["supply"] ?: return data
+    val overridden = supplies.map { row ->
+        val sid = (row["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@map row
+        val override = tsaOverrides[sid] ?: return@map row
+        val next = row.toMutableMap()
+        if (override.qtyCap != null) next["qty"] = override.qtyCap
+        if (override.target != null) next["target"] = override.target.takeIf { it.isNotBlank() }
+        next
+    }
+    return data + ("supply" to overridden)
+}
+
+/**
+ * Parses `config["targeted_supply_allocation"]` — a JSON-array-shaped list of
+ * `{supply_id, qty_cap?, target?}` rows — into the same [TsaOverride] map [applyTsaOverrides]
+ * expects. This is how TSA edits reach [buildSupplyAllocation] on every real call site (plan
+ * submission, Critical Material Allocation preview/generate) without those call sites needing
+ * their own dedicated parameter: TSA rides along as part of the ordinary planning config, exactly
+ * like `purchasable_materials`/`constraints` already do (see `Allocate.kt`'s `planningConfig`).
+ * Rows with a blank/missing `supply_id` are skipped; a present `target` key (even `""`) clears the
+ * lot's own target, matching [TsaOverride.target]'s convention — only an ABSENT key means "leave
+ * as-is".
+ */
+internal fun parseTsaOverridesFromConfig(config: Map<String, Any?>?): Map<String, TsaOverride> {
+    val rows = (config?.get("targeted_supply_allocation") as? List<*>) ?: return emptyMap()
+    val result = mutableMapOf<String, TsaOverride>()
+    for (entry in rows) {
+        val row = entry as? Map<*, *> ?: continue
+        val sid = (row["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: continue
+        val qtyCap = (row["qty_cap"] as? Number)?.toDouble()
+        val target = if (row.containsKey("target")) (row["target"] as? String ?: "") else null
+        result[sid] = TsaOverride(qtyCap = qtyCap, target = target)
+    }
+    return result
+}
+
 // ── Allocation result ──────────────────────────────────────────────────────────
 
 /**
@@ -176,12 +245,13 @@ internal fun computeCriticalStockPositions(
  * material ([criticalStocks], from [computeCriticalStockPositions]) — Ramification 1's proportional
  * split, "stock_i(product, location, quantity × weight_i/Σweight, target = supply_i.target)".
  *
- * [rawLotAllocatedTotals] (real raw-material `supply_id` → its current effective total, i.e. the
- * sum of `qty_allocated` across all its `case_allocation` rows) is the weight — NOT the raw lot's
- * own physical `qty` — so the split tracks the raw material's CURRENT allocation, following it
- * when a user manually rebalances it (see `Allocation.kt`'s `recomputeCriticalStockAllocationRows`
- * doc). A lot absent from the map (nothing allocated yet, e.g. before first generate) falls back to
- * its own physical `qty` — reproduces the plain Ramification-1 formula in that case.
+ * [rawLotAllocatedTotals] (real raw-material `supply_id` → its current effective total) would let
+ * the split track the raw material's CURRENT allocation rather than its static physical `qty` —
+ * kept as a parameter for that purpose, but [buildSupplyAllocation] (this function's one caller)
+ * always passes an empty map now: `case_allocation` no longer persists a critical-stock-aware
+ * allocation total to read (it stores TSA INPUT rows — qty_cap/target per RAW lot only, never
+ * critical stock — see `Allocation.kt`'s `CaseAllocRow`/`generateDefaultTsaRows` doc), so every
+ * call falls back to each raw lot's own physical `qty` — the plain Ramification-1 formula.
  *
  * Every virtual row is synthetic, product/location/date-identical to the real row it splits, with
  * `supply_id = "$realSupplyId#$i"` and `target` inherited from the raw material lot it corresponds
@@ -352,13 +422,20 @@ internal fun collapseCriticalStockBudgets(
  * @param demands all demands competing for shared supply
  * @param data    BOM, methods, supply tables (read-only)
  * @param config  planning config (supply_guided sub-key, purchasable_materials, …)
+ * @param tsaOverrides Targeted Supply Allocation edits (qty cap / target per lot's `supply_id`).
+ *   Defaults to null, meaning "read them from `config["targeted_supply_allocation"]` instead" —
+ *   see [parseTsaOverridesFromConfig] — which is what every real call site relies on; tests pass
+ *   this directly instead of building a config blob. Either way, no TSA rows anywhere reproduces
+ *   pre-TSA behavior exactly.
  */
 internal fun buildSupplyAllocation(
     demands: List<Map<String, Any?>>,
     data: Map<String, List<Map<String, Any?>>>,
     config: Map<String, Any?>?,
+    tsaOverrides: Map<String, TsaOverride>? = null,
 ): SupplyAllocationResult {
     val sgConfig = parseSupplyGuidedConfig(config)
+    val data = applyTsaOverrides(data, tsaOverrides ?: parseTsaOverridesFromConfig(config))
 
     // Critical-materials identification (done before BOM walk so the walk can prune early) — see
     // computeCriticalPids's own doc for the per-location rule.
@@ -468,11 +545,10 @@ internal fun buildSupplyAllocation(
         // Critical stock's real physical lots are replaced by virtual per-target sub-lots here
         // (Ramification 1's split — see expandCriticalStockSupplies's own doc), so
         // allocateCriticalSuppliesPerLot competes demands for them exactly like any other
-        // TARGETed critical-material lot. rawLotAllocatedTotals is empty here (this is a pure,
-        // DB-unaware computation — no persisted case_allocation to read from), so the split falls
-        // back to each raw lot's own physical qty; see Allocation.kt's
-        // recomputeCriticalStockAllocationRows for the DB-aware variant that reads the raw
-        // material's CURRENT allocation instead.
+        // TARGETed critical-material lot. rawLotAllocatedTotals is always empty (see
+        // expandCriticalStockSupplies's own doc) — case_allocation only ever stores TSA rows for
+        // genuinely raw lots now, never critical stock, so there's nothing DB-backed to weight
+        // the split against; it always falls back to each raw lot's own physical qty.
         val (expandedSupplies, virtualToReal) = expandCriticalStockSupplies(
             supplies              = data["supply"] ?: emptyList(),
             criticalStocks        = criticalStocks,

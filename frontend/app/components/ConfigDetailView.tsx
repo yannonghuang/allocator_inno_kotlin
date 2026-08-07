@@ -3,7 +3,7 @@
 import React, { useEffect, useState } from 'react';
 import { useTranslations } from 'next-intl';
 import {
-  getAllocation,
+  previewAllocation,
   getPreferences,
   getDemandOrdering,
   getPurchasableMaterials,
@@ -18,6 +18,7 @@ import {
   listPurchasableMaterialsVersions,
   listCaseConstraintsVersions,
   type AllocationRow,
+  type AllocationPreview,
   type PreferenceRow,
   type DemandOrderRow,
   type PurchasableMaterialRow,
@@ -32,7 +33,7 @@ import { RawMaterialPicker } from './RawMaterialPicker';
 import { ConstraintPicker } from './ConstraintPicker';
 import { PreferenceTable } from './PreferenceTable';
 import { DemandOrderTable } from './DemandOrderTable';
-import { AllocationMatrixView } from './AllocationMatrixView';
+import { TsaTable } from './TsaTable';
 
 export type ExternalKind = 'allocation' | 'preferences' | 'demandOrdering' | 'purchasableMaterials' | 'constraints';
 
@@ -48,7 +49,7 @@ type VersionRefs = {
 };
 
 const EXTERNAL_LABELS: Record<ExternalKind, string> = {
-  allocation: 'Critical Material Allocation',
+  allocation: 'Targeted Supply Allocation',
   preferences: 'Supply Preferences',
   demandOrdering: 'Demand Ordering',
   purchasableMaterials: 'Purchasable Materials',
@@ -155,7 +156,7 @@ export function ConfigDetailView({ config, caseId, versionRefs }: { config: Reco
   );
 }
 
-type AllocationAux = { supplies: CaseSupplyRow[]; demands: CaseDemandRow[] };
+type AllocationAux = { supplies: CaseSupplyRow[]; demands: CaseDemandRow[]; supplyIds: string[] };
 
 /** Read-only preview of one external config object's content, for [versionId] — or "no version
  *  selected" if none, never a fallback to anything (no "default" concept exists — see
@@ -203,10 +204,17 @@ export function ExternalConfigDrilldown({ kind, caseId, versionId, onBack, showB
     const load = async (): Promise<{ rows: unknown[]; aux: unknown }> => {
       switch (kind) {
         case 'allocation': {
-          const [a, supplies, demandRows] = await Promise.all([
-            getAllocation(caseId, versionId), getCaseSupplies(caseId), getCaseDemands(caseId),
+          // Recomputed (supply_lot, demand) -> qty_allocated preview for this version's own saved
+          // TSA rows (qty_cap/target) — case_allocation no longer stores this grid directly, see
+          // TsaRow's own doc in api.ts.
+          const [preview, supplies, demandRows]: [AllocationPreview, CaseSupplyRow[], CaseDemandRow[]] = await Promise.all([
+            previewAllocation(caseId, versionId), getCaseSupplies(caseId), getCaseDemands(caseId),
           ]);
-          return { rows: a ?? [], aux: { supplies, demands: demandRows } satisfies AllocationAux };
+          const supplyIds = Array.from(new Set([
+            ...preview.rows.map((r) => r.supply_id),
+            ...preview.rawCriticalSupplyIds,
+          ]));
+          return { rows: preview.rows, aux: { supplies, demands: demandRows, supplyIds } satisfies AllocationAux };
         }
         case 'preferences': {
           const r = await getPreferences(caseId, versionId);
@@ -248,7 +256,7 @@ export function ExternalConfigDrilldown({ kind, caseId, versionId, onBack, showB
     switch (kind) {
       case 'allocation': {
         const a = aux as AllocationAux | null;
-        return <AllocationMatrixView rows={rows as AllocationRow[]} supplies={a?.supplies ?? []} demands={a?.demands ?? []} t={tAllocation} />;
+        return <TsaTable rows={rows as AllocationRow[]} supplies={a?.supplies ?? []} demands={a?.demands ?? []} supplyIds={a?.supplyIds ?? []} t={tAllocation} />;
       }
       case 'preferences':
         return <PreferenceTable rows={rows as PreferenceRow[]} t={tPreferences} />;

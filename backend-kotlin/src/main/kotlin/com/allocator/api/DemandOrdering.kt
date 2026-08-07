@@ -94,7 +94,7 @@ private fun versionJson(caseId: Int, versionId: Int?): JsonObject {
  * background job, since Demand Ordering is optional-by-design (planning falls back to raw
  * `(priority, demand_id)` sort when absent; auto-seeding would silently change that fallback
  * behavior without user action). Deliberately does NOT check "is this version referenced" — see
- * Allocation.kt's generateAndSeedCaseAllocation's own doc for why that guard belongs in the
+ * Allocation.kt's generateDefaultTsaRows's own doc for why that guard belongs in the
  * route layer, not here.
  */
 internal fun generateAndSeedCaseDemandOrder(

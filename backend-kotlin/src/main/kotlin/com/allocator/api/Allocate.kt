@@ -2872,21 +2872,14 @@ internal suspend fun runPlanBackground(
             }
         }
 
-        val caseAllocRowsRaw = loadCaseAllocRows(effectiveConfig.caseAllocVersionId)
-        val caseAllocRows = caseAllocRowsRaw?.takeIf { rows ->
-            val stored = caseAllocMaterialSet(rows, data["supply"] ?: emptyList())
-            val current = com.allocator.services.computeCriticalPids(data, config)
-            val ok = stored == current
-            if (!ok) log.info(
-                "[plan] case {} allocation version {} covers a different critical-material set than this run ({} vs {} materials) — treating as detached",
-                caseId, effectiveConfig.caseAllocVersionId, stored.size, current.size,
-            )
-            ok
-        }
-        val precomputedBudgets = if (caseAllocRows != null) {
-            log.info("[plan] case {} has {} case_allocation rows — using as budget override", caseId, caseAllocRows.size)
-            buildBudgetsFromCaseAlloc(caseAllocRows, data["supply"] ?: emptyList())
-        } else null
+        // Targeted Supply Allocation (qty_cap/target per critical-material lot, if the case has
+        // any) rides along inside planningConfig's own overlay (read from
+        // effectiveConfig.caseAllocVersionId) — buildSupplyAllocation picks it up internally via
+        // parseTsaOverridesFromConfig, so there's no separate precomputedBudgets bypass needed
+        // for it here anymore (case_allocation stores INPUTS now, not a derived budget grid to
+        // inject directly — see CaseAllocations' own doc). precomputedBudgets stays reserved for
+        // the unrelated "reallocate critical leftover" second-pass feature, which computes its
+        // own internally (see runPlanning's own doc).
         val preferenceKb = loadPreferenceKb(effectiveConfig.prefVersionId)
         if (preferenceKb != null) {
             log.info("[plan] case {} has {} case_preference rows — using as method/variant ranking override", caseId, preferenceKb.entries.size)
@@ -2895,24 +2888,8 @@ internal suspend fun runPlanBackground(
         if (demandOrder != null) {
             log.info("[plan] case {} has {} case_demand_order rows — using as demand processing order override", caseId, demandOrder.size)
         }
-        val raw = runPlanning(data, config = planningConfig(config, effectiveConfig), progressCallback = progressCb, precomputedBudgets = precomputedBudgets, preferenceKb = preferenceKb, demandOrder = demandOrder)
+        val raw = runPlanning(data, config = planningConfig(config, effectiveConfig), progressCallback = progressCb, preferenceKb = preferenceKb, demandOrder = demandOrder)
         log.info("[plan] runPlanning done for run {}", planRunId)
-        // Seed case_allocation only when no user allocation existed.
-        // Uses the same generateAndSeedCaseAllocation() function as the Generate endpoint
-        // so the allocation is computed and filtered identically in both paths.
-        if (precomputedBudgets == null) {
-            // This is itself a write action (seeding fresh allocation data for later viewing/
-            // reuse) — the one legitimate place to materialize a version on demand if the case
-            // never had one, same as an explicit Generate. Doesn't retroactively touch this
-            // plan_run's own (already-persisted) caseAllocVersionId — the run itself genuinely
-            // ran with no explicit allocation override; this just seeds a fresh snapshot. Now that
-            // there's no "default" concept at all, resolveOrCreateVersionId can't accidentally
-            // promote this silent seed to anything — it's just a cache slot, no different from any
-            // other unnamed version until a user explicitly picks it.
-            val seedVersionId = CaseConfigVersioning.resolveOrCreateVersionId(caseId, ConfigVersionKind.CASEALLOC, effectiveConfig.caseAllocVersionId)
-            val allocRows = generateAndSeedCaseAllocation(caseId, seedVersionId, data, config)
-            log.info("[plan] seeded case_allocation with {} rows for case {}", allocRows.size, caseId)
-        }
         // Hint GC to collect planning intermediates (reconciledTrees, workingTrees, nodeLevelWos,
         // etc.) that went out of scope when runPlanning returned, freeing headroom for enrichment.
         @Suppress("ExplicitGarbageCollectionCall")
@@ -3092,12 +3069,12 @@ internal suspend fun runBootstrapBatchBackground(
 }
 
 /** Run one preset end-to-end: insert plan_run, run planner, persist, soundness. Reads the
- *  preset's resolved Critical Material Allocation / Supply Preferences / Demand Ordering version the
- *  same way a manual Plan Run does (`loadCaseAllocRows`/`loadPreferenceKb`/`loadDemandOrderMap`,
+ *  preset's resolved Targeted Supply Allocation / Supply Preferences / Demand Ordering version the
+ *  same way a manual Plan Run does (`planningConfig`/`loadPreferenceKb`/`loadDemandOrderMap`,
  *  see `runPlanBackground`'s identical wiring) — every KB-seeding run genuinely consults the
- *  case's actual (picked-or-default) business data, not a fixed "na" placeholder. Deliberately
- *  read-only: unlike the interactive plan path, this never calls `generateAndSeedCaseAllocation`
- *  — a batch seeding job must not mutate the case's persisted `case_allocation` as a side effect. */
+ *  case's actual (picked-or-default) business data, not a fixed "na" placeholder. Read-only with
+ *  respect to `case_allocation` itself — this never writes TSA rows as a side effect (only an
+ *  explicit Generate/PUT does). */
 private suspend fun runOneBootstrapPreset(
     caseId: Int,
     preset: com.allocator.services.BootstrapPreset,
@@ -3131,21 +3108,12 @@ private suspend fun runOneBootstrapPreset(
     }
 
     try {
-        val caseAllocRowsRaw = loadCaseAllocRows(effectiveConfig.caseAllocVersionId)
-        val caseAllocRows = caseAllocRowsRaw?.takeIf { rows ->
-            val stored = caseAllocMaterialSet(rows, data["supply"] ?: emptyList())
-            val current = com.allocator.services.computeCriticalPids(data, configMap)
-            val ok = stored == current
-            if (!ok) log.info(
-                "[bootstrap] case {} allocation version {} covers a different critical-material set than preset {} ({} vs {} materials) — treating as detached",
-                caseId, effectiveConfig.caseAllocVersionId, preset.presetId, stored.size, current.size,
-            )
-            ok
-        }
-        val precomputedBudgets = caseAllocRows?.let { buildBudgetsFromCaseAlloc(it, data["supply"] ?: emptyList()) }
+        // Targeted Supply Allocation rides along inside planningConfig's own overlay — see the
+        // matching comment at runPlanBackground's identical call site for why no separate
+        // precomputedBudgets bypass is needed here anymore.
         val preferenceKb = loadPreferenceKb(effectiveConfig.prefVersionId)
         val demandOrder = loadDemandOrderMap(effectiveConfig.ordVersionId)
-        val raw = runPlanning(data, config = planningConfig(configMap, effectiveConfig), precomputedBudgets = precomputedBudgets, preferenceKb = preferenceKb, demandOrder = demandOrder)
+        val raw = runPlanning(data, config = planningConfig(configMap, effectiveConfig), preferenceKb = preferenceKb, demandOrder = demandOrder)
         val enriched = enrichPlanResultWithData(caseId, raw.output, data)
         val resultJson = serializeResultOrNull(enriched)
         val serializeFailed = resultJson == null
@@ -3453,6 +3421,20 @@ internal fun resolveEffectiveConfig(
                 }
             }
         }
+        // Targeted Supply Allocation input rows (qty_cap/target per critical-material lot) —
+        // `case_allocation`'s repurposed shape (see CaseAllocations' own doc). Embedded here so a
+        // reloaded run shows what TSA state it actually used, and read back by
+        // buildSupplyAllocation's own `parseTsaOverridesFromConfig` at planning time via
+        // planningConfig's overlay below — not consulted directly by anything in this function.
+        putJsonArray("targeted_supply_allocation") {
+            (loadCaseAllocRows(caseAllocVersionId) ?: emptyList()).forEach { row ->
+                addJsonObject {
+                    put("supply_id", row.supplyId)
+                    put("qty_cap", row.qtyCap)
+                    put("target", row.target)
+                }
+            }
+        }
         putJsonObject("method_selection") {
             put("max_methods",   methodCfg.maxMethods)
             put("root_waterfall", methodCfg.rootWaterfall)
@@ -3527,6 +3509,9 @@ internal fun planningConfig(config: Map<String, Any?>?, effective: EffectiveConf
         "purchasable_materials" to loadPurchasableMaterialIds(effective.purchMatVersionId).sorted(),
         "constraints" to loadCaseConstraintRows(effective.constrVersionId).map { k ->
             mapOf("customer" to k.customerId, "parent" to k.parent, "location" to k.location, "child" to k.child)
+        },
+        "targeted_supply_allocation" to (loadCaseAllocRows(effective.caseAllocVersionId) ?: emptyList()).map { row ->
+            mapOf("supply_id" to row.supplyId, "qty_cap" to row.qtyCap, "target" to row.target)
         },
     )
 

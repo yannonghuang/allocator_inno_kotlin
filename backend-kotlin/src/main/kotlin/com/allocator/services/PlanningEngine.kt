@@ -6775,6 +6775,11 @@ private fun runPlanningOnePass(
     // Step 1+2: pure allocation — BOM reachability walk + proportional supply split.
     val sgAllocationBase = buildSupplyAllocation(demands, data, config)
     val sgAllocation = if (precomputedBudgets != null) {
+        // precomputedBudgets is now exclusively the "reallocate critical leftover" second pass's
+        // own combinedBudgets (see runPlanning's own doc) — case_allocation no longer bypasses
+        // this computation at all; its TSA rows (qty_cap/target) instead ride along inside
+        // `config` and are already reflected in sgAllocationBase above via
+        // buildSupplyAllocation's own `parseTsaOverridesFromConfig`.
         // Merge, don't replace: precomputedBudgets (from reallocateCriticalLeftoverBudget) only
         // has entries for demands that drew nonzero critical material somewhere in pass 1 — any
         // demand that drew ZERO critical material anywhere in pass 1 is entirely absent from it.
@@ -6792,7 +6797,7 @@ private fun runPlanningOnePass(
         for ((did, lotMap) in sgAllocationBase.perLotBudgets) {
             if (did !in merged) merged[did] = lotMap.toMutableMap()
         }
-        log.info("[supply-guided] using case_allocation override: {} demand budget entries ({} backfilled from default)",
+        log.info("[supply-guided] using reallocate-critical-leftover budget: {} demand budget entries ({} backfilled from default)",
             precomputedBudgets.size, merged.size - precomputedBudgets.size)
         sgAllocationBase.copy(perLotBudgets = merged)
     } else {
@@ -7446,7 +7451,7 @@ internal fun reconcileReallocatedSupplyAllocations(result: RunPlanningResult): R
  * it already exhibited, to close its own remaining gap entirely.
  *
  * TWO fixes, both learned from live regressions on case 173, both resolved by treating this as a
- * REVISED, self-consistent Critical Material Allocation table computed up front — the SAME way a real
+ * REVISED, self-consistent Targeted Supply Allocation table computed up front — the SAME way a real
  * one is computed — rather than pass-1 output patched after the fact:
  *
  * 1. `original_allocation` is built from every demand's ACTUAL pass-1 CONSUMPTION

@@ -89,7 +89,7 @@ fun initDatabase() {
     // recomputes signatures so dedup survives.
     com.allocator.services.ScopeRenameMigration.run()
     com.allocator.services.ConfigRetirementMigration.run()
-    // Backfills version_id for the 5 external config objects (Critical Material Allocation/Supply
+    // Backfills version_id for the 5 external config objects (Targeted Supply Allocation/Supply
     // Preferences/Demand Ordering/Purchasable Materials/Constraints) — see its own doc.
     // Independent of the two migrations above; order relative to them doesn't matter.
     com.allocator.services.ExternalConfigVersioningMigration.run()
@@ -139,8 +139,27 @@ private fun dropLegacyExternalConfigConstraints() {
     }
 }
 
+/**
+ * `case_allocation` was repurposed from storing a DERIVED (supply_lot, demand) -> qty_allocated
+ * grid (multiple rows per supply_id, one per demand) to storing TSA INPUT rows (one row per
+ * supply_id — see [CaseAllocations]' own doc) — so it now carries a `uniqueIndex(versionId,
+ * supplyId)` that old multi-row-per-lot data would violate. This is a dev/experimental repo with
+ * no production data to preserve across the shape change (the old grid's numbers have no
+ * meaning under the new columns anyway), so the simplest correct migration is to wipe the table
+ * before schema sync adds the new constraint — must run BEFORE `SchemaUtils
+ * .createMissingTablesAndColumns`, which would otherwise fail trying to add the unique index
+ * against pre-existing duplicate (version_id, supply_id) rows.
+ */
+private fun truncateRepurposedCaseAllocation() {
+    runCatching {
+        org.jetbrains.exposed.sql.transactions.TransactionManager.current()
+            .exec("DELETE FROM case_allocation")
+    }
+}
+
 private fun createTables() {
     dropLegacyExternalConfigConstraints()
+    truncateRepurposedCaseAllocation()
     SchemaUtils.createMissingTablesAndColumns(
         Cases, CaseConfigVersions, Boms, Customers, Locations, Products, Vendors,
         Demands, MethodBuys, MethodMakes, ProductLocations,
@@ -282,6 +301,13 @@ private fun migrateSchema() {
         // Phase-out: "default version" concept removed from external-config versioning — every
         // plan_run now carries an explicit version id per kind, or none (meaning no override).
         "ALTER TABLE case_config_version DROP COLUMN IF EXISTS is_default",
+        // case_allocation repurposed from a derived (supply_lot, demand) -> qty_allocated grid to
+        // Targeted Supply Allocation input rows (qty_cap/target per lot) — see CaseAllocations'
+        // own doc and truncateRepurposedCaseAllocation's own doc for why the table is wiped first.
+        "ALTER TABLE case_allocation DROP COLUMN IF EXISTS demand_id",
+        "ALTER TABLE case_allocation DROP COLUMN IF EXISTS qty_allocated",
+        "ALTER TABLE case_allocation ADD COLUMN IF NOT EXISTS qty_cap DOUBLE PRECISION",
+        "ALTER TABLE case_allocation ADD COLUMN IF NOT EXISTS target VARCHAR(255)",
     )
     val conn = org.jetbrains.exposed.sql.transactions.TransactionManager.current().connection
     stmts.forEach { sql ->
