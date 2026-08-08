@@ -600,6 +600,7 @@ class SupplyGuidedPlanningTest : FunSpec({
         ),
         demands = listOf(demand("D1", "P", "L", qty = 40.0)),
         productlocation = listOf(
+            mapOf("product_id" to "Y", "location_id" to "L", "prod_area" to "raw"),
             mapOf("product_id" to "X", "location_id" to "L", "prod_area" to "raw"),
         ),
     )
@@ -698,6 +699,7 @@ class SupplyGuidedPlanningTest : FunSpec({
         ),
         demands = listOf(demand("D1", "P", "L", qty = 40.0)),
         productlocation = listOf(
+            mapOf("product_id" to "Y", "location_id" to "L", "prod_area" to "raw"),
             mapOf("product_id" to "X", "location_id" to "L", "prod_area" to "raw"),
         ),
     )
@@ -788,6 +790,7 @@ class SupplyGuidedPlanningTest : FunSpec({
         ),
         demands = listOf(demand("D1", "P", "L", qty = 40.0)),
         productlocation = listOf(
+            mapOf("product_id" to "Y", "location_id" to "L", "prod_area" to "raw"),
             mapOf("product_id" to "X", "location_id" to "L", "prod_area" to "raw"),
         ),
     )
