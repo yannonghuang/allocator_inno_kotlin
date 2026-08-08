@@ -4,8 +4,12 @@ import com.allocator.*
 import com.allocator.services.CaseConfigVersioning
 import com.allocator.services.CaseLoader
 import com.allocator.services.ConfigVersionKind
+import com.allocator.services.applyAppSpecificConfig
 import com.allocator.services.getMethods
+import com.allocator.services.hasAnyTargetedSupply
+import com.allocator.services.materializeCriticalStockSupply
 import com.allocator.services.resolveMethodSelection
+import com.allocator.services.resolveWipSupplyDates
 import com.allocator.services.roundQty
 import com.allocator.services.runAllocation
 import com.allocator.services.runPlanning
@@ -1781,6 +1785,7 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
             val resultJson: String?,
             val invInitialJson: String?,
             val invLeftoverJson: String?,
+            val configJson: String?,
         )
         val inputs = transaction {
             val row = PlanRuns.selectAll().where { PlanRuns.id eq runId }.single()
@@ -1788,6 +1793,7 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
                 resultJson = row[PlanRuns.result],
                 invInitialJson = row[PlanRuns.inventoryEffectiveInitial],
                 invLeftoverJson = row[PlanRuns.inventoryLeftover],
+                configJson = row[PlanRuns.config],
             )
         }
         if (inputs.resultJson == null) throw IllegalStateException("Plan run has no result to check")
@@ -1803,7 +1809,41 @@ internal fun runSoundnessCheckForRun(caseId: Int, runId: Int, deepCheck: Boolean
         val workOrdersNative = (resultMap["work_orders_native"] as? List<Map<String, Any?>>) ?: emptyList()
         @Suppress("UNCHECKED_CAST")
         val committedDemandsForCheck = (resultMap["committed_demands"] as? List<Map<String, Any?>>) ?: emptyList()
-        val data = transaction { CaseLoader.load(caseId) }
+        // The run's own config (not the case's CURRENT effective config, which may have since
+        // changed) — needed so materializeCriticalStockSupply below reproduces the EXACT same
+        // critical-stock split (wip_280-1001_Q6J/_Q6K, ...) the run itself used, referenced
+        // throughout its own pegging/work_orders/committed_demands/supply_allocations.
+        @Suppress("UNCHECKED_CAST")
+        val runConfig = inputs.configJson?.let {
+            runCatching { jsonElementToNative(Json.parseToJsonElement(it)) as? Map<String, Any?> }.getOrNull()
+        }
+        val rawCaseData = transaction { CaseLoader.load(caseId) }
+        // Everything below is scoped to cases that actually use TARGET — same hard gate every
+        // other TARGET-aware behavior in this codebase relies on (see hasAnyTargetedSupply's own
+        // doc). A case with no TARGET usage at all — including one with plain "wip"-dated supply
+        // that has nothing to do with critical stock — gets `data` identical to `rawCaseData`,
+        // byte-for-byte the same as before this fix existed. Only once a case actually has
+        // critical stock does it need real, resolved dates and a materialized target split.
+        val data = if (hasAnyTargetedSupply(rawCaseData)) {
+            val demandsForDateResolve = (rawCaseData["demand"] as? List<Map<String, Any?>>) ?: emptyList()
+            // Same "wip" -> real date resolution runPlanning itself applies before materializing —
+            // without it, a split critical-stock row would inherit the literal "wip" string, which
+            // R10 (verifyInventoryPriority) treats as "always timely" regardless of any actual WO
+            // timing, exactly the false-positive this whole fix exists to close.
+            val wipSupplyDates = resolveWipSupplyDates(runConfig, demandsForDateResolve, rawCaseData["supply"] ?: emptyList())
+            val dataWithResolvedDates = applyAppSpecificConfig(rawCaseData, wipSupplyDates)
+            // Critical stock's target(s) become real fields on real, permanently-identified supply
+            // rows (wip_280-1001_Q6J, wip_280-1001_Q6K, ...) here — matching runPlanningOnePass's
+            // own call site exactly, so R10's supplyMeta lookup can resolve the SAME ids the run's
+            // own pegging/work_orders/supply_allocations/inventory_leftover reference.
+            // Deterministic and idempotent (pure function of data/config), so recomputing it here
+            // independently is safe as long as the case's own supply data hasn't changed since the
+            // run — and a no-op (returns dataWithResolvedDates unchanged) if there's no critical
+            // stock to split, e.g. a case with TARGETed raw materials but no critical stock at all.
+            materializeCriticalStockSupply(dataWithResolvedDates, runConfig).first
+        } else {
+            rawCaseData
+        }
         @Suppress("UNCHECKED_CAST")
         val demands = (data["demand"] as? List<Map<String, Any?>>) ?: emptyList()
         // R7e: parse persisted inventory snapshots if available.

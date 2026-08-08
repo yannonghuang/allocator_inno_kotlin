@@ -1475,13 +1475,14 @@ class SupplyGuidedPlanningTest : FunSpec({
             data["supply"]!!, criticalStocks, rawLotAllocatedTotals = emptyMap(), data = data, config = noPurchaseConfig,
         )
 
-        val virtualRows = expanded.filter { (it["supply_id"] as String).startsWith("LOT_M#") }
-        virtualRows.size shouldBe 2
+        val splitRows = expanded.filter { (it["supply_id"] as String).startsWith("LOT_M_") }
+        splitRows.size shouldBe 2
+        splitRows.map { it["supply_id"] }.toSet() shouldBe setOf("LOT_M_Q6J", "LOT_M_Q6K")
         virtualToReal.values.toSet() shouldBe setOf("LOT_M")
-        val byTarget = virtualRows.associate { it["target"] to (it["qty"] as Double) }
+        val byTarget = splitRows.associate { it["target"] to (it["qty"] as Double) }
         byTarget["Q6J"] shouldBe (80902.67202087476 plusOrMinus 1e-4)
         byTarget["Q6K"] shouldBe (6110.327979125241 plusOrMinus 1e-4)
-        // The real physical row is gone, replaced by its virtual sub-lots.
+        // The real physical row is gone, replaced by its two new, permanent, target-named rows.
         expanded.none { it["supply_id"] == "LOT_M" } shouldBe true
     }
 
@@ -1570,37 +1571,10 @@ class SupplyGuidedPlanningTest : FunSpec({
             rawLotAllocatedTotals = mapOf("LOT_A" to 50.0, "LOT_B" to 50.0),
             data = data, config = noPurchaseConfig,
         )
-        val byTarget = expanded.filter { (it["supply_id"] as String).startsWith("LOT_M#") }
+        val byTarget = expanded.filter { (it["supply_id"] as String).startsWith("LOT_M_") }
             .associate { it["target"] to (it["qty"] as Double) }
         byTarget["CUST_A"] shouldBe (50.0 plusOrMinus 1e-6)
         byTarget["CUST_B"] shouldBe (50.0 plusOrMinus 1e-6)
-    }
-
-    test("buildSupplyAllocation: critical stock budgets collapse to the real supply_id and respect the inherited target split") {
-        val xLots = listOf(
-            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 90.0, "target" to "CUST_A"),
-            mapOf<String, Any?>("supply_id" to "LOT_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 10.0, "target" to "CUST_B"),
-        )
-        // Demand well beyond either raw lot's share, so both sides are scarce/fully-subscribed —
-        // matches cases/inno2026_2's own regime (see the worked example in the plan).
-        val demands = listOf(
-            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P1", "location_id" to "L", "quantity" to 1000.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_A"),
-            mapOf<String, Any?>("demand_id" to "DB", "product_id" to "P2", "location_id" to "L", "quantity" to 1000.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_B"),
-        )
-        val data = sharedStockData(100.0, xLots, demands)
-        val alloc = buildSupplyAllocation(demands, data, noPurchaseConfig)
-
-        // No virtual "#i" key ever leaks into the final budgets — proves the collapse step ran.
-        val allKeys = alloc.perLotBudgets.values.flatMap { it.keys }
-        allKeys.none { it.contains("#") } shouldBe true
-
-        // DA (CUST_A) gets (up to) its fair share of M's Q6J-side split; DB (CUST_B) is capped out
-        // of it entirely — the actual regression this feature exists to fix (today, ignoring
-        // target, either demand could exhaust the shared stock FIFO regardless of target).
-        val daM = alloc.perLotBudgets["DA"]?.get("M|L|LOT_M")
-        val dbM = alloc.perLotBudgets["DB"]?.get("M|L|LOT_M")
-        daM shouldBe (90.0 plusOrMinus 1e-6)
-        dbM shouldBe (10.0 plusOrMinus 1e-6)
     }
 
     test("buildSupplyAllocation: a case with no TARGET usage anywhere is unaffected by critical-stock detection") {
@@ -1617,5 +1591,196 @@ class SupplyGuidedPlanningTest : FunSpec({
         val alloc = buildSupplyAllocation(demands, data, noPurchaseConfig)
 
         alloc.criticalMatrix.byColumn.keys.contains(SupplyKey("M", "L")) shouldBe false
+    }
+
+    // ── J. Critical stock: materialize + FIFO consumption (no scoping, no allocation table) ────
+    // A critical stock traces back to its LATEST dependent critical-raw-material allocation(s) to
+    // identify its target(s) — reusing expandCriticalStockSupplies's existing split, now called
+    // once, early (materializeCriticalStockSupply), to produce REAL supply rows the whole planning
+    // pass runs against, not merely a transient budget-computation view. An already-targeted stock
+    // needs no tracing (its one real row already has its one real target). Either way, once every
+    // critical-stock row has a real target, it's pulled OUT of the critical-material allocation
+    // table entirely (no criticalMatrix column, no per-lot budget, no scope) — consumeFromInventory's
+    // own direct target check plus its plain date-FIFO sort are all that govern its consumption.
+
+    fun inno2026_2Data(): Map<String, List<Map<String, Any?>>> = mkData(
+        bom = listOf(
+            mapOf("bom_id" to "BOM_Q6J", "parent_id" to "Q6J", "child_id" to "500-0001", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_Q6K", "parent_id" to "Q6K", "child_id" to "500-0002", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_Q4R", "parent_id" to "Q4R", "child_id" to "500-0003", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_500-0001", "parent_id" to "500-0001", "child_id" to "280-0001", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_500-0002", "parent_id" to "500-0002", "child_id" to "280-0002", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_500-0003", "parent_id" to "500-0003", "child_id" to "280-0003", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_280-0001", "parent_id" to "280-0001", "child_id" to "280-1001", "rate" to 2.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_280-0002", "parent_id" to "280-0002", "child_id" to "280-1001", "rate" to 4.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_280-0003", "parent_id" to "280-0003", "child_id" to "280-1003", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_280-1001", "parent_id" to "280-1001", "child_id" to "283-0504-31", "rate" to 1.0, "alt_group" to null),
+            mapOf("bom_id" to "BOM_280-1003", "parent_id" to "280-1003", "child_id" to "263-0071-31", "rate" to 1.0, "alt_group" to null),
+        ),
+        methodMake = listOf("Q6J", "Q6K", "Q4R", "500-0001", "500-0002", "500-0003").map { pid ->
+            mapOf("bom_id" to "BOM_$pid", "product_id" to pid, "location_id" to "1000", "preference" to 1, "lead_time" to 0.0, "yield" to 1.0)
+        } + listOf(
+            mapOf("bom_id" to "BOM_280-0001", "product_id" to "280-0001", "location_id" to "1000", "preference" to 1, "lead_time" to 7.0, "yield" to 0.97),
+            mapOf("bom_id" to "BOM_280-0002", "product_id" to "280-0002", "location_id" to "1000", "preference" to 1, "lead_time" to 7.0, "yield" to 0.97),
+            mapOf("bom_id" to "BOM_280-0003", "product_id" to "280-0003", "location_id" to "1000", "preference" to 1, "lead_time" to 6.0, "yield" to 0.98),
+            mapOf("bom_id" to "BOM_280-1001", "product_id" to "280-1001", "location_id" to "1000", "preference" to 1, "lead_time" to 7.0, "yield" to 0.925),
+            mapOf("bom_id" to "BOM_280-1003", "product_id" to "280-1003", "location_id" to "1000", "preference" to 1, "lead_time" to 7.0, "yield" to 0.93),
+        ),
+        methodBuy = listOf(
+            mapOf("product_id" to "283-0504-31", "location_id" to "1000", "preference" to 1),
+            mapOf("product_id" to "263-0071-31", "location_id" to "1000", "preference" to 1),
+        ),
+        demands = listOf(
+            mapOf<String, Any?>("demand_id" to "Q6J_CB_08/01/2026", "product_id" to "280-0001", "location_id" to "1000", "quantity" to 5513.0, "priority" to 10, "request_due_time" to "2026-08-01", "customer_id" to "Q6J"),
+        ),
+        supplies = listOf(
+            // 283-0504-31: Q6J-targeted lots
+            mapOf<String, Any?>("supply_id" to "RAW_QJ_0715", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-07-15", "qty" to 81667.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "RAW_QJ_0722", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-07-22", "qty" to 7500.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "RAW_QJ_0801", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-08-01", "qty" to 81667.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "RAW_QJ_0808", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-08-08", "qty" to 7500.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "RAW_QJ_0815", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-08-15", "qty" to 73757.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "RAW_QJ_0822", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-08-22", "qty" to 214425.0, "target" to "Q6J"),
+            // 283-0504-31: Q6K-targeted lots
+            mapOf<String, Any?>("supply_id" to "RAW_QK_0715", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-07-15", "qty" to 17500.0, "target" to "Q6K"),
+            mapOf<String, Any?>("supply_id" to "RAW_QK_0722", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-07-22", "qty" to 11000.0, "target" to "Q6K"),
+            mapOf<String, Any?>("supply_id" to "RAW_QK_0801", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-08-01", "qty" to 17500.0, "target" to "Q6K"),
+            mapOf<String, Any?>("supply_id" to "RAW_QK_0808", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-08-08", "qty" to 11000.0, "target" to "Q6K"),
+            mapOf<String, Any?>("supply_id" to "RAW_QK_0815", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-08-15", "qty" to 0.0, "target" to "Q6K"),
+            mapOf<String, Any?>("supply_id" to "RAW_QK_0822", "product_id" to "283-0504-31", "location_id" to "1000", "supply_date" to "2026-08-22", "qty" to 0.0, "target" to "Q6K"),
+            // 263-0071-31: Q4R-targeted lots (no pre-horizon history uploaded, unlike 283-0504-31)
+            mapOf<String, Any?>("supply_id" to "RAW_4R_0801", "product_id" to "263-0071-31", "location_id" to "1000", "supply_date" to "2026-08-01", "qty" to 62667.0, "target" to "Q4R"),
+            mapOf<String, Any?>("supply_id" to "RAW_4R_0808", "product_id" to "263-0071-31", "location_id" to "1000", "supply_date" to "2026-08-08", "qty" to 62667.0, "target" to "Q4R"),
+            mapOf<String, Any?>("supply_id" to "RAW_4R_0815", "product_id" to "263-0071-31", "location_id" to "1000", "supply_date" to "2026-08-15", "qty" to 62667.0, "target" to "Q4R"),
+            mapOf<String, Any?>("supply_id" to "RAW_4R_0822", "product_id" to "263-0071-31", "location_id" to "1000", "supply_date" to "2026-08-22", "qty" to 62667.0, "target" to "Q4R"),
+            // the 5 WIP rows under test
+            mapOf<String, Any?>("supply_id" to "wip_280-0001", "product_id" to "280-0001", "location_id" to "1000", "supply_date" to "wip", "qty" to 37961.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "wip_280-0002", "product_id" to "280-0002", "location_id" to "1000", "supply_date" to "wip", "qty" to 4438.0, "target" to "Q6K"),
+            mapOf<String, Any?>("supply_id" to "wip_280-0003", "product_id" to "280-0003", "location_id" to "1000", "supply_date" to "wip", "qty" to 54987.0, "target" to "Q4R"),
+            mapOf<String, Any?>("supply_id" to "wip_280-1001", "product_id" to "280-1001", "location_id" to "1000", "supply_date" to "wip", "qty" to 87013.0, "target" to null),
+            mapOf<String, Any?>("supply_id" to "wip_280-1003", "product_id" to "280-1003", "location_id" to "1000", "supply_date" to "wip", "qty" to 66730.0, "target" to "Q4R"),
+        ),
+    )
+
+    test("materializeCriticalStockSupply: no critical stock -> data returned unchanged") {
+        val data = mkData(demands = listOf(demand("D1", "M", "L", 10.0)))
+        val (out, virtualToReal) = materializeCriticalStockSupply(data, noPurchaseConfig)
+        out shouldBe data
+        virtualToReal.isEmpty() shouldBe true
+    }
+
+    test("materializeCriticalStockSupply: an already-targeted stock passes through as one real row, unsplit") {
+        val xLots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 377349.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "LOT_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 28500.0, "target" to "Q6K"),
+        )
+        val data = mkData(
+            supplies = xLots + listOf(
+                mapOf<String, Any?>("supply_id" to "LOT_M", "product_id" to "M", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 37961.0, "target" to "Q6J"),
+            ),
+            methodMake = listOf(mapOf("bom_id" to "BM", "product_id" to "M", "location_id" to "L", "preference" to 1)),
+            methodBuy  = listOf(mapOf("product_id" to "X", "location_id" to "L", "preference" to 1)),
+            bom        = listOf(mapOf("bom_id" to "BM", "parent_id" to "M", "child_id" to "X", "rate" to 1.0, "alt_group" to null)),
+        )
+        val (out, virtualToReal) = materializeCriticalStockSupply(data, noPurchaseConfig)
+        virtualToReal.isEmpty() shouldBe true
+        val mRow = out["supply"]!!.single { it["supply_id"] == "LOT_M" }
+        mRow["qty"] shouldBe (37961.0 plusOrMinus 1e-9)
+        mRow["target"] shouldBe "Q6J"
+    }
+
+    test("materializeCriticalStockSupply: untargeted stock splits into real per-target rows, weighted by the latest raw lot") {
+        val xLots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 90.0, "target" to "CUST_A"),
+            mapOf<String, Any?>("supply_id" to "LOT_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 10.0, "target" to "CUST_B"),
+        )
+        val data = sharedStockData(100.0, xLots)
+        val (out, virtualToReal) = materializeCriticalStockSupply(data, noPurchaseConfig)
+        virtualToReal.values.toSet() shouldBe setOf("LOT_M")
+        val splitRows = out["supply"]!!.filter { (it["supply_id"] as String).startsWith("LOT_M_") }
+        splitRows.size shouldBe 2
+        splitRows.map { it["supply_id"] }.toSet() shouldBe setOf("LOT_M_CUST_A", "LOT_M_CUST_B")
+        out["supply"]!!.none { it["supply_id"] == "LOT_M" } shouldBe true
+        val byTarget = splitRows.associate { it["target"] to (it["qty"] as Double) }
+        byTarget["CUST_A"] shouldBe (90.0 plusOrMinus 1e-6)
+        byTarget["CUST_B"] shouldBe (10.0 plusOrMinus 1e-6)
+    }
+
+    test("buildSupplyAllocation: critical stock is never a criticalMatrix column -- no allocation-table participation at all") {
+        val xLots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 90.0, "target" to "CUST_A"),
+            mapOf<String, Any?>("supply_id" to "LOT_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 10.0, "target" to "CUST_B"),
+        )
+        val demands = listOf(
+            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P1", "location_id" to "L", "quantity" to 1000.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_A"),
+        )
+        val data = sharedStockData(100.0, xLots, demands)
+        val alloc = buildSupplyAllocation(demands, data, noPurchaseConfig)
+
+        // M (the critical stock) is never a column.
+        alloc.criticalMatrix.byColumn.keys.contains(SupplyKey("M", "L")) shouldBe false
+        // No per-lot budget entry for M's own lot anywhere in the table.
+        alloc.perLotBudgets["DA"]?.keys?.none { it.startsWith("M|L") } ?: true shouldBe true
+    }
+
+    test("runPlanning: untargeted critical stock is split into two PERMANENT, target-named supplies, enforced directly by consumeFromInventory, no allocation-table budget needed") {
+        val xLots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 90.0, "target" to "CUST_A"),
+            mapOf<String, Any?>("supply_id" to "LOT_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 10.0, "target" to "CUST_B"),
+        )
+        // Small enough that each demand is fully satisfiable from M's own on-hand split share
+        // alone (90/10) -- purchase is disabled (noPurchaseConfig), so a demand big enough to
+        // need X's own make/buy path would hard-fail with zero credit (plan()'s waterfall has no
+        // partial-success concept when a method chain bottoms out at no_methods), which isn't
+        // what this test is trying to observe. Due dates are in the SAME month as the lots'
+        // 2024-01-01 supply_date -- runPlanningOnePass's own horizon floor (unlike
+        // buildSupplyAllocation, which every other fixture here only exercises directly) excludes
+        // any lot dated before horizon_start (auto: last day of the month before the EARLIEST
+        // demand), so a June due date would silently filter this whole stock out of the real
+        // inventory pool before it's ever reachable.
+        val demands = listOf(
+            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P1", "location_id" to "L", "quantity" to 50.0, "request_due_time" to "2024-01-15", "customer_id" to "CUST_A"),
+            mapOf<String, Any?>("demand_id" to "DB", "product_id" to "P2", "location_id" to "L", "quantity" to 5.0, "request_due_time" to "2024-01-15", "customer_id" to "CUST_B"),
+        )
+        val data = sharedStockData(100.0, xLots, demands)
+
+        val result = runPlanning(data, noPurchaseConfig)
+        @Suppress("UNCHECKED_CAST")
+        val supplyAllocations = result.output["supply_allocations"] as List<Map<String, Any?>>
+
+        // materializeCriticalStockSupply's split rows are now PERMANENT physical supplies in
+        // their own right -- LOT_M_CUST_A / LOT_M_CUST_B -- not virtual ids collapsed back to
+        // "LOT_M" at the end of the run. The original "LOT_M" id never appears in output at all.
+        supplyAllocations.none { it["supply_id"] == "LOT_M" } shouldBe true
+
+        val mDrawsByDemand = supplyAllocations.filter { it["supply_id"] == "LOT_M_CUST_A" || it["supply_id"] == "LOT_M_CUST_B" }
+            .groupBy { it["demand_id"] }
+            .mapValues { (_, rows) -> rows.sumOf { (it["qty_consumed"] as? Number)?.toDouble() ?: 0.0 } }
+
+        // DA (CUST_A) draws its full 50-unit need from LOT_M_CUST_A; DB (CUST_B) draws its full
+        // 5-unit need from LOT_M_CUST_B -- never the other's -- enforced now purely by
+        // consumeFromInventory's own direct target check, not by any per-lot budget table entry
+        // (there is none anymore -- see the test above).
+        (mDrawsByDemand["DA"] ?: 0.0) shouldBe (50.0 plusOrMinus 1e-6)
+        (mDrawsByDemand["DB"] ?: 0.0) shouldBe (5.0 plusOrMinus 1e-6)
+        supplyAllocations.single { it["demand_id"] == "DA" && it["supply_id"]?.toString()?.startsWith("LOT_M") == true }["supply_id"] shouldBe "LOT_M_CUST_A"
+        supplyAllocations.single { it["demand_id"] == "DB" && it["supply_id"]?.toString()?.startsWith("LOT_M") == true }["supply_id"] shouldBe "LOT_M_CUST_B"
+    }
+
+    test("runPlanning: an already-targeted critical stock (Q6J_CB_08/01/2026 against wip_280-0001) is still correctly consumed") {
+        // Regression for the live bug this whole feature started from: cases/inno2026_2's
+        // wip_280-0001 (target=Q6J) must still serve its own matching demand under the new,
+        // simpler model (no scoping, no allocation table -- just consumeFromInventory's direct
+        // target check).
+        val demand = mapOf<String, Any?>("demand_id" to "Q6J_CB_08/01/2026", "product_id" to "280-0001", "location_id" to "1000", "quantity" to 5513.0, "priority" to 10, "request_due_time" to "2026-08-01", "customer_id" to "Q6J")
+        val data = inno2026_2Data() + ("demand" to listOf(demand))
+
+        val result = runPlanning(data, noPurchaseConfig)
+        @Suppress("UNCHECKED_CAST")
+        val supplyAllocations = result.output["supply_allocations"] as List<Map<String, Any?>>
+
+        val fromWip0001 = supplyAllocations.filter { it["supply_id"] == "wip_280-0001" && it["demand_id"] == "Q6J_CB_08/01/2026" }
+            .sumOf { (it["qty_consumed"] as? Number)?.toDouble() ?: 0.0 }
+        (fromWip0001 > 0.0) shouldBe true
     }
 })

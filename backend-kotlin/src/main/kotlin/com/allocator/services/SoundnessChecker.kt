@@ -538,10 +538,17 @@ fun checkRunSoundness(
 
     // R10: inventory priority — timely physical inventory must be exhausted before
     // creating WOs at the same component. Only runs when inventoryLeftover is available
-    // (same guard as R7e; skipped for historical runs without persisted snapshots).
+    // (same guard as R7e; skipped for historical runs without persisted snapshots). Uses the
+    // NATIVE (per-demand) work order list, not the consolidated one — see
+    // verifyInventoryPriority's own doc for why a single, unambiguous demand_id per row matters.
     val inventoryPriorityViolations: List<String> =
-        if (inventoryLeftover.isNotEmpty() && workOrders.isNotEmpty())
-            verifyInventoryPriority(inventoryLeftover, workOrders, supplies)
+        if (inventoryLeftover.isNotEmpty() && workOrdersNative.isNotEmpty())
+            verifyInventoryPriority(
+                inventoryLeftover, workOrdersNative, supplies,
+                demandCustomerById = demandById.mapNotNull { (did, row) ->
+                    (row["customer_id"] as? String)?.trim()?.takeIf { it.isNotBlank() }?.let { did to it }
+                }.toMap(),
+            )
         else emptyList()
 
     // R11: wo_group_id orphan check — only when work_orders is available.
@@ -1960,10 +1967,16 @@ internal fun checkRunSoundnessStreaming(
             )
         else emptyList()
 
-    // R10 inventory priority
+    // R10 inventory priority — see checkRunSoundness's own identical call for why this uses the
+    // NATIVE work order list and a demand_id -> customer_id map.
     val inventoryPriorityViolations: List<String> =
-        if (inventoryLeftover.isNotEmpty() && workOrders.isNotEmpty())
-            verifyInventoryPriority(inventoryLeftover, workOrders, supplies)
+        if (inventoryLeftover.isNotEmpty() && workOrdersNative.isNotEmpty())
+            verifyInventoryPriority(
+                inventoryLeftover, workOrdersNative, supplies,
+                demandCustomerById = demandById.mapNotNull { (did, row) ->
+                    (row["customer_id"] as? String)?.trim()?.takeIf { it.isNotBlank() }?.let { did to it }
+                }.toMap(),
+            )
         else emptyList()
 
     // R11: from accumulated orphan gids

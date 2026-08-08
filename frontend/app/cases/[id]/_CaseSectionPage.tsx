@@ -994,9 +994,33 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     /** Count of WO groups pushed by ResourceScheduler.arbitrate.
      *  0 when global scheduling is off or nothing was contended. */
     resource_contention_pushed_wos?: number;
+    /** splitId -> the one real, case-uploaded supply_id it was materialized from, e.g.
+     *  "wip_280-1001_Q6J" -> "wip_280-1001" — an untargeted critical stock's split into a
+     *  permanent, target-named supply per target. Empty/absent for the vast majority of cases
+     *  (no critical stock, or none of it untargeted). Every supply_allocations/pegging/work_order
+     *  entry references the SPLIT id directly, never the original — use this map to roll a split
+     *  id's figures back up to the case's own supply row when displaying against it. */
+    critical_stock_origin?: Record<string, string>;
   } | null>(null);
   const [planLoading, setPlanLoading] = useState(false);
   const [planError, setPlanError] = useState<string | null>(null);
+
+  /**
+   * An untargeted critical stock (e.g. "wip_280-1001") is split at plan time into one PERMANENT,
+   * target-named supply per target ("wip_280-1001_Q6J", "wip_280-1001_Q6K") — every
+   * supply_allocations/pegging/work_order entry from here on references the split id directly,
+   * never the original the case was actually uploaded with. `critical_stock_origin` (splitId ->
+   * originalId) is how the backend tells us that mapping; resolve every supply_id read from
+   * planResult through this BEFORE using it as a lookup key, so a row keyed by the case's own
+   * "wip_280-1001" (from caseSupplies, which is never split) still finds its children's figures
+   * instead of silently showing 0. A no-op identity function for the vast majority of cases
+   * (empty/absent critical_stock_origin). Declared early (right after planResult's own state) so
+   * every memo below — including demandSummaryRows, which runs before the rest — can use it.
+   */
+  const resolveSplitOrigin = useMemo(() => {
+    const origin = planResult?.critical_stock_origin ?? {};
+    return (sid: string): string => origin[sid] ?? sid;
+  }, [planResult?.critical_stock_origin]);
 
   const [planPeggingOpen, setPlanPeggingOpen] = useState(false);
   const [planPeggingContext, setPlanPeggingContext] = useState<
@@ -1108,7 +1132,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     const invRows: WorkOrder[] = (planResult?.supply_allocations ?? [])
       .filter((a) => (a.qty_consumed ?? 0) > 0 && a.demand_id)
       .map((a): WorkOrder | null => {
-        const meta = supplyMeta.get(a.supply_id);
+        const meta = supplyMeta.get(resolveSplitOrigin(a.supply_id));
         if (!meta) return null;
         const key = `${meta.productId}|${meta.locationId}`;
         const customerId = a.demand_id ? customerByDemandId.get(a.demand_id) : undefined;
@@ -1126,7 +1150,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       })
       .filter((r): r is WorkOrder => r !== null);
     return [...woRows, ...invRows];
-  }, [planResult, caseSupplies]);
+  }, [planResult, caseSupplies, resolveSplitOrigin]);
   const [planSupplyTextFilter, setPlanSupplyTextFilter] = useState('');
   const [planSupplyUnusedOnly, setPlanSupplyUnusedOnly] = useState(false);
   const [planSupplyPartialOnly, setPlanSupplyPartialOnly] = useState(false);
@@ -3179,10 +3203,11 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const supplyConsumedMap = useMemo(() => {
     const m = new Map<string, number>();
     for (const a of planResult?.supply_allocations ?? []) {
-      m.set(a.supply_id, (m.get(a.supply_id) ?? 0) + a.qty_consumed);
+      const sid = resolveSplitOrigin(a.supply_id);
+      m.set(sid, (m.get(sid) ?? 0) + a.qty_consumed);
     }
     return m;
-  }, [planResult?.supply_allocations]);
+  }, [planResult?.supply_allocations, resolveSplitOrigin]);
 
   const demandCustomerMap = useMemo(() => {
     const m = new Map<string, string | null>();
@@ -3208,12 +3233,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     const m = new Map<string, Map<string, number>>();
     for (const a of planResult?.supply_allocations ?? []) {
       if (!a.demand_id || a.qty_allocated == null) continue;  // non-critical lots: no allocation concept
-      let dm = m.get(a.supply_id);
-      if (!dm) { dm = new Map(); m.set(a.supply_id, dm); }
+      const sid = resolveSplitOrigin(a.supply_id);
+      let dm = m.get(sid);
+      if (!dm) { dm = new Map(); m.set(sid, dm); }
       dm.set(a.demand_id, a.qty_allocated);
     }
     return m;
-  }, [planResult?.supply_allocations]);
+  }, [planResult?.supply_allocations, resolveSplitOrigin]);
 
   // supply_id → demand_id → qty_consumed — used as peggedDemands fallback when planning_pegging
   // is not loaded inline (large runs stream pegging from DB). Separate from lotDemandAllocMap
@@ -3224,12 +3250,13 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       // Math.abs(): a negative_inventory leaf's qty_consumed is legitimately negative — see
       // addPegging's identical fix above.
       if (!a.demand_id || Math.abs(a.qty_consumed) <= 1e-9) continue;
-      let dm = m.get(a.supply_id);
-      if (!dm) { dm = new Map(); m.set(a.supply_id, dm); }
+      const sid = resolveSplitOrigin(a.supply_id);
+      let dm = m.get(sid);
+      if (!dm) { dm = new Map(); m.set(sid, dm); }
       dm.set(a.demand_id, (dm.get(a.demand_id) ?? 0) + a.qty_consumed);
     }
     return m;
-  }, [planResult?.supply_allocations]);
+  }, [planResult?.supply_allocations, resolveSplitOrigin]);
 
   /**
    * Map supply_id → SupplySplitInfo for supplies consumed by a consolidated WO.
@@ -3265,7 +3292,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
 
     const collectSupplies = (node: PlanningPeggingNode, acc: Set<string>): void => {
       if (node.type === 'supply' && node.supply_id && !node.supply_id.startsWith('consolidated_')) {
-        acc.add(node.supply_id);
+        acc.add(resolveSplitOrigin(node.supply_id));
       }
       for (const child of node.children ?? []) collectSupplies(child, acc);
     };
@@ -3352,16 +3379,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
         policySource: 'config',
       };
       const groupKey = `${info.groupProductId}|${info.groupLocationId}`;
-      const list = map.get(rec.supply_id);
+      const sid = resolveSplitOrigin(rec.supply_id);
+      const list = map.get(sid);
       if (!list) {
-        map.set(rec.supply_id, [info]);
+        map.set(sid, [info]);
       } else if (!list.some((x) => `${x.groupProductId}|${x.groupLocationId}` === groupKey)) {
         list.push(info);
       }
     }
 
     return map;
-  }, [planResult, planningConfig]);
+  }, [planResult, planningConfig, resolveSplitOrigin]);
 
   /** Inverted index: wo_group_id → list of resources this WO consumes, with daily load arrays.
    *  Built from cached resource-utilization data; empty map until the first BOR expand triggers fetch. */
@@ -3412,7 +3440,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
 
     const collectSupplies = (node: PlanningPeggingNode, acc: Set<string>): void => {
       if (node.type === 'supply' && node.supply_id && !node.supply_id.startsWith('consolidated_')) {
-        acc.add(node.supply_id);
+        acc.add(resolveSplitOrigin(node.supply_id));
       }
       for (const child of node.children ?? []) collectSupplies(child, acc);
     };
@@ -3446,15 +3474,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     // scope=leaf-only, so this loop is a no-op there.
     for (const rec of planResult.supply_level_allocations ?? []) {
       const label = `${rec.group_product_id}@${rec.group_location_id}`;
+      const sid = resolveSplitOrigin(rec.supply_id);
       for (const did of Object.keys(rec.per_demand_allocations)) {
         if (rec.per_demand_allocations[did] > 1e-9) {
-          map.set(`${rec.supply_id}|${did}`, label);
+          map.set(`${sid}|${did}`, label);
         }
       }
     }
 
     return map;
-  }, [planResult]);
+  }, [planResult, resolveSplitOrigin]);
 
   // supplyView (from plan_supply_allocation via backend) keyed by supply_id — used as
   // fallback when supplyPeggingMap is empty (pegging trees too large to load in-memory).

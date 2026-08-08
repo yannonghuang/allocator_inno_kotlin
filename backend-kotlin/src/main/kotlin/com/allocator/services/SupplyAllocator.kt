@@ -370,6 +370,11 @@ fun allocateSuppliesPerLot(
  *
  * Output shape is identical to [allocateSuppliesPerLot]'s (demandId → `"$pid|$lid|$supplyId"` /
  * `"$pid|$lid"` → qty), so [consumeFromInventory]/`legacyCommit` need no changes.
+ *
+ * Critical STOCK (as opposed to critical raw material) never reaches this function at all —
+ * [com.allocator.services.materializeCriticalStockSupply] resolves its target(s) up front and
+ * [consumeFromInventory]'s own direct target check is all that governs its consumption (plain FIFO
+ * among same-target demands, no per-lot budget, no scope). See that function's own doc.
  */
 internal fun allocateCriticalSuppliesPerLot(
     matrix: NeedsMatrix,
