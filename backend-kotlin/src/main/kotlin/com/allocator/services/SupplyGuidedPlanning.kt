@@ -241,25 +241,35 @@ internal fun computeCriticalStockPositions(
 }
 
 /**
- * Splits each real critical-stock supply row into one virtual row per lot of its mandatory raw
- * material ([criticalStocks], from [computeCriticalStockPositions]) — Ramification 1's proportional
- * split, "stock_i(product, location, quantity × weight_i/Σweight, target = supply_i.target)".
+ * Splits each untargeted critical-stock supply row into one NEW, PERMANENT physical supply row
+ * per lot of its mandatory raw material ([criticalStocks], from [computeCriticalStockPositions]) —
+ * Ramification 1's proportional split, "stock_i(product, location, quantity × weight_i/Σweight,
+ * target = supply_i.target)". e.g. `wip_280-1001` (target-less, ambiguous between Q6J and Q6K)
+ * becomes TWO real, independent supplies, `wip_280-1001_Q6J` and `wip_280-1001_Q6K` — not a
+ * transient view that gets collapsed back into the original id at the end of a pass.
+ *
+ * Called once, early, via [materializeCriticalStockSupply] — its output REPLACES the untargeted
+ * stock row in the real `data["supply"]` the whole planning pass (pegging, work orders, the
+ * inventory pool [consumeFromInventory] draws from) runs against. Once split, each new row is a
+ * critical stock exactly like any other already-targeted one (e.g. `wip_280-0001`) — it never
+ * rejoins the original id, and never participates in the critical-material allocation table (see
+ * [materializeCriticalStockSupply]'s own doc); [consumeFromInventory]'s own direct target check is
+ * all that governs it from here on.
  *
  * [rawLotAllocatedTotals] (real raw-material `supply_id` → its current effective total) would let
  * the split track the raw material's CURRENT allocation rather than its static physical `qty` —
- * kept as a parameter for that purpose, but [buildSupplyAllocation] (this function's one caller)
- * always passes an empty map now: `case_allocation` no longer persists a critical-stock-aware
- * allocation total to read (it stores TSA INPUT rows — qty_cap/target per RAW lot only, never
- * critical stock — see `Allocation.kt`'s `CaseAllocRow`/`generateDefaultTsaRows` doc), so every
- * call falls back to each raw lot's own physical `qty` — the plain Ramification-1 formula.
+ * kept as a parameter for that purpose, but [materializeCriticalStockSupply] (this function's one
+ * caller) always passes an empty map now: `case_allocation` no longer persists a critical-stock-
+ * aware allocation total to read (it stores TSA INPUT rows — qty_cap/target per RAW lot only,
+ * never critical stock — see `Allocation.kt`'s `CaseAllocRow`/`generateDefaultTsaRows` doc), so
+ * every call falls back to each raw lot's own physical `qty` — the plain Ramification-1 formula.
  *
- * Every virtual row is synthetic, product/location/date-identical to the real row it splits, with
- * `supply_id = "$realSupplyId#$i"` and `target` inherited from the raw material lot it corresponds
- * to. Non-critical-stock rows, and critical-stock rows whose mandatory material has zero weight to
- * split against, pass through completely unchanged. The returned `virtualSid -> realSid` map lets
- * the caller collapse budgets keyed by a virtual id back to the one real, physical supply_id every
- * downstream consumer (`consumeFromInventory`, `case_allocation`) actually knows about — see
- * `buildSupplyAllocation`'s own collapse step, right after `allocateCriticalSuppliesPerLot`.
+ * Every split row is otherwise product/location/date-identical to the row it splits from, with
+ * `supply_id = "${realSupplyId}_$target"` and `target` inherited from the raw material lot it
+ * corresponds to. Non-critical-stock rows, and critical-stock rows whose mandatory material has
+ * zero weight to split against, pass through completely unchanged. The returned
+ * `splitSid -> originalSid` map is purely for traceability (e.g. "this split lot originated from
+ * wip_280-1001") — nothing collapses split ids back to it anymore.
  */
 internal fun expandCriticalStockSupplies(
     supplies: List<Map<String, Any?>>,
@@ -323,7 +333,15 @@ internal fun expandCriticalStockSupplies(
 
         for ((i, weightedLot) in weightedLots.withIndex()) {
             val (lot, weight) = weightedLot
-            val virtualSid = "$realSid#$i"
+            // Stable, target-named id ("wip_280-1001_Q6J") rather than an index-suffixed one
+            // ("wip_280-1001#0") — this is now a PERMANENT physical supply in its own right (see
+            // materializeCriticalStockSupply's own doc), not a transient view collapsed back to
+            // one real id at the end of a pass, so it needs an identity that means something on
+            // its own to a pegging tree, a WO, or the soundness checker. Falls back to the old
+            // index suffix only in the (practically unreachable) case a raw lot has no target of
+            // its own despite being eligible weight — see this function's own hard invariants.
+            val lotTarget = (lot["target"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+            val virtualSid = if (lotTarget != null) "${realSid}_$lotTarget" else "$realSid#$i"
             val virtualRow = row.toMutableMap()
             virtualRow["supply_id"] = virtualSid
             virtualRow["qty"] = qty * (weight / totalWeight)
@@ -334,6 +352,53 @@ internal fun expandCriticalStockSupplies(
     }
 
     return expanded to virtualToReal
+}
+
+/**
+ * Materializes untargeted critical stock's [expandCriticalStockSupplies] split into the REAL
+ * `data["supply"]` the whole planning pass runs against — called once, early (see
+ * `runPlanningOnePass`'s own call site), before either the pre-planning allocation table or the
+ * real inventory pool ([consumeFromInventory]) is built, so both agree on the same physical rows.
+ *
+ * This is the mechanism that keeps critical stock OUT of the critical-material allocation table
+ * (`allocateCriticalSuppliesPerLot`/`criticalMatrix`) while still resolving its target correctly:
+ * a critical stock traces back to its LATEST dependent critical-raw-material allocation(s) to
+ * identify its target(s) ([expandCriticalStockSupplies]/[selectHistoricalWeightLots]/
+ * [latestDatedSupplyLots]) — an ALREADY-targeted stock needs no tracing (its one real row already
+ * carries its one real target); an untargeted stock (e.g. cases/inno2026_2's wip_280-1001) is
+ * genuinely ambiguous and gets split into one real row per inherited target/lot. Either way, once
+ * every critical-stock row has a real `target` field of its own, [consumeFromInventory]'s direct
+ * target check is all that's needed to keep it correctly restricted to matching demand — no
+ * scoping, no per-lot budget, no separate allocation-table participation. Consumption order among
+ * same-target competing demands is then whatever [consumeFromInventory]'s own date sort already
+ * does — plain FIFO (a `"wip"` `supply_date` sorts as earliest, so it's drawn before any dated
+ * lot), not this table's proportional/latest-lot-first split.
+ *
+ * Returns [data] unchanged (and an empty map) whenever there's no critical stock to split — a
+ * pure no-op for the vast majority of cases, same hard early-exit every other TARGET-aware
+ * behavior in this file relies on. A split row's `supply_id` (e.g. `wip_280-1001_Q6J`) is
+ * PERMANENT for the rest of this run — pegging trees, work orders, and persisted
+ * `supply_allocations`/`inventory_leftover` all reference it directly, never the original id it
+ * split from. This is deterministic and idempotent (a pure function of `data`/`config`), so the
+ * soundness checker — which independently reloads case data rather than reusing a run's own
+ * materialized supply — gets the exact same split by calling this same function itself; see its
+ * own call site in `Allocate.kt`.
+ */
+internal fun materializeCriticalStockSupply(
+    data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
+): Pair<Map<String, List<Map<String, Any?>>>, Map<String, String>> {
+    val criticalStocks = computeCriticalStockPositions(data, config)
+    if (criticalStocks.isEmpty()) return data to emptyMap()
+    val (expandedSupplies, virtualToReal) = expandCriticalStockSupplies(
+        supplies = data["supply"] ?: emptyList(),
+        criticalStocks = criticalStocks,
+        rawLotAllocatedTotals = emptyMap(),
+        data = data,
+        config = config,
+    )
+    if (virtualToReal.isEmpty()) return data to emptyMap()
+    return (data + ("supply" to expandedSupplies)) to virtualToReal
 }
 
 /**
@@ -389,10 +454,10 @@ internal fun selectHistoricalWeightLots(
  * two-earliest-dates fallback, or a lookback window wide enough to span more than one real dated
  * lot) should already have been absorbed by downstream WIP or by demands themselves, so it
  * contributes no weight. A no-op when every candidate lot already shares one date (the common
- * case — see every existing [expandCriticalStockSupplies] fixture). Shared by both
- * [expandCriticalStockSupplies] (the real proportional allocation split) and
- * [com.allocator.services.computeCriticalStockCells] (the advisory scope reconstruction), so the
- * two can never disagree about which lots a stock's split is weighted against.
+ * case — see every existing [expandCriticalStockSupplies] fixture). Used by
+ * [expandCriticalStockSupplies] — the real, only remaining proportional-split mechanism for
+ * critical stock (see [materializeCriticalStockSupply]'s own doc for why there's no longer a
+ * separate advisory computation of this).
  */
 internal fun latestDatedSupplyLots(lots: List<Map<String, Any?>>): List<Pair<LocalDate, Map<String, Any?>>> {
     val dated = lots.mapNotNull { lot -> parseDate(lot["supply_date"] as? String)?.let { it to lot } }
@@ -431,119 +496,6 @@ internal fun collapseCriticalStockBudgets(
 }
 
 /**
- * One "qualified cell" of a critical stock: a (product, location, target, quantity) slice tied to
- * one specific raw-material supply lot, with the reconstructed [scopeStart]..[scopeEnd] window that
- * lot's WIP is presumed to cover:
- * ```
- * start    = horizon_start + daysToFinishedGood(stock.product, stock.location)
- * coverage = date(nextSupply)   -   date(rawSupply)
- * end      = start + coverage
- * ```
- * "rawSupply" is the specific mandatory-raw-material lot this stock's quantity is tied to — its
- * "dependent raw alloc" — and "nextSupply" is the next dated lot of that same raw material/target
- * after it, i.e. the point the following planning cycle's own allocation would have taken over.
- *
- * An already-targeted stock row (e.g. wip_280-0001, target=Q6J) is never split — it stays one cell
- * at its full quantity, tied to the latest same-target raw lot on/before its own lookback date (see
- * [selectHistoricalWeightLots]), or the earliest available lot if none qualifies.
- *
- * An untargeted stock (e.g. wip_280-1001) yields one cell per lot [selectHistoricalWeightLots]
- * selects — the exact same Ramification-1 proportional split [expandCriticalStockSupplies] already
- * performs for allocation purposes — since each split fraction inherits a different target (and
- * therefore a different raw lot / scope) from the raw material lot it's weighted against.
- *
- * [nextSupplyDate] (and therefore [scopeEnd]) is null when a cell's raw lot is the last dated lot of
- * its target — an open-ended scope, not a bug: there's no "next cycle" yet to bound it.
- */
-internal data class CriticalStockCell(
-    val stockSupplyId: String,
-    val productId: String,
-    val locationId: String,
-    val target: String?,
-    val quantity: Double,
-    val rawSupplyId: String,
-    val rawSupplyDate: LocalDate,
-    val nextSupplyDate: LocalDate?,
-    val scopeStart: LocalDate,
-    val scopeEnd: LocalDate?,
-)
-
-/** Computes every [CriticalStockCell] for the case — see that type's own doc for the model. Empty
- *  whenever [computeCriticalStockPositions] finds no critical stock (its own hard early-exit), same
- *  as every other TARGET-aware behavior in this file. */
-internal fun computeCriticalStockCells(
-    data: Map<String, List<Map<String, Any?>>>,
-    config: Map<String, Any?>?,
-): List<CriticalStockCell> {
-    val criticalStocks = computeCriticalStockPositions(data, config)
-    if (criticalStocks.isEmpty()) return emptyList()
-
-    val horizonStart = resolveHorizonStart(config, data["demand"] ?: emptyList()) ?: return emptyList()
-    val supplies = data["supply"] ?: emptyList()
-
-    fun nextDateAfter(pid: String, lid: String, target: String?, after: LocalDate): LocalDate? =
-        supplies.mapNotNull { row ->
-            if ((row["product_id"] as? String)?.trim() != pid) return@mapNotNull null
-            if ((row["location_id"] as? String)?.trim() != lid) return@mapNotNull null
-            if ((row["target"] as? String)?.trim()?.takeIf { it.isNotBlank() } != target) return@mapNotNull null
-            parseDate(row["supply_date"] as? String)
-        }.filter { it.isAfter(after) }.minOrNull()
-
-    val cells = mutableListOf<CriticalStockCell>()
-    for (row in supplies) {
-        val pid = (row["product_id"] as? String)?.trim() ?: continue
-        val lid = (row["location_id"] as? String)?.trim() ?: continue
-        val qty = (row["qty"] as? Number)?.toDouble() ?: continue
-        val sid = (row["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: continue
-        if (qty <= 0) continue
-        val rawKey = criticalStocks[SupplyKey(pid, lid)] ?: continue
-        val ownTarget = (row["target"] as? String)?.trim()?.takeIf { it.isNotBlank() }
-
-        val rawLotsAll = supplies.filter { r ->
-            (r["product_id"] as? String)?.trim() == rawKey.productId &&
-                (r["location_id"] as? String)?.trim() == rawKey.locationId
-        }
-        val startDate = horizonStart.plusDays(daysToFinishedGood(pid, lid, data).toLong())
-
-        if (ownTarget != null) {
-            val candidates = rawLotsAll.filter { (it["target"] as? String)?.trim() == ownTarget }
-            val selected = selectHistoricalWeightLots(pid, lid, rawKey.productId, rawKey.locationId, candidates, data, config)
-            val (lotDate, lot) = latestDatedSupplyLots(selected).firstOrNull() ?: continue
-            val lotSid = (lot["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: continue
-            val next = nextDateAfter(rawKey.productId, rawKey.locationId, ownTarget, lotDate)
-            cells.add(CriticalStockCell(
-                stockSupplyId = sid, productId = pid, locationId = lid, target = ownTarget, quantity = qty,
-                rawSupplyId = lotSid, rawSupplyDate = lotDate, nextSupplyDate = next,
-                scopeStart = startDate,
-                scopeEnd = next?.let { startDate.plusDays(it.toEpochDay() - lotDate.toEpochDay()) },
-            ))
-        } else {
-            val selected = selectHistoricalWeightLots(pid, lid, rawKey.productId, rawKey.locationId, rawLotsAll, data, config)
-            val weighted = latestDatedSupplyLots(selected).mapNotNull { (lotDate, lot) ->
-                val lotSid = (lot["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                val lotQty = (lot["qty"] as? Number)?.toDouble() ?: 0.0
-                if (lotQty <= 0) null else Triple(lotDate to lot, lotSid, lotQty)
-            }
-            val totalWeight = weighted.sumOf { it.third }
-            if (totalWeight <= 0) continue
-            for ((dateAndLot, lotSid, lotQty) in weighted) {
-                val (lotDate, lot) = dateAndLot
-                val lotTarget = (lot["target"] as? String)?.trim()?.takeIf { it.isNotBlank() }
-                val next = nextDateAfter(rawKey.productId, rawKey.locationId, lotTarget, lotDate)
-                cells.add(CriticalStockCell(
-                    stockSupplyId = sid, productId = pid, locationId = lid, target = lotTarget,
-                    quantity = qty * (lotQty / totalWeight),
-                    rawSupplyId = lotSid, rawSupplyDate = lotDate, nextSupplyDate = next,
-                    scopeStart = startDate,
-                    scopeEnd = next?.let { startDate.plusDays(it.toEpochDay() - lotDate.toEpochDay()) },
-                ))
-            }
-        }
-    }
-    return cells
-}
-
-/**
  * Pure allocation step: BOM reachability walk + proportional supply split.
  * Does NOT touch inventory — no side effects on the supply pool.
  *
@@ -569,13 +521,10 @@ internal fun buildSupplyAllocation(
     val data = applyTsaOverrides(data, tsaOverrides ?: parseTsaOverridesFromConfig(config))
 
     // Critical-materials identification (done before BOM walk so the walk can prune early) — see
-    // computeCriticalPids's own doc for the per-location rule.
+    // computeCriticalPids's own doc for the per-location rule. Critical STOCK is deliberately NOT
+    // included here (no criticalStockKeys param) — it never becomes a criticalMatrix column; see
+    // materializeCriticalStockSupply's own doc for where its target instead gets resolved.
     val criticalPids: Set<String> = computeCriticalPids(data, config)
-    // Critical stock: on-hand inventory of an otherwise-elastic product that's nonetheless
-    // structurally guaranteed to derive from one specific critical, TARGETed raw material — see
-    // computeCriticalStockPositions's own doc. Empty whenever the case has no TARGET usage at all
-    // (its own hard early-exit), so this is a no-op for the vast majority of cases.
-    val criticalStocks: Map<SupplyKey, SupplyKey> = computeCriticalStockPositions(data, config)
 
     // Step 1 — BOM reachability: build full graph (for unmapped-demand check), then build
     // the critical-only matrix in one pass by pruning non-critical supply leaves during walk.
@@ -589,7 +538,7 @@ internal fun buildSupplyAllocation(
             unmappedDemands.joinToString { d -> "${d["demand_id"]}(qty=${d["quantity"]})" },
         )
     }
-    val criticalMatrix = buildReachabilityMatrix(demands, graph, criticalPids = criticalPids, criticalStockKeys = criticalStocks.keys)
+    val criticalMatrix = buildReachabilityMatrix(demands, graph, criticalPids = criticalPids)
     log.info(
         "[supply-guided] critical matrix: {} supply columns ({} critical product ids) of {} total",
         criticalMatrix.byColumn.size, criticalPids.size, requestMatrix.byColumn.size,
@@ -673,39 +622,19 @@ internal fun buildSupplyAllocation(
     // when the new path ran unconditionally for every critical material in every case.
     val hasTargetedSupply = hasAnyTargetedSupply(data)
     val perLotBudgets = if (hasTargetedSupply) {
-        // Critical stock's real physical lots are replaced by virtual per-target sub-lots here
-        // (Ramification 1's split — see expandCriticalStockSupplies's own doc), so
-        // allocateCriticalSuppliesPerLot competes demands for them exactly like any other
-        // TARGETed critical-material lot. rawLotAllocatedTotals is always empty (see
-        // expandCriticalStockSupplies's own doc) — case_allocation only ever stores TSA rows for
-        // genuinely raw lots now, never critical stock, so there's nothing DB-backed to weight
-        // the split against; it always falls back to each raw lot's own physical qty.
-        val (expandedSupplies, virtualToReal) = expandCriticalStockSupplies(
-            supplies              = data["supply"] ?: emptyList(),
-            criticalStocks        = criticalStocks,
-            rawLotAllocatedTotals = emptyMap(),
-            data                  = data,
-            config                = config,
-        )
-        // Reconstructed coverage ceiling per critical-stock (product, location, target) cell —
-        // see computeCriticalStockCells's own doc. Keyed by the stock's own real supply_id (never
-        // a virtual "#i" sub-lot) so allocateCriticalSuppliesPerLot can match it directly off
-        // expandedSupplies' lot ids.
-        val criticalStockScopeEnds: Map<Pair<String, String?>, LocalDate> = computeCriticalStockCells(data, config)
-            .mapNotNull { cell -> cell.scopeEnd?.let { (cell.stockSupplyId to cell.target) to it } }
-            .toMap()
-        val rawBudgets = allocateCriticalSuppliesPerLot(
+        // Critical STOCK never reaches this table at all — computeCriticalStockPositions above
+        // feeds buildReachabilityMatrix's criticalPids only (raw materials), never a
+        // criticalStockKeys param, so no critical-stock SupplyKey is ever a criticalMatrix column
+        // here. Its target(s) were already resolved onto real supply rows upstream by
+        // materializeCriticalStockSupply (see that function's own doc), and its consumption is
+        // governed entirely by consumeFromInventory's own direct target check — plain FIFO among
+        // same-target demands, not this proportional/deadline-gated table.
+        allocateCriticalSuppliesPerLot(
             matrix    = criticalMatrix,
-            supplies  = expandedSupplies,
+            supplies  = data["supply"] ?: emptyList(),
             demands   = demands,
             data      = data,
-            criticalStockScopeEnds = criticalStockScopeEnds,
         )
-        // Collapse: every downstream consumer (case_allocation persistence, consumeFromInventory)
-        // must only ever see the real, physical supply_id — never a virtual "#i" sub-lot, which
-        // doesn't exist in the actual inventory pool. No-op (returns rawBudgets unchanged) when
-        // virtualToReal is empty, i.e. whenever criticalStocks is empty.
-        collapseCriticalStockBudgets(rawBudgets, virtualToReal)
     } else {
         allocateSuppliesPerLot(
             matrix           = criticalMatrix,

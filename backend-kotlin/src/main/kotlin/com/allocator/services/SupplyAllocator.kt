@@ -371,23 +371,16 @@ fun allocateSuppliesPerLot(
  * Output shape is identical to [allocateSuppliesPerLot]'s (demandId → `"$pid|$lid|$supplyId"` /
  * `"$pid|$lid"` → qty), so [consumeFromInventory]/`legacyCommit` need no changes.
  *
- * @param criticalStockScopeEnds Per critical-STOCK lot (not raw material) coverage ceiling — see
- *   [com.allocator.services.computeCriticalStockCells]'s own doc for the reconstructed-scope model.
- *   Keyed by (the stock row's OWN `supply_id` — real, e.g. "wip_280-1001", never a virtual "#i"
- *   sub-lot id, to `lot["target"]`). A WIP stock row's `supply_date` is never a real calendar date
- *   (e.g. the literal string "wip"), so [parseDate] on it always returns null — without this map,
- *   the plain [lotDate]-vs-[deadline] check below is silently skipped entirely for every
- *   critical-stock lot, letting it satisfy demand arbitrarily far in the future (confirmed live:
- *   cases/inno2026_2's wip_280-1001 was feeding demand three weeks past when the next raw
- *   allocation cycle should have taken over). Empty for every case with no critical stock — a
- *   pure no-op, identical to main.
+ * Critical STOCK (as opposed to critical raw material) never reaches this function at all —
+ * [com.allocator.services.materializeCriticalStockSupply] resolves its target(s) up front and
+ * [consumeFromInventory]'s own direct target check is all that governs its consumption (plain FIFO
+ * among same-target demands, no per-lot budget, no scope). See that function's own doc.
  */
 internal fun allocateCriticalSuppliesPerLot(
     matrix: NeedsMatrix,
     supplies: List<Map<String, Any?>>,
     demands: List<Map<String, Any?>>,
     data: Map<String, List<Map<String, Any?>>>,
-    criticalStockScopeEnds: Map<Pair<String, String?>, LocalDate> = emptyMap(),
 ): MutableMap<Any?, MutableMap<String, Double>> {
     val result = mutableMapOf<Any?, MutableMap<String, Double>>()
     val demandsById = demands.associateBy { it["demand_id"] }
@@ -402,7 +395,7 @@ internal fun allocateCriticalSuppliesPerLot(
         lotsByKey.getOrPut(SupplyKey(pid, lid)) { mutableListOf() }.add(row)
     }
 
-    data class DemandContext(val customerId: String?, val eligDate: LocalDate?, val deadline: LocalDate?, val reqDate: LocalDate?)
+    data class DemandContext(val customerId: String?, val eligDate: LocalDate?, val deadline: LocalDate?)
     for ((sk, demandNeeds) in matrix.byColumn) {
         val lots = lotsByKey[sk] ?: continue
         val aggKey = sk.toString()
@@ -429,7 +422,6 @@ internal fun allocateCriticalSuppliesPerLot(
                 customerId = (d["customer_id"] as? String)?.trim(),
                 eligDate = eligDate,
                 deadline = deadline,
-                reqDate = reqDate,
             )
         }
         if (remaining.isEmpty()) continue
@@ -452,22 +444,6 @@ internal fun allocateCriticalSuppliesPerLot(
                     if (ctx.customerId != lotTarget) return@filter false
                     val deadline = ctx.deadline
                     if (lotDate != null && deadline != null && lotDate.isAfter(deadline)) return@filter false
-                    // Critical-stock coverage ceiling (see this function's own doc): a WIP lot's
-                    // supply_id is never virtual-suffixed for a real dated raw lot, only for a
-                    // critical-stock split ("$realStockSid#$i") — substringBefore is a no-op for
-                    // the former, so this lookup only ever fires for actual critical-stock lots.
-                    // Compares against the demand's RAW reqDate — deliberately neither eligDate
-                    // (the period-bucket month-end extension, e.g. Q6J_CB_08/01/2026 -> 08/31,
-                    // would wrongly read a due-on-the-1st demand as needing material past scopeEnd
-                    // even though its real due date sits well inside it) NOR deadline (already
-                    // backs reqDate off by this SAME node's own cumulative lead time — but
-                    // scopeEnd is computed via daysToFinishedGood, which already walks that exact
-                    // lead time FORWARD into the ceiling, so subtracting it again from reqDate
-                    // double-counts it, quietly extending the ceiling by that many days — confirmed
-                    // live: wip_280-1001's scopeEnd=8/17 was still feeding 08/24 demand, exactly
-                    // its 7-day cumulative lead time past the intended boundary).
-                    val scopeEnd = criticalStockScopeEnds[supplyId.substringBefore('#') to lotTarget]
-                    if (scopeEnd != null && ctx.reqDate != null && ctx.reqDate.isAfter(scopeEnd)) return@filter false
                 } else {
                     // Untargeted lot (the common case): same period-bucket-aware date check as
                     // allocateSuppliesPerLot, no lead-time subtraction.

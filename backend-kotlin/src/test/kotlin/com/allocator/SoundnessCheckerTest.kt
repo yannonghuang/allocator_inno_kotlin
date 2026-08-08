@@ -2,6 +2,7 @@ package com.allocator
 
 import com.allocator.services.SoundnessConfig
 import com.allocator.services.checkRunSoundness
+import com.allocator.services.verifyInventoryPriority
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.collections.shouldContain
 import io.kotest.matchers.collections.shouldNotContain
@@ -967,5 +968,65 @@ class SoundnessCheckerTest : FunSpec({
         val d1 = report.demands.first { it.demandId == "D1" }
         d1.sound shouldBe false
         d1.violations.map { it.rule } shouldContain "R13_dominator_budget_exhausted"
+    }
+
+    // ── verifyInventoryPriority (R10) target-awareness ──────────────────────────
+    // Regression for a live false positive: an untargeted critical stock split into
+    // target-named permanent supplies (wip_280-1001_Q6J / wip_280-1001_Q6K — see
+    // materializeCriticalStockSupply's own doc) was reported as R10-unsound because the OLD
+    // (product_id, location_id)-only check conflated a WO built for one target's own shortfall
+    // with a completely different target's own, permanently-unreachable leftover.
+
+    test("verifyInventoryPriority: a targeted leftover lot is only flagged against a WO for the SAME target") {
+        val inventoryLeftover = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_Q6J", "qty" to 50.0),
+            mapOf<String, Any?>("supply_id" to "LOT_Q6K", "qty" to 100.0),
+        )
+        val supplies = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_Q6J", "product_id" to "M", "location_id" to "L", "supply_date" to "wip", "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "LOT_Q6K", "product_id" to "M", "location_id" to "L", "supply_date" to "wip", "target" to "Q6K"),
+        )
+        // Only a Q6J-targeted demand ever got a WO for M@L -- Q6K's own leftover has no WO it
+        // could ever have served, so it must never be flagged.
+        val workOrders = listOf(
+            mapOf<String, Any?>("product_id" to "M", "location_id" to "L", "method" to "make", "quantity" to 10.0, "start_time" to "2024-01-10", "demand_id" to "D_Q6J"),
+        )
+        val demandCustomerById = mapOf("D_Q6J" to "Q6J")
+
+        val violations = verifyInventoryPriority(inventoryLeftover, workOrders, supplies, demandCustomerById)
+
+        violations shouldHaveSize 1
+        violations[0] stringShouldContain "target=Q6J"
+        violations.none { it.contains("Q6K") } shouldBe true
+    }
+
+    test("verifyInventoryPriority: an untargeted leftover lot is still flagged against any WO at that component (unchanged behavior)") {
+        val inventoryLeftover = listOf(mapOf<String, Any?>("supply_id" to "LOT_A", "qty" to 25.0))
+        val supplies = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "M", "location_id" to "L", "supply_date" to "wip"),
+        )
+        val workOrders = listOf(
+            mapOf<String, Any?>("product_id" to "M", "location_id" to "L", "method" to "make", "quantity" to 10.0, "start_time" to "2024-01-10", "demand_id" to "D1"),
+        )
+        // No demandCustomerById entry for D1 at all (default) -- still flags, since the leftover
+        // lot itself carries no target and is therefore eligible against any WO regardless.
+        val violations = verifyInventoryPriority(inventoryLeftover, workOrders, supplies)
+
+        violations shouldHaveSize 1
+        violations[0].contains("target=") shouldBe false
+    }
+
+    test("verifyInventoryPriority: a targeted leftover lot with no matching-target WO is never flagged") {
+        val inventoryLeftover = listOf(mapOf<String, Any?>("supply_id" to "LOT_Q6K", "qty" to 100.0))
+        val supplies = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_Q6K", "product_id" to "M", "location_id" to "L", "supply_date" to "wip", "target" to "Q6K"),
+        )
+        val workOrders = listOf(
+            mapOf<String, Any?>("product_id" to "M", "location_id" to "L", "method" to "make", "quantity" to 10.0, "start_time" to "2024-01-10", "demand_id" to "D_Q6J"),
+        )
+        val demandCustomerById = mapOf("D_Q6J" to "Q6J")
+
+        val violations = verifyInventoryPriority(inventoryLeftover, workOrders, supplies, demandCustomerById)
+        violations shouldHaveSize 0
     }
 })

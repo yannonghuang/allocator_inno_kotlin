@@ -1475,13 +1475,14 @@ class SupplyGuidedPlanningTest : FunSpec({
             data["supply"]!!, criticalStocks, rawLotAllocatedTotals = emptyMap(), data = data, config = noPurchaseConfig,
         )
 
-        val virtualRows = expanded.filter { (it["supply_id"] as String).startsWith("LOT_M#") }
-        virtualRows.size shouldBe 2
+        val splitRows = expanded.filter { (it["supply_id"] as String).startsWith("LOT_M_") }
+        splitRows.size shouldBe 2
+        splitRows.map { it["supply_id"] }.toSet() shouldBe setOf("LOT_M_Q6J", "LOT_M_Q6K")
         virtualToReal.values.toSet() shouldBe setOf("LOT_M")
-        val byTarget = virtualRows.associate { it["target"] to (it["qty"] as Double) }
+        val byTarget = splitRows.associate { it["target"] to (it["qty"] as Double) }
         byTarget["Q6J"] shouldBe (80902.67202087476 plusOrMinus 1e-4)
         byTarget["Q6K"] shouldBe (6110.327979125241 plusOrMinus 1e-4)
-        // The real physical row is gone, replaced by its virtual sub-lots.
+        // The real physical row is gone, replaced by its two new, permanent, target-named rows.
         expanded.none { it["supply_id"] == "LOT_M" } shouldBe true
     }
 
@@ -1570,37 +1571,10 @@ class SupplyGuidedPlanningTest : FunSpec({
             rawLotAllocatedTotals = mapOf("LOT_A" to 50.0, "LOT_B" to 50.0),
             data = data, config = noPurchaseConfig,
         )
-        val byTarget = expanded.filter { (it["supply_id"] as String).startsWith("LOT_M#") }
+        val byTarget = expanded.filter { (it["supply_id"] as String).startsWith("LOT_M_") }
             .associate { it["target"] to (it["qty"] as Double) }
         byTarget["CUST_A"] shouldBe (50.0 plusOrMinus 1e-6)
         byTarget["CUST_B"] shouldBe (50.0 plusOrMinus 1e-6)
-    }
-
-    test("buildSupplyAllocation: critical stock budgets collapse to the real supply_id and respect the inherited target split") {
-        val xLots = listOf(
-            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 90.0, "target" to "CUST_A"),
-            mapOf<String, Any?>("supply_id" to "LOT_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 10.0, "target" to "CUST_B"),
-        )
-        // Demand well beyond either raw lot's share, so both sides are scarce/fully-subscribed —
-        // matches cases/inno2026_2's own regime (see the worked example in the plan).
-        val demands = listOf(
-            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P1", "location_id" to "L", "quantity" to 1000.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_A"),
-            mapOf<String, Any?>("demand_id" to "DB", "product_id" to "P2", "location_id" to "L", "quantity" to 1000.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_B"),
-        )
-        val data = sharedStockData(100.0, xLots, demands)
-        val alloc = buildSupplyAllocation(demands, data, noPurchaseConfig)
-
-        // No virtual "#i" key ever leaks into the final budgets — proves the collapse step ran.
-        val allKeys = alloc.perLotBudgets.values.flatMap { it.keys }
-        allKeys.none { it.contains("#") } shouldBe true
-
-        // DA (CUST_A) gets (up to) its fair share of M's Q6J-side split; DB (CUST_B) is capped out
-        // of it entirely — the actual regression this feature exists to fix (today, ignoring
-        // target, either demand could exhaust the shared stock FIFO regardless of target).
-        val daM = alloc.perLotBudgets["DA"]?.get("M|L|LOT_M")
-        val dbM = alloc.perLotBudgets["DB"]?.get("M|L|LOT_M")
-        daM shouldBe (90.0 plusOrMinus 1e-6)
-        dbM shouldBe (10.0 plusOrMinus 1e-6)
     }
 
     test("buildSupplyAllocation: a case with no TARGET usage anywhere is unaffected by critical-stock detection") {
@@ -1619,13 +1593,15 @@ class SupplyGuidedPlanningTest : FunSpec({
         alloc.criticalMatrix.byColumn.keys.contains(SupplyKey("M", "L")) shouldBe false
     }
 
-    // ── J. Critical stock qualified cells ───────────────────────────────────────
-    // Reconstructs each critical-stock WIP row's coverage window from the previous planning
-    // cycle: start = horizon_start + daysToFinishedGood(stock.product); coverage = date(next raw
-    // lot) - date(the raw lot the stock's own pegging tree draws against); end = start + coverage.
-    // Fixture below is cases/inno2026_2 itself, transcribed verbatim (same products, BOM, lead
-    // times/yields, raw-lot dates/qtys, WIP rows) so this test doubles as a regression check
-    // against the real case's own numbers.
+    // ── J. Critical stock: materialize + FIFO consumption (no scoping, no allocation table) ────
+    // A critical stock traces back to its LATEST dependent critical-raw-material allocation(s) to
+    // identify its target(s) — reusing expandCriticalStockSupplies's existing split, now called
+    // once, early (materializeCriticalStockSupply), to produce REAL supply rows the whole planning
+    // pass runs against, not merely a transient budget-computation view. An already-targeted stock
+    // needs no tracing (its one real row already has its one real target). Either way, once every
+    // critical-stock row has a real target, it's pulled OUT of the critical-material allocation
+    // table entirely (no criticalMatrix column, no per-lot budget, no scope) — consumeFromInventory's
+    // own direct target check plus its plain date-FIFO sort are all that govern its consumption.
 
     fun inno2026_2Data(): Map<String, List<Map<String, Any?>>> = mkData(
         bom = listOf(
@@ -1686,123 +1662,125 @@ class SupplyGuidedPlanningTest : FunSpec({
         ),
     )
 
-    test("computeCriticalStockCells: horizon_start resolves to the last day of the prior month (auto)") {
-        // Earliest demand is 2026-08-01 -> horizon_start = 2026-07-31, same "auto" convention
-        // resolveHorizonStart already uses everywhere else.
-        val cells = computeCriticalStockCells(inno2026_2Data(), noPurchaseConfig)
-        cells.map { it.scopeStart }.distinct().toSet() shouldBe setOf(
-            java.time.LocalDate.of(2026, 7, 31),
-            java.time.LocalDate.of(2026, 8, 6),
-            java.time.LocalDate.of(2026, 8, 7),
+    test("materializeCriticalStockSupply: no critical stock -> data returned unchanged") {
+        val data = mkData(demands = listOf(demand("D1", "M", "L", 10.0)))
+        val (out, virtualToReal) = materializeCriticalStockSupply(data, noPurchaseConfig)
+        out shouldBe data
+        virtualToReal.isEmpty() shouldBe true
+    }
+
+    test("materializeCriticalStockSupply: an already-targeted stock passes through as one real row, unsplit") {
+        val xLots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 377349.0, "target" to "Q6J"),
+            mapOf<String, Any?>("supply_id" to "LOT_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 28500.0, "target" to "Q6K"),
         )
+        val data = mkData(
+            supplies = xLots + listOf(
+                mapOf<String, Any?>("supply_id" to "LOT_M", "product_id" to "M", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 37961.0, "target" to "Q6J"),
+            ),
+            methodMake = listOf(mapOf("bom_id" to "BM", "product_id" to "M", "location_id" to "L", "preference" to 1)),
+            methodBuy  = listOf(mapOf("product_id" to "X", "location_id" to "L", "preference" to 1)),
+            bom        = listOf(mapOf("bom_id" to "BM", "parent_id" to "M", "child_id" to "X", "rate" to 1.0, "alt_group" to null)),
+        )
+        val (out, virtualToReal) = materializeCriticalStockSupply(data, noPurchaseConfig)
+        virtualToReal.isEmpty() shouldBe true
+        val mRow = out["supply"]!!.single { it["supply_id"] == "LOT_M" }
+        mRow["qty"] shouldBe (37961.0 plusOrMinus 1e-9)
+        mRow["target"] shouldBe "Q6J"
     }
 
-    test("computeCriticalStockCells: an already-targeted stock (wip_280-0001, Q6J) stays a single cell") {
-        val cells = computeCriticalStockCells(inno2026_2Data(), noPurchaseConfig)
-        val stock = cells.single { it.stockSupplyId == "wip_280-0001" }
-        stock.target shouldBe "Q6J"
-        stock.quantity shouldBe (37961.0 plusOrMinus 1e-6)
-        stock.rawSupplyId shouldBe "RAW_QJ_0715"
-        stock.rawSupplyDate shouldBe java.time.LocalDate.of(2026, 7, 15)
-        stock.nextSupplyDate shouldBe java.time.LocalDate.of(2026, 7, 22)
-        // days_to_FG(280-0001) = 0 (everything above it — 500-0001, Q6J — has 0 lead time)
-        stock.scopeStart shouldBe java.time.LocalDate.of(2026, 7, 31)
-        stock.scopeEnd shouldBe java.time.LocalDate.of(2026, 8, 7)
+    test("materializeCriticalStockSupply: untargeted stock splits into real per-target rows, weighted by the latest raw lot") {
+        val xLots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 90.0, "target" to "CUST_A"),
+            mapOf<String, Any?>("supply_id" to "LOT_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 10.0, "target" to "CUST_B"),
+        )
+        val data = sharedStockData(100.0, xLots)
+        val (out, virtualToReal) = materializeCriticalStockSupply(data, noPurchaseConfig)
+        virtualToReal.values.toSet() shouldBe setOf("LOT_M")
+        val splitRows = out["supply"]!!.filter { (it["supply_id"] as String).startsWith("LOT_M_") }
+        splitRows.size shouldBe 2
+        splitRows.map { it["supply_id"] }.toSet() shouldBe setOf("LOT_M_CUST_A", "LOT_M_CUST_B")
+        out["supply"]!!.none { it["supply_id"] == "LOT_M" } shouldBe true
+        val byTarget = splitRows.associate { it["target"] to (it["qty"] as Double) }
+        byTarget["CUST_A"] shouldBe (90.0 plusOrMinus 1e-6)
+        byTarget["CUST_B"] shouldBe (10.0 plusOrMinus 1e-6)
     }
 
-    test("computeCriticalStockCells: wip_280-0002 (Q6K) and wip_280-1003 (Q4R) match the reconstructed scope") {
-        val cells = computeCriticalStockCells(inno2026_2Data(), noPurchaseConfig)
+    test("buildSupplyAllocation: critical stock is never a criticalMatrix column -- no allocation-table participation at all") {
+        val xLots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 90.0, "target" to "CUST_A"),
+            mapOf<String, Any?>("supply_id" to "LOT_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 10.0, "target" to "CUST_B"),
+        )
+        val demands = listOf(
+            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P1", "location_id" to "L", "quantity" to 1000.0, "request_due_time" to "2024-06-01", "customer_id" to "CUST_A"),
+        )
+        val data = sharedStockData(100.0, xLots, demands)
+        val alloc = buildSupplyAllocation(demands, data, noPurchaseConfig)
 
-        val s2 = cells.single { it.stockSupplyId == "wip_280-0002" }
-        s2.quantity shouldBe (4438.0 plusOrMinus 1e-6)
-        s2.rawSupplyDate shouldBe java.time.LocalDate.of(2026, 7, 15)
-        s2.nextSupplyDate shouldBe java.time.LocalDate.of(2026, 7, 22)
-        s2.scopeStart shouldBe java.time.LocalDate.of(2026, 7, 31)
-        s2.scopeEnd shouldBe java.time.LocalDate.of(2026, 8, 7)
-
-        // 280-0003/263-0071-31 has no lot dated before its lookback window (no pre-horizon history
-        // uploaded for this raw material) -> selectHistoricalWeightLots falls back to the two
-        // earliest available lots (8/1, 8/8); latestDatedOnly then takes just the later of those
-        // two (8/8) as "the" reference lot, same "only the latest matters" rule as everywhere else.
-        // Coverage (7d, to the next lot at 8/15) is unaffected either way.
-        val s3 = cells.single { it.stockSupplyId == "wip_280-0003" }
-        s3.rawSupplyDate shouldBe java.time.LocalDate.of(2026, 8, 8)
-        s3.nextSupplyDate shouldBe java.time.LocalDate.of(2026, 8, 15)
-        s3.scopeStart shouldBe java.time.LocalDate.of(2026, 7, 31)
-        s3.scopeEnd shouldBe java.time.LocalDate.of(2026, 8, 7)
-
-        // days_to_FG(280-1003) = 6 (its own parent 280-0003's make lead time)
-        val s5 = cells.single { it.stockSupplyId == "wip_280-1003" }
-        s5.quantity shouldBe (66730.0 plusOrMinus 1e-6)
-        s5.rawSupplyDate shouldBe java.time.LocalDate.of(2026, 8, 8)
-        s5.nextSupplyDate shouldBe java.time.LocalDate.of(2026, 8, 15)
-        s5.scopeStart shouldBe java.time.LocalDate.of(2026, 8, 6)
-        s5.scopeEnd shouldBe java.time.LocalDate.of(2026, 8, 13)
+        // M (the critical stock) is never a column.
+        alloc.criticalMatrix.byColumn.keys.contains(SupplyKey("M", "L")) shouldBe false
+        // No per-lot budget entry for M's own lot anywhere in the table.
+        alloc.perLotBudgets["DA"]?.keys?.none { it.startsWith("M|L") } ?: true shouldBe true
     }
 
-    test("computeCriticalStockCells: untargeted wip_280-1001 splits into 2 cells at the LATEST qualifying raw-lot date only") {
-        // 280-1001's lookback window (2026-07-24) would nominally admit FOUR historical lots
-        // (7/15 x2 + 7/22 x2 across both targets) — but only the latest date's lots (7/22) are
-        // used: earlier lots should already have been absorbed by downstream WIP or by demands
-        // themselves, so they carry no weight in reconstructing what THIS stock covers.
-        val cells = computeCriticalStockCells(inno2026_2Data(), noPurchaseConfig)
-        val stock1001 = cells.filter { it.stockSupplyId == "wip_280-1001" }
-        stock1001.size shouldBe 2
+    test("runPlanning: untargeted critical stock is split into two PERMANENT, target-named supplies, enforced directly by consumeFromInventory, no allocation-table budget needed") {
+        val xLots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 90.0, "target" to "CUST_A"),
+            mapOf<String, Any?>("supply_id" to "LOT_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 10.0, "target" to "CUST_B"),
+        )
+        // Small enough that each demand is fully satisfiable from M's own on-hand split share
+        // alone (90/10) -- purchase is disabled (noPurchaseConfig), so a demand big enough to
+        // need X's own make/buy path would hard-fail with zero credit (plan()'s waterfall has no
+        // partial-success concept when a method chain bottoms out at no_methods), which isn't
+        // what this test is trying to observe. Due dates are in the SAME month as the lots'
+        // 2024-01-01 supply_date -- runPlanningOnePass's own horizon floor (unlike
+        // buildSupplyAllocation, which every other fixture here only exercises directly) excludes
+        // any lot dated before horizon_start (auto: last day of the month before the EARLIEST
+        // demand), so a June due date would silently filter this whole stock out of the real
+        // inventory pool before it's ever reachable.
+        val demands = listOf(
+            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P1", "location_id" to "L", "quantity" to 50.0, "request_due_time" to "2024-01-15", "customer_id" to "CUST_A"),
+            mapOf<String, Any?>("demand_id" to "DB", "product_id" to "P2", "location_id" to "L", "quantity" to 5.0, "request_due_time" to "2024-01-15", "customer_id" to "CUST_B"),
+        )
+        val data = sharedStockData(100.0, xLots, demands)
 
-        val q6j = stock1001.single { it.target == "Q6J" }
-        val q6k = stock1001.single { it.target == "Q6K" }
+        val result = runPlanning(data, noPurchaseConfig)
+        @Suppress("UNCHECKED_CAST")
+        val supplyAllocations = result.output["supply_allocations"] as List<Map<String, Any?>>
 
-        // weighted 7500/(7500+11000) and 11000/(7500+11000) of the 87013 total
-        q6j.quantity shouldBe (87013.0 * 7500.0 / 18500.0 plusOrMinus 1e-6)
-        q6k.quantity shouldBe (87013.0 * 11000.0 / 18500.0 plusOrMinus 1e-6)
-        (q6j.quantity + q6k.quantity) shouldBe (87013.0 plusOrMinus 1e-6)
+        // materializeCriticalStockSupply's split rows are now PERMANENT physical supplies in
+        // their own right -- LOT_M_CUST_A / LOT_M_CUST_B -- not virtual ids collapsed back to
+        // "LOT_M" at the end of the run. The original "LOT_M" id never appears in output at all.
+        supplyAllocations.none { it["supply_id"] == "LOT_M" } shouldBe true
 
-        for (cell in stock1001) {
-            cell.rawSupplyDate shouldBe java.time.LocalDate.of(2026, 7, 22)
-            cell.nextSupplyDate shouldBe java.time.LocalDate.of(2026, 8, 1)
-            // days_to_FG(280-1001) = 7, same via either the Q6J or Q6K path (280-0001/280-0002
-            // both have their own 7-day lead, 500-000x/Q6J/Q6K all 0)
-            cell.scopeStart shouldBe java.time.LocalDate.of(2026, 8, 7)
-            cell.scopeEnd shouldBe java.time.LocalDate.of(2026, 8, 17)
-        }
+        val mDrawsByDemand = supplyAllocations.filter { it["supply_id"] == "LOT_M_CUST_A" || it["supply_id"] == "LOT_M_CUST_B" }
+            .groupBy { it["demand_id"] }
+            .mapValues { (_, rows) -> rows.sumOf { (it["qty_consumed"] as? Number)?.toDouble() ?: 0.0 } }
+
+        // DA (CUST_A) draws its full 50-unit need from LOT_M_CUST_A; DB (CUST_B) draws its full
+        // 5-unit need from LOT_M_CUST_B -- never the other's -- enforced now purely by
+        // consumeFromInventory's own direct target check, not by any per-lot budget table entry
+        // (there is none anymore -- see the test above).
+        (mDrawsByDemand["DA"] ?: 0.0) shouldBe (50.0 plusOrMinus 1e-6)
+        (mDrawsByDemand["DB"] ?: 0.0) shouldBe (5.0 plusOrMinus 1e-6)
+        supplyAllocations.single { it["demand_id"] == "DA" && it["supply_id"]?.toString()?.startsWith("LOT_M") == true }["supply_id"] shouldBe "LOT_M_CUST_A"
+        supplyAllocations.single { it["demand_id"] == "DB" && it["supply_id"]?.toString()?.startsWith("LOT_M") == true }["supply_id"] shouldBe "LOT_M_CUST_B"
     }
 
-    test("buildSupplyAllocation: wip_280-1001 stops feeding demand once its reconstructed scope (8/17) is behind it") {
-        // Regression for the live bug: a WIP row's supply_date is never a real date ("wip"), so
-        // parseDate returns null and the plain lotDate-vs-deadline eligibility check was silently
-        // skipped entirely for critical-stock lots — wip_280-1001 was feeding demand arbitrarily
-        // far into the future (confirmed live on cases/inno2026_2, run #1740: it was still
-        // allocating to 08/24/2026 demand). criticalStockScopeEnds now caps it at its own
-        // reconstructed scope end (8/17, per the test above), compared against the demand's own
-        // RAW due date — NOT a further lead-time-backed-off deadline (a second live regression:
-        // comparing against `deadline` = reqDate - 7 double-counted the SAME 7-day lead time
-        // daysToFinishedGood already folds forward into scopeEnd, quietly extending the ceiling to
-        // 8/24 instead of 8/17 — exactly the leak the live screenshot showed).
-        val early = mapOf<String, Any?>("demand_id" to "D_EARLY", "product_id" to "280-0001", "location_id" to "1000", "quantity" to 100.0, "priority" to 10, "request_due_time" to "2026-08-17", "customer_id" to "Q6J")
-        val late  = mapOf<String, Any?>("demand_id" to "D_LATE",  "product_id" to "280-0001", "location_id" to "1000", "quantity" to 100.0, "priority" to 10, "request_due_time" to "2026-08-18", "customer_id" to "Q6J")
-        val data = inno2026_2Data() + ("demand" to listOf(early, late))
-
-        val alloc = buildSupplyAllocation(data["demand"]!!, data, noPurchaseConfig)
-
-        val earlyFromWip1001 = alloc.perLotBudgets["D_EARLY"]?.get("280-1001|1000|wip_280-1001") ?: 0.0
-        val lateFromWip1001  = alloc.perLotBudgets["D_LATE"]?.get("280-1001|1000|wip_280-1001") ?: 0.0
-        (earlyFromWip1001 > 0.0) shouldBe true
-        lateFromWip1001 shouldBe (0.0 plusOrMinus 1e-9)
-    }
-
-    test("buildSupplyAllocation: a demand due on the 1st of the month isn't wrongly pushed past its own critical stock's scope") {
-        // Regression: Q6J_CB_08/01/2026 (cases/inno2026_2's own real demand row) is due 2026-08-01,
-        // squarely inside wip_280-0001's own scope [7/31, 8/07] — but request_due_time falling on
-        // the 1st of a month triggers this allocator's separate "period-bucket demand" convention
-        // (eligDate extended to end-of-month, 8/31), which the scopeEnd check must NOT use, or a
-        // demand due on the 1st looks like it needs the material as late as month-end and gets
-        // wrongly excluded even though its real due date is nowhere near the scope boundary.
+    test("runPlanning: an already-targeted critical stock (Q6J_CB_08/01/2026 against wip_280-0001) is still correctly consumed") {
+        // Regression for the live bug this whole feature started from: cases/inno2026_2's
+        // wip_280-0001 (target=Q6J) must still serve its own matching demand under the new,
+        // simpler model (no scoping, no allocation table -- just consumeFromInventory's direct
+        // target check).
         val demand = mapOf<String, Any?>("demand_id" to "Q6J_CB_08/01/2026", "product_id" to "280-0001", "location_id" to "1000", "quantity" to 5513.0, "priority" to 10, "request_due_time" to "2026-08-01", "customer_id" to "Q6J")
         val data = inno2026_2Data() + ("demand" to listOf(demand))
 
-        val alloc = buildSupplyAllocation(data["demand"]!!, data, noPurchaseConfig)
+        val result = runPlanning(data, noPurchaseConfig)
+        @Suppress("UNCHECKED_CAST")
+        val supplyAllocations = result.output["supply_allocations"] as List<Map<String, Any?>>
 
-        val fromWip0001 = alloc.perLotBudgets["Q6J_CB_08/01/2026"]?.get("280-0001|1000|wip_280-0001") ?: 0.0
+        val fromWip0001 = supplyAllocations.filter { it["supply_id"] == "wip_280-0001" && it["demand_id"] == "Q6J_CB_08/01/2026" }
+            .sumOf { (it["qty_consumed"] as? Number)?.toDouble() ?: 0.0 }
         (fromWip0001 > 0.0) shouldBe true
     }
 })

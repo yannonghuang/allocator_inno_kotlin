@@ -928,6 +928,26 @@ private fun consumeFromInventory(
      * earliest-first FIFO — main's original behavior, unchanged.
      */
     preferLatest: Boolean = false,
+    /**
+     * The calling demand's own customer_id — a plain, direct substitute for the per-lot budget-
+     * table enforcement critical STOCK used to rely on (see [computeCriticalStockPositions]'s own
+     * doc): critical stock is no longer a `criticalMatrix` column, so nothing upstream computes a
+     * perLotBudget cap for it anymore — this is now the ONLY place its target gets enforced.
+     *
+     * `null` (the default) means "don't target-filter at all" — every existing call site that
+     * doesn't pass this keeps seeing every bucket regardless of target, byte-for-byte unchanged
+     * (e.g. the diamond-split sizing probe's `existingSupplyOf`, which deliberately wants a
+     * demand-agnostic physical-quantity answer, not a specific demand's own eligibility).
+     *
+     * Any NON-null value (including `""` for a demand with a blank/missing customer_id — the
+     * caller must pass that explicitly, not omit the argument) switches filtering ON: a bucket
+     * whose own `target` field is set is only eligible when it equals this value; a bucket with
+     * no target is always eligible regardless. Applies to every targeted bucket, not just critical
+     * stock (harmless/redundant for critical RAW materials, which still get target-gated via their
+     * own perLotBudget from [allocateCriticalSuppliesPerLot] too — belt and suspenders, same
+     * result either way).
+     */
+    demandTarget: String? = null,
 ): List<ConsumedBucket> {
     val pid = productId.trim()
     val lid = locationId.trim()
@@ -988,9 +1008,14 @@ private fun consumeFromInventory(
     }
 
     // Fast path: use (pid,lid) index when available (IndexedInventory), avoiding O(N) scan.
-    val candidateBuckets: List<MutableMap<String, Any?>> =
+    val allCandidateBuckets: List<MutableMap<String, Any?>> =
         (inventory as? IndexedInventory)?.idx?.get(Pair(pid, lid))
             ?: inventory.filter { b -> b["product_id"]?.toString()?.trim() == pid && b["location_id"]?.toString()?.trim() == lid }
+    val candidateBuckets: List<MutableMap<String, Any?>> = if (demandTarget == null) allCandidateBuckets else
+        allCandidateBuckets.filter { b ->
+            val bucketTarget = (b["target"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+            bucketTarget == null || bucketTarget == demandTarget
+        }
 
     if (preferDemandId != null) {
         // Pass 1: tagged buckets for this demand only
@@ -3370,15 +3395,20 @@ fun plan(
 
     // 1) Fulfill from inventory (FIFO)
     val componentKey = "$productId|$locationId"
-    // Computed once, reused below both to decide "critical but no budget entries → banned, not
-    // uncapped" (immediately below) and for the draw order / ownLotRefs' own gate further down
-    // (consumeFromInventory's preferLatest doc). Critical STOCK joins critical raw material here —
-    // this is Ramification 2's consumption side in full: existing on-hand stock of an otherwise-
-    // elastic product follows the pre-planning allocation table exactly like a raw critical
-    // material, while a WO issued to REPLENISH it (a different (productId, locationId) — its own
-    // make method's other components) is evaluated fresh on its own merits below, staying FIFO
-    // unless independently critical. See computeCriticalStockPositions's own doc.
-    val isCriticalPosition = isRawCriticalPosition(productId, locationId, data, config) ||
+    // Raw critical material ONLY — critical STOCK is deliberately excluded here: it no longer
+    // participates in the critical-material allocation table at all (see
+    // materializeCriticalStockSupply's own doc) — its target(s), resolved onto real supply rows
+    // up front, are enforced directly by consumeFromInventory's own check, with plain FIFO among
+    // same-target demands otherwise, exactly like any other untracked position. Gates perLotBudget
+    // construction (immediately below) and the draw-order preferLatest gate further down
+    // (consumeFromInventory's own doc).
+    val isCriticalMaterial = isRawCriticalPosition(productId, locationId, data, config)
+    // Raw critical material OR critical stock — used ONLY for quantity_dominator reporting
+    // (ownLotRefs further down): a demand shortfall caused by exhausting a critical stock's own
+    // on-hand lot is still a real, citable cause even though its consumption isn't budget-gated
+    // anymore. Matches rawDominatorRefs's own isCriticalOrCriticalStock gate — the two must never
+    // disagree about which materials are worth citing as a dominator.
+    val isCriticalPosition = isCriticalMaterial ||
         ((data as? PlanData)?.idx?.criticalStockPositions?.contains(productId to locationId) == true)
     // Per-lot caps: collect all budget entries whose key starts with "$pid|$lid|".
     // Paired with perLotBudget: each lot's demand-wide-correct remaining BEFORE branch
@@ -3405,7 +3435,7 @@ fun plan(
         // isCriticalPosition — not "did the budget happen to have entries" — can tell those
         // apart; an empty-but-non-null map here makes every lot's own consumeFromInventory
         // lookup miss and fall to its "else -> 0.0" forbidden branch.
-        if (lotEntries.isEmpty() && !isCriticalPosition) null
+        if (lotEntries.isEmpty() && !isCriticalMaterial) null
         else if (lotEntries.isEmpty()) mutableMapOf()
         else {
             // Pass 1: each lot's demand-wide-correct remaining BEFORE branch narrowing —
@@ -3511,7 +3541,13 @@ fun plan(
     val hasTargetedSupply = (data as? PlanData)?.idx?.hasTargetedSupply ?: false
     val consumedBuckets = consumeFromInventory(
         inventory, productId, locationId, quantity, preferDemandId, null, perLotBudget,
-        preferLatest = isCriticalPosition && hasTargetedSupply,
+        preferLatest = isCriticalMaterial && hasTargetedSupply,
+        // Same case-wide gate as preferLatest above — null (no filtering) for any case that
+        // doesn't use TARGET at all, so this is a guaranteed no-op there (matches
+        // hasAnyTargetedSupply's own "byte-for-byte unchanged" guarantee everywhere else in this
+        // file). "" (never a real customer_id) for a demand with no customer_id of its own, so it
+        // correctly gets nothing from a targeted bucket rather than silently bypassing the check.
+        demandTarget = if (hasTargetedSupply) (demand["customer_id"] as? String)?.trim() ?: "" else null,
     )
     val taken = consumedBuckets.sumOf { it.qty }
     // Real, physical lots THIS node actually drew from — the informative, "688_M51-style"
@@ -4523,45 +4559,6 @@ internal fun aggregatePathToLeaf(
         }
     }
     return walk(fromPid, fromLid, 0)
-}
-
-/**
- * Cumulative make lead time from (pid, lid) UP to its finished-good root(s) — the mirror image of
- * [aggregatePathToLeaf]'s downward walk, used to reconstruct a critical stock's coverage window
- * (see [com.allocator.services.computeCriticalStockCells]'s own doc for the mental model). Sums each
- * ANCESTOR's own make lead time via bom.csv child_id -> parent_id edges, NOT [pid]'s own lead time —
- * [pid] is assumed already-built (on-hand WIP), so only the time remaining above it counts.
- *
- * A component reachable from more than one finished good (e.g. cases/inno2026_2's 280-1001, which
- * feeds both the Q6J and Q6K trees) takes the MAX across every reachable parent — conservative: never
- * assume WIP is available for consumption before the slowest reachable path could actually use it.
- * Returns 0.0 when [pid] has no BOM parent at all (it IS a finished good).
- */
-internal fun daysToFinishedGood(
-    pid: String,
-    lid: String,
-    data: Map<String, List<Map<String, Any?>>>,
-): Double {
-    val visited = mutableSetOf<String>()
-    fun walk(p: String, depth: Int): Double {
-        if (depth > 100 || !visited.add(p)) return 0.0
-        try {
-            val parents = (data["bom"] ?: emptyList())
-                .filter { (it["child_id"] as? String)?.trim() == p }
-                .mapNotNull { (it["parent_id"] as? String)?.trim()?.takeIf { x -> x.isNotBlank() } }
-                .distinct()
-            if (parents.isEmpty()) return 0.0
-            return parents.maxOf { parentPid ->
-                val parentLead = getMethods(parentPid, lid, data)
-                    .filter { it["type"] == "make" }
-                    .maxOfOrNull { leadDaysForMethod(it) } ?: 0.0
-                parentLead + walk(parentPid, depth + 1)
-            }
-        } finally {
-            visited.remove(p)
-        }
-    }
-    return walk(pid, 0)
 }
 
 private fun computeStartDt(
@@ -6787,6 +6784,19 @@ private fun runPlanningOnePass(
      *  (DemandOrderBuilder.kt), which computes this exact rule as its own KB-seeding formula. */
     demandOrder: Map<String, Int>? = null,
 ): RunPlanningResult {
+    // Critical stock's target(s) become real fields on real, PERMANENT supply rows here, before
+    // anything else in this pass touches data["supply"] — both the pre-planning allocation table
+    // (buildSupplyAllocation, below) and the real inventory pool (built right after this) need to
+    // agree on the same physical rows, and every output this pass produces (pegging, work orders,
+    // supply_allocations, inventory_leftover) references these split ids directly from here on —
+    // see materializeCriticalStockSupply's own doc. A no-op (data unchanged, empty map) for the
+    // vast majority of cases (no critical stock, or none of it untargeted). splitOrigin is
+    // persisted as `output["critical_stock_origin"]` so a UI built against the case's own
+    // (never-split) supply table — e.g. a row literally named "wip_280-1001" — can aggregate its
+    // split children ("wip_280-1001_Q6J", "wip_280-1001_Q6K") back under it instead of doing an
+    // exact supply_id match that silently finds nothing.
+    val (data, splitOrigin) = materializeCriticalStockSupply(data, config)
+
     // Negative-QTY supply rows represent pre-existing deficits, not fungible FIFO stock — split
     // them off here so they never enter the FIFO pool below (see NegativeInventoryLot's doc).
     // The rows stay in `data["supply"]` unchanged (untouched map), so SoundnessChecker's
@@ -7353,6 +7363,12 @@ private fun runPlanningOnePass(
         // to wait for contended resources. Zero when the feature flag is
         // off; > 0 when global scheduling actually moved at least one WO.
         "resource_contention_pushed_wos" to resourceContentionPushed,
+        // splitId -> the one real, case-uploaded supply_id it was materialized from (e.g.
+        // "wip_280-1001_Q6J" -> "wip_280-1001") — see materializeCriticalStockSupply's own doc.
+        // Empty for every case with no critical stock, or none of it untargeted. Lets a UI built
+        // against the case's own (never-split) supply table aggregate split rows back under the
+        // one it actually uploaded.
+        "critical_stock_origin"  to splitOrigin,
     )
     return RunPlanningResult(
         output = output,
@@ -8051,13 +8067,21 @@ internal fun verifyWoConservation(
 }
 
 /**
- * R10: inventory-priority check. For each (product_id, location_id) where the plan
- * created new work orders, verify that all timely physical supply inventory at that
- * component was consumed before resorting to new production.
+ * R10: inventory-priority check. For each (product_id, location_id[, target]) where the plan
+ * created new work orders, verify that all timely physical supply inventory at that component
+ * was consumed before resorting to new production.
  *
- * "Timely" means the supply lot's [supply_date] is on or before the earliest WO
- * [start_time] at the same component — i.e., the inventory was available when the
- * WO would have started and should have been drawn instead.
+ * "Timely" means the supply lot's [supply_date] is on or before the earliest APPLICABLE WO
+ * [start_time] at the same component — i.e., the inventory was available when a WO it could
+ * actually have served would have started, and should have been drawn instead. "Applicable"
+ * respects TARGET the same way [consumeFromInventory]'s own direct check does: an untargeted
+ * supply lot can serve ANY WO at that (pid, lid), targeted or not — byte-for-byte the same
+ * behavior as before this parameter existed, so a case with no TARGET usage anywhere sees zero
+ * change here. A TARGETED supply lot (e.g. a critical stock split like `wip_280-1001_Q6K` — see
+ * [com.allocator.services.materializeCriticalStockSupply]'s own doc for why that split exists)
+ * only counts a WO as applicable when that WO's own demand shares the SAME target — otherwise a
+ * WO built to cover a DIFFERENT target's own shortfall would wrongly indict this lot's leftover,
+ * which that WO's demand could never actually have drawn.
  *
  * Violations indicate the planner under-consumed existing stock and created
  * unnecessary WOs, which over-states production load and inflates WO count.
@@ -8067,20 +8091,27 @@ internal fun verifyWoConservation(
  *
  * @param inventoryLeftover   Compact inventory snapshot after all planning passes
  *        (supply_id + qty only, as persisted to [PlanRuns.inventoryLeftover]).
- * @param workOrders          Consolidated work orders from the plan output.
+ * @param workOrders          NATIVE (per-demand) work orders — deliberately NOT the consolidated
+ *        list: a consolidated WO can merge several demands (and therefore several targets) into
+ *        one row, which would make "this WO's own target" ambiguous. Each native row's
+ *        `demand_id` is a single, unambiguous value.
  * @param supplies            Full supply rows from case data ([data["supply"]]).
- *        Required to look up (product_id, location_id, supply_date) from supply_id.
+ *        Required to look up (product_id, location_id, supply_date, target) from supply_id.
+ * @param demandCustomerById  demand_id -> customer_id, for deriving each WO's own target from
+ *        the one demand it was built for. Defaults to empty (every WO then has a null derived
+ *        target, matching the pre-existing behavior exactly).
  */
 internal fun verifyInventoryPriority(
     inventoryLeftover: List<Map<String, Any?>>,
     workOrders: List<Map<String, Any?>>,
     supplies: List<Map<String, Any?>>,
+    demandCustomerById: Map<String, String> = emptyMap(),
     tolerance: Double = 1e-6,
 ): List<String> {
     if (inventoryLeftover.isEmpty() || workOrders.isEmpty()) return emptyList()
 
-    // supply_id → (product_id, location_id, supply_date)
-    data class SupplyMeta(val pid: String, val lid: String, val supplyDate: java.time.LocalDate?)
+    // supply_id → (product_id, location_id, supply_date, target)
+    data class SupplyMeta(val pid: String, val lid: String, val supplyDate: java.time.LocalDate?, val target: String?)
     val supplyMeta = mutableMapOf<String, SupplyMeta>()
     for (s in supplies) {
         val sid = s["supply_id"]?.toString() ?: continue
@@ -8089,7 +8120,8 @@ internal fun verifyInventoryPriority(
         val supplyDate = (s["supply_date"] as? String)?.let {
             runCatching { java.time.LocalDate.parse(it) }.getOrNull()
         }
-        supplyMeta[sid] = SupplyMeta(pid, lid, supplyDate)
+        val target = (s["target"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+        supplyMeta[sid] = SupplyMeta(pid, lid, supplyDate, target)
     }
 
     // Leftover qty by supply_id, skipping consolidated synthetic buckets.
@@ -8105,11 +8137,14 @@ internal fun verifyInventoryPriority(
     }
     if (leftoverBySupply.isEmpty()) return emptyList()
 
-    // Earliest WO start_time per component (pid|lid). Skip zero-qty, failed, and move WOs.
-    // Move WOs deliver supply to location_id (they create, not consume, inventory there), so they
-    // are irrelevant to the inventory-priority check: leftover stock at the destination does not
-    // imply the move was unnecessary — it may have been needed for a different downstream demand.
-    val woEarliestStart = mutableMapOf<String, java.time.LocalDate>()
+    // Every (non-move, non-failed, non-zero-qty) WO's own start date + derived target, grouped by
+    // component (pid|lid) — NOT collapsed to a single earliest date yet, since which WOs are
+    // "applicable" to a given leftover lot depends on THAT lot's own target (see this function's
+    // own doc). Move WOs deliver supply to location_id (they create, not consume, inventory
+    // there), so they're irrelevant here: leftover at the destination doesn't imply the move was
+    // unnecessary — it may have been needed for a different downstream demand.
+    data class WoStart(val start: java.time.LocalDate, val target: String?)
+    val woStartsByComponent = mutableMapOf<String, MutableList<WoStart>>()
     for (wo in workOrders) {
         val pid = (wo["product_id"] as? String)?.trim() ?: continue
         val lid = (wo["location_id"] as? String)?.trim() ?: continue
@@ -8119,32 +8154,42 @@ internal fun verifyInventoryPriority(
         val start = (wo["start_time"] as? String)?.let {
             runCatching { java.time.LocalDate.parse(it) }.getOrNull()
         } ?: continue
-        val key = "$pid|$lid"
-        val cur = woEarliestStart[key]
-        if (cur == null || start.isBefore(cur)) woEarliestStart[key] = start
+        val woTarget = wo["demand_id"]?.toString()?.let { demandCustomerById[it] }
+        woStartsByComponent.getOrPut("$pid|$lid") { mutableListOf() }.add(WoStart(start, woTarget))
     }
-    if (woEarliestStart.isEmpty()) return emptyList()
+    if (woStartsByComponent.isEmpty()) return emptyList()
 
-    // Accumulate timely leftover by component: leftover lots whose supply_date ≤ earliest WO start.
-    val timelyLeftoverByComponent = mutableMapOf<String, Double>()
+    // Accumulate timely leftover by (component, target) — an untargeted supply lot is eligible
+    // against ANY WO at that component (identical to the pre-target-aware behavior); a targeted
+    // one only against WOs whose own derived target matches it.
+    data class Bucket(var leftover: Double = 0.0, var earliestApplicableStart: java.time.LocalDate? = null)
+    val timelyLeftover = mutableMapOf<Pair<String, String?>, Bucket>()
     for ((sid, leftover) in leftoverBySupply) {
         val meta = supplyMeta[sid] ?: continue
         val compKey = "${meta.pid}|${meta.lid}"
-        val woStart = woEarliestStart[compKey] ?: continue   // no WO at this component → skip
-        // Supply is "timely" if it was available on or before the WO's start date.
-        // A null supply_date is treated as earliest possible (e.g. on-hand stock) → always timely.
-        if (meta.supplyDate != null && meta.supplyDate.isAfter(woStart)) continue
-        timelyLeftoverByComponent.merge(compKey, leftover, Double::plus)
+        val candidates = woStartsByComponent[compKey] ?: continue
+        val applicable = candidates.filter { meta.target == null || it.target == meta.target }
+        if (applicable.isEmpty()) continue   // no WO this lot could ever have served → not a violation
+        val earliestApplicable = applicable.minOf { it.start }
+        // Supply is "timely" if it was available on or before the earliest WO it could have
+        // served. A null supply_date is treated as earliest possible (e.g. on-hand stock) →
+        // always timely.
+        if (meta.supplyDate != null && meta.supplyDate.isAfter(earliestApplicable)) continue
+        val bucket = timelyLeftover.getOrPut(compKey to meta.target) { Bucket() }
+        bucket.leftover += leftover
+        val cur = bucket.earliestApplicableStart
+        if (cur == null || earliestApplicable.isBefore(cur)) bucket.earliestApplicableStart = earliestApplicable
     }
 
     val violations = mutableListOf<String>()
-    for ((compKey, leftover) in timelyLeftoverByComponent.entries.sortedBy { it.key }) {
+    for ((key, bucket) in timelyLeftover.entries.sortedBy { "${it.key.first}|${it.key.second ?: ""}" }) {
+        val (compKey, target) = key
         val (pid, lid) = compKey.split("|", limit = 2)
-        val woStart = woEarliestStart[compKey]
+        val targetSuffix = target?.let { " (target=$it)" } ?: ""
         violations.add(
-            "R10: $pid@$lid — %.4f units of inventory available before earliest WO ($woStart) were not consumed. Existing stock should be exhausted before new WOs are issued.".format(leftover)
+            "R10: $pid@$lid$targetSuffix — %.4f units of inventory available before earliest WO (${bucket.earliestApplicableStart}) were not consumed. Existing stock should be exhausted before new WOs are issued.".format(bucket.leftover)
         )
-        log.warn("inventory-priority violation — R10: {}@{} leftover={} woStart={}", pid, lid, leftover, woStart)
+        log.warn("inventory-priority violation — R10: {}@{}{} leftover={} woStart={}", pid, lid, targetSuffix, bucket.leftover, bucket.earliestApplicableStart)
     }
     return violations
 }
