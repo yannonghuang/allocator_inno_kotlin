@@ -53,6 +53,17 @@ export function VersionSwitcher({
 
   const label = (v: ConfigVersion) => v.name || t('versionLabel', { id: v.id });
 
+  // A plan_run reference clears the moment that run is deleted; a kb_record reference
+  // deliberately does not (see backend CaseConfigVersioning's own doc) — so "deleting the run"
+  // doesn't always unlock the version, and the generic message misled users into thinking it
+  // would. Picking the specific reason here instead of always falling back to the vague one.
+  const inUseTooltipFor = (v: ConfigVersion): string => {
+    if (v.referenced_by_plan_run && v.referenced_by_kb) return t('inUseTooltipBoth');
+    if (v.referenced_by_kb) return t('inUseTooltipKb');
+    if (v.referenced_by_plan_run) return t('inUseTooltipPlanRun');
+    return t('inUseTooltip');
+  };
+
   return (
     <div style={{ marginBottom: '1rem', padding: '0.6rem 0.75rem', border: '1px solid #3d3d40', borderRadius: 6, background: '#18181b' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -72,9 +83,9 @@ export function VersionSwitcher({
         ) : (
           <span style={{ fontSize: '0.82rem', color: '#e4e4e7' }}>{current ? label(current) : t('none')}</span>
         )}
-        {referenced && (
+        {referenced && current && (
           <span
-            title={t('inUseTooltip')}
+            title={inUseTooltipFor(current)}
             style={{ fontSize: '0.66rem', padding: '2px 6px', background: '#3f2d0d', color: '#fbbf24', borderRadius: 4 }}
           >
             {t('inUseReadOnly')}
@@ -121,7 +132,7 @@ export function VersionSwitcher({
                   <td style={{ padding: '3px 6px', color: '#e4e4e7' }}>{label(v)}</td>
                   <td style={{ padding: '3px 6px', color: '#a1a1aa' }}>{v.comments ?? ''}</td>
                   <td style={{ padding: '3px 6px' }}>
-                    {v.referenced && <span style={{ color: '#fbbf24' }}>{t('inUseReadOnly')}</span>}
+                    {v.referenced && <span title={inUseTooltipFor(v)} style={{ color: '#fbbf24' }}>{t('inUseReadOnly')}</span>}
                   </td>
                   <td style={{ padding: '3px 6px', textAlign: 'right', whiteSpace: 'nowrap' }}>
                     <button

@@ -2153,6 +2153,12 @@ export type ConfigVersion = {
   name: string | null;
   comments: string | null;
   referenced: boolean;
+  // Split-out detail behind `referenced` (their OR) — a plan_run reference clears the moment
+  // that run is deleted, but a kb_record reference deliberately survives its source run's
+  // deletion (see backend CaseConfigVersioning's own doc), so a version can stay just as locked
+  // with referenced_by_plan_run now false. Lets the UI say WHY instead of one generic message.
+  referenced_by_plan_run: boolean;
+  referenced_by_kb: boolean;
   created_at: string;
   updated_at: string;
 };

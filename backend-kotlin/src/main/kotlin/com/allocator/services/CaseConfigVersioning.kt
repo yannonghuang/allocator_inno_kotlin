@@ -40,6 +40,15 @@ data class VersionSummary(
     val createdAt: String,
     val updatedAt: String,
     val referenced: Boolean,
+    /** Split-out detail behind [referenced] (which is just their OR) — lets a UI say WHY a
+     *  version is locked instead of one generic message. Distinct in practice: a plan_run
+     *  reference goes away the moment that run is deleted (or was never more than "running"/
+     *  "success"/"contingent"); a kb_record reference deliberately does NOT — see
+     *  [KbRecords.sourcePlanRunDeleted]'s own doc. A version can be locked by BOTH, by ONLY one
+     *  (e.g. the exact case that prompted this: deleting the source run left referencedByKb true
+     *  and referencedByPlanRun false, but the version stayed just as locked), or neither. */
+    val referencedByPlanRun: Boolean,
+    val referencedByKb: Boolean,
 )
 
 object CaseConfigVersioning {
@@ -89,22 +98,68 @@ object CaseConfigVersioning {
             ?: createVersion(caseId, kind, name = null, comments = null)
     }
 
-    /** Whether [versionId] is used by any COMPLETED plan_run or kb_record for [kind] — the gate
-     *  for Save/Generate/Import/Clear/Delete having to become "Save As" instead, and for Delete
-     *  being blocked outright.
+    /** Whether [versionId] is used by any COMPLETED **or currently-running** plan_run, or by any
+     *  kb_record, for [kind] — the gate for Save/Generate/Import/Clear/Delete having to become
+     *  "Save As" instead, and for Delete being blocked outright.
      *
-     *  Only "success"/"contingent" plan_runs count — NOT "running" or "failed". A genuinely
-     *  completed run (success, or contingent — a negotiation-branch result pending promotion)
-     *  must lock its version: mutating the config in place would retroactively change what that
-     *  historical run says it used. kb_records don't need the same filter — a KB record is only
-     *  ever created for an already-successful, sound run (see KbStore's own doc). */
-    fun isVersionReferenced(versionId: Int, kind: ConfigVersionKind): Boolean = transaction {
+     *  "running" plan_runs count too, not just "success"/"contingent" — NOT "failed" (a run that
+     *  failed left no result that needs its inputs preserved). This closes a real race: a
+     *  plan_run row is inserted with every version id already populated the MOMENT a run is
+     *  submitted (see runPlanBackground's own insert), status="running" — but before this fix,
+     *  isVersionReferenced only started returning true once that run reached "success", leaving a
+     *  window (the run's own full processing time — confirmed live: a case_allocation version got
+     *  cleared out from under a run that was still using it, well before the run itself
+     *  completed and would have locked it) where the version everyone THINKS is safe (because a
+     *  run is actively using it) could still be edited or cleared. The run's own persisted
+     *  `plan_run.config` snapshot is never affected either way — this is purely about keeping the
+     *  LIVE version's own rows from drifting out from under it while still needed.
+     *
+     *  A genuinely completed run (success, or contingent — a negotiation-branch result pending
+     *  promotion) must ALSO stay locked afterward: mutating the config in place would
+     *  retroactively change what that historical run says it used. kb_records don't need the same
+     *  filter — a KB record is only ever created for an already-successful, sound run (see
+     *  KbStore's own doc). */
+    /** Split-out detail behind [isVersionReferenced] (which is just `.isNotEmpty()` on this) —
+     *  lets a caller say WHY a version is locked instead of one generic reason. The two sources
+     *  behave differently on deletion: a plan_run reference disappears the moment that run is
+     *  deleted (or never counted at all — only "running"/"success"/"contingent" do); a kb_record
+     *  reference deliberately does NOT disappear when its source run is deleted (see
+     *  [KbRecords.sourcePlanRunDeleted]'s own doc) — confirmed live: deleting the plan run that
+     *  originally used a version left it referenced by KB alone, still just as locked. */
+    fun referencingSources(versionId: Int, kind: ConfigVersionKind): Set<String> = transaction {
+        val sources = mutableSetOf<String>()
         val inPlanRuns = PlanRuns.selectAll()
-            .where { (planRunColumn(kind) eq versionId) and (PlanRuns.status inList listOf("success", "contingent")) }
+            .where { (planRunColumn(kind) eq versionId) and (PlanRuns.status inList listOf("running", "success", "contingent")) }
             .any()
-        if (inPlanRuns) return@transaction true
-        KbRecords.selectAll().where { kbRecordColumn(kind) eq versionId }.any()
+        if (inPlanRuns) sources += "plan_run"
+        val inKb = KbRecords.selectAll().where { kbRecordColumn(kind) eq versionId }.any()
+        if (inKb) sources += "kb"
+        sources
     }
+
+    /** Whether [versionId] is used by any COMPLETED **or currently-running** plan_run, or by any
+     *  kb_record, for [kind] — the gate for Save/Generate/Import/Clear/Delete having to become
+     *  "Save As" instead, and for Delete being blocked outright.
+     *
+     *  "running" plan_runs count too, not just "success"/"contingent" — NOT "failed" (a run that
+     *  failed left no result that needs its inputs preserved). This closes a real race: a
+     *  plan_run row is inserted with every version id already populated the MOMENT a run is
+     *  submitted (see runPlanBackground's own insert), status="running" — but before this fix,
+     *  isVersionReferenced only started returning true once that run reached "success", leaving a
+     *  window (the run's own full processing time — confirmed live: a case_allocation version got
+     *  cleared out from under a run that was still using it, well before the run itself
+     *  completed and would have locked it) where the version everyone THINKS is safe (because a
+     *  run is actively using it) could still be edited or cleared. The run's own persisted
+     *  `plan_run.config` snapshot is never affected either way — this is purely about keeping the
+     *  LIVE version's own rows from drifting out from under it while still needed.
+     *
+     *  A genuinely completed run (success, or contingent — a negotiation-branch result pending
+     *  promotion) must ALSO stay locked afterward: mutating the config in place would
+     *  retroactively change what that historical run says it used. kb_records don't need the same
+     *  filter — a KB record is only ever created for an already-successful, sound run (see
+     *  KbStore's own doc). */
+    fun isVersionReferenced(versionId: Int, kind: ConfigVersionKind): Boolean =
+        referencingSources(versionId, kind).isNotEmpty()
 
     fun listVersions(caseId: Int, kind: ConfigVersionKind): List<VersionSummary> = transaction {
         CaseConfigVersions.selectAll()
@@ -112,13 +167,16 @@ object CaseConfigVersioning {
             .orderBy(CaseConfigVersions.id)
             .map { row ->
                 val id = row[CaseConfigVersions.id]
+                val sources = referencingSources(id, kind)
                 VersionSummary(
                     id = id,
                     name = row[CaseConfigVersions.name],
                     comments = row[CaseConfigVersions.comments],
                     createdAt = row[CaseConfigVersions.createdAt].toString(),
                     updatedAt = row[CaseConfigVersions.updatedAt].toString(),
-                    referenced = isVersionReferenced(id, kind),
+                    referenced = sources.isNotEmpty(),
+                    referencedByPlanRun = "plan_run" in sources,
+                    referencedByKb = "kb" in sources,
                 )
             }
     }

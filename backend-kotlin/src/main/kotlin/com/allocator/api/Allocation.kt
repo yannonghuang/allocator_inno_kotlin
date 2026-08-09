@@ -621,6 +621,8 @@ fun Routing.allocationRoutes() {
                 buildJsonObject {
                     put("id", v.id); put("name", v.name); put("comments", v.comments)
                     put("referenced", v.referenced)
+                    put("referenced_by_plan_run", v.referencedByPlanRun)
+                    put("referenced_by_kb", v.referencedByKb)
                     put("created_at", v.createdAt); put("updated_at", v.updatedAt)
                 }
             }))
