@@ -256,13 +256,14 @@ internal fun computeCriticalStockPositions(
  * [materializeCriticalStockSupply]'s own doc); [consumeFromInventory]'s own direct target check is
  * all that governs it from here on.
  *
- * [rawLotAllocatedTotals] (real raw-material `supply_id` → its current effective total) would let
- * the split track the raw material's CURRENT allocation rather than its static physical `qty` —
- * kept as a parameter for that purpose, but [materializeCriticalStockSupply] (this function's one
- * caller) always passes an empty map now: `case_allocation` no longer persists a critical-stock-
- * aware allocation total to read (it stores TSA INPUT rows — qty_cap/target per RAW lot only,
- * never critical stock — see `Allocation.kt`'s `CaseAllocRow`/`generateDefaultTsaRows` doc), so
- * every call falls back to each raw lot's own physical `qty` — the plain Ramification-1 formula.
+ * [rawLotAllocatedTotals] (real raw-material `supply_id` → its current effective total) lets the
+ * split track the raw material's CURRENT (TSA-aware) allocation rather than its static physical
+ * `qty` — [materializeCriticalStockSupply] computes it fresh via
+ * [computeRawMaterialAllocatedTotals] on every call, since `case_allocation` no longer persists a
+ * derived allocation total to read back the way it used to (it stores TSA INPUT rows — qty_cap/
+ * target per RAW lot only, never critical stock — see `Allocation.kt`'s `CaseAllocRow`/
+ * `generateDefaultTsaRows` doc). A lot absent from the map (e.g. zero eligible demand reached it)
+ * falls back to its own physical `qty` — the plain Ramification-1 formula.
  *
  * Every split row is otherwise product/location/date-identical to the row it splits from, with
  * `supply_id = "${realSupplyId}_$target"` and `target` inherited from the raw material lot it
@@ -388,17 +389,69 @@ internal fun materializeCriticalStockSupply(
     data: Map<String, List<Map<String, Any?>>>,
     config: Map<String, Any?>?,
 ): Pair<Map<String, List<Map<String, Any?>>>, Map<String, String>> {
-    val criticalStocks = computeCriticalStockPositions(data, config)
+    // TSA overrides must be applied BEFORE any of this runs — computeCriticalStockPositions'
+    // targetedRawKeys check and expandCriticalStockSupplies' own lot["target"]/lot["qty"] reads
+    // both need to see the user's edited target, not just its qty_cap (computeRawMaterialAllocatedTotals
+    // handles qty; this is the matching fix for TARGET — a TSA edit that MOVES a raw lot's target
+    // to a different customer must also move which target a dependent critical stock inherits).
+    val overridden = applyTsaOverrides(data, parseTsaOverridesFromConfig(config))
+    val criticalStocks = computeCriticalStockPositions(overridden, config)
     if (criticalStocks.isEmpty()) return data to emptyMap()
+    val rawLotAllocatedTotals = computeRawMaterialAllocatedTotals(overridden, config, criticalStocks)
     val (expandedSupplies, virtualToReal) = expandCriticalStockSupplies(
-        supplies = data["supply"] ?: emptyList(),
+        supplies = overridden["supply"] ?: emptyList(),
         criticalStocks = criticalStocks,
-        rawLotAllocatedTotals = emptyMap(),
-        data = data,
+        rawLotAllocatedTotals = rawLotAllocatedTotals,
+        data = overridden,
         config = config,
     )
     if (virtualToReal.isEmpty()) return data to emptyMap()
     return (data + ("supply" to expandedSupplies)) to virtualToReal
+}
+
+/**
+ * Each dependent raw-material lot's REAL computed allocation — not its static physical qty — for
+ * [expandCriticalStockSupplies] to weight a critical stock's inherited target split against.
+ * Without this, a TSA qty_cap edit on a raw material lot never affects any critical stock that
+ * inherits targeting from it: confirmed live, editing `283-0504-31_7/22/2026_Q6J`'s cap left
+ * `wip_280-1001`'s Q6J/Q6K split completely unchanged, because [expandCriticalStockSupplies] was
+ * always called with an empty [rawLotAllocatedTotals] and fell back to physical `qty` — silently
+ * defeating the entire point of TSA for any case with critical stock. This mirrors the
+ * pre-TSA-refactor `recomputeCriticalStockAllocationRows` (Allocation.kt, removed in commit
+ * a3a2bd9) which read this same total back from a persisted `case_allocation` grid — that grid no
+ * longer exists (`case_allocation` now stores TSA INPUT rows, not derived output — see
+ * `CaseAllocRow`'s own doc) — so this recomputes it fresh from [allocateCriticalSuppliesPerLot]
+ * every call instead of reading a stale prior snapshot.
+ *
+ * Runs the same critical-matrix + per-lot-budget computation [buildSupplyAllocation] itself runs
+ * later in the same pass — including TSA overrides ([applyTsaOverrides]/
+ * [parseTsaOverridesFromConfig], so an edited cap is reflected here too — necessarily duplicating a
+ * slice of that later, real computation for the SAME raw-material lots. Unavoidable:
+ * [materializeCriticalStockSupply] has to run before [buildSupplyAllocation] (both it and the real
+ * inventory pool need to agree on the same, already-split physical rows), so there's no way to
+ * reuse one result for the other. Stays cheap in practice — gated behind [criticalStocks] being
+ * non-empty, itself gated behind [hasAnyTargetedSupply], so a case with no critical stock (or no
+ * TARGET usage at all, the vast majority) never reaches this at all.
+ */
+internal fun computeRawMaterialAllocatedTotals(
+    data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
+    criticalStocks: Map<SupplyKey, SupplyKey>,
+): Map<String, Double> {
+    if (criticalStocks.isEmpty()) return emptyMap()
+    val overridden = applyTsaOverrides(data, parseTsaOverridesFromConfig(config))
+    val demands = overridden["demand"] ?: emptyList()
+    val criticalPids = computeCriticalPids(overridden, config)
+    val graph = buildBomGraph(demands, overridden)
+    val criticalMatrix = buildReachabilityMatrix(demands, graph, criticalPids = criticalPids)
+    val rawBudgets = allocateCriticalSuppliesPerLot(
+        matrix = criticalMatrix,
+        supplies = overridden["supply"] ?: emptyList(),
+        demands = demands,
+        data = overridden,
+    )
+    val rows = buildAllocationBudgetRowsFull(rawBudgets, criticalMatrix, overridden["supply"] ?: emptyList())
+    return rows.groupBy({ it.first }, { it.third }).mapValues { (_, qtys) -> qtys.sum() }
 }
 
 /**

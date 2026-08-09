@@ -1421,6 +1421,16 @@ class SupplyGuidedPlanningTest : FunSpec({
             mapOf("bom_id" to "BP2", "parent_id" to "P2", "child_id" to "M", "rate" to 1.0, "alt_group" to null),
         ),
         demands = demands,
+        // computeCriticalPids (unlike computeCriticalStockPositions, which walks BOM/isRawCriticalPosition
+        // directly) enumerates candidates from productlocation only — without these, X never gets
+        // classified as critical for allocateCriticalSuppliesPerLot, silently zeroing out any
+        // computeRawMaterialAllocatedTotals result even though the stock-detection side works fine.
+        productlocation = listOf(
+            mapOf("product_id" to "M", "location_id" to "L", "prod_area" to "assy"),
+            mapOf("product_id" to "P1", "location_id" to "L", "prod_area" to "assy"),
+            mapOf("product_id" to "P2", "location_id" to "L", "prod_area" to "assy"),
+            mapOf("product_id" to "X", "location_id" to "L", "prod_area" to "raw"),
+        ),
     )
 
     test("computeCriticalStockPositions: shared intermediate qualifies; raw leaf and top virtual products don't") {
@@ -1707,6 +1717,95 @@ class SupplyGuidedPlanningTest : FunSpec({
         val byTarget = splitRows.associate { it["target"] to (it["qty"] as Double) }
         byTarget["CUST_A"] shouldBe (90.0 plusOrMinus 1e-6)
         byTarget["CUST_B"] shouldBe (10.0 plusOrMinus 1e-6)
+    }
+
+    test("materializeCriticalStockSupply: a TSA qty_cap edit on a raw material lot moves the dependent critical stock's inherited split") {
+        // Regression test for a real bug: editing a raw lot's TSA qty_cap silently never affected
+        // any critical stock inheriting from it, because materializeCriticalStockSupply always
+        // called expandCriticalStockSupplies with an empty rawLotAllocatedTotals, falling back to
+        // each lot's static physical qty (see computeRawMaterialAllocatedTotals's own doc).
+        val xLots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 90.0, "target" to "CUST_A"),
+            mapOf<String, Any?>("supply_id" to "LOT_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 10.0, "target" to "CUST_B"),
+        )
+        // Abundant, fully-eligible demand on each target so the real allocation for an unedited
+        // lot equals its own physical qty exactly (baseline matches the no-TSA test above).
+        val demands = listOf(
+            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P1", "location_id" to "L", "quantity" to 1000.0, "request_due_time" to "2024-01-15", "customer_id" to "CUST_A"),
+            mapOf<String, Any?>("demand_id" to "DB", "product_id" to "P2", "location_id" to "L", "quantity" to 1000.0, "request_due_time" to "2024-01-15", "customer_id" to "CUST_B"),
+        )
+        val data = sharedStockData(100.0, xLots, demands)
+
+        val (baseline, _) = materializeCriticalStockSupply(data, noPurchaseConfig)
+        val baselineByTarget = baseline["supply"]!!.filter { (it["supply_id"] as String).startsWith("LOT_M_") }
+            .associate { it["target"] to (it["qty"] as Double) }
+        baselineByTarget["CUST_A"] shouldBe (90.0 plusOrMinus 1e-6)
+        baselineByTarget["CUST_B"] shouldBe (10.0 plusOrMinus 1e-6)
+
+        // Cap LOT_A down to 40 via a TSA override (same shape PUT /allocation persists). Demand is
+        // still abundant enough to fully consume the capped lot, so its real allocation equals the
+        // cap exactly (40) -- but the split is `stock_qty × weight_i/Σweight` (Ramification 1),
+        // proportional against M's own 100 units, NOT a literal pass-through of the raw lot's own
+        // qty: weights become 40/10 (Σ=50), so CUST_A = 100×40/50 = 80, CUST_B = 100×10/50 = 20.
+        // The key regression signal is that CUST_A moved at all (was 90, now 80) — proving the
+        // edit reached the split — not that it landed on any particular absolute number.
+        val tsaConfig = noPurchaseConfig + mapOf(
+            "targeted_supply_allocation" to listOf(mapOf("supply_id" to "LOT_A", "qty_cap" to 40.0)),
+        )
+        val (edited, _) = materializeCriticalStockSupply(data, tsaConfig)
+        val editedByTarget = edited["supply"]!!.filter { (it["supply_id"] as String).startsWith("LOT_M_") }
+            .associate { it["target"] to (it["qty"] as Double) }
+        editedByTarget["CUST_A"] shouldBe (80.0 plusOrMinus 1e-6)
+        editedByTarget["CUST_B"] shouldBe (20.0 plusOrMinus 1e-6)
+    }
+
+    test("materializeCriticalStockSupply: the split follows the raw lot's REAL demand-constrained allocation, not its capacity") {
+        // Distinguishes "real allocation" from a mere qty/qty_cap fallback: LOT_A has 90 physical
+        // (no TSA edit at all here) but CUST_A's only demand needs just 30 of it -- the other 60 is
+        // simply never claimed by anyone. A capacity-based weight (physical qty OR a TSA cap) would
+        // still see 90; only the REAL allocateCriticalSuppliesPerLot output correctly sees 30.
+        val xLots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 90.0, "target" to "CUST_A"),
+            mapOf<String, Any?>("supply_id" to "LOT_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 10.0, "target" to "CUST_B"),
+        )
+        val demands = listOf(
+            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P1", "location_id" to "L", "quantity" to 30.0, "request_due_time" to "2024-01-15", "customer_id" to "CUST_A"),
+            mapOf<String, Any?>("demand_id" to "DB", "product_id" to "P2", "location_id" to "L", "quantity" to 1000.0, "request_due_time" to "2024-01-15", "customer_id" to "CUST_B"),
+        )
+        val data = sharedStockData(100.0, xLots, demands)
+        val (out, _) = materializeCriticalStockSupply(data, noPurchaseConfig)
+        val byTarget = out["supply"]!!.filter { (it["supply_id"] as String).startsWith("LOT_M_") }
+            .associate { it["target"] to (it["qty"] as Double) }
+        // weights: CUST_A=30 (demand-limited, not LOT_A's 90 physical), CUST_B=10 (fully consumes
+        // its own abundant-relative-to-need lot) -- Σ=40, so CUST_A=100×30/40=75, CUST_B=100×10/40=25.
+        byTarget["CUST_A"] shouldBe (75.0 plusOrMinus 1e-6)
+        byTarget["CUST_B"] shouldBe (25.0 plusOrMinus 1e-6)
+    }
+
+    test("materializeCriticalStockSupply: a TSA target edit on a raw material lot moves which customer the dependent critical stock inherits") {
+        // Matching regression test for TARGET (not just qty_cap): expandCriticalStockSupplies
+        // reads lot["target"] to both group weighting lots and label the resulting split rows —
+        // it must see the TSA-overridden target, not the lot's original physical one.
+        val xLots = listOf(
+            mapOf<String, Any?>("supply_id" to "LOT_A", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 90.0, "target" to "CUST_A"),
+            mapOf<String, Any?>("supply_id" to "LOT_B", "product_id" to "X", "location_id" to "L", "supply_date" to "2024-01-01", "qty" to 10.0, "target" to "CUST_B"),
+        )
+        val demands = listOf(
+            mapOf<String, Any?>("demand_id" to "DA", "product_id" to "P1", "location_id" to "L", "quantity" to 1000.0, "request_due_time" to "2024-01-15", "customer_id" to "CUST_A"),
+            mapOf<String, Any?>("demand_id" to "DB", "product_id" to "P2", "location_id" to "L", "quantity" to 1000.0, "request_due_time" to "2024-01-15", "customer_id" to "CUST_C"),
+        )
+        val data = sharedStockData(100.0, xLots, demands)
+
+        // Retarget LOT_B from CUST_B to CUST_C.
+        val tsaConfig = noPurchaseConfig + mapOf(
+            "targeted_supply_allocation" to listOf(mapOf("supply_id" to "LOT_B", "target" to "CUST_C")),
+        )
+        val (edited, _) = materializeCriticalStockSupply(data, tsaConfig)
+        val splitRows = edited["supply"]!!.filter { (it["supply_id"] as String).startsWith("LOT_M_") }
+        splitRows.map { it["supply_id"] }.toSet() shouldBe setOf("LOT_M_CUST_A", "LOT_M_CUST_C")
+        val byTarget = splitRows.associate { it["target"] to (it["qty"] as Double) }
+        byTarget["CUST_A"] shouldBe (90.0 plusOrMinus 1e-6)
+        byTarget["CUST_C"] shouldBe (10.0 plusOrMinus 1e-6)
     }
 
     test("buildSupplyAllocation: critical stock is never a criticalMatrix column -- no allocation-table participation at all") {

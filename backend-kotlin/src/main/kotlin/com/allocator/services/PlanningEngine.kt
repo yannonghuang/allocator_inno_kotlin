@@ -6796,6 +6796,18 @@ private fun runPlanningOnePass(
     // split children ("wip_280-1001_Q6J", "wip_280-1001_Q6K") back under it instead of doing an
     // exact supply_id match that silently finds nothing.
     val (data, splitOrigin) = materializeCriticalStockSupply(data, config)
+    // The INITIAL split qty each virtual sub-lot got — the Ramification-1 weight × stock_qty
+    // result, captured HERE, before consumption ever touches it — not derivable from anything
+    // else this pass persists: supply_allocations only records what actually got CONSUMED, which
+    // diverges from the initial split whenever a target's own demand doesn't fully draw its
+    // share (confirmed live investigating case 251/wip_280-1001 — the split and the consumed
+    // total told two different, easily-conflated stories). Persisted as
+    // `output["critical_stock_split_qty"]` alongside `critical_stock_origin` so this is always
+    // auditable from the run's own record instead of needing an ad-hoc recomputation.
+    val splitInitialQty: Map<String, Double> = splitOrigin.keys.associateWith { vsid ->
+        (data["supply"] ?: emptyList()).firstOrNull { (it["supply_id"] as? String) == vsid }
+            ?.get("qty") as? Double ?: 0.0
+    }
 
     // Negative-QTY supply rows represent pre-existing deficits, not fungible FIFO stock — split
     // them off here so they never enter the FIFO pool below (see NegativeInventoryLot's doc).
@@ -7369,6 +7381,11 @@ private fun runPlanningOnePass(
         // against the case's own (never-split) supply table aggregate split rows back under the
         // one it actually uploaded.
         "critical_stock_origin"  to splitOrigin,
+        // Each split sub-lot's own INITIAL qty (weight × stock_qty), captured right after
+        // materializeCriticalStockSupply — NOT the same as summing supply_allocations' consumed
+        // qty for that sub-lot, which can be less when its target's demand doesn't fully draw it.
+        // See this map's own capture site (splitInitialQty, above) for the full rationale.
+        "critical_stock_split_qty" to splitInitialQty,
     )
     return RunPlanningResult(
         output = output,
