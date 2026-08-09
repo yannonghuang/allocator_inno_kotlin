@@ -199,20 +199,30 @@ internal fun rawCriticalSupplyIds(
  * Deliberately does NOT check "is this version referenced" — see call sites: the Generate route
  * checks before calling this.
  */
-internal fun generateDefaultTsaRows(
-    caseId: Int,
-    versionId: Int,
+/** Pure computation half of [generateDefaultTsaRows] — no DB writes. Split out so the Generate
+ *  route can compute-and-return without persisting when no version is resolved yet (see that
+ *  route's own doc: Generate must never silently create a version — only Save/Save As may). */
+internal fun computeDefaultTsaRows(
     data: Map<String, List<Map<String, Any?>>>,
     config: Map<String, Any?>?,
 ): List<CaseAllocRow> {
     val rawCriticalIds = rawCriticalSupplyIds(data, config)
-    val rows = (data["supply"] ?: emptyList()).mapNotNull { s ->
+    return (data["supply"] ?: emptyList()).mapNotNull { s ->
         val sid = (s["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
         if (sid !in rawCriticalIds) return@mapNotNull null
         val qty = (s["qty"] as? Number)?.toDouble() ?: return@mapNotNull null
         val target = (s["target"] as? String)?.trim()?.takeIf { it.isNotBlank() }
         CaseAllocRow(sid, qty, target)
     }
+}
+
+internal fun generateDefaultTsaRows(
+    caseId: Int,
+    versionId: Int,
+    data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
+): List<CaseAllocRow> {
+    val rows = computeDefaultTsaRows(data, config)
     if (rows.isNotEmpty()) {
         transaction {
             CaseAllocations.deleteWhere { CaseAllocations.versionId eq versionId }
@@ -365,10 +375,19 @@ fun Routing.allocationRoutes() {
 
     // ── POST /cases/{case_id}/allocation/generate ─────────────────────────────
     // Body: { config? } — seeds TSA rows for the case's current critical-material lots.
+    // Deliberately does NOT auto-create a version when none is resolved — unlike PUT/import, which
+    // DO (see resolvedOrCreatedVersionId's own doc: "the ONE place a version gets materialized on
+    // demand... about to WRITE data"). Generate is a "try it out" action, not a write the user
+    // asked for; silently persisting it as a new unnamed version surprised users who never
+    // intended to keep it (confirmed live: Generate then "Save As" produced TWO versions — the
+    // silent one plus the named one). When no version is resolved, this computes and returns rows
+    // WITHOUT touching the DB at all; the frontend stages them exactly like a pending edit, and
+    // the eventual Save/Save As is the one place a version gets created — consistent with every
+    // other write path's existing "no version yet" contract.
     post("/cases/{case_id}/allocation/generate") {
         val caseId = requireCaseId(call)
-        val versionId = resolvedOrCreatedVersionId(call, caseId)
-        if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
+        val versionId = resolvedVersionId(call, caseId)
+        if (versionId != null && CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@post
         }
@@ -378,11 +397,19 @@ fun Routing.allocationRoutes() {
 
         val config = resolveConfigFromBody(call, caseId)
 
-        log.info("[allocation] generating TSA rows for case {} version {}", caseId, versionId)
-        val newRows = generateDefaultTsaRows(caseId, versionId, data, config)
-        log.info("[allocation] generated {} TSA rows for case {} (critical supply lots)", newRows.size, caseId)
+        val newRows = if (versionId != null) {
+            log.info("[allocation] generating TSA rows for case {} version {}", caseId, versionId)
+            generateDefaultTsaRows(caseId, versionId, data, config)
+        } else {
+            log.info("[allocation] computing TSA rows for case {} (no version resolved — not persisted)", caseId)
+            computeDefaultTsaRows(data, config)
+        }
+        log.info("[allocation] generated {} TSA rows for case {}", newRows.size, caseId)
 
-        call.respond(buildJsonObject { put("rows", JsonArray(newRows.map(::rowJson))) })
+        call.respond(buildJsonObject {
+            put("rows", JsonArray(newRows.map(::rowJson)))
+            put("version_id", versionId?.let { JsonPrimitive(it) } ?: JsonNull)
+        })
     }
 
     // ── PUT /cases/{case_id}/allocation ───────────────────────────────────────
@@ -446,6 +473,7 @@ fun Routing.allocationRoutes() {
         call.respond(HttpStatusCode.OK, buildJsonObject {
             put("updated", rows.size)
             put("rejected", JsonArray(rejected.map { JsonPrimitive(it) }))
+            put("version_id", versionId)
         })
     }
 
@@ -511,6 +539,7 @@ fun Routing.allocationRoutes() {
         call.respond(buildJsonObject {
             put("rows", JsonArray(rows.map(::rowJson)))
             put("rejected", JsonArray(rejected.map { JsonPrimitive(it) }))
+            put("version_id", versionId)
         })
     }
 

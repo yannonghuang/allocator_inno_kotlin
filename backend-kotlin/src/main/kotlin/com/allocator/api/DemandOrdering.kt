@@ -97,12 +97,18 @@ private fun versionJson(caseId: Int, versionId: Int?): JsonObject {
  * Allocation.kt's generateDefaultTsaRows's own doc for why that guard belongs in the
  * route layer, not here.
  */
+/** Pure computation half of [generateAndSeedCaseDemandOrder] — no DB writes. Split out so the
+ *  Generate route can compute-and-return without persisting when no version is resolved yet (see
+ *  Allocation.kt's /allocation/generate route for the full rationale). */
+internal fun computeDemandOrderRows(data: Map<String, List<Map<String, Any?>>>): List<CaseDemandOrderRow> =
+    toRows(buildDemandOrder(data))
+
 internal fun generateAndSeedCaseDemandOrder(
     caseId: Int,
     versionId: Int,
     data: Map<String, List<Map<String, Any?>>>,
 ): List<CaseDemandOrderRow> {
-    val rows = toRows(buildDemandOrder(data))
+    val rows = computeDemandOrderRows(data)
     transaction {
         CaseDemandOrders.deleteWhere { CaseDemandOrders.versionId eq versionId }
         if (rows.isNotEmpty()) {
@@ -214,10 +220,12 @@ fun Routing.demandOrderingRoutes() {
     }
 
     // ── POST /cases/{case_id}/demand-ordering/generate ────────────────────────
+    // Deliberately does NOT auto-create a version when none is resolved — see Allocation.kt's
+    // /allocation/generate route for the full rationale.
     post("/cases/{case_id}/demand-ordering/generate") {
         val caseId = requireCaseId(call)
-        val versionId = resolvedOrCreatedVersionId(call, caseId)
-        if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
+        val versionId = resolvedVersionId(call, caseId)
+        if (versionId != null && CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@post
         }
@@ -225,11 +233,18 @@ fun Routing.demandOrderingRoutes() {
         if ((data["demand"] ?: emptyList()).isEmpty()) throw IllegalArgumentException("No demand data for case $caseId")
 
         log.info("[demand-ordering] generating for case {} version {}", caseId, versionId)
-        val newRows = generateAndSeedCaseDemandOrder(caseId, versionId, data)
+        val newRows = if (versionId != null) {
+            generateAndSeedCaseDemandOrder(caseId, versionId, data)
+        } else {
+            computeDemandOrderRows(data)
+        }
         log.info("[demand-ordering] generated {} rows for case {}", newRows.size, caseId)
 
         val ctxById = demandContextByIdFor(caseId)
-        call.respond(buildJsonObject { put("rows", JsonArray(newRows.sortedBy { it.order }.map { rowJson(it, ctxById[it.demandId]) })) })
+        call.respond(buildJsonObject {
+            put("rows", JsonArray(newRows.sortedBy { it.order }.map { rowJson(it, ctxById[it.demandId]) }))
+            put("version_id", versionId?.let { JsonPrimitive(it) } ?: JsonNull)
+        })
     }
 
     // ── PUT /cases/{case_id}/demand-ordering ──────────────────────────────────
@@ -261,7 +276,7 @@ fun Routing.demandOrderingRoutes() {
             val currentRows = loadCaseDemandOrderRows(versionId) ?: emptyList()
             recomputeCaseDemandOrderHash(caseId, versionId, currentRows)
         }
-        call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", edits.size) })
+        call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", edits.size); put("version_id", versionId) })
     }
 
     // ── DELETE /cases/{case_id}/demand-ordering ───────────────────────────────
@@ -311,7 +326,7 @@ fun Routing.demandOrderingRoutes() {
             recomputeCaseDemandOrderHash(caseId, versionId, rows)
         }
         val ctxById = demandContextByIdFor(caseId)
-        call.respond(buildJsonObject { put("rows", JsonArray(rows.sortedBy { it.order }.map { rowJson(it, ctxById[it.demandId]) })) })
+        call.respond(buildJsonObject { put("rows", JsonArray(rows.sortedBy { it.order }.map { rowJson(it, ctxById[it.demandId]) })); put("version_id", versionId) })
     }
 
     // ── GET /cases/{case_id}/demand-ordering/export ───────────────────────────

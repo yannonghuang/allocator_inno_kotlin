@@ -259,18 +259,23 @@ export function TsaTable({
   // fine on its own — that's a same-column sum, not a cross-column one.
   const summableColSpecs = useMemo(() => colSpecs.filter((s) => s.type !== 'untargeted'), [colSpecs]);
 
+  // A lot row's own active column displays its CAP (getCellQty), not its computed output (see
+  // getCellQty's own doc) — so the row's Total must sum getCellQty too, not getOutputQty, or it
+  // silently disagrees with the one cell in the row a user would actually add up by eye. Group
+  // rows have no such active-column special case (every cell is real computed output, per
+  // getGroupOutputQty's own doc), so their total is unaffected and stays output-based.
   const getLotRowTotal = useCallback((sid: string) =>
-    summableColSpecs.reduce((s, spec) => s + getOutputQty(sid, spec), 0), [summableColSpecs, getOutputQty]);
+    summableColSpecs.reduce((s, spec) => s + getCellQty(sid, spec), 0), [summableColSpecs, getCellQty]);
 
   const getGroupRowTotal = useCallback((gk: SupplyGroupKey) =>
     summableColSpecs.reduce((s, spec) => s + getGroupOutputQty(gk, spec), 0), [summableColSpecs, getGroupOutputQty]);
 
   const getColTotal = useCallback((spec: ColSpec): number => {
     if (supplyPivot === 'lot') {
-      return supplies.filter((s) => supplyIds.includes(s.supplyId)).reduce((s, sup) => s + getOutputQty(sup.supplyId, spec), 0);
+      return supplies.filter((s) => supplyIds.includes(s.supplyId)).reduce((s, sup) => s + getCellQty(sup.supplyId, spec), 0);
     }
     return supplyGroups.reduce((s, g) => s + getGroupOutputQty(g.groupKey, spec), 0);
-  }, [supplyPivot, supplies, supplyIds, supplyGroups, getOutputQty, getGroupOutputQty]);
+  }, [supplyPivot, supplies, supplyIds, supplyGroups, getCellQty, getGroupOutputQty]);
 
   // ── Dirty detection (pending edit on this lot's currently-active cell) ──────────────────────
 

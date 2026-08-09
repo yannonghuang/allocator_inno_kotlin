@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
-import { useParams, useSearchParams } from 'next/navigation';
+import { useParams, usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { useTranslations } from 'next-intl';
 import {
   PreferenceRow,
@@ -85,9 +85,12 @@ function LookupAutocomplete({
 export function PreferencesPage() {
   const params = useParams();
   const caseId = Number(params.id);
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
   // Optional ?version_id= — set when arriving from ConfigDetailView's "Open full page" link for
   // a specific historical version (see CaseConfigVersions' own doc).
-  const initialVersionId = Number(useSearchParams().get('version_id')) || undefined;
+  const initialVersionId = Number(searchParams.get('version_id')) || undefined;
   const t = useTranslations('preferencesPage');
 
   const [rows, setRows] = useState<PreferenceRow[] | null>(null);
@@ -118,7 +121,13 @@ export function PreferencesPage() {
   const [versionId, setVersionId] = useState<number | null>(null);
   const referenced = versions.find((v) => v.id === versionId)?.referenced ?? false;
 
-  const hasPending = pendingChanges.size > 0;
+  // Generate can return a full row set with no version resolved (nothing persisted — see
+  // generatePreferences' own doc); that state is "unsaved" exactly like a pending edit, just not
+  // expressible as a pendingChanges delta since non-preference columns (product_id, scores, ...)
+  // came from Generate too, not from a committed `rows` baseline that still exists.
+  const hasUnsavedGenerate = versionId == null && (rows?.length ?? 0) > 0;
+  const hasPending = pendingChanges.size > 0 || hasUnsavedGenerate;
+  const pendingCount = hasUnsavedGenerate ? (rows?.length ?? 0) : pendingChanges.size;
 
   // ── Load ──────────────────────────────────────────────────────────────────
 
@@ -142,6 +151,20 @@ export function PreferencesPage() {
   }, [caseId]);
 
   useEffect(() => { loadVersion(initialVersionId); }, [loadVersion, initialVersionId]);
+
+  // Keep the URL's version_id in sync with the resolved version — without this, the address bar
+  // keeps whatever version_id it had at page load (or none) even after Save As / version-switch
+  // move the user onto a different version; navigating away and back then re-reads that STALE
+  // query param (see the Allocation page's own identical fix for the full failure story).
+  useEffect(() => {
+    const current = searchParams.get('version_id');
+    const desired = versionId != null ? String(versionId) : null;
+    if (current === desired) return;
+    const next = new URLSearchParams(searchParams.toString());
+    if (desired == null) next.delete('version_id'); else next.set('version_id', desired);
+    const qs = next.toString();
+    router.replace(qs ? `${pathname}?${qs}` : pathname);
+  }, [versionId, pathname, router, searchParams]);
 
   // ── Navigation guards ─────────────────────────────────────────────────────
 
@@ -172,32 +195,52 @@ export function PreferencesPage() {
   const saveRef = useRef<() => void>(() => {});
 
   const handleSave = React.useCallback(async () => {
-    if (!pendingChanges.size || !rows || referenced) return;
+    if (!hasPending || !rows || referenced) return;
+    // Saving with no version resolved yet is the moment a version gets created (see
+    // resolvedOrCreatedVersionId's own doc) — ask for a real name here instead of silently
+    // leaving it as an anonymous "Version {id}" the user then has to hunt down and rename.
+    let versionName: string | undefined;
+    if (versionId == null) {
+      const entered = prompt(t('saveNamePrompt'));
+      if (entered === null) return; // cancelled — nothing persisted
+      versionName = entered.trim() || undefined;
+    }
     setSaving(true);
     setError(null);
     try {
-      const byKey = new Map(rows.map((r) => [rowKey(r), r]));
-      const updated: PreferenceRow[] = Array.from(pendingChanges.entries()).map(([key, preference]) => {
-        const base = byKey.get(key)!;
-        return { ...base, preference };
-      });
-      await updatePreferenceRows(caseId, updated, versionId ?? undefined);
-      setRows((prev) => {
-        if (!prev) return prev;
-        const next = [...prev];
-        for (const ur of updated) {
-          const idx = next.findIndex((r) => rowKey(r) === rowKey(ur));
-          if (idx >= 0) next[idx] = ur;
-        }
-        return next;
-      });
+      // A staged (unsaved) Generate result has no committed baseline to diff against — the
+      // whole row set IS the change, so persist it wholesale instead of pendingChanges' deltas.
+      const updated: PreferenceRow[] = hasUnsavedGenerate ? rows : (() => {
+        const byKey = new Map(rows.map((r) => [rowKey(r), r]));
+        return Array.from(pendingChanges.entries()).map(([key, preference]) => {
+          const base = byKey.get(key)!;
+          return { ...base, preference };
+        });
+      })();
+      if (versionId == null) {
+        const v = await createPreferencesVersion(caseId, { name: versionName, rows: updated });
+        loadVersion(v.id);
+      } else {
+        const { versionId: writtenVersionId } = await updatePreferenceRows(caseId, updated, versionId);
+        setVersionId(writtenVersionId);
+        setVersions(await listPreferencesVersions(caseId));
+        setRows((prev) => {
+          if (!prev) return prev;
+          const next = [...prev];
+          for (const ur of updated) {
+            const idx = next.findIndex((r) => rowKey(r) === rowKey(ur));
+            if (idx >= 0) next[idx] = ur;
+          }
+          return next;
+        });
+      }
       setPendingChanges(new Map());
     } catch (e) {
       setError(String(e));
     } finally {
       setSaving(false);
     }
-  }, [pendingChanges, rows, caseId, versionId, referenced]);
+  }, [hasPending, hasUnsavedGenerate, pendingChanges, rows, caseId, versionId, referenced, t, loadVersion]);
 
   useEffect(() => { saveRef.current = handleSave; }, [handleSave]);
 
@@ -220,14 +263,22 @@ export function PreferencesPage() {
     if (hasPending && !confirm(t('confirmDiscard'))) return;
     setGenerating(true); setError(null);
     try {
-      const newRows = await generatePreferences(caseId, {
+      const { rows: newRows, versionId: writtenVersionId } = await generatePreferences(caseId, {
         max_bom_depth: maxBomDepth, delivery_weight: deliveryWeight, inventory_weight: inventoryWeight,
         critical_material_weight: criticalMaterialWeight,
       }, versionId ?? undefined);
       setRows(newRows);
       clearPending();
-      const res = await getPreferences(caseId, versionId ?? undefined);
-      setConfig(res?.config ?? null);
+      if (writtenVersionId != null) {
+        // A version was already resolved — generate persisted in place immediately.
+        setVersionId(writtenVersionId);
+        setVersions(await listPreferencesVersions(caseId));
+        const res = await getPreferences(caseId, writtenVersionId);
+        setConfig(res?.config ?? null);
+      }
+      // else: nothing persisted (see generatePreferences' own doc) — `rows` now holds the staged,
+      // unsaved result (hasUnsavedGenerate picks this up automatically since versionId is still
+      // null); Save is the one place a version gets created.
     } catch (e) { setError(String(e)); }
     finally { setGenerating(false); }
   };
@@ -240,7 +291,13 @@ export function PreferencesPage() {
       return;
     }
     setImportLoading(true); setError(null);
-    try { setRows(await importPreferencesCsv(caseId, await file.text(), versionId ?? undefined)); clearPending(); }
+    try {
+      const { rows: newRows, versionId: writtenVersionId } = await importPreferencesCsv(caseId, await file.text(), versionId ?? undefined);
+      setRows(newRows);
+      setVersionId(writtenVersionId);
+      setVersions(await listPreferencesVersions(caseId));
+      clearPending();
+    }
     catch (e) { setError(String(e)); }
     finally { setImportLoading(false); if (importRef.current) importRef.current.value = ''; }
   };
@@ -264,7 +321,16 @@ export function PreferencesPage() {
 
   // ── Versioning ────────────────────────────────────────────────────────────
 
-  const handleSwitchVersion = (vId: number) => { setVersionId(vId); loadVersion(vId); };
+  // Pending edits are keyed by product/location/method (rowKey) which is shared across every
+  // version of this case's preferences — without clearing here, an unsaved edit made before
+  // switching versions silently reappears overlaid on the newly-loaded version (see the
+  // Allocation page's identical fix for the full failure story).
+  const handleSwitchVersion = (vId: number) => {
+    if (hasPending && !confirm(t('confirmDiscard'))) return;
+    clearPending();
+    setVersionId(vId);
+    loadVersion(vId);
+  };
 
   const handleSaveAs = async (name: string | undefined, comments: string | undefined) => {
     setSaving(true); setError(null);
@@ -430,7 +496,7 @@ export function PreferencesPage() {
             <button
               style={{ ...btn(hasPending ? 'save' : 'ghost'), opacity: hasPending ? 1 : 0.35 }}
               onClick={handleSave} disabled={!hasPending || saving || referenced} title={t('saveTitle')}>
-              {saving ? t('saving') : hasPending ? t('saveWithCount', { count: pendingChanges.size }) : t('save')}
+              {saving ? t('saving') : hasPending ? t('saveWithCount', { count: pendingCount }) : t('save')}
             </button>
           )}
         </div>
@@ -467,7 +533,7 @@ export function PreferencesPage() {
 
       {hasPending && (
         <div style={{ background: '#1c1008', border: '1px solid #78350f', borderRadius: 4, padding: '0.4rem 0.75rem', fontSize: '0.78rem', color: '#fdba74', marginBottom: '0.75rem' }}>
-          {t('unsavedBanner', { count: pendingChanges.size })}
+          {t('unsavedBanner', { count: pendingCount })}
         </div>
       )}
 

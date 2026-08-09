@@ -165,7 +165,7 @@ fun Routing.constraintsRoutes() {
             }
             recomputeConstraintHash(caseId, versionId, rows)
         }
-        call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", rows.size) })
+        call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", rows.size); put("version_id", versionId) })
     }
 
     // ── DELETE /cases/{case_id}/constraints ───────────────────────────────────
@@ -216,7 +216,7 @@ fun Routing.constraintsRoutes() {
             }
             recomputeConstraintHash(caseId, versionId, rows)
         }
-        call.respond(buildJsonObject { put("rows", JsonArray(rows.map { rowJson(it) })) })
+        call.respond(buildJsonObject { put("rows", JsonArray(rows.map { rowJson(it) })); put("version_id", versionId) })
     }
 
     // ── GET /cases/{case_id}/constraints/export ───────────────────────────────

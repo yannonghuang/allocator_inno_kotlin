@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
-import { useParams, useSearchParams } from 'next/navigation';
+import { useParams, usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { useTranslations } from 'next-intl';
 import {
   getPurchasableMaterials,
@@ -28,9 +28,12 @@ import { VersionSwitcher } from '@/app/components/VersionSwitcher';
 export function PurchasableMaterialsPage() {
   const params = useParams();
   const caseId = Number(params.id);
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
   // Optional ?version_id= — set when arriving from ConfigDetailView's "Open full page" link for
   // a specific historical version (see CaseConfigVersions' own doc).
-  const initialVersionId = Number(useSearchParams().get('version_id')) || undefined;
+  const initialVersionId = Number(searchParams.get('version_id')) || undefined;
   const t = useTranslations('purchasableMaterialsPage');
   const tP = useTranslations('planning');  // RawMaterialPicker's own labels live under planning.config.*
 
@@ -69,6 +72,19 @@ export function PurchasableMaterialsPage() {
 
   useEffect(() => { loadVersion(initialVersionId); }, [loadVersion, initialVersionId]);
 
+  // Keep the URL's version_id in sync with the resolved version — see the Allocation page's
+  // identical fix for the full failure story (stale URL param outlives a deleted/replaced
+  // version, so navigating away and back silently lands on the wrong one).
+  useEffect(() => {
+    const current = searchParams.get('version_id');
+    const desired = versionId != null ? String(versionId) : null;
+    if (current === desired) return;
+    const next = new URLSearchParams(searchParams.toString());
+    if (desired == null) next.delete('version_id'); else next.set('version_id', desired);
+    const qs = next.toString();
+    router.replace(qs ? `${pathname}?${qs}` : pathname);
+  }, [versionId, pathname, router, searchParams]);
+
   // ── Navigation guards ─────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -102,7 +118,9 @@ export function PurchasableMaterialsPage() {
     setSaving(true);
     setError(null);
     try {
-      await updatePurchasableMaterials(caseId, draft, versionId ?? undefined);
+      const { versionId: writtenVersionId } = await updatePurchasableMaterials(caseId, draft, versionId ?? undefined);
+      setVersionId(writtenVersionId);
+      setVersions(await listPurchasableMaterialsVersions(caseId));
       setSaved(draft);
       setDirty(false);
     } catch (e) {
@@ -137,8 +155,10 @@ export function PurchasableMaterialsPage() {
     setImportLoading(true); setError(null);
     try {
       const text = await file.text();
-      const rows = await importPurchasableMaterialsCsv(caseId, text, versionId ?? undefined);
+      const { rows, versionId: writtenVersionId } = await importPurchasableMaterialsCsv(caseId, text, versionId ?? undefined);
       const ids = rows.map((r) => r.product_id);
+      setVersionId(writtenVersionId);
+      setVersions(await listPurchasableMaterialsVersions(caseId));
       setSaved(ids); setDraft(ids); setDirty(false);
     } catch (err) { setError(String(err)); }
     finally { setImportLoading(false); e.target.value = ''; }
@@ -167,7 +187,14 @@ export function PurchasableMaterialsPage() {
 
   // ── Versioning ────────────────────────────────────────────────────────────
 
-  const handleSwitchVersion = (vId: number) => { setVersionId(vId); loadVersion(vId); };
+  // `draft` isn't cleared on switch — without this, an unsaved selection made before switching
+  // versions stays displayed (and wrongly marked dirty/clean) against the newly-loaded version
+  // (see the Allocation page's identical fix for the full failure story).
+  const handleSwitchVersion = (vId: number) => {
+    if (dirty && !confirm(t('confirmDiscard'))) return;
+    setVersionId(vId);
+    loadVersion(vId);
+  };
 
   const handleSaveAs = async (name: string | undefined, comments: string | undefined) => {
     setSaving(true); setError(null);
