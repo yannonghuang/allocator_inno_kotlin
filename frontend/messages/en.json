@@ -1296,6 +1296,7 @@
     "undoTitle": "Undo  Ctrl+Z",
     "redoTitle": "Redo  Ctrl+Shift+Z",
     "saveTitle": "Save  Ctrl+S",
+    "saveNamePrompt": "Name this version (optional, but recommended so it's easy to find later):",
     "tsaHeader": "Targeted Supply Allocation",
     "tsaHint": "Editable cells (highlighted) are raw critical-material lots × customer — set a qty cap and/or move a lot's target by editing its cell. Every other cell is read-only: computed aggregates, the finer per-demand split under a customer, or a critical-stock lot's values propagated from its dependent raw material.",
     "untargetedHeader": "Untargeted",
@@ -1353,7 +1354,8 @@
     "confirmClear": "Clear the Preferences KB? Planning will fall back to raw CSV preference values.",
     "confirmDiscard": "This will discard unsaved changes. Continue?",
     "confirmLeave": "You have unsaved changes. Leave without saving?",
-    "saveTitle": "Save  Ctrl+S"
+    "saveTitle": "Save  Ctrl+S",
+    "saveNamePrompt": "Name this version (optional, but recommended so it's easy to find later):"
   },
   "demandOrderingPage": {
     "loading": "Loading demand ordering…",
@@ -1385,7 +1387,8 @@
     "confirmClear": "Clear the Demand Ordering? Planning will fall back to raw priority/demand_id order.",
     "confirmDiscard": "This will discard unsaved changes. Continue?",
     "confirmLeave": "You have unsaved changes. Leave without saving?",
-    "saveTitle": "Save  Ctrl+S"
+    "saveTitle": "Save  Ctrl+S",
+    "saveNamePrompt": "Name this version (optional, but recommended so it's easy to find later):"
   },
   "purchasableMaterialsPage": {
     "title": "Purchasable Materials",
@@ -1425,7 +1428,10 @@
     "version": "Version",
     "none": "-",
     "inUseReadOnly": "in use — read only",
-    "inUseTooltip": "This version is used by an existing plan run — Save/Generate/Import/Clear are disabled. Use Save As to create an editable copy.",
+    "inUseTooltip": "This version is in use — Save/Generate/Import/Clear are disabled. Use Save As to create an editable copy.",
+    "inUseTooltipPlanRun": "This version is used by a plan run that's currently running or has completed — Save/Generate/Import/Clear are disabled. Use Save As to create an editable copy.",
+    "inUseTooltipKb": "This version is referenced by a Knowledge Base entry — it stays locked even if you delete the plan run that created it; only removing the KB entry itself will unlock it. Save/Generate/Import/Clear are disabled. Use Save As to create an editable copy.",
+    "inUseTooltipBoth": "This version is used by a plan run (running or completed) and referenced by a Knowledge Base entry — deleting the plan run alone won't unlock it, the KB entry must also be removed. Save/Generate/Import/Clear are disabled. Use Save As to create an editable copy.",
     "saveAs": "Save As…",
     "manageVersions": "Manage versions",
     "namePlaceholder": "Name (optional)",

@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
-import { useParams, useSearchParams } from 'next/navigation';
+import { useParams, usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { useTranslations } from 'next-intl';
 import {
   DemandOrderRow,
@@ -24,9 +24,12 @@ import { DemandOrderTable } from '@/app/components/DemandOrderTable';
 export function DemandOrderingPage() {
   const params = useParams();
   const caseId = Number(params.id);
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
   // Optional ?version_id= — set when arriving from ConfigDetailView's "Open full page" link for
   // a specific historical version (see CaseConfigVersions' own doc).
-  const initialVersionId = Number(useSearchParams().get('version_id')) || undefined;
+  const initialVersionId = Number(searchParams.get('version_id')) || undefined;
   const t = useTranslations('demandOrderingPage');
 
   const [rows, setRows] = useState<DemandOrderRow[] | null>(null);
@@ -46,7 +49,13 @@ export function DemandOrderingPage() {
   const [versionId, setVersionId] = useState<number | null>(null);
   const referenced = versions.find((v) => v.id === versionId)?.referenced ?? false;
 
-  const hasPending = pendingChanges.size > 0;
+  // Generate can return a full row set with no version resolved (nothing persisted — see
+  // generateDemandOrdering's own doc); that state is "unsaved" exactly like a pending edit, just
+  // not expressible as a pendingChanges delta since context columns (customer/product/due date)
+  // came from Generate too, not from a committed `rows` baseline that still exists.
+  const hasUnsavedGenerate = versionId == null && (rows?.length ?? 0) > 0;
+  const hasPending = pendingChanges.size > 0 || hasUnsavedGenerate;
+  const pendingCount = hasUnsavedGenerate ? (rows?.length ?? 0) : pendingChanges.size;
 
   // ── Load ──────────────────────────────────────────────────────────────────
 
@@ -64,6 +73,19 @@ export function DemandOrderingPage() {
   }, [caseId]);
 
   useEffect(() => { loadVersion(initialVersionId); }, [loadVersion, initialVersionId]);
+
+  // Keep the URL's version_id in sync with the resolved version — see the Allocation page's
+  // identical fix for the full failure story (stale URL param outlives a deleted/replaced
+  // version, so navigating away and back silently lands on the wrong one).
+  useEffect(() => {
+    const current = searchParams.get('version_id');
+    const desired = versionId != null ? String(versionId) : null;
+    if (current === desired) return;
+    const next = new URLSearchParams(searchParams.toString());
+    if (desired == null) next.delete('version_id'); else next.set('version_id', desired);
+    const qs = next.toString();
+    router.replace(qs ? `${pathname}?${qs}` : pathname);
+  }, [versionId, pathname, router, searchParams]);
 
   // ── Navigation guards ─────────────────────────────────────────────────────
 
@@ -94,32 +116,52 @@ export function DemandOrderingPage() {
   const saveRef = useRef<() => void>(() => {});
 
   const handleSave = React.useCallback(async () => {
-    if (!pendingChanges.size || !rows || referenced) return;
+    if (!hasPending || !rows || referenced) return;
+    // Saving with no version resolved yet is the moment a version gets created (see
+    // resolvedOrCreatedVersionId's own doc) — ask for a real name here instead of silently
+    // leaving it as an anonymous "Version {id}" the user then has to hunt down and rename.
+    let versionName: string | undefined;
+    if (versionId == null) {
+      const entered = prompt(t('saveNamePrompt'));
+      if (entered === null) return; // cancelled — nothing persisted
+      versionName = entered.trim() || undefined;
+    }
     setSaving(true);
     setError(null);
     try {
-      const byId = new Map(rows.map((r) => [r.demand_id, r]));
-      const updated: DemandOrderRow[] = Array.from(pendingChanges.entries()).map(([demandId, order]) => {
-        const base = byId.get(demandId)!;
-        return { ...base, order };
-      });
-      await updateDemandOrderRows(caseId, updated.map((r) => ({ demand_id: r.demand_id, order: r.order })), versionId ?? undefined);
-      setRows((prev) => {
-        if (!prev) return prev;
-        const next = [...prev];
-        for (const ur of updated) {
-          const idx = next.findIndex((r) => r.demand_id === ur.demand_id);
-          if (idx >= 0) next[idx] = ur;
-        }
-        return next;
-      });
+      // A staged (unsaved) Generate result has no committed baseline to diff against — the whole
+      // row set IS the change, so persist it wholesale instead of pendingChanges' deltas.
+      const updated: DemandOrderRow[] = hasUnsavedGenerate ? rows : (() => {
+        const byId = new Map(rows.map((r) => [r.demand_id, r]));
+        return Array.from(pendingChanges.entries()).map(([demandId, order]) => {
+          const base = byId.get(demandId)!;
+          return { ...base, order };
+        });
+      })();
+      if (versionId == null) {
+        const v = await createDemandOrderingVersion(caseId, { name: versionName, rows: updated.map((r) => ({ demand_id: r.demand_id, order: r.order })) });
+        loadVersion(v.id);
+      } else {
+        const { versionId: writtenVersionId } = await updateDemandOrderRows(caseId, updated.map((r) => ({ demand_id: r.demand_id, order: r.order })), versionId);
+        setVersionId(writtenVersionId);
+        setVersions(await listDemandOrderingVersions(caseId));
+        setRows((prev) => {
+          if (!prev) return prev;
+          const next = [...prev];
+          for (const ur of updated) {
+            const idx = next.findIndex((r) => r.demand_id === ur.demand_id);
+            if (idx >= 0) next[idx] = ur;
+          }
+          return next;
+        });
+      }
       setPendingChanges(new Map());
     } catch (e) {
       setError(String(e));
     } finally {
       setSaving(false);
     }
-  }, [pendingChanges, rows, caseId, versionId, referenced]);
+  }, [hasPending, hasUnsavedGenerate, pendingChanges, rows, caseId, versionId, referenced, t, loadVersion]);
 
   useEffect(() => { saveRef.current = handleSave; }, [handleSave]);
 
@@ -141,11 +183,19 @@ export function DemandOrderingPage() {
     if (hasPending && !confirm(t('confirmDiscard'))) return;
     setGenerating(true); setError(null);
     try {
-      const newRows = await generateDemandOrdering(caseId, versionId ?? undefined);
+      const { rows: newRows, versionId: writtenVersionId } = await generateDemandOrdering(caseId, versionId ?? undefined);
       setRows(newRows);
       clearPending();
-      const res = await getDemandOrdering(caseId, versionId ?? undefined);
-      setConfig(res?.config ?? null);
+      if (writtenVersionId != null) {
+        // A version was already resolved — generate persisted in place immediately.
+        setVersionId(writtenVersionId);
+        setVersions(await listDemandOrderingVersions(caseId));
+        const res = await getDemandOrdering(caseId, writtenVersionId);
+        setConfig(res?.config ?? null);
+      }
+      // else: nothing persisted (see generateDemandOrdering's own doc) — `rows` now holds the
+      // staged, unsaved result (hasUnsavedGenerate picks this up since versionId is still null);
+      // Save is the one place a version gets created.
     } catch (e) { setError(String(e)); }
     finally { setGenerating(false); }
   };
@@ -158,7 +208,13 @@ export function DemandOrderingPage() {
       return;
     }
     setImportLoading(true); setError(null);
-    try { setRows(await importDemandOrderingCsv(caseId, await file.text(), versionId ?? undefined)); clearPending(); }
+    try {
+      const { rows: newRows, versionId: writtenVersionId } = await importDemandOrderingCsv(caseId, await file.text(), versionId ?? undefined);
+      setRows(newRows);
+      setVersionId(writtenVersionId);
+      setVersions(await listDemandOrderingVersions(caseId));
+      clearPending();
+    }
     catch (e) { setError(String(e)); }
     finally { setImportLoading(false); if (importRef.current) importRef.current.value = ''; }
   };
@@ -182,7 +238,15 @@ export function DemandOrderingPage() {
 
   // ── Versioning ────────────────────────────────────────────────────────────
 
-  const handleSwitchVersion = (vId: number) => { setVersionId(vId); loadVersion(vId); };
+  // Pending edits are keyed by demand_id, shared across every version of this case — without
+  // clearing here, an unsaved edit leaks onto whichever version is loaded next (see the
+  // Allocation page's identical fix for the full failure story).
+  const handleSwitchVersion = (vId: number) => {
+    if (hasPending && !confirm(t('confirmDiscard'))) return;
+    clearPending();
+    setVersionId(vId);
+    loadVersion(vId);
+  };
 
   const handleSaveAs = async (name: string | undefined, comments: string | undefined) => {
     setSaving(true); setError(null);
@@ -264,7 +328,7 @@ export function DemandOrderingPage() {
           <button
             style={{ ...btn(hasPending ? 'save' : 'ghost'), opacity: hasPending ? 1 : 0.35 }}
             onClick={handleSave} disabled={!hasPending || saving || referenced} title={t('saveTitle')}>
-            {saving ? t('saving') : hasPending ? t('saveWithCount', { count: pendingChanges.size }) : t('save')}
+            {saving ? t('saving') : hasPending ? t('saveWithCount', { count: pendingCount }) : t('save')}
           </button>
         )}
       </div>
@@ -300,7 +364,7 @@ export function DemandOrderingPage() {
 
       {hasPending && (
         <div style={{ background: '#1c1008', border: '1px solid #78350f', borderRadius: 4, padding: '0.4rem 0.75rem', fontSize: '0.78rem', color: '#fdba74', marginBottom: '0.75rem' }}>
-          {t('unsavedBanner', { count: pendingChanges.size })}
+          {t('unsavedBanner', { count: pendingCount })}
         </div>
       )}
 

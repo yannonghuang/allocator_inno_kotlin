@@ -155,6 +155,19 @@ private fun versionJson(caseId: Int, versionId: Int?): JsonObject {
  * Deliberately does NOT check "is this version referenced" — see Allocation.kt's
  * generateDefaultTsaRows's own doc for why that guard belongs in the route layer, not here.
  */
+/** Pure computation half of [generateAndSeedCasePreferences] — no DB writes. Split out so the
+ *  Generate route can compute-and-return without persisting when no version is resolved yet (see
+ *  that route's own doc: Generate must never silently create a version — only Save/Save As may). */
+internal fun computePreferenceRows(
+    data: Map<String, List<Map<String, Any?>>>,
+    config: Map<String, Any?>?,
+    maxBomDepth: Int,
+    deliveryWeight: Double,
+    inventoryWeight: Double,
+    criticalMaterialWeight: Double,
+): List<CasePreferenceRow> =
+    toRows(buildPreferenceKb(data, config, maxBomDepth, deliveryWeight, inventoryWeight, criticalMaterialWeight))
+
 internal fun generateAndSeedCasePreferences(
     caseId: Int,
     versionId: Int,
@@ -165,7 +178,7 @@ internal fun generateAndSeedCasePreferences(
     inventoryWeight: Double,
     criticalMaterialWeight: Double,
 ): List<CasePreferenceRow> {
-    val rows = toRows(buildPreferenceKb(data, config, maxBomDepth, deliveryWeight, inventoryWeight, criticalMaterialWeight))
+    val rows = computePreferenceRows(data, config, maxBomDepth, deliveryWeight, inventoryWeight, criticalMaterialWeight)
     transaction {
         CasePreferences.deleteWhere { CasePreferences.versionId eq versionId }
         if (rows.isNotEmpty()) {
@@ -297,10 +310,14 @@ fun Routing.preferenceRoutes() {
     // ── POST /cases/{case_id}/preferences/generate ────────────────────────────
     // Body: { "max_bom_depth": N, "delivery_weight": D, "inventory_weight": I,
     //         "critical_material_weight": C, "config": {...} }
+    // Deliberately does NOT auto-create a version when none is resolved — see Allocation.kt's
+    // /allocation/generate route for the full rationale (Generate is a "try it out" action, not a
+    // write the user asked for; when unresolved, this computes and returns rows WITHOUT touching
+    // the DB, and the frontend stages them like a pending edit until Save/Save As).
     post("/cases/{case_id}/preferences/generate") {
         val caseId = requireCaseId(call)
-        val versionId = resolvedOrCreatedVersionId(call, caseId)
-        if (CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
+        val versionId = resolvedVersionId(call, caseId)
+        if (versionId != null && CaseConfigVersioning.isVersionReferenced(versionId, KIND)) {
             call.respond(HttpStatusCode.Conflict, buildJsonObject { put("error", "version_in_use") })
             return@post
         }
@@ -340,11 +357,18 @@ fun Routing.preferenceRoutes() {
 
         log.info("[preferences] generating for case {} version {} (max_bom_depth={}, delivery_weight={}, inventory_weight={}, critical_material_weight={})",
             caseId, versionId, maxBomDepth, deliveryWeight, inventoryWeight, criticalMaterialWeight)
-        val newRows = generateAndSeedCasePreferences(caseId, versionId, data, config, maxBomDepth, deliveryWeight, inventoryWeight, criticalMaterialWeight)
+        val newRows = if (versionId != null) {
+            generateAndSeedCasePreferences(caseId, versionId, data, config, maxBomDepth, deliveryWeight, inventoryWeight, criticalMaterialWeight)
+        } else {
+            computePreferenceRows(data, config, maxBomDepth, deliveryWeight, inventoryWeight, criticalMaterialWeight)
+        }
         log.info("[preferences] generated {} rows for case {}", newRows.size, caseId)
 
         val prodAreaByPl = prodAreaByProductLocation(caseId)
-        call.respond(buildJsonObject { put("rows", JsonArray(newRows.map { rowJson(it, prodAreaByPl) })) })
+        call.respond(buildJsonObject {
+            put("rows", JsonArray(newRows.map { rowJson(it, prodAreaByPl) }))
+            put("version_id", versionId?.let { JsonPrimitive(it) } ?: JsonNull)
+        })
     }
 
     // ── PUT /cases/{case_id}/preferences ──────────────────────────────────────
@@ -387,7 +411,7 @@ fun Routing.preferenceRoutes() {
             val currentRows = loadCasePreferenceRows(versionId) ?: emptyList()
             recomputeCasePreferenceHash(caseId, versionId, currentRows)
         }
-        call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", edits.size) })
+        call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", edits.size); put("version_id", versionId) })
     }
 
     // ── DELETE /cases/{case_id}/preferences ───────────────────────────────────
@@ -443,7 +467,7 @@ fun Routing.preferenceRoutes() {
             recomputeCasePreferenceHash(caseId, versionId, rows)
         }
         val prodAreaByPl = prodAreaByProductLocation(caseId)
-        call.respond(buildJsonObject { put("rows", JsonArray(rows.map { rowJson(it, prodAreaByPl) })) })
+        call.respond(buildJsonObject { put("rows", JsonArray(rows.map { rowJson(it, prodAreaByPl) })); put("version_id", versionId) })
     }
 
     // ── GET /cases/{case_id}/preferences/export ───────────────────────────────
@@ -477,6 +501,8 @@ fun Routing.preferenceRoutes() {
                 buildJsonObject {
                     put("id", v.id); put("name", v.name); put("comments", v.comments)
                     put("referenced", v.referenced)
+                    put("referenced_by_plan_run", v.referencedByPlanRun)
+                    put("referenced_by_kb", v.referencedByKb)
                     put("created_at", v.createdAt); put("updated_at", v.updatedAt)
                 }
             }))

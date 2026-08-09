@@ -1296,6 +1296,7 @@
     "undoTitle": "撤销  Ctrl+Z",
     "redoTitle": "重做  Ctrl+Shift+Z",
     "saveTitle": "保存  Ctrl+S",
+    "saveNamePrompt": "为此版本命名（可选，但建议填写以便日后查找）：",
     "tsaHeader": "定向供应分配",
     "tsaHint": "高亮的可编辑单元格 = 原材料批次 × 客户 — 编辑单元格可设置额度上限并/或将批次的目标客户移到此列。其余单元格均为只读：聚合汇总、某客户下按需求拆分的更细粒度结果，或由其依赖的原材料分配传导而来的关键库存批次数值。",
     "untargetedHeader": "未指定客户",
@@ -1353,7 +1354,8 @@
     "confirmClear": "清除偏好知识库？规划将回退使用原始 CSV 偏好值。",
     "confirmDiscard": "此操作将丢弃未保存的更改，是否继续？",
     "confirmLeave": "您有未保存的更改，确定要离开吗？",
-    "saveTitle": "保存  Ctrl+S"
+    "saveTitle": "保存  Ctrl+S",
+    "saveNamePrompt": "为此版本命名（可选，但建议填写以便日后查找）："
   },
   "demandOrderingPage": {
     "loading": "正在加载需求排序…",
@@ -1385,7 +1387,8 @@
     "confirmClear": "清除需求排序?规划将回退到原始优先级/需求编号顺序。",
     "confirmDiscard": "这将丢弃未保存的更改。是否继续?",
     "confirmLeave": "您有未保存的更改。是否离开而不保存?",
-    "saveTitle": "保存  Ctrl+S"
+    "saveTitle": "保存  Ctrl+S",
+    "saveNamePrompt": "为此版本命名（可选，但建议填写以便日后查找）："
   },
   "purchasableMaterialsPage": {
     "title": "可采购物料",
@@ -1425,7 +1428,10 @@
     "version": "版本",
     "none": "-",
     "inUseReadOnly": "使用中 — 只读",
-    "inUseTooltip": "此版本已被某个计划运行使用 — 保存/生成/导入/清除已禁用。请使用「另存为」创建可编辑的副本。",
+    "inUseTooltip": "此版本正在使用中 — 保存/生成/导入/清除已禁用。请使用「另存为」创建可编辑的副本。",
+    "inUseTooltipPlanRun": "此版本正被某个计划运行使用（进行中或已完成）— 保存/生成/导入/清除已禁用。请使用「另存为」创建可编辑的副本。",
+    "inUseTooltipKb": "此版本被知识库（KB）条目引用 — 即使删除创建它的计划运行，仍会保持锁定；只有删除该 KB 条目本身才能解锁。保存/生成/导入/清除已禁用。请使用「另存为」创建可编辑的副本。",
+    "inUseTooltipBoth": "此版本既被计划运行使用（进行中或已完成），又被知识库（KB）条目引用 — 仅删除计划运行并不会解锁，还需删除该 KB 条目。保存/生成/导入/清除已禁用。请使用「另存为」创建可编辑的副本。",
     "saveAs": "另存为…",
     "manageVersions": "管理版本",
     "namePlaceholder": "名称(可选)",

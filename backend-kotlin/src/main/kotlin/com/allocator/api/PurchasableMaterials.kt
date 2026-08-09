@@ -136,7 +136,7 @@ fun Routing.purchasableMaterialsRoutes() {
             }
             recomputePurchasableMaterialHash(caseId, versionId, ids)
         }
-        call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", ids.size) })
+        call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", ids.size); put("version_id", versionId) })
     }
 
     // ── DELETE /cases/{case_id}/purchasable-materials ─────────────────────────
@@ -186,6 +186,7 @@ fun Routing.purchasableMaterialsRoutes() {
         }
         call.respond(buildJsonObject {
             put("rows", JsonArray(ids.sorted().map { buildJsonObject { put("product_id", it) } }))
+            put("version_id", versionId)
         })
     }
 
@@ -209,6 +210,8 @@ fun Routing.purchasableMaterialsRoutes() {
                 buildJsonObject {
                     put("id", v.id); put("name", v.name); put("comments", v.comments)
                     put("referenced", v.referenced)
+                    put("referenced_by_plan_run", v.referencedByPlanRun)
+                    put("referenced_by_kb", v.referencedByKb)
                     put("created_at", v.createdAt); put("updated_at", v.updatedAt)
                 }
             }))

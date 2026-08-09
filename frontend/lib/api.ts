@@ -2153,12 +2153,25 @@ export type ConfigVersion = {
   name: string | null;
   comments: string | null;
   referenced: boolean;
+  // Split-out detail behind `referenced` (their OR) — a plan_run reference clears the moment
+  // that run is deleted, but a kb_record reference deliberately survives its source run's
+  // deletion (see backend CaseConfigVersioning's own doc), so a version can stay just as locked
+  // with referenced_by_plan_run now false. Lets the UI say WHY instead of one generic message.
+  referenced_by_plan_run: boolean;
+  referenced_by_kb: boolean;
   created_at: string;
   updated_at: string;
 };
 
+// next.config.js sets trailingSlash:true, so any request built without a trailing slash gets a
+// 308 redirect back to the same path + '/' before Next even runs its rewrite. fetch() is spec'd
+// to replay the method and body on a 307/308, but that replay is exactly the kind of edge case
+// browsers disagree on for PUT/POST bodies — reproduced here as TSA table edits (PUT
+// .../allocation) that appeared to succeed but never reached the backend. Building the
+// trailing-slash URL up front avoids the redirect hop entirely instead of depending on redirect
+// replay behavior.
 function withVersion(url: string, versionId?: number): string {
-  return versionId != null ? `${url}?version_id=${versionId}` : url;
+  return versionId != null ? `${url}/?version_id=${versionId}` : `${url}/`;
 }
 
 async function listConfigVersions(kindPath: string, caseId: number): Promise<ConfigVersion[]> {
@@ -2227,23 +2240,37 @@ export async function getAllocation(caseId: number, versionId?: number): Promise
 
 /** POST /cases/{id}/allocation/generate — seeds TSA rows for the case's current critical-material
  *  lots (qty_cap/target copied from their physical values — a no-op starting point to edit from).
- *  409 if the target version is referenced by an existing plan run. */
-export async function generateAllocation(caseId: number, versionId?: number): Promise<TsaRow[]> {
+ *  409 if the target version is referenced by an existing plan run.
+ *
+ *  Returns the version_id the rows were written against — when [versionId] wasn't passed (no
+ *  version resolved yet), the backend silently resolves-or-creates one (see
+ *  resolvedOrCreatedVersionId's own doc); without reporting it back, the caller has no way to
+ *  learn a version now exists, and a later "Save As" would create a SECOND, unrelated version,
+ *  orphaning this one. */
+/** versionId in the response is null when the backend didn't resolve a version and deliberately
+ *  did NOT auto-create one — Generate is a "try it out" action, not a write the user asked for
+ *  (see the backend route's own doc). The caller must stage `rows` as a pending/unsaved edit in
+ *  that case; only Save/Save As may create a version. */
+export async function generateAllocation(caseId: number, versionId?: number): Promise<{ rows: TsaRow[]; versionId: number | null }> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/allocation/generate`, versionId), { method: 'POST' });
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
-  return data.rows as TsaRow[];
+  return { rows: data.rows as TsaRow[], versionId: (data.version_id as number | null) ?? null };
 }
 
 /** PUT /cases/{id}/allocation — upsert (partial or full) TSA rows. 409 if the target version is
- *  referenced by an existing plan run — use createAllocationVersion ("Save As") instead. */
-export async function updateAllocationRows(caseId: number, rows: TsaRow[], versionId?: number): Promise<void> {
+ *  referenced by an existing plan run — use createAllocationVersion ("Save As") instead. Returns
+ *  the version_id written against — see generateAllocation's own doc for why this matters when no
+ *  version was resolved yet. */
+export async function updateAllocationRows(caseId: number, rows: TsaRow[], versionId?: number): Promise<{ versionId: number }> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/allocation`, versionId), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ rows }),
   });
   if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return { versionId: data.version_id as number };
 }
 
 /** DELETE /cases/{id}/allocation — clear the target version's TSA rows. */
@@ -2252,8 +2279,10 @@ export async function deleteAllocation(caseId: number, versionId?: number): Prom
   if (!r.ok) throw new Error(await r.text());
 }
 
-/** POST /cases/{id}/allocation/import — upload CSV (supply_id,qty_cap,target), replace all rows. */
-export async function importAllocationCsv(caseId: number, csvText: string, versionId?: number): Promise<TsaRow[]> {
+/** POST /cases/{id}/allocation/import — upload CSV (supply_id,qty_cap,target), replace all rows.
+ *  Returns the version_id written against — see generateAllocation's own doc for why this matters
+ *  when no version was resolved yet. */
+export async function importAllocationCsv(caseId: number, csvText: string, versionId?: number): Promise<{ rows: TsaRow[]; versionId: number }> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/allocation/import`, versionId), {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain' },
@@ -2261,7 +2290,7 @@ export async function importAllocationCsv(caseId: number, csvText: string, versi
   });
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
-  return data.rows as TsaRow[];
+  return { rows: data.rows as TsaRow[], versionId: data.version_id as number };
 }
 
 /** GET /cases/{id}/allocation/export — download CSV text (supply_id,qty_cap,target). */
@@ -2318,14 +2347,18 @@ export async function getPurchasableMaterials(caseId: number, versionId?: number
 }
 
 /** PUT /cases/{id}/purchasable-materials — replaces the whole set. 409 if the target version is
- *  referenced by an existing plan run — use createPurchasableMaterialsVersion ("Save As") instead. */
-export async function updatePurchasableMaterials(caseId: number, productIds: string[], versionId?: number): Promise<void> {
+ *  referenced by an existing plan run — use createPurchasableMaterialsVersion ("Save As") instead.
+ *  Returns the version_id written against — see Preferences' generatePreferences for why this
+ *  matters (an unreported implicit version create leaves a later Save As to orphan it). */
+export async function updatePurchasableMaterials(caseId: number, productIds: string[], versionId?: number): Promise<{ versionId: number }> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/purchasable-materials`, versionId), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ product_ids: productIds }),
   });
   if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return { versionId: data.version_id as number };
 }
 
 /** DELETE /cases/{id}/purchasable-materials — clear the target version's rows (revert to
@@ -2335,7 +2368,8 @@ export async function deletePurchasableMaterials(caseId: number, versionId?: num
   if (!r.ok) throw new Error(await r.text());
 }
 
-export async function importPurchasableMaterialsCsv(caseId: number, csvText: string, versionId?: number): Promise<PurchasableMaterialRow[]> {
+/** Returns the version_id written against — see updatePurchasableMaterials' own doc. */
+export async function importPurchasableMaterialsCsv(caseId: number, csvText: string, versionId?: number): Promise<{ rows: PurchasableMaterialRow[]; versionId: number }> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/purchasable-materials/import`, versionId), {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain' },
@@ -2343,7 +2377,7 @@ export async function importPurchasableMaterialsCsv(caseId: number, csvText: str
   });
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
-  return data.rows as PurchasableMaterialRow[];
+  return { rows: data.rows as PurchasableMaterialRow[], versionId: data.version_id as number };
 }
 
 export async function exportPurchasableMaterialsCsv(caseId: number, versionId?: number): Promise<string> {
@@ -2378,14 +2412,18 @@ export async function getCaseConstraints(caseId: number, versionId?: number): Pr
 }
 
 /** PUT /cases/{id}/constraints — replaces the whole rule set. 409 if the target version is
- *  referenced by an existing plan run — use createCaseConstraintsVersion ("Save As") instead. */
-export async function updateCaseConstraints(caseId: number, rows: ConstraintRuleRow[], versionId?: number): Promise<void> {
+ *  referenced by an existing plan run — use createCaseConstraintsVersion ("Save As") instead.
+ *  Returns the version_id written against — see Preferences' generatePreferences for why this
+ *  matters (an unreported implicit version create leaves a later Save As to orphan it). */
+export async function updateCaseConstraints(caseId: number, rows: ConstraintRuleRow[], versionId?: number): Promise<{ versionId: number }> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/constraints`, versionId), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ rows }),
   });
   if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return { versionId: data.version_id as number };
 }
 
 /** DELETE /cases/{id}/constraints — clear the target version's rules. */
@@ -2394,7 +2432,8 @@ export async function deleteCaseConstraints(caseId: number, versionId?: number):
   if (!r.ok) throw new Error(await r.text());
 }
 
-export async function importCaseConstraintsCsv(caseId: number, csvText: string, versionId?: number): Promise<ConstraintRuleRow[]> {
+/** Returns the version_id written against — see updateCaseConstraints' own doc. */
+export async function importCaseConstraintsCsv(caseId: number, csvText: string, versionId?: number): Promise<{ rows: ConstraintRuleRow[]; versionId: number }> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/constraints/import`, versionId), {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain' },
@@ -2402,7 +2441,7 @@ export async function importCaseConstraintsCsv(caseId: number, csvText: string, 
   });
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
-  return data.rows as ConstraintRuleRow[];
+  return { rows: data.rows as ConstraintRuleRow[], versionId: data.version_id as number };
 }
 
 export async function exportCaseConstraintsCsv(caseId: number, versionId?: number): Promise<string> {
@@ -2457,8 +2496,13 @@ export async function getPreferences(caseId: number, versionId?: number): Promis
 }
 
 /** POST /cases/{id}/preferences/generate — builds the KB from case data and saves it. 409 if
- *  the target version is referenced by an existing plan run. */
-export async function generatePreferences(caseId: number, params: PreferenceGenerateParams, versionId?: number): Promise<PreferenceRow[]> {
+ *  the target version is referenced by an existing plan run. Returns the version_id written
+ *  against — when [versionId] wasn't passed, the backend silently resolves-or-creates one; without
+ *  reporting it back, a later "Save As" would create a SECOND, unrelated version, orphaning this
+ *  one (see Allocation's generateAllocation, which hit exactly this). */
+/** versionId in the response is null when the backend didn't resolve a version and deliberately
+ *  did NOT auto-create one — see generateAllocation's own doc for the full rationale. */
+export async function generatePreferences(caseId: number, params: PreferenceGenerateParams, versionId?: number): Promise<{ rows: PreferenceRow[]; versionId: number | null }> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/preferences/generate`, versionId), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -2466,19 +2510,22 @@ export async function generatePreferences(caseId: number, params: PreferenceGene
   });
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
-  return data.rows as PreferenceRow[];
+  return { rows: data.rows as PreferenceRow[], versionId: (data.version_id as number | null) ?? null };
 }
 
 /** PUT /cases/{id}/preferences — upsert edited preference values by natural key. 409 if the
  *  target version is referenced by an existing plan run — use createPreferencesVersion
- *  ("Save As") instead. */
-export async function updatePreferenceRows(caseId: number, rows: PreferenceRow[], versionId?: number): Promise<void> {
+ *  ("Save As") instead. Returns the version_id written against — see generatePreferences' own
+ *  doc for why this matters. */
+export async function updatePreferenceRows(caseId: number, rows: PreferenceRow[], versionId?: number): Promise<{ versionId: number }> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/preferences`, versionId), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ rows }),
   });
   if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return { versionId: data.version_id as number };
 }
 
 /** DELETE /cases/{id}/preferences — clear the target version's rows. */
@@ -2487,8 +2534,9 @@ export async function deletePreferences(caseId: number, versionId?: number): Pro
   if (!r.ok) throw new Error(await r.text());
 }
 
-/** POST /cases/{id}/preferences/import — upload CSV, replace all rows. */
-export async function importPreferencesCsv(caseId: number, csvText: string, versionId?: number): Promise<PreferenceRow[]> {
+/** POST /cases/{id}/preferences/import — upload CSV, replace all rows. Returns the version_id
+ *  written against — see generatePreferences' own doc for why this matters. */
+export async function importPreferencesCsv(caseId: number, csvText: string, versionId?: number): Promise<{ rows: PreferenceRow[]; versionId: number }> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/preferences/import`, versionId), {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain' },
@@ -2496,7 +2544,7 @@ export async function importPreferencesCsv(caseId: number, csvText: string, vers
   });
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
-  return data.rows as PreferenceRow[];
+  return { rows: data.rows as PreferenceRow[], versionId: data.version_id as number };
 }
 
 /** GET /cases/{id}/preferences/export — download CSV text. */
@@ -2538,24 +2586,29 @@ export async function getDemandOrdering(caseId: number, versionId?: number): Pro
 }
 
 /** POST /cases/{id}/demand-ordering/generate — builds the order from case data and saves it.
- *  409 if the target version is referenced by an existing plan run. */
-export async function generateDemandOrdering(caseId: number, versionId?: number): Promise<DemandOrderRow[]> {
+ *  409 if the target version is referenced by an existing plan run. Returns the version_id
+ *  written against — see Preferences' generatePreferences for why this matters. */
+/** versionId in the response is null when the backend didn't resolve a version and deliberately
+ *  did NOT auto-create one — see generateAllocation's own doc for the full rationale. */
+export async function generateDemandOrdering(caseId: number, versionId?: number): Promise<{ rows: DemandOrderRow[]; versionId: number | null }> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/demand-ordering/generate`, versionId), { method: 'POST' });
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
-  return data.rows as DemandOrderRow[];
+  return { rows: data.rows as DemandOrderRow[], versionId: (data.version_id as number | null) ?? null };
 }
 
 /** PUT /cases/{id}/demand-ordering — upsert edited order values by demand_id. 409 if the target
  *  version is referenced by an existing plan run — use createDemandOrderingVersion ("Save As")
- *  instead. */
-export async function updateDemandOrderRows(caseId: number, rows: { demand_id: string; order: number }[], versionId?: number): Promise<void> {
+ *  instead. Returns the version_id written against. */
+export async function updateDemandOrderRows(caseId: number, rows: { demand_id: string; order: number }[], versionId?: number): Promise<{ versionId: number }> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/demand-ordering`, versionId), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ rows }),
   });
   if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return { versionId: data.version_id as number };
 }
 
 /** DELETE /cases/{id}/demand-ordering — clear the target version's rows. */
@@ -2564,8 +2617,9 @@ export async function deleteDemandOrdering(caseId: number, versionId?: number): 
   if (!r.ok) throw new Error(await r.text());
 }
 
-/** POST /cases/{id}/demand-ordering/import — upload CSV, replace all rows. */
-export async function importDemandOrderingCsv(caseId: number, csvText: string, versionId?: number): Promise<DemandOrderRow[]> {
+/** POST /cases/{id}/demand-ordering/import — upload CSV, replace all rows. Returns the version_id
+ *  written against. */
+export async function importDemandOrderingCsv(caseId: number, csvText: string, versionId?: number): Promise<{ rows: DemandOrderRow[]; versionId: number }> {
   const r = await fetch(withVersion(`${API}/cases/${caseId}/demand-ordering/import`, versionId), {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain' },
@@ -2573,7 +2627,7 @@ export async function importDemandOrderingCsv(caseId: number, csvText: string, v
   });
   if (!r.ok) throw new Error(await r.text());
   const data = await r.json();
-  return data.rows as DemandOrderRow[];
+  return { rows: data.rows as DemandOrderRow[], versionId: data.version_id as number };
 }
 
 /** GET /cases/{id}/demand-ordering/export — download CSV text. */

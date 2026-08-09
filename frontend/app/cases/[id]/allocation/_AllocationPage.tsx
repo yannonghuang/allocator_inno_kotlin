@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { useParams, useSearchParams } from 'next/navigation';
+import { useParams, usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { useTranslations } from 'next-intl';
 import {
   AllocationRow,
@@ -41,7 +41,10 @@ type CellEdit = {
 export function AllocationPage() {
   const params = useParams();
   const caseId = Number(params.id);
-  const initialVersionId = Number(useSearchParams().get('version_id')) || undefined;
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const initialVersionId = Number(searchParams.get('version_id')) || undefined;
   const t = useTranslations('allocationPage');
 
   // Committed state
@@ -91,6 +94,23 @@ export function AllocationPage() {
   }, [caseId]);
 
   useEffect(() => { loadVersion(initialVersionId); }, [loadVersion, initialVersionId]);
+
+  // Keep the URL's version_id in sync with the resolved version — without this, the address bar
+  // keeps whatever version_id it had at page load (or none) even after Save As / version-switch
+  // move the user onto a different version. Navigating away and back (or a refresh) then re-reads
+  // that STALE query param: if the original version has since been deleted (e.g. replaced via
+  // "Save As" + "Manage versions" cleanup), it silently resolves to "no version" and the table
+  // falls back to raw physical qty/target — looking exactly like a save that didn't persist, even
+  // though it did, against a version the URL no longer points at.
+  useEffect(() => {
+    const current = searchParams.get('version_id');
+    const desired = versionId != null ? String(versionId) : null;
+    if (current === desired) return;
+    const next = new URLSearchParams(searchParams.toString());
+    if (desired == null) next.delete('version_id'); else next.set('version_id', desired);
+    const qs = next.toString();
+    router.replace(qs ? `${pathname}?${qs}` : pathname);
+  }, [versionId, pathname, router, searchParams]);
 
   // ── Committed lookup + effective (pending-aware) overrides ────────────────
 
@@ -226,6 +246,15 @@ export function AllocationPage() {
 
   const handleSave = useCallback(async () => {
     if (!hasPending || referenced) return;
+    // Saving with no version resolved yet is the moment a version gets created (see
+    // resolvedOrCreatedVersionId's own doc) — ask for a real name here instead of silently
+    // leaving it as an anonymous "Version {id}" the user then has to hunt down and rename.
+    let versionName: string | undefined;
+    if (versionId == null) {
+      const entered = prompt(t('saveNamePrompt'));
+      if (entered === null) return; // cancelled — nothing persisted
+      versionName = entered.trim() || undefined;
+    }
     setSaving(true);
     setError(null);
     try {
@@ -233,15 +262,22 @@ export function AllocationPage() {
       const updated: TsaRow[] = Array.from(changedIds).map(sid => ({
         supply_id: sid, qty_cap: effectiveQtyCap(sid), target: effectiveTarget(sid),
       }));
-      await updateAllocationRows(caseId, updated, versionId ?? undefined);
-      setTsaRows(prev => {
-        const next = [...(prev ?? [])];
-        for (const ur of updated) {
-          const idx = next.findIndex(r => r.supply_id === ur.supply_id);
-          if (idx >= 0) next[idx] = ur; else next.push(ur);
-        }
-        return next;
-      });
+      if (versionId == null) {
+        const v = await createAllocationVersion(caseId, { name: versionName, rows: updated });
+        loadVersion(v.id);
+      } else {
+        const { versionId: writtenVersionId } = await updateAllocationRows(caseId, updated, versionId);
+        setVersionId(writtenVersionId);
+        setVersions(await listAllocationVersions(caseId));
+        setTsaRows(prev => {
+          const next = [...(prev ?? [])];
+          for (const ur of updated) {
+            const idx = next.findIndex(r => r.supply_id === ur.supply_id);
+            if (idx >= 0) next[idx] = ur; else next.push(ur);
+          }
+          return next;
+        });
+      }
       setPendingQtyCap(new Map());
       setPendingTarget(new Map());
       setUndoStack([]);
@@ -251,7 +287,7 @@ export function AllocationPage() {
     } finally {
       setSaving(false);
     }
-  }, [hasPending, caseId, versionId, referenced, pendingQtyCap, pendingTarget, effectiveQtyCap, effectiveTarget]);
+  }, [hasPending, caseId, versionId, referenced, pendingQtyCap, pendingTarget, effectiveQtyCap, effectiveTarget, t, loadVersion]);
 
   useEffect(() => { saveRef.current = handleSave; }, [handleSave]);
 
@@ -263,7 +299,27 @@ export function AllocationPage() {
     if (referenced) return;
     if (hasPending && !confirm(t('confirmDiscard'))) return;
     setGenerating(true); setError(null);
-    try { setTsaRows(await generateAllocation(caseId, versionId ?? undefined)); clearPending(); }
+    try {
+      const { rows, versionId: writtenVersionId } = await generateAllocation(caseId, versionId ?? undefined);
+      if (writtenVersionId != null) {
+        // A version was already resolved — generate persisted in place immediately, matching the
+        // existing "regenerate this version" expectation.
+        setTsaRows(rows);
+        setVersionId(writtenVersionId);
+        setVersions(await listAllocationVersions(caseId));
+        clearPending();
+      } else {
+        // No version yet — nothing was persisted (see generateAllocation's own doc). Stage the
+        // whole generated set as pending edits against an empty committed baseline, exactly like
+        // a manual cap/target edit: every cell shows dirty, Save lights up with the true count,
+        // and clicking Save is the one moment a version actually gets created.
+        setTsaRows([]);
+        setPendingQtyCap(new Map(rows.map((r) => [r.supply_id, r.qty_cap])));
+        setPendingTarget(new Map(rows.map((r) => [r.supply_id, r.target])));
+        setUndoStack([]);
+        setRedoStack([]);
+      }
+    }
     catch (e) { setError(String(e)); }
     finally { setGenerating(false); }
   };
@@ -276,7 +332,13 @@ export function AllocationPage() {
       return;
     }
     setImportLoading(true); setError(null);
-    try { setTsaRows(await importAllocationCsv(caseId, await file.text(), versionId ?? undefined)); clearPending(); }
+    try {
+      const { rows, versionId: writtenVersionId } = await importAllocationCsv(caseId, await file.text(), versionId ?? undefined);
+      setTsaRows(rows);
+      setVersionId(writtenVersionId);
+      setVersions(await listAllocationVersions(caseId));
+      clearPending();
+    }
     catch (e) { setError(String(e)); }
     finally { setImportLoading(false); if (importRef.current) importRef.current.value = ''; }
   };
@@ -300,7 +362,16 @@ export function AllocationPage() {
 
   // ── Versioning ────────────────────────────────────────────────────────────
 
-  const handleSwitchVersion = (vId: number) => { setVersionId(vId); loadVersion(vId); };
+  // Pending edits are keyed by supply_id, which is shared across every TSA version for this case
+  // (it's the same physical lot) — without clearing here, an unsaved edit made before switching
+  // versions silently reappears overlaid on the newly-loaded version's rows (effectiveQtyCap
+  // prefers pendingQtyCap over committed), as if the user had edited a version they never touched.
+  const handleSwitchVersion = (vId: number) => {
+    if (hasPending && !confirm(t('confirmDiscard'))) return;
+    clearPending();
+    setVersionId(vId);
+    loadVersion(vId);
+  };
 
   const handleSaveAs = async (name: string | undefined, comments: string | undefined) => {
     setSaving(true); setError(null);
