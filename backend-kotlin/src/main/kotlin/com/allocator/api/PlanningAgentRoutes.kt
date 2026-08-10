@@ -26,6 +26,14 @@ import com.allocator.services.LlmToolCall
 import com.allocator.services.llmChatWithTools
 import com.allocator.services.Constraint
 import com.allocator.services.parseConstraints
+import com.allocator.services.BranchKey
+import com.allocator.services.DominatorRef
+import com.allocator.services.buildSupplyAllocation
+import com.allocator.services.computeAndSiblingCaps
+import com.allocator.services.computePlanBlueprint
+import com.allocator.services.findOrGroupRecipients
+import com.allocator.services.CaseConfigVersioning
+import com.allocator.services.ConfigVersionKind
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.call
 import io.ktor.server.request.receive
@@ -285,7 +293,9 @@ private val DESIGN_DOC_FILES: List<String> = listOf(
     "planner-orphan-consumption.md",
     "planner-soundness-followups.md",
     "soundness-checker-gaps.md",
+    "soundness-findings-case-171.md",
     "planning-agent.md",
+    "wo-consolidation-and-commitment-aggregate.md",
 )
 
 private val DESIGN_DOC_INDEX: List<DesignDocParagraph> by lazy {
@@ -330,12 +340,25 @@ private const val SYSTEM_PROMPT_INTRO = """You are the Planning Agent — a doma
 Your jobs:
   1. Run plans on the user's behalf (run_plan_async).
   2. Explain the planner's decisions and surface KPIs, pegging, soundness.
-  3. Handle shutdown / maintenance window scheduling (WO impact analysis).
-  4. Answer demand / supply / BOM lookup questions.
+  3. Configure a run — core knobs (method_selection, consolidation, purchase_allowed,
+     etc. via update_config) AND, as of this revision, all 5 external config objects
+     (Targeted Supply Allocation, Supply Preferences, Demand Ordering, Purchasable
+     Materials, Constraints — read/write tools in the "External config objects"
+     primer below).
+  4. Handle shutdown / maintenance window scheduling (WO impact analysis).
+  5. Answer demand / supply / BOM lookup questions.
 
-You do NOT modify planning config (consolidation, method_selection, score_weights,
-etc.). Config changes go through the plan-form UI, not through you. If the user
-asks to change those, redirect them to the form rather than attempting the change.
+You CAN modify the working config and, via the write tools below, the case's own
+external config objects — this is a real capability, not a redirect-to-the-form
+situation. Three rules govern it: (1) always state a change back to the user plainly
+in words — for core knobs the form visibly reflects the change so you don't need to
+repeat it verbatim, but for external-config-object writes there is no such visible
+echo, so state the row count + version_id explicitly; (2) respect `version_in_use`
+locks — never claim to have edited a version that was actually locked and silently
+redirected to a new one, always relay that it happened; (3) never leave a run's
+external-config-object version-id key silently unset when the user asked for that
+object to be used — there is no default-version fallback, an omitted key means the
+object is used NOT AT ALL (see below).
 
 **HONESTY HARD STOP — the single most-violated rule in this system, read before
 answering ANY "why" question:** Every fact you state about this case's data — a
@@ -437,6 +460,18 @@ Planner knowledge (from docs/waterfall-allocation.md):
     demand legitimately drawing beyond its own pre-allocated rows is expected behavior, not a
     bug.
 
+**Planning logic — the 3-step pipeline** (full mental model in agent-knowledge.md and
+`query_design_docs("bottom-up commitment aggregate")`): (1) top-down request decomposition —
+BOM-explode from the demand, propagate quantity+timing requests to raw materials, committing
+greedily as it goes; (2) bottom-up commitment aggregate, including sibling propagation —
+`reconcile(node, target)` re-derives commitment over the FINAL pegging by reverse BOM explosion,
+a parent committing the least-supplied child (AND-min), with each AND-sibling's fair share fed in
+by the diamond/competition-zone split mechanisms first; (3) top-down garbage collection —
+`GCEngine.kt` trims a pegging subtree top-down for the AND-min partial-fulfillment case, returning
+excess inventory/budget as it descends. Reach for this whenever a demand's commit looks smaller
+than its request even though no single node looks wrong in isolation — that's usually step 2
+correctly trimming step 1's greedy over-commit, not a bug.
+
 **Critical materials** (canonical test: `isRawCriticalPosition` in PlanningEngine.kt — the
 SAME function used for live dominator labeling and for building Targeted Supply Allocation's
 budgets, so this is the one true definition, not an approximation you should re-derive):
@@ -472,6 +507,22 @@ budgets, so this is the one true definition, not an approximation you should re-
     a real consumption number — get_component_allocation_by_demand or get_leaf_competition's
     per-demand draws — never infer "not consumed" from a failure/bottleneck node's mere
     presence.
+  - **Consumption policy is binary — pre-allocation vs. plain FIFO, nothing in between.**
+    Critical raw materials draw against the pre-allocated per-demand budget
+    (get_critical_raw_allocation's recomputed grid). Every other product — ordinary
+    purchasable/manufacturable materials, AND critical *stock* that merely inherits targeting
+    from a critical raw material it depends on — draws plain FIFO (`consumeFromInventory`,
+    earliest `supply_date` first, no allocation concept). Don't describe a non-critical
+    product's consumption in allocation-budget terms, and don't assume pre-allocation applies
+    just because a material happens to be scarce — scarcity alone doesn't make something
+    critical; only the isRawCriticalPosition test above does.
+  - **Critical stock's inherited-target split correctly reflects TSA overrides** (fixed
+    2026-08-09, commit `3841ced` — `materializeCriticalStockSupply` now applies TSA overrides
+    before reading target/qty, weighted by each dependent raw lot's real allocated total, not
+    static physical qty as before the fix). Quote `critical_stock_split_qty` for a critical
+    stock's initial split figure when asked to explain it — distinct from `supply_allocations`'
+    actual-consumed figure, which diverges whenever a target's own demand doesn't fully draw
+    its share.
 
 External config objects (5 total, from Tables.kt's CaseConfigVersions doc — DO NOT
 confuse any of these with `manual_override`, a mechanism that was fully retired
@@ -531,15 +582,37 @@ schema for it):
     which BOM-alternative child a customer's demand resolves to, at
     method+variant level (`location="*"` means any location).
   Each object is independently versioned (`CaseConfigVersions`, kind =
-  casealloc/pref/ord/purchmat/constr); a case has one version marked default,
-  but each plan_run/kb_record records the SPECIFIC version_id it actually
-  used — which is not necessarily the case's current default. You only have a
-  read tool for Targeted Supply Allocation's content. If asked about the
-  CONTENT of Supply Preferences, Demand Ordering, Purchasable Materials, or
-  Constraints (not just "which version did this run use", answerable from
-  get_run_config where present) — say plainly you have no tool for that and
-  point the user to the case's own page for that object, rather than
-  guessing or fabricating a schema.
+  casealloc/pref/ord/purchmat/constr). **There is NO "default version" concept**
+  (CaseConfigVersioning.kt — an old is_default-based fallback was deliberately
+  removed; do not say "the case's default version," that idea no longer
+  exists). A case can have zero, one, or many versions of any given object;
+  each plan_run/kb_record records the SPECIFIC version_id it actually used
+  (via get_run_config), which is the only way to know what a past run saw.
+  For a NEW run, a version-id key omitted from the working config means that
+  object is used NOT AT ALL — no fallback, no "most recent," nothing — always
+  say this plainly rather than assuming an unset key means "whatever the case
+  normally uses."
+  Read tools: `get_supply_preferences`, `get_demand_ordering`,
+  `get_purchasable_materials`, `get_constraints` (plus `get_critical_raw_allocation`
+  for Targeted Supply Allocation — recomputed, not raw input, see above), each
+  taking an optional `version_id`; `list_config_versions(kind)` lists a given
+  object's versions with `referenced`/`referenced_by_plan_run`/`referenced_by_kb`
+  flags. When `version_id` is omitted and the case has versions but none is
+  unambiguous, these tools say so plainly (no default to fall back on) instead
+  of guessing which one the user meant.
+  **Write tools** (unlike core config knobs below, editing these IS something you can
+  do from chat): `set_purchasable_materials`, `set_constraints`, `set_demand_ordering`,
+  `set_supply_preferences`, `set_targeted_supply_allocation`. Each always lands in a
+  NEW-or-reused-UNREFERENCED version — the same `version_in_use` lock the form pages
+  respect makes it structurally impossible to mutate a version any saved plan_run/
+  kb_record already used. Omitting `version_id` reuses/creates automatically; if that
+  auto-picked version turns out locked, a genuinely new one is created instead and the
+  result's `note` says so — relay that to the user, don't silently absorb it. These
+  writes do NOT wire themselves into any run — after writing, call `update_config` with
+  the matching `*_version_id` key (see the config-run-triggering rules below) and then
+  `run_plan_async` if the user wants a run to actually use the new version. State every
+  write back explicitly (row count + version_id) — unlike core knobs there is no form
+  the user is already watching that shows the change happened.
 
 Tactics:
   - **Decide which knowledge layer the question lives in BEFORE picking a tool.**
@@ -1211,7 +1284,15 @@ internal val TOOLS: List<LlmTool> = listOf(
         "update_config",
         "Apply a partial patch to the working planning config for this conversation. Deep-merges " +
             "`partial` onto the current working config — set only the keys that change (method_selection, " +
-            "purchase_allowed, purchasable_materials, consolidation, analyze_criticality, check_soundness). " +
+            "purchase_allowed, purchasable_materials, consolidation, analyze_criticality, check_soundness, " +
+            "plus the 5 external-config-object version-id keys: case_alloc_version_id, pref_version_id, " +
+            "demand_order_version_id, purchasable_material_version_id, constraint_version_id — set one of " +
+            "these to the version_id a get_*/set_* external-config tool returned, e.g. after " +
+            "set_constraints returns version_id=7, call update_config({\"partial\": " +
+            "{\"constraint_version_id\": 7}}) to make the NEXT run_plan_async actually use it). " +
+            "IMPORTANT: omitting one of the 5 version-id keys means that object is used NOT AT ALL in " +
+            "the run — there is no default-version fallback; state this plainly if the user seems to " +
+            "assume an unset key means 'the usual one.' " +
             "Does NOT run a plan by itself — call run_plan_async afterward if the user wants the change " +
             "applied. Returns the merged config as confirmation.",
         buildJsonObject {
@@ -1219,7 +1300,8 @@ internal val TOOLS: List<LlmTool> = listOf(
             putJsonObject("properties") {
                 putJsonObject("partial") {
                     put("type", "object")
-                    put("description", "Config keys to merge in, e.g. {\"method_selection\": {\"max_methods\": 3}}")
+                    put("description", "Config keys to merge in, e.g. {\"method_selection\": {\"max_methods\": 3}} " +
+                        "or {\"constraint_version_id\": 7}")
                 }
             }
             put("required", buildJsonArray { add("partial") })
@@ -1691,9 +1773,10 @@ internal val TOOLS: List<LlmTool> = listOf(
             "`manual_override` (a DIFFERENT, retired mechanism — the DB table backing it was " +
             "dropped; do not reference `manual_override.component_split` or " +
             "`manual_override.method_selection`, they no longer exist and setting them does " +
-            "nothing). If the user asks about Supply Preferences, Demand Ordering, or Constraints " +
-            "content directly (not just which version a run used), say plainly you have no tool " +
-            "for reading those and point them to the case's own pages instead of guessing.\n" +
+            "nothing). If the user asks about Supply Preferences, Demand Ordering, Purchasable " +
+            "Materials, or Constraints content, use get_supply_preferences / get_demand_ordering / " +
+            "get_purchasable_materials / get_constraints instead — those read the other 4 external " +
+            "config objects directly.\n" +
             "Returns one row per (supply_id, demand_id) with `qty_allocated`, resolved against the " +
             "run's own `case_alloc_version_id` (each run pins a specific version — this is NOT the " +
             "case's current default unless the run used it). Empty `rows` + a plain-language note " +
@@ -1712,6 +1795,268 @@ internal val TOOLS: List<LlmTool> = listOf(
                 putJsonObject("demand_id") { put("type", "string") }
             }
             put("required", buildJsonArray { add("run_id"); add("product_id") })
+        },
+    ),
+    tool(
+        "explain_competition_zone",
+        "**\"Competition zone\" / diamond-allocation explainer.** For a specific demand + " +
+            "critical-material leaf (product_id@location_id), reports whether that demand has " +
+            "AND-sibling branches contending for the SAME shared critical material, and if so, the " +
+            "fair-split cap each branch actually got (recomputed via computeAndSiblingCaps, the " +
+            "SAME mechanism a live run used — see agent-knowledge.md's 'Planning logic' section, " +
+            "step 2 'sibling propagation'). Use for 'why did branch A get X and branch B get Y of " +
+            "this material' / 'is this leaf a competition zone' questions that get_leaf_competition " +
+            "can't answer (that tool shows DRAWS across demands; this tool shows the INTRA-demand " +
+            "fair-split CAP across one demand's own competing branches). " +
+            "Known limitations, state them if relevant rather than presenting the answer as exact " +
+            "in every case: (1) does not replicate the reallocate_critical_leftover second-pass " +
+            "budget merge — for a run with that flag on, this reflects pass-1 budgets only, same " +
+            "caveat get_critical_raw_allocation already has; (2) does not cover OR-group diamond " +
+            "splits (computeDiamondCapsForAttempt), which are live per-waterfall-attempt and can't " +
+            "be replayed post-hoc — `is_diamond_recipient_material` tells you only whether the " +
+            "material structurally has that shape, not the live split. `has_and_sibling_cap=false` " +
+            "is a complete, valid answer meaning no contention cap applied at this leaf for this " +
+            "demand (either only one branch reaches it, or supply wasn't actually short) — report " +
+            "it plainly, don't invent a mechanism to fill the gap.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("run_id") { put("type", "integer") }
+                putJsonObject("demand_id") { put("type", "string") }
+                putJsonObject("product_id") { put("type", "string") }
+                putJsonObject("location_id") { put("type", "string") }
+            }
+            put("required", buildJsonArray { add("run_id"); add("demand_id"); add("product_id"); add("location_id") })
+        },
+    ),
+    tool(
+        "list_config_versions",
+        "List all versions of one of the case's 5 external config objects (see the system " +
+            "prompt's 'External config objects' primer). `kind` is one of: `casealloc` (Targeted " +
+            "Supply Allocation), `pref` (Supply Preferences), `ord` (Demand Ordering), `purchmat` " +
+            "(Purchasable Materials), `constr` (Constraints). Each version reports `referenced` " +
+            "(locked from in-place edits — used by a saved plan run or KB record; see " +
+            "`referenced_by_plan_run`/`referenced_by_kb` for which). There is NO default version " +
+            "concept in this system — a case with versions but none picked is genuinely ambiguous; " +
+            "never assume 'most recent' means 'the one in use.'",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("kind") {
+                    put("type", "string")
+                    put("enum", buildJsonArray { listOf("casealloc", "pref", "ord", "purchmat", "constr").forEach { add(it) } })
+                }
+            }
+            put("required", buildJsonArray { add("kind") })
+        },
+    ),
+    tool(
+        "get_supply_preferences",
+        "**Supply Preferences** (one of the 5 external config objects) — precomputed " +
+            "method/BOM-variant preference ranking, consulted in place of the raw CSV `preference` " +
+            "column when a (product, location, method) row exists here. Pass `version_id` " +
+            "explicitly when known (e.g. from get_run_config or list_config_versions); if omitted " +
+            "and the case has no versions, or has versions but none is unambiguous, this tool says " +
+            "so plainly instead of guessing (no default-version concept in this system).",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("version_id") { put("type", "integer") }
+            }
+        },
+    ),
+    tool(
+        "get_demand_ordering",
+        "**Demand Ordering** (one of the 5 external config objects) — precomputed demand " +
+            "processing order (by due_time, tie-broken by priority), consulted in place of the " +
+            "raw `(priority, demand_id)` sort when a row exists for a demand. Pass `version_id` " +
+            "explicitly when known; if omitted and ambiguous, this tool says so plainly.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("version_id") { put("type", "integer") }
+            }
+        },
+    ),
+    tool(
+        "get_purchasable_materials",
+        "**Purchasable Materials** (one of the 5 external config objects) — case-level " +
+            "whitelist of which raw materials may be bought (only applies when the run's " +
+            "`purchasable_materials` is non-empty; an empty/absent whitelist means purchase " +
+            "eligibility is governed by `purchase_allowed` + raw method_buy rows alone). Pass " +
+            "`version_id` explicitly when known; if omitted and ambiguous, this tool says so " +
+            "plainly.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("version_id") { put("type", "integer") }
+            }
+        },
+    ),
+    tool(
+        "get_constraints",
+        "**Constraints** (one of the 5 external config objects) — customer-specific " +
+            "BOM-alternative pins: (customer_id, parent, location) -> child, forcing which BOM " +
+            "alternative a customer's demand resolves to at method or alt_group/variant level " +
+            "(`location=\"*\"` means any location). NOT the same as `manual_override` (fully " +
+            "retired — never reference it). Pass `version_id` explicitly when known; if omitted " +
+            "and ambiguous, this tool says so plainly.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("version_id") { put("type", "integer") }
+            }
+        },
+    ),
+    tool(
+        "set_purchasable_materials",
+        "**Write** a new Purchasable Materials whitelist (full replace, like the form's own " +
+            "checklist submit — pass the COMPLETE desired list, not a delta). Creates a new " +
+            "version unless `version_id` names an existing, unreferenced one to edit in place. " +
+            "Omit `version_id` to reuse/create automatically — if the version that would be reused " +
+            "turns out to be locked (already used by a saved plan run or KB record), a new one is " +
+            "created automatically and `note` in the result says so; state that back to the user. " +
+            "This does NOT wire the new version into any run by itself — after this, call " +
+            "update_config with `purchasable_material_version_id` set to the returned `version_id`, " +
+            "then run_plan_async, if the user wants a run to actually use it.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("product_ids") { put("type", "array"); putJsonObject("items") { put("type", "string") } }
+                putJsonObject("version_id") { put("type", "integer") }
+                putJsonObject("version_name") { put("type", "string") }
+            }
+            put("required", buildJsonArray { add("product_ids") })
+        },
+    ),
+    tool(
+        "set_constraints",
+        "**Write** a new Constraints rule set (full replace — pass the COMPLETE desired rows). " +
+            "Each row: `{customer_id, parent, location, child}` (`location=\"*\"` means any " +
+            "location) — pins which BOM alternative a customer's demand resolves to. Creates a " +
+            "new version unless `version_id` names an existing, unreferenced one. Omit " +
+            "`version_id` to reuse/create automatically (auto-creates a new one if the reused " +
+            "version turns out locked — see `note`). Wire the result into a run via " +
+            "update_config's `constraint_version_id`, then run_plan_async.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("rows") {
+                    put("type", "array")
+                    putJsonObject("items") {
+                        put("type", "object")
+                        putJsonObject("properties") {
+                            putJsonObject("customer_id") { put("type", "string") }
+                            putJsonObject("parent") { put("type", "string") }
+                            putJsonObject("location") { put("type", "string") }
+                            putJsonObject("child") { put("type", "string") }
+                        }
+                    }
+                }
+                putJsonObject("version_id") { put("type", "integer") }
+                putJsonObject("version_name") { put("type", "string") }
+            }
+            put("required", buildJsonArray { add("rows") })
+        },
+    ),
+    tool(
+        "set_demand_ordering",
+        "**Write** Demand Ordering. Two modes: (1) `generate: true` — algorithmically re-derive " +
+            "the canonical order from current demand data (by due_time, tie-broken by priority), " +
+            "same as the form's 'Generate' button; (2) `rows: [{demand_id, order}]` — apply " +
+            "specific edits to EXISTING rows by demand_id (this is an UPDATE, not an upsert — a " +
+            "demand_id with no existing row in the target version is a silent no-op; call with " +
+            "`generate: true` first if the version has never been seeded). Creates a new version " +
+            "unless `version_id` names an existing, unreferenced one (auto-creates if the reused " +
+            "one turns out locked — see `note`). Wire into a run via update_config's " +
+            "`demand_order_version_id`, then run_plan_async.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("generate") { put("type", "boolean") }
+                putJsonObject("rows") {
+                    put("type", "array")
+                    putJsonObject("items") {
+                        put("type", "object")
+                        putJsonObject("properties") {
+                            putJsonObject("demand_id") { put("type", "string") }
+                            putJsonObject("order") { put("type", "integer") }
+                        }
+                    }
+                }
+                putJsonObject("version_id") { put("type", "integer") }
+                putJsonObject("version_name") { put("type", "string") }
+            }
+        },
+    ),
+    tool(
+        "set_supply_preferences",
+        "**Write** Supply Preferences. Two modes: (1) `generate: true` (optional " +
+            "`max_bom_depth`/`delivery_weight`/`inventory_weight`/`critical_material_weight`, " +
+            "defaults 3/0.3/0.3/0.4) — algorithmically re-derive the ranking from current demand/" +
+            "supply/BOM data plus the case's latest successful plan run's config (needed for the " +
+            "critical-material axis), same as the form's 'Generate' button; (2) " +
+            "`rows: [{product_id, location_id, method_type, method_key, preference}]` — apply " +
+            "specific edits to EXISTING rows by natural key (UPDATE, not upsert — a key with no " +
+            "existing row in the target version is a silent no-op; `generate: true` first if never " +
+            "seeded). Creates a new version unless `version_id` names an existing, unreferenced " +
+            "one (auto-creates if the reused one turns out locked — see `note`). Wire into a run " +
+            "via update_config's `pref_version_id`, then run_plan_async.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("generate") { put("type", "boolean") }
+                putJsonObject("max_bom_depth") { put("type", "integer") }
+                putJsonObject("delivery_weight") { put("type", "number") }
+                putJsonObject("inventory_weight") { put("type", "number") }
+                putJsonObject("critical_material_weight") { put("type", "number") }
+                putJsonObject("rows") {
+                    put("type", "array")
+                    putJsonObject("items") {
+                        put("type", "object")
+                        putJsonObject("properties") {
+                            putJsonObject("product_id") { put("type", "string") }
+                            putJsonObject("location_id") { put("type", "string") }
+                            putJsonObject("method_type") { put("type", "string") }
+                            putJsonObject("method_key") { put("type", "string") }
+                            putJsonObject("preference") { put("type", "integer") }
+                        }
+                    }
+                }
+                putJsonObject("version_id") { put("type", "integer") }
+                putJsonObject("version_name") { put("type", "string") }
+            }
+        },
+    ),
+    tool(
+        "set_targeted_supply_allocation",
+        "**Write** Targeted Supply Allocation INPUT rows (full replace — pass the COMPLETE " +
+            "desired rows). Each row: `{supply_id, qty_cap?, target?}` — a cap override and/or " +
+            "customer earmark for ONE critical-material lot (NOT the recomputed output grid " +
+            "get_critical_raw_allocation returns). Rows targeting a critical-STOCK supply (derived/" +
+            "read-only, inherits targeting from a raw material — see 'Critical materials' primer) " +
+            "are silently rejected, same as the form; check `rejected` in the result and relay it. " +
+            "Creates a new version unless `version_id` names an existing, unreferenced one " +
+            "(auto-creates if the reused one turns out locked — see `note`). Wire into a run via " +
+            "update_config's `case_alloc_version_id`, then run_plan_async.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("rows") {
+                    put("type", "array")
+                    putJsonObject("items") {
+                        put("type", "object")
+                        putJsonObject("properties") {
+                            putJsonObject("supply_id") { put("type", "string") }
+                            putJsonObject("qty_cap") { put("type", "number") }
+                            putJsonObject("target") { put("type", "string") }
+                        }
+                    }
+                }
+                putJsonObject("version_id") { put("type", "integer") }
+                putJsonObject("version_name") { put("type", "string") }
+            }
+            put("required", buildJsonArray { add("rows") })
         },
     ),
     tool(
@@ -2418,6 +2763,11 @@ private fun toolUpdateConfig(
         val configKeys = setOf(
             "method_selection", "consolidation", "purchase_allowed", "purchasable_materials", "constraints",
             "analyze_criticality", "check_soundness",
+            // The 5 external config objects' version-id keys (CaseBootstrap.kt's explicitVersionId
+            // reads these straight off the run config) — omitted means that object is used NOT AT
+            // ALL for the run, no default-version fallback. See "External config objects" primer.
+            "case_alloc_version_id", "pref_version_id", "demand_order_version_id",
+            "purchasable_material_version_id", "constraint_version_id",
         )
         if (args.keys.any { it in configKeys }) args else null
     }
@@ -4846,6 +5196,557 @@ private fun toolGetCriticalRawAllocation(caseId: Int, args: JsonObject, locale: 
     )
 }
 
+/**
+ * "Competition zone" explainer — the AND-sibling/diamond fair-split mechanism
+ * (see [computeAndSiblingCaps], [findOrGroupRecipients] in SupplyGuidedPlanning.kt, and
+ * agent-knowledge.md's "Planning logic" section, step 2 "sibling propagation") is pure
+ * in-memory state during the live commit loop — never persisted into `planning_pegging` or
+ * `plan_run.result`. Re-derives it read-only from the run's own pinned (data, config), the same
+ * recompute-on-demand pattern [computeRunAllocationPreview] already uses for Targeted Supply
+ * Allocation, so this never drifts from what the live run actually used for the AND-sibling
+ * mechanism specifically.
+ *
+ * Known limitation (documented, not silently glossed): does NOT replicate the
+ * `reallocate_critical_leftover` second-pass budget merge `runPlanning` applies before its OWN
+ * live `computeAndSiblingCaps` call — for a run with that experimental flag on, this recompute
+ * reflects pass-1 budgets only. Same limitation [computeRunAllocationPreview]/TSA already has;
+ * not new here. Also does not cover [computeDiamondCapsForAttempt]'s OR-group diamond splits —
+ * those are recomputed live, per waterfall-candidate ATTEMPT, and can't be faithfully replayed
+ * post-hoc without re-running the actual candidate sequence; this tool reports only whether the
+ * material structurally HAS an OR-group diamond shape (via [findOrGroupRecipients], a static
+ * BOM-topology fact), not the live per-attempt split itself.
+ */
+private fun toolExplainCompetitionZone(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val runId = args["run_id"]?.jsonPrimitive?.intOrNull
+        ?: return toolError("`run_id` is required", locale)
+    val demandIdArg = args["demand_id"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotBlank() }
+        ?: return toolError("`demand_id` is required", locale)
+    val productId = args["product_id"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotBlank() }
+        ?: return toolError("`product_id` is required", locale)
+    val locationId = args["location_id"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotBlank() }
+        ?: return toolError("`location_id` is required", locale)
+    val demandId = resolveDemandId(caseId, demandIdArg) ?: demandIdArg
+
+    val runRow = transaction {
+        PlanRuns.selectAll().where { (PlanRuns.id eq runId) and (PlanRuns.caseId eq caseId) }.firstOrNull()
+    } ?: return toolError("plan run $runId not found for case $caseId", locale)
+    val config: Map<String, Any?>? = runRow[PlanRuns.config]?.let { cfg ->
+        @Suppress("UNCHECKED_CAST")
+        runCatching { jsonElementToNative(jsonParser.parseToJsonElement(cfg)) as? Map<String, Any?> }.getOrNull()
+    }
+    val prefVersionId = runRow[PlanRuns.prefVersionId]
+    val preferenceKb = loadPreferenceKb(prefVersionId)
+    val data = transaction { CaseLoader.load(caseId) }
+    val demands = data["demand"] ?: emptyList()
+    if (demands.none { it["demand_id"] == demandId }) {
+        return toolError("demand '$demandId' not found in case $caseId's current dataset", locale)
+    }
+
+    val sgAllocation = buildSupplyAllocation(demands, data, config)
+    val planBlueprint = computePlanBlueprint(demands, sgAllocation, data, preferenceKb, config)
+    val andSiblingCapsResult = computeAndSiblingCaps(demands, sgAllocation, data, config, preferenceKb, planBlueprint = planBlueprint)
+    val diamondRecipients = findOrGroupRecipients(
+        sgAllocation.criticalMatrix.byColumn.keys.map { it.productId }.toSet(), data,
+    )
+
+    val demandCaps = andSiblingCapsResult.caps[demandId].orEmpty()
+    val demandDominators = andSiblingCapsResult.dominators[demandId].orEmpty()
+    val matchingBranches = demandCaps.keys.filter { it.productId == productId && it.locationId == locationId }
+    val isDiamondRecipientMaterial = productId in diamondRecipients
+
+    if (matchingBranches.isEmpty()) {
+        val note = if (isDiamondRecipientMaterial) {
+            "No AND-sibling contention cap found for demand '$demandId' at '$productId@$locationId', " +
+                "but this material DOES have an OR-group diamond-recipient structure elsewhere in the " +
+                "BOM (get_leaf_competition may show a live per-attempt split this tool can't replay)."
+        } else {
+            "No AND-sibling contention found for demand '$demandId' at '$productId@$locationId' — " +
+                "either this leaf isn't reached by more than one branch of this demand, or the " +
+                "contended material's combined need didn't exceed available supply (no cap needed)."
+        }
+        return ToolResult(
+            summary = loc(note, note, locale),
+            payload = buildJsonObject {
+                put("run_id", runId)
+                put("demand_id", demandId)
+                put("product_id", productId)
+                put("location_id", locationId)
+                put("has_and_sibling_cap", false)
+                put("is_diamond_recipient_material", isDiamondRecipientMaterial)
+            },
+        )
+    }
+
+    fun dominatorRefToJson(d: DominatorRef): JsonObject = buildJsonObject {
+        put("kind", d.kind)
+        d.productId?.let { put("product_id", it) }
+        d.locationId?.let { put("location_id", it) }
+        d.demandId?.let { put("demand_id", it) }
+        d.woGroupId?.let { put("wo_group_id", it) }
+        d.supplyId?.let { put("supply_id", it) }
+        d.competingDemandIds?.let { ids -> put("competing_demand_ids", buildJsonArray { ids.forEach { add(it) } }) }
+        put("label", d.label)
+    }
+    val branchesJson = buildJsonArray {
+        matchingBranches.forEach { branch ->
+            val lotCaps = demandCaps[branch].orEmpty()
+            val total = lotCaps.values.sum()
+            addJsonObject {
+                branch.slot?.let { put("slot", it) } ?: put("slot", JsonNull)
+                put("total_capped_qty", total)
+                put("lot_count", lotCaps.size)
+                put("dominators", buildJsonArray {
+                    demandDominators[branch]?.forEach { d -> add(dominatorRefToJson(d)) }
+                })
+            }
+        }
+    }
+    val total = matchingBranches.sumOf { b -> demandCaps[b].orEmpty().values.sum() }
+
+    return ToolResult(
+        summary = loc(
+            "Demand '$demandId' at '$productId@$locationId': ${matchingBranches.size} AND-sibling " +
+                "branch(es) capped, total ${total} — this leaf is a competition zone (see `branches`).",
+            "需求 '$demandId' 在 '$productId@$locationId'：${matchingBranches.size} 个 AND 兄弟分支受限，" +
+                "共 ${total} — 该节点是一个竞争区（见 branches）。",
+            locale,
+        ),
+        payload = buildJsonObject {
+            put("run_id", runId)
+            put("demand_id", demandId)
+            put("product_id", productId)
+            put("location_id", locationId)
+            put("has_and_sibling_cap", true)
+            put("is_diamond_recipient_material", isDiamondRecipientMaterial)
+            put("total_capped_qty", total)
+            put("branches", branchesJson)
+        },
+    )
+}
+
+// ── External config objects — read tools ────────────────────────────────────
+//
+// TSA (get_critical_raw_allocation, above) is the only one of the 5 versioned external
+// config objects with an agent read tool prior to this. These 4 close that gap for
+// Supply Preferences, Demand Ordering, Purchasable Materials, and Constraints, plus one
+// generic version-lister — all thin wrappers over existing internal load functions, no
+// new backend logic. "No default version" is a hard rule (CaseConfigVersioning.kt) —
+// resolveReadableVersionId below reports plainly, rather than guessing, whenever the
+// caller omits version_id and the case has versions but no way to pick one implicitly.
+
+/** Shared version-resolution for the 4 read tools below. Returns the resolved version_id
+ *  to read from, or (when null) a ToolResult the caller should return immediately —
+ *  either a real error (an invalid version_id was passed) or a plain, honest "no version
+ *  exists" / "ambiguous, pick one" answer (never a silent guess). */
+private fun resolveReadableVersionId(
+    caseId: Int,
+    kind: ConfigVersionKind,
+    args: JsonObject,
+    objectLabelEn: String,
+    objectLabelZh: String,
+    locale: String,
+): Pair<Int?, ToolResult?> {
+    val requested = args["version_id"]?.jsonPrimitive?.intOrNull
+    if (requested != null) {
+        val resolved = CaseConfigVersioning.resolveVersionId(caseId, kind, requested)
+            ?: return null to toolError(
+                "version_id $requested is not a valid $objectLabelEn version for case $caseId", locale,
+            )
+        return resolved to null
+    }
+    val versions = CaseConfigVersioning.listVersions(caseId, kind)
+    if (versions.isEmpty()) {
+        return null to ToolResult(
+            summary = loc(
+                "Case $caseId has never touched $objectLabelEn — no version exists yet.",
+                "案例 $caseId 从未设置过$objectLabelZh — 尚不存在任何版本。",
+                locale,
+            ),
+            payload = buildJsonObject { put("versions_exist", false) },
+        )
+    }
+    return null to ToolResult(
+        summary = loc(
+            "Case $caseId has ${versions.size} $objectLabelEn version(s) but no default is picked — " +
+                "call list_config_versions(kind=\"${kind.key}\") and pass a specific version_id.",
+            "案例 $caseId 有 ${versions.size} 个$objectLabelZh 版本，但未指定默认版本 — 请先调用 " +
+                "list_config_versions（kind=\"${kind.key}\"），再显式传入 version_id。",
+            locale,
+        ),
+        payload = buildJsonObject { put("versions_exist", true); put("version_count", versions.size) },
+    )
+}
+
+private fun toolListConfigVersions(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val kindArg = args["kind"]?.jsonPrimitive?.contentOrNull?.trim()?.lowercase()
+        ?: return toolError("`kind` is required — one of: casealloc, pref, ord, purchmat, constr", locale)
+    val kind = ConfigVersionKind.entries.firstOrNull { it.key == kindArg }
+        ?: return toolError(
+            "unrecognized kind '$kindArg' — must be one of: casealloc (Targeted Supply Allocation), " +
+                "pref (Supply Preferences), ord (Demand Ordering), purchmat (Purchasable Materials), " +
+                "constr (Constraints)",
+            locale,
+        )
+    val versions = CaseConfigVersioning.listVersions(caseId, kind)
+    return ToolResult(
+        summary = loc(
+            "Case $caseId has ${versions.size} '${kind.key}' version(s).",
+            "案例 $caseId 有 ${versions.size} 个 '${kind.key}' 版本。",
+            locale,
+        ),
+        payload = buildJsonObject {
+            put("kind", kind.key)
+            put("versions", buildJsonArray {
+                versions.forEach { v ->
+                    addJsonObject {
+                        put("id", v.id)
+                        v.name?.let { put("name", it) } ?: put("name", JsonNull)
+                        v.comments?.let { put("comments", it) } ?: put("comments", JsonNull)
+                        put("created_at", v.createdAt)
+                        put("updated_at", v.updatedAt)
+                        put("referenced", v.referenced)
+                        put("referenced_by_plan_run", v.referencedByPlanRun)
+                        put("referenced_by_kb", v.referencedByKb)
+                    }
+                }
+            })
+        },
+    )
+}
+
+private fun toolGetSupplyPreferences(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val (versionId, early) = resolveReadableVersionId(caseId, ConfigVersionKind.PREF, args, "Supply Preferences", "供应偏好", locale)
+    if (early != null) return early
+    val rows = loadCasePreferenceRows(versionId).orEmpty()
+    val cfg = loadCasePreferenceConfig(versionId)
+    return ToolResult(
+        summary = loc(
+            "Supply Preferences version $versionId: ${rows.size} row(s)" +
+                (cfg?.let { " (generated ${it.generatedAt}, weights delivery=${it.deliveryWeight}/" +
+                    "inventory=${it.inventoryWeight}/critical=${it.criticalMaterialWeight})" } ?: ""),
+            "供应偏好版本 $versionId：${rows.size} 行",
+            locale,
+        ),
+        payload = buildJsonObject {
+            put("version_id", versionId)
+            cfg?.let {
+                put("config", buildJsonObject {
+                    put("max_bom_depth", it.maxBomDepth)
+                    put("delivery_weight", it.deliveryWeight)
+                    put("inventory_weight", it.inventoryWeight)
+                    put("critical_material_weight", it.criticalMaterialWeight)
+                    put("generated_at", it.generatedAt)
+                })
+            } ?: put("config", JsonNull)
+            put("rows", buildJsonArray {
+                rows.forEach { r ->
+                    addJsonObject {
+                        put("product_id", r.productId)
+                        put("location_id", r.locationId)
+                        put("method_type", r.methodType)
+                        put("method_key", r.methodKey)
+                        put("preference", r.preference)
+                        r.inventoryScore?.let { put("inventory_score", it) } ?: put("inventory_score", JsonNull)
+                        r.deliveryScore?.let { put("delivery_score", it) } ?: put("delivery_score", JsonNull)
+                        r.criticalMaterialScore?.let { put("critical_material_score", it) } ?: put("critical_material_score", JsonNull)
+                    }
+                }
+            })
+        },
+    )
+}
+
+private fun toolGetDemandOrdering(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val (versionId, early) = resolveReadableVersionId(caseId, ConfigVersionKind.ORD, args, "Demand Ordering", "需求排序", locale)
+    if (early != null) return early
+    val rows = loadCaseDemandOrderRows(versionId).orEmpty().sortedBy { it.order }
+    val cfg = loadCaseDemandOrderConfig(versionId)
+    return ToolResult(
+        summary = loc(
+            "Demand Ordering version $versionId: ${rows.size} demand(s) ordered" +
+                (cfg?.let { " (generated ${it.generatedAt})" } ?: ""),
+            "需求排序版本 $versionId：${rows.size} 个需求已排序",
+            locale,
+        ),
+        payload = buildJsonObject {
+            put("version_id", versionId)
+            cfg?.let { put("generated_at", it.generatedAt) } ?: put("generated_at", JsonNull)
+            put("rows", buildJsonArray {
+                rows.forEach { r ->
+                    addJsonObject {
+                        put("demand_id", r.demandId)
+                        put("order", r.order)
+                    }
+                }
+            })
+        },
+    )
+}
+
+private fun toolGetPurchasableMaterials(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val (versionId, early) = resolveReadableVersionId(caseId, ConfigVersionKind.PURCHMAT, args, "Purchasable Materials", "可采购物料", locale)
+    if (early != null) return early
+    val ids = loadPurchasableMaterialIds(versionId).sorted()
+    return ToolResult(
+        summary = loc(
+            "Purchasable Materials version $versionId: ${ids.size} product(s) whitelisted.",
+            "可采购物料版本 $versionId：${ids.size} 个产品在白名单中。",
+            locale,
+        ),
+        payload = buildJsonObject {
+            put("version_id", versionId)
+            put("product_ids", buildJsonArray { ids.forEach { add(it) } })
+        },
+    )
+}
+
+private fun toolGetConstraints(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val (versionId, early) = resolveReadableVersionId(caseId, ConfigVersionKind.CONSTR, args, "Constraints", "约束", locale)
+    if (early != null) return early
+    val rows = loadCaseConstraintRows(versionId)
+    return ToolResult(
+        summary = loc(
+            "Constraints version $versionId: ${rows.size} constraint row(s).",
+            "约束版本 $versionId：${rows.size} 条约束。",
+            locale,
+        ),
+        payload = buildJsonObject {
+            put("version_id", versionId)
+            put("rows", buildJsonArray {
+                rows.forEach { r ->
+                    addJsonObject {
+                        put("customer_id", r.customerId)
+                        put("parent", r.parent)
+                        put("location", r.location)
+                        put("child", r.child)
+                    }
+                }
+            })
+        },
+    )
+}
+
+// ── External config objects — write tools ───────────────────────────────────
+//
+// Every write here lands in a new-or-reused-UNREFERENCED version — the version_in_use gate
+// (CaseConfigVersioning.isVersionReferenced) makes it structurally impossible to mutate a
+// version any saved plan_run/kb_record already used; append-only once referenced, exactly
+// like the form UI's own PUT routes. Each tool calls the SAME extracted save function its
+// route counterpart does (Constraints.kt/PurchasableMaterials.kt/DemandOrdering.kt/
+// Preferences.kt/Allocation.kt), so the two paths can never diverge in behavior.
+
+private class WritableVersionResolution(val versionId: Int?, val error: ToolResult?, val autoCreatedNote: String?)
+
+/** Shared resolve-for-write + version_in_use guard for the 5 write tools below.
+ *  - `version_id` explicitly passed: must be a real, valid, NOT-referenced version for this
+ *    case+kind, else a real error (never silently substituted — the caller named a specific
+ *    version on purpose).
+ *  - `version_id` omitted: reuse-latest-or-create (CaseConfigVersioning's own no-default rule
+ *    doesn't apply to WRITES the same way — this mirrors the form UI's own
+ *    resolvedOrCreatedVersionId helper). If the resulting version turns out to be referenced,
+ *    auto-create a genuinely new one instead of failing — a chat tool has no manual "Save As"
+ *    button, so this is the only sane default; `autoCreatedNote` tells the caller this happened
+ *    so it can be stated back to the user, per the honesty rules. */
+private fun resolveWritableVersionId(
+    caseId: Int,
+    kind: ConfigVersionKind,
+    args: JsonObject,
+    objectLabelEn: String,
+    objectLabelZh: String,
+    locale: String,
+): WritableVersionResolution {
+    val requested = args["version_id"]?.jsonPrimitive?.intOrNull
+    if (requested != null) {
+        val resolved = CaseConfigVersioning.resolveVersionId(caseId, kind, requested)
+            ?: return WritableVersionResolution(null, toolError(
+                "version_id $requested is not a valid $objectLabelEn version for case $caseId", locale,
+            ), null)
+        if (CaseConfigVersioning.isVersionReferenced(resolved, kind)) {
+            return WritableVersionResolution(null, toolError(
+                "$objectLabelEn version $resolved is locked — already used by a saved plan run or KB " +
+                    "record, cannot edit in place. Call again WITHOUT version_id to create a new " +
+                    "version automatically, or name a different, unreferenced version_id.",
+                locale,
+            ), null)
+        }
+        return WritableVersionResolution(resolved, null, null)
+    }
+    val versionName = args["version_name"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotBlank() }
+    var versionId = CaseConfigVersioning.resolveOrCreateVersionId(caseId, kind, null)
+    var note: String? = null
+    if (CaseConfigVersioning.isVersionReferenced(versionId, kind)) {
+        val lockedId = versionId
+        versionId = CaseConfigVersioning.createVersion(caseId, kind, versionName, null)
+        note = "$objectLabelEn version $lockedId was locked (already used by a saved plan run or KB " +
+            "record) — created new version $versionId instead."
+    }
+    return WritableVersionResolution(versionId, null, note)
+}
+
+private fun toolSetPurchasableMaterials(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val productIds = args["product_ids"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull?.trim()?.takeIf { s -> s.isNotBlank() } }?.toSet()
+        ?: return toolError("`product_ids` is required (array of strings; pass an empty array to clear the whitelist)", locale)
+    val res = resolveWritableVersionId(caseId, ConfigVersionKind.PURCHMAT, args, "Purchasable Materials", "可采购物料", locale)
+    res.error?.let { return it }
+    val versionId = res.versionId!!
+    val updated = savePurchasableMaterialIds(caseId, versionId, productIds)
+    val summaryEn = "Purchasable Materials version $versionId saved: $updated product(s) whitelisted." +
+        (res.autoCreatedNote?.let { " $it" } ?: "")
+    return ToolResult(
+        summary = loc(summaryEn, "可采购物料版本 $versionId 已保存：$updated 个产品。", locale),
+        payload = buildJsonObject {
+            put("version_id", versionId)
+            put("updated", updated)
+            res.autoCreatedNote?.let { put("note", it) }
+        },
+    )
+}
+
+private fun toolSetConstraints(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val rowsJson = args["rows"]?.jsonArray
+        ?: return toolError("`rows` is required (array of {customer_id, parent, location, child}; pass an empty array to clear)", locale)
+    val rows = rowsJson.map { el ->
+        val obj = el.jsonObject
+        CaseConstraintRow(
+            customerId = obj["customer_id"]?.jsonPrimitive?.contentOrNull ?: return toolError("row missing customer_id", locale),
+            parent = obj["parent"]?.jsonPrimitive?.contentOrNull ?: return toolError("row missing parent", locale),
+            location = obj["location"]?.jsonPrimitive?.contentOrNull ?: return toolError("row missing location (use \"*\" for any)", locale),
+            child = obj["child"]?.jsonPrimitive?.contentOrNull ?: return toolError("row missing child", locale),
+        )
+    }
+    val res = resolveWritableVersionId(caseId, ConfigVersionKind.CONSTR, args, "Constraints", "约束", locale)
+    res.error?.let { return it }
+    val versionId = res.versionId!!
+    val updated = saveCaseConstraintRows(caseId, versionId, rows)
+    val summaryEn = "Constraints version $versionId saved: $updated row(s)." + (res.autoCreatedNote?.let { " $it" } ?: "")
+    return ToolResult(
+        summary = loc(summaryEn, "约束版本 $versionId 已保存：$updated 条。", locale),
+        payload = buildJsonObject {
+            put("version_id", versionId)
+            put("updated", updated)
+            res.autoCreatedNote?.let { put("note", it) }
+        },
+    )
+}
+
+private fun toolSetDemandOrdering(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val generate = args["generate"]?.jsonPrimitive?.booleanOrNull ?: false
+    val res = resolveWritableVersionId(caseId, ConfigVersionKind.ORD, args, "Demand Ordering", "需求排序", locale)
+    res.error?.let { return it }
+    val versionId = res.versionId!!
+    val updated: Int
+    if (generate) {
+        val data = transaction { CaseLoader.load(caseId) }
+        if ((data["demand"] ?: emptyList()).isEmpty()) return toolError("case $caseId has no demand data to generate Demand Ordering from", locale)
+        updated = generateAndSeedCaseDemandOrder(caseId, versionId, data).size
+    } else {
+        val rowsJson = args["rows"]?.jsonArray
+            ?: return toolError("either `rows` (array of {demand_id, order}) or `generate: true` is required", locale)
+        val edits = rowsJson.map { el ->
+            val obj = el.jsonObject
+            val demandId = obj["demand_id"]?.jsonPrimitive?.contentOrNull ?: return toolError("row missing demand_id", locale)
+            val order = obj["order"]?.jsonPrimitive?.intOrNull ?: return toolError("row missing order", locale)
+            demandId to order
+        }
+        updated = saveCaseDemandOrderEdits(caseId, versionId, edits)
+    }
+    val mode = if (generate) "generated" else "edited"
+    val summaryEn = "Demand Ordering version $versionId $mode: $updated row(s)." + (res.autoCreatedNote?.let { " $it" } ?: "")
+    return ToolResult(
+        summary = loc(summaryEn, "需求排序版本 $versionId 已$mode：$updated 行。", locale),
+        payload = buildJsonObject {
+            put("version_id", versionId)
+            put("updated", updated)
+            res.autoCreatedNote?.let { put("note", it) }
+        },
+    )
+}
+
+private fun toolSetSupplyPreferences(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val generate = args["generate"]?.jsonPrimitive?.booleanOrNull ?: false
+    val res = resolveWritableVersionId(caseId, ConfigVersionKind.PREF, args, "Supply Preferences", "供应偏好", locale)
+    res.error?.let { return it }
+    val versionId = res.versionId!!
+    val updated: Int
+    if (generate) {
+        val data = transaction { CaseLoader.load(caseId) }
+        if ((data["demand"] ?: emptyList()).isEmpty()) return toolError("case $caseId has no demand data to generate Supply Preferences from", locale)
+        val maxBomDepth = args["max_bom_depth"]?.jsonPrimitive?.intOrNull?.coerceIn(1, 10) ?: 3
+        val deliveryWeight = args["delivery_weight"]?.jsonPrimitive?.doubleOrNull ?: 0.3
+        val inventoryWeight = args["inventory_weight"]?.jsonPrimitive?.doubleOrNull ?: 0.3
+        val criticalMaterialWeight = args["critical_material_weight"]?.jsonPrimitive?.doubleOrNull ?: 0.4
+        // Same fallback as the form's own generate route: prefer the case's latest successful
+        // plan run's config (needed for the critical-material axis) over a bare null.
+        val config: Map<String, Any?>? = transaction {
+            PlanRuns.select(PlanRuns.config)
+                .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
+                .orderBy(PlanRuns.id to SortOrder.DESC)
+                .limit(1)
+                .singleOrNull()
+                ?.get(PlanRuns.config)
+        }?.let {
+            @Suppress("UNCHECKED_CAST")
+            runCatching { jsonElementToNative(jsonParser.parseToJsonElement(it)) as? Map<String, Any?> }.getOrNull()
+        }
+        updated = generateAndSeedCasePreferences(caseId, versionId, data, config, maxBomDepth, deliveryWeight, inventoryWeight, criticalMaterialWeight).size
+    } else {
+        val rowsJson = args["rows"]?.jsonArray
+            ?: return toolError("either `rows` (array of {product_id, location_id, method_type, method_key, preference}) or `generate: true` is required", locale)
+        val edits = rowsJson.map { el ->
+            val obj = el.jsonObject
+            CasePreferenceEdit(
+                productId = obj["product_id"]?.jsonPrimitive?.contentOrNull ?: return toolError("row missing product_id", locale),
+                locationId = obj["location_id"]?.jsonPrimitive?.contentOrNull ?: return toolError("row missing location_id", locale),
+                methodType = obj["method_type"]?.jsonPrimitive?.contentOrNull ?: return toolError("row missing method_type", locale),
+                methodKey = obj["method_key"]?.jsonPrimitive?.contentOrNull ?: "",
+                preference = obj["preference"]?.jsonPrimitive?.intOrNull ?: return toolError("row missing preference", locale),
+            )
+        }
+        updated = saveCasePreferenceEdits(caseId, versionId, edits)
+    }
+    val mode = if (generate) "generated" else "edited"
+    val summaryEn = "Supply Preferences version $versionId $mode: $updated row(s)." + (res.autoCreatedNote?.let { " $it" } ?: "")
+    return ToolResult(
+        summary = loc(summaryEn, "供应偏好版本 $versionId 已$mode：$updated 行。", locale),
+        payload = buildJsonObject {
+            put("version_id", versionId)
+            put("updated", updated)
+            res.autoCreatedNote?.let { put("note", it) }
+        },
+    )
+}
+
+private fun toolSetTargetedSupplyAllocation(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val rowsJson = args["rows"]?.jsonArray
+        ?: return toolError("`rows` is required (array of {supply_id, qty_cap?, target?}; pass an empty array to clear)", locale)
+    val rows = rowsJson.map { el ->
+        val obj = el.jsonObject
+        CaseAllocRow(
+            supplyId = obj["supply_id"]?.jsonPrimitive?.contentOrNull ?: return toolError("row missing supply_id", locale),
+            qtyCap = obj["qty_cap"]?.takeIf { it !is JsonNull }?.jsonPrimitive?.doubleOrNull,
+            target = obj["target"]?.takeIf { it !is JsonNull }?.jsonPrimitive?.contentOrNull,
+        )
+    }
+    val res = resolveWritableVersionId(caseId, ConfigVersionKind.CASEALLOC, args, "Targeted Supply Allocation", "关键原材料分配", locale)
+    res.error?.let { return it }
+    val versionId = res.versionId!!
+    val (saved, rejected) = saveCaseAllocRows(caseId, versionId, rows)
+    val rejectedNote = if (rejected.isNotEmpty()) {
+        " ${rejected.size} row(s) rejected (target a critical-STOCK supply, which is derived/read-only, not a raw critical-material lot): ${rejected.joinToString(", ")}."
+    } else ""
+    val summaryEn = "Targeted Supply Allocation version $versionId saved: ${saved.size} row(s)." +
+        rejectedNote + (res.autoCreatedNote?.let { " $it" } ?: "")
+    return ToolResult(
+        summary = loc(summaryEn, "关键原材料分配版本 $versionId 已保存：${saved.size} 行。$rejectedNote", locale),
+        payload = buildJsonObject {
+            put("version_id", versionId)
+            put("updated", saved.size)
+            put("rejected", buildJsonArray { rejected.forEach { add(it) } })
+            res.autoCreatedNote?.let { put("note", it) }
+        },
+    )
+}
+
 // ── L1 dataset-feasibility tools ────────────────────────────────────────────
 //
 // Static, plan-run-independent answers about the case's CSV-derived data:
@@ -6178,6 +7079,17 @@ private suspend fun dispatchTool(
         "get_component_allocation_by_demand" -> Pair(toolGetComponentAllocationByDemand(caseId, args, locale), workingConfig)
         "get_critical_materials" -> Pair(toolGetCriticalMaterials(caseId, args, locale), workingConfig)
         "get_critical_raw_allocation" -> Pair(toolGetCriticalRawAllocation(caseId, args, locale), workingConfig)
+        "explain_competition_zone" -> Pair(toolExplainCompetitionZone(caseId, args, locale), workingConfig)
+        "list_config_versions" -> Pair(toolListConfigVersions(caseId, args, locale), workingConfig)
+        "get_supply_preferences" -> Pair(toolGetSupplyPreferences(caseId, args, locale), workingConfig)
+        "get_demand_ordering" -> Pair(toolGetDemandOrdering(caseId, args, locale), workingConfig)
+        "get_purchasable_materials" -> Pair(toolGetPurchasableMaterials(caseId, args, locale), workingConfig)
+        "get_constraints" -> Pair(toolGetConstraints(caseId, args, locale), workingConfig)
+        "set_purchasable_materials" -> Pair(toolSetPurchasableMaterials(caseId, args, locale), workingConfig)
+        "set_constraints" -> Pair(toolSetConstraints(caseId, args, locale), workingConfig)
+        "set_demand_ordering" -> Pair(toolSetDemandOrdering(caseId, args, locale), workingConfig)
+        "set_supply_preferences" -> Pair(toolSetSupplyPreferences(caseId, args, locale), workingConfig)
+        "set_targeted_supply_allocation" -> Pair(toolSetTargetedSupplyAllocation(caseId, args, locale), workingConfig)
         "get_bom_tree" -> Pair(toolGetBomTree(caseId, args, locale), workingConfig)
         "find_move_path" -> Pair(toolFindMovePath(caseId, args, locale), workingConfig)
         "trace_demand_to_supply" -> Pair(toolTraceDemandToSupply(caseId, args, locale), workingConfig)

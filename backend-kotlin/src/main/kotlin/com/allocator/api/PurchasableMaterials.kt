@@ -66,6 +66,27 @@ private fun recomputePurchasableMaterialHash(caseId: Int, versionId: Int, produc
     }
 }
 
+/** Replaces [versionId]'s whole product_id whitelist with [ids] (delete-then-insert, matching
+ *  a checklist's full-state submit) and refreshes its content-hash fingerprint. Shared by the
+ *  PUT route below and the `set_purchasable_materials` agent tool (PlanningAgentRoutes.kt) —
+ *  the ONE place this write happens, so the two can never diverge. Caller is responsible for
+ *  the `version_in_use` conflict check (route and tool both do it identically before calling
+ *  this). Returns the updated row count. */
+internal fun savePurchasableMaterialIds(caseId: Int, versionId: Int, ids: Set<String>): Int {
+    transaction {
+        CasePurchasableMaterials.deleteWhere { CasePurchasableMaterials.versionId eq versionId }
+        if (ids.isNotEmpty()) {
+            CasePurchasableMaterials.batchInsert(ids) { pid ->
+                this[CasePurchasableMaterials.caseId] = caseId
+                this[CasePurchasableMaterials.versionId] = versionId
+                this[CasePurchasableMaterials.productId] = pid
+            }
+        }
+        recomputePurchasableMaterialHash(caseId, versionId, ids)
+    }
+    return ids.size
+}
+
 /** [versionId] null means this case has never had a Purchasable Materials version at all — a
  *  legitimate "nothing yet" state (see CaseConfigVersioning's own doc), not an error. */
 private fun versionJson(caseId: Int, versionId: Int?): JsonObject {
@@ -125,18 +146,8 @@ fun Routing.purchasableMaterialsRoutes() {
         val ids = (payload["product_ids"]?.jsonArray ?: throw IllegalArgumentException("Missing 'product_ids'"))
             .mapNotNull { it.jsonPrimitive.contentOrNull?.trim()?.takeIf { s -> s.isNotBlank() } }
             .toSet()
-        transaction {
-            CasePurchasableMaterials.deleteWhere { CasePurchasableMaterials.versionId eq versionId }
-            if (ids.isNotEmpty()) {
-                CasePurchasableMaterials.batchInsert(ids) { pid ->
-                    this[CasePurchasableMaterials.caseId] = caseId
-                    this[CasePurchasableMaterials.versionId] = versionId
-                    this[CasePurchasableMaterials.productId] = pid
-                }
-            }
-            recomputePurchasableMaterialHash(caseId, versionId, ids)
-        }
-        call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", ids.size); put("version_id", versionId) })
+        val updated = savePurchasableMaterialIds(caseId, versionId, ids)
+        call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", updated); put("version_id", versionId) })
     }
 
     // ── DELETE /cases/{case_id}/purchasable-materials ─────────────────────────

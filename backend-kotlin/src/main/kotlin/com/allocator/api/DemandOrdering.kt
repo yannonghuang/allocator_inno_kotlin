@@ -135,6 +135,26 @@ internal fun generateAndSeedCaseDemandOrder(
     return rows
 }
 
+/** Applies [edits] (demand_id -> new order) as UPDATEs against [versionId]'s existing rows —
+ *  NOT an insert-if-missing upsert despite the route's own naming; a demand_id with no existing
+ *  row (never `generate`d) is silently a no-op UPDATE, matching this route's pre-existing
+ *  behavior exactly. Shared by the PUT route below and the `set_demand_ordering` agent tool
+ *  (PlanningAgentRoutes.kt) — the ONE place this write happens. Caller is responsible for the
+ *  `version_in_use` conflict check. Returns [edits].size (matching the route's existing
+ *  response), not the actual affected-row count. */
+internal fun saveCaseDemandOrderEdits(caseId: Int, versionId: Int, edits: List<Pair<String, Int>>): Int {
+    transaction {
+        for ((demandId, order) in edits) {
+            CaseDemandOrders.update({
+                (CaseDemandOrders.versionId eq versionId) and (CaseDemandOrders.demandId eq demandId)
+            }) { it[CaseDemandOrders.order] = order }
+        }
+        val currentRows = loadCaseDemandOrderRows(versionId) ?: emptyList()
+        recomputeCaseDemandOrderHash(caseId, versionId, currentRows)
+    }
+    return edits.size
+}
+
 internal fun loadCaseDemandOrderConfig(versionId: Int?): CaseDemandOrderConfig? {
     if (versionId == null) return null
     return transaction {
@@ -267,16 +287,8 @@ fun Routing.demandOrderingRoutes() {
                 id to (obj["order"]?.jsonPrimitive?.intOrNull ?: throw IllegalArgumentException("Missing order"))
             } ?: throw IllegalArgumentException("Missing demand_id")
         }
-        transaction {
-            for ((demandId, order) in edits) {
-                CaseDemandOrders.update({
-                    (CaseDemandOrders.versionId eq versionId) and (CaseDemandOrders.demandId eq demandId)
-                }) { it[CaseDemandOrders.order] = order }
-            }
-            val currentRows = loadCaseDemandOrderRows(versionId) ?: emptyList()
-            recomputeCaseDemandOrderHash(caseId, versionId, currentRows)
-        }
-        call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", edits.size); put("version_id", versionId) })
+        val updated = saveCaseDemandOrderEdits(caseId, versionId, edits)
+        call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", updated); put("version_id", versionId) })
     }
 
     // ── DELETE /cases/{case_id}/demand-ordering ───────────────────────────────

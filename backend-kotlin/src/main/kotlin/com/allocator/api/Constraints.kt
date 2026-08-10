@@ -56,6 +56,30 @@ internal fun loadCaseConstraintRows(versionId: Int?): List<CaseConstraintRow> {
     }
 }
 
+/** Replaces [versionId]'s whole constraint set with [rows] (delete-then-insert, matching a
+ *  full-state submit) and refreshes its content-hash fingerprint. Shared by the PUT route below
+ *  and the `set_constraints` agent tool (PlanningAgentRoutes.kt) — the ONE place this write
+ *  happens. Caller is responsible for the `version_in_use` conflict check. Returns the updated
+ *  row count (after de-duplication, matching the route's existing `.distinct()`). */
+internal fun saveCaseConstraintRows(caseId: Int, versionId: Int, rows: List<CaseConstraintRow>): Int {
+    val distinctRows = rows.distinct()
+    transaction {
+        CaseConstraints.deleteWhere { CaseConstraints.versionId eq versionId }
+        if (distinctRows.isNotEmpty()) {
+            CaseConstraints.batchInsert(distinctRows) { row ->
+                this[CaseConstraints.caseId] = caseId
+                this[CaseConstraints.versionId] = versionId
+                this[CaseConstraints.customerId] = row.customerId
+                this[CaseConstraints.parent] = row.parent
+                this[CaseConstraints.location] = row.location
+                this[CaseConstraints.child] = row.child
+            }
+        }
+        recomputeConstraintHash(caseId, versionId, distinctRows)
+    }
+    return distinctRows.size
+}
+
 /** Recompute and persist the content-hash fingerprint for [versionId]'s current constraint set —
  *  see KbFingerprint.kt's own doc. Call inside the same transaction as the row mutation. */
 private fun recomputeConstraintHash(caseId: Int, versionId: Int, rows: List<CaseConstraintRow>) {
@@ -150,22 +174,9 @@ fun Routing.constraintsRoutes() {
         val body = call.receiveText()
         val payload = Json.parseToJsonElement(body).jsonObject
         val rowsJson = payload["rows"]?.jsonArray ?: throw IllegalArgumentException("Missing 'rows'")
-        val rows = rowsJson.map { parseRow(it) }.distinct()
-        transaction {
-            CaseConstraints.deleteWhere { CaseConstraints.versionId eq versionId }
-            if (rows.isNotEmpty()) {
-                CaseConstraints.batchInsert(rows) { row ->
-                    this[CaseConstraints.caseId] = caseId
-                    this[CaseConstraints.versionId] = versionId
-                    this[CaseConstraints.customerId] = row.customerId
-                    this[CaseConstraints.parent] = row.parent
-                    this[CaseConstraints.location] = row.location
-                    this[CaseConstraints.child] = row.child
-                }
-            }
-            recomputeConstraintHash(caseId, versionId, rows)
-        }
-        call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", rows.size); put("version_id", versionId) })
+        val rows = rowsJson.map { parseRow(it) }
+        val updated = saveCaseConstraintRows(caseId, versionId, rows)
+        call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", updated); put("version_id", versionId) })
     }
 
     // ── DELETE /cases/{case_id}/constraints ───────────────────────────────────
