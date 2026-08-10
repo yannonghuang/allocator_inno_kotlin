@@ -5396,6 +5396,7 @@ private fun toolListConfigVersions(caseId: Int, args: JsonObject, locale: String
         ),
         payload = buildJsonObject {
             put("kind", kind.key)
+            put("count", versions.size)
             put("versions", buildJsonArray {
                 versions.forEach { v ->
                     addJsonObject {
@@ -5438,6 +5439,7 @@ private fun toolGetSupplyPreferences(caseId: Int, args: JsonObject, locale: Stri
                     put("generated_at", it.generatedAt)
                 })
             } ?: put("config", JsonNull)
+            put("count", rows.size)
             put("rows", buildJsonArray {
                 rows.forEach { r ->
                     addJsonObject {
@@ -5471,6 +5473,7 @@ private fun toolGetDemandOrdering(caseId: Int, args: JsonObject, locale: String)
         payload = buildJsonObject {
             put("version_id", versionId)
             cfg?.let { put("generated_at", it.generatedAt) } ?: put("generated_at", JsonNull)
+            put("count", rows.size)
             put("rows", buildJsonArray {
                 rows.forEach { r ->
                     addJsonObject {
@@ -5495,6 +5498,7 @@ private fun toolGetPurchasableMaterials(caseId: Int, args: JsonObject, locale: S
         ),
         payload = buildJsonObject {
             put("version_id", versionId)
+            put("count", ids.size)
             put("product_ids", buildJsonArray { ids.forEach { add(it) } })
         },
     )
@@ -5512,6 +5516,7 @@ private fun toolGetConstraints(caseId: Int, args: JsonObject, locale: String): T
         ),
         payload = buildJsonObject {
             put("version_id", versionId)
+            put("count", rows.size)
             put("rows", buildJsonArray {
                 rows.forEach { r ->
                     addJsonObject {
