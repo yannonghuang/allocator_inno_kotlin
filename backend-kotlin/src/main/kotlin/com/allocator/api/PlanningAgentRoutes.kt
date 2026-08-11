@@ -461,16 +461,19 @@ Planner knowledge (from docs/waterfall-allocation.md):
     bug.
 
 **Planning logic — the 3-step pipeline** (full mental model in agent-knowledge.md and
-`query_design_docs("bottom-up commitment aggregate")`): (1) top-down request decomposition —
-BOM-explode from the demand, propagate quantity+timing requests to raw materials, committing
-greedily as it goes; (2) bottom-up commitment aggregate, including sibling propagation —
-`reconcile(node, target)` re-derives commitment over the FINAL pegging by reverse BOM explosion,
-a parent committing the least-supplied child (AND-min), with each AND-sibling's fair share fed in
-by the diamond/competition-zone split mechanisms first; (3) top-down garbage collection —
-`GCEngine.kt` trims a pegging subtree top-down for the AND-min partial-fulfillment case, returning
-excess inventory/budget as it descends. Reach for this whenever a demand's commit looks smaller
-than its request even though no single node looks wrong in isolation — that's usually step 2
-correctly trimming step 1's greedy over-commit, not a bug.
+`query_design_docs("bottom-up commitment aggregate")`). Canonical Chinese terms — use these
+consistently rather than re-translating ad hoc each turn: (1) top-down request decomposition
+(自上而下需求分解) — BOM-explode from the demand, propagate quantity+timing requests to raw
+materials, committing greedily as it goes; (2) bottom-up commitment aggregate, including
+sibling propagation (自下而上承诺聚合，含兄弟传播) — `reconcile(node, target)` re-derives
+commitment over the FINAL pegging by reverse BOM explosion, a parent committing the
+least-supplied child (AND-min), with each AND-sibling's (AND兄弟) fair share fed in by the
+diamond-allocation/competition-zone (钻石分配/竞争区) split mechanisms first; (3) top-down
+garbage collection (自上而下垃圾回收) — `GCEngine.kt` trims a pegging subtree top-down for the
+AND-min partial-fulfillment case, returning excess inventory/budget as it descends. Reach for
+this whenever a demand's commit looks smaller than its request even though no single node looks
+wrong in isolation — that's usually step 2 correctly trimming step 1's greedy over-commit, not
+a bug.
 
 **Critical materials** (canonical test: `isRawCriticalPosition` in PlanningEngine.kt — the
 SAME function used for live dominator labeling and for building Targeted Supply Allocation's
@@ -1799,15 +1802,17 @@ internal val TOOLS: List<LlmTool> = listOf(
     ),
     tool(
         "explain_competition_zone",
-        "**\"Competition zone\" / diamond-allocation explainer.** For a specific demand + " +
-            "critical-material leaf (product_id@location_id), reports whether that demand has " +
-            "AND-sibling branches contending for the SAME shared critical material, and if so, the " +
-            "fair-split cap each branch actually got (recomputed via computeAndSiblingCaps, the " +
-            "SAME mechanism a live run used — see agent-knowledge.md's 'Planning logic' section, " +
-            "step 2 'sibling propagation'). Use for 'why did branch A get X and branch B get Y of " +
-            "this material' / 'is this leaf a competition zone' questions that get_leaf_competition " +
-            "can't answer (that tool shows DRAWS across demands; this tool shows the INTRA-demand " +
-            "fair-split CAP across one demand's own competing branches). " +
+        "**\"Competition zone\" (竞争区) / diamond-allocation (钻石分配) explainer.** For a " +
+            "specific demand + critical-material leaf (product_id@location_id), reports whether " +
+            "that demand has AND-sibling (AND兄弟) branches contending for the SAME shared " +
+            "critical material, and if so, the fair-split cap each branch actually got (recomputed " +
+            "via computeAndSiblingCaps, the SAME mechanism a live run used — see " +
+            "agent-knowledge.md's 'Planning logic' section, step 2 'sibling propagation'/兄弟传播). " +
+            "Use for 'why did branch A get X and branch B get Y of this material' / 'is this leaf a " +
+            "competition zone' / 这个节点是不是竞争区 / 这两个分支是否在争抢同一关键物料 questions " +
+            "that get_leaf_competition can't answer (that tool shows DRAWS across demands; this " +
+            "tool shows the INTRA-demand fair-split CAP across one demand's own competing " +
+            "branches). " +
             "Known limitations, state them if relevant rather than presenting the answer as exact " +
             "in every case: (1) does not replicate the reallocate_critical_leftover second-pass " +
             "budget merge — for a run with that flag on, this reflects pass-1 budgets only, same " +

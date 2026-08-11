@@ -132,30 +132,37 @@ from `is_bottleneck` (orange 瓶颈) on convergence-aligned siblings.
 The end-to-end shape of one planning pass, from `docs/wo-consolidation-and-commitment-aggregate.md`
 §3 ("Mental model (quantity pass)") — reach for this when asked "how does
 this planner actually work" / "walk me through the steps" / "why does the
-structure look like this":
+structure look like this". **Canonical Chinese terms** (use these consistently,
+don't re-translate ad hoc each turn — a live Chinese-language test found the
+agent otherwise either invents inconsistent phrasing per turn, or fails to
+route "AND兄弟分支竞争"-style paraphrases to `explain_competition_zone` at all
+unless "竞争区" is the anchor term used):
 
-1. **Top-down request decomposition.** From the demand, BOM-explode and
-   propagate quantity + timing *requests* down to raw materials. `plan()`
-   does this top-down and commits greedily as it goes.
-2. **Bottom-up commitment aggregate, including sibling propagation.**
-   Cross-demand inventory contention can later zero a child a parent
-   already (greedily) committed against, so commitment is re-derived as a
-   genuine bottom-up aggregate over the *final* pegging: `reconcile(node,
-   target)` walks the tree bottom-up, and by reverse BOM explosion a parent
-   commits the **least-supplied child** (`min(child_commit / bom_rate)`
-   across children) for quantity, and the *latest* child for timing — "only
-   commitment counts." "Sibling propagation" is what feeds the fair share
-   each AND-sibling gets *before* this aggregate trims to it — the
-   diamond/AND-sibling split mechanisms (`computeAndSiblingCaps`,
-   `findOrGroupRecipients`, `computeDiamondCapsForAttempt` in
-   `PlanningEngine.kt`; mental model in `query_design_docs`-indexed docs and
-   the competition-zone concept — ask if you need the deeper mechanics, no
-   tool surfaces the live per-sibling cap directly yet).
-3. **Top-down garbage collection.** `GCEngine.kt::garbageCollectPegging`
-   trims a pegging subtree top-down (demand → work_order → supply) for the
-   AND-min partial-fulfillment case, returning excess inventory/budget to
-   the pool as it descends — replaces an earlier snapshot-restore +
-   second-pass re-plan loop.
+1. **Top-down request decomposition (自上而下需求分解).** From the demand,
+   BOM-explode and propagate quantity + timing *requests* down to raw
+   materials. `plan()` does this top-down and commits greedily as it goes.
+2. **Bottom-up commitment aggregate, including sibling propagation
+   (自下而上承诺聚合，含兄弟传播).** Cross-demand inventory contention can
+   later zero a child a parent already (greedily) committed against, so
+   commitment is re-derived as a genuine bottom-up aggregate over the
+   *final* pegging: `reconcile(node, target)` walks the tree bottom-up, and
+   by reverse BOM explosion a parent commits the **least-supplied child**
+   (`min(child_commit / bom_rate)` across children) for quantity, and the
+   *latest* child for timing — "only commitment counts." "Sibling
+   propagation" (兄弟传播) is what feeds the fair share each AND-sibling
+   (AND兄弟) gets *before* this aggregate trims to it — the
+   diamond-allocation/competition-zone (钻石分配/竞争区) split mechanisms
+   (`computeAndSiblingCaps`, `findOrGroupRecipients`,
+   `computeDiamondCapsForAttempt` in `PlanningEngine.kt`). Use
+   `explain_competition_zone(run_id, demand_id, product_id, location_id)`
+   to surface the recomputed per-sibling cap for a specific demand+leaf —
+   it re-derives `computeAndSiblingCaps`'s result read-only, live per-attempt
+   OR-group diamond splits aren't covered (see the tool's own doc).
+3. **Top-down garbage collection (自上而下垃圾回收).**
+   `GCEngine.kt::garbageCollectPegging` trims a pegging subtree top-down
+   (demand → work_order → supply) for the AND-min partial-fulfillment case,
+   returning excess inventory/budget to the pool as it descends — replaces
+   an earlier snapshot-restore + second-pass re-plan loop.
 
 This is the mental model to reach for whenever a demand's commit looks
 smaller than its own request even though no single node looks "wrong" in
@@ -333,7 +340,7 @@ Organized by knowledge layer (see "Knowledge layers" section above).
 | `explain_method_choice(run_id, product_id, location_id, demand_id?)` | "Why was method X picked over Y at node N (product P @ location L)?" AND "how do I admit method Y?". Walks the FULL pegging tree (bypasses `get_demand_pegging`'s pruner). Returns matching WO(s) with `method_choice_explanation` + parent demand context, AND **every method at the site classified by `status` (chosen / lower_preference / beyond_max_methods / purchase_disabled / failed_cascade_probe / score_lower / unknown_not_chosen) + `presumed_reason` + `would_admit_if` hint**, AND the run's `method_selection` config, AND `override_levers` listing the seven supply-side override paths. Symmetric to `get_leaf_competition`'s `members` enrichment — same recipe applied to method selection. |
 | `get_run_config(run_id)` | "What config did run X use?". MUST-HAVE before A/B comparison; `compare_runs` already wraps this. |
 | `get_leaf_competition(run_id, product_id, location_id)` | **Demand-side root-cause story + zero-share members.** Two views: (1) `competitors` — demands that drew > 0 with `leaf_draw_qty` + `share_pct` (the 根因 story). (2) `members` — every demand whose BOM contains this product, drawers AND zero-share candidates, each tagged with `share_status` (drew_full / drew_partial / walk_at_other_location / walk_avoids_product / priority_filtered / share_starved_under_shortage / outside_bucket / override_blocked / zero_share) + `presumed_reason`. Use the `members` view for "why was demand D eliminated and how do I re-assign shares to it?". Returns `override_levers` listing the four override paths (manual_override.component_split, allocation_mode change, period_days change, demand.priority change). **Note:** for "how much P@L did each demand get?" (allocation TABLE across demands), prefer `get_component_allocation_by_demand` — same data, demand-centric framing, status field instead of leaf-side null/0 ambiguity. |
-| `explain_competition_zone(run_id, demand_id, product_id, location_id)` | **Intra-demand "diamond allocation" / competition-zone explainer** — distinct from `get_leaf_competition` (which shows draws ACROSS demands). Reports whether ONE demand's own AND-sibling branches are contending for the same shared critical material at this leaf, and if so, each branch's recomputed fair-split cap (`computeAndSiblingCaps`, the same mechanism a live run used). Use for "why did branch A get X and branch B get Y of this material within demand D". Two documented gaps: no `reallocate_critical_leftover` second-pass merge (pass-1 budgets only, same caveat as `get_critical_raw_allocation`); no live per-attempt OR-group diamond split (`is_diamond_recipient_material` only reports the static structural fact). `has_and_sibling_cap=false` is a valid, complete answer — no contention at this leaf for this demand. |
+| `explain_competition_zone(run_id, demand_id, product_id, location_id)` | **Intra-demand "diamond allocation" (钻石分配) / competition-zone (竞争区) explainer** — distinct from `get_leaf_competition` (which shows draws ACROSS demands). Reports whether ONE demand's own AND-sibling branches are contending for the same shared critical material at this leaf, and if so, each branch's recomputed fair-split cap (`computeAndSiblingCaps`, the same mechanism a live run used). Use for "why did branch A get X and branch B get Y of this material within demand D". Two documented gaps: no `reallocate_critical_leftover` second-pass merge (pass-1 budgets only, same caveat as `get_critical_raw_allocation`); no live per-attempt OR-group diamond split (`is_diamond_recipient_material` only reports the static structural fact). `has_and_sibling_cap=false` is a valid, complete answer — no contention at this leaf for this demand. |
 | `get_component_allocation_by_demand(run_id, product_id, location_id, demand_ids?)` | **Per-demand allocation table for a (pid, lid) leaf.** Canonical answer to "how much P@L did each demand get?" / "物料 P@L 在这些需求中的分配情况". Returns one row per demand with `consumed_qty` (draw at THIS leaf), `requested_qty`, `share_of_total_consumed_pct`, and explicit `status` (drew_at_leaf / walks_leaf_drew_zero / walks_other_location / doesnt_walk_product / no_pegging_entry) so the agent never reads a 0 as "overall elimination". Optional `demand_ids` filter scopes to specific demands. For a demand's TOTAL consumption of the product across all leaves, call `get_demand_pegging` on that demand and sum. |
 | `get_soundness_summary(run_id)` | Rule-level rollup of soundness violations. Use INSTEAD of walking each demand's pegging. |
 | `recheck_soundness(run_id, deep_check?)` | A soundness rule has shipped *since* run X — apply the current ruleset retroactively. |
