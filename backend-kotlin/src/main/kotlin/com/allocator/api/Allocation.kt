@@ -67,6 +67,51 @@ internal fun loadCaseAllocRows(versionId: Int?): List<CaseAllocRow>? {
     }
 }
 
+/** Upserts [submittedRows] into [versionId]'s TSA input rows (update-if-present, else insert),
+ *  after filtering out any row that targets a critical-STOCK supply (derived/read-only, not a
+ *  raw critical-material lot — see [filterOutCriticalStockRows]'s own doc; only applies when the
+ *  case has ANY targeted supply at all, via [caseHasTargetedSupply]). Refreshes the version's
+ *  content-hash fingerprint. Shared by the PUT route below and the
+ *  `set_targeted_supply_allocation` agent tool (PlanningAgentRoutes.kt) — the ONE place this
+ *  write happens, so the tool inherits the exact same critical-stock rejection the form UI has,
+ *  never a looser one. Returns (accepted rows, rejected supply_ids). */
+internal fun saveCaseAllocRows(caseId: Int, versionId: Int, submittedRows: List<CaseAllocRow>): Pair<List<CaseAllocRow>, List<String>> {
+    var rows = submittedRows
+    var rejected: List<String> = emptyList()
+    if (caseHasTargetedSupply(caseId)) {
+        val data = transaction { CaseLoader.load(caseId) }
+        val config = latestPlanRunConfig(caseId)
+        val (editable, rej) = filterOutCriticalStockRows(submittedRows, data, config)
+        rows = editable
+        rejected = rej
+    }
+    transaction {
+        for (row in rows) {
+            val existing = CaseAllocations.selectAll().where {
+                (CaseAllocations.versionId eq versionId) and (CaseAllocations.supplyId eq row.supplyId)
+            }.singleOrNull()
+            if (existing != null) {
+                CaseAllocations.update({
+                    (CaseAllocations.versionId eq versionId) and (CaseAllocations.supplyId eq row.supplyId)
+                }) {
+                    it[CaseAllocations.qtyCap] = row.qtyCap
+                    it[CaseAllocations.target] = row.target
+                }
+            } else {
+                CaseAllocations.insert {
+                    it[CaseAllocations.caseId]    = caseId
+                    it[CaseAllocations.versionId] = versionId
+                    it[CaseAllocations.supplyId]  = row.supplyId
+                    it[CaseAllocations.qtyCap]    = row.qtyCap
+                    it[CaseAllocations.target]    = row.target
+                }
+            }
+        }
+        recomputeCaseAllocationHash(caseId, versionId)
+    }
+    return rows to rejected
+}
+
 /** Converts a version's TSA rows into the override map [buildSupplyAllocation] takes directly. */
 internal fun buildTsaOverridesFromCaseAlloc(rows: List<CaseAllocRow>): Map<String, TsaOverride> =
     rows.associate { it.supplyId to TsaOverride(qtyCap = it.qtyCap, target = it.target) }
@@ -435,41 +480,7 @@ fun Routing.allocationRoutes() {
                 target   = obj["target"]?.takeIf { it !is JsonNull }?.jsonPrimitive?.content,
             )
         }
-
-        var rows = submittedRows
-        var rejected: List<String> = emptyList()
-        if (caseHasTargetedSupply(caseId)) {
-            val data = transaction { CaseLoader.load(caseId) }
-            val config = latestPlanRunConfig(caseId)
-            val (editable, rej) = filterOutCriticalStockRows(submittedRows, data, config)
-            rows = editable
-            rejected = rej
-        }
-
-        transaction {
-            for (row in rows) {
-                val existing = CaseAllocations.selectAll().where {
-                    (CaseAllocations.versionId eq versionId) and (CaseAllocations.supplyId eq row.supplyId)
-                }.singleOrNull()
-                if (existing != null) {
-                    CaseAllocations.update({
-                        (CaseAllocations.versionId eq versionId) and (CaseAllocations.supplyId eq row.supplyId)
-                    }) {
-                        it[CaseAllocations.qtyCap] = row.qtyCap
-                        it[CaseAllocations.target] = row.target
-                    }
-                } else {
-                    CaseAllocations.insert {
-                        it[CaseAllocations.caseId]    = caseId
-                        it[CaseAllocations.versionId] = versionId
-                        it[CaseAllocations.supplyId]  = row.supplyId
-                        it[CaseAllocations.qtyCap]    = row.qtyCap
-                        it[CaseAllocations.target]    = row.target
-                    }
-                }
-            }
-            recomputeCaseAllocationHash(caseId, versionId)
-        }
+        val (rows, rejected) = saveCaseAllocRows(caseId, versionId, submittedRows)
         call.respond(HttpStatusCode.OK, buildJsonObject {
             put("updated", rows.size)
             put("rejected", JsonArray(rejected.map { JsonPrimitive(it) }))

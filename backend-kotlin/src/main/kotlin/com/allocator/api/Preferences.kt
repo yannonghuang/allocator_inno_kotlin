@@ -219,6 +219,40 @@ internal fun generateAndSeedCasePreferences(
     return rows
 }
 
+/** One preference-row edit: natural key (product_id, location_id, method_type, method_key) plus
+ *  the new `preference` int. Mirrors the PUT route's Triple-of-Triple shape with named fields. */
+data class CasePreferenceEdit(
+    val productId: String,
+    val locationId: String,
+    val methodType: String,
+    val methodKey: String,
+    val preference: Int,
+)
+
+/** Applies [edits] as UPDATEs against [versionId]'s existing rows by natural key — NOT an
+ *  insert-if-missing upsert; an edit whose natural key has no existing row (never `generate`d)
+ *  is silently a no-op UPDATE, matching this route's pre-existing behavior exactly. Shared by
+ *  the PUT route below and the `set_supply_preferences` agent tool (PlanningAgentRoutes.kt) —
+ *  the ONE place this write happens. Caller is responsible for the `version_in_use` conflict
+ *  check. Returns [edits].size (matching the route's existing response), not the actual
+ *  affected-row count. */
+internal fun saveCasePreferenceEdits(caseId: Int, versionId: Int, edits: List<CasePreferenceEdit>): Int {
+    transaction {
+        for (e in edits) {
+            CasePreferences.update({
+                (CasePreferences.versionId eq versionId) and
+                (CasePreferences.productId eq e.productId) and
+                (CasePreferences.locationId eq e.locationId) and
+                (CasePreferences.methodType eq e.methodType) and
+                (CasePreferences.methodKey eq e.methodKey)
+            }) { it[CasePreferences.preference] = e.preference }
+        }
+        val currentRows = loadCasePreferenceRows(versionId) ?: emptyList()
+        recomputeCasePreferenceHash(caseId, versionId, currentRows)
+    }
+    return edits.size
+}
+
 internal fun loadCasePreferenceConfig(versionId: Int?): CasePreferenceConfig? {
     if (versionId == null) return null
     return transaction {
@@ -387,31 +421,16 @@ fun Routing.preferenceRoutes() {
         val rowsJson = payload["rows"]?.jsonArray ?: throw IllegalArgumentException("Missing 'rows'")
         val edits = rowsJson.map { el ->
             val obj = el.jsonObject
-            Triple(
-                Triple(
-                    obj["product_id"]?.jsonPrimitive?.content ?: throw IllegalArgumentException("Missing product_id"),
-                    obj["location_id"]?.jsonPrimitive?.content ?: throw IllegalArgumentException("Missing location_id"),
-                    obj["method_type"]?.jsonPrimitive?.content ?: throw IllegalArgumentException("Missing method_type"),
-                ),
-                obj["method_key"]?.jsonPrimitive?.content ?: "",
-                obj["preference"]?.jsonPrimitive?.intOrNull ?: throw IllegalArgumentException("Missing preference"),
+            CasePreferenceEdit(
+                productId = obj["product_id"]?.jsonPrimitive?.content ?: throw IllegalArgumentException("Missing product_id"),
+                locationId = obj["location_id"]?.jsonPrimitive?.content ?: throw IllegalArgumentException("Missing location_id"),
+                methodType = obj["method_type"]?.jsonPrimitive?.content ?: throw IllegalArgumentException("Missing method_type"),
+                methodKey = obj["method_key"]?.jsonPrimitive?.content ?: "",
+                preference = obj["preference"]?.jsonPrimitive?.intOrNull ?: throw IllegalArgumentException("Missing preference"),
             )
         }
-        transaction {
-            for ((key, methodKey, preference) in edits) {
-                val (pid, lid, mtype) = key
-                CasePreferences.update({
-                    (CasePreferences.versionId eq versionId) and
-                    (CasePreferences.productId eq pid) and
-                    (CasePreferences.locationId eq lid) and
-                    (CasePreferences.methodType eq mtype) and
-                    (CasePreferences.methodKey eq methodKey)
-                }) { it[CasePreferences.preference] = preference }
-            }
-            val currentRows = loadCasePreferenceRows(versionId) ?: emptyList()
-            recomputeCasePreferenceHash(caseId, versionId, currentRows)
-        }
-        call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", edits.size); put("version_id", versionId) })
+        val updated = saveCasePreferenceEdits(caseId, versionId, edits)
+        call.respond(HttpStatusCode.OK, buildJsonObject { put("updated", updated); put("version_id", versionId) })
     }
 
     // ── DELETE /cases/{case_id}/preferences ───────────────────────────────────

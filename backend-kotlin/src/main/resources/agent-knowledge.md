@@ -44,6 +44,25 @@ quotes from `docs/*.md` for design rationale ("why does mode=elaborate
 hurt fairness?", "what does R7d catch?") when the digest below isn't
 specific enough.
 
+**Case configuration objects** — a distinct layer from L1/L2/L3 above: inputs to a
+*future* run, not static L1 data, past-run L2 results, or L3 KB advice. The 5 versioned
+external config objects (Targeted Supply Allocation, Supply Preferences, Demand
+Ordering, Purchasable Materials, Constraints — see `SYSTEM_PROMPT_INTRO`'s "External
+config objects" primer) are read via `get_critical_raw_allocation` / `get_supply_preferences`
+/ `get_demand_ordering` / `get_purchasable_materials` / `get_constraints`, with
+`list_config_versions(kind)` to see what versions exist. **No default-version concept** —
+a version_id omitted from a run's config means that object isn't used at all, never a
+silent fallback to "the usual one."
+
+Write tools — `set_purchasable_materials` / `set_constraints` / `set_demand_ordering` /
+`set_supply_preferences` / `set_targeted_supply_allocation` — always land in a new-or-reused
+UNREFERENCED version (the same `version_in_use` lock the form pages respect, so a chat-driven
+edit can never mutate config a saved plan_run/kb_record already used). None of these
+auto-wires into a run: after writing, call `update_config` with the matching
+`case_alloc_version_id` / `pref_version_id` / `demand_order_version_id` /
+`purchasable_material_version_id` / `constraint_version_id` key set to the returned
+`version_id`, then `run_plan_async`.
+
 ## Algorithmic ideas (the conceptual lenses)
 
 These are the load-bearing design decisions to reason **from** when
@@ -108,6 +127,48 @@ substrate for every "why" question. "Why did demand X commit only 50?"
 UI) marks the genuine origin leaf in AND-bottleneck cascades, distinct
 from `is_bottleneck` (orange 瓶颈) on convergence-aligned siblings.
 
+## Planning logic — the 3-step pipeline
+
+The end-to-end shape of one planning pass, from `docs/wo-consolidation-and-commitment-aggregate.md`
+§3 ("Mental model (quantity pass)") — reach for this when asked "how does
+this planner actually work" / "walk me through the steps" / "why does the
+structure look like this". **Canonical Chinese terms** (use these consistently,
+don't re-translate ad hoc each turn — a live Chinese-language test found the
+agent otherwise either invents inconsistent phrasing per turn, or fails to
+route "AND兄弟分支竞争"-style paraphrases to `explain_competition_zone` at all
+unless "竞争区" is the anchor term used):
+
+1. **Top-down request decomposition (自上而下需求分解).** From the demand,
+   BOM-explode and propagate quantity + timing *requests* down to raw
+   materials. `plan()` does this top-down and commits greedily as it goes.
+2. **Bottom-up commitment aggregate, including sibling propagation
+   (自下而上承诺聚合，含兄弟传播).** Cross-demand inventory contention can
+   later zero a child a parent already (greedily) committed against, so
+   commitment is re-derived as a genuine bottom-up aggregate over the
+   *final* pegging: `reconcile(node, target)` walks the tree bottom-up, and
+   by reverse BOM explosion a parent commits the **least-supplied child**
+   (`min(child_commit / bom_rate)` across children) for quantity, and the
+   *latest* child for timing — "only commitment counts." "Sibling
+   propagation" (兄弟传播) is what feeds the fair share each AND-sibling
+   (AND兄弟) gets *before* this aggregate trims to it — the
+   diamond-allocation/competition-zone (钻石分配/竞争区) split mechanisms
+   (`computeAndSiblingCaps`, `findOrGroupRecipients`,
+   `computeDiamondCapsForAttempt` in `PlanningEngine.kt`). Use
+   `explain_competition_zone(run_id, demand_id, product_id, location_id)`
+   to surface the recomputed per-sibling cap for a specific demand+leaf —
+   it re-derives `computeAndSiblingCaps`'s result read-only, live per-attempt
+   OR-group diamond splits aren't covered (see the tool's own doc).
+3. **Top-down garbage collection (自上而下垃圾回收).**
+   `GCEngine.kt::garbageCollectPegging` trims a pegging subtree top-down
+   (demand → work_order → supply) for the AND-min partial-fulfillment case,
+   returning excess inventory/budget to the pool as it descends — replaces
+   an earlier snapshot-restore + second-pass re-plan loop.
+
+This is the mental model to reach for whenever a demand's commit looks
+smaller than its own request even though no single node looks "wrong" in
+isolation — the discrepancy is usually the bottom-up aggregate (step 2)
+correctly trimming a greedy top-down (step 1) over-commit, not a bug.
+
 ## Design principles (the load-bearing decisions)
 
 ### Method selection — `method_selection`
@@ -129,6 +190,24 @@ from `is_bottleneck` (orange 瓶颈) on convergence-aligned siblings.
   this value. Set to 1 to disable make-fallback entirely. See
   `docs/waterfall-allocation.md` "Reactive fallback" section.
 - **No re-ranking between waterfall iterations** in v1 — order is frozen.
+
+### Waterfall vs. equal-split — two independent knobs, not a root/leaf switch
+
+Easy to mis-frame as "root and leaf use equal-split, intermediate uses waterfall" — that's
+**wrong**. The two knobs are orthogonal and differently scoped:
+
+- `method_selection.root_waterfall` (default `true`) is **root-node-only**. `false` makes the
+  demand's ROOT node divide its quantity up-front across its alternatives (proportional/equal
+  split) before waterfall applies to everything below. Every non-root node ALWAYS waterfalls
+  regardless of this flag — there is no separate leaf-tier behavior.
+- `method_selection.raw_material_sourcing = "equal_split"` (vs. default `"waterfall"`) is
+  **depth-agnostic** — it applies at ANY BOM depth, but only to purchasable-raw-material
+  alternatives filling the same slot (no `method_make`, admitted as buy). Manufacturable
+  alternatives are never grouped this way even if structurally identical.
+
+So "root vs. leaf" isn't the axis at all: one knob is root-only, the other is depth-agnostic but
+alternative-type-scoped (raw-purchasable siblings specifically). A demand can have `root_waterfall`
+on AND `equal_split` raw-material siblings three levels down, simultaneously, independently.
 
 ### Why waterfall replaced proportional split
 
@@ -162,6 +241,47 @@ Two orthogonal knobs:
 The supply-level orchestrator (historical `consolidation.scope = "all"`)
 was retired in 2026-05; only the leaf-level fixed-point pipeline remains.
 Old runs with `scope=all` are silently coerced to leaf-only on parse.
+
+### WO consolidation (post-plan) — distinct from demand-side `consolidation`
+
+Not to be confused with `consolidation.allocation_mode`/`period_days` above (that's about how
+CONTESTED SUPPLY is split among competing demands, during planning). This is a separate,
+post-plan pass: `consolidate_wos` (default ON when consolidation is enabled) merges per-demand
+work orders sharing `(product, location, method, source, window)` into fewer, larger orders — e.g.
+one PO per raw material instead of one per sub-assembly per demand. Full mechanics in
+`docs/wo-consolidation-and-commitment-aggregate.md` §2 (indexed for `query_design_docs`):
+
+- **make / buy** — keyed + re-lotted by `max_lot_size` within each scheduling window; the merged
+  total is divided by `max_lot_size` to derive `lot_count` (not summed from constituent WOs).
+- **move** — same windowing, batched into one mixed-cargo shipment per window.
+- Per-demand pegging is left intact for traceability — only the WO *list* is consolidated, never
+  the pegging trees. `consolidation_split_details` (`{demand_id, allocated_qty}` per constituent)
+  is what restores predecessor/successor drill-down for a merged WO.
+- A merged row carries `demand_id=null` + `consolidated_demand_ids`; the work-order-pegging
+  endpoint resolves it back to its per-demand nodes on demand.
+- Eligibility requires structurally identical downstream pegging (`subtreeSignature()`) — two
+  makes of the same product that chose different variants never merge.
+
+Use this to answer "why do I see fewer/bigger work orders than demands" or "what changes if I
+turn WO consolidation off" — `get_run_config` already returns `consolidate_wos` and the window
+setting verbatim; this section is the vocabulary to interpret them.
+
+### Critical materials & consumption policy
+
+A product@location is critical (canonical test: `isRawCriticalPosition` in `PlanningEngine.kt`)
+iff it has no `make` method anywhere AND either has no admitted `buy` method, or its `buy` is
+excluded by the current run's config (`purchase_allowed=false` or a non-empty
+`purchasable_materials` whitelist that omits it). It's version-dependent — call
+`get_critical_materials(run_id)` for the real, run-specific set; never guess from a product code.
+
+Consumption policy is binary, no in-between: critical materials draw against a pre-allocated
+per-demand budget (Targeted Supply Allocation — `get_critical_raw_allocation`'s recomputed grid);
+everything else — including critical *stock* that merely inherits targeting from a critical raw
+material it depends on — draws plain FIFO (earliest `supply_date` first, no allocation concept).
+Critical stock's inherited-target split correctly reflects TSA overrides on its dependent raw lots
+(fixed 2026-08-09, commit `3841ced`) — see `critical_stock_split_qty` for its initial split figure,
+distinct from `supply_allocations`' actual-consumed figure (they diverge when a target's own
+demand doesn't fully draw its share).
 
 ### Soundness check
 
@@ -220,6 +340,7 @@ Organized by knowledge layer (see "Knowledge layers" section above).
 | `explain_method_choice(run_id, product_id, location_id, demand_id?)` | "Why was method X picked over Y at node N (product P @ location L)?" AND "how do I admit method Y?". Walks the FULL pegging tree (bypasses `get_demand_pegging`'s pruner). Returns matching WO(s) with `method_choice_explanation` + parent demand context, AND **every method at the site classified by `status` (chosen / lower_preference / beyond_max_methods / purchase_disabled / failed_cascade_probe / score_lower / unknown_not_chosen) + `presumed_reason` + `would_admit_if` hint**, AND the run's `method_selection` config, AND `override_levers` listing the seven supply-side override paths. Symmetric to `get_leaf_competition`'s `members` enrichment — same recipe applied to method selection. |
 | `get_run_config(run_id)` | "What config did run X use?". MUST-HAVE before A/B comparison; `compare_runs` already wraps this. |
 | `get_leaf_competition(run_id, product_id, location_id)` | **Demand-side root-cause story + zero-share members.** Two views: (1) `competitors` — demands that drew > 0 with `leaf_draw_qty` + `share_pct` (the 根因 story). (2) `members` — every demand whose BOM contains this product, drawers AND zero-share candidates, each tagged with `share_status` (drew_full / drew_partial / walk_at_other_location / walk_avoids_product / priority_filtered / share_starved_under_shortage / outside_bucket / override_blocked / zero_share) + `presumed_reason`. Use the `members` view for "why was demand D eliminated and how do I re-assign shares to it?". Returns `override_levers` listing the four override paths (manual_override.component_split, allocation_mode change, period_days change, demand.priority change). **Note:** for "how much P@L did each demand get?" (allocation TABLE across demands), prefer `get_component_allocation_by_demand` — same data, demand-centric framing, status field instead of leaf-side null/0 ambiguity. |
+| `explain_competition_zone(run_id, demand_id, product_id, location_id)` | **Intra-demand "diamond allocation" (钻石分配) / competition-zone (竞争区) explainer** — distinct from `get_leaf_competition` (which shows draws ACROSS demands). Reports whether ONE demand's own AND-sibling branches are contending for the same shared critical material at this leaf, and if so, each branch's recomputed fair-split cap (`computeAndSiblingCaps`, the same mechanism a live run used). Use for "why did branch A get X and branch B get Y of this material within demand D". Two documented gaps: no `reallocate_critical_leftover` second-pass merge (pass-1 budgets only, same caveat as `get_critical_raw_allocation`); no live per-attempt OR-group diamond split (`is_diamond_recipient_material` only reports the static structural fact). `has_and_sibling_cap=false` is a valid, complete answer — no contention at this leaf for this demand. |
 | `get_component_allocation_by_demand(run_id, product_id, location_id, demand_ids?)` | **Per-demand allocation table for a (pid, lid) leaf.** Canonical answer to "how much P@L did each demand get?" / "物料 P@L 在这些需求中的分配情况". Returns one row per demand with `consumed_qty` (draw at THIS leaf), `requested_qty`, `share_of_total_consumed_pct`, and explicit `status` (drew_at_leaf / walks_leaf_drew_zero / walks_other_location / doesnt_walk_product / no_pegging_entry) so the agent never reads a 0 as "overall elimination". Optional `demand_ids` filter scopes to specific demands. For a demand's TOTAL consumption of the product across all leaves, call `get_demand_pegging` on that demand and sum. |
 | `get_soundness_summary(run_id)` | Rule-level rollup of soundness violations. Use INSTEAD of walking each demand's pegging. |
 | `recheck_soundness(run_id, deep_check?)` | A soundness rule has shipped *since* run X — apply the current ruleset retroactively. |
