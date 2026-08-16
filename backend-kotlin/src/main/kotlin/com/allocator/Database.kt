@@ -169,7 +169,8 @@ private fun createTables() {
         PlanPegging, PlanSupplyAllocations, CaseAllocations, NegotiationWaits, PlanRunEvents, AgentMemory,
         KbRecords, KbDeletedSignatures, CasePreferences, CasePreferenceConfigs,
         CaseDemandOrders, CaseDemandOrderConfigs, CaseAllocationConfigs,
-        CasePurchasableMaterials, CasePurchasableMaterialConfigs, CaseConstraints, CaseConstraintConfigs
+        CasePurchasableMaterials, CasePurchasableMaterialConfigs, CaseConstraints, CaseConstraintConfigs,
+        CaseMethodMakes, CaseMethodMakeConfigs, CaseMethodMoves, CaseMethodMoveConfigs
     )
 }
 
@@ -308,6 +309,10 @@ private fun migrateSchema() {
         "ALTER TABLE case_allocation DROP COLUMN IF EXISTS qty_allocated",
         "ALTER TABLE case_allocation ADD COLUMN IF NOT EXISTS qty_cap DOUBLE PRECISION",
         "ALTER TABLE case_allocation ADD COLUMN IF NOT EXISTS target VARCHAR(255)",
+        // case_method_make.bom_id removed — it's a derivable field (BOM_<resolved_product_id>,
+        // synthesized in PlanningEngine.kt's getMethods), not something the Method Make Overrides
+        // form should ask the user to type; see CaseMethodMakes' own doc.
+        "ALTER TABLE case_method_make DROP COLUMN IF EXISTS bom_id",
     )
     val conn = org.jetbrains.exposed.sql.transactions.TransactionManager.current().connection
     stmts.forEach { sql ->

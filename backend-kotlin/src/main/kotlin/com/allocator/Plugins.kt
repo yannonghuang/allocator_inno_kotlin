@@ -12,6 +12,8 @@ import com.allocator.api.peggingRoutes
 import com.allocator.api.resourceUtilizationRoutes
 import com.allocator.api.materialImpactRoutes
 import com.allocator.api.materialEventRoutes
+import com.allocator.api.methodMakeOverrideRoutes
+import com.allocator.api.methodMoveOverrideRoutes
 import com.allocator.api.workOrderImpactRoutes
 import com.allocator.api.woScheduleEventRoutes
 import com.allocator.api.workOrderQueryRoutes
@@ -109,6 +111,8 @@ fun Application.configureRouting() {
         demandOrderingRoutes()
         purchasableMaterialsRoutes()
         constraintsRoutes()
+        methodMakeOverrideRoutes()
+        methodMoveOverrideRoutes()
         allocateRoutes()
         peggingRoutes()
         resourceUtilizationRoutes()

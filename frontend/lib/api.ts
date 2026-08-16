@@ -517,7 +517,7 @@ export type PlanningConfig = {
   /** When true, automatically run the soundness check (always deep) after each successful plan. Default: true. */
   check_soundness?: boolean;
   /**
-   * Explicit version picks for the 5 "external config objects" (see CaseConfigVersions' own doc
+   * Explicit version picks for the 7 "external config objects" (see CaseConfigVersions' own doc
    * in Tables.kt) — omit any (or "-" in the UI) for no override on that object. No implicit
    * fallback of any kind. Resolved server-side by
    * `resolveEffectiveConfig`/`CaseConfigVersioning.resolveVersionId`.
@@ -527,6 +527,8 @@ export type PlanningConfig = {
   demand_order_version_id?: number;
   purchasable_material_version_id?: number;
   constraint_version_id?: number;
+  method_make_version_id?: number;
+  method_move_version_id?: number;
   /**
    * App-specific config (ASC): optional runtime parameters a case's own CSVs can't hardcode.
    * Only meaningful when the case has at least one supply row with SUPPLY_DATE="wip" — see
@@ -935,13 +937,15 @@ export type PlanRun = {
   total_requested?: number;
   manufacturing_total_quantity?: number;
   inventory_consumed_total?: number;
-  // Which version of each of the 5 external config objects this run used (see
+  // Which version of each of the 7 external config objects this run used (see
   // CaseConfigVersions' own doc) — undefined for pre-versioning runs.
   case_alloc_version_id?: number;
   pref_version_id?: number;
   demand_order_version_id?: number;
   purchasable_material_version_id?: number;
   constraint_version_id?: number;
+  method_make_version_id?: number;
+  method_move_version_id?: number;
 };
 
 export type SoundnessViolation = {
@@ -2010,6 +2014,8 @@ export type SeedForm = {
   demand_order_version_id?: number;
   purchasable_material_version_id?: number;
   constraint_version_id?: number;
+  method_make_version_id?: number;
+  method_move_version_id?: number;
   /** Default true, matching the Planning page's own default. max_methods_min/max only has any
    *  effect when this is false — same relationship as the Planning page's own form. */
   root_waterfall?: boolean;
@@ -2456,6 +2462,146 @@ export const createCaseConstraintsVersion = (caseId: number, body: { name?: stri
 export const updateCaseConstraintsVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null }) =>
   updateConfigVersion('constraints', caseId, versionId, body);
 export const deleteCaseConstraintsVersion = (caseId: number, versionId: number) => deleteConfigVersion('constraints', caseId, versionId);
+
+// ── Method Make Overrides (promoted out of the static method_make.csv import) ────
+// Same rationale as Purchasable Materials/Constraints — no "generate", pure user input. When a
+// version is selected for a run, its rows REPLACE the CSV-imported method_make data entirely
+// (an empty version means NO make methods at all, not "fall back to CSV" — see backend
+// CaseMethodMakes' own doc in Tables.kt). product_id accepts an individual product_id, a
+// PROD_AREA value, or "*"/"" (matches every product) — same wildcarding location_id already
+// supports on the plain CSV import.
+//
+// No bom_id field — it's derived server-side ("BOM_" + the resolved concrete product_id, once a
+// wildcard product_id is matched to one; see getMethods/deriveMakeBomId in PlanningEngine.kt),
+// never something this form asks the user to type.
+
+export type MethodMakeOverrideRow = {
+  product_id: string;
+  location_id: string;
+  preference: number | null;
+  lead_time: number | null;
+  yield: number | null;
+};
+
+/** GET /cases/{id}/method-make-overrides — the persisted row set (empty = no override active). */
+export async function getMethodMakeOverrides(caseId: number, versionId?: number): Promise<MethodMakeOverrideRow[]> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/method-make-overrides`, versionId));
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return data.rows as MethodMakeOverrideRow[];
+}
+
+/** PUT /cases/{id}/method-make-overrides — replaces the whole row set. 409 if the target version
+ *  is referenced by an existing plan run — use createMethodMakeOverridesVersion ("Save As")
+ *  instead. Returns the version_id written against. */
+export async function updateMethodMakeOverrides(caseId: number, rows: MethodMakeOverrideRow[], versionId?: number): Promise<{ versionId: number }> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/method-make-overrides`, versionId), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rows }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return { versionId: data.version_id as number };
+}
+
+/** DELETE /cases/{id}/method-make-overrides — clear the target version's rows. */
+export async function deleteMethodMakeOverrides(caseId: number, versionId?: number): Promise<void> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/method-make-overrides`, versionId), { method: 'DELETE' });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+/** Returns the version_id written against — see updateMethodMakeOverrides' own doc. */
+export async function importMethodMakeOverridesCsv(caseId: number, csvText: string, versionId?: number): Promise<{ rows: MethodMakeOverrideRow[]; versionId: number }> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/method-make-overrides/import`, versionId), {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: csvText,
+  });
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return { rows: data.rows as MethodMakeOverrideRow[], versionId: data.version_id as number };
+}
+
+export async function exportMethodMakeOverridesCsv(caseId: number, versionId?: number): Promise<string> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/method-make-overrides/export`, versionId));
+  if (!r.ok) throw new Error(await r.text());
+  return r.text();
+}
+
+export const listMethodMakeOverridesVersions = (caseId: number) => listConfigVersions('method-make-overrides', caseId);
+export const createMethodMakeOverridesVersion = (caseId: number, body: { name?: string; comments?: string; rows: MethodMakeOverrideRow[] }) =>
+  createConfigVersion('method-make-overrides', caseId, body);
+export const updateMethodMakeOverridesVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null }) =>
+  updateConfigVersion('method-make-overrides', caseId, versionId, body);
+export const deleteMethodMakeOverridesVersion = (caseId: number, versionId: number) => deleteConfigVersion('method-make-overrides', caseId, versionId);
+
+// ── Method Move Overrides (promoted out of the static method_move.csv import) ────
+// Same REPLACE-the-whole-set semantics as Method Make Overrides (see its own doc), for
+// method_move. product_id/from_location_id/to_location_id each accept an individual value or
+// the "*"/"" wildcard (product_id also accepts a PROD_AREA value).
+
+export type MethodMoveOverrideRow = {
+  product_id: string;
+  from_location_id: string;
+  to_location_id: string;
+  transit_time: number | null;
+  transit_time_uom: string | null;
+  preference: number | null;
+};
+
+/** GET /cases/{id}/method-move-overrides — the persisted row set (empty = no override active). */
+export async function getMethodMoveOverrides(caseId: number, versionId?: number): Promise<MethodMoveOverrideRow[]> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/method-move-overrides`, versionId));
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return data.rows as MethodMoveOverrideRow[];
+}
+
+/** PUT /cases/{id}/method-move-overrides — replaces the whole row set. 409 if the target version
+ *  is referenced by an existing plan run — use createMethodMoveOverridesVersion ("Save As")
+ *  instead. Returns the version_id written against. */
+export async function updateMethodMoveOverrides(caseId: number, rows: MethodMoveOverrideRow[], versionId?: number): Promise<{ versionId: number }> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/method-move-overrides`, versionId), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rows }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return { versionId: data.version_id as number };
+}
+
+/** DELETE /cases/{id}/method-move-overrides — clear the target version's rows. */
+export async function deleteMethodMoveOverrides(caseId: number, versionId?: number): Promise<void> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/method-move-overrides`, versionId), { method: 'DELETE' });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+/** Returns the version_id written against — see updateMethodMoveOverrides' own doc. */
+export async function importMethodMoveOverridesCsv(caseId: number, csvText: string, versionId?: number): Promise<{ rows: MethodMoveOverrideRow[]; versionId: number }> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/method-move-overrides/import`, versionId), {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: csvText,
+  });
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return { rows: data.rows as MethodMoveOverrideRow[], versionId: data.version_id as number };
+}
+
+export async function exportMethodMoveOverridesCsv(caseId: number, versionId?: number): Promise<string> {
+  const r = await fetch(withVersion(`${API}/cases/${caseId}/method-move-overrides/export`, versionId));
+  if (!r.ok) throw new Error(await r.text());
+  return r.text();
+}
+
+export const listMethodMoveOverridesVersions = (caseId: number) => listConfigVersions('method-move-overrides', caseId);
+export const createMethodMoveOverridesVersion = (caseId: number, body: { name?: string; comments?: string; rows: MethodMoveOverrideRow[] }) =>
+  createConfigVersion('method-move-overrides', caseId, body);
+export const updateMethodMoveOverridesVersion = (caseId: number, versionId: number, body: { name?: string | null; comments?: string | null }) =>
+  updateConfigVersion('method-move-overrides', caseId, versionId, body);
+export const deleteMethodMoveOverridesVersion = (caseId: number, versionId: number) => deleteConfigVersion('method-move-overrides', caseId, versionId);
 
 // ── Preferences KB ───────────────────────────────────────────────────────────────
 

@@ -682,9 +682,11 @@ object CaseBootstrap {
         val ord = fp?.get("ord")?.jsonPrimitive?.contentOrNull ?: "legacy"
         val purchMat = fp?.get("purchmat")?.jsonPrimitive?.contentOrNull ?: "legacy"
         val constr = fp?.get("constr")?.jsonPrimitive?.contentOrNull ?: "legacy"
+        val methMake = fp?.get("methmake")?.jsonPrimitive?.contentOrNull ?: "legacy"
+        val methMove = fp?.get("methmove")?.jsonPrimitive?.contentOrNull ?: "legacy"
         return "m=$mode|max=$maxM|d=$depth|bom=$bomDepth|w=$wC,$wI,$wP|" +
             "bs=$bsMake,$bsMove,$bsPurchase|p=$period|purch=$purch|casealloc=$caseAlloc|pref=$pref|ord=$ord|" +
-            "purchmat=$purchMat|constr=$constr"
+            "purchmat=$purchMat|constr=$constr|methmake=$methMake|methmove=$methMove"
     }
 
     /**
@@ -705,6 +707,8 @@ object CaseBootstrap {
             ordVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.ORD, explicitVersionId("demand_order_version_id")),
             purchMatVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.PURCHMAT, explicitVersionId("purchasable_material_version_id")),
             constrVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.CONSTR, explicitVersionId("constraint_version_id")),
+            methMakeVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.METHMAKE, explicitVersionId("method_make_version_id")),
+            methMoveVersionId = CaseConfigVersioning.resolveVersionId(caseId, ConfigVersionKind.METHMOVE, explicitVersionId("method_move_version_id")),
         )
         return signatureFor(embedFingerprint(config, fp))
     }
@@ -723,6 +727,8 @@ object CaseBootstrap {
             put("ord", fp.ord)
             put("purchmat", fp.purchmat)
             put("constr", fp.constr)
+            put("methmake", fp.methmake)
+            put("methmove", fp.methmove)
         }
     }
 
@@ -759,6 +765,8 @@ object CaseBootstrap {
         kb.ordVersionId?.let { put("demand_order_version_id", it) }
         kb.purchMatVersionId?.let { put("purchasable_material_version_id", it) }
         kb.constrVersionId?.let { put("constraint_version_id", it) }
+        kb.methMakeVersionId?.let { put("method_make_version_id", it) }
+        kb.methMoveVersionId?.let { put("method_move_version_id", it) }
     }
 
     /** JSON shape for one KB record, for the KB-seeding dialog's "already run" list.
@@ -814,6 +822,8 @@ object CaseBootstrap {
         val ordVersionId: Int?,
         val purchMatVersionId: Int?,
         val constrVersionId: Int?,
+        val methMakeVersionId: Int? = null,
+        val methMoveVersionId: Int? = null,
         val rootWaterfall: Boolean = true,
         val equalSplitRawMaterials: Boolean = false,
         val horizonStart: String? = null,
@@ -837,6 +847,8 @@ object CaseBootstrap {
         form.ordVersionId?.let { put("demand_order_version_id", it) }
         form.purchMatVersionId?.let { put("purchasable_material_version_id", it) }
         form.constrVersionId?.let { put("constraint_version_id", it) }
+        form.methMakeVersionId?.let { put("method_make_version_id", it) }
+        form.methMoveVersionId?.let { put("method_move_version_id", it) }
     }
 
     /** One entry per integer in [SeedForm.maxMethodsMin, SeedForm.maxMethodsMax] whose resulting

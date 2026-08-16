@@ -65,7 +65,7 @@ internal val bootstrapJobs = ConcurrentHashMap<String, MutableMap<String, Any?>>
  *  `/bootstrap/preview` POST body. Mirrors the exact knobs the Planning page's own manual-run
  *  form exposes (purchase allowed, per-type WO batch scale, analyze criticality, check
  *  soundness, root waterfall, raw-material sourcing, horizon start, ASC wip supply date) plus
- *  the 5 external-config version picks — everything else about a submitted config
+ *  the 7 external-config version picks — everything else about a submitted config
  *  (mode/depth/max_bom_depth/weights) is fixed at Planning's own defaults, same as a manual
  *  submission that never touched those. */
 private fun parseSeedForm(payload: JsonObject): com.allocator.services.CaseBootstrap.SeedForm {
@@ -90,6 +90,8 @@ private fun parseSeedForm(payload: JsonObject): com.allocator.services.CaseBoots
         ordVersionId = versionId("demand_order_version_id"),
         purchMatVersionId = versionId("purchasable_material_version_id"),
         constrVersionId = versionId("constraint_version_id"),
+        methMakeVersionId = versionId("method_make_version_id"),
+        methMoveVersionId = versionId("method_move_version_id"),
         rootWaterfall = bool("root_waterfall", true),
         equalSplitRawMaterials = str("raw_material_sourcing", "waterfall") == "equal_split",
         horizonStart = payload["horizon_start"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() },
@@ -480,8 +482,9 @@ fun Routing.allocateRoutes() {
 
         casePlanResults.remove(caseId)  // release previous result before allocating a new one
         val syncEffective = transaction { resolveEffectiveConfig(config, caseId, data) }
-        val result = runPlanning(data, config = planningConfig(config, syncEffective))
-        val enriched = enrichPlanResultWithData(caseId, result.output, data)
+        val syncData = effectiveData(data, syncEffective)
+        val result = runPlanning(syncData, config = planningConfig(config, syncEffective))
+        val enriched = enrichPlanResultWithData(caseId, result.output, syncData)
         casePlanResults[caseId] = enriched - "planning_pegging"
         call.respond(anyToJson(enriched))
     }
@@ -1075,6 +1078,7 @@ fun Routing.allocateRoutes() {
                 PlanRuns.soundnessStatus, PlanRuns.soundnessCheckedAt,
                 PlanRuns.caseAllocVersionId, PlanRuns.prefVersionId, PlanRuns.ordVersionId,
                 PlanRuns.purchMatVersionId, PlanRuns.constrVersionId,
+                PlanRuns.methMakeVersionId, PlanRuns.methMoveVersionId,
             )
             val rows = PlanRuns.select(listColumns).where { (PlanRuns.caseId eq caseId) and (PlanRuns.status neq "ready") and (PlanRuns.status neq "running") }
                 .orderBy(PlanRuns.createdAt, SortOrder.DESC)
@@ -1146,6 +1150,8 @@ fun Routing.allocateRoutes() {
                     demandOrderVersionId = row[PlanRuns.ordVersionId],
                     purchasableMaterialVersionId = row[PlanRuns.purchMatVersionId],
                     constraintVersionId = row[PlanRuns.constrVersionId],
+                    methodMakeVersionId = row[PlanRuns.methMakeVersionId],
+                    methodMoveVersionId = row[PlanRuns.methMoveVersionId],
                 )
             }
         }
@@ -2881,6 +2887,8 @@ internal suspend fun runPlanBackground(
             it[PlanRuns.ordVersionId] = effectiveConfig.ordVersionId
             it[PlanRuns.purchMatVersionId] = effectiveConfig.purchMatVersionId
             it[PlanRuns.constrVersionId] = effectiveConfig.constrVersionId
+            it[PlanRuns.methMakeVersionId] = effectiveConfig.methMakeVersionId
+            it[PlanRuns.methMoveVersionId] = effectiveConfig.methMoveVersionId
         }[PlanRuns.id]
         com.allocator.services.emitPlanRunEvent(caseId, insertedId, "created", buildJsonObject {
             put("source", "plan")
@@ -2888,6 +2896,12 @@ internal suspend fun runPlanBackground(
         insertedId
     }
     planJobRunIds[jobId] = planRunId
+    // Shadow the CSV-imported `data` param with the method_make/method_move-override-applied
+    // version for the rest of this function — see effectiveData's own doc. resolveEffectiveConfig
+    // above deliberately used the ORIGINAL data (only reads data["demand"] for horizon calcs,
+    // unaffected by these overrides), so this reassignment happens only after that call.
+    @Suppress("NAME_SHADOWING")
+    val data = effectiveData(data, effectiveConfig)
 
     // Release the previous plan result for this case so GC can reclaim its
     // memory before enrichment allocates a new one. Without this, the old
@@ -3154,6 +3168,8 @@ private suspend fun runOneBootstrapPreset(
             it[PlanRuns.ordVersionId] = effectiveConfig.ordVersionId
             it[PlanRuns.purchMatVersionId] = effectiveConfig.purchMatVersionId
             it[PlanRuns.constrVersionId] = effectiveConfig.constrVersionId
+            it[PlanRuns.methMakeVersionId] = effectiveConfig.methMakeVersionId
+            it[PlanRuns.methMoveVersionId] = effectiveConfig.methMoveVersionId
         }[PlanRuns.id]
         com.allocator.services.emitPlanRunEvent(caseId, insertedId, "created", buildJsonObject {
             put("source", "bootstrap")
@@ -3161,6 +3177,10 @@ private suspend fun runOneBootstrapPreset(
         })
         insertedId
     }
+    // Shadow `data` with the override-applied version for KB-seeding runs too — see
+    // effectiveData's own doc and runPlanBackground's identical wiring.
+    @Suppress("NAME_SHADOWING")
+    val data = effectiveData(data, effectiveConfig)
 
     try {
         // Targeted Supply Allocation rides along inside planningConfig's own overlay — see the
@@ -3394,6 +3414,8 @@ internal data class EffectiveConfig(
     val ordVersionId: Int?,
     val purchMatVersionId: Int?,
     val constrVersionId: Int?,
+    val methMakeVersionId: Int?,
+    val methMoveVersionId: Int?,
 )
 
 @Suppress("UNCHECKED_CAST")
@@ -3446,6 +3468,8 @@ internal fun resolveEffectiveConfig(
     val ordVersionId = resolved(ConfigVersionKind.ORD, "demand_order_version_id")
     val purchMatVersionId = resolved(ConfigVersionKind.PURCHMAT, "purchasable_material_version_id")
     val constrVersionId = resolved(ConfigVersionKind.CONSTR, "constraint_version_id")
+    val methMakeVersionId = resolved(ConfigVersionKind.METHMAKE, "method_make_version_id")
+    val methMoveVersionId = resolved(ConfigVersionKind.METHMOVE, "method_move_version_id")
 
     val json = buildJsonObject {
         put("purchase_allowed", c["purchase_allowed"] as? Boolean ?: true)
@@ -3488,6 +3512,34 @@ internal fun resolveEffectiveConfig(
                     put("supply_id", row.supplyId)
                     put("qty_cap", row.qtyCap)
                     put("target", row.target)
+                }
+            }
+        }
+        // method_make/method_move overrides — see CaseMethodMakes/CaseMethodMoves' own doc.
+        // Embedded here (rows, not just the version id) for the same "genuine round-trip
+        // descriptor" reason as targeted_supply_allocation above; the actual data-splicing that
+        // makes these overrides take effect happens in effectiveData, not here (this function
+        // only ever produces the config JSON, never mutates `data`).
+        putJsonArray("method_make_overrides") {
+            loadCaseMethodMakeRows(methMakeVersionId).forEach { row ->
+                addJsonObject {
+                    put("product_id", row.productId)
+                    put("location_id", row.locationId)
+                    put("preference", row.preference)
+                    put("lead_time", row.leadTime)
+                    put("yield", row.yield_)
+                }
+            }
+        }
+        putJsonArray("method_move_overrides") {
+            loadCaseMethodMoveRows(methMoveVersionId).forEach { row ->
+                addJsonObject {
+                    put("product_id", row.productId)
+                    put("from_location_id", row.fromLocationId)
+                    put("to_location_id", row.toLocationId)
+                    put("transit_time", row.transitTime)
+                    put("transit_time_uom", row.transitTimeUom)
+                    put("preference", row.preference)
                 }
             }
         }
@@ -3537,8 +3589,11 @@ internal fun resolveEffectiveConfig(
         put("demand_order_version_id", ordVersionId)
         put("purchasable_material_version_id", purchMatVersionId)
         put("constraint_version_id", constrVersionId)
+        put("method_make_version_id", methMakeVersionId)
+        put("method_move_version_id", methMoveVersionId)
         val fp = com.allocator.services.KbFingerprint.buildFingerprint(
             caseAllocVersionId, prefVersionId, ordVersionId, purchMatVersionId, constrVersionId,
+            methMakeVersionId, methMoveVersionId,
         )
         putJsonObject("_kb_fingerprint") {
             put("casealloc", fp.casealloc)
@@ -3546,9 +3601,11 @@ internal fun resolveEffectiveConfig(
             put("ord", fp.ord)
             put("purchmat", fp.purchmat)
             put("constr", fp.constr)
+            put("methmake", fp.methmake)
+            put("methmove", fp.methmove)
         }
     }
-    return EffectiveConfig(json, caseAllocVersionId, prefVersionId, ordVersionId, purchMatVersionId, constrVersionId)
+    return EffectiveConfig(json, caseAllocVersionId, prefVersionId, ordVersionId, purchMatVersionId, constrVersionId, methMakeVersionId, methMoveVersionId)
 }
 
 /**
@@ -3571,6 +3628,51 @@ internal fun planningConfig(config: Map<String, Any?>?, effective: EffectiveConf
             mapOf("supply_id" to row.supplyId, "qty_cap" to row.qtyCap, "target" to row.target)
         },
     )
+
+/**
+ * The `data` map actually handed to [runPlanning]: [data] with `method_make`/`method_move`
+ * REPLACED (not merged — see [CaseMethodMakes]/[CaseMethodMoves]' own doc) by the resolved
+ * override version's rows, when one is set. Unlike [planningConfig]'s overlay (config keys the
+ * planner already knows how to read out of its config map), method_make/method_move are core
+ * planning DATA — `getMethods`/`buildDataIndex` (PlanningEngine.kt) read them straight out of
+ * `data["method_make"]`/`data["method_move"]`, so an override has to replace those keys before
+ * `data` ever reaches the planner, not ride along in `config`.
+ *
+ * A version with zero rows genuinely means "no make/move methods at all" for its object — the
+ * same "selecting a version means this is now the complete set" convention [planningConfig]
+ * already uses for purchasable_materials/constraints. Every submission path (manual Plan Run,
+ * agent-driven, KB-seeding) must call this on the SAME [data] it read from CaseLoader before
+ * passing it to `runPlanning`, exactly the way each already calls [planningConfig] on `config` —
+ * see `runPlanBackground`/the sync `/plan` route/`runOneBootstrapPreset` for the three call sites.
+ */
+internal fun effectiveData(
+    data: Map<String, List<Map<String, Any?>>>,
+    effective: EffectiveConfig,
+): Map<String, List<Map<String, Any?>>> {
+    if (effective.methMakeVersionId == null && effective.methMoveVersionId == null) return data
+    val overridden = data.toMutableMap()
+    if (effective.methMakeVersionId != null) {
+        // No bom_id key here — it's derived downstream (getMethods/deriveMakeBomId,
+        // PlanningEngine.kt) as "BOM_" + the resolved concrete product_id, once a wildcard
+        // product_id row is matched to one. See CaseMethodMakes' own doc in Tables.kt.
+        overridden["method_make"] = loadCaseMethodMakeRows(effective.methMakeVersionId).map { row ->
+            mapOf(
+                "product_id" to row.productId, "location_id" to row.locationId,
+                "preference" to row.preference, "lead_time" to row.leadTime, "yield" to row.yield_,
+            )
+        }
+    }
+    if (effective.methMoveVersionId != null) {
+        overridden["method_move"] = loadCaseMethodMoveRows(effective.methMoveVersionId).map { row ->
+            mapOf(
+                "product_id" to row.productId, "from_location_id" to row.fromLocationId,
+                "to_location_id" to row.toLocationId, "transit_time" to row.transitTime,
+                "transit_time_uom" to row.transitTimeUom, "preference" to row.preference,
+            )
+        }
+    }
+    return overridden
+}
 
 /** Resolve bom.csv path — walks up from working directory. */
 private fun resolveBomCsv() = run {

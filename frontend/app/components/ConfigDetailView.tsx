@@ -9,6 +9,8 @@ import {
   getDemandOrdering,
   getPurchasableMaterials,
   getCaseConstraints,
+  getMethodMakeOverrides,
+  getMethodMoveOverrides,
   getCaseSupplies,
   getCaseDemands,
   getPurchasableRawMaterials,
@@ -18,6 +20,8 @@ import {
   listDemandOrderingVersions,
   listPurchasableMaterialsVersions,
   listCaseConstraintsVersions,
+  listMethodMakeOverridesVersions,
+  listMethodMoveOverridesVersions,
   type AllocationRow,
   type AllocationPreview,
   type TsaRow,
@@ -25,6 +29,8 @@ import {
   type DemandOrderRow,
   type PurchasableMaterialRow,
   type ConstraintRuleRow,
+  type MethodMakeOverrideRow,
+  type MethodMoveOverrideRow,
   type ConfigVersion,
   type CaseSupplyRow,
   type CaseDemandRow,
@@ -33,13 +39,15 @@ import {
 } from '@/lib/api';
 import { RawMaterialPicker } from './RawMaterialPicker';
 import { ConstraintPicker } from './ConstraintPicker';
+import { MethodMakeOverridePicker } from './MethodMakeOverridePicker';
+import { MethodMoveOverridePicker } from './MethodMoveOverridePicker';
 import { PreferenceTable } from './PreferenceTable';
 import { DemandOrderTable } from './DemandOrderTable';
 import { TsaTable } from './TsaTable';
 
-export type ExternalKind = 'allocation' | 'preferences' | 'demandOrdering' | 'purchasableMaterials' | 'constraints';
+export type ExternalKind = 'allocation' | 'preferences' | 'demandOrdering' | 'purchasableMaterials' | 'constraints' | 'methodMakeOverrides' | 'methodMoveOverrides';
 
-/** The 5 version-reference fields carried by `PlanRun`/`BootstrapPreset` (see CaseConfigVersions'
+/** The 7 version-reference fields carried by `PlanRun`/`BootstrapPreset` (see CaseConfigVersions'
  *  own doc) — which version of each external config object a given run actually used. Undefined
  *  for pre-versioning ("legacy") runs. */
 type VersionRefs = {
@@ -48,6 +56,8 @@ type VersionRefs = {
   demand_order_version_id?: number;
   purchasable_material_version_id?: number;
   constraint_version_id?: number;
+  method_make_version_id?: number;
+  method_move_version_id?: number;
 };
 
 const EXTERNAL_LABELS: Record<ExternalKind, string> = {
@@ -56,6 +66,8 @@ const EXTERNAL_LABELS: Record<ExternalKind, string> = {
   demandOrdering: 'Demand Ordering',
   purchasableMaterials: 'Purchasable Materials',
   constraints: 'Constraints',
+  methodMakeOverrides: 'Method Make Overrides',
+  methodMoveOverrides: 'Method Move Overrides',
 };
 
 const VERSION_REF_KEY: Record<ExternalKind, keyof VersionRefs> = {
@@ -64,6 +76,8 @@ const VERSION_REF_KEY: Record<ExternalKind, keyof VersionRefs> = {
   demandOrdering: 'demand_order_version_id',
   purchasableMaterials: 'purchasable_material_version_id',
   constraints: 'constraint_version_id',
+  methodMakeOverrides: 'method_make_version_id',
+  methodMoveOverrides: 'method_move_version_id',
 };
 
 const listVersionsFor: Record<ExternalKind, (caseId: number) => Promise<ConfigVersion[]>> = {
@@ -72,6 +86,8 @@ const listVersionsFor: Record<ExternalKind, (caseId: number) => Promise<ConfigVe
   demandOrdering: listDemandOrderingVersions,
   purchasableMaterials: listPurchasableMaterialsVersions,
   constraints: listCaseConstraintsVersions,
+  methodMakeOverrides: listMethodMakeOverridesVersions,
+  methodMoveOverrides: listMethodMoveOverridesVersions,
 };
 
 /**
@@ -182,6 +198,8 @@ export function ExternalConfigDrilldown({ kind, caseId, versionId, onBack, showB
   const tPreferences = useTranslations('preferencesPage');
   const tDemandOrdering = useTranslations('demandOrderingPage');
   const tAllocation = useTranslations('allocationPage');
+  const tMethodMake = useTranslations('methodMakeOverridesPage');
+  const tMethodMove = useTranslations('methodMoveOverridesPage');
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -243,6 +261,14 @@ export function ExternalConfigDrilldown({ kind, caseId, versionId, onBack, showB
           ]);
           return { rows: cRows, aux: opts };
         }
+        case 'methodMakeOverrides': {
+          const mRows = await getMethodMakeOverrides(caseId, versionId);
+          return { rows: mRows, aux: null };
+        }
+        case 'methodMoveOverrides': {
+          const mRows = await getMethodMoveOverrides(caseId, versionId);
+          return { rows: mRows, aux: null };
+        }
       }
     };
     load()
@@ -298,6 +324,24 @@ export function ExternalConfigDrilldown({ kind, caseId, versionId, onBack, showB
             readOnly
             defaultCollapsed={false}
             tP={tPlanning}
+          />
+        );
+      case 'methodMakeOverrides':
+        return (
+          <MethodMakeOverridePicker
+            rows={rows as MethodMakeOverrideRow[]}
+            readOnly
+            defaultCollapsed={false}
+            t={tMethodMake}
+          />
+        );
+      case 'methodMoveOverrides':
+        return (
+          <MethodMoveOverridePicker
+            rows={rows as MethodMoveOverrideRow[]}
+            readOnly
+            defaultCollapsed={false}
+            t={tMethodMove}
           />
         );
     }

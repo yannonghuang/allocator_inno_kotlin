@@ -31,6 +31,8 @@ enum class ConfigVersionKind(val key: String) {
     ORD("ord"),
     PURCHMAT("purchmat"),
     CONSTR("constr"),
+    METHMAKE("methmake"),
+    METHMOVE("methmove"),
 }
 
 data class VersionSummary(
@@ -59,6 +61,8 @@ object CaseConfigVersioning {
         ConfigVersionKind.ORD       -> PlanRuns.ordVersionId
         ConfigVersionKind.PURCHMAT  -> PlanRuns.purchMatVersionId
         ConfigVersionKind.CONSTR    -> PlanRuns.constrVersionId
+        ConfigVersionKind.METHMAKE  -> PlanRuns.methMakeVersionId
+        ConfigVersionKind.METHMOVE  -> PlanRuns.methMoveVersionId
     }
 
     private fun kbRecordColumn(kind: ConfigVersionKind): Column<Int?> = when (kind) {
@@ -67,6 +71,8 @@ object CaseConfigVersioning {
         ConfigVersionKind.ORD       -> KbRecords.ordVersionId
         ConfigVersionKind.PURCHMAT  -> KbRecords.purchMatVersionId
         ConfigVersionKind.CONSTR    -> KbRecords.constrVersionId
+        ConfigVersionKind.METHMAKE  -> KbRecords.methMakeVersionId
+        ConfigVersionKind.METHMOVE  -> KbRecords.methMoveVersionId
     }
 
     /** [requested] if it's a real version belonging to this case+kind, else **null** — never a

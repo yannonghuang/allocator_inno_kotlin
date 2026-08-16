@@ -294,6 +294,11 @@ object PlanRuns : Table("plan_run") {
     val ordVersionId        = integer("ord_version_id").references(CaseConfigVersions.id).nullable()
     val purchMatVersionId   = integer("purch_mat_version_id").references(CaseConfigVersions.id).nullable()
     val constrVersionId     = integer("constr_version_id").references(CaseConfigVersions.id).nullable()
+    // method_make/method_move overrides — see CaseMethodMakes/CaseMethodMoves' own doc. Same
+    // non-cascading FK relationship as the 5 columns above (a run's reference must BLOCK the
+    // version's deletion, not cascade with it).
+    val methMakeVersionId   = integer("meth_make_version_id").references(CaseConfigVersions.id).nullable()
+    val methMoveVersionId   = integer("meth_move_version_id").references(CaseConfigVersions.id).nullable()
     override val primaryKey = PrimaryKey(id)
 }
 
@@ -449,6 +454,82 @@ object CaseConstraints : Table("case_constraint") {
  *  own doc; identical shape/rationale. One row per *version* now (not per case) — see
  *  [CaseConfigVersions]. */
 object CaseConstraintConfigs : Table("case_constraint_config") {
+    val id          = integer("id").autoIncrement()
+    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val versionId   = integer("version_id").references(CaseConfigVersions.id, onDelete = ReferenceOption.CASCADE).nullable().uniqueIndex()
+    val contentHash = varchar("content_hash", 32).nullable()
+    val generatedAt = timestamp("generated_at").defaultExpression(CurrentTimestamp)
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
+ * Case-level method_make OVERRIDE — 6th "external config object" (see [CaseConfigVersions]' own
+ * doc for the shared versioning shape). When a case has a resolved version for this kind, its
+ * rows REPLACE the CSV-imported `method_make` data entirely for that plan run (same "selecting a
+ * version means this is now the complete set" convention as [CaseConstraints]/
+ * [CasePurchasableMaterials] — an empty version means "no make methods at all", not "fall back to
+ * CSV"). [productId] accepts an individual product_id (current CSV behavior), a PROD_AREA value,
+ * or the `"*"`/`""` global wildcard — see `productIdWildcardGroupKey` (PlanningEngine.kt).
+ * [locationId] already supports the `"*"`/`""` wildcard on the plain CSV-imported table
+ * ([MethodMakes]) via `isWildcardLocation` — same convention here. No unique index, mirroring
+ * [MethodMakes] itself (the plain CSV import enforces no row-level uniqueness either).
+ *
+ * No `bom_id` column, unlike [MethodMakes] — it's a DERIVABLE field here, not user input: a
+ * wildcard [productId] (a PROD_AREA or the global `"*"`/`""`) resolves to MULTIPLE concrete
+ * products, each with its own real BOM (`BOM_280-2695`, `BOM_280-A3831`, ...), so there is no
+ * single correct literal to store per row. `getMethods` (PlanningEngine.kt) synthesizes
+ * `"BOM_" + resolvedProductId` at the point it already resolves the wildcard to a concrete
+ * product — see `deriveMakeBomId`'s own doc.
+ */
+object CaseMethodMakes : Table("case_method_make") {
+    val id         = integer("id").autoIncrement()
+    val caseId     = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val versionId  = integer("version_id").references(CaseConfigVersions.id, onDelete = ReferenceOption.CASCADE).nullable()
+    val productId  = varchar("product_id", 255)
+    val locationId = varchar("location_id", 255)
+    val preference = integer("preference").nullable()
+    val leadTime   = integer("lead_time").nullable()
+    val yield      = double("yield").nullable()
+    override val primaryKey = PrimaryKey(id)
+    init { index("ix_case_method_make_version", false, versionId) }
+}
+
+/** Content-fingerprint tracker for [CaseMethodMakes] — see [CaseConstraintConfigs]'s own doc;
+ *  identical shape/rationale. */
+object CaseMethodMakeConfigs : Table("case_method_make_config") {
+    val id          = integer("id").autoIncrement()
+    val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val versionId   = integer("version_id").references(CaseConfigVersions.id, onDelete = ReferenceOption.CASCADE).nullable().uniqueIndex()
+    val contentHash = varchar("content_hash", 32).nullable()
+    val generatedAt = timestamp("generated_at").defaultExpression(CurrentTimestamp)
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
+ * Case-level method_move OVERRIDE — 7th "external config object". Same replace-the-whole-set
+ * convention as [CaseMethodMakes] (see its own doc). Unlike method_make, method_move already
+ * supports both wildcard AND individual product_id in the plain CSV import — this override
+ * carries the identical shape, just versioned/persisted like the other 6 objects. [productId]
+ * accepts individual/PROD_AREA/global-wildcard exactly like [CaseMethodMakes.productId];
+ * [fromLocationId]/[toLocationId] accept the existing `"*"`/`""` location wildcard.
+ */
+object CaseMethodMoves : Table("case_method_move") {
+    val id             = integer("id").autoIncrement()
+    val caseId         = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
+    val versionId      = integer("version_id").references(CaseConfigVersions.id, onDelete = ReferenceOption.CASCADE).nullable()
+    val productId      = varchar("product_id", 255)
+    val fromLocationId = varchar("from_location_id", 255)
+    val toLocationId   = varchar("to_location_id", 255)
+    val transitTime    = double("transit_time").nullable()
+    val transitTimeUom = varchar("transit_time_uom", 32).nullable()
+    val preference     = integer("preference").nullable()
+    override val primaryKey = PrimaryKey(id)
+    init { index("ix_case_method_move_version", false, versionId) }
+}
+
+/** Content-fingerprint tracker for [CaseMethodMoves] — see [CaseConstraintConfigs]'s own doc;
+ *  identical shape/rationale. */
+object CaseMethodMoveConfigs : Table("case_method_move_config") {
     val id          = integer("id").autoIncrement()
     val caseId      = integer("case_id").references(Cases.id, onDelete = ReferenceOption.CASCADE)
     val versionId   = integer("version_id").references(CaseConfigVersions.id, onDelete = ReferenceOption.CASCADE).nullable().uniqueIndex()
@@ -688,6 +769,8 @@ object KbRecords : Table("kb_record") {
     val ordVersionId        = integer("ord_version_id").references(CaseConfigVersions.id).nullable()
     val purchMatVersionId   = integer("purch_mat_version_id").references(CaseConfigVersions.id).nullable()
     val constrVersionId     = integer("constr_version_id").references(CaseConfigVersions.id).nullable()
+    val methMakeVersionId   = integer("meth_make_version_id").references(CaseConfigVersions.id).nullable()
+    val methMoveVersionId   = integer("meth_move_version_id").references(CaseConfigVersions.id).nullable()
     val createdAt             = timestamp("created_at").defaultExpression(CurrentTimestamp)
     val updatedAt             = timestamp("updated_at").defaultExpression(CurrentTimestamp)
     override val primaryKey = PrimaryKey(id)
