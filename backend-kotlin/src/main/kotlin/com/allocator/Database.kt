@@ -121,18 +121,18 @@ private fun createDatabase(jdbcUrl: String, user: String, password: String, dbNa
  */
 private fun dropLegacyExternalConfigConstraints() {
     val drops = listOf(
-        "ALTER TABLE case_preference DROP CONSTRAINT IF EXISTS ux_case_preference_key",
-        "ALTER TABLE case_demand_order DROP CONSTRAINT IF EXISTS ux_case_demand_order_key",
-        "ALTER TABLE case_purchasable_material DROP CONSTRAINT IF EXISTS ux_case_purchasable_material_key",
-        "ALTER TABLE case_constraint DROP CONSTRAINT IF EXISTS ux_case_constraint_key",
+        "ALTER TABLE IF EXISTS case_preference DROP CONSTRAINT IF EXISTS ux_case_preference_key",
+        "ALTER TABLE IF EXISTS case_demand_order DROP CONSTRAINT IF EXISTS ux_case_demand_order_key",
+        "ALTER TABLE IF EXISTS case_purchasable_material DROP CONSTRAINT IF EXISTS ux_case_purchasable_material_key",
+        "ALTER TABLE IF EXISTS case_constraint DROP CONSTRAINT IF EXISTS ux_case_constraint_key",
         // The 5 companion "config" tables were previously unique-per-case (one row per case);
         // now unique-per-version (one row per version) — same stale-constraint hazard as above,
         // Exposed auto-named these `{table}_case_id_unique` from the old `caseId.uniqueIndex()`.
-        "ALTER TABLE case_allocation_config DROP CONSTRAINT IF EXISTS case_allocation_config_case_id_unique",
-        "ALTER TABLE case_preference_config DROP CONSTRAINT IF EXISTS case_preference_config_case_id_unique",
-        "ALTER TABLE case_demand_order_config DROP CONSTRAINT IF EXISTS case_demand_order_config_case_id_unique",
-        "ALTER TABLE case_purchasable_material_config DROP CONSTRAINT IF EXISTS case_purchasable_material_config_case_id_unique",
-        "ALTER TABLE case_constraint_config DROP CONSTRAINT IF EXISTS case_constraint_config_case_id_unique",
+        "ALTER TABLE IF EXISTS case_allocation_config DROP CONSTRAINT IF EXISTS case_allocation_config_case_id_unique",
+        "ALTER TABLE IF EXISTS case_preference_config DROP CONSTRAINT IF EXISTS case_preference_config_case_id_unique",
+        "ALTER TABLE IF EXISTS case_demand_order_config DROP CONSTRAINT IF EXISTS case_demand_order_config_case_id_unique",
+        "ALTER TABLE IF EXISTS case_purchasable_material_config DROP CONSTRAINT IF EXISTS case_purchasable_material_config_case_id_unique",
+        "ALTER TABLE IF EXISTS case_constraint_config DROP CONSTRAINT IF EXISTS case_constraint_config_case_id_unique",
     )
     for (sql in drops) {
         runCatching { org.jetbrains.exposed.sql.transactions.TransactionManager.current().exec(sql) }
@@ -153,7 +153,7 @@ private fun dropLegacyExternalConfigConstraints() {
 private fun truncateRepurposedCaseAllocation() {
     runCatching {
         org.jetbrains.exposed.sql.transactions.TransactionManager.current()
-            .exec("DELETE FROM case_allocation")
+            .exec("DO \$\$ BEGIN IF to_regclass('case_allocation') IS NOT NULL THEN DELETE FROM case_allocation; END IF; END \$\$")
     }
 }
 
@@ -301,18 +301,18 @@ private fun migrateSchema() {
         "DROP TABLE IF EXISTS manual_override",
         // Phase-out: "default version" concept removed from external-config versioning — every
         // plan_run now carries an explicit version id per kind, or none (meaning no override).
-        "ALTER TABLE case_config_version DROP COLUMN IF EXISTS is_default",
+        "ALTER TABLE IF EXISTS case_config_version DROP COLUMN IF EXISTS is_default",
         // case_allocation repurposed from a derived (supply_lot, demand) -> qty_allocated grid to
         // Targeted Supply Allocation input rows (qty_cap/target per lot) — see CaseAllocations'
         // own doc and truncateRepurposedCaseAllocation's own doc for why the table is wiped first.
-        "ALTER TABLE case_allocation DROP COLUMN IF EXISTS demand_id",
-        "ALTER TABLE case_allocation DROP COLUMN IF EXISTS qty_allocated",
-        "ALTER TABLE case_allocation ADD COLUMN IF NOT EXISTS qty_cap DOUBLE PRECISION",
-        "ALTER TABLE case_allocation ADD COLUMN IF NOT EXISTS target VARCHAR(255)",
+        "ALTER TABLE IF EXISTS case_allocation DROP COLUMN IF EXISTS demand_id",
+        "ALTER TABLE IF EXISTS case_allocation DROP COLUMN IF EXISTS qty_allocated",
+        "ALTER TABLE IF EXISTS case_allocation ADD COLUMN IF NOT EXISTS qty_cap DOUBLE PRECISION",
+        "ALTER TABLE IF EXISTS case_allocation ADD COLUMN IF NOT EXISTS target VARCHAR(255)",
         // case_method_make.bom_id removed — it's a derivable field (BOM_<resolved_product_id>,
         // synthesized in PlanningEngine.kt's getMethods), not something the Method Make Overrides
         // form should ask the user to type; see CaseMethodMakes' own doc.
-        "ALTER TABLE case_method_make DROP COLUMN IF EXISTS bom_id",
+        "ALTER TABLE IF EXISTS case_method_make DROP COLUMN IF EXISTS bom_id",
     )
     val conn = org.jetbrains.exposed.sql.transactions.TransactionManager.current().connection
     stmts.forEach { sql ->

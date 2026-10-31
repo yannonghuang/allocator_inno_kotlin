@@ -8783,7 +8783,7 @@ fun Routing.planningAgentRoutes() {
             log.warn("planning-agent: LLM not configured: {}", e.message)
             call.respond(
                 HttpStatusCode.ServiceUnavailable,
-                mapOf("error" to "Planning agent requires NANOGPT_API_KEY to be configured.")
+                mapOf("error" to "Planning agent LLM (provider=${config.allocatorLlmProvider}) is not configured: ${e.message}")
             )
             return@post
         } catch (e: Exception) {
