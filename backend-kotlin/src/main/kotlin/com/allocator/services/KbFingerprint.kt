@@ -3,6 +3,8 @@ package com.allocator.services
 import com.allocator.CaseAllocationConfigs
 import com.allocator.CaseConstraintConfigs
 import com.allocator.CaseDemandOrderConfigs
+import com.allocator.CaseMethodMakeConfigs
+import com.allocator.CaseMethodMoveConfigs
 import com.allocator.CasePreferenceConfigs
 import com.allocator.CasePurchasableMaterialConfigs
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
@@ -51,6 +53,8 @@ internal object KbFingerprint {
         val ord: String,
         val purchmat: String,
         val constr: String,
+        val methmake: String,
+        val methmove: String,
     )
 
     /**
@@ -67,6 +71,8 @@ internal object KbFingerprint {
         ordVersionId: Int?,
         purchMatVersionId: Int?,
         constrVersionId: Int?,
+        methMakeVersionId: Int? = null,
+        methMoveVersionId: Int? = null,
     ): Segments = transaction {
         // A null version id (case never had one for this kind — see CaseConfigVersioning's own
         // doc) is the same "genuinely empty" state as a version whose config row happens to not
@@ -93,6 +99,14 @@ internal object KbFingerprint {
             CaseDemandOrderConfigs.selectAll().where { CaseDemandOrderConfigs.versionId eq vid }
                 .singleOrNull()?.get(CaseDemandOrderConfigs.contentHash)
         }
+        val methMakeHash = methMakeVersionId?.let { vid ->
+            CaseMethodMakeConfigs.selectAll().where { CaseMethodMakeConfigs.versionId eq vid }
+                .singleOrNull()?.get(CaseMethodMakeConfigs.contentHash)
+        }
+        val methMoveHash = methMoveVersionId?.let { vid ->
+            CaseMethodMoveConfigs.selectAll().where { CaseMethodMoveConfigs.versionId eq vid }
+                .singleOrNull()?.get(CaseMethodMoveConfigs.contentHash)
+        }
         val prefSegment = if (prefCfg == null) "none" else {
             val depth = prefCfg[CasePreferenceConfigs.maxBomDepth]
             val wD = prefCfg[CasePreferenceConfigs.deliveryWeight]
@@ -107,6 +121,8 @@ internal object KbFingerprint {
             ord = ordHash ?: "none",
             purchmat = purchMatHash ?: "none",
             constr = constrHash ?: "none",
+            methmake = methMakeHash ?: "none",
+            methmove = methMoveHash ?: "none",
         )
     }
 }

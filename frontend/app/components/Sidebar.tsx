@@ -21,6 +21,8 @@ export function Sidebar({ open, onToggle }: { open: boolean; onToggle: () => voi
   const inPreferences = !!caseId && pathname.startsWith(`/cases/${caseId}/preferences`);
   const inDemandOrdering = !!caseId && pathname.startsWith(`/cases/${caseId}/demand-ordering`);
   const inPurchasableMaterials = !!caseId && pathname.startsWith(`/cases/${caseId}/purchasable-materials`);
+  const inMethodMakeOverrides = !!caseId && pathname.startsWith(`/cases/${caseId}/method-make-overrides`);
+  const inMethodMoveOverrides = !!caseId && pathname.startsWith(`/cases/${caseId}/method-move-overrides`);
   const inConstraints = !!caseId && pathname.startsWith(`/cases/${caseId}/constraints`);
   const inBom = !!caseId && pathname.startsWith(`/cases/${caseId}/bom`);
   const inMaterial = !!caseId && pathname.startsWith(`/cases/${caseId}/material-impact`);
@@ -146,6 +148,28 @@ export function Sidebar({ open, onToggle }: { open: boolean; onToggle: () => voi
             </Link>
           ) : (
             <span style={link(false, true)}>{t('purchasableMaterials')}</span>
+          )}
+        </div>
+
+        {/* Method Make Overrides */}
+        <div style={{ marginTop: '0.125rem' }}>
+          {caseId ? (
+            <Link href={`/cases/${caseId}/method-make-overrides`} style={link(inMethodMakeOverrides)}>
+              {t('methodMakeOverrides')}
+            </Link>
+          ) : (
+            <span style={link(false, true)}>{t('methodMakeOverrides')}</span>
+          )}
+        </div>
+
+        {/* Method Move Overrides */}
+        <div style={{ marginTop: '0.125rem' }}>
+          {caseId ? (
+            <Link href={`/cases/${caseId}/method-move-overrides`} style={link(inMethodMoveOverrides)}>
+              {t('methodMoveOverrides')}
+            </Link>
+          ) : (
+            <span style={link(false, true)}>{t('methodMoveOverrides')}</span>
           )}
         </div>
 

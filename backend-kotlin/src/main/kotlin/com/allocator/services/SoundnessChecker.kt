@@ -623,6 +623,17 @@ private class WalkContext(
     val data: Map<String, List<Map<String, Any?>>>,
 ) {
     val violations = mutableListOf<Violation>()
+    /** product_id -> prod_area, for resolving PROD_AREA-wildcarded method_make/method_move rows
+     *  in R2/R3 (see productIdMatchesRow) the same way getMethods does at plan time. */
+    val prodAreaByProductId: Map<String, String> by lazy {
+        (data["productlocation"] ?: emptyList())
+            .mapNotNull { row ->
+                val pid = (row["product_id"] as? String)?.trim()
+                val area = (row["prod_area"] as? String)?.trim()
+                if (pid.isNullOrEmpty() || area.isNullOrEmpty()) null else pid to area
+            }
+            .toMap()
+    }
     /** supply_id → qty consumed across all leaves of this demand's tree. */
     val supplyConsumption = mutableMapOf<String, Double>()
     /** "$pid|$lid" → qty consumed via synthetic `consolidated_<pid>_<lid>` buckets. */
@@ -1066,7 +1077,7 @@ private class WalkContext(
         // matching pid, with lid match (or VIRTUAL fallback, or a wildcard LOCATION_ID row —
         // "any location" — consistent with getMethods/isWildcardLocation, PlanningEngine.kt).
         val matchingMakes = methodMakes.filter {
-            (it["product_id"] as? String)?.trim() == pid &&
+            productIdMatchesRow(it["product_id"] as? String, pid, prodAreaByProductId) &&
                 ((it["location_id"] as? String)?.trim() == lid || lid.isBlank() || lid == "VIRTUAL" ||
                     isWildcardLocation(it["location_id"] as? String))
         }
@@ -1277,10 +1288,11 @@ private class WalkContext(
         val fromLid = node["location_source"]?.toString()?.trim() ?: ""
 
         // R3: a method_move must exist for (pid, from_lid, to_lid) — either side may instead be
-        // backed by a wildcard FROM_LOCATION_ID/TO_LOCATION_ID row ("any location"), consistent
-        // with getMethods/expandMoveWildcardSource/isWildcardLocation (PlanningEngine.kt).
+        // backed by a wildcard FROM_LOCATION_ID/TO_LOCATION_ID row ("any location"), and PRODUCT_ID
+        // may instead be a PROD_AREA or global "*"/"" wildcard, consistent with
+        // getMethods/expandMoveWildcardSource/isWildcardLocation/productIdMatchesRow (PlanningEngine.kt).
         val matchingMove = methodMoves.firstOrNull {
-            (it["product_id"] as? String)?.trim() == pid &&
+            productIdMatchesRow(it["product_id"] as? String, pid, prodAreaByProductId) &&
                 ((it["from_location_id"] as? String)?.trim() == fromLid || isWildcardLocation(it["from_location_id"] as? String)) &&
                 ((it["to_location_id"] as? String)?.trim() == toLid || isWildcardLocation(it["to_location_id"] as? String))
         }

@@ -58,6 +58,8 @@ object KbStore {
         val ordVersionId: Int? = null,
         val purchMatVersionId: Int? = null,
         val constrVersionId: Int? = null,
+        val methMakeVersionId: Int? = null,
+        val methMoveVersionId: Int? = null,
     )
 
     /** Headline KPI snapshot extracted from a plan_run.result JSON tree.
@@ -169,6 +171,8 @@ object KbStore {
         val ordVersionId = row[PlanRuns.ordVersionId]
         val purchMatVersionId = row[PlanRuns.purchMatVersionId]
         val constrVersionId = row[PlanRuns.constrVersionId]
+        val methMakeVersionId = row[PlanRuns.methMakeVersionId]
+        val methMoveVersionId = row[PlanRuns.methMoveVersionId]
 
         if (existing == null) {
             KbRecords.insert {
@@ -187,6 +191,8 @@ object KbStore {
                 it[KbRecords.ordVersionId] = ordVersionId
                 it[KbRecords.purchMatVersionId] = purchMatVersionId
                 it[KbRecords.constrVersionId] = constrVersionId
+                it[KbRecords.methMakeVersionId] = methMakeVersionId
+                it[KbRecords.methMoveVersionId] = methMoveVersionId
             }[KbRecords.id]
         } else {
             val existingId = existing[KbRecords.id]
@@ -204,6 +210,8 @@ object KbStore {
                 it[KbRecords.ordVersionId] = ordVersionId
                 it[KbRecords.purchMatVersionId] = purchMatVersionId
                 it[KbRecords.constrVersionId] = constrVersionId
+                it[KbRecords.methMakeVersionId] = methMakeVersionId
+                it[KbRecords.methMoveVersionId] = methMoveVersionId
                 if (bootstrapMeta != null) {
                     it[KbRecords.presetId] = bootstrapMeta.first
                     it[KbRecords.presetLabel] = bootstrapMeta.second
@@ -452,6 +460,8 @@ object KbStore {
                     ordVersionId = row[KbRecords.ordVersionId],
                     purchMatVersionId = row[KbRecords.purchMatVersionId],
                     constrVersionId = row[KbRecords.constrVersionId],
+                    methMakeVersionId = row[KbRecords.methMakeVersionId],
+                    methMoveVersionId = row[KbRecords.methMoveVersionId],
                 )
                 rec.signature to rec
             }

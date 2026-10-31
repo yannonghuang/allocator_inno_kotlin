@@ -56,6 +56,8 @@ import {
   listDemandOrderingVersions,
   listPurchasableMaterialsVersions,
   listCaseConstraintsVersions,
+  listMethodMakeOverridesVersions,
+  listMethodMoveOverridesVersions,
   getWorkOrderPegging,
   type Case as CaseType,
   type AllocationRun as RunType,
@@ -883,11 +885,13 @@ const EXTERNAL_CONFIG_REF_KEYS = [
   { configKey: 'demand_order_version_id',          kind: 'ord' },
   { configKey: 'purchasable_material_version_id',  kind: 'purchmat' },
   { configKey: 'constraint_version_id',            kind: 'constr' },
+  { configKey: 'method_make_version_id',           kind: 'methmake' },
+  { configKey: 'method_move_version_id',           kind: 'methmove' },
 ] as const;
 
 /**
  * Copies a loaded run's own external-config refs onto its config, so re-opening a past run (or
- * seeding a rerun from it) starts from exactly what THAT run used. The 5 version-id fields live
+ * seeding a rerun from it) starts from exactly what THAT run used. The 7 version-id fields live
  * on the plan_run row itself (PlanRunFull), never inside the `config` JSON blob (see Allocate.kt's
  * resolveEffectiveConfig, which persists only `_kb_fingerprint` hashes there, not the literal
  * ids) — normalizePlanningConfig alone can't restore them.
@@ -1311,7 +1315,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   // case marks default.
   const [externalConfigVersions, setExternalConfigVersions] = useState<{
     casealloc: ConfigVersion[]; pref: ConfigVersion[]; ord: ConfigVersion[]; purchmat: ConfigVersion[]; constr: ConfigVersion[];
-  }>({ casealloc: [], pref: [], ord: [], purchmat: [], constr: [] });
+    methmake: ConfigVersion[]; methmove: ConfigVersion[];
+  }>({ casealloc: [], pref: [], ord: [], purchmat: [], constr: [], methmake: [], methmove: [] });
   // What "auto" would resolve to right now — fetched from the server (computePlanningHorizonStart,
   // PlanningEngine.kt), NOT recomputed client-side (demand due dates arrive in inconsistent
   // formats only the backend's resilient parser handles). Shown as the Horizon start input's
@@ -1429,6 +1434,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [bootstrapVersionPicks, setBootstrapVersionPicks] = useState<{
     case_alloc_version_id?: number; pref_version_id?: number; demand_order_version_id?: number;
     purchasable_material_version_id?: number; constraint_version_id?: number;
+    method_make_version_id?: number; method_move_version_id?: number;
   }>({});
   const buildSeedForm = (): SeedForm => ({
     max_methods_min: bootstrapMaxMethodsMin,
@@ -1983,7 +1989,7 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     return () => { cancelled = true; };
   }, [id, planningConfig.purchasable_material_version_id]);
 
-  // Load the version list for each of the 5 external config objects, so the Planning page can
+  // Load the version list for each of the 7 external config objects, so the Planning page can
   // offer an explicit version picker per object (defaulting to the case's default version when
   // the user doesn't pick one — see resolveEffectiveConfig's own doc).
   useEffect(() => {
@@ -1995,8 +2001,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       listDemandOrderingVersions(id).catch(() => []),
       listPurchasableMaterialsVersions(id).catch(() => []),
       listCaseConstraintsVersions(id).catch(() => []),
-    ]).then(([casealloc, pref, ord, purchmat, constr]) => {
-      if (!cancelled) setExternalConfigVersions({ casealloc, pref, ord, purchmat, constr });
+      listMethodMakeOverridesVersions(id).catch(() => []),
+      listMethodMoveOverridesVersions(id).catch(() => []),
+    ]).then(([casealloc, pref, ord, purchmat, constr, methmake, methmove]) => {
+      if (!cancelled) setExternalConfigVersions({ casealloc, pref, ord, purchmat, constr, methmake, methmove });
     });
     return () => { cancelled = true; };
   }, [id]);
@@ -5089,6 +5097,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                 { kind: 'pref', externalKind: 'preferences', label: tP('config.externalPreferences'), configKey: 'pref_version_id' },
                 { kind: 'ord', externalKind: 'demandOrdering', label: tP('config.externalDemandOrdering'), configKey: 'demand_order_version_id' },
                 { kind: 'purchmat', externalKind: 'purchasableMaterials', label: tP('config.externalPurchasableMaterials'), configKey: 'purchasable_material_version_id' },
+                { kind: 'methmake', externalKind: 'methodMakeOverrides', label: tP('config.externalMethodMakeOverrides'), configKey: 'method_make_version_id' },
+                { kind: 'methmove', externalKind: 'methodMoveOverrides', label: tP('config.externalMethodMoveOverrides'), configKey: 'method_move_version_id' },
                 { kind: 'constr', externalKind: 'constraints', label: tP('config.externalConstraints'), configKey: 'constraint_version_id' },
               ] as const).map(({ kind, externalKind, label, configKey }) => {
                 const versions = externalConfigVersions[kind];
@@ -8406,6 +8416,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       { kind: 'pref', externalKind: 'preferences', label: tP('config.externalPreferences'), configKey: 'pref_version_id' },
                       { kind: 'ord', externalKind: 'demandOrdering', label: tP('config.externalDemandOrdering'), configKey: 'demand_order_version_id' },
                       { kind: 'purchmat', externalKind: 'purchasableMaterials', label: tP('config.externalPurchasableMaterials'), configKey: 'purchasable_material_version_id' },
+                      { kind: 'methmake', externalKind: 'methodMakeOverrides', label: tP('config.externalMethodMakeOverrides'), configKey: 'method_make_version_id' },
+                      { kind: 'methmove', externalKind: 'methodMoveOverrides', label: tP('config.externalMethodMoveOverrides'), configKey: 'method_move_version_id' },
                       { kind: 'constr', externalKind: 'constraints', label: tP('config.externalConstraints'), configKey: 'constraint_version_id' },
                     ] as const).map(({ kind, externalKind, label, configKey }) => {
                       const versions = externalConfigVersions[kind];

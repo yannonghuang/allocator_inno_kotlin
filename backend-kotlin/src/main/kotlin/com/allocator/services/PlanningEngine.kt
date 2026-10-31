@@ -1074,6 +1074,23 @@ internal data class DataIndex(
     val makeWildcardByPid: Map<String, List<Map<String, Any?>>> = emptyMap(),
     val moveWildcardByPid: Map<String, List<Map<String, Any?>>> = emptyMap(),
     val buyWildcardByPid: Map<String, List<Map<String, Any?>>> = emptyMap(),
+    /** method_make/method_move rows whose PRODUCT_ID column is itself a wildcard — either a
+     *  PROD_AREA value (matches every product whose `productlocation.prod_area` equals it) or
+     *  the global sentinel `"*"`/`""` (matches every product) — see [productIdWildcardGroupKey].
+     *  Keyed by `(groupKey, location_id)` where groupKey is the raw PRODUCT_ID cell content (a
+     *  PROD_AREA string, or the literal `"*"` for the global case). Disjoint from *ByPidLid: a
+     *  row lands in exactly one of the two depending on whether its PRODUCT_ID resolves to a
+     *  known individual product. */
+    val makeByGroupLid: Map<Pair<String, String>, List<Map<String, Any?>>> = emptyMap(),
+    val moveByGroupToLid: Map<Pair<String, String>, List<Map<String, Any?>>> = emptyMap(),
+    /** Same group rows as above, but whose location (or TO_LOCATION_ID) is ALSO a wildcard —
+     *  matches any product in the group at any location. Keyed by groupKey alone. */
+    val makeWildcardLocByGroup: Map<String, List<Map<String, Any?>>> = emptyMap(),
+    val moveWildcardLocByGroup: Map<String, List<Map<String, Any?>>> = emptyMap(),
+    /** `product_id -> prod_area` from `productlocation`, used to resolve which group(s) a
+     *  queried product falls into. A product with no productlocation row has no PROD_AREA group
+     *  membership (only the global `"*"` group can still match it). */
+    val prodAreaByProductId: Map<String, String> = emptyMap(),
     /** BOM rows keyed by bom_id; secondary filter by parent_id applied at use site. */
     val bomByBomId: Map<String, List<Map<String, Any?>>>,
     /** BOM rows keyed by parent_id for the fallback (no bom_id match) case. */
@@ -1103,6 +1120,79 @@ internal fun isWildcardLocation(loc: String?): Boolean {
     return t.isEmpty() || t == "*"
 }
 
+/** Global-wildcard sentinel used as the group key for `"*"`/`""` PRODUCT_ID rows — distinct
+ *  from any real PROD_AREA value (see [productIdWildcardGroupKey]). */
+private const val GLOBAL_PRODUCT_GROUP = "*"
+
+/**
+ * Classifies a raw method_make/method_move PRODUCT_ID cell:
+ *  - blank or literal `"*"`               → [GLOBAL_PRODUCT_GROUP] (matches every product)
+ *  - a known PROD_AREA value              → that value itself (the row matches every product
+ *                                            whose `productlocation.prod_area` equals it)
+ *  - anything else                        → `null` (not a group row — an ordinary individual
+ *                                            product_id, handled by the existing exact-pid maps,
+ *                                            unchanged "current behavior")
+ *
+ * `knownProdAreas` (the distinct set of `productlocation.prod_area` values) is a POSITIVE
+ * recognition test, not a product_id membership test — a product legitimately absent from
+ * productlocation (common in focused test fixtures, and not unheard of in real cases) must still
+ * default to "individual", or its own make/move rows would silently become unreachable. Only a
+ * cell that actually matches a real PROD_AREA name is ever treated as a wildcard.
+ */
+internal fun productIdWildcardGroupKey(rawProductId: String?, knownProdAreas: Set<String>): String? {
+    val t = rawProductId?.trim() ?: ""
+    if (t.isEmpty() || t == GLOBAL_PRODUCT_GROUP) return GLOBAL_PRODUCT_GROUP
+    if (knownProdAreas.contains(t)) return t
+    return null
+}
+
+/**
+ * Does a method_make/method_move row's raw PRODUCT_ID cell match [queriedProductId]? True for
+ * an exact match (current behavior), a PROD_AREA match (`rowProductId` equals
+ * `prodAreaByProductId[queriedProductId]`), or the global `"*"`/`""` wildcard. Symmetric,
+ * forward-lookup counterpart to [productIdWildcardGroupKey] — used by validators (e.g.
+ * SoundnessChecker) that check "does a method row exist for this product?" per-row rather than
+ * building a full [DataIndex].
+ */
+/**
+ * A method_make row's BOM_ID is normally a real, explicit CSV value (sometimes location-suffixed,
+ * e.g. `BOM_223-0011_SUB_PCBA`) — never touched here. But an override row from the Method Make
+ * Overrides object (CaseMethodMakes) carries no bom_id at all: it's a derivable field, not a
+ * user-entered one (see MethodMakeOverrides.kt's own doc) — for a wildcard PRODUCT_ID row (a
+ * PROD_AREA or `"*"`/`""`), there is no single correct literal to store since the row resolves to
+ * MULTIPLE concrete products, each with its own real BOM (`BOM_280-2695`, `BOM_280-A3831`, ...),
+ * not one shared placeholder. So it's derived HERE, at the one place a wildcard row's product_id
+ * is already being rewritten to the concrete queried product — `"BOM_" + resolvedProductId`,
+ * mirroring this codebase's own dominant bom_id convention.
+ *
+ * [forceOverride] distinguishes the two callers:
+ *  - GROUP/wildcard-matched rows (from either the override object OR a wildcarded row in the
+ *    plain CSV-imported method_make.csv — wildcarding there is likewise "meant for expansion,"
+ *    same convention) ALWAYS get the derived id, `true` — a wildcard row's PRODUCT_ID column
+ *    resolving to many concrete products makes ANY single literal in its BOM_ID column
+ *    meaningless, whether that literal is blank (the override object's case) or some value a CSV
+ *    author happened to type (still wrong for every resolved product but one, at best).
+ *  - INDIVIDUAL-matched rows only derive when bom_id is missing/blank, `false` — covers override
+ *    rows (never carry one) while leaving real CSV-imported individual rows (which may use the
+ *    location-suffixed `BOM_223-0011_SUB_PCBA` convention, not the plain `BOM_<product_id>` this
+ *    derives) completely untouched.
+ */
+private fun deriveMakeBomId(m: Map<String, Any?>, resolvedProductId: String, forceOverride: Boolean = false): Map<String, Any?> {
+    val bomId = (m["bom_id"] as? String)?.trim()
+    return if (forceOverride || bomId.isNullOrEmpty()) m + ("bom_id" to "BOM_$resolvedProductId") else m
+}
+
+internal fun productIdMatchesRow(
+    rowProductId: String?,
+    queriedProductId: String,
+    prodAreaByProductId: Map<String, String>,
+): Boolean {
+    val t = rowProductId?.trim() ?: ""
+    if (t.isEmpty() || t == GLOBAL_PRODUCT_GROUP) return true
+    if (t == queriedProductId) return true
+    return t == prodAreaByProductId[queriedProductId]
+}
+
 /** Wraps the data map with a [DataIndex]; detected via `data as? PlanData`. */
 internal class PlanData(
     private val raw: Map<String, List<Map<String, Any?>>>,
@@ -1115,35 +1205,72 @@ internal class IndexedInventory(
     val idx: Map<Pair<String, String>, List<MutableMap<String, Any?>>>,
 ) : MutableList<MutableMap<String, Any?>> by list
 
-private fun buildDataIndex(data: Map<String, List<Map<String, Any?>>>, config: Map<String, Any?>?): DataIndex = DataIndex(
-    makeByPidLid = (data["method_make"] ?: emptyList())
-        .filterNot { isWildcardLocation(it["location_id"] as? String) }
-        .groupBy { Pair(it["product_id"]?.toString()?.trim() ?: "", it["location_id"]?.toString()?.trim() ?: "") },
-    moveByPidToLid = (data["method_move"] ?: emptyList())
-        .filterNot { isWildcardLocation(it["to_location_id"] as? String) }
-        .groupBy { Pair(it["product_id"]?.toString()?.trim() ?: "", it["to_location_id"]?.toString()?.trim() ?: "") },
-    buyByPidLid = (data["method_buy"] ?: emptyList())
-        .filterNot { isWildcardLocation(it["location_id"] as? String) }
-        .groupBy { Pair(it["product_id"]?.toString()?.trim() ?: "", it["location_id"]?.toString()?.trim() ?: "") },
-    makeWildcardByPid = (data["method_make"] ?: emptyList())
-        .filter { isWildcardLocation(it["location_id"] as? String) }
-        .groupBy { it["product_id"]?.toString()?.trim() ?: "" },
-    moveWildcardByPid = (data["method_move"] ?: emptyList())
-        .filter { isWildcardLocation(it["to_location_id"] as? String) }
-        .groupBy { it["product_id"]?.toString()?.trim() ?: "" },
-    buyWildcardByPid = (data["method_buy"] ?: emptyList())
-        .filter { isWildcardLocation(it["location_id"] as? String) }
-        .groupBy { it["product_id"]?.toString()?.trim() ?: "" },
-    bomByBomId = (data["bom"] ?: emptyList()).groupBy {
-        it["bom_id"]?.toString()?.trim() ?: ""
-    },
-    bomByParentId = (data["bom"] ?: emptyList()).groupBy {
-        it["parent_id"]?.toString()?.trim() ?: ""
-    },
-    hasTargetedSupply = hasAnyTargetedSupply(data),
-    criticalStockPositions = computeCriticalStockPositions(data, config).keys
-        .map { it.productId to it.locationId }.toSet(),
-)
+private fun buildDataIndex(data: Map<String, List<Map<String, Any?>>>, config: Map<String, Any?>?): DataIndex {
+    val knownProdAreas = (data["productlocation"] ?: emptyList())
+        .mapNotNull { (it["prod_area"] as? String)?.trim() }
+        .filter { it.isNotEmpty() }
+        .toSet()
+    // Individual rows only (existing exact-pid maps below stay disjoint from the group maps —
+    // productIdWildcardGroupKey returns null for these, so they're excluded from grouping).
+    val makeIndividual = (data["method_make"] ?: emptyList())
+        .filter { productIdWildcardGroupKey(it["product_id"] as? String, knownProdAreas) == null }
+    val moveIndividual = (data["method_move"] ?: emptyList())
+        .filter { productIdWildcardGroupKey(it["product_id"] as? String, knownProdAreas) == null }
+    val makeGroup = (data["method_make"] ?: emptyList())
+        .mapNotNull { row -> productIdWildcardGroupKey(row["product_id"] as? String, knownProdAreas)?.let { it to row } }
+    val moveGroup = (data["method_move"] ?: emptyList())
+        .mapNotNull { row -> productIdWildcardGroupKey(row["product_id"] as? String, knownProdAreas)?.let { it to row } }
+    return DataIndex(
+        makeByPidLid = makeIndividual
+            .filterNot { isWildcardLocation(it["location_id"] as? String) }
+            .groupBy { Pair(it["product_id"]?.toString()?.trim() ?: "", it["location_id"]?.toString()?.trim() ?: "") },
+        moveByPidToLid = moveIndividual
+            .filterNot { isWildcardLocation(it["to_location_id"] as? String) }
+            .groupBy { Pair(it["product_id"]?.toString()?.trim() ?: "", it["to_location_id"]?.toString()?.trim() ?: "") },
+        buyByPidLid = (data["method_buy"] ?: emptyList())
+            .filterNot { isWildcardLocation(it["location_id"] as? String) }
+            .groupBy { Pair(it["product_id"]?.toString()?.trim() ?: "", it["location_id"]?.toString()?.trim() ?: "") },
+        makeWildcardByPid = makeIndividual
+            .filter { isWildcardLocation(it["location_id"] as? String) }
+            .groupBy { it["product_id"]?.toString()?.trim() ?: "" },
+        moveWildcardByPid = moveIndividual
+            .filter { isWildcardLocation(it["to_location_id"] as? String) }
+            .groupBy { it["product_id"]?.toString()?.trim() ?: "" },
+        buyWildcardByPid = (data["method_buy"] ?: emptyList())
+            .filter { isWildcardLocation(it["location_id"] as? String) }
+            .groupBy { it["product_id"]?.toString()?.trim() ?: "" },
+        makeByGroupLid = makeGroup
+            .filterNot { (_, row) -> isWildcardLocation(row["location_id"] as? String) }
+            .groupBy { (gk, row) -> Pair(gk, row["location_id"]?.toString()?.trim() ?: "") }
+            .mapValues { (_, v) -> v.map { it.second } },
+        moveByGroupToLid = moveGroup
+            .filterNot { (_, row) -> isWildcardLocation(row["to_location_id"] as? String) }
+            .groupBy { (gk, row) -> Pair(gk, row["to_location_id"]?.toString()?.trim() ?: "") }
+            .mapValues { (_, v) -> v.map { it.second } },
+        makeWildcardLocByGroup = makeGroup
+            .filter { (_, row) -> isWildcardLocation(row["location_id"] as? String) }
+            .groupBy({ (gk, _) -> gk }, { (_, row) -> row }),
+        moveWildcardLocByGroup = moveGroup
+            .filter { (_, row) -> isWildcardLocation(row["to_location_id"] as? String) }
+            .groupBy({ (gk, _) -> gk }, { (_, row) -> row }),
+        prodAreaByProductId = (data["productlocation"] ?: emptyList())
+            .mapNotNull { row ->
+                val pid = (row["product_id"] as? String)?.trim()
+                val area = (row["prod_area"] as? String)?.trim()
+                if (pid.isNullOrEmpty() || area.isNullOrEmpty()) null else pid to area
+            }
+            .toMap(),
+        bomByBomId = (data["bom"] ?: emptyList()).groupBy {
+            it["bom_id"]?.toString()?.trim() ?: ""
+        },
+        bomByParentId = (data["bom"] ?: emptyList()).groupBy {
+            it["parent_id"]?.toString()?.trim() ?: ""
+        },
+        hasTargetedSupply = hasAnyTargetedSupply(data),
+        criticalStockPositions = computeCriticalStockPositions(data, config).keys
+            .map { it.productId to it.locationId }.toSet(),
+    )
+}
 
 private fun buildInventoryIndex(
     inventory: List<MutableMap<String, Any?>>,
@@ -1859,16 +1986,49 @@ fun getMethods(productId: String, locationId: String, data: Map<String, List<Map
         val key = Pair(pid, loc)
         idx.buyByPidLid[key]?.forEach { m -> result.add(mapOf("type" to "purchase") + m) }
         idx.buyWildcardByPid[pid]?.forEach { m -> result.add(mapOf("type" to "purchase") + m + ("location_id" to loc)) }
-        idx.makeByPidLid[key]?.forEach { m -> result.add(mapOf("type" to "make") + m) }
-        idx.makeWildcardByPid[pid]?.forEach { m -> result.add(mapOf("type" to "make") + m + ("location_id" to loc)) }
+        idx.makeByPidLid[key]?.forEach { m -> result.add(mapOf("type" to "make") + deriveMakeBomId(m, pid)) }
+        idx.makeWildcardByPid[pid]?.forEach { m -> result.add(mapOf("type" to "make") + deriveMakeBomId(m, pid) + ("location_id" to loc)) }
         idx.moveByPidToLid[key]?.forEach { m ->
             expandMoveWildcardSource(m, loc, data).forEach { result.add(mapOf("type" to "move") + it) }
         }
         idx.moveWildcardByPid[pid]?.forEach { m ->
             expandMoveWildcardSource(m, loc, data).forEach { result.add(mapOf("type" to "move") + it + ("to_location_id" to loc)) }
         }
+        // PRODUCT_ID/PROD_AREA-wildcarded rows: a queried product can fall into its own
+        // PROD_AREA group and/or the global "*" group simultaneously — both are additive
+        // candidates alongside whatever individual-pid rows already matched above, mirroring
+        // the location-wildcard union pattern just above. Rewrite product_id (and location,
+        // for the wildcard-location group maps) to the concrete queried values so downstream
+        // consumers never see an unresolved group key.
+        val groupKeys = listOfNotNull(idx.prodAreaByProductId[pid], GLOBAL_PRODUCT_GROUP).distinct()
+        groupKeys.forEach { gk ->
+            idx.makeByGroupLid[Pair(gk, loc)]?.forEach { m ->
+                result.add(mapOf("type" to "make") + deriveMakeBomId(m, pid, forceOverride = true) + ("product_id" to pid))
+            }
+            idx.makeWildcardLocByGroup[gk]?.forEach { m ->
+                result.add(mapOf("type" to "make") + deriveMakeBomId(m, pid, forceOverride = true) + ("product_id" to pid) + ("location_id" to loc))
+            }
+            idx.moveByGroupToLid[Pair(gk, loc)]?.forEach { m ->
+                val resolved = m + ("product_id" to pid)
+                expandMoveWildcardSource(resolved, loc, data).forEach { result.add(mapOf("type" to "move") + it) }
+            }
+            idx.moveWildcardLocByGroup[gk]?.forEach { m ->
+                val resolved = m + ("product_id" to pid) + ("to_location_id" to loc)
+                expandMoveWildcardSource(resolved, loc, data).forEach { result.add(mapOf("type" to "move") + it) }
+            }
+        }
         return result
     }
+
+    val knownProdAreas = (data["productlocation"] ?: emptyList())
+        .mapNotNull { (it["prod_area"] as? String)?.trim() }
+        .filter { it.isNotEmpty() }
+        .toSet()
+    val prodArea = (data["productlocation"] ?: emptyList())
+        .firstOrNull { (it["product_id"] as? String)?.trim() == pid }
+        ?.let { (it["prod_area"] as? String)?.trim() }
+        ?.takeIf { it.isNotEmpty() }
+    val groupKeys = listOfNotNull(prodArea, GLOBAL_PRODUCT_GROUP).distinct()
 
     val result = mutableListOf<Map<String, Any?>>()
     (data["method_buy"] ?: emptyList()).forEach { m ->
@@ -1887,19 +2047,26 @@ fun getMethods(productId: String, locationId: String, data: Map<String, List<Map
         }
     }
     (data["method_make"] ?: emptyList()).forEach { m ->
-        if ((m["product_id"] as? String)?.trim() == pid) {
+        val mPid = (m["product_id"] as? String)?.trim()
+        val matchesGroup = mPid != null && productIdWildcardGroupKey(mPid, knownProdAreas)?.let { it in groupKeys } == true
+        if (mPid == pid || matchesGroup) {
             val mLoc = (m["location_id"] as? String)?.trim() ?: ""
             if (mLoc == loc || emptyLocFallback || isWildcardLocation(mLoc)) {
-                val resolved = if (isWildcardLocation(mLoc) && !emptyLocFallback) m + ("location_id" to loc) else m
+                var resolved = if (isWildcardLocation(mLoc) && !emptyLocFallback) m + ("location_id" to loc) else m
+                if (matchesGroup && mPid != pid) resolved = resolved + ("product_id" to pid)
+                resolved = deriveMakeBomId(resolved, pid, forceOverride = matchesGroup)
                 result.add(mapOf("type" to "make") + resolved)
             }
         }
     }
     (data["method_move"] ?: emptyList()).forEach { m ->
-        if ((m["product_id"] as? String)?.trim() == pid) {
+        val mPid = (m["product_id"] as? String)?.trim()
+        val matchesGroup = mPid != null && productIdWildcardGroupKey(mPid, knownProdAreas)?.let { it in groupKeys } == true
+        if (mPid == pid || matchesGroup) {
             val toLoc = (m["to_location_id"] as? String)?.trim() ?: ""
             if (toLoc == loc || isWildcardLocation(toLoc)) {
-                val resolvedTo = if (isWildcardLocation(toLoc)) m + ("to_location_id" to loc) else m
+                var resolvedTo = if (isWildcardLocation(toLoc)) m + ("to_location_id" to loc) else m
+                if (matchesGroup && mPid != pid) resolvedTo = resolvedTo + ("product_id" to pid)
                 expandMoveWildcardSource(resolvedTo, loc, data).forEach { result.add(mapOf("type" to "move") + it) }
             }
         }

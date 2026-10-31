@@ -341,10 +341,10 @@ Your jobs:
   1. Run plans on the user's behalf (run_plan_async).
   2. Explain the planner's decisions and surface KPIs, pegging, soundness.
   3. Configure a run — core knobs (method_selection, consolidation, purchase_allowed,
-     etc. via update_config) AND, as of this revision, all 5 external config objects
+     etc. via update_config) AND, as of this revision, all 7 external config objects
      (Targeted Supply Allocation, Supply Preferences, Demand Ordering, Purchasable
-     Materials, Constraints — read/write tools in the "External config objects"
-     primer below).
+     Materials, Constraints, Method Make Overrides, Method Move Overrides — read/write
+     tools in the "External config objects" primer below).
   4. Handle shutdown / maintenance window scheduling (WO impact analysis).
   5. Answer demand / supply / BOM lookup questions.
 
@@ -527,7 +527,7 @@ budgets, so this is the one true definition, not an approximation you should re-
     actual-consumed figure, which diverges whenever a target's own demand doesn't fully draw
     its share.
 
-External config objects (5 total, from Tables.kt's CaseConfigVersions doc — DO NOT
+External config objects (7 total, from Tables.kt's CaseConfigVersions doc — DO NOT
 confuse any of these with `manual_override`, a mechanism that was fully retired
 — its DB table was dropped and no `manual_override` structure exists anywhere in
 the codebase; never invent an `override_id`/`component_split`/`method_selection`
@@ -584,8 +584,21 @@ schema for it):
     BOM-alternative pins: (customer_id, parent, location) -> child. Forces
     which BOM-alternative child a customer's demand resolves to, at
     method+variant level (`location="*"` means any location).
+  - **Method Make Overrides** (`case_method_make` table) — when a version is
+    selected for a run, its rows REPLACE the CSV-imported `method_make` data
+    entirely (an empty version means NO make methods at all, not "fall back
+    to CSV"). `product_id` accepts an individual product_id (current-behavior
+    default), a PROD_AREA value (matches every product whose
+    `productlocation.prod_area` equals it), or `"*"`/`""` (matches every
+    product) — same wildcarding `location_id` already supports on the plain
+    CSV import.
+  - **Method Move Overrides** (`case_method_move` table) — same REPLACE-the-
+    whole-set semantics as Method Make Overrides, for `method_move`.
+    `product_id`/`from_location_id`/`to_location_id` each accept an
+    individual value or the `"*"`/`""` wildcard (`product_id` also accepts a
+    PROD_AREA value).
   Each object is independently versioned (`CaseConfigVersions`, kind =
-  casealloc/pref/ord/purchmat/constr). **There is NO "default version" concept**
+  casealloc/pref/ord/purchmat/constr/methmake/methmove). **There is NO "default version" concept**
   (CaseConfigVersioning.kt — an old is_default-based fallback was deliberately
   removed; do not say "the case's default version," that idea no longer
   exists). A case can have zero, one, or many versions of any given object;
@@ -596,7 +609,8 @@ schema for it):
   say this plainly rather than assuming an unset key means "whatever the case
   normally uses."
   Read tools: `get_supply_preferences`, `get_demand_ordering`,
-  `get_purchasable_materials`, `get_constraints` (plus `get_critical_raw_allocation`
+  `get_purchasable_materials`, `get_constraints`, `get_method_make_overrides`,
+  `get_method_move_overrides` (plus `get_critical_raw_allocation`
   for Targeted Supply Allocation — recomputed, not raw input, see above), each
   taking an optional `version_id`; `list_config_versions(kind)` lists a given
   object's versions with `referenced`/`referenced_by_plan_run`/`referenced_by_kb`
@@ -605,7 +619,8 @@ schema for it):
   of guessing which one the user meant.
   **Write tools** (unlike core config knobs below, editing these IS something you can
   do from chat): `set_purchasable_materials`, `set_constraints`, `set_demand_ordering`,
-  `set_supply_preferences`, `set_targeted_supply_allocation`. Each always lands in a
+  `set_supply_preferences`, `set_targeted_supply_allocation`, `set_method_make_overrides`,
+  `set_method_move_overrides`. Each always lands in a
   NEW-or-reused-UNREFERENCED version — the same `version_in_use` lock the form pages
   respect makes it structurally impossible to mutate a version any saved plan_run/
   kb_record already used. Omitting `version_id` reuses/creates automatically; if that
@@ -1288,8 +1303,9 @@ internal val TOOLS: List<LlmTool> = listOf(
         "Apply a partial patch to the working planning config for this conversation. Deep-merges " +
             "`partial` onto the current working config — set only the keys that change (method_selection, " +
             "purchase_allowed, purchasable_materials, consolidation, analyze_criticality, check_soundness, " +
-            "plus the 5 external-config-object version-id keys: case_alloc_version_id, pref_version_id, " +
-            "demand_order_version_id, purchasable_material_version_id, constraint_version_id — set one of " +
+            "plus the 7 external-config-object version-id keys: case_alloc_version_id, pref_version_id, " +
+            "demand_order_version_id, purchasable_material_version_id, constraint_version_id, " +
+            "method_make_version_id, method_move_version_id — set one of " +
             "these to the version_id a get_*/set_* external-config tool returned, e.g. after " +
             "set_constraints returns version_id=7, call update_config({\"partial\": " +
             "{\"constraint_version_id\": 7}}) to make the NEXT run_plan_async actually use it). " +
@@ -1777,9 +1793,10 @@ internal val TOOLS: List<LlmTool> = listOf(
             "dropped; do not reference `manual_override.component_split` or " +
             "`manual_override.method_selection`, they no longer exist and setting them does " +
             "nothing). If the user asks about Supply Preferences, Demand Ordering, Purchasable " +
-            "Materials, or Constraints content, use get_supply_preferences / get_demand_ordering / " +
-            "get_purchasable_materials / get_constraints instead — those read the other 4 external " +
-            "config objects directly.\n" +
+            "Materials, Constraints, Method Make Overrides, or Method Move Overrides content, use " +
+            "get_supply_preferences / get_demand_ordering / get_purchasable_materials / " +
+            "get_constraints / get_method_make_overrides / get_method_move_overrides instead — " +
+            "those read the other 6 external config objects directly.\n" +
             "Returns one row per (supply_id, demand_id) with `qty_allocated`, resolved against the " +
             "run's own `case_alloc_version_id` (each run pins a specific version — this is NOT the " +
             "case's current default unless the run used it). Empty `rows` + a plain-language note " +
@@ -1836,10 +1853,11 @@ internal val TOOLS: List<LlmTool> = listOf(
     ),
     tool(
         "list_config_versions",
-        "List all versions of one of the case's 5 external config objects (see the system " +
+        "List all versions of one of the case's 7 external config objects (see the system " +
             "prompt's 'External config objects' primer). `kind` is one of: `casealloc` (Targeted " +
             "Supply Allocation), `pref` (Supply Preferences), `ord` (Demand Ordering), `purchmat` " +
-            "(Purchasable Materials), `constr` (Constraints). Each version reports `referenced` " +
+            "(Purchasable Materials), `constr` (Constraints), `methmake` (Method Make Overrides), " +
+            "`methmove` (Method Move Overrides). Each version reports `referenced` " +
             "(locked from in-place edits — used by a saved plan run or KB record; see " +
             "`referenced_by_plan_run`/`referenced_by_kb` for which). There is NO default version " +
             "concept in this system — a case with versions but none picked is genuinely ambiguous; " +
@@ -1849,7 +1867,7 @@ internal val TOOLS: List<LlmTool> = listOf(
             putJsonObject("properties") {
                 putJsonObject("kind") {
                     put("type", "string")
-                    put("enum", buildJsonArray { listOf("casealloc", "pref", "ord", "purchmat", "constr").forEach { add(it) } })
+                    put("enum", buildJsonArray { listOf("casealloc", "pref", "ord", "purchmat", "constr", "methmake", "methmove").forEach { add(it) } })
                 }
             }
             put("required", buildJsonArray { add("kind") })
@@ -1914,6 +1932,42 @@ internal val TOOLS: List<LlmTool> = listOf(
         },
     ),
     tool(
+        "get_method_make_overrides",
+        "**Method Make Overrides** (one of the 7 external config objects) — when a version is " +
+            "selected for a run, its rows REPLACE the CSV-imported method_make data entirely (an " +
+            "empty version means NO make methods at all, not 'fall back to CSV'). Each row: " +
+            "{product_id, location_id, preference, lead_time, yield} — no bom_id: it's derived " +
+            "automatically as \"BOM_\" + the resolved concrete product_id (never a stored/entered " +
+            "value, since a wildcard product_id resolves to MULTIPLE products, each with its own " +
+            "real BOM). `product_id` accepts " +
+            "an individual product_id, a PROD_AREA value (matches every product in that area), or " +
+            "`\"*\"`/`\"\"` (matches every product) — same PROD_AREA/global wildcarding as the " +
+            "plain CSV import. Pass `version_id` explicitly when known; if omitted and ambiguous, " +
+            "this tool says so plainly.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("version_id") { put("type", "integer") }
+            }
+        },
+    ),
+    tool(
+        "get_method_move_overrides",
+        "**Method Move Overrides** (one of the 7 external config objects) — same REPLACE-the-" +
+            "whole-set semantics as Method Make Overrides (see its own doc), but for method_move. " +
+            "Each row: {product_id, from_location_id, to_location_id, transit_time, " +
+            "transit_time_uom, preference}. `product_id`/`from_location_id`/`to_location_id` each " +
+            "accept an individual value or the `\"*\"`/`\"\"` wildcard (product_id also accepts a " +
+            "PROD_AREA value) — same wildcarding as the plain CSV import. Pass `version_id` " +
+            "explicitly when known; if omitted and ambiguous, this tool says so plainly.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("version_id") { put("type", "integer") }
+            }
+        },
+    ),
+    tool(
         "set_purchasable_materials",
         "**Write** a new Purchasable Materials whitelist (full replace, like the form's own " +
             "checklist submit — pass the COMPLETE desired list, not a delta). Creates a new " +
@@ -1956,6 +2010,82 @@ internal val TOOLS: List<LlmTool> = listOf(
                             putJsonObject("location") { put("type", "string") }
                             putJsonObject("child") { put("type", "string") }
                         }
+                    }
+                }
+                putJsonObject("version_id") { put("type", "integer") }
+                putJsonObject("version_name") { put("type", "string") }
+            }
+            put("required", buildJsonArray { add("rows") })
+        },
+    ),
+    tool(
+        "set_method_make_overrides",
+        "**Write** a new Method Make Overrides set (full replace — pass the COMPLETE desired " +
+            "rows; an empty array means NO make methods at all for this version, not 'fall back " +
+            "to CSV'). Each row: `{product_id, location_id, preference?, lead_time?, yield?}` — " +
+            "no bom_id: it's derived automatically as \"BOM_\" + the resolved concrete product_id " +
+            "(never something you set — a wildcard product_id resolves to MULTIPLE products, each " +
+            "with its own real BOM, so there's no single correct value to store per row). " +
+            "`product_id` accepts an individual product_id (current-behavior default), " +
+            "a PROD_AREA value (matches every product whose productlocation.prod_area equals it), " +
+            "or `\"*\"`/`\"\"` (matches every product) — same wildcarding as `location_id` already " +
+            "supports on the plain CSV import. Creates a new version unless `version_id` names an " +
+            "existing, unreferenced one. Omit `version_id` to reuse/create automatically " +
+            "(auto-creates a new one if the reused version turns out locked — see `note`). Wire " +
+            "the result into a run via update_config's `method_make_version_id`, then " +
+            "run_plan_async.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("rows") {
+                    put("type", "array")
+                    putJsonObject("items") {
+                        put("type", "object")
+                        putJsonObject("properties") {
+                            putJsonObject("product_id") { put("type", "string") }
+                            putJsonObject("location_id") { put("type", "string") }
+                            putJsonObject("preference") { put("type", "integer") }
+                            putJsonObject("lead_time") { put("type", "integer") }
+                            putJsonObject("yield") { put("type", "number") }
+                        }
+                        put("required", buildJsonArray { add("product_id") })
+                    }
+                }
+                putJsonObject("version_id") { put("type", "integer") }
+                putJsonObject("version_name") { put("type", "string") }
+            }
+            put("required", buildJsonArray { add("rows") })
+        },
+    ),
+    tool(
+        "set_method_move_overrides",
+        "**Write** a new Method Move Overrides set (full replace — pass the COMPLETE desired " +
+            "rows; an empty array means NO move methods at all for this version, not 'fall back " +
+            "to CSV'). Each row: `{product_id?, from_location_id?, to_location_id, transit_time?, " +
+            "transit_time_uom?, preference?}`. `product_id` accepts an individual product_id, a " +
+            "PROD_AREA value, or `\"*\"`/`\"\"` (matches every product) — same wildcarding as " +
+            "`set_method_make_overrides`. `from_location_id`/`to_location_id` accept `\"*\"`/" +
+            "`\"\"` for 'any location' (existing method_move convention). Creates a new version " +
+            "unless `version_id` names an existing, unreferenced one. Omit `version_id` to " +
+            "reuse/create automatically (auto-creates a new one if the reused version turns out " +
+            "locked — see `note`). Wire the result into a run via update_config's " +
+            "`method_move_version_id`, then run_plan_async.",
+        buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("rows") {
+                    put("type", "array")
+                    putJsonObject("items") {
+                        put("type", "object")
+                        putJsonObject("properties") {
+                            putJsonObject("product_id") { put("type", "string") }
+                            putJsonObject("from_location_id") { put("type", "string") }
+                            putJsonObject("to_location_id") { put("type", "string") }
+                            putJsonObject("transit_time") { put("type", "number") }
+                            putJsonObject("transit_time_uom") { put("type", "string") }
+                            putJsonObject("preference") { put("type", "integer") }
+                        }
+                        put("required", buildJsonArray { add("to_location_id") })
                     }
                 }
                 putJsonObject("version_id") { put("type", "integer") }
@@ -2768,11 +2898,12 @@ private fun toolUpdateConfig(
         val configKeys = setOf(
             "method_selection", "consolidation", "purchase_allowed", "purchasable_materials", "constraints",
             "analyze_criticality", "check_soundness",
-            // The 5 external config objects' version-id keys (CaseBootstrap.kt's explicitVersionId
+            // The 7 external config objects' version-id keys (CaseBootstrap.kt's explicitVersionId
             // reads these straight off the run config) — omitted means that object is used NOT AT
             // ALL for the run, no default-version fallback. See "External config objects" primer.
             "case_alloc_version_id", "pref_version_id", "demand_order_version_id",
             "purchasable_material_version_id", "constraint_version_id",
+            "method_make_version_id", "method_move_version_id",
         )
         if (args.keys.any { it in configKeys }) args else null
     }
@@ -5384,12 +5515,12 @@ private fun resolveReadableVersionId(
 
 private fun toolListConfigVersions(caseId: Int, args: JsonObject, locale: String): ToolResult {
     val kindArg = args["kind"]?.jsonPrimitive?.contentOrNull?.trim()?.lowercase()
-        ?: return toolError("`kind` is required — one of: casealloc, pref, ord, purchmat, constr", locale)
+        ?: return toolError("`kind` is required — one of: casealloc, pref, ord, purchmat, constr, methmake, methmove", locale)
     val kind = ConfigVersionKind.entries.firstOrNull { it.key == kindArg }
         ?: return toolError(
             "unrecognized kind '$kindArg' — must be one of: casealloc (Targeted Supply Allocation), " +
                 "pref (Supply Preferences), ord (Demand Ordering), purchmat (Purchasable Materials), " +
-                "constr (Constraints)",
+                "constr (Constraints), methmake (Method Make Overrides), methmove (Method Move Overrides)",
             locale,
         )
     val versions = CaseConfigVersioning.listVersions(caseId, kind)
@@ -5536,6 +5667,63 @@ private fun toolGetConstraints(caseId: Int, args: JsonObject, locale: String): T
     )
 }
 
+private fun toolGetMethodMakeOverrides(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val (versionId, early) = resolveReadableVersionId(caseId, ConfigVersionKind.METHMAKE, args, "Method Make Overrides", "method_make 覆盖", locale)
+    if (early != null) return early
+    val rows = loadCaseMethodMakeRows(versionId)
+    return ToolResult(
+        summary = loc(
+            "Method Make Overrides version $versionId: ${rows.size} row(s).",
+            "method_make 覆盖版本 $versionId：${rows.size} 行。",
+            locale,
+        ),
+        payload = buildJsonObject {
+            put("version_id", versionId)
+            put("count", rows.size)
+            put("rows", buildJsonArray {
+                rows.forEach { r ->
+                    addJsonObject {
+                        put("product_id", r.productId)
+                        put("location_id", r.locationId)
+                        r.preference?.let { put("preference", it) } ?: put("preference", JsonNull)
+                        r.leadTime?.let { put("lead_time", it) } ?: put("lead_time", JsonNull)
+                        r.yield_?.let { put("yield", it) } ?: put("yield", JsonNull)
+                    }
+                }
+            })
+        },
+    )
+}
+
+private fun toolGetMethodMoveOverrides(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val (versionId, early) = resolveReadableVersionId(caseId, ConfigVersionKind.METHMOVE, args, "Method Move Overrides", "method_move 覆盖", locale)
+    if (early != null) return early
+    val rows = loadCaseMethodMoveRows(versionId)
+    return ToolResult(
+        summary = loc(
+            "Method Move Overrides version $versionId: ${rows.size} row(s).",
+            "method_move 覆盖版本 $versionId：${rows.size} 行。",
+            locale,
+        ),
+        payload = buildJsonObject {
+            put("version_id", versionId)
+            put("count", rows.size)
+            put("rows", buildJsonArray {
+                rows.forEach { r ->
+                    addJsonObject {
+                        put("product_id", r.productId)
+                        put("from_location_id", r.fromLocationId)
+                        put("to_location_id", r.toLocationId)
+                        r.transitTime?.let { put("transit_time", it) } ?: put("transit_time", JsonNull)
+                        r.transitTimeUom?.let { put("transit_time_uom", it) } ?: put("transit_time_uom", JsonNull)
+                        r.preference?.let { put("preference", it) } ?: put("preference", JsonNull)
+                    }
+                }
+            })
+        },
+    )
+}
+
 // ── External config objects — write tools ───────────────────────────────────
 //
 // Every write here lands in a new-or-reused-UNREFERENCED version — the version_in_use gate
@@ -5631,6 +5819,63 @@ private fun toolSetConstraints(caseId: Int, args: JsonObject, locale: String): T
     val summaryEn = "Constraints version $versionId saved: $updated row(s)." + (res.autoCreatedNote?.let { " $it" } ?: "")
     return ToolResult(
         summary = loc(summaryEn, "约束版本 $versionId 已保存：$updated 条。", locale),
+        payload = buildJsonObject {
+            put("version_id", versionId)
+            put("updated", updated)
+            res.autoCreatedNote?.let { put("note", it) }
+        },
+    )
+}
+
+private fun toolSetMethodMakeOverrides(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val rowsJson = args["rows"]?.jsonArray
+        ?: return toolError("`rows` is required (array of {product_id, location_id, preference?, lead_time?, yield?} — no bom_id, it's derived automatically; pass an empty array to clear — an empty version means NO make methods at all, not 'fall back to CSV')", locale)
+    val rows = rowsJson.map { el ->
+        val obj = el.jsonObject
+        CaseMethodMakeRow(
+            productId = obj["product_id"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotBlank() } ?: "*",
+            locationId = obj["location_id"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotBlank() } ?: "*",
+            preference = obj["preference"]?.jsonPrimitive?.intOrNull,
+            leadTime = obj["lead_time"]?.jsonPrimitive?.intOrNull,
+            yield_ = obj["yield"]?.jsonPrimitive?.doubleOrNull,
+        )
+    }
+    val res = resolveWritableVersionId(caseId, ConfigVersionKind.METHMAKE, args, "Method Make Overrides", "method_make 覆盖", locale)
+    res.error?.let { return it }
+    val versionId = res.versionId!!
+    val updated = saveCaseMethodMakeRows(caseId, versionId, rows)
+    val summaryEn = "Method Make Overrides version $versionId saved: $updated row(s)." + (res.autoCreatedNote?.let { " $it" } ?: "")
+    return ToolResult(
+        summary = loc(summaryEn, "method_make 覆盖版本 $versionId 已保存：$updated 行。", locale),
+        payload = buildJsonObject {
+            put("version_id", versionId)
+            put("updated", updated)
+            res.autoCreatedNote?.let { put("note", it) }
+        },
+    )
+}
+
+private fun toolSetMethodMoveOverrides(caseId: Int, args: JsonObject, locale: String): ToolResult {
+    val rowsJson = args["rows"]?.jsonArray
+        ?: return toolError("`rows` is required (array of {product_id?, from_location_id?, to_location_id, transit_time?, transit_time_uom?, preference?}; pass an empty array to clear — an empty version means NO move methods at all, not 'fall back to CSV')", locale)
+    val rows = rowsJson.map { el ->
+        val obj = el.jsonObject
+        CaseMethodMoveRow(
+            productId = obj["product_id"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotBlank() } ?: "*",
+            fromLocationId = obj["from_location_id"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotBlank() } ?: "*",
+            toLocationId = obj["to_location_id"]?.jsonPrimitive?.contentOrNull ?: return toolError("row missing to_location_id", locale),
+            transitTime = obj["transit_time"]?.jsonPrimitive?.doubleOrNull,
+            transitTimeUom = obj["transit_time_uom"]?.jsonPrimitive?.contentOrNull,
+            preference = obj["preference"]?.jsonPrimitive?.intOrNull,
+        )
+    }
+    val res = resolveWritableVersionId(caseId, ConfigVersionKind.METHMOVE, args, "Method Move Overrides", "method_move 覆盖", locale)
+    res.error?.let { return it }
+    val versionId = res.versionId!!
+    val updated = saveCaseMethodMoveRows(caseId, versionId, rows)
+    val summaryEn = "Method Move Overrides version $versionId saved: $updated row(s)." + (res.autoCreatedNote?.let { " $it" } ?: "")
+    return ToolResult(
+        summary = loc(summaryEn, "method_move 覆盖版本 $versionId 已保存：$updated 行。", locale),
         payload = buildJsonObject {
             put("version_id", versionId)
             put("updated", updated)
@@ -7095,8 +7340,12 @@ private suspend fun dispatchTool(
         "get_demand_ordering" -> Pair(toolGetDemandOrdering(caseId, args, locale), workingConfig)
         "get_purchasable_materials" -> Pair(toolGetPurchasableMaterials(caseId, args, locale), workingConfig)
         "get_constraints" -> Pair(toolGetConstraints(caseId, args, locale), workingConfig)
+        "get_method_make_overrides" -> Pair(toolGetMethodMakeOverrides(caseId, args, locale), workingConfig)
+        "get_method_move_overrides" -> Pair(toolGetMethodMoveOverrides(caseId, args, locale), workingConfig)
         "set_purchasable_materials" -> Pair(toolSetPurchasableMaterials(caseId, args, locale), workingConfig)
         "set_constraints" -> Pair(toolSetConstraints(caseId, args, locale), workingConfig)
+        "set_method_make_overrides" -> Pair(toolSetMethodMakeOverrides(caseId, args, locale), workingConfig)
+        "set_method_move_overrides" -> Pair(toolSetMethodMoveOverrides(caseId, args, locale), workingConfig)
         "set_demand_ordering" -> Pair(toolSetDemandOrdering(caseId, args, locale), workingConfig)
         "set_supply_preferences" -> Pair(toolSetSupplyPreferences(caseId, args, locale), workingConfig)
         "set_targeted_supply_allocation" -> Pair(toolSetTargetedSupplyAllocation(caseId, args, locale), workingConfig)
@@ -8534,7 +8783,7 @@ fun Routing.planningAgentRoutes() {
             log.warn("planning-agent: LLM not configured: {}", e.message)
             call.respond(
                 HttpStatusCode.ServiceUnavailable,
-                mapOf("error" to "Planning agent requires NANOGPT_API_KEY to be configured.")
+                mapOf("error" to "Planning agent LLM (provider=${config.allocatorLlmProvider}) is not configured: ${e.message}")
             )
             return@post
         } catch (e: Exception) {
