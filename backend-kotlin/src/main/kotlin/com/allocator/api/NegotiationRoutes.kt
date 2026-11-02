@@ -102,7 +102,7 @@ data class NegotiationWaitView(
 
 /**
  * POST /cases/{caseId}/negotiation-reply
- * Resumes a paused material-agent session via OpenClaw's chat-completion endpoint.
+ * Resumes a paused material-agent session via OpenClaw's sessions_send tool.
  * Fires the reply and returns immediately — the agent continues its ReAct loop
  * asynchronously, emitting further trace events when new state is reached.
  */
@@ -145,15 +145,20 @@ fun Routing.negotiationRoutes() {
             }.toString()
         }
 
+        // Delivered via the gateway's sessions_send tool (POST /tools/invoke):
+        // OpenClaw >= 2026.6.x rejects `x-openclaw-session-key` overrides for
+        // subagent sessions on /v1/chat/completions. Sent from the target agent's
+        // own main session (tools.sessions.visibility="agent"); timeoutSeconds=0
+        // queues the turn and returns immediately.
+        val targetAgent = req.sessionKey.split(":").getOrNull(1) ?: "material"
         val body = buildJsonObject {
-            put("model", config.openClawMaterialAgent)
-            putJsonArray("messages") {
-                addJsonObject {
-                    put("role", "user")
-                    put("content", messageContent)
-                }
+            put("name", "sessions_send")
+            put("sessionKey", "agent:$targetAgent:main")
+            putJsonObject("args") {
+                put("sessionKey", req.sessionKey)
+                put("message", messageContent)
+                put("timeoutSeconds", 0)
             }
-            put("stream", false)
         }
 
         log.info(
@@ -166,22 +171,25 @@ fun Routing.negotiationRoutes() {
         resolveLatestActiveWait(caseId, req.sessionKey, action)
 
         // Fire-and-forget. A material-agent turn re-runs material_engine and
-        // re-rates before emitting the next trace, which can exceed any
-        // reasonable HTTP timeout. The UI tracks progress via the trace
-        // stream, not this response.
+        // re-rates before emitting the next trace; the UI tracks progress via
+        // the trace stream, not this response.
         val bodyString = body.toString()
         openClawDispatchScope.launch {
             try {
-                val response = openClawClient.post("${config.openClawUrl}/v1/chat/completions") {
+                val response = openClawClient.post("${config.openClawUrl}/tools/invoke") {
                     header(HttpHeaders.Authorization, "Bearer $token")
-                    header("x-openclaw-session-key", req.sessionKey)
                     contentType(ContentType.Application.Json)
                     setBody(bodyString)
                 }
-                if (!response.status.isSuccess()) {
+                val responseText = response.bodyAsText()
+                val status = runCatching {
+                    Json.parseToJsonElement(responseText).jsonObject["result"]?.jsonObject
+                        ?.get("details")?.jsonObject?.get("status")?.jsonPrimitive?.contentOrNull
+                }.getOrNull()
+                if (!response.status.isSuccess() || status !in setOf("ok", "accepted")) {
                     log.error(
-                        "openclaw gateway error: status={} body={}",
-                        response.status, response.bodyAsText(),
+                        "openclaw sessions_send failed: http={} status={} body={}",
+                        response.status, status, responseText.take(500),
                     )
                 }
             } catch (e: Exception) {

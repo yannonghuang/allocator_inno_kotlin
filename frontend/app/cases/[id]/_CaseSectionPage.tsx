@@ -74,6 +74,7 @@ import {
   updateMaterialEvent,
   deleteMaterialEvent,
   analyzeMaterialImpact,
+  getCriticalSupplyIds,
   type CaseSupplyRow,
   type PeggedDemandEntry,
   type PlanSupplyViewRow,
@@ -1374,6 +1375,10 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [supplyCriticalityMap, setSupplyCriticalityMap] = useState<Record<string, 'critical' | 'not_critical' | 'running' | 'error'>>({});
   const [criticalityRunning, setCriticalityRunning] = useState(false);
   const [criticalityProgress, setCriticalityProgress] = useState<{ done: number; total: number } | null>(null);
+  // Aborts the in-flight scan (Stop button, leaving the page); analyzeMaterialImpact then
+  // cancels its backend job so re-plans nobody is waiting for don't keep running.
+  const criticalityAbortRef = useRef<AbortController | null>(null);
+  useEffect(() => () => criticalityAbortRef.current?.abort(), []);
   // Whether to auto-run criticality scan after planning (config option, default: off)
   // analyzeCriticalityEnabled + checkSoundnessEnabled are derived from planningConfig so the
   // planning-copilot's config_update can flip them via natural language ("turn off
@@ -1392,6 +1397,9 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   const [planRunHistorySoundOnly, setPlanRunHistorySoundOnly] = useState(false);
   const currentRunIsContingent = currentPlanRunId != null &&
     planRunHistory.find(r => r.id === currentPlanRunId)?.status === 'contingent';
+  // The case's active plan (pinned via "Set active", else the latest saved/promoted run):
+  // what the agents analyse against and what the page opens on.
+  const activePlanRun = planRunHistory.find(r => r.is_active) ?? null;
   // Two states, per the versioning rework: New (still composing a draft for the NEXT
   // submission — planningConfig is live/editable) vs Done (a specific already-executed run is
   // loaded, whether formally saved yet or not — its external-config section renders read-only,
@@ -3635,7 +3643,17 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
   };
 
   const handleAnalyzeCriticality = async () => {
-    const all = planSupplyViewRows.filter(r => !r.supplyId.toLowerCase().endsWith('_dummy'));
+    // Each analysis is a full re-plan (~14 min on heavy configs), so the scan covers only
+    // lots of critical (non-purchasable) materials: a lost lot of a purchasable material can
+    // be bought again. Other lots stay unanalyzed; the per-row Analyze button still checks
+    // any one of them on demand.
+    let criticalIds: Set<string>;
+    try {
+      criticalIds = new Set(await getCriticalSupplyIds(id));
+    } catch {
+      return;
+    }
+    const all = planSupplyViewRows.filter(r => !r.supplyId.toLowerCase().endsWith('_dummy') && criticalIds.has(r.supplyId));
     if (all.length === 0) return;
 
     // Skip supplies that already have a status (critical / not_critical / error) —
@@ -3646,6 +3664,8 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
     const needsAnalysis = pending.filter(r => r.consumedQty > 0);
     const alreadyDone = all.length - pending.length;
 
+    const abort = new AbortController();
+    criticalityAbortRef.current = abort;
     setCriticalityRunning(true);
     setCriticalityProgress({ done: alreadyDone + trivialSafe.length, total: all.length });
     setSupplyCriticalityMap(prev => {
@@ -3655,37 +3675,37 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
       return next;
     });
 
-    const BATCH = 3;
+    // A pool of workers, one per backend re-plan slot (replanSemaphore permits = 2): each
+    // picks the next lot as soon as its last one finishes, so no slot idles waiting for a
+    // batch-mate and progress advances per lot. More workers would only queue on the backend.
+    const WORKERS = 2;
     const total = all.length;
     let done = alreadyDone + trivialSafe.length;
-    for (let i = 0; i < needsAnalysis.length; i += BATCH) {
-      // Only keep (supplyId, status) — the MaterialImpactResult contains a large
-      // `impacts[]` array we don't need; destructuring immediately lets it be GC'd
-      // as soon as analyzeMaterialImpact's microtask settles.
-      const updates: Array<[string, 'critical' | 'not_critical' | 'error']> = [];
-      await Promise.all(
-        needsAnalysis.slice(i, i + BATCH).map(async (r) => {
-          const sid = r.supplyId;
-          try {
-            const { impactedDemandCount } = await analyzeMaterialImpact(sid, 0, 100, false);
-            updates.push([sid, impactedDemandCount > 0 ? 'critical' : 'not_critical']);
-          } catch {
-            updates.push([sid, 'error']);
-          }
-        })
-      );
-      // Single setState per batch instead of per result → O(N) clones instead of O(N²).
-      done += updates.length;
-      setSupplyCriticalityMap(prev => {
-        const next = { ...prev };
-        for (const [sid, status] of updates) next[sid] = status;
-        return next;
-      });
-      setCriticalityProgress({ done, total });
-      // Yield to the event loop so the browser can run idle GC + paint updates
-      // before we spin up the next batch of re-plans.
-      await new Promise(resolve => setTimeout(resolve, 0));
+    let next = 0;
+    const worker = async () => {
+      while (!abort.signal.aborted && next < needsAnalysis.length) {
+        const sid = needsAnalysis[next++].supplyId;
+        // Only keep the status — the MaterialImpactResult contains a large `impacts[]`
+        // array we don't need; destructuring immediately lets it be GC'd.
+        let status: 'critical' | 'not_critical' | 'error';
+        try {
+          const { impactedDemandCount } = await analyzeMaterialImpact(sid, 0, 100, false, null, undefined, abort.signal);
+          status = impactedDemandCount > 0 ? 'critical' : 'not_critical';
+        } catch {
+          if (abort.signal.aborted) return;
+          status = 'error';
+        }
+        done += 1;
+        setSupplyCriticalityMap(prev => ({ ...prev, [sid]: status }));
+        setCriticalityProgress({ done, total });
+      }
+    };
+    await Promise.all(Array.from({ length: WORKERS }, worker));
+    if (abort.signal.aborted) {
+      // Stopped: lots that never finished go back to unanalyzed, not 'error'.
+      setSupplyCriticalityMap(prev => Object.fromEntries(Object.entries(prev).filter(([, s]) => s !== 'running')));
     }
+    if (criticalityAbortRef.current === abort) criticalityAbortRef.current = null;
     setCriticalityRunning(false);
   };
 
@@ -5392,6 +5412,25 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                       {tP('runHistory.chips.initial')}
                     </span>
                   )}
+                  {/* Viewing ≠ active: loading a run is only a preview — the agents and the
+                      page's default stay on the active plan until the user sets this one. */}
+                  {loadedRow && !loadedRow.is_active && activePlanRun && (
+                    <>
+                      <span style={{ color: '#fcd34d' }}>{tP('runHistory.viewing.notActive', { active: activePlanRun.id })}</span>
+                      {loadedRow.status === 'success' && (
+                        <button type="button" className="secondary" style={{ fontSize: '0.75rem', padding: '2px 8px' }}
+                          disabled={!!planRunDesignating[loadedRow.id]}
+                          onClick={() => handleDesignateActive(loadedRow.id)}
+                          title={tP('runHistory.actions.setActiveTitle')}>
+                          {tP('runHistory.actions.setActive')}
+                        </button>
+                      )}
+                      <button type="button" className="secondary" style={{ fontSize: '0.75rem', padding: '2px 8px' }}
+                        onClick={() => handleRestorePlanRun(activePlanRun.id)}>
+                        {tP('runHistory.viewing.backToActive')}
+                      </button>
+                    </>
+                  )}
                 </div>
               );
             })()}
@@ -5399,6 +5438,16 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#2e1065', border: '1px solid #7c3aed', borderRadius: 6, padding: '6px 12px', marginBottom: '0.75rem', fontSize: '0.82rem', color: '#ddd6fe' }}>
                 <span style={{ fontWeight: 700, color: '#a78bfa' }}>{tP('runHistory.viewing.contingentBanner', { id: currentPlanRunId ?? 0 })}</span>
                 <span>{tP('runHistory.viewing.contingentNote')}</span>
+                {/* A what-if can be viewed but never becomes active. */}
+                {activePlanRun && (
+                  <>
+                    <span style={{ color: '#fcd34d' }}>{tP('runHistory.viewing.agentsUse', { active: activePlanRun.id })}</span>
+                    <button type="button" className="secondary" style={{ fontSize: '0.75rem', padding: '2px 8px' }}
+                      onClick={() => handleRestorePlanRun(activePlanRun.id)}>
+                      {tP('runHistory.viewing.backToActive')}
+                    </button>
+                  </>
+                )}
               </div>
             )}
             {currentPlanRunId === null && freshPlanRunId !== null && (
@@ -7380,6 +7429,14 @@ export function CaseDetail({ section: sectionProp = 'planning', subsection }: { 
                         ? tP('config.analyzingCriticality', { done: criticalityProgress?.done ?? 0, total: criticalityProgress?.total ?? 0 })
                         : tP('config.analyzeCriticality')}
                     </button>
+                    {criticalityRunning && (
+                      <button
+                        type="button"
+                        className="secondary"
+                        onClick={() => criticalityAbortRef.current?.abort()}
+                        style={{ fontSize: '0.8rem' }}
+                      >{tP('config.criticalityStop')}</button>
+                    )}
                     {!criticalityRunning && Object.keys(supplyCriticalityMap).length > 0 && (
                       <button
                         type="button"

@@ -3,6 +3,7 @@ package com.allocator.api
 import com.allocator.*
 import com.allocator.services.CaseLoader
 import com.allocator.services.emitPlanRunEvent
+import com.allocator.services.computeCriticalPids
 import com.allocator.services.resolveActiveRunId
 import com.allocator.services.runPlanning
 import io.ktor.http.*
@@ -10,8 +11,11 @@ import io.ktor.server.application.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -27,10 +31,16 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 private val log = LoggerFactory.getLogger("com.allocator.MaterialImpactRoute")
-private val materialImpactScope = CoroutineScope(Dispatchers.IO)
+// SupervisorJob: one job's failure (an OutOfMemoryError took down the plain-Job scope on
+// 2026-11-01) must not cancel the scope and kill every job launched after it.
+private val materialImpactScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 private val materialImpactJobs = ConcurrentHashMap<String, MutableMap<String, Any?>>()
-// Cap concurrent re-plans to protect heap during bulk criticality scans.
+// Cap concurrent jobs to protect heap during bulk criticality scans. A job holds a permit
+// for its whole run — case data, baseline result and cache candidates are loaded only once
+// it gets one, so queued jobs cost nothing.
 private val replanSemaphore = Semaphore(permits = 2)
+// Submissions beyond this many waiting jobs are refused instead of piling up.
+private const val MAX_QUEUED_JOBS = 6
 // Terminal jobs older than this are swept on GET in case the client abandoned polling.
 private const val JOB_TTL_SECONDS = 600L
 
@@ -59,6 +69,11 @@ data class MaterialImpactRequest(
     val negotiationRound: Int? = null,
     /** Id of the prior round's contingent. When provided, the new row supersedes it. */
     val parentPlanRunId: Int? = null,
+    /**
+     * Case the supply belongs to. A supplyId is only unique within a case; omit to
+     * let [pickSupplyCaseId] choose (active case, else newest case holding the supply).
+     */
+    val caseId: Int? = null,
 )
 
 @Serializable
@@ -184,6 +199,100 @@ private data class SupplyLookup(
     val supply: MaterialSupplyDetail,
 )
 
+/**
+ * Picks the case a material event applies to. The same supplyId can exist in several
+ * cases (cases are imported from overlapping CSV snapshots), and an unfiltered lookup
+ * returned whichever row Postgres produced first — runs silently negotiated and
+ * promoted plans in a case the planner wasn't working in.
+ *
+ * Order: the caller's [requestedCaseId] (must hold the supply) → the active case, if it
+ * holds the supply → the newest case holding the supply. Null when no case has it.
+ */
+internal fun pickSupplyCaseId(supplyId: String, requestedCaseId: Int?): Int? = transaction {
+    val caseIds = Supplies.select(Supplies.caseId)
+        .where { Supplies.supplyId eq supplyId }
+        .map { it[Supplies.caseId] }
+        .toSet()
+    if (requestedCaseId != null) return@transaction requestedCaseId.takeIf { it in caseIds }
+    if (caseIds.isEmpty()) return@transaction null
+    val activeCaseId = Cases.select(Cases.id)
+        .where { (Cases.active eq true) and (Cases.id inList caseIds) }
+        .orderBy(Cases.id, SortOrder.DESC)
+        .firstOrNull()?.get(Cases.id)
+    activeCaseId ?: caseIds.max()
+}
+
+/**
+ * Ids, newest first, of persisted runs whose metadata records the re-plan [req] asks for:
+ * the same (supplyId, delay, qty%, baseline). Reads metadata only, never `result` (~18 MB
+ * per run on case 173), so it's cheap enough for the submit route.
+ *
+ * [chainExact] also requires the row to be this negotiation chain's own — not superseded,
+ * same negotiationRound / parentPlanRunId when the caller declares them — so a replayed
+ * request gets its existing row back. Without it, any run with the same params matches:
+ * the plan result depends only on those params, so its result can be reused for a new row.
+ */
+private fun cachedContingentIds(
+    caseId: Int,
+    baselinePlanRunId: Int,
+    req: MaterialImpactRequest,
+    chainExact: Boolean,
+): List<Int> = transaction {
+    PlanRuns.select(PlanRuns.id, PlanRuns.metadata)
+        .where {
+            var cond: Op<Boolean> = (PlanRuns.caseId eq caseId) and
+                (PlanRuns.status inList listOf("contingent", "success")) and
+                PlanRuns.result.isNotNull()
+            if (chainExact) {
+                cond = cond and PlanRuns.supersededByPlanRunId.isNull()
+                if (req.negotiationRound != null) {
+                    cond = cond and (PlanRuns.negotiationRound eq req.negotiationRound)
+                }
+                if (req.parentPlanRunId != null) {
+                    cond = cond and (PlanRuns.parentPlanRunId eq req.parentPlanRunId)
+                }
+            }
+            cond
+        }
+        .orderBy(PlanRuns.id, SortOrder.DESC)
+        .mapNotNull { row ->
+            val meta = row[PlanRuns.metadata]?.let {
+                runCatching { Json.parseToJsonElement(it).jsonObject }.getOrNull()
+            } ?: return@mapNotNull null
+            val matches = meta["supplyId"]?.jsonPrimitive?.contentOrNull == req.supplyId.trim() &&
+                meta["deliveryDelayDays"]?.jsonPrimitive?.intOrNull == req.deliveryDelayDays &&
+                meta["quantityDecreasePct"]?.jsonPrimitive?.doubleOrNull == req.quantityDecreasePct &&
+                meta["baselinePlanRunId"]?.jsonPrimitive?.intOrNull == baselinePlanRunId
+            row[PlanRuns.id].takeIf { matches }
+        }
+}
+
+/**
+ * True when a job for [req] will be served from an earlier re-plan. Such a job does no
+ * planning, so the submit route lets it skip the re-plan queue — an agent's millisecond
+ * cache hit must not wait behind a criticality scan's 14-minute re-plans (its caller
+ * gives up after 90 s). Resolves the baseline the same way the job does, by id only.
+ */
+private fun isCacheHit(req: MaterialImpactRequest): Boolean {
+    val caseId = pickSupplyCaseId(req.supplyId, req.caseId) ?: return false
+    val baselineId = transaction {
+        if (req.planRunId != null) {
+            PlanRuns.select(PlanRuns.id)
+                .where { (PlanRuns.id eq req.planRunId) and (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
+                .firstOrNull()?.get(PlanRuns.id)
+        } else {
+            val designatedId = Cases.selectAll()
+                .where { Cases.id eq caseId }
+                .singleOrNull()?.get(Cases.designatedActivePlanRunId)
+            val successIds = PlanRuns.select(PlanRuns.id)
+                .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
+                .map { it[PlanRuns.id] }
+            resolveActiveRunId(designatedId, successIds)
+        }
+    } ?: return false
+    return cachedContingentIds(caseId, baselineId, req, chainExact = false).isNotEmpty()
+}
+
 private data class BaselineLookup(
     val planRunId: Int,
     /** Parsed committed-demands map — either from in-memory casePlanResults (ready) or DB (success). */
@@ -206,10 +315,11 @@ private data class DemandMeta(
 
 private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpactRequest) {
     try {
-        // 1. Look up supply — read all columns inside transaction
-        val supplyLookup: SupplyLookup? = transaction {
+        // 1. Look up supply in the case it applies to — read all columns inside transaction
+        val supplyCaseId = pickSupplyCaseId(req.supplyId, req.caseId)
+        val supplyLookup: SupplyLookup? = if (supplyCaseId == null) null else transaction {
             Supplies.selectAll()
-                .where { Supplies.supplyId eq req.supplyId }
+                .where { (Supplies.supplyId eq req.supplyId) and (Supplies.caseId eq supplyCaseId) }
                 .firstOrNull()
                 ?.let { row ->
                     val productId = row[Supplies.productId].trim()
@@ -229,7 +339,7 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
         if (supplyLookup == null) {
             materialImpactJobs[jobId]?.apply {
                 set("status", "failed")
-                set("error", "Supply '${req.supplyId}' not found")
+                set("error", "Supply '${req.supplyId}' not found" + (req.caseId?.let { " in case $it" } ?: ""))
                 set("completedAt", Instant.now())
             }
             return
@@ -303,32 +413,35 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
 
         val baselinePlanRunId = baselineLookup.planRunId
 
-        // 3. Load case data and mutate the target supply
-        val caseData = CaseLoader.load(caseId)
-        val mutatedSupply = (caseData["supply"] ?: emptyList()).map { s ->
-            if ((s["supply_id"] as? String)?.trim() == req.supplyId.trim()) {
-                s.toMutableMap().apply {
-                    val oldQty = (s["qty"] as? Number)?.toDouble() ?: 0.0
-                    val newQty = when {
-                        req.quantityDecreaseAbs != null && req.quantityDecreaseAbs > 0 ->
-                            maxOf(0.0, oldQty - req.quantityDecreaseAbs)
-                        req.quantityDecreasePct > 0 ->
-                            oldQty * (1.0 - req.quantityDecreasePct / 100.0)
-                        else -> oldQty
+        // 3. Load case data and mutate the target supply — lazily, only on a cache miss:
+        // cache hits skip the re-plan queue, so they must not hold a full case copy.
+        val mutatedData: Map<String, List<Map<String, Any?>>> by lazy {
+            val caseData = CaseLoader.load(caseId)
+            val mutatedSupply = (caseData["supply"] ?: emptyList()).map { s ->
+                if ((s["supply_id"] as? String)?.trim() == req.supplyId.trim()) {
+                    s.toMutableMap().apply {
+                        val oldQty = (s["qty"] as? Number)?.toDouble() ?: 0.0
+                        val newQty = when {
+                            req.quantityDecreaseAbs != null && req.quantityDecreaseAbs > 0 ->
+                                maxOf(0.0, oldQty - req.quantityDecreaseAbs)
+                            req.quantityDecreasePct > 0 ->
+                                oldQty * (1.0 - req.quantityDecreasePct / 100.0)
+                            else -> oldQty
+                        }
+                        if (newQty != oldQty) put("qty", newQty)
+                        if (req.deliveryDelayDays > 0) {
+                            val newDate = parseSupplyDate(s["supply_date"] as? String)
+                                ?.plusDays(req.deliveryDelayDays.toLong())
+                                ?: LocalDate.now().plusDays(req.deliveryDelayDays.toLong())
+                            put("supply_date", newDate.toString())
+                        }
                     }
-                    if (newQty != oldQty) put("qty", newQty)
-                    if (req.deliveryDelayDays > 0) {
-                        val newDate = parseSupplyDate(s["supply_date"] as? String)
-                            ?.plusDays(req.deliveryDelayDays.toLong())
-                            ?: LocalDate.now().plusDays(req.deliveryDelayDays.toLong())
-                        put("supply_date", newDate.toString())
-                    }
-                }
-            } else s
+                } else s
+            }
+            @Suppress("UNCHECKED_CAST")
+            (caseData as Map<String, Any>).toMutableMap()
+                .apply { put("supply", mutatedSupply) } as Map<String, List<Map<String, Any?>>>
         }
-        @Suppress("UNCHECKED_CAST")
-        val mutatedData = (caseData as Map<String, Any>).toMutableMap()
-            .apply { put("supply", mutatedSupply) } as Map<String, List<Map<String, Any?>>>
 
         // 4. Parse baseline config for consistent comparison (all values already extracted)
         val parsedConfig: Map<String, Any?>? = baselineLookup.configJson?.let { cfgStr ->
@@ -339,51 +452,109 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
         }
 
         // 4b. Cache lookup: has an earlier call already re-planned these exact params?
-        // Key: (caseId, baselinePlanRunId, supplyId, deliveryDelayDays, quantityDecreasePct)
-        // plus negotiationRound / parentPlanRunId when the caller declares them.
-        //
-        // Fires for all callers (persist=true or false): material_engine persists the
-        // contingent on its first pass, and order_engine's later persist=false call
-        // matches on the same params and skips the second 10s runPlanning. Planning
-        // agent goes through /material-impact-assessment (not this endpoint), so it is
-        // already free of this redundancy — but any future caller of /material-impact
-        // picks up the cache automatically via this lookup.
-        val cachedHit: Pair<Int, Map<String, Any>>? = transaction {
-            val candidates = PlanRuns.selectAll()
-                .where {
-                    var cond: Op<Boolean> = (PlanRuns.caseId eq caseId) and
-                        (PlanRuns.status inList listOf("contingent", "success")) and
-                        PlanRuns.supersededByPlanRunId.isNull()
-                    if (req.negotiationRound != null) {
-                        cond = cond and (PlanRuns.negotiationRound eq req.negotiationRound)
-                    }
-                    if (req.parentPlanRunId != null) {
-                        cond = cond and (PlanRuns.parentPlanRunId eq req.parentPlanRunId)
-                    }
-                    cond
-                }
-                .orderBy(PlanRuns.id, SortOrder.DESC)
-                .toList()
-            candidates.firstNotNullOfOrNull { row ->
-                val meta = row[PlanRuns.metadata]?.let {
-                    runCatching { Json.parseToJsonElement(it).jsonObject }.getOrNull()
-                } ?: return@firstNotNullOfOrNull null
-                val matches = meta["supplyId"]?.jsonPrimitive?.contentOrNull == req.supplyId.trim() &&
-                    meta["deliveryDelayDays"]?.jsonPrimitive?.intOrNull == req.deliveryDelayDays &&
-                    meta["quantityDecreasePct"]?.jsonPrimitive?.doubleOrNull == req.quantityDecreasePct &&
-                    meta["baselinePlanRunId"]?.jsonPrimitive?.intOrNull == baselinePlanRunId
-                if (!matches) return@firstNotNullOfOrNull null
-                val resultJson = row[PlanRuns.result] ?: return@firstNotNullOfOrNull null
-                val parsed = runCatching {
-                    @Suppress("UNCHECKED_CAST")
-                    jsonElementToNative(Json.parseToJsonElement(resultJson)) as? Map<String, Any>
-                }.getOrNull() ?: return@firstNotNullOfOrNull null
-                row[PlanRuns.id] to parsed
-            }
+        // Key: (caseId, baselinePlanRunId, supplyId, deliveryDelayDays, quantityDecreasePct).
+        //  - Exact chain hit (also same negotiationRound / parentPlanRunId, not superseded):
+        //    a replayed or follow-up request (e.g. order_engine's persist=false call) gets
+        //    that row back as-is.
+        //  - Result hit (same params, any chain — e.g. a relaunched run, or a counter that
+        //    lands on values an earlier chain already tried): the plan is identical, so its
+        //    result is reused instead of a ~14-minute re-plan; a persisting request still
+        //    gets its own row, so this chain's links and promotion stay intact.
+        fun loadCached(ids: List<Int>): Pair<Int, Map<String, Any>>? = ids.firstNotNullOfOrNull { runId ->
+            val resultJson = transaction {
+                PlanRuns.select(PlanRuns.result).where { PlanRuns.id eq runId }.firstOrNull()?.get(PlanRuns.result)
+            } ?: return@firstNotNullOfOrNull null
+            val parsed = runCatching {
+                @Suppress("UNCHECKED_CAST")
+                jsonElementToNative(Json.parseToJsonElement(resultJson)) as? Map<String, Any>
+            }.getOrNull() ?: return@firstNotNullOfOrNull null
+            runId to parsed
         }
+        val cachedHit = loadCached(cachedContingentIds(caseId, baselinePlanRunId, req, chainExact = true))
+        val reusable = if (cachedHit == null) loadCached(cachedContingentIds(caseId, baselinePlanRunId, req, chainExact = false)) else null
 
         val contingentResult: Map<String, Any>
         val contingentPlanRunId: Int?
+
+        // 6. Persist a contingent plan run + material event record for this request. Pegging
+        // comes from [peggingSourceRunId]'s plan_pegging rows when the result was reused,
+        // else from the result itself.
+        fun persistContingent(
+            result: Map<String, Any>,
+            startedAt: kotlinx.datetime.Instant,
+            finishedAt: kotlinx.datetime.Instant,
+            peggingSourceRunId: Int?,
+        ): Int {
+            val metadataJson = buildJsonObject {
+                put("type", "contingent")
+                put("supplyId", req.supplyId)
+                put("deliveryDelayDays", req.deliveryDelayDays)
+                put("quantityDecreasePct", req.quantityDecreasePct)
+                put("baselinePlanRunId", baselinePlanRunId)
+                if (req.negotiationRound != null) put("negotiationRound", req.negotiationRound)
+                if (req.parentPlanRunId != null) put("parentPlanRunId", req.parentPlanRunId)
+                if (peggingSourceRunId != null) put("reusedFromPlanRunId", peggingSourceRunId)
+            }.toString()
+            // Same storage split as a normal plan save: planning_pegging (~220 MB on a
+            // 208-demand case) goes to plan_pegging rows, the result column keeps the
+            // rest. Storing it inline made the result too big to cast to jsonb, which
+            // broke the plan-run history list once a contingent run was promoted.
+            val resultJson = runCatching { resultToJson(result - "planning_pegging").toString() }.getOrNull()
+            val newRunId = transaction {
+                val planRunId = PlanRuns.insert {
+                    it[PlanRuns.caseId] = caseId
+                    it[PlanRuns.jobId] = jobId
+                    it[PlanRuns.status] = "contingent"
+                    it[PlanRuns.config] = baselineLookup.configJson
+                    it[PlanRuns.result] = resultJson
+                    it[PlanRuns.metadata] = metadataJson
+                    it[PlanRuns.createdAt] = startedAt
+                    it[PlanRuns.finishedAt] = finishedAt
+                    if (req.negotiationRound != null) it[PlanRuns.negotiationRound] = req.negotiationRound
+                    if (req.parentPlanRunId != null) it[PlanRuns.parentPlanRunId] = req.parentPlanRunId
+                }[PlanRuns.id]
+                if (req.parentPlanRunId != null) {
+                    PlanRuns.update({ PlanRuns.id eq req.parentPlanRunId }) {
+                        it[PlanRuns.supersededByPlanRunId] = planRunId
+                    }
+                }
+                // Record the material event so it appears in the case view
+                MaterialEvents.insert {
+                    it[MaterialEvents.caseId]         = caseId
+                    it[MaterialEvents.supplyId]       = req.supplyId.trim()
+                    it[MaterialEvents.delayDays]      = req.deliveryDelayDays
+                    it[MaterialEvents.qtyDecreasePct] = req.quantityDecreasePct
+                    it[MaterialEvents.note]           = "AI agent analysis (planRun=$planRunId)"
+                }
+                emitPlanRunEvent(caseId, planRunId, "created", buildJsonObject {
+                    put("source", "material_impact")
+                    put("supply_id", JsonPrimitive(req.supplyId.trim()))
+                    put("baseline_plan_run_id", JsonPrimitive(baselinePlanRunId))
+                    if (req.negotiationRound != null) put("negotiation_round", JsonPrimitive(req.negotiationRound))
+                    if (req.parentPlanRunId != null) put("parent_plan_run_id", JsonPrimitive(req.parentPlanRunId))
+                    if (peggingSourceRunId != null) put("reused_from_plan_run_id", JsonPrimitive(peggingSourceRunId))
+                })
+                planRunId
+            }
+            // Pegging rows take minutes to write; don't hold up the impact result.
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    if (peggingSourceRunId != null && "planning_pegging" !in result) {
+                        transaction {
+                            exec(
+                                "INSERT INTO plan_pegging (plan_run_id, demand_id, entry) " +
+                                    "SELECT $newRunId, demand_id, entry FROM plan_pegging WHERE plan_run_id = $peggingSourceRunId"
+                            )
+                        }
+                    } else {
+                        savePlanPeggingRows(newRunId, result, caseId)
+                    }
+                } catch (e: Exception) {
+                    log.warn("Pegging save failed for contingent run $newRunId: ${e.message}")
+                }
+            }
+            return newRunId
+        }
 
         if (cachedHit != null) {
             log.info(
@@ -392,74 +563,41 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
             )
             contingentResult = cachedHit.second
             contingentPlanRunId = cachedHit.first
+        } else if (reusable != null) {
+            log.info(
+                "material-impact result reuse: from planRun={} baseline={} supplyId={} delay={} qtyPct={} persist={} (skipping re-plan)",
+                reusable.first, baselinePlanRunId, req.supplyId, req.deliveryDelayDays, req.quantityDecreasePct, req.persist,
+            )
+            contingentResult = reusable.second
+            val now = kotlinx.datetime.Clock.System.now()
+            contingentPlanRunId = if (req.persist) persistContingent(reusable.second, now, now, reusable.first) else reusable.first
         } else {
             // 5. Re-run planning with the mutated supply (bounded concurrency via semaphore)
             log.info("material-impact re-plan: jobId={} supplyId={} delay={} qtyDecrease={}",
                 jobId, req.supplyId, req.deliveryDelayDays, req.quantityDecreasePct)
             val demandTotal = (mutatedData["demand"] as? List<*>)?.size ?: 0
             val progressCb: (Map<String, Any?>) -> Unit = { p ->
-                materialImpactJobs[jobId]?.let { job ->
-                    val payload = mutableMapOf<String, Any?>(
-                        "current" to (p["current"] ?: 0),
-                        "total" to demandTotal,
-                    )
-                    p["iteration"]?.let { payload["iteration"] = it }
-                    p["iterations_max"]?.let { payload["iterations_max"] = it }
-                    job["progress"] = payload
-                }
+                // Planning is CPU-bound and never suspends, so coroutine cancellation alone
+                // can't stop it; a DELETEd job (entry gone) aborts here at the next demand.
+                val job = materialImpactJobs[jobId]
+                    ?: throw CancellationException("material-impact job $jobId cancelled")
+                val payload = mutableMapOf<String, Any?>(
+                    "current" to (p["current"] ?: 0),
+                    "total" to demandTotal,
+                )
+                p["iteration"]?.let { payload["iteration"] = it }
+                p["iterations_max"]?.let { payload["iterations_max"] = it }
+                job["progress"] = payload
             }
-            contingentResult = replanSemaphore.withPermit {
-                runPlanning(mutatedData, config = parsedConfig, progressCallback = progressCb).output
-            }
+            // The row is inserted only after the re-plan, so record the real start for
+            // created_at; history derives duration from finished_at - created_at.
+            val replanStartedAt = kotlinx.datetime.Clock.System.now()
+            contingentResult = runPlanning(mutatedData, config = parsedConfig, progressCallback = progressCb).output
+            val replanFinishedAt = kotlinx.datetime.Clock.System.now()
 
-            // 6. Persist contingent plan run + material event record (only when persist=true).
             // Cache-miss path: insert a fresh contingent row so the next identical request
             // (e.g. order_engine's follow-up with persist=false) hits the cache above.
-            contingentPlanRunId = if (req.persist) {
-                val metadataJson = buildJsonObject {
-                    put("type", "contingent")
-                    put("supplyId", req.supplyId)
-                    put("deliveryDelayDays", req.deliveryDelayDays)
-                    put("quantityDecreasePct", req.quantityDecreasePct)
-                    put("baselinePlanRunId", baselinePlanRunId)
-                    if (req.negotiationRound != null) put("negotiationRound", req.negotiationRound)
-                    if (req.parentPlanRunId != null) put("parentPlanRunId", req.parentPlanRunId)
-                }.toString()
-                val contingentResultJson = runCatching { resultToJson(contingentResult).toString() }.getOrNull()
-                transaction {
-                    val planRunId = PlanRuns.insert {
-                        it[PlanRuns.caseId] = caseId
-                        it[PlanRuns.jobId] = jobId
-                        it[PlanRuns.status] = "contingent"
-                        it[PlanRuns.config] = baselineLookup.configJson
-                        it[PlanRuns.result] = contingentResultJson
-                        it[PlanRuns.metadata] = metadataJson
-                        if (req.negotiationRound != null) it[PlanRuns.negotiationRound] = req.negotiationRound
-                        if (req.parentPlanRunId != null) it[PlanRuns.parentPlanRunId] = req.parentPlanRunId
-                    }[PlanRuns.id]
-                    if (req.parentPlanRunId != null) {
-                        PlanRuns.update({ PlanRuns.id eq req.parentPlanRunId }) {
-                            it[PlanRuns.supersededByPlanRunId] = planRunId
-                        }
-                    }
-                    // Record the material event so it appears in the case view
-                    MaterialEvents.insert {
-                        it[MaterialEvents.caseId]         = caseId
-                        it[MaterialEvents.supplyId]       = req.supplyId.trim()
-                        it[MaterialEvents.delayDays]      = req.deliveryDelayDays
-                        it[MaterialEvents.qtyDecreasePct] = req.quantityDecreasePct
-                        it[MaterialEvents.note]           = "AI agent analysis (planRun=$planRunId)"
-                    }
-                    emitPlanRunEvent(caseId, planRunId, "created", buildJsonObject {
-                        put("source", "material_impact")
-                        put("supply_id", JsonPrimitive(req.supplyId.trim()))
-                        put("baseline_plan_run_id", JsonPrimitive(baselinePlanRunId))
-                        if (req.negotiationRound != null) put("negotiation_round", JsonPrimitive(req.negotiationRound))
-                        if (req.parentPlanRunId != null) put("parent_plan_run_id", JsonPrimitive(req.parentPlanRunId))
-                    })
-                    planRunId
-                }
-            } else null
+            contingentPlanRunId = if (req.persist) persistContingent(contingentResult, replanStartedAt, replanFinishedAt, null) else null
         }
 
         // 7. Diff baseline vs contingent
@@ -574,14 +712,62 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
             set("completedAt", Instant.now())
         }
 
-    } catch (e: Exception) {
+    } catch (e: CancellationException) {
+        log.info("material-impact job $jobId cancelled")
+        materialImpactJobs[jobId]?.apply {
+            set("status", "cancelled")
+            set("completedAt", Instant.now())
+        }
+        throw e
+    } catch (e: Throwable) {
+        // Throwable, not Exception: an OutOfMemoryError must still mark the job failed,
+        // otherwise pollers wait on it forever.
         log.error("material-impact job $jobId failed: ${e.message}", e)
         materialImpactJobs[jobId]?.apply {
             set("status", "failed")
-            set("error", e.message ?: "Unknown error")
+            set("error", e.message ?: e.javaClass.simpleName)
             set("completedAt", Instant.now())
         }
     }
+}
+
+/**
+ * Supply ids of [caseId] whose product is a critical material — the planner's own
+ * [computeCriticalPids] set (no make anywhere, no admitted buy: i.e. non-purchasable raw
+ * material) — judged with the config of the plan a material-impact job would use as its
+ * baseline (designated active run, else latest success). The criticality scan only re-plans
+ * these lots: an elastic material can be made or bought again, and a full re-plan per lot
+ * is too expensive to run for every supply.
+ */
+private fun criticalSupplyIds(caseId: Int): Pair<Int?, List<String>> {
+    val configJson: Pair<Int, String?>? = transaction {
+        val designatedId = Cases.selectAll()
+            .where { Cases.id eq caseId }
+            .singleOrNull()?.get(Cases.designatedActivePlanRunId)
+        val successIds = PlanRuns.select(PlanRuns.id)
+            .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
+            .map { it[PlanRuns.id] }
+        val runId = resolveActiveRunId(designatedId, successIds) ?: return@transaction null
+        val cfg = PlanRuns.select(PlanRuns.config)
+            .where { PlanRuns.id eq runId }
+            .firstOrNull()?.get(PlanRuns.config)
+        runId to cfg
+    }
+    val config: Map<String, Any?>? = configJson?.second?.let { cfgStr ->
+        runCatching {
+            @Suppress("UNCHECKED_CAST")
+            jsonElementToNative(Json.parseToJsonElement(cfgStr)) as? Map<String, Any?>
+        }.getOrNull()
+    }
+    @Suppress("UNCHECKED_CAST")
+    val data = CaseLoader.load(caseId) as Map<String, List<Map<String, Any?>>>
+    val criticalPids = computeCriticalPids(data, config)
+    val ids = (data["supply"] ?: emptyList()).mapNotNull { s ->
+        val sid = (s["supply_id"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        val pid = (s["product_id"] as? String)?.trim() ?: return@mapNotNull null
+        sid.takeIf { pid in criticalPids }
+    }.distinct().sorted()
+    return configJson?.first to ids
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -594,7 +780,13 @@ private suspend fun runMaterialImpactBackground(jobId: String, req: MaterialImpa
  * (alternatives are naturally used — no static escape-route guessing).
  *
  * GET /material-impact/status/{jobId}
- * Polls for job result. Returns {"status":"running|completed|failed","result"?:...,"error"?:...}
+ * Polls for job result. Returns {"status":"queued|running|completed|failed|cancelled","result"?:...,"error"?:...}
+ *
+ * DELETE /material-impact/{jobId}
+ * Cancels a job the caller no longer wants (frees its slot; a queued job never starts).
+ *
+ * GET /material-impact/critical-supplies/{caseId}
+ * Supply ids of critical (non-purchasable) materials — the lots the criticality scan re-plans.
  */
 fun Routing.materialImpactRoutes() {
     route("/material-impact") {
@@ -614,20 +806,58 @@ fun Routing.materialImpactRoutes() {
                 req.supplyId, req.deliveryDelayDays, req.quantityDecreasePct,
             )
 
+            val cacheHit = runCatching { isCacheHit(req) }.getOrDefault(false)
+            val queued = materialImpactJobs.values.count { it["status"] == "queued" }
+            if (!cacheHit && queued >= MAX_QUEUED_JOBS) {
+                call.respond(HttpStatusCode.ServiceUnavailable, buildJsonObject {
+                    put("error", "Material impact queue is full ($queued jobs waiting); retry later.")
+                })
+                return@post
+            }
+
             val jobId = UUID.randomUUID().toString()
-            materialImpactJobs[jobId] = mutableMapOf(
-                "status" to "running",
+            val entry: MutableMap<String, Any?> = java.util.Collections.synchronizedMap(mutableMapOf(
+                "status" to "queued",
                 "result" to null,
                 "error" to null,
                 "progress" to mapOf("current" to 0, "total" to 0),
-            )
-            materialImpactScope.launch { runMaterialImpactBackground(jobId, req) }
+            ))
+            materialImpactJobs[jobId] = entry
+            entry["handle"] = materialImpactScope.launch {
+                if (cacheHit) {
+                    entry["status"] = "running"
+                    runMaterialImpactBackground(jobId, req)
+                } else replanSemaphore.withPermit {
+                    entry["status"] = "running"
+                    runMaterialImpactBackground(jobId, req)
+                }
+            }
 
             call.response.headers.append("Location", "/material-impact/status/$jobId")
             call.respond(HttpStatusCode.Accepted, buildJsonObject {
                 put("jobId", jobId)
-                put("status", "running")
+                put("status", "queued")
                 put("message", "Poll GET /material-impact/status/$jobId for result.")
+            })
+        }
+
+        // ── DELETE /{jobId} — caller gave up; stop the job and free its permit ──
+        delete("/{jobId}") {
+            val jobId = call.parameters["jobId"]
+                ?: throw IllegalArgumentException("jobId required")
+            val job = materialImpactJobs.remove(jobId)
+            (job?.get("handle") as? Job)?.cancel()
+            call.respond(HttpStatusCode.NoContent)
+        }
+
+        // ── GET /critical-supplies/{caseId} — lots the criticality scan covers ──
+        get("/critical-supplies/{caseId}") {
+            val caseId = call.parameters["caseId"]?.toIntOrNull()
+                ?: throw IllegalArgumentException("caseId must be an integer")
+            val (planRunId, ids) = criticalSupplyIds(caseId)
+            call.respond(buildJsonObject {
+                planRunId?.let { put("planRunId", it) }
+                putJsonArray("supplyIds") { ids.forEach { add(it) } }
             })
         }
 
@@ -655,7 +885,8 @@ fun Routing.materialImpactRoutes() {
                 if (error != null) put("error", error.toString())
             })
             // Evict on client-observed terminal state so completed/failed jobs don't pile up.
-            if (status == "completed" || status == "failed") {
+            val terminal = setOf("completed", "failed", "cancelled")
+            if (status in terminal) {
                 materialImpactJobs.remove(jobId)
             }
             // Opportunistic TTL sweep: drop terminal jobs where the client abandoned polling.
@@ -663,8 +894,7 @@ fun Routing.materialImpactRoutes() {
             materialImpactJobs.entries.removeIf { (_, j) ->
                 val s = j["status"]?.toString()
                 val completedAt = j["completedAt"] as? Instant
-                (s == "completed" || s == "failed") &&
-                    completedAt != null && completedAt.isBefore(cutoff)
+                s in terminal && completedAt != null && completedAt.isBefore(cutoff)
             }
         }
     }
@@ -723,6 +953,7 @@ fun Routing.planRunRoutes() {
                     PlanRuns.update({ PlanRuns.id eq planRunId }) {
                         it[PlanRuns.status] = "success"
                     }
+                    com.allocator.services.adoptAsActivePlanRun(caseId, planRunId)
                     emitPlanRunEvent(caseId, planRunId, "promoted", buildJsonObject {
                         put("from_status", JsonPrimitive("contingent"))
                         put("to_status", JsonPrimitive("success"))

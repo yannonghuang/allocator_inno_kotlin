@@ -366,6 +366,7 @@
       "analyzeCriticality": "分析关键度",
       "analyzingCriticality": "分析中…（{done}/{total}）",
       "criticalityClear": "清除",
+      "criticalityStop": "停止",
       "resetDefaults": "重置配置",
       "resetDefaultsTitle": "重置计划配置：按偏好方法选择（深度 1）、最大 BOM 深度 3、禁用采购、工单批量合并开启（30 天窗口）"
     },
@@ -998,7 +999,10 @@
         "banner": "👁 正在查看运行 #{id}",
         "contingentBanner": "👁 应急运行 #{id}",
         "contingentNote": " — 假设分支。请运行新计划以创建新的基线。",
-        "unnamed": "（未命名）"
+        "unnamed": "（未命名）",
+        "notActive": "— 非当前计划；智能体基于当前计划 #{active} 进行分析。",
+        "agentsUse": "智能体基于当前计划 #{active} 进行分析。",
+        "backToActive": "查看当前计划"
       },
       "unsaved": {
         "title": "👁 正在查看未保存的运行 #{id}",

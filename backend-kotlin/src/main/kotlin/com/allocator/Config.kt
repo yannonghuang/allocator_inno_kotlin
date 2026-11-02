@@ -44,7 +44,6 @@ data class AppConfig(
     val assessmentModel: String,
     val openClawUrl: String,
     val openClawToken: String?,
-    val openClawMaterialAgent: String,
     /** HTTP request timeout for every LLM call (LlmClient.kt), millis. Default 90s. Override
      *  with LLM_REQUEST_TIMEOUT_MS if a provider/route ever needs longer (unaffected unless
      *  explicitly set). */
@@ -87,7 +86,6 @@ data class AppConfig(
                 assessmentModel = env("ASSESSMENT_MODEL") ?: defaultModel,
                 openClawUrl = env("OPENCLAW_URL") ?: "http://openclaw:18789",
                 openClawToken = env("OPENCLAW_TOKEN"),
-                openClawMaterialAgent = env("OPENCLAW_MATERIAL_AGENT") ?: "openclaw:material",
                 llmRequestTimeoutMs = env("LLM_REQUEST_TIMEOUT_MS")?.toLongOrNull() ?: 90_000L,
             )
         }

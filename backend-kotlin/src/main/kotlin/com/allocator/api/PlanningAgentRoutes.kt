@@ -8254,6 +8254,7 @@ private fun toolCommitOptionPick(caseId: Int, args: JsonObject, locale: String):
                 status == "success" -> "already_promoted"
                 status == "contingent" -> {
                     PlanRuns.update({ PlanRuns.id eq pickedCpr }) { it[PlanRuns.status] = "success" }
+                    com.allocator.services.adoptAsActivePlanRun(caseId, pickedCpr)
                     emitPlanRunEvent(caseId, pickedCpr, "promoted", buildJsonObject {
                         put("from_status", JsonPrimitive("contingent"))
                         put("to_status", JsonPrimitive("success"))
@@ -8419,6 +8420,7 @@ private fun toolPromotePlanRun(caseId: Int, args: JsonObject, locale: String): T
             status == "contingent" && supersededBy != null -> "superseded:$supersededBy"
             status == "contingent" -> {
                 PlanRuns.update({ PlanRuns.id eq planRunId }) { it[PlanRuns.status] = "success" }
+                com.allocator.services.adoptAsActivePlanRun(caseId, planRunId)
                 emitPlanRunEvent(caseId, planRunId, "promoted", buildJsonObject {
                     put("from_status", JsonPrimitive("contingent"))
                     put("to_status", JsonPrimitive("success"))
