@@ -162,12 +162,19 @@ fun Routing.resolveRoutes() {
     }
 
     // POST /cases/{case_id}/active   { "active": true|false }
+    // Activating is exclusive: the case the planner is viewing becomes the only active
+    // one, so agent tools that resolve "the current case" (pickActiveCase, and
+    // pickSupplyCaseId for material events) follow what's on screen.
     post("/cases/{case_id}/active") {
         val caseId = call.parameters["case_id"]?.toIntOrNull()
             ?: throw IllegalArgumentException("Invalid case_id")
         val body = Json.decodeFromString<SetActiveRequest>(call.receiveText().ifBlank { "{\"active\":true}" })
         val updated = transaction {
-            Cases.update({ Cases.id eq caseId }) { it[Cases.active] = body.active }
+            val n = Cases.update({ Cases.id eq caseId }) { it[Cases.active] = body.active }
+            if (n > 0 && body.active) {
+                Cases.update({ (Cases.id neq caseId) and (Cases.active eq true) }) { it[Cases.active] = false }
+            }
+            n
         }
         if (updated == 0) {
             call.respond(HttpStatusCode.NotFound, ResolveError("case_not_found", "case_id=$caseId"))

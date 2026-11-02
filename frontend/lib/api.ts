@@ -63,6 +63,12 @@ export async function getCase(id: number): Promise<Case> {
   return r.json();
 }
 
+/** Marks this case as the (single) active case — what agent tools treat as "the current case". */
+export async function setActiveCase(id: number): Promise<void> {
+  const r = await fetch(`${API}/cases/${id}/active`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ active: true }) });
+  if (!r.ok) throw new Error(await r.text());
+}
+
 export async function createCase(name: string): Promise<Case> {
   const r = await fetch(`${API}/cases`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
   if (!r.ok) throw new Error(await r.text());
@@ -1511,36 +1517,59 @@ export async function analyzeMaterialImpact(
   persist = true,
   quantityDecreaseAbs?: number | null,
   onProgress?: (p: MaterialImpactProgress) => void,
+  signal?: AbortSignal,
 ): Promise<MaterialImpactResult> {
   // 1. Submit async re-plan job
   const submit = await fetch(`${API}/material-impact`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ supplyId, deliveryDelayDays, quantityDecreasePct, quantityDecreaseAbs: quantityDecreaseAbs ?? null, persist }),
+    signal,
   });
   if (!submit.ok) throw new Error(await submit.text());
   const { jobId } = await submit.json();
   if (!jobId) throw new Error('No jobId returned from material-impact');
 
-  // 2. Poll until completed. Fast initial cadence so progress feels live, then
-  // back off; total budget is generous because v2 fixed-point iteration can
-  // run 5x for hard cases.
+  // 2. Poll until terminal. Fast initial cadence so progress feels live, then back off.
+  // No short fixed timeout: a re-plan takes ~14 min on heavy configs and may first wait
+  // for a slot, and the backend reports queued/running the whole time. The cap only
+  // guards against a job that never finishes. Whenever we stop waiting without a terminal
+  // status (abort, cap, error), cancel the backend job so abandoned work doesn't pile up.
   let delay = 500;
   const maxDelay = 2000;
-  const maxWait = 600_000; // 10 min
+  const maxWait = 90 * 60_000;
   const start = Date.now();
-  while (Date.now() - start < maxWait) {
-    await new Promise(res => setTimeout(res, delay));
-    delay = Math.min(delay * 2, maxDelay);
+  let terminal = false;
+  try {
+    while (Date.now() - start < maxWait) {
+      await new Promise(res => setTimeout(res, delay));
+      delay = Math.min(delay * 2, maxDelay);
+      if (signal?.aborted) throw new DOMException('Material impact analysis aborted', 'AbortError');
 
-    const poll = await fetch(`${API}/material-impact/status/${encodeURIComponent(jobId)}`);
-    if (!poll.ok) throw new Error(`Poll failed: ${poll.status}`);
-    const body = await poll.json();
-    if (body.progress && onProgress) onProgress(body.progress as MaterialImpactProgress);
-    if (body.status === 'completed') return body.result as MaterialImpactResult;
-    if (body.status === 'failed') throw new Error(body.error ?? 'Re-plan job failed');
+      const poll = await fetch(`${API}/material-impact/status/${encodeURIComponent(jobId)}`, { signal });
+      if (!poll.ok) throw new Error(`Poll failed: ${poll.status}`);
+      const body = await poll.json();
+      if (body.progress && onProgress) onProgress(body.progress as MaterialImpactProgress);
+      if (body.status === 'completed') { terminal = true; return body.result as MaterialImpactResult; }
+      if (body.status === 'failed' || body.status === 'cancelled') {
+        terminal = true;
+        throw new Error(body.error ?? `Re-plan job ${body.status}`);
+      }
+    }
+    throw new Error('Material impact analysis timed out');
+  } finally {
+    if (!terminal) {
+      fetch(`${API}/material-impact/${encodeURIComponent(jobId)}`, { method: 'DELETE' }).catch(() => {});
+    }
   }
-  throw new Error('Material impact analysis timed out');
+}
+
+/** Supply ids of the case's critical (non-purchasable) materials — the lots the criticality scan re-plans. */
+export async function getCriticalSupplyIds(caseId: number): Promise<string[]> {
+  const r = await fetch(`${API}/material-impact/critical-supplies/${caseId}`);
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return (data.supplyIds ?? []) as string[];
 }
 
 // ── WO Schedule Events ─────────────────────────────────────────────────────────

@@ -366,6 +366,7 @@
       "analyzeCriticality": "Analyze Criticality",
       "analyzingCriticality": "Analyzing… ({done}/{total})",
       "criticalityClear": "Clear",
+      "criticalityStop": "Stop",
       "resetDefaults": "Reset config",
       "resetDefaultsTitle": "Reset planning config: method by preference (depth 1, max BOM depth 3), purchase disallowed, WO batching on (30-day window)"
     },
@@ -998,7 +999,10 @@
         "banner": "👁 Viewing run #{id}",
         "contingentBanner": "👁 Contingent run #{id}",
         "contingentNote": "— what-if branch. Run a fresh plan to create a new baseline.",
-        "unnamed": "(unnamed)"
+        "unnamed": "(unnamed)",
+        "notActive": "— not the active plan; agents analyse against active plan #{active}.",
+        "agentsUse": "Agents analyse against active plan #{active}.",
+        "backToActive": "View active plan"
       },
       "unsaved": {
         "title": "👁 Viewing unsaved run #{id}",

@@ -1,10 +1,15 @@
 package com.allocator.services
 
+import com.allocator.Cases
 import com.allocator.PlanRunEvents
+import com.allocator.PlanRuns
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.insert
+import org.jetbrains.exposed.sql.update
 import org.jetbrains.exposed.sql.transactions.transaction
 
 /**
@@ -19,6 +24,22 @@ import org.jetbrains.exposed.sql.transactions.transaction
 fun resolveActiveRunId(designatedId: Int?, successRunIds: Collection<Int>): Int? {
     if (designatedId != null && designatedId in successRunIds) return designatedId
     return successRunIds.maxOrNull()
+}
+
+/**
+ * Makes [planRunId] — just saved or promoted — the case's active plan run: a newer plan
+ * takes over from any manual "Set active" pin. When it's already the latest successful
+ * run the pin is simply cleared, so active follows the default again; otherwise (a
+ * promoted what-if older than a plan saved in the meantime) it's pinned, so the plan just
+ * adopted still wins. Call inside a transaction, after the run's status became "success".
+ */
+fun adoptAsActivePlanRun(caseId: Int, planRunId: Int) {
+    val latestSuccess = PlanRuns.select(PlanRuns.id)
+        .where { (PlanRuns.caseId eq caseId) and (PlanRuns.status eq "success") }
+        .maxOfOrNull { it[PlanRuns.id] }
+    Cases.update({ Cases.id eq caseId }) {
+        it[Cases.designatedActivePlanRunId] = if (planRunId == latestSuccess) null else planRunId
+    }
 }
 
 /**

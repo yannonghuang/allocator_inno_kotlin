@@ -1092,18 +1092,23 @@ fun Routing.allocateRoutes() {
             // records here was wrong: KB is keyed by config signature, so all runs sharing
             // the same config showed the LATEST run's KPIs instead of each run's own values.
             val runIdsWithResult = rows.filter { it[PlanRuns.status] == "success" }.map { it[PlanRuns.id] }
-            val kpisByRunId: Map<Int, JsonObject> = if (runIdsWithResult.isEmpty()) emptyMap() else {
-                val ids = runIdsWithResult.joinToString(",")
-                exec("SELECT id, result::jsonb->'plan_kpis' AS plan_kpis FROM plan_run WHERE id IN ($ids) AND result IS NOT NULL") { rs ->
-                    val m = mutableMapOf<Int, JsonObject>()
-                    while (rs.next()) {
-                        val kpisJson = rs.getString("plan_kpis")
-                        if (kpisJson != null)
-                            m[rs.getInt("id")] = com.allocator.services.KbStore.extractKpisFromPlanKpisJson(kpisJson)
+            // One query per run: a single result too large to cast to jsonb (Postgres caps
+            // jsonb at 256 MB) must only lose that run's KPIs, not fail the whole list —
+            // the history drawer used to render "No persisted plan runs found".
+            val kpisByRunId: Map<Int, JsonObject> = runIdsWithResult.mapNotNull { id ->
+                runCatching {
+                    exec("SAVEPOINT kpi_$id")
+                    val kpisJson = exec("SELECT result::jsonb->'plan_kpis' AS plan_kpis FROM plan_run WHERE id = $id AND result IS NOT NULL") { rs ->
+                        if (rs.next()) rs.getString("plan_kpis") else null
                     }
-                    m
-                } ?: emptyMap()
-            }
+                    exec("RELEASE SAVEPOINT kpi_$id")
+                    kpisJson?.let { id to com.allocator.services.KbStore.extractKpisFromPlanKpisJson(it) }
+                }.getOrElse { e ->
+                    runCatching { exec("ROLLBACK TO SAVEPOINT kpi_$id") }
+                    log.warn("plan-runs list: skipping KPIs for run {}: {}", id, e.message)
+                    null
+                }
+            }.toMap()
             rows.map { row ->
                 val runId = row[PlanRuns.id]
                 val startedInstant = row[PlanRuns.createdAt]
@@ -1610,6 +1615,7 @@ fun Routing.allocateRoutes() {
                 if (nameArg != null) it[PlanRuns.name] = nameArg.ifBlank { null }
                 if (notesArg != null) it[PlanRuns.notes] = notesArg.ifBlank { null }
             }
+            com.allocator.services.adoptAsActivePlanRun(caseId, runId)
             @Suppress("UNCHECKED_CAST")
             val supplyAllocs = (enriched["supply_allocations"] as? List<Map<String, Any?>>).orEmpty()
             if (supplyAllocs.isNotEmpty()) {
@@ -2132,7 +2138,7 @@ private const val PEGGING_CHUNK_SIZE = 1
 // Called OUTSIDE the main save transaction so a pegging failure never rolls back the committed
 // plan result.  Manages its own transactions internally.
 @Suppress("UNCHECKED_CAST")
-private fun savePlanPeggingRows(runId: Int, enriched: Map<String, Any?>, caseId: Int = 0) {
+internal fun savePlanPeggingRows(runId: Int, enriched: Map<String, Any?>, caseId: Int = 0) {
     val entries = (enriched["planning_pegging"] as? List<Map<String, Any?>>).orEmpty()
     if (entries.isEmpty()) return
     val totalChunks = (entries.size + PEGGING_CHUNK_SIZE - 1) / PEGGING_CHUNK_SIZE

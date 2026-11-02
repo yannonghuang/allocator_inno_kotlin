@@ -1176,6 +1176,7 @@ fun Routing.workOrderImpactRoutes() {
                         when (status) {
                             "contingent" -> {
                                 PlanRuns.update({ PlanRuns.id eq cprId }) { it[PlanRuns.status] = "success" }
+                                com.allocator.services.adoptAsActivePlanRun(resolved.caseId, cprId)
                                 emitPlanRunEvent(resolved.caseId, cprId, "promoted", buildJsonObject {
                                     put("from_status", JsonPrimitive("contingent"))
                                     put("to_status", JsonPrimitive("success"))
